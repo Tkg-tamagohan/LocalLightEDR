@@ -848,6 +848,15 @@ fn find_process_exe_toolhelp32(pid: u32) -> Option<String> {
         .map(|e| e.exe_name)
 }
 
+/// Returns `true` when a process with `pid` is present in the current Toolhelp32
+/// snapshot (`BUG_0004` — lets callers distinguish "target already exited" from a
+/// genuine suspend/resume failure on a still-running process).
+pub fn process_is_running(pid: u32) -> bool {
+    snapshot_process_entries()
+        .map(|entries| entries.iter().any(|e| e.pid == pid))
+        .unwrap_or(false)
+}
+
 fn utf16_z_to_string(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])

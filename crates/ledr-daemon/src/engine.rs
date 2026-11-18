@@ -639,11 +639,17 @@ impl DaemonEngine {
             AlertDecision::TerminateAndBlock { add_block_rule } => {
                 if let Some(ident) = identity {
                     if let Err(err) = self.defense.terminate_process(&ident, true) {
-                        if alert.process_suspended || is_protected_process_refusal(&err) {
-                            if !is_protected_process_refusal(&err) {
-                                for child in &suspended_children {
-                                    let _ = self.defense.terminate_process(child, true);
-                                }
+                        if is_protected_process_refusal(&err) {
+                            return Err(err);
+                        }
+                        // A suspended alert tolerates the target already being gone: a
+                        // previous attempt may have terminated the process and then
+                        // failed the status update (rolling back the block rule), so a
+                        // retry must reach the rule save instead of erroring again.
+                        // A failure on a still-running process stays fatal.
+                        if alert.process_suspended && !is_process_gone_or_replaced(&err, ident.pid) {
+                            for child in &suspended_children {
+                                let _ = self.defense.terminate_process(child, true);
                             }
                             return Err(err);
                         }
@@ -651,7 +657,7 @@ impl DaemonEngine {
                             alert_id = %alert_id,
                             pid = ident.pid,
                             error = %err,
-                            "terminate_process failed for non-suspended alert (process already exited or PID reused); continuing block rule and alert resolution"
+                            "terminate_process failed (target already terminated or PID reused); continuing block rule and alert resolution"
                         );
                     }
                 } else if alert.process_suspended {

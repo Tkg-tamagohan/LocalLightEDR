@@ -1503,10 +1503,16 @@ async fn daemon_p2_08_terminate_and_block_exited_non_suspended_and_refusals() {
         AlertStatus::Pending
     );
 
-    // 3. Suspended alert where terminate_process fails -> still returns Err strictly.
+    // 3. Suspended alert where terminate_process fails on a still-running process
+    //    (this test binary) -> still returns Err strictly. A gone/replaced target is
+    //    tolerated instead so a retry can re-save the block rule (`BUG_0001`).
+    let live_ident = ProcessIdentity::new(
+        std::process::id(),
+        unix_ms_to_filetime(now_ms - 1_000),
+    );
     let suspended_alert = AlertRecord {
         alert_id: "alert-suspended-fail".to_string(),
-        process_instance_id: Some("5502:133765432100000002".to_string()),
+        process_instance_id: Some(live_ident.instance_id()),
         process_suspended: true,
         ..exited_alert
     };
@@ -3043,3 +3049,105 @@ async fn daemon_p2_26_bug_0002_suspended_child_resume_failure_keeps_unresolved()
     engine.shutdown_and_flush().await.expect("shutdown");
 }
 
+
+/// `DAEMON-P2-27` (`BUG_0001`): when `TerminateAndBlock` already killed the target but the
+/// status update failed and rolled back the block rule, the retry hits a terminate error
+/// on the now-gone process. The retry must still re-save the block rule and resolve the
+/// alert; a failure on a still-running target stays fatal.
+#[tokio::test]
+async fn daemon_p2_27_bug_0001_terminate_retry_on_gone_suspended_target_saves_block_rule() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    let mk_alert = |alert_id: &str, ident: &ProcessIdentity| AlertRecord {
+        alert_id: alert_id.to_string(),
+        timestamp_ms: current_unix_ms(),
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
+        title: "canary".to_string(),
+        process_instance_id: Some(ident.instance_id()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({ "exe_path": r"C:\Temp\terminated_once.exe" }).to_string(),
+        resolved_at_ms: None,
+    };
+
+    // Retry scenario: the PID cannot appear in a Toolhelp32 snapshot, so the repeated
+    // terminate fails but the block rule must still be persisted and the alert resolved.
+    let gone_ident =
+        ProcessIdentity::new(0x7FFF_FFC0, unix_ms_to_filetime(current_unix_ms() - 1_000));
+    defense.add_failing_terminate_pid(gone_ident.pid);
+    let gone_alert = mk_alert("gone-terminate-fail", &gone_ident);
+    store.record_alert(&gone_alert).expect("record gone alert");
+    let outcome = engine
+        .resolve_alert_with_outcome(
+            &gone_alert.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+        )
+        .expect("terminate failure on a gone target must not block rule persistence");
+    assert_eq!(outcome.alert.status, AlertStatus::TerminatedBlocked);
+    let rule_id = outcome.saved_rule_id.expect("block rule persisted");
+    assert!(rule_id.starts_with("RULE-BLOCK-"));
+    assert!(
+        store
+            .list_rules(Some(RuleScope::NetworkBlock))
+            .expect("list block rules")
+            .iter()
+            .any(|rule| rule.rule_id == rule_id),
+        "block rule must remain stored after resolution"
+    );
+
+    // A terminate failure on a still-running target stays fatal and persists nothing.
+    let live_ident = ProcessIdentity::new(
+        std::process::id(),
+        unix_ms_to_filetime(current_unix_ms() - 1_000),
+    );
+    defense.add_failing_terminate_pid(live_ident.pid);
+    let live_alert = mk_alert("live-terminate-fail", &live_ident);
+    store.record_alert(&live_alert).expect("record live alert");
+    assert!(
+        engine
+            .resolve_alert(
+                &live_alert.alert_id,
+                AlertDecision::TerminateAndBlock {
+                    add_block_rule: true,
+                },
+            )
+            .is_err(),
+        "terminate failure on a live process must surface as an error"
+    );
+    assert!(
+        store
+            .get_alert(&live_alert.alert_id)
+            .expect("get live alert")
+            .expect("live alert exists")
+            .status
+            .is_unresolved(),
+        "alert must stay unresolved while the target cannot be terminated"
+    );
+    assert_eq!(
+        store
+            .list_rules(Some(RuleScope::NetworkBlock))
+            .expect("list block rules")
+            .len(),
+        1,
+        "failed attempt must not persist a second block rule"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}

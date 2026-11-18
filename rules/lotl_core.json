@@ -1,0 +1,94 @@
+{
+  "rules": [
+    {
+      "id": "LEDR-LOTL-001",
+      "title": "Cmd Spawning Encoded PowerShell",
+      "severity": "High",
+      "description": "Detects cmd.exe spawning powershell.exe or pwsh.exe with an encoded command parameter (T1059.001).",
+      "conditions": [
+        {
+          "field": "ParentImage",
+          "modifier": "Regex",
+          "values": ["(?i)(?:^|[\\\\/])cmd\\.exe$"]
+        },
+        {
+          "field": "Image",
+          "modifier": "Regex",
+          "values": ["(?i)(?:^|[\\\\/])(powershell|pwsh)\\.exe$"]
+        },
+        {
+          "field": "CommandLine",
+          "modifier": "ContainsAll",
+          "values": ["-enc"]
+        }
+      ]
+    },
+    {
+      "id": "LEDR-LOTL-002",
+      "title": "PowerShell Download Cradle or Base64 Execution",
+      "severity": "High",
+      "description": "Detects PowerShell executing web download cradles or base64 decoding primitives.",
+      "conditions": [
+        {
+          "field": "Image",
+          "modifier": "EndsWith",
+          "values": ["\\powershell.exe", "\\pwsh.exe"]
+        },
+        {
+          "field": "CommandLine",
+          "modifier": "Regex",
+          "values": ["(?i)(downloadstring|frombase64string|invoke-expression|\\biex\\b|\\biwr\\b)"]
+        }
+      ]
+    },
+    {
+      "id": "LEDR-LOTL-003",
+      "title": "Certutil Remote Retrieval or Decoding",
+      "severity": "High",
+      "description": "Detects certutil.exe used for downloading remote files or decoding payloads.",
+      "conditions": [
+        {
+          "field": "Image",
+          "modifier": "EndsWith",
+          "values": ["\\certutil.exe"]
+        },
+        {
+          "field": "CommandLine",
+          "modifier": "Regex",
+          "values": ["(?i)(-urlcache|-decode)"]
+        }
+      ]
+    },
+    {
+      "id": "LEDR-LOTL-004",
+      "title": "Mshta or Regsvr32 Remote Script Execution",
+      "severity": "High",
+      "description": "Detects mshta.exe or regsvr32.exe executing remote URLs or scriptlets.",
+      "conditions": [
+        {
+          "field": "Image",
+          "modifier": "EndsWith",
+          "values": ["\\mshta.exe", "\\regsvr32.exe"]
+        },
+        {
+          "field": "CommandLine",
+          "modifier": "Regex",
+          "values": ["(?i)(http://|https://|javascript:|vbscript:|scrobj\\.dll)"]
+        }
+      ]
+    },
+    {
+      "id": "LEDR-SCRIPT-001",
+      "title": "Suspicious Script Content via AMSI or ScriptBlock",
+      "severity": "Critical",
+      "description": "Detects high-risk PowerShell/AMSI script constructs such as AMSI bypass or reflective memory primitives.",
+      "conditions": [
+        {
+          "field": "ScriptContent",
+          "modifier": "Regex",
+          "values": ["(?i)(AmsiUtils|amsiInitFailed|VirtualAlloc|FromBase64String)"]
+        }
+      ]
+    }
+  ]
+}

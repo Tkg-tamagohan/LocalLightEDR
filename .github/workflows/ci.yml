@@ -1,0 +1,285 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      web: ${{ steps.detect.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect changed paths
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          import pathlib
+          import subprocess
+
+          ZERO_SHA = "0000000000000000000000000000000000000000"
+          event_name = os.environ.get("EVENT_NAME", "")
+          push_before = os.environ.get("PUSH_BEFORE", "")
+          pr_base_sha = os.environ.get("PR_BASE_SHA", "")
+          head_sha = os.environ.get("HEAD_SHA", "")
+
+
+          def write_outputs(rust_flag: bool, web_flag: bool) -> None:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                  fh.write(f"rust={'true' if rust_flag else 'false'}\n")
+                  fh.write(f"web={'true' if web_flag else 'false'}\n")
+
+
+          def detect() -> tuple[bool, bool]:
+              if event_name == "pull_request":
+                  base, head = pr_base_sha, head_sha
+              elif event_name == "push":
+                  if not push_before or push_before == ZERO_SHA:
+                      print("Push has empty or zero before SHA; enabling both rust and web.")
+                      return True, True
+                  base, head = push_before, head_sha
+              else:
+                  print(f"Unhandled event {event_name!r}; enabling both rust and web.")
+                  return True, True
+
+              if not base or not head:
+                  print("Missing base or head SHA; enabling both rust and web.")
+                  return True, True
+
+              res = subprocess.run(
+                  ["git", "diff", "--no-renames", "-z", "--name-only", base, head],
+                  capture_output=True,
+                  check=False,
+              )
+              if res.returncode != 0:
+                  err = res.stderr.decode("utf-8", errors="replace").strip()
+                  print(f"git diff failed (rc={res.returncode}): {err}; enabling both rust and web.")
+                  return True, True
+
+              files = [p for p in res.stdout.decode("utf-8", errors="replace").split("\0") if p]
+              if not files:
+                  print("Empty changed file list; enabling both rust and web.")
+                  return True, True
+
+              rust = False
+              web = False
+              default_both_exact = {
+                  "Cargo.toml",
+                  "Cargo.lock",
+                  "docs/implementation-plan.md",
+                  "docs/decision-records.md",
+              }
+
+              for path in files:
+                  print(f"Changed file: {path}")
+                  if path.startswith(".github/workflows/") or path in default_both_exact:
+                      rust = True
+                      web = True
+                      continue
+
+                  if (
+                      path.startswith("crates/")
+                      or (path.startswith("apps/ledr-ui/") and not path.startswith("apps/ledr-ui/ui/"))
+                      or path.startswith("rules/")
+                  ):
+                      rust = True
+
+                  if (
+                      path.startswith("apps/ledr-ui/")
+                      or path.startswith("extensions/")
+                      or path.startswith("rules/")
+                      or path.startswith(".github/")
+                      or pathlib.Path(path).suffix.lower()
+                      in {".js", ".json", ".html", ".css", ".md", ".yml", ".yaml", ".toml"}
+                  ):
+                      web = True
+
+              return rust, web
+
+
+          rust_needed, web_needed = detect()
+          print(f"Outputs: rust={rust_needed}, web={web_needed}")
+          write_outputs(rust_needed, web_needed)
+          EOF
+
+  static-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Check JS syntax (apps/ledr-ui/ui/app.js)
+        run: node --check apps/ledr-ui/ui/app.js
+      - name: Check JS syntax (extensions/ledr-chrome-mv3/background.js)
+        run: node --check extensions/ledr-chrome-mv3/background.js
+      - name: Check JS syntax (extensions/ledr-chrome-mv3/content.js)
+        run: node --check extensions/ledr-chrome-mv3/content.js
+      - name: Validate JSON, text integrity, conflict markers, and UI assets
+        run: |
+          python3 - <<'EOF'
+          import json
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          errors = []
+
+          json_files = [
+              "rules/lotl_core.json",
+              "rules/default_allowlist.json",
+              "apps/ledr-ui/tauri.conf.json",
+              "apps/ledr-ui/capabilities/default.json",
+              "extensions/ledr-chrome-mv3/manifest.json",
+              "extensions/ledr-chrome-mv3/rules/dnr_static.json",
+          ]
+          for rel in json_files:
+              p = pathlib.Path(rel)
+              if not p.is_file():
+                  errors.append(f"Missing required JSON file: {rel}")
+                  continue
+              try:
+                  json.loads(p.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  errors.append(f"Invalid JSON in {rel}: {exc}")
+
+          required_ui_files = [
+              "apps/ledr-ui/ui/index.html",
+              "apps/ledr-ui/ui/app.js",
+          ]
+          for rel in required_ui_files:
+              p = pathlib.Path(rel)
+              if not p.is_file() or p.stat().st_size == 0 or not p.read_text(encoding="utf-8").strip():
+                  errors.append(f"Required UI file missing or empty: {rel}")
+
+          ls_res = subprocess.run(
+              ["git", "ls-files", "-z"],
+              capture_output=True,
+              check=True,
+          )
+          text_exts = {".rs", ".toml", ".json", ".js", ".html", ".css", ".md", ".yml", ".yaml"}
+          conflict_re = re.compile(r"^(?:<{7}(?: |$)|={7}$|>{7}(?: |$))")
+
+          for rel in ls_res.stdout.decode("utf-8", errors="strict").split("\0"):
+              if not rel:
+                  continue
+              p = pathlib.Path(rel)
+              if p.suffix.lower() not in text_exts or not p.is_file():
+                  continue
+              try:
+                  content = p.read_text(encoding="utf-8")
+              except UnicodeDecodeError as exc:
+                  errors.append(f"Invalid UTF-8 in {rel}: {exc}")
+                  continue
+
+              for line_no, line in enumerate(content.splitlines(), start=1):
+                  if "\ufffd" in line:
+                      errors.append(f"Replacement character U+FFFD in {rel}:{line_no}")
+                  if conflict_re.match(line):
+                      errors.append(f"Conflict marker in {rel}:{line_no}: {line!r}")
+
+          if errors:
+              for err in errors:
+                  print(err, file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Static checks passed ({len(json_files)} JSON files, UI assets, UTF-8 & conflict marker scan).")
+          EOF
+
+  rust-windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Cargo check
+        shell: pwsh
+        run: cargo check --workspace --all-targets --locked
+      - name: Cargo clippy
+        shell: pwsh
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Cargo test (workspace)
+        shell: pwsh
+        run: cargo test --workspace --locked
+      - name: Cargo test (ledr-daemon burst_budget)
+        shell: pwsh
+        run: cargo test -p ledr-daemon --test burst_budget --locked -- --nocapture
+      - name: Cargo test (ledr-store ttl_purge_lineage)
+        shell: pwsh
+        run: cargo test -p ledr-store --test ttl_purge_lineage --locked
+
+  ci-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, static-checks, rust-windows]
+    if: always()
+    steps:
+      - name: Verify required CI job results
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          changes = needs.get("changes", {})
+          outputs = changes.get("outputs") or {}
+
+          flag_map = {
+              "static-checks": "web",
+              "rust-windows": "rust",
+          }
+
+          failed = False
+          if changes.get("result") != "success":
+              print(f"changes result={changes.get('result')!r}, expected='success'", file=sys.stderr)
+              failed = True
+
+          for flag in flag_map.values():
+              if outputs.get(flag) not in ("true", "false"):
+                  print(f"Invalid or missing changes output {flag!r}: {outputs.get(flag)!r}", file=sys.stderr)
+                  failed = True
+
+          for job_name in ("changes", "static-checks", "rust-windows"):
+              actual = needs.get(job_name, {}).get("result")
+              if job_name in flag_map:
+                  expected = "success" if outputs.get(flag_map[job_name]) == "true" else "skipped"
+              else:
+                  expected = "success"
+              print(f"{job_name}: actual={actual}, expected={expected}")
+              if actual != expected:
+                  failed = True
+
+          if failed:
+              sys.exit(1)
+          EOF

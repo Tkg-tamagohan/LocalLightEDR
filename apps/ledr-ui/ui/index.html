@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LocalEDR - Process Lineage &amp; Flight Recorder</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand-group">
+        <div class="brand-mark" aria-hidden="true">LE</div>
+        <div>
+          <h1 class="brand-title">LocalEDR</h1>
+          <div class="brand-subtitle">Endpoint Flight Recorder</div>
+        </div>
+      </div>
+
+      <nav class="view-nav" aria-label="Core Views">
+        <button type="button" class="nav-tab" data-view="triage">
+          <span>View 1: アラートトリアージ</span>
+          <span class="phase-tag">Phase 2</span>
+        </button>
+        <button type="button" class="nav-tab is-active" data-view="lineage" aria-current="page">
+          <span>View 2: プロセス系譜・通信フライトレコーダー</span>
+          <span class="phase-tag is-live">Active</span>
+        </button>
+        <button type="button" class="nav-tab" data-view="policy">
+          <span>View 3: 防御ポリシー・カナリア・ブラウザシールド</span>
+          <span class="phase-tag">Phase 3</span>
+        </button>
+      </nav>
+
+      <div class="header-controls">
+        <span id="launch-mode-pill" class="pill pill-warn hidden"></span>
+        <span id="daemon-status-pill" class="pill pill-muted">Daemon: Checking...</span>
+        <span id="metrics-pill" class="pill pill-mono" title="Daemon Pipeline Metrics">
+          Procs: - | Alerts: - | Drops: -
+        </span>
+        <button id="refresh-btn" type="button" class="btn btn-primary">Refresh</button>
+      </div>
+    </header>
+
+    <div id="status-banner" class="status-banner hidden" role="alert">
+      <div class="banner-text">
+        <strong id="banner-title">Daemon Offline</strong>
+        <span id="banner-detail" class="mono"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="retry-btn" type="button" class="btn btn-secondary">Retry IPC</button>
+        <button id="sample-btn" type="button" class="btn btn-ghost">Preview Sample</button>
+      </div>
+    </div>
+
+    <main id="view-lineage" class="workspace">
+      <section class="panel tree-panel" aria-label="Process Lineage Tree">
+        <div class="panel-header">
+          <div>
+            <h2>プロセス系譜ツリー</h2>
+            <span id="tree-summary" class="panel-meta">0 processes</span>
+          </div>
+          <div class="panel-actions">
+            <button id="all-procs-btn" type="button" class="btn btn-xs is-selected">All</button>
+            <button id="expand-all-btn" type="button" class="btn btn-xs">Expand</button>
+            <button id="collapse-all-btn" type="button" class="btn btn-xs">Collapse</button>
+          </div>
+        </div>
+
+        <div class="filter-bar">
+          <input
+            id="process-filter"
+            type="search"
+            placeholder="Filter by exe path, PID, command line, signer..."
+            autocomplete="off"
+          />
+        </div>
+
+        <div id="process-tree" class="tree-container" role="tree"></div>
+      </section>
+
+      <section class="panel telemetry-panel" aria-label="Communication Flight Recorder">
+        <div id="process-inspector" class="inspector-card">
+          <div class="inspector-empty">
+            Select a process node to filter DNS queries and outbound connections, or inspect the full timeline.
+          </div>
+        </div>
+
+        <div class="telemetry-toolbar">
+          <div class="tab-group" role="tablist">
+            <button type="button" class="tab-btn is-active" data-tab="all" role="tab">
+              Timeline <span id="count-all" class="count-badge">0</span>
+            </button>
+            <button type="button" class="tab-btn" data-tab="dns" role="tab">
+              DNS Queries <span id="count-dns" class="count-badge">0</span>
+            </button>
+            <button type="button" class="tab-btn" data-tab="network" role="tab">
+              Network <span id="count-network" class="count-badge">0</span>
+            </button>
+            <button type="button" class="tab-btn" data-tab="canary" role="tab">
+              Canary &amp; Downloads <span id="count-canary" class="count-badge">0</span>
+            </button>
+          </div>
+          <div id="scope-indicator" class="scope-label mono">Scope: All Processes</div>
+        </div>
+
+        <div class="table-wrap">
+          <table class="telemetry-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Type</th>
+                <th>Process</th>
+                <th>Target / Query</th>
+                <th>Details / Resolved</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="telemetry-body">
+              <tr>
+                <td colspan="6" class="empty-row">Waiting for flight recorder snapshot...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <main id="view-triage" class="placeholder-view hidden">
+      <section class="panel placeholder-card">
+        <h2>View 1: アラートトリアージ (Phase 2 Target)</h2>
+        <p>
+          Emergency containment triage view for suspended alerts (<code>PENDING</code> /
+          <code>EXPIRED_SUSPENDED</code>) with 3-tier resolution actions is scheduled for Phase 2.
+        </p>
+        <button type="button" class="btn btn-primary back-to-view2">Return to View 2</button>
+      </section>
+    </main>
+
+    <main id="view-policy" class="placeholder-view hidden">
+      <section class="panel placeholder-card">
+        <h2>View 3: 防御ポリシー・カナリア・ブラウザシールド (Phase 3 Target)</h2>
+        <p>
+          Protected canary paths, decoy files, WFP allow/block rules, and Chrome MV3 shield status
+          management are scheduled for Phase 3.
+        </p>
+        <button type="button" class="btn btn-primary back-to-view2">Return to View 2</button>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

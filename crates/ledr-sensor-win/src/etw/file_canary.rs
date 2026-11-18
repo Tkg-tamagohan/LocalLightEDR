@@ -369,6 +369,52 @@ pub fn is_autorun_registry_key_u16(raw_u16: &[u16]) -> bool {
     false
 }
 
+/// Returns `true` if a raw UTF-16 registry key path is an autorun location where a
+/// *value write* indicates persistence (`\CurrentVersion\Run`, `\CurrentVersion\RunOnce`,
+/// or `\Winlogon`). `Services\*` is excluded: service-key persistence is already covered by
+/// new-key creation events, while existing service keys (e.g. `Services\Tcpip\Parameters`)
+/// see constant benign value writes from the OS itself.
+#[inline]
+pub fn is_autorun_registry_value_target_u16(raw_u16: &[u16]) -> bool {
+    let end = raw_u16
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(raw_u16.len());
+    let slice = &raw_u16[..end];
+    if slice.is_empty() {
+        return false;
+    }
+    [
+        &REG_RUN_U16[..],
+        &REG_RUN_ONCE_U16[..],
+        &REG_WINLOGON_U16[..],
+    ]
+    .iter()
+        .any(|marker| {
+            find_segment_ci_u16(slice, marker).is_some_and(|after| {
+                after == slice.len() || is_sep_u16(slice[after])
+            })
+        })
+}
+
+/// String wrapper around [`is_autorun_registry_value_target_u16`].
+pub fn is_autorun_registry_value_target(key_path: &str) -> bool {
+    if key_path.is_empty() {
+        return false;
+    }
+    let mut stack = [0u16; 512];
+    let mut len = 0usize;
+    for unit in key_path.encode_utf16() {
+        if len >= stack.len() {
+            let heap: Vec<u16> = key_path.encode_utf16().collect();
+            return is_autorun_registry_value_target_u16(&heap);
+        }
+        stack[len] = unit;
+        len += 1;
+    }
+    is_autorun_registry_value_target_u16(&stack[..len])
+}
+
 /// String wrapper around [`is_autorun_registry_key_u16`].
 pub fn is_autorun_registry_key(key_path: &str) -> bool {
     if key_path.is_empty() {
@@ -769,6 +815,33 @@ mod tests {
             assert!(
                 !is_autorun_registry_key(benign),
                 "expected no autorun match for `{benign}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sens_p2_04_autorun_registry_value_target_excludes_services() {
+        for target in [
+            r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            r"\REGISTRY\USER\S-1-5-21-123\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+            r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
+        ] {
+            assert!(
+                is_autorun_registry_value_target(target),
+                "expected value-target match for `{target}`"
+            );
+        }
+
+        for non_target in [
+            r"\REGISTRY\MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+            r"\REGISTRY\MACHINE\SYSTEM\ControlSet001\Services\EvilPersistence",
+            r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\RunMRU",
+            "",
+        ] {
+            assert!(
+                !is_autorun_registry_value_target(non_target),
+                "expected no value-target match for `{non_target}`"
             );
         }
     }

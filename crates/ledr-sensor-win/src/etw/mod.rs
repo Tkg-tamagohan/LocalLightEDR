@@ -30,6 +30,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 
 pub use self::file_canary::{
     CanaryMatcher, is_autorun_registry_key, is_autorun_registry_key_u16,
+    is_autorun_registry_value_target, is_autorun_registry_value_target_u16,
     prefilter_and_classify_canary, prefilter_and_classify_canary_u16,
 };
 use self::tdh::{
@@ -54,7 +55,7 @@ const MAX_LOGFILE_NAME_CHARS: usize = 128;
 const MAX_TRACKED_HONEYPOT_HANDLES: usize = 512;
 const WINEVENT_KEYWORD_PROCESS: u64 = 0x10;
 const KERNEL_FILE_KEYWORDS: u64 = 0x0010 | 0x0020 | 0x0080 | 0x0200 | 0x0400 | 0x0800 | 0x1000;
-const KERNEL_REGISTRY_KEYWORDS: u64 = 0x0100 | 0x0200 | 0x1000 | 0x4000;
+const KERNEL_REGISTRY_KEYWORDS: u64 = 0x0100 | 0x0200 | 0x1000 | 0x2000 | 0x4000;
 const ERROR_WMI_INSTANCE_NOT_FOUND_CODE: u32 = 4201;
 
 /// `Microsoft-Windows-Kernel-Process` (`{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}`).
@@ -288,9 +289,15 @@ struct EtwCallbackContext {
     canary_matcher: Arc<RwLock<CanaryMatcher>>,
     honeypot_handles: Mutex<HoneypotHandleTracker>,
     has_honeypot_handles: AtomicBool,
+    registry_kcb_names: Mutex<HashMap<u64, String>>,
     stop_requested: Arc<AtomicBool>,
     session_name_nul: Vec<u16>,
 }
+
+/// Bound on the cached `KeyObject` -> key-path map for autorun registry keys.
+/// Only autorun paths are cached, so this stays small; on overflow the cache is
+/// cleared rather than grown to keep worst-case memory bounded.
+const REGISTRY_KCB_CACHE_CAPACITY: usize = 4096;
 
 impl EtwCallbackContext {
     /// Emits a decoded event directly to the bounded downstream sink.
@@ -332,6 +339,36 @@ impl EtwCallbackContext {
             .unwrap_or_else(|e| e.into_inner());
         let non_empty = tracker.close_handle(file_object);
         self.has_honeypot_handles.store(non_empty, Ordering::Release);
+    }
+
+    /// Caches an autorun registry key's KCB pointer -> path so write events whose
+    /// `KeyName` arrives empty (uncached KCB name) can still be attributed.
+    fn remember_registry_key(&self, key_object: u64, key_name: &str) {
+        let mut cache = self
+            .registry_kcb_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= REGISTRY_KCB_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(key_object, key_name.to_owned());
+    }
+
+    fn lookup_registry_key(&self, key_object: u64) -> Option<String> {
+        self.registry_kcb_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key_object)
+            .cloned()
+    }
+
+    /// Removes and returns the cached path (used on DeleteKey, after which the
+    /// KCB no longer accepts writes).
+    fn take_registry_key(&self, key_object: u64) -> Option<String> {
+        self.registry_kcb_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key_object)
     }
 }
 
@@ -521,6 +558,7 @@ impl SensorBackend for WindowsEtwSensor {
             canary_matcher: Arc::clone(&self.canary_matcher),
             honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
             has_honeypot_handles: AtomicBool::new(false),
+            registry_kcb_names: Mutex::new(HashMap::new()),
             stop_requested: Arc::clone(&stop_requested),
             session_name_nul: session_name_nul.clone(),
         });
@@ -809,7 +847,7 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
     } else if provider == KERNEL_FILE_GUID {
         handle_kernel_file(record, event_id, ctx)
     } else if provider == KERNEL_REGISTRY_GUID {
-        handle_kernel_registry(record, event_id)
+        handle_kernel_registry(record, event_id, ctx)
     } else if provider == DNS_CLIENT_GUID {
         match event_id {
             3008 | 3018 | 3020 | 3006 => handle_dns_client(record, event_id, ctx),
@@ -1103,8 +1141,12 @@ fn handle_kernel_file(
     }
 }
 
-fn handle_kernel_registry(record: &EVENT_RECORD, event_id: u16) -> Option<SensorEvent> {
-    if !matches!(event_id, 1 | 3 | 5 | 6) {
+fn handle_kernel_registry(
+    record: &EVENT_RECORD,
+    event_id: u16,
+    ctx: &EtwCallbackContext,
+) -> Option<SensorEvent> {
+    if !matches!(event_id, 1 | 2 | 3 | 5 | 6) {
         return None;
     }
     let pid = record.EventHeader.ProcessId;
@@ -1112,33 +1154,86 @@ fn handle_kernel_registry(record: &EVENT_RECORD, event_id: u16) -> Option<Sensor
         return None;
     }
     let info = TdhEventInfo::from_record(record)?;
+    let key_object = info.get_u64("KeyObject");
 
-    let key_name = if event_id == 1 {
-        info.inspect_first_utf16_property(&["KeyName"], |u16_slice| {
-            if is_autorun_registry_key_u16(u16_slice) {
-                Some(String::from_utf16_lossy(u16_slice))
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            info.inspect_joined_utf16_properties("BaseName", "RelativeName", |u16_slice| {
+    // Event 1 (CreateKey) also fires when `RegCreateKeyEx`/`NtCreateKey` merely opens an
+    // existing key (`Disposition` = `REG_OPENED_EXISTING_KEY`), and event 2 (OpenKey)
+    // covers plain `RegOpenKeyEx`/`NtOpenKey`. Only a genuinely new key under an autorun
+    // location is a persistence write, so opens never alert; instead their resolved
+    // autorun path is cached under `KeyObject` (which is stable for the opened handle)
+    // so that later SetValue/DeleteValue/DeleteKey events on the same handle — whose
+    // `KeyName` arrives empty when the KCB name is not yet populated — can still be
+    // attributed.
+    const REG_CREATED_NEW_KEY: u32 = 0x0000_0001;
+    let key_name = if matches!(event_id, 1 | 2) {
+        let key_name = info
+            .inspect_first_utf16_property(&["KeyName"], |u16_slice| {
                 if is_autorun_registry_key_u16(u16_slice) {
                     Some(String::from_utf16_lossy(u16_slice))
                 } else {
                     None
                 }
             })
-        })?
+            .or_else(|| {
+                info.inspect_joined_utf16_properties("BaseName", "RelativeName", |u16_slice| {
+                    if is_autorun_registry_key_u16(u16_slice) {
+                        Some(String::from_utf16_lossy(u16_slice))
+                    } else {
+                        None
+                    }
+                })
+            });
+        if let (Some(key_object), Some(key_name)) = (key_object, key_name.as_deref()) {
+            // Cache only value-write-relevant autorun keys so the map stays small and is
+            // not churned by constant `Services\*` traffic.
+            if is_autorun_registry_value_target(key_name) {
+                ctx.remember_registry_key(key_object, key_name);
+            }
+        }
+        if event_id == 2
+            || info
+                .get_u32("Disposition")
+                .is_some_and(|disposition| disposition != REG_CREATED_NEW_KEY)
+        {
+            return None;
+        }
+        key_name?
     } else {
-        info.inspect_first_utf16_property(&["KeyName"], |u16_slice| {
+        let via_key_name = info.inspect_first_utf16_property(&["KeyName"], |u16_slice| {
             if is_autorun_registry_key_u16(u16_slice) {
                 Some(String::from_utf16_lossy(u16_slice))
             } else {
                 None
             }
-        })?
+        });
+        match (via_key_name, key_object) {
+            (Some(key_name), Some(key_object)) => {
+                if event_id == 3 {
+                    ctx.take_registry_key(key_object);
+                } else if is_autorun_registry_value_target(&key_name) {
+                    ctx.remember_registry_key(key_object, &key_name);
+                }
+                key_name
+            }
+            (Some(key_name), None) => key_name,
+            (None, Some(key_object)) => {
+                if event_id == 3 {
+                    ctx.take_registry_key(key_object)?
+                } else {
+                    ctx.lookup_registry_key(key_object)?
+                }
+            }
+            (None, None) => return None,
+        }
     };
+
+    // Value writes only matter under the persistence locations where the written value is
+    // itself the payload (Run/RunOnce entries, Winlogon shell/userinit). Existing
+    // `Services\*` keys see constant benign churn (e.g. `Tcpip\Parameters`), so writes
+    // there are not alerted on; service persistence stays covered by new-key creation.
+    if matches!(event_id, 5 | 6) && !is_autorun_registry_value_target(&key_name) {
+        return None;
+    }
 
     let target_path = if matches!(event_id, 5 | 6) {
         match info.get_string("ValueName").filter(|v| !v.is_empty()) {
@@ -1301,6 +1396,7 @@ mod tests {
             canary_matcher: Arc::new(RwLock::new(CanaryMatcher::default())),
             honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
             has_honeypot_handles: AtomicBool::new(false),
+            registry_kcb_names: Mutex::new(HashMap::new()),
             stop_requested: Arc::clone(&stop_requested),
             session_name_nul: session_name_nul.clone(),
         };
@@ -1358,6 +1454,7 @@ mod tests {
             canary_matcher: Arc::new(RwLock::new(CanaryMatcher::default())),
             honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
             has_honeypot_handles: AtomicBool::new(false),
+            registry_kcb_names: Mutex::new(HashMap::new()),
             stop_requested: Arc::clone(&stop_requested),
             session_name_nul: session_name_nul.clone(),
         });

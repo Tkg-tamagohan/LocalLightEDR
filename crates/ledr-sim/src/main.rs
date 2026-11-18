@@ -555,7 +555,12 @@ pub fn prepare_sim_dir(base_dir: &Path) -> Result<PrepareDirOutcome> {
         })?;
     }
     {
-        let mut writer = File::create(&cookie_path)
+        // `create_new` fails when the file already exists instead of truncating it
+        // (BUG_0003 — `--prepare-dir` must never clobber a real Cookies DB or honeypot).
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cookie_path)
             .with_context(|| format!("failed to create dummy Cookies {}", cookie_path.display()))?;
         writer.write_all(DUMMY_COOKIE_PAYLOAD)?;
         writer.flush()?;
@@ -563,7 +568,10 @@ pub fn prepare_sim_dir(base_dir: &Path) -> Result<PrepareDirOutcome> {
 
     let honeypot_path = dummy_honeypot_path(base_dir);
     {
-        let mut writer = File::create(&honeypot_path)
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&honeypot_path)
             .with_context(|| format!("failed to create honeypot {}", honeypot_path.display()))?;
         writer.write_all(INITIAL_HONEYPOT_BYTES)?;
         writer.flush()?;
@@ -1197,6 +1205,31 @@ mod tests {
 
         // Restore original permissions so TempSimDir Drop cleans up cleanly.
         std::fs::set_permissions(&cookies_path, orig_perms).expect("restore cookies permissions");
+
+        // BUG_0003: --prepare-dir must refuse to overwrite existing fixture files
+        // instead of truncating them (create_new semantics).
+        const SENTINEL_PREP: &[u8] = b"SQLite format 3\0RealUserCookiesDb";
+        std::fs::write(&cookies_path, SENTINEL_PREP).expect("seed real cookies");
+        std::fs::write(&honeypot_path, SENTINEL_HONEYPOT).expect("seed real honeypot");
+        assert!(
+            prepare_sim_dir(temp.path()).is_err(),
+            "prepare_sim_dir must fail when the Cookies file already exists"
+        );
+        assert_eq!(
+            std::fs::read(&cookies_path).expect("read preserved cookies"),
+            SENTINEL_PREP,
+            "existing Cookies content must be preserved"
+        );
+        std::fs::remove_file(&cookies_path).expect("remove cookies for honeypot check");
+        assert!(
+            prepare_sim_dir(temp.path()).is_err(),
+            "prepare_sim_dir must fail when the honeypot already exists"
+        );
+        assert_eq!(
+            std::fs::read(&honeypot_path).expect("read preserved honeypot"),
+            SENTINEL_HONEYPOT,
+            "existing honeypot content must be preserved"
+        );
 
         // Pre-prepared honeypot must also append directly without File::create overwriting it.
         const SENTINEL_HONEYPOT: &[u8] = b"CustomHoneypotHeader\n";

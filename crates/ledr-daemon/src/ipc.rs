@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ledr_proto::{
-    decode_ipc_frame, encode_ipc_frame, AlertRecord, AlertSeverity, AlertStatus,
-    DownloadOriginRecord, IpcRequest, IpcResponse, AUTHORIZED_BRIDGE_EXE_PATH,
+    decode_ipc_frame, encode_ipc_frame, AlertDecision, AlertRecord, AlertSeverity,
+    AlertStatus, DownloadOriginRecord, IpcRequest, IpcResponse, AUTHORIZED_BRIDGE_EXE_PATH,
     AUTHORIZED_UI_EXE_PATH, IPC_MAX_FRAME_BYTES,
 };
 use ledr_rules::{assess_domain_risk, signer_subject_matches, BinaryIdentity};
@@ -594,10 +594,26 @@ async fn handle_pipe_client(
     };
 
     let frame_timeout = Duration::from_millis(engine.config().ipc_frame_timeout_ms.max(50));
+    // SEC_0001: cap the total session lifetime so one client cannot pin the single
+    // strict-mode pipe instance forever with periodic lightweight requests.
+    let session_timeout =
+        Duration::from_millis(engine.config().ipc_session_timeout_ms.max(1_000));
+    let session_deadline = tokio::time::Instant::now() + session_timeout;
 
     loop {
+        let session_remaining =
+            session_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if session_remaining.is_zero() {
+            tracing::info!(
+                timeout_ms = session_timeout.as_millis(),
+                "IPC client session lifetime cap reached; closing session (SEC_0001)"
+            );
+            break;
+        }
         let mut len_buf = [0u8; 4];
-        match tokio::time::timeout(frame_timeout, pipe.read_exact(&mut len_buf)).await {
+        match tokio::time::timeout(session_remaining.min(frame_timeout), pipe.read_exact(&mut len_buf))
+            .await
+        {
             Ok(Ok(_)) => {}
             Ok(Err(err)) if is_disconnect_error(&err) => break,
             Ok(Err(err)) => return Err(err),
@@ -628,9 +644,19 @@ async fn handle_pipe_client(
             break;
         }
 
+        let session_remaining =
+            session_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if session_remaining.is_zero() {
+            tracing::info!(
+                timeout_ms = session_timeout.as_millis(),
+                "IPC client session lifetime cap reached; closing session (SEC_0001)"
+            );
+            break;
+        }
+
         let mut frame = Vec::with_capacity(4 + payload_len.min(IPC_READ_CHUNK_BYTES));
         frame.extend_from_slice(&len_buf);
-        let payload_read = tokio::time::timeout(frame_timeout, async {
+        let payload_read = tokio::time::timeout(session_remaining.min(frame_timeout), async {
             let mut remaining = payload_len;
             let mut chunk = [0u8; IPC_READ_CHUNK_BYTES];
             while remaining > 0 {
@@ -665,7 +691,16 @@ async fn handle_pipe_client(
             },
         };
 
-        write_response(&mut pipe, &response, frame_timeout).await?;
+        let session_remaining =
+            session_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if session_remaining.is_zero() {
+            tracing::info!(
+                timeout_ms = session_timeout.as_millis(),
+                "IPC client session lifetime cap reached; closing session (SEC_0001)"
+            );
+            break;
+        }
+        write_response(&mut pipe, &response, session_remaining.min(frame_timeout)).await?;
     }
 
     Ok(())
@@ -781,13 +816,21 @@ fn dispatch_request(
             }
         }
         IpcRequest::ResolveAlert { alert_id, decision } => {
-            match engine.resolve_alert(&alert_id, decision) {
-                Ok(resolved) => IpcResponse::Ack {
-                    message: format!(
+            let wants_block_rule =
+                matches!(decision, AlertDecision::TerminateAndBlock { add_block_rule: true });
+            match engine.resolve_alert_with_outcome(&alert_id, decision) {
+                Ok(outcome) => {
+                    let mut message = format!(
                         "alert {} resolved to {}",
-                        resolved.alert_id,
-                        resolved.status.as_db_str()
-                    ),
+                        outcome.alert.alert_id,
+                        outcome.alert.status.as_db_str()
+                    );
+                    if let Some(rule_id) = outcome.saved_rule_id.as_deref() {
+                        message.push_str(&format!("; rule {rule_id} saved"));
+                    } else if wants_block_rule {
+                        message.push_str("; no NetworkBlock rule saved (executable path unresolved)");
+                    }
+                    IpcResponse::Ack { message }
                 },
                 Err(msg) => {
                     let code = if msg.contains("not found") {

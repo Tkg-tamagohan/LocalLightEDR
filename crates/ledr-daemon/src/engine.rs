@@ -35,6 +35,7 @@ const TICKS_PER_MS: u64 = 10_000;
 const DEFAULT_TTL_PURGE_INTERVAL_MS: u64 = 3_600_000;
 const DEFAULT_MAX_CONCURRENT_IPC_CLIENTS: usize = 16;
 const DEFAULT_IPC_FRAME_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_IPC_SESSION_TIMEOUT_MS: u64 = 60_000;
 const BINARY_INSPECTOR_CACHE_CAPACITY: usize = 512;
 
 /// Abstraction for inspecting binary SHA-256 and Authenticode metadata (`L-04`).
@@ -131,6 +132,10 @@ pub struct DaemonConfig {
     pub alert_timeout_ms: u64,
     pub max_concurrent_ipc_clients: usize,
     pub ipc_frame_timeout_ms: u64,
+    /// Maximum wall-clock lifetime of one IPC client session (`SEC_0001`). In strict
+    /// non-elevated mode only a single pipe instance exists, so a client must not be
+    /// able to pin it forever with periodic lightweight requests.
+    pub ipc_session_timeout_ms: u64,
     pub pipe_name: String,
     /// When `true` (Phase 1 `--foreground` dev mode), mutating IPC commands bypass the
     /// `C:\Program Files\LocalEDR\ledr-ui.exe` install-path check while still inspecting
@@ -166,6 +171,7 @@ impl Default for DaemonConfig {
             alert_timeout_ms: DEFAULT_ALERT_TIMEOUT_SECS * 1000,
             max_concurrent_ipc_clients: DEFAULT_MAX_CONCURRENT_IPC_CLIENTS,
             ipc_frame_timeout_ms: DEFAULT_IPC_FRAME_TIMEOUT_MS,
+            ipc_session_timeout_ms: DEFAULT_IPC_SESSION_TIMEOUT_MS,
             pipe_name: IPC_PIPE_NAME.to_string(),
             dev_mode_bypass_ui_auth: true,
             strict_pipe_dacl: false,
@@ -179,6 +185,17 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Outcome of a successful [`DaemonEngine::resolve_alert_with_outcome`] call.
+#[derive(Debug)]
+pub struct ResolvedAlertOutcome {
+    /// The alert after its status transition.
+    pub alert: AlertRecord,
+    /// `rule_id` of the allowlist/block rule persisted by this decision, or `None`
+    /// when no rule was stored (e.g. `AllowOnce`, or `add_block_rule` requested but
+    /// the executable path could not be resolved — `ANALYSIS_0001`).
+    pub saved_rule_id: Option<String>,
+}
+
 /// Resident Layer 2 detection and persistence pipeline engine.
 pub struct DaemonEngine {
     config: DaemonConfig,
@@ -189,6 +206,10 @@ pub struct DaemonEngine {
     notifier: Arc<dyn NotificationDispatcher>,
     inspector: Arc<dyn BinaryInspector>,
     process_table: Mutex<ActiveProcessTable>,
+    /// Serializes `resolve_alert` so concurrent resolves of sibling alerts cannot both
+    /// observe "another unresolved suspended alert exists" and leave the process
+    /// suspended forever (`BUG_0002`).
+    resolve_lock: Mutex<()>,
     prior_running_candidates: Mutex<Vec<String>>,
     sender: TwoLaneSender,
     started_at: Instant,
@@ -267,6 +288,7 @@ impl DaemonEngine {
             notifier,
             inspector,
             process_table,
+            resolve_lock: Mutex::new(()),
             prior_running_candidates: Mutex::new(prior_running_candidates),
             sender,
             started_at: Instant::now(),
@@ -409,6 +431,19 @@ impl DaemonEngine {
         alert_id: &str,
         decision: AlertDecision,
     ) -> Result<AlertRecord, String> {
+        self.resolve_alert_with_outcome(alert_id, decision)
+            .map(|outcome| outcome.alert)
+    }
+
+    /// Like [`DaemonEngine::resolve_alert`], additionally reporting whether the
+    /// requested allowlist/block rule was actually persisted (`ANALYSIS_0001`).
+    pub fn resolve_alert_with_outcome(
+        &self,
+        alert_id: &str,
+        decision: AlertDecision,
+    ) -> Result<ResolvedAlertOutcome, String> {
+        let _resolve_guard = self.resolve_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut saved_rule_id: Option<String> = None;
         let mut alert = self
             .store
             .get_alert(alert_id)
@@ -435,10 +470,9 @@ impl DaemonEngine {
         let mut suspended_children = Vec::new();
         collect_suspended_children_from_ctx(&ctx_val, identity, &mut seen_children, &mut suspended_children);
         if let Some(ref proc_inst_id) = alert.process_instance_id {
-            if let Ok(all_alerts) = self.store.list_alerts(None, 1000) {
+            if let Ok(all_alerts) = self.store.list_alerts_for_process(proc_inst_id, false, 1000) {
                 for other in all_alerts {
                     if other.alert_id != alert_id
-                        && other.process_instance_id.as_deref() == Some(proc_inst_id.as_str())
                     {
                         if let Ok(other_ctx) =
                             serde_json::from_str::<serde_json::Value>(&other.context_json)
@@ -572,6 +606,7 @@ impl DaemonEngine {
                     created_by: "user_triage".to_string(),
                 };
 
+                saved_rule_id = Some(rule.rule_id.clone());
                 self.store
                     .upsert_rule(&rule)
                     .map_err(|err| format!("failed to store permanent allowlist rule: {err}"))?;
@@ -643,6 +678,7 @@ impl DaemonEngine {
                             created_at_ms: now_ms,
                             created_by: "user_quarantine".to_string(),
                         };
+                        saved_rule_id = Some(block_rule.rule_id.clone());
                         self.store
                             .upsert_rule(&block_rule)
                             .map_err(|err| format!("failed to store block rule: {err}"))?;
@@ -668,7 +704,10 @@ impl DaemonEngine {
 
         alert.status = new_status;
         alert.resolved_at_ms = Some(now_ms);
-        Ok(alert)
+        Ok(ResolvedAlertOutcome {
+            alert,
+            saved_rule_id,
+        })
     }
 
     fn has_other_unresolved_suspended_alert(
@@ -681,12 +720,10 @@ impl DaemonEngine {
         };
         let unresolved = self
             .store
-            .list_unresolved_alerts(1000)
+            .list_alerts_for_process(proc_inst_id, true, 1000)
             .map_err(|err| format!("failed to query unresolved alerts: {err}"))?;
         let exists = unresolved.into_iter().any(|other| {
-            other.alert_id != alert_id
-                && other.process_suspended
-                && other.process_instance_id.as_deref() == Some(proc_inst_id)
+            other.alert_id != alert_id && other.process_suspended
         });
         if exists {
             tracing::info!(
@@ -708,17 +745,32 @@ impl DaemonEngine {
             if is_protected_process_refusal(&err) {
                 return Err(err);
             }
+            // BUG_0004: only swallow the failure when the target is actually gone
+            // (exited or PID reused). A live process that failed to resume must keep
+            // the alert unresolved so the operator can retry.
+            if !is_process_gone_or_replaced(&err, ident.pid) {
+                return Err(format!(
+                    "resume_process failed for alert {alert_id} (PID {} still running): {err}",
+                    ident.pid
+                ));
+            }
             tracing::warn!(
                 alert_id = %alert_id,
                 pid = ident.pid,
                 error = %err,
-                "resume_process failed for parent (process may have exited); continuing child resume and alert resolution"
+                "resume_process failed for parent (process already exited or PID reused); continuing child resume and alert resolution"
             );
         }
         for child in suspended_children {
             if let Err(err) = self.defense.resume_process(child) {
                 if is_protected_process_refusal(&err) {
                     return Err(err);
+                }
+                if !is_process_gone_or_replaced(&err, child.pid) {
+                    return Err(format!(
+                        "resume_process failed for suspended child PID {} of alert {alert_id}: {err}",
+                        child.pid
+                    ));
                 }
                 tracing::warn!(
                     alert_id = %alert_id,
@@ -737,13 +789,11 @@ impl DaemonEngine {
         proc_inst_id: &str,
         now_ms: i64,
     ) {
-        let Ok(unresolved) = self.store.list_unresolved_alerts(1000) else {
+        let Ok(unresolved) = self.store.list_alerts_for_process(proc_inst_id, true, 1000) else {
             return;
         };
         for other in unresolved {
-            if other.alert_id != resolved_alert_id
-                && other.process_instance_id.as_deref() == Some(proc_inst_id)
-            {
+            if other.alert_id != resolved_alert_id {
                 match self.store.update_alert_status(
                     &other.alert_id,
                     AlertStatus::TerminatedBlocked,
@@ -1070,6 +1120,32 @@ impl DaemonEngine {
             return;
         };
 
+        // ANALYSIS_0002: dedup check BEFORE the expensive binary inspection so every
+        // repeat event in a canary burst does not re-read the executable on the
+        // high-priority lane. This is a read-only check; the dedup mark is only set
+        // below once the event is confirmed non-allowed (single worker, no race).
+        let dedup_key = format!(
+            "CANARY:{}:{}",
+            category.as_str(),
+            target_path.trim().replace('/', "\\").to_ascii_lowercase()
+        );
+        let already_emitted = proc_ctx
+            .proc_instance_id
+            .as_deref()
+            .is_some_and(|inst_id| self.has_rule_alert_emitted(inst_id, &dedup_key));
+        if already_emitted {
+            if let Err(err) = self.store.ingest_event_with_exit(
+                event,
+                proc_ctx.store_hint.as_deref(),
+                None,
+                false,
+                "DEDUP_SUPPRESSED",
+            ) {
+                tracing::warn!(error = %err, "failed to ingest deduplicated canary event");
+            }
+            return;
+        }
+
         let exe_path = proc_ctx.proc_exe_path.clone().unwrap_or_default();
         let bin_identity = if exe_path.trim().is_empty() {
             BinaryIdentity {
@@ -1103,26 +1179,11 @@ impl DaemonEngine {
             return;
         }
 
-        let dedup_key = format!(
-            "CANARY:{}:{}",
-            category.as_str(),
-            target_path.trim().replace('/', "\\").to_ascii_lowercase()
-        );
-        let is_new_alert = proc_ctx
-            .proc_instance_id
-            .as_deref()
-            .is_none_or(|inst_id| self.is_new_rule_alert(inst_id, &dedup_key));
-        if !is_new_alert {
-            if let Err(err) = self.store.ingest_event_with_exit(
-                event,
-                proc_ctx.store_hint.as_deref(),
-                None,
-                false,
-                "DEDUP_SUPPRESSED",
-            ) {
-                tracing::warn!(error = %err, "failed to ingest deduplicated canary event");
-            }
-            return;
+        // First non-allowed event for this (process, category, target): mark the dedup
+        // slot now. Allowed events never consume it, and `record_alert` failure clears
+        // it again below (BUG_0004 compensation path).
+        if let Some(inst_id) = proc_ctx.proc_instance_id.as_deref() {
+            let _ = self.is_new_rule_alert(inst_id, &dedup_key);
         }
 
         let include_children = matches!(category, CanaryCategory::Honeypot);
@@ -1294,6 +1355,14 @@ impl DaemonEngine {
         }
     }
 
+    fn has_rule_alert_emitted(&self, instance_id: &str, rule_id: &str) -> bool {
+        let table = self
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        table.has_rule_alert_emitted(instance_id, rule_id)
+    }
+
     fn is_new_rule_alert(&self, instance_id: &str, rule_id: &str) -> bool {
         let mut table = self
             .process_table
@@ -1461,6 +1530,15 @@ fn collect_suspended_children_from_ctx(
 fn is_protected_process_refusal(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("refusing to act on") || lower.contains("never-suspend")
+}
+
+/// Returns `true` when a failed suspend/resume target is actually gone — the process
+/// exited (no PID in the Toolhelp32 snapshot) or its PID was reused (CreationTime
+/// mismatch). Live processes reporting any other error are genuine failures the
+/// caller must surface (`BUG_0004`).
+fn is_process_gone_or_replaced(err: &str, pid: u32) -> bool {
+    err.contains("CreationTime mismatch")
+        || !ledr_sensor_win::defense::process_is_running(pid)
 }
 
 fn json_non_empty_str(val: &serde_json::Value, pointer: &str) -> Option<String> {

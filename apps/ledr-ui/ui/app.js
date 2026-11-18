@@ -1174,15 +1174,9 @@
         alertId: alert.alert_id,
         decision,
       });
-      const feedbackMessage =
-        kind === "terminate"
-          ? `${ackMessage} — process tree terminated; ${
-              addBlockRule
-                ? "NetworkBlock rule saved, WFP applies in Phase 3"
-                : "no NetworkBlock rule saved"
-            }`
-          : ackMessage;
-      state.triageFeedback = { ok: true, message: feedbackMessage };
+      // The daemon's Ack message already reports whether the requested rule was
+      // actually saved; do not re-derive it from the checkbox state (ANALYSIS_0001).
+      state.triageFeedback = { ok: true, message: ackMessage };
       await refreshAll();
     } catch (err) {
       state.triageFeedback = { ok: false, message: String(err) };

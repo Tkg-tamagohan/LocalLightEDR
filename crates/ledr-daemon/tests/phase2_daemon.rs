@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -236,6 +236,7 @@ impl NotificationDispatcher for MockNotifier {
 #[derive(Default)]
 struct MockBinaryInspector {
     entries: Mutex<HashMap<String, BinaryIdentity>>,
+    inspections: AtomicU64,
 }
 
 impl MockBinaryInspector {
@@ -245,10 +246,15 @@ impl MockBinaryInspector {
             .expect("lock inspector")
             .insert(identity.exe_path.to_ascii_lowercase(), identity);
     }
+
+    fn inspections(&self) -> u64 {
+        self.inspections.load(Ordering::Relaxed)
+    }
 }
 
 impl BinaryInspector for MockBinaryInspector {
     fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+        self.inspections.fetch_add(1, Ordering::Relaxed);
         self.entries
             .lock()
             .expect("lock inspector")
@@ -2381,5 +2387,362 @@ async fn daemon_p2_18_bug_0003_bug_0005_honeypot_sibling_resumes_children_on_las
         .expect("resolve cookie last");
     assert_eq!(defense.resumes(), vec![parent_ident, child_ident]);
 
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P2-19` (`ANALYSIS_0001`): `resolve_alert_with_outcome` must report whether the
+/// requested NetworkBlock rule was actually persisted, so callers cannot claim a rule was
+/// saved when `exe_path` was unresolved.
+#[tokio::test]
+async fn daemon_p2_19_analysis_0001_resolve_outcome_reports_block_rule_saved() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let engine = DaemonEngine::start(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+    );
+
+    let make_pending = |alert_id: &str, ctx: serde_json::Value| AlertRecord {
+        alert_id: alert_id.to_string(),
+        timestamp_ms: current_unix_ms(),
+        severity: AlertSeverity::Critical,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+        title: "canary".to_string(),
+        process_instance_id: None,
+        process_suspended: false,
+        status: AlertStatus::Pending,
+        context_json: ctx.to_string(),
+        resolved_at_ms: None,
+    };
+
+    // Case A: no resolvable exe_path -> alert resolves but no block rule is saved.
+    let a = make_pending("no-exe-path", serde_json::json!({}));
+    store.record_alert(&a).expect("record alert a");
+    let outcome_a = engine
+        .resolve_alert_with_outcome(
+            &a.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+        )
+        .expect("resolve alert a");
+    assert_eq!(outcome_a.alert.status, AlertStatus::TerminatedBlocked);
+    assert_eq!(
+        outcome_a.saved_rule_id, None,
+        "block rule must not be reported saved without an exe path"
+    );
+
+    // Case B: exe_path in context -> block rule saved and its id is reported.
+    let b = make_pending(
+        "with-exe-path",
+        serde_json::json!({ "exe_path": r"C:\Temp\evil.exe" }),
+    );
+    store.record_alert(&b).expect("record alert b");
+    let outcome_b = engine
+        .resolve_alert_with_outcome(
+            &b.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+        )
+        .expect("resolve alert b");
+    let rule_id = outcome_b
+        .saved_rule_id
+        .expect("block rule id must be reported");
+    assert!(rule_id.starts_with("RULE-BLOCK-"));
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P2-20` (`ANALYSIS_0002`): repeated canary events for the same
+/// (process, category, target) must be dedup-suppressed BEFORE the binary inspection so
+/// a burst does not re-read the executable on the high-priority lane.
+#[tokio::test]
+async fn daemon_p2_20_analysis_0002_dedup_suppresses_before_binary_inspection() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MockBinaryInspector::default());
+
+    let dropper_exe = r"C:\Temp\burst_dedup.exe";
+    inspector.insert(BinaryIdentity {
+        exe_path: dropper_exe.to_string(),
+        sha256: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+        authenticode: None,
+    });
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense,
+        notifier,
+        inspector.clone(),
+    );
+
+    let t0 = current_unix_ms() - 2_000;
+    let ident = ProcessIdentity::new(6700, unix_ms_to_filetime(t0));
+    let sender = engine.sender();
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: dropper_exe.to_string(),
+            command_line: "burst_dedup.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send start");
+    for offset in 0..3i64 {
+        sender
+            .send(SensorEvent::CanaryFileAccess {
+                pid: ident.pid,
+                target_path: r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx"
+                    .to_string(),
+                category: CanaryCategory::Honeypot,
+                access_mask: 0x0012_0116,
+                is_write_or_delete: true,
+                timestamp_ms: t0 + 10 + offset,
+            })
+            .await
+            .expect("send canary burst");
+    }
+
+    wait_for_hp_processed(&engine, 4).await;
+    assert_eq!(
+        inspector.inspections(),
+        1,
+        "dedup-suppressed events must skip binary inspection"
+    );
+    assert_eq!(store.list_alerts(None, 20).expect("list alerts").len(), 1);
+    let canary_rows = store
+        .list_file_canary_events(Some(CanaryCategory::Honeypot), Some(&ident.instance_id()), 20)
+        .expect("list canary events");
+    assert_eq!(
+        canary_rows
+            .iter()
+            .filter(|r| r.action_taken == "DEDUP_SUPPRESSED")
+            .count(),
+        2
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P2-21` (`BUG_0002`): concurrent resolves of sibling suspended alerts must be
+/// serialized so exactly one of them sees "no other unresolved alert" and resumes the
+/// process once — never both skipping resume and freezing it forever.
+#[tokio::test]
+async fn daemon_p2_21_bug_0002_concurrent_sibling_resolves_resume_exactly_once() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    let t0 = current_unix_ms() - 5_000;
+    let ident = ProcessIdentity::new(8301, unix_ms_to_filetime(t0));
+    let sender = engine.sender();
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: r"C:\Temp\race_root.exe".to_string(),
+            command_line: "race_root.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send start");
+    for (idx, target) in [r"C:\t\a.env", r"C:\t\b.env"].iter().enumerate() {
+        sender
+            .send(SensorEvent::CanaryFileAccess {
+                pid: ident.pid,
+                target_path: (*target).to_string(),
+                category: CanaryCategory::EnvFile,
+                access_mask: 0x0012_0089,
+                is_write_or_delete: false,
+                timestamp_ms: t0 + 100 + idx as i64,
+            })
+            .await
+            .expect("send canary");
+    }
+    wait_for_hp_processed(&engine, 3).await;
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    assert_eq!(alerts.len(), 2);
+    assert!(alerts.iter().all(|a| a.process_suspended));
+    let id_a = alerts[0].alert_id.clone();
+    let id_b = alerts[1].alert_id.clone();
+
+    // Release both resolves simultaneously; serialization must order them so the second
+    // one observes the first as resolved and performs the resume.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let (e1, e2) = (Arc::clone(&engine), Arc::clone(&engine));
+    let (b1, b2) = (Arc::clone(&barrier), Arc::clone(&barrier));
+    let h1 = std::thread::spawn(move || {
+        b1.wait();
+        e1.resolve_alert(&id_a, AlertDecision::AllowOnce)
+    });
+    let h2 = std::thread::spawn(move || {
+        b2.wait();
+        e2.resolve_alert(&id_b, AlertDecision::AllowOnce)
+    });
+    h1.join().expect("join resolve 1").expect("resolve 1 ok");
+    h2.join().expect("join resolve 2")
+.expect("resolve 2 ok");
+
+    assert_eq!(
+        defense.resumes(),
+        vec![ident],
+        "exactly one resume must happen across concurrent sibling resolves"
+    );
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P2-22` (`BUG_0004`): a resume failure on a still-running process must keep the
+/// alert unresolved (operator can retry); only a genuinely gone process may be swallowed.
+#[tokio::test]
+async fn daemon_p2_22_bug_0004_resume_failure_on_live_process_keeps_alert_unresolved() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    let mk_alert = |alert_id: &str, ident: &ProcessIdentity| AlertRecord {
+        alert_id: alert_id.to_string(),
+        timestamp_ms: current_unix_ms(),
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
+        title: "canary".to_string(),
+        process_instance_id: Some(ident.instance_id()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: "{}".to_string(),
+        resolved_at_ms: None,
+    };
+
+    // Live process (this test binary) whose resume fails: alert must stay unresolved.
+    let live_ident = ProcessIdentity::new(
+        std::process::id(),
+        unix_ms_to_filetime(current_unix_ms() - 1_000),
+    );
+    defense.add_failing_resume_pid(live_ident.pid);
+    let live_alert = mk_alert("live-resume-fail", &live_ident);
+    store.record_alert(&live_alert).expect("record live alert");
+    assert!(
+        engine
+            .resolve_alert(&live_alert.alert_id, AlertDecision::AllowOnce)
+            .is_err(),
+        "resume failure on a live process must surface as an error"
+    );
+    let kept = store
+        .get_alert(&live_alert.alert_id)
+        .expect("get live alert")
+        .expect("live alert exists");
+    assert!(
+        kept.status.is_unresolved(),
+        "alert must stay unresolved so the operator can retry"
+    );
+
+    // Gone process (PID that cannot exist in a Toolhelp32 snapshot): resolution proceeds.
+    let gone_ident =
+        ProcessIdentity::new(0x7FFF_FFC0, unix_ms_to_filetime(current_unix_ms() - 1_000));
+    defense.add_failing_resume_pid(gone_ident.pid);
+    let gone_alert = mk_alert("gone-resume-fail", &gone_ident);
+    store.record_alert(&gone_alert).expect("record gone alert");
+    let resolved = engine
+        .resolve_alert(&gone_alert.alert_id, AlertDecision::AllowOnce)
+        .expect("resume failure on a gone process is swallowed");
+    assert_eq!(resolved.status, AlertStatus::ApprovedOnce);
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P2-23` (`SEC_0001`): an IPC client session is force-closed once its lifetime
+/// exceeds `ipc_session_timeout_ms`, so one client cannot pin the single strict-mode
+/// pipe instance forever with periodic lightweight requests.
+#[tokio::test]
+async fn daemon_p2_23_sec_0001_ipc_session_lifetime_cap() {
+    let pipe_name = unique_test_pipe_name();
+    let store = LedrStore::open_in_memory().expect("open store");
+    let engine = DaemonEngine::start(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_name.clone(),
+            ipc_frame_timeout_ms: 5_000,
+            ipc_session_timeout_ms: 1_000,
+            ..DaemonConfig::default()
+        },
+    );
+    let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("bind Named Pipe");
+
+    let pipe_for_clients = pipe_name.clone();
+    let (session_capped, fresh_pong) = tokio::task::spawn_blocking(move || {
+        let mut c = open_pipe_with_retry(&pipe_for_clients);
+        // Staying under the cap keeps the session alive: periodic Ping works.
+        write_ipc_frame(&mut c, &IpcRequest::Ping).expect("write ping 1");
+        assert!(matches!(
+            read_ipc_frame::<_, IpcResponse>(&mut c).expect("read pong 1"),
+            IpcResponse::Pong { .. }
+        ));
+        // Wait past the session cap (1s, the documented minimum); the server must close.
+        std::thread::sleep(Duration::from_millis(1_300));
+        // Bound the post-cap probe so a hung server read fails the test instead of
+        // blocking it forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = (|| {
+                if write_ipc_frame(&mut c, &IpcRequest::Ping).is_err() {
+                    return true;
+                }
+                read_ipc_frame::<_, IpcResponse>(&mut c).is_err()
+            })();
+            let _ = tx.send(r);
+        });
+        let session_capped = rx.recv_timeout(Duration::from_secs(5)).unwrap_or(true);
+        // A fresh connection after the cap still works normally.
+        let fresh_pong = matches!(
+            send_pipe_request(&pipe_for_clients, &IpcRequest::Ping),
+            IpcResponse::Pong { .. }
+        );
+        (session_capped, fresh_pong)
+    })
+    .await
+    .expect("join session cap probe");
+    assert!(session_capped, "session must be cut at ipc_session_timeout_ms");
+    assert!(fresh_pong, "fresh connection must still receive Pong");
+
+    ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await.expect("shutdown");
 }

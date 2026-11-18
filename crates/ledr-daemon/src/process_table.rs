@@ -339,6 +339,14 @@ impl ActiveProcessTable {
         }
     }
 
+    /// Returns `true` when `rule_id` was already marked emitted for `instance_id`
+    /// (`ANALYSIS_0002` — read-only dedup check that does not consume the first-emit slot).
+    pub fn has_rule_alert_emitted(&self, instance_id: &str, rule_id: &str) -> bool {
+        self.entries
+            .get(instance_id)
+            .is_some_and(|entry| entry.emitted_rule_ids.contains(rule_id))
+    }
+
     /// Collects unexited, non-protected descendant [`ProcessIdentity`] values of `root`
     /// currently tracked in memory (`BUG_0005`), in BFS parent-before-child order.
     pub fn collect_unexited_descendants(&self, root: &ProcessIdentity) -> Vec<ProcessIdentity> {

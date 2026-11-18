@@ -428,6 +428,49 @@ impl LedrStore {
         Ok(records)
     }
 
+    /// Lists alerts for a single `process_instance_id`, ordered by newest `timestamp_ms`
+    /// first. When `unresolved_only` is set, only `PENDING`/`EXPIRED_SUSPENDED` rows are
+    /// returned (`BUG_0005` — sibling lookups must not depend on global list limits).
+    pub fn list_alerts_for_process(
+        &self,
+        process_instance_id: &str,
+        unresolved_only: bool,
+        limit: usize,
+    ) -> Result<Vec<AlertRecord>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let reader = self.lock_reader()?;
+        let limit_i64 = clamp_limit(limit);
+        if unresolved_only {
+            let sql = format!(
+                "SELECT {ALERT_COLS} FROM alerts
+                 WHERE process_instance_id = ?1 AND status IN (?2, ?3)
+                 ORDER BY timestamp_ms DESC
+                 LIMIT ?4"
+            );
+            collect_rows(
+                &reader,
+                &sql,
+                params![
+                    process_instance_id,
+                    AlertStatus::Pending.as_db_str(),
+                    AlertStatus::ExpiredSuspended.as_db_str(),
+                    limit_i64
+                ],
+                row_to_alert,
+            )
+        } else {
+            let sql = format!(
+                "SELECT {ALERT_COLS} FROM alerts
+                 WHERE process_instance_id = ?1
+                 ORDER BY timestamp_ms DESC
+                 LIMIT ?2"
+            );
+            collect_rows(&reader, &sql, params![process_instance_id, limit_i64], row_to_alert)
+        }
+    }
+
     /// Fetches a single [`AlertRecord`] by `alert_id` via the read-only query connection.
     pub fn get_alert(&self, alert_id: &str) -> Result<Option<AlertRecord>, StoreError> {
         let reader = self.lock_reader()?;

@@ -787,3 +787,61 @@ fn store_p2_05_ttl_purge_preserves_expired_suspended_lineage() {
         .expect("resolved branch purged")
         .is_empty());
 }
+
+/// `STORE-P2-06` (`BUG_0005`): `list_alerts_for_process` must scope by
+/// `process_instance_id` in SQL so sibling lookups still see older alerts when the
+/// global `list_alerts` top-N window is filled by unrelated processes.
+#[test]
+fn store_p2_06_list_alerts_for_process_scopes_by_process() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+
+    // Fill the newest slots with unrelated alerts so the global top-1000 list cannot
+    // see the target process's older alerts.
+    for i in 0..1_100i64 {
+        store
+            .record_alert(&make_alert(
+                &format!("noise-{i}"),
+                10_000 + i,
+                Some("900:1"),
+                AlertStatus::Pending,
+                None,
+            ))
+            .expect("record noise alert");
+    }
+    store
+        .record_alert(&make_alert(
+            "target-resolved",
+            9_999,
+            Some("4242:9"),
+            AlertStatus::ApprovedOnce,
+            Some(11_000),
+        ))
+        .expect("record target resolved");
+    store
+        .record_alert(&make_alert(
+            "target-pending",
+            9_998,
+            Some("4242:9"),
+            AlertStatus::Pending,
+            None,
+        ))
+        .expect("record target pending");
+
+    // The regression: a global newest-first listing misses the target alerts entirely.
+    assert!(store
+        .list_alerts(None, 1_000)
+        .expect("global list")
+        .iter()
+        .all(|a| a.process_instance_id.as_deref() != Some("4242:9")));
+
+    let scoped = store
+        .list_alerts_for_process("4242:9", false, 1_000)
+        .expect("scoped list");
+    assert_eq!(scoped.len(), 2);
+
+    let unresolved = store
+        .list_alerts_for_process("4242:9", true, 1_000)
+        .expect("scoped unresolved list");
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0].alert_id, "target-pending");
+}

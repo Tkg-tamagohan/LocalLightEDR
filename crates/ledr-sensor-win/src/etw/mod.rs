@@ -1157,7 +1157,11 @@ fn handle_kernel_registry(
     }
     let info = TdhEventInfo::from_record(record)?;
     let facts = registry_event_facts(&info, record, event_id);
-    decide_registry_event(&facts, &ctx.registry_kcb_names)
+    // `ValueName` needs a heap read, so decode it lazily only once the event is
+    // confirmed alertable — most SetValueKey traffic is unrelated churn.
+    decide_registry_event(&facts, &ctx.registry_kcb_names, || {
+        info.get_string("ValueName").filter(|v| !v.is_empty())
+    })
 }
 
 /// How the key name that arrived with a Kernel-Registry event classifies against the
@@ -1188,7 +1192,6 @@ struct RegistryEventFacts {
     key_name: RegistryKeyName,
     disposition: Option<u32>,
     access_type: Option<u32>,
-    value_name: Option<String>,
     timestamp_ms: i64,
 }
 
@@ -1237,7 +1240,6 @@ fn registry_event_facts(
         key_name,
         disposition: info.get_u32("Disposition"),
         access_type: info.get_u32("Type"),
-        value_name: info.get_string("ValueName").filter(|v| !v.is_empty()),
         timestamp_ms: filetime_100ns_to_unix_ms(record.EventHeader.TimeStamp.max(0) as u64),
     }
 }
@@ -1245,6 +1247,7 @@ fn registry_event_facts(
 fn decide_registry_event(
     facts: &RegistryEventFacts,
     key_cache: &Mutex<HashMap<u64, String>>,
+    value_name: impl FnOnce() -> Option<String>,
 ) -> Option<SensorEvent> {
     if !matches!(facts.event_id, 1 | 2 | 3 | 5 | 6 | 13) {
         return None;
@@ -1345,7 +1348,7 @@ fn decide_registry_event(
     }
 
     let target_path = if matches!(facts.event_id, 5 | 6) {
-        match &facts.value_name {
+        match value_name() {
             Some(value_name) => format!("{key_name}\\{value_name}"),
             None => key_name,
         }
@@ -1686,7 +1689,6 @@ mod tests {
             key_name,
             disposition: None,
             access_type: None,
-            value_name: None,
             timestamp_ms: 1_700_000_000_000,
         }
     }
@@ -1703,29 +1705,32 @@ mod tests {
 
         // An open of a monitored autorun key binds its name to the KeyObject.
         let open = registry_facts(2, 0x1000, autorun_run_key(), 0);
-        assert!(decide_registry_event(&open, &cache).is_none());
+        assert!(decide_registry_event(&open, &cache, || panic!("unreachable")).is_none());
         assert!(lookup_registry_key(&cache, 0x1000).is_some());
 
         // The OS recycles the pointer for an unmonitored key: its named open must evict
         // the stale entry instead of leaving the old attribution behind.
         let reopen = registry_facts(2, 0x1000, RegistryKeyName::Unrelated, 0);
-        assert!(decide_registry_event(&reopen, &cache).is_none());
+        assert!(decide_registry_event(&reopen, &cache, || panic!("unreachable")).is_none());
         assert!(
             lookup_registry_key(&cache, 0x1000).is_none(),
             "reused KeyObject must drop the stale cached name"
         );
 
         // An empty-name SetValueKey on the recycled object must not inherit the old name.
-        let mut write = registry_facts(5, 0x1000, RegistryKeyName::Missing, 0);
-        write.value_name = Some("Payload".to_string());
-        assert!(decide_registry_event(&write, &cache).is_none());
+        let write = registry_facts(5, 0x1000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&write, &cache, || panic!("no alertable path"))
+            .is_none());
 
-        // A write event that arrives with a known non-autorun name evicts rather than alerts.
+        // A write event that arrives with a known non-autorun name evicts rather than
+        // alerts — and must not even decode the value name.
         let open2 = registry_facts(2, 0x2000, autorun_run_key(), 0);
-        assert!(decide_registry_event(&open2, &cache).is_none());
-        let mut named_write = registry_facts(5, 0x2000, RegistryKeyName::Unrelated, 0);
-        named_write.value_name = Some("Payload".to_string());
-        assert!(decide_registry_event(&named_write, &cache).is_none());
+        assert!(decide_registry_event(&open2, &cache, || panic!("unreachable")).is_none());
+        let named_write = registry_facts(5, 0x2000, RegistryKeyName::Unrelated, 0);
+        assert!(decide_registry_event(&named_write, &cache, || {
+            panic!("ValueName must not be decoded for unmonitored keys")
+        })
+        .is_none());
         assert!(lookup_registry_key(&cache, 0x2000).is_none());
     }
 
@@ -1735,14 +1740,15 @@ mod tests {
 
         // Opening an existing monitored key must not alert (opens are attribution-only).
         let open = registry_facts(2, 0x2000, autorun_run_key(), 0);
-        assert!(decide_registry_event(&open, &cache).is_none());
+        assert!(decide_registry_event(&open, &cache, || panic!("unreachable")).is_none());
 
         // A subsequent SetValueKey on the same handle arrives with an empty KeyName:
         // attribution comes from the cache and alerts with the value name appended.
-        let mut set_value = registry_facts(5, 0x2000, RegistryKeyName::Missing, 0);
-        set_value.value_name = Some("Persistence".to_string());
-        let event = decide_registry_event(&set_value, &cache)
-            .expect("SetValueKey on a cached autorun key must alert");
+        let set_value = registry_facts(5, 0x2000, RegistryKeyName::Missing, 0);
+        let event = decide_registry_event(&set_value, &cache, || {
+            Some("Persistence".to_string())
+        })
+        .expect("SetValueKey on a cached autorun key must alert");
         match event {
             SensorEvent::CanaryFileAccess {
                 pid,
@@ -1761,13 +1767,16 @@ mod tests {
 
         // DeleteValueKey on the same handle also alerts.
         let delete_value = registry_facts(6, 0x2000, RegistryKeyName::Missing, 0);
-        assert!(decide_registry_event(&delete_value, &cache).is_some());
+        assert!(decide_registry_event(&delete_value, &cache, || None).is_some());
 
         // CloseKey retires the binding; later empty-name writes stay silent.
         let close = registry_facts(13, 0x2000, RegistryKeyName::Missing, 0);
-        assert!(decide_registry_event(&close, &cache).is_none());
+        assert!(decide_registry_event(&close, &cache, || panic!("unreachable")).is_none());
         let after_close = registry_facts(5, 0x2000, RegistryKeyName::Missing, 0);
-        assert!(decide_registry_event(&after_close, &cache).is_none());
+        assert!(decide_registry_event(&after_close, &cache, || {
+            panic!("ValueName must not be decoded after CloseKey eviction")
+        })
+        .is_none());
     }
 
     #[test]
@@ -1776,20 +1785,29 @@ mod tests {
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 
         let open = registry_facts(2, 0x3000, autorun_run_key(), 0);
-        assert!(decide_registry_event(&open, &cache).is_none());
+        assert!(decide_registry_event(&open, &cache, || panic!("unreachable")).is_none());
 
-        // Failed SetValueKey / DeleteValueKey on a cached autorun handle must not alert.
-        let mut failed_set = registry_facts(5, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
-        failed_set.value_name = Some("Persistence".to_string());
-        assert!(decide_registry_event(&failed_set, &cache).is_none());
+        // Failed SetValueKey / DeleteValueKey on a cached autorun handle must not alert
+        // (and must not even decode the value name).
+        let failed_set = registry_facts(5, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
+        assert!(decide_registry_event(&failed_set, &cache, || {
+            panic!("ValueName must not be decoded for failed ops")
+        })
+        .is_none());
         let failed_delete_value =
             registry_facts(6, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
-        assert!(decide_registry_event(&failed_delete_value, &cache).is_none());
+        assert!(decide_registry_event(&failed_delete_value, &cache, || {
+            panic!("ValueName must not be decoded for failed ops")
+        })
+        .is_none());
 
         // A failed DeleteKey neither alerts nor clears the cached name.
         let failed_delete_key =
             registry_facts(3, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
-        assert!(decide_registry_event(&failed_delete_key, &cache).is_none());
+        assert!(decide_registry_event(&failed_delete_key, &cache, || {
+            panic!("unreachable")
+        })
+        .is_none());
         assert!(
             lookup_registry_key(&cache, 0x3000).is_some(),
             "failed DeleteKey must keep the cached name"
@@ -1797,12 +1815,12 @@ mod tests {
 
         // A failed open must not create a cache binding either.
         let failed_open = registry_facts(2, 0x4000, autorun_run_key(), STATUS_ACCESS_DENIED);
-        assert!(decide_registry_event(&failed_open, &cache).is_none());
+        assert!(decide_registry_event(&failed_open, &cache, || panic!("unreachable")).is_none());
         assert!(lookup_registry_key(&cache, 0x4000).is_none());
 
         // A successful DeleteKey still alerts with the cached name and evicts it.
         let delete_key = registry_facts(3, 0x3000, RegistryKeyName::Missing, 0);
-        assert!(decide_registry_event(&delete_key, &cache).is_some());
+        assert!(decide_registry_event(&delete_key, &cache, || panic!("unreachable")).is_some());
         assert!(lookup_registry_key(&cache, 0x3000).is_none());
     }
 }

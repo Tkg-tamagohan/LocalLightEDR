@@ -96,6 +96,7 @@ struct MockDefenseController {
     terminates: Mutex<Vec<TerminateCall>>,
     fail_suspend: Mutex<bool>,
     terminate_error: Mutex<Option<String>>,
+    failing_suspend_pids: Mutex<Vec<u32>>,
     failing_terminate_pids: Mutex<Vec<u32>>,
     failing_resume_pids: Mutex<Vec<u32>>,
 }
@@ -124,11 +125,25 @@ impl MockDefenseController {
             .push(pid);
     }
 
+    fn add_failing_suspend_pid(&self, pid: u32) {
+        self.failing_suspend_pids
+            .lock()
+            .expect("lock failing_suspend_pids")
+            .push(pid);
+    }
+
     fn add_failing_resume_pid(&self, pid: u32) {
         self.failing_resume_pids
             .lock()
             .expect("lock failing_resume_pids")
             .push(pid);
+    }
+
+    fn remove_failing_resume_pid(&self, pid: u32) {
+        self.failing_resume_pids
+            .lock()
+            .expect("lock failing_resume_pids")
+            .retain(|p| *p != pid);
     }
 }
 
@@ -140,6 +155,17 @@ impl ActiveDefenseController for MockDefenseController {
     ) -> Result<(), String> {
         if *self.fail_suspend.lock().expect("lock fail_suspend") {
             return Err("mock suspend failure".to_string());
+        }
+        if self
+            .failing_suspend_pids
+            .lock()
+            .expect("lock failing_suspend_pids")
+            .contains(&target.pid)
+        {
+            return Err(format!(
+                "OpenProcess(PID {}) failed: Access is denied.",
+                target.pid
+            ));
         }
         self.suspends.lock().expect("lock suspends").push(SuspendCall {
             target: *target,
@@ -1914,12 +1940,19 @@ async fn daemon_p2_12_bug_0004_record_alert_error_compensates_suspension_dedup_a
     wait_for_hp_processed(&engine, 3).await;
 
     // Suspension was triggered then compensated (parent + child resumed), no toast sent, no alert persisted.
+    // The child also gets a per-descendant suspend_process confirmation call (BUG_0002).
     assert_eq!(
         defense.suspends(),
-        vec![SuspendCall {
-            target: parent_ident,
-            include_children: true,
-        }]
+        vec![
+            SuspendCall {
+                target: parent_ident,
+                include_children: true,
+            },
+            SuspendCall {
+                target: child_ident,
+                include_children: false,
+            }
+        ]
     );
     assert_eq!(defense.resumes(), vec![parent_ident, child_ident]);
     assert!(notifier.alerts().is_empty());
@@ -1945,7 +1978,7 @@ async fn daemon_p2_12_bug_0004_record_alert_error_compensates_suspension_dedup_a
         .expect("send recovered canary");
     wait_for_hp_processed(&engine, 4).await;
 
-    assert_eq!(defense.suspends().len(), 2);
+    assert_eq!(defense.suspends().len(), 4);
     assert_eq!(store.list_alerts(None, 20).expect("list alerts").len(), 1);
     assert_eq!(notifier.alerts().len(), 1);
 
@@ -2730,7 +2763,9 @@ async fn daemon_p2_23_sec_0001_ipc_session_lifetime_cap() {
             })();
             let _ = tx.send(r);
         });
-        let session_capped = rx.recv_timeout(Duration::from_secs(5)).unwrap_or(true);
+        let session_capped = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "post-cap probe must return a verdict within 5s; a timeout means the disconnect could not be confirmed",
+        );
         // A fresh connection after the cap still works normally.
         let fresh_pong = matches!(
             send_pipe_request(&pipe_for_clients, &IpcRequest::Ping),
@@ -2746,3 +2781,265 @@ async fn daemon_p2_23_sec_0001_ipc_session_lifetime_cap() {
     ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await.expect("shutdown");
 }
+
+/// `DAEMON-P2-24` (`BUG_0001`): when the resume step of an `AllowPermanent` resolve
+/// fails, the stored allowlist rule must be rolled back so a later "allow once" retry
+/// does not silently keep permanent access, and a retried decision must not pile up
+/// duplicate rules.
+#[tokio::test]
+async fn daemon_p2_24_bug_0001_permanent_rule_rolled_back_on_resume_failure() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    // Suspended alert on a live process (this test binary) whose resume keeps failing.
+    let live_ident = ProcessIdentity::new(
+        std::process::id(),
+        unix_ms_to_filetime(current_unix_ms() - 1_000),
+    );
+    defense.add_failing_resume_pid(live_ident.pid);
+    let alert = AlertRecord {
+        alert_id: "perm-rollback".to_string(),
+        timestamp_ms: current_unix_ms(),
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
+        title: "canary".to_string(),
+        process_instance_id: Some(live_ident.instance_id()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": r"C:\Temp\backup.exe",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    store.record_alert(&alert).expect("record alert");
+
+    assert!(
+        engine
+            .resolve_alert(
+                &alert.alert_id,
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: false,
+                    allow_dest: None,
+                },
+            )
+            .is_err(),
+        "resume failure on a live process must surface as an error"
+    );
+    assert!(
+        store
+            .get_alert(&alert.alert_id)
+            .expect("get alert")
+            .expect("alert exists")
+            .status
+            .is_unresolved(),
+        "alert must stay unresolved so the operator can retry"
+    );
+    assert!(
+        store
+            .list_rules(None)
+            .expect("list rules")
+            .is_empty(),
+        "stored permanent rule must be rolled back when the resolve fails"
+    );
+
+    // Retrying the same permanent decision after the failure must not pile up
+    // duplicate rules.
+    defense.remove_failing_resume_pid(live_ident.pid);
+    let resolved = engine
+        .resolve_alert(
+            &alert.alert_id,
+            AlertDecision::AllowPermanent {
+                use_signer_if_available: false,
+                allow_dest: None,
+            },
+        )
+        .expect("retry after clearing the failure");
+    assert_eq!(resolved.status, AlertStatus::ApprovedRule);
+    assert_eq!(
+        store
+            .list_rules(None)
+            .expect("list rules")
+            .len(),
+        1,
+        "exactly one allowlist rule must exist after a retried permanent allow"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P2-25` (`BUG_0002`): a descendant the actuator could not suspend must not be
+/// recorded in `suspended_children`, so its resume failure cannot block resolution.
+#[tokio::test]
+async fn daemon_p2_25_bug_0002_unsuspendable_child_not_recorded_for_resume() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    let t0 = current_unix_ms() - 5_000;
+    let root_ident = ProcessIdentity::new(0x7FFF_0101, unix_ms_to_filetime(t0));
+    let stuck_child = ProcessIdentity::new(0x7FFF_0102, unix_ms_to_filetime(t0 + 50));
+    let ok_child = ProcessIdentity::new(0x7FFF_0103, unix_ms_to_filetime(t0 + 60));
+    let sender = engine.sender();
+    for (ident, parent_pid, exe) in [
+        (root_ident, 4u32, r"C:\Temp\root.exe"),
+        (stuck_child, root_ident.pid, r"C:\Temp\stuck.exe"),
+        (ok_child, root_ident.pid, r"C:\Temp\ok.exe"),
+    ] {
+        sender
+            .send(SensorEvent::ProcessStart {
+                identity: ident,
+                parent_pid,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("send start");
+    }
+    // The child the actuator cannot suspend would also fail resume; it must be
+    // excluded from the recorded list so it cannot block resolution.
+    defense.add_failing_suspend_pid(stuck_child.pid);
+    defense.add_failing_resume_pid(stuck_child.pid);
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: root_ident.pid,
+            target_path: r"C:\t\!00_LocalEDR_Canary_DoNotEdit.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x0012_0089,
+            is_write_or_delete: true,
+            timestamp_ms: t0 + 100,
+        })
+        .await
+        .expect("send canary");
+    wait_for_hp_processed(&engine, 4).await;
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    assert_eq!(alerts.len(), 1);
+    let alert = &alerts[0];
+    assert!(alert.process_suspended);
+    let ctx: serde_json::Value =
+        serde_json::from_str(&alert.context_json).expect("parse alert context");
+    let recorded: Vec<String> = ctx
+        .get("suspended_children")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        recorded,
+        vec![ok_child.instance_id()],
+        "only actuator-confirmed suspended children may be recorded"
+    );
+
+    // Resolution must succeed even though the non-suspended child would fail resume.
+    let resolved = engine
+        .resolve_alert(&alert.alert_id, AlertDecision::AllowOnce)
+        .expect("allow once resolves");
+    assert_eq!(resolved.status, AlertStatus::ApprovedOnce);
+    assert!(
+        !defense.resumes().contains(&stuck_child),
+        "resume must not be attempted for a child that was never suspended"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P2-26` (`BUG_0002`): a recorded suspended child that is still running but
+/// cannot be resumed must keep the alert unresolved so the operator can retry.
+#[tokio::test]
+async fn daemon_p2_26_bug_0002_suspended_child_resume_failure_keeps_unresolved() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    let t0 = current_unix_ms() - 5_000;
+    let root_ident = ProcessIdentity::new(0x7FFF_0110, unix_ms_to_filetime(t0));
+    // A recorded suspended child on a live pid (this test binary) whose resume fails.
+    let live_child = ProcessIdentity::new(
+        std::process::id(),
+        unix_ms_to_filetime(t0 + 50),
+    );
+    let alert = AlertRecord {
+        alert_id: "child-resume-fail".to_string(),
+        timestamp_ms: current_unix_ms(),
+        severity: AlertSeverity::Critical,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+        title: "canary".to_string(),
+        process_instance_id: Some(root_ident.instance_id()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "suspended_children": [live_child.instance_id()],
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    store.record_alert(&alert).expect("record alert");
+
+    defense.add_failing_resume_pid(live_child.pid);
+    assert!(
+        engine
+            .resolve_alert(&alert.alert_id, AlertDecision::AllowOnce)
+            .is_err(),
+        "resume failure on a live suspended child must surface as an error"
+    );
+    assert!(
+        store
+            .get_alert(&alert.alert_id)
+            .expect("get alert")
+            .expect("alert exists")
+            .status
+            .is_unresolved(),
+        "alert must stay unresolved while a suspended child cannot be resumed"
+    );
+
+    defense.remove_failing_resume_pid(live_child.pid);
+    let resolved = engine
+        .resolve_alert(&alert.alert_id, AlertDecision::AllowOnce)
+        .expect("retry after clearing the failure");
+    assert_eq!(resolved.status, AlertStatus::ApprovedOnce);
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+

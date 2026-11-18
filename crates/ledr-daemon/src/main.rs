@@ -120,8 +120,9 @@ where
 
     // `--ui-signer` without `--ui-root-thumbprint` can never verify: the caller check
     // requires the signer/root-thumbprint pair and would reject every mutating IPC
-    // command at runtime. Fail fast at startup instead (BUG_0007).
-    if parsed.ui_signer.is_some() && parsed.ui_root_thumbprint.is_none() {
+    // command at runtime. Fail fast at startup instead (BUG_0007). Under
+    // `--dev-bypass-auth` no authorization runs at all, so the pair is not required.
+    if !parsed.dev_bypass_auth && parsed.ui_signer.is_some() && parsed.ui_root_thumbprint.is_none() {
         anyhow::bail!("--ui-signer requires --ui-root-thumbprint");
     }
 
@@ -428,6 +429,18 @@ mod tests {
         assert!(
             parse_cli_args(["ledr-daemon", "--ui-signer", "CN=LocalEDR"]).is_err(),
             "--ui-signer alone must fail (root thumbprint pin required)"
+        );
+        // Under --dev-bypass-auth no authorization runs, so the signer/thumbprint
+        // pair is not required.
+        assert!(
+            parse_cli_args([
+                "ledr-daemon",
+                "--dev-bypass-auth",
+                "--ui-signer",
+                "CN=LocalEDR",
+            ])
+            .is_ok(),
+            "--dev-bypass-auth + --ui-signer must be accepted"
         );
         assert!(
             parse_cli_args([

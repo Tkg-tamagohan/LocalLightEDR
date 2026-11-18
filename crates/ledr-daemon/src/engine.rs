@@ -606,24 +606,33 @@ impl DaemonEngine {
                     created_by: "user_triage".to_string(),
                 };
 
-                saved_rule_id = Some(rule.rule_id.clone());
                 self.store
                     .upsert_rule(&rule)
                     .map_err(|err| format!("failed to store permanent allowlist rule: {err}"))?;
+                saved_rule_id = Some(rule.rule_id.clone());
 
                 if alert.process_suspended {
-                    let ident = identity.ok_or_else(|| {
-                        format!("missing process identity to resume suspended alert {alert_id}")
-                    })?;
-                    if !self.has_other_unresolved_suspended_alert(
-                        alert_id,
-                        alert.process_instance_id.as_deref(),
-                    )? {
-                        self.resume_process_and_children(
+                    let resume_result = (|| -> Result<(), String> {
+                        let ident = identity.ok_or_else(|| {
+                            format!(
+                                "missing process identity to resume suspended alert {alert_id}"
+                            )
+                        })?;
+                        if !self.has_other_unresolved_suspended_alert(
                             alert_id,
-                            &ident,
-                            &suspended_children,
-                        )?;
+                            alert.process_instance_id.as_deref(),
+                        )? {
+                            self.resume_process_and_children(
+                                alert_id,
+                                &ident,
+                                &suspended_children,
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(err) = resume_result {
+                        self.rollback_saved_rule(&rule.rule_id);
+                        return Err(err);
                     }
                 }
             }
@@ -678,21 +687,31 @@ impl DaemonEngine {
                             created_at_ms: now_ms,
                             created_by: "user_quarantine".to_string(),
                         };
-                        saved_rule_id = Some(block_rule.rule_id.clone());
                         self.store
                             .upsert_rule(&block_rule)
                             .map_err(|err| format!("failed to store block rule: {err}"))?;
+                        saved_rule_id = Some(block_rule.rule_id.clone());
                     }
                 }
             }
         }
 
-        let updated = self
+        let status_result = self
             .store
             .update_alert_status(alert_id, new_status, Some(now_ms))
-            .map_err(|err| format!("failed to update alert status: {err}"))?;
-        if !updated {
-            return Err(format!("alert {alert_id} not found"));
+            .map_err(|err| format!("failed to update alert status: {err}"))
+            .and_then(|updated| {
+                if updated {
+                    Ok(())
+                } else {
+                    Err(format!("alert {alert_id} not found"))
+                }
+            });
+        if let Err(err) = status_result {
+            if let Some(rule_id) = saved_rule_id.take() {
+                self.rollback_saved_rule(&rule_id);
+            }
+            return Err(err);
         }
 
         if let Some(ref proc_inst_id) = alert.process_instance_id {
@@ -733,6 +752,19 @@ impl DaemonEngine {
             );
         }
         Ok(exists)
+    }
+
+    /// Best-effort rollback of a rule stored by a failed
+    /// [`DaemonEngine::resolve_alert_with_outcome`] call so a rejected resume or status update
+    /// cannot leave a permanent allow/block rule active (BUG_0001).
+    fn rollback_saved_rule(&self, rule_id: &str) {
+        if let Err(err) = self.store.delete_rule(rule_id) {
+            tracing::warn!(
+                rule_id = %rule_id,
+                error = %err,
+                "failed to roll back allowlist rule after resolve error"
+            );
+        }
     }
 
     fn resume_process_and_children(
@@ -1221,10 +1253,28 @@ impl DaemonEngine {
             );
         }
 
+        // Record only children the actuator actually suspends: `suspend_process` skips
+        // descendants it cannot freeze, so confirming each one keeps a never-frozen child
+        // out of the resume list and prevents its resume failure from blocking resolution
+        // (BUG_0002). The call is idempotent for already-suspended children.
         let suspended_child_idents = if include_children && process_suspended {
             verified_ident
                 .as_ref()
-                .map(|ident| self.collect_descendant_identities_for_pid(ident))
+                .map(|ident| {
+                    self.collect_descendant_identities_for_pid(ident)
+                        .into_iter()
+                        .filter(|child| {
+                            let confirmed = self.defense.suspend_process(child, false).is_ok();
+                            if !confirmed {
+                                tracing::debug!(
+                                    child_pid = child.pid,
+                                    "descendant not suspended by actuator; excluding from alert resume list"
+                                );
+                            }
+                            confirmed
+                        })
+                        .collect()
+                })
                 .unwrap_or_default()
         } else {
             Vec::new()

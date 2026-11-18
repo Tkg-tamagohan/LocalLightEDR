@@ -547,6 +547,9 @@ fn dummy_honeypot_path(base_dir: &Path) -> PathBuf {
 
 /// Pre-creates dummy `Google\Chrome\User Data\Default\Cookies` and
 /// `!00_LocalEDR_Canary_DoNotEdit.docx` inside `base_dir` before telemetry monitoring starts.
+///
+/// Files created by this call are tracked and removed again when the overall preparation
+/// fails, so a retry after resolving the reported conflict is not blocked by leftovers.
 pub fn prepare_sim_dir(base_dir: &Path) -> Result<PrepareDirOutcome> {
     let cookie_path = dummy_cookie_path(base_dir);
     if let Some(parent) = cookie_path.parent() {
@@ -554,33 +557,50 @@ pub fn prepare_sim_dir(base_dir: &Path) -> Result<PrepareDirOutcome> {
             format!("failed to create dummy Chrome profile dir {}", parent.display())
         })?;
     }
-    {
-        // `create_new` fails when the file already exists instead of truncating it
-        // (BUG_0003 — `--prepare-dir` must never clobber a real Cookies DB or honeypot).
-        let mut writer = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&cookie_path)
-            .with_context(|| format!("failed to create dummy Cookies {}", cookie_path.display()))?;
-        writer.write_all(DUMMY_COOKIE_PAYLOAD)?;
-        writer.flush()?;
-    }
 
-    let honeypot_path = dummy_honeypot_path(base_dir);
-    {
-        let mut writer = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&honeypot_path)
-            .with_context(|| format!("failed to create honeypot {}", honeypot_path.display()))?;
-        writer.write_all(INITIAL_HONEYPOT_BYTES)?;
-        writer.flush()?;
+    let mut created_paths: Vec<PathBuf> = Vec::new();
+    let outcome = (|| -> Result<()> {
+        {
+            // `create_new` fails when the file already exists instead of truncating it
+            // (BUG_0003 — `--prepare-dir` must never clobber a real Cookies DB or honeypot).
+            let mut writer = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&cookie_path)
+                .with_context(|| {
+                    format!("failed to create dummy Cookies {}", cookie_path.display())
+                })?;
+            created_paths.push(cookie_path.clone());
+            writer.write_all(DUMMY_COOKIE_PAYLOAD)?;
+            writer.flush()?;
+        }
+
+        let honeypot_path = dummy_honeypot_path(base_dir);
+        {
+            let mut writer = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&honeypot_path)
+                .with_context(|| {
+                    format!("failed to create honeypot {}", honeypot_path.display())
+                })?;
+            created_paths.push(honeypot_path);
+            writer.write_all(INITIAL_HONEYPOT_BYTES)?;
+            writer.flush()?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = outcome {
+        for path in &created_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(err);
     }
 
     Ok(PrepareDirOutcome {
         base_dir: base_dir.display().to_string(),
         cookies_path: cookie_path.display().to_string(),
-        honeypot_path: honeypot_path.display().to_string(),
+        honeypot_path: dummy_honeypot_path(base_dir).display().to_string(),
     })
 }
 
@@ -1247,5 +1267,28 @@ mod tests {
             std::fs::read(&honeypot_path).expect("read appended honeypot"),
             expected_hp
         );
+    }
+
+    #[test]
+    fn sim_p2_05_prepare_dir_rolls_back_created_files() {
+        let temp = TempSimDir::new("prep-retry").expect("temp dir");
+        let base = temp.path();
+
+        // A leftover honeypot conflicts with exclusive creation; the dummy Cookies
+        // written first by this run must be removed so a retry is not self-blocked.
+        let honeypot_path = dummy_honeypot_path(base);
+        std::fs::write(&honeypot_path, b"pre-existing").expect("seed leftover honeypot");
+        assert!(
+            prepare_sim_dir(base).is_err(),
+            "conflicting honeypot must fail prepare"
+        );
+        assert!(
+            !dummy_cookie_path(base).exists(),
+            "failed prepare must remove the Cookies file it created"
+        );
+        std::fs::remove_file(&honeypot_path).expect("clear honeypot conflict");
+        let retried = prepare_sim_dir(base).expect("retry after conflict cleanup");
+        assert!(Path::new(&retried.cookies_path).is_file());
+        assert!(Path::new(&retried.honeypot_path).is_file());
     }
 }

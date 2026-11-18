@@ -252,6 +252,7 @@ fn validate_process_metadata(
 /// `NtSuspendProcess`/`NtResumeProcess` and Win32 `TerminateProcess` (`AUTO-02`, `AUTO-03`, `L-07`).
 #[derive(Debug, Default)]
 pub struct WindowsDefenseController {
+    suspended_processes: Mutex<HashSet<ProcessIdentity>>,
     suspended_children: Mutex<HashMap<ProcessIdentity, Vec<ProcessIdentity>>>,
 }
 
@@ -274,6 +275,21 @@ impl WindowsDefenseController {
 
     fn suspend_single_validated(&self, target: &ProcessIdentity) -> Result<ValidatedTarget, String> {
         let pre = validate_and_inspect_target(target)?;
+        {
+            let tracked = self
+                .suspended_processes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if tracked.contains(&pre.identity) {
+                tracing::debug!(
+                    pid = pre.identity.pid,
+                    exe = %pre.exe_path,
+                    "process already suspended by LocalEDR; skipping duplicate NtSuspendProcess"
+                );
+                return Ok(pre);
+            }
+        }
+
         let handle = open_process_checked(
             target.pid,
             PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -288,6 +304,10 @@ impl WindowsDefenseController {
                 verified.identity.pid, verified.exe_path, status as u32
             ));
         }
+        self.suspended_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(verified.identity);
         tracing::info!(
             pid = verified.identity.pid,
             exe = %verified.exe_path,
@@ -312,6 +332,10 @@ impl WindowsDefenseController {
                 verified.identity.pid, verified.exe_path, status as u32
             ));
         }
+        self.suspended_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&verified.identity);
         tracing::info!(
             pid = verified.identity.pid,
             exe = %verified.exe_path,
@@ -335,6 +359,10 @@ impl WindowsDefenseController {
                 verified.identity.pid, verified.exe_path
             )
         })?;
+        self.suspended_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&verified.identity);
         tracing::info!(
             pid = verified.identity.pid,
             exe = %verified.exe_path,
@@ -372,7 +400,12 @@ impl ActiveDefenseController for WindowsDefenseController {
                 .suspended_children
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            map.insert(root.identity, suspended_kids);
+            let entry = map.entry(root.identity).or_default();
+            for kid in suspended_kids {
+                if !entry.contains(&kid) {
+                    entry.push(kid);
+                }
+            }
         }
 
         Ok(())
@@ -850,6 +883,59 @@ mod tests {
         let default_mgr = HoneypotManager::new();
         if std::env::var_os("USERPROFILE").is_some() {
             assert_eq!(default_mgr.roots().len(), 3);
+        }
+    }
+
+    #[test]
+    fn sens_p2_07_idempotent_double_suspend_single_resume() {
+        let controller = WindowsDefenseController::new();
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "findstr .*"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn harmless cmd.exe child for idempotent suspend test");
+        let stdin_pipe = child.stdin.take();
+
+        let child_pid = child.id();
+        let handle = open_process_checked(child_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+            .expect("open child for CreationTime");
+        let real_create_time =
+            query_process_creation_time(handle.as_raw()).expect("query child CreationTime");
+        drop(handle);
+
+        let ident = ProcessIdentity::new(child_pid, real_create_time);
+        controller
+            .suspend_process(&ident, false)
+            .expect("first suspend");
+        controller
+            .suspend_process(&ident, false)
+            .expect("idempotent second suspend");
+
+        // Drop stdin EOF while suspended: process must stay paused until a single resume_process.
+        drop(stdin_pipe);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(
+            child.try_wait().expect("poll suspended child").is_none(),
+            "child must remain suspended despite stdin EOF"
+        );
+
+        controller
+            .resume_process(&ident)
+            .expect("single resume must clear suspension completely");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(_status) = child.try_wait().expect("poll resumed child") {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child remained frozen after single resume_process (double suspend leaked suspend count)");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 }

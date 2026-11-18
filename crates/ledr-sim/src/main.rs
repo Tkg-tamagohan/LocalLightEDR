@@ -57,6 +57,7 @@ pub struct SimConfig {
     pub port: u16,
     pub loopback: bool,
     pub json_output: bool,
+    pub hold_ms: u64,
 }
 
 impl Default for SimConfig {
@@ -67,6 +68,7 @@ impl Default for SimConfig {
             port: DEFAULT_SIM_PORT,
             loopback: false,
             json_output: false,
+            hold_ms: 0,
         }
     }
 }
@@ -182,6 +184,15 @@ where
                 config.port = port;
                 idx += 2;
             }
+            "--hold-ms" => {
+                let val = items
+                    .get(idx + 1)
+                    .context("missing value after `--hold-ms`")?;
+                config.hold_ms = val
+                    .parse()
+                    .with_context(|| format!("invalid `--hold-ms` value `{val}`"))?;
+                idx += 2;
+            }
             val if val.starts_with("--scenario=") => {
                 let raw = &val["--scenario=".len()..];
                 config.scenario = Scenario::parse(raw)?;
@@ -205,6 +216,13 @@ where
                     bail!("`--port` must be between 1 and 65535");
                 }
                 config.port = port;
+                idx += 1;
+            }
+            val if val.starts_with("--hold-ms=") => {
+                let raw = &val["--hold-ms=".len()..];
+                config.hold_ms = raw
+                    .parse()
+                    .with_context(|| format!("invalid `--hold-ms` value `{raw}`"))?;
                 idx += 1;
             }
             positional if !positional.starts_with('-') => {
@@ -457,12 +475,33 @@ impl Drop for TempSimDir {
     }
 }
 
+struct ChildGuard(Option<std::process::Child>);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Creates a harmless dummy `Google\Chrome\User Data\Default\Cookies` file in a temporary
 /// directory, opens and reads it cleanly, and returns [`CookiesOpenOutcome`].
 pub async fn run_cookies_open_scenario() -> Result<CookiesOpenOutcome> {
-    tokio::task::spawn_blocking(|| {
+    run_cookies_open_scenario_with_hold(0).await
+}
+
+/// Like [`run_cookies_open_scenario`], holding the process alive for `hold_ms` milliseconds
+/// after opening `Cookies` so real-time ETW + `NtSuspendProcess` E2E tests can observe suspension.
+pub async fn run_cookies_open_scenario_with_hold(hold_ms: u64) -> Result<CookiesOpenOutcome> {
+    tokio::task::spawn_blocking(move || {
         let temp_dir = TempSimDir::new("cookies")?;
-        run_cookies_open_scenario_in(temp_dir.path())
+        let outcome = run_cookies_open_scenario_in(temp_dir.path())?;
+        if hold_ms > 0 {
+            std::thread::sleep(Duration::from_millis(hold_ms));
+        }
+        Ok(outcome)
     })
     .await
     .context("cookies-open simulation task panicked")?
@@ -507,9 +546,35 @@ pub fn run_cookies_open_scenario_in(base_dir: &Path) -> Result<CookiesOpenOutcom
 /// Creates a harmless temp `!00_LocalEDR_Canary_DoNotEdit.docx` file, appends 1 byte, and
 /// returns [`HoneypotWriteOutcome`].
 pub async fn run_honeypot_write_scenario() -> Result<HoneypotWriteOutcome> {
-    tokio::task::spawn_blocking(|| {
+    run_honeypot_write_scenario_with_hold(0).await
+}
+
+/// Like [`run_honeypot_write_scenario`], spawning a harmless child process and holding for
+/// `hold_ms` milliseconds after modifying the decoy file so tree-level `NtSuspendProcess` E2E
+/// tests can verify parent + child suspension (`L-07`).
+pub async fn run_honeypot_write_scenario_with_hold(hold_ms: u64) -> Result<HoneypotWriteOutcome> {
+    tokio::task::spawn_blocking(move || {
         let temp_dir = TempSimDir::new("honeypot")?;
-        run_honeypot_write_scenario_in(temp_dir.path())
+        let _child_guard = if hold_ms > 0 {
+            let ping_count = (hold_ms / 1000).saturating_add(2).clamp(2, 120);
+            let cmd = format!("ping -n {ping_count} 127.0.0.1 >nul");
+            let child = std::process::Command::new("cmd.exe")
+                .args(["/c", &cmd])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok();
+            ChildGuard(child)
+        } else {
+            ChildGuard(None)
+        };
+
+        let outcome = run_honeypot_write_scenario_in(temp_dir.path())?;
+        if hold_ms > 0 {
+            std::thread::sleep(Duration::from_millis(hold_ms));
+        }
+        Ok(outcome)
     })
     .await
     .context("honeypot-write simulation task panicked")?
@@ -564,6 +629,7 @@ fn print_usage() {
     println!("  --domain <HOST>   Domain to resolve/connect in dns-tcp (default: {DEFAULT_SIM_DOMAIN})");
     println!("  --port <PORT>     TCP port for dns-tcp (default: {DEFAULT_SIM_PORT})");
     println!("  --loopback        Use local 127.0.0.1 TCP listener without external traffic");
+    println!("  --hold-ms <MS>    Keep process alive after canary/honeypot access for E2E checks");
     println!("  --json            Print structured JSON simulation report");
     println!("  -h, --help        Show this help message");
 }
@@ -634,12 +700,16 @@ async fn main() -> Result<()> {
     };
 
     let cookies_open = match config.scenario {
-        Scenario::CookiesOpen | Scenario::All => Some(run_cookies_open_scenario().await?),
+        Scenario::CookiesOpen | Scenario::All => {
+            Some(run_cookies_open_scenario_with_hold(config.hold_ms).await?)
+        }
         Scenario::Lotl | Scenario::DnsTcp | Scenario::HoneypotWrite => None,
     };
 
     let honeypot_write = match config.scenario {
-        Scenario::HoneypotWrite | Scenario::All => Some(run_honeypot_write_scenario().await?),
+        Scenario::HoneypotWrite | Scenario::All => {
+            Some(run_honeypot_write_scenario_with_hold(config.hold_ms).await?)
+        }
         Scenario::Lotl | Scenario::DnsTcp | Scenario::CookiesOpen => None,
     };
 
@@ -709,6 +779,23 @@ mod tests {
                 port: 8443,
                 loopback: true,
                 json_output: false,
+                hold_ms: 0,
+            })
+        );
+        assert_eq!(
+            parse_cli_args(["cookies-open", "--hold-ms", "1500"]).unwrap(),
+            CliAction::Run(SimConfig {
+                scenario: Scenario::CookiesOpen,
+                hold_ms: 1500,
+                ..SimConfig::default()
+            })
+        );
+        assert_eq!(
+            parse_cli_args(["honeypot-write", "--hold-ms=250"]).unwrap(),
+            CliAction::Run(SimConfig {
+                scenario: Scenario::HoneypotWrite,
+                hold_ms: 250,
+                ..SimConfig::default()
             })
         );
         assert_eq!(
@@ -865,5 +952,20 @@ mod tests {
                 .len() as usize,
             in_dir.final_bytes
         );
+    }
+
+    #[tokio::test]
+    async fn sim_p2_03_hold_ms_keeps_scenario_clean() {
+        let cookie_res = run_cookies_open_scenario_with_hold(30)
+            .await
+            .expect("cookies-open with short hold should succeed");
+        assert!(cookie_res.opened);
+        assert!(!Path::new(&cookie_res.target_path).exists());
+
+        let honeypot_res = run_honeypot_write_scenario_with_hold(30)
+            .await
+            .expect("honeypot-write with short hold should succeed");
+        assert_eq!(honeypot_res.appended_bytes, 1);
+        assert!(!Path::new(&honeypot_res.target_path).exists());
     }
 }

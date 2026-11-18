@@ -1335,3 +1335,111 @@ async fn daemon_p2_08_terminate_and_block_exited_non_suspended_and_refusals() {
 
     engine.shutdown_and_flush().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn daemon_p2_09_canary_burst_deduplicates_alerts_and_suspends() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MockBinaryInspector::default());
+
+    let dropper_exe = r"C:\Temp\burst_locker.exe";
+    inspector.insert(BinaryIdentity {
+        exe_path: dropper_exe.to_string(),
+        sha256: Some("fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe".to_string()),
+        authenticode: None,
+    });
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier.clone(),
+        inspector,
+    );
+
+    let t0 = current_unix_ms() - 2_000;
+    let ident = ProcessIdentity::new(6600, unix_ms_to_filetime(t0));
+    let sender = engine.sender();
+
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: dropper_exe.to_string(),
+            command_line: "burst_locker.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send start");
+
+    // Simulate a Kernel-File burst (Create, CreateNewFile, Write) on the same honeypot path
+    // with mixed slashes/casing.
+    for (offset, path, mask) in [
+        (
+            10,
+            r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx",
+            0x0012_0116,
+        ),
+        (
+            11,
+            r"c:\users\alice\documents\!00_LocalEDR_Canary_DoNotEdit.docx",
+            0x0012_0116,
+        ),
+        (
+            12,
+            "C:/Users/alice/Documents/!00_LocalEDR_Canary_DoNotEdit.docx",
+            16,
+        ),
+    ] {
+        sender
+            .send(SensorEvent::CanaryFileAccess {
+                pid: ident.pid,
+                target_path: path.to_string(),
+                category: CanaryCategory::Honeypot,
+                access_mask: mask,
+                is_write_or_delete: true,
+                timestamp_ms: t0 + offset,
+            })
+            .await
+            .expect("send burst canary");
+    }
+
+    wait_for_hp_processed(&engine, 4).await;
+
+    assert_eq!(
+        defense.suspends(),
+        vec![SuspendCall {
+            target: ident,
+            include_children: true,
+        }]
+    );
+    assert_eq!(store.list_alerts(None, 20).expect("list alerts").len(), 1);
+    assert_eq!(notifier.alerts().len(), 1);
+
+    let canary_rows = store
+        .list_file_canary_events(Some(CanaryCategory::Honeypot), Some(&ident.instance_id()), 20)
+        .expect("list canary events");
+    assert_eq!(canary_rows.len(), 3);
+    assert_eq!(
+        canary_rows
+            .iter()
+            .filter(|r| r.action_taken == "SUSPENDED")
+            .count(),
+        1
+    );
+    assert_eq!(
+        canary_rows
+            .iter()
+            .filter(|r| r.action_taken == "DEDUP_SUPPRESSED")
+            .count(),
+        2
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}

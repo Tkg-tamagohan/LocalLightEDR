@@ -890,6 +890,28 @@ impl DaemonEngine {
             return;
         }
 
+        let dedup_key = format!(
+            "CANARY:{}:{}",
+            category.as_str(),
+            target_path.trim().replace('/', "\\").to_ascii_lowercase()
+        );
+        let is_new_alert = proc_ctx
+            .proc_instance_id
+            .as_deref()
+            .is_none_or(|inst_id| self.is_new_rule_alert(inst_id, &dedup_key));
+        if !is_new_alert {
+            if let Err(err) = self.store.ingest_event_with_exit(
+                event,
+                proc_ctx.store_hint.as_deref(),
+                None,
+                false,
+                "DEDUP_SUPPRESSED",
+            ) {
+                tracing::warn!(error = %err, "failed to ingest deduplicated canary event");
+            }
+            return;
+        }
+
         let include_children = matches!(category, CanaryCategory::Honeypot);
         let target_ident = proc_ctx
             .proc_identity

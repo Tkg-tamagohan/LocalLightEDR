@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use ledr_proto::{ProcessIdentity, ACTIVE_PROCESS_TABLE_CAPACITY};
+use ledr_proto::{is_never_suspend_process, ProcessIdentity, ACTIVE_PROCESS_TABLE_CAPACITY};
 
 /// Process metadata cached in memory for O(1) parent context lookup during rule evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +328,63 @@ impl ActiveProcessTable {
             Some(entry) => entry.emitted_rule_ids.insert(rule_id.to_string()),
             None => true,
         }
+    }
+
+    /// Clears a previously emitted `(instance_id, rule_id)` alert deduplication mark so
+    /// subsequent matches for that rule/canary target can re-evaluate (`BUG_0006` / `BUG_0004`).
+    pub fn clear_rule_alert_emitted(&mut self, instance_id: &str, rule_id: &str) -> bool {
+        match self.entries.get_mut(instance_id) {
+            Some(entry) => entry.emitted_rule_ids.remove(rule_id),
+            None => false,
+        }
+    }
+
+    /// Returns `true` when `rule_id` was already marked emitted for `instance_id`
+    /// (`ANALYSIS_0002` — read-only dedup check that does not consume the first-emit slot).
+    pub fn has_rule_alert_emitted(&self, instance_id: &str, rule_id: &str) -> bool {
+        self.entries
+            .get(instance_id)
+            .is_some_and(|entry| entry.emitted_rule_ids.contains(rule_id))
+    }
+
+    /// Collects unexited, non-protected descendant [`ProcessIdentity`] values of `root`
+    /// currently tracked in memory (`BUG_0005`), in BFS parent-before-child order.
+    pub fn collect_unexited_descendants(&self, root: &ProcessIdentity) -> Vec<ProcessIdentity> {
+        if root.create_time_100ns == 0 {
+            return Vec::new();
+        }
+        let mut visited = HashSet::new();
+        visited.insert(*root);
+        let mut queue = VecDeque::new();
+        queue.push_back(*root);
+        let mut descendants = Vec::new();
+
+        while let Some(parent) = queue.pop_front() {
+            let parent_id = parent.instance_id();
+            let mut children: Vec<&ActiveProcessEntry> = self
+                .entries
+                .values()
+                .filter(|e| {
+                    e.exited_at_ms.is_none()
+                        && e.identity.create_time_100ns != 0
+                        && !visited.contains(&e.identity)
+                        && !is_never_suspend_process(&e.exe_path)
+                        && (e.parent_instance_id.as_deref() == Some(parent_id.as_str())
+                            || (e.parent_instance_id.is_none()
+                                && e.ppid == parent.pid
+                                && e.identity.create_time_100ns >= parent.create_time_100ns))
+                })
+                .collect();
+            children.sort_by_key(|e| (e.identity.create_time_100ns, e.pid));
+            for child in children {
+                if visited.insert(child.identity) {
+                    descendants.push(child.identity);
+                    queue.push_back(child.identity);
+                }
+            }
+        }
+
+        descendants
     }
 
     /// Returns the number of non-exited processes currently tracked.

@@ -13,8 +13,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_daemon::{
-    is_authorized_bridge_caller, start_ipc_server, ActiveProcessTable, DaemonConfig, DaemonEngine,
-    HighPrioritySendError, TwoLaneChannel,
+    is_authorized_bridge_caller, start_ipc_server, verify_authorized_caller_binary,
+    ActiveProcessTable, DaemonConfig, DaemonEngine, HighPrioritySendError, TwoLaneChannel,
 };
 use ledr_proto::{
     read_ipc_frame, write_ipc_frame, AlertSeverity, AlertStatus, BrowserSecurityEventType,
@@ -63,7 +63,14 @@ fn unique_test_pipe_name() -> String {
 fn open_pipe_with_retry(pipe_name: &str) -> std::fs::File {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        match OpenOptions::new().read(true).write(true).open(pipe_name) {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            opts.access_mode(0x0012_019B);
+        }
+        match opts.open(pipe_name) {
             Ok(file) => return file,
             Err(err) if Instant::now() < deadline && matches!(err.raw_os_error(), Some(231) | Some(2)) => {
                 std::thread::sleep(Duration::from_millis(5));
@@ -779,11 +786,12 @@ async fn burst_05_periodic_ttl_purge_and_startup_stale_reconciliation() {
 
 #[tokio::test]
 async fn burst_06_ipc_bridge_caller_auth_and_stalled_frame_timeout() {
-    assert!(is_authorized_bridge_caller(
+    // SEC_0002: path-only verification without a hash/signer pin or valid Authenticode fails closed.
+    assert!(!is_authorized_bridge_caller(
         Some(AUTHORIZED_BRIDGE_EXE_PATH),
         false
     ));
-    assert!(is_authorized_bridge_caller(
+    assert!(!is_authorized_bridge_caller(
         Some(&AUTHORIZED_BRIDGE_EXE_PATH.to_ascii_uppercase()),
         false
     ));
@@ -793,6 +801,28 @@ async fn burst_06_ipc_bridge_caller_auth_and_stalled_frame_timeout() {
     ));
     assert!(!is_authorized_bridge_caller(None, false));
     assert!(is_authorized_bridge_caller(None, true));
+
+    let auth_dir = TestTempDir::new("ledr-bridge-auth");
+    let fake_bridge = auth_dir.path.join("ledr-bridge-nm.exe");
+    std::fs::write(&fake_bridge, b"bridge-test-binary").expect("write fake bridge");
+    let fake_bridge_str = fake_bridge.to_string_lossy().into_owned();
+    let fake_bridge_sha = ledr_rules::compute_file_sha256_hex(&fake_bridge).expect("hash bridge");
+    assert!(verify_authorized_caller_binary(
+        Some(&fake_bridge_str.to_ascii_uppercase()),
+        &fake_bridge_str,
+        Some(&fake_bridge_sha),
+        None,
+        None,
+        false
+    ));
+    assert!(!verify_authorized_caller_binary(
+        Some(&fake_bridge_str),
+        &fake_bridge_str,
+        None,
+        None,
+        None,
+        false
+    ));
 
     let pipe_name = unique_test_pipe_name();
     let store = LedrStore::open_in_memory().expect("open in-memory store");

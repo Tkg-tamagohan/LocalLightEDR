@@ -7,6 +7,14 @@ pub mod path_norm;
 pub mod privileges;
 pub mod wfp;
 
+pub use defense::{
+    HoneypotManager, WindowsDefenseController, collect_live_descendants, validate_target_process,
+};
+pub use etw::file_canary::{
+    CanaryMatcher, is_autorun_registry_key, is_autorun_registry_key_u16,
+    prefilter_and_classify_canary, prefilter_and_classify_canary_u16,
+};
+
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -25,6 +33,8 @@ pub enum SensorError {
     AlreadyRunning,
     #[error("process snapshot failed: {0}")]
     Snapshot(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// RAII guard for Win32 `HANDLE` values that must be closed via `CloseHandle`.

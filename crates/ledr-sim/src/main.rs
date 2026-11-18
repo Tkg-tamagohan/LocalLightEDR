@@ -1,11 +1,15 @@
 //! Harmless attack-simulation CLI for validating LocalEDR detection and active defense (`AUTO-15`).
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use ledr_proto::IPC_PIPE_NAME;
+use ledr_proto::{HONEYPOT_DEFAULT_FILENAME, IPC_PIPE_NAME};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
@@ -17,6 +21,9 @@ const DEFAULT_SIM_DOMAIN: &str = "example.com";
 const DEFAULT_SIM_PORT: u16 = 80;
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 const LOTL_TIMEOUT: Duration = Duration::from_secs(20);
+const DUMMY_COOKIE_PAYLOAD: &[u8] = b"SQLite format 3\0LocalEDR-Sim-Dummy-Cookies";
+const INITIAL_HONEYPOT_BYTES: &[u8] = b"LocalEDR-Sim-Honeypot-Decoy\n";
+static TEMP_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Simulation scenarios supported by `ledr-sim`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +31,8 @@ const LOTL_TIMEOUT: Duration = Duration::from_secs(20);
 pub enum Scenario {
     Lotl,
     DnsTcp,
+    CookiesOpen,
+    HoneypotWrite,
     All,
 }
 
@@ -32,9 +41,11 @@ impl Scenario {
         match value.trim().to_ascii_lowercase().as_str() {
             "lotl" => Ok(Self::Lotl),
             "dns-tcp" => Ok(Self::DnsTcp),
+            "cookies-open" => Ok(Self::CookiesOpen),
+            "honeypot-write" => Ok(Self::HoneypotWrite),
             "all" | "run-all" => Ok(Self::All),
             other => bail!(
-                "unknown scenario `{other}`; expected one of: lotl, dns-tcp, all, run-all"
+                "unknown scenario `{other}`; expected one of: lotl, dns-tcp, cookies-open, honeypot-write, all, run-all"
             ),
         }
     }
@@ -48,6 +59,9 @@ pub struct SimConfig {
     pub port: u16,
     pub loopback: bool,
     pub json_output: bool,
+    pub hold_ms: u64,
+    pub prepare_dir: Option<PathBuf>,
+    pub base_dir: Option<PathBuf>,
 }
 
 impl Default for SimConfig {
@@ -58,8 +72,19 @@ impl Default for SimConfig {
             port: DEFAULT_SIM_PORT,
             loopback: false,
             json_output: false,
+            hold_ms: 0,
+            prepare_dir: None,
+            base_dir: None,
         }
     }
+}
+
+/// Outcome of pre-creating dummy canary and honeypot fixtures via `--prepare-dir`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrepareDirOutcome {
+    pub base_dir: String,
+    pub cookies_path: String,
+    pub honeypot_path: String,
 }
 
 /// Top-level parsed CLI directive.
@@ -89,6 +114,23 @@ pub struct DnsTcpOutcome {
     pub note: String,
 }
 
+/// Outcome of the harmless dummy Chrome `Cookies` open/read simulation (`L-05`, `AUTO-15`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CookiesOpenOutcome {
+    pub target_path: String,
+    pub bytes_read: usize,
+    pub opened: bool,
+}
+
+/// Outcome of the harmless honeypot decoy 1-byte append simulation (`L-06`, `AUTO-15`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoneypotWriteOutcome {
+    pub target_path: String,
+    pub initial_bytes: usize,
+    pub appended_bytes: usize,
+    pub final_bytes: usize,
+}
+
 /// Combined structured report emitted by `ledr-sim`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimReport {
@@ -96,6 +138,8 @@ pub struct SimReport {
     pub scenario: Scenario,
     pub lotl: Option<LotlOutcome>,
     pub dns_tcp: Option<DnsTcpOutcome>,
+    pub cookies_open: Option<CookiesOpenOutcome>,
+    pub honeypot_write: Option<HoneypotWriteOutcome>,
 }
 
 /// Parses CLI arguments (excluding argv[0]) into [`CliAction`].
@@ -154,6 +198,29 @@ where
                 config.port = port;
                 idx += 2;
             }
+            "--hold-ms" => {
+                let val = items
+                    .get(idx + 1)
+                    .context("missing value after `--hold-ms`")?;
+                config.hold_ms = val
+                    .parse()
+                    .with_context(|| format!("invalid `--hold-ms` value `{val}`"))?;
+                idx += 2;
+            }
+            "--prepare-dir" => {
+                let val = items
+                    .get(idx + 1)
+                    .context("missing value after `--prepare-dir`")?;
+                config.prepare_dir = Some(parse_nonempty_dir("--prepare-dir", val)?);
+                idx += 2;
+            }
+            "--base-dir" => {
+                let val = items
+                    .get(idx + 1)
+                    .context("missing value after `--base-dir`")?;
+                config.base_dir = Some(parse_nonempty_dir("--base-dir", val)?);
+                idx += 2;
+            }
             val if val.starts_with("--scenario=") => {
                 let raw = &val["--scenario=".len()..];
                 config.scenario = Scenario::parse(raw)?;
@@ -179,6 +246,23 @@ where
                 config.port = port;
                 idx += 1;
             }
+            val if val.starts_with("--hold-ms=") => {
+                let raw = &val["--hold-ms=".len()..];
+                config.hold_ms = raw
+                    .parse()
+                    .with_context(|| format!("invalid `--hold-ms` value `{raw}`"))?;
+                idx += 1;
+            }
+            val if val.starts_with("--prepare-dir=") => {
+                let raw = &val["--prepare-dir=".len()..];
+                config.prepare_dir = Some(parse_nonempty_dir("--prepare-dir", raw)?);
+                idx += 1;
+            }
+            val if val.starts_with("--base-dir=") => {
+                let raw = &val["--base-dir=".len()..];
+                config.base_dir = Some(parse_nonempty_dir("--base-dir", raw)?);
+                idx += 1;
+            }
             positional if !positional.starts_with('-') => {
                 if scenario_set {
                     bail!("unexpected positional argument `{positional}`");
@@ -192,6 +276,14 @@ where
     }
 
     Ok(CliAction::Run(config))
+}
+
+fn parse_nonempty_dir(flag: &str, raw: &str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("`{flag}` value must not be empty");
+    }
+    Ok(PathBuf::from(trimmed))
 }
 
 /// Encodes `script` into PowerShell `-EncodedCommand` UTF-16LE Base64 format.
@@ -404,20 +496,301 @@ async fn exchange_ping_ack<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) ->
     Ok(String::from_utf8_lossy(&ack[..n]).into_owned())
 }
 
+struct TempSimDir(PathBuf);
+
+impl TempSimDir {
+    fn new(prefix: &str) -> Result<Self> {
+        let seq = TEMP_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ledr-sim-{prefix}-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create temp simulation dir {}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempSimDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct ChildGuard(Option<std::process::Child>);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn dummy_cookie_path(base_dir: &Path) -> PathBuf {
+    base_dir
+        .join("Google")
+        .join("Chrome")
+        .join("User Data")
+        .join("Default")
+        .join("Cookies")
+}
+
+fn dummy_honeypot_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(HONEYPOT_DEFAULT_FILENAME)
+}
+
+/// Pre-creates dummy `Google\Chrome\User Data\Default\Cookies` and
+/// `!00_LocalEDR_Canary_DoNotEdit.docx` inside `base_dir` before telemetry monitoring starts.
+///
+/// Files created by this call are tracked and removed again when the overall preparation
+/// fails, so a retry after resolving the reported conflict is not blocked by leftovers.
+pub fn prepare_sim_dir(base_dir: &Path) -> Result<PrepareDirOutcome> {
+    let cookie_path = dummy_cookie_path(base_dir);
+    if let Some(parent) = cookie_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create dummy Chrome profile dir {}", parent.display())
+        })?;
+    }
+
+    let mut created_paths: Vec<PathBuf> = Vec::new();
+    let outcome = (|| -> Result<()> {
+        {
+            // `create_new` fails when the file already exists instead of truncating it
+            // (BUG_0003 — `--prepare-dir` must never clobber a real Cookies DB or honeypot).
+            let mut writer = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&cookie_path)
+                .with_context(|| {
+                    format!("failed to create dummy Cookies {}", cookie_path.display())
+                })?;
+            created_paths.push(cookie_path.clone());
+            writer.write_all(DUMMY_COOKIE_PAYLOAD)?;
+            writer.flush()?;
+        }
+
+        let honeypot_path = dummy_honeypot_path(base_dir);
+        {
+            let mut writer = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&honeypot_path)
+                .with_context(|| {
+                    format!("failed to create honeypot {}", honeypot_path.display())
+                })?;
+            created_paths.push(honeypot_path);
+            writer.write_all(INITIAL_HONEYPOT_BYTES)?;
+            writer.flush()?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = outcome {
+        for path in &created_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(err);
+    }
+
+    Ok(PrepareDirOutcome {
+        base_dir: base_dir.display().to_string(),
+        cookies_path: cookie_path.display().to_string(),
+        honeypot_path: dummy_honeypot_path(base_dir).display().to_string(),
+    })
+}
+
+/// Creates a harmless dummy `Google\Chrome\User Data\Default\Cookies` file in a temporary
+/// directory, opens and reads it cleanly, and returns [`CookiesOpenOutcome`].
+pub async fn run_cookies_open_scenario() -> Result<CookiesOpenOutcome> {
+    run_cookies_open_scenario_with_hold(0).await
+}
+
+/// Like [`run_cookies_open_scenario`], holding the process alive for `hold_ms` milliseconds
+/// after opening `Cookies` so real-time ETW + `NtSuspendProcess` E2E tests can observe suspension.
+pub async fn run_cookies_open_scenario_with_hold(hold_ms: u64) -> Result<CookiesOpenOutcome> {
+    run_cookies_open_scenario_with_options(None, hold_ms).await
+}
+
+/// Like [`run_cookies_open_scenario_with_hold`], optionally running inside an existing `base_dir`
+/// without deleting it afterwards.
+pub async fn run_cookies_open_scenario_with_options(
+    base_dir: Option<PathBuf>,
+    hold_ms: u64,
+) -> Result<CookiesOpenOutcome> {
+    tokio::task::spawn_blocking(move || {
+        let _temp_guard = match base_dir.as_ref() {
+            Some(_) => None,
+            None => Some(TempSimDir::new("cookies")?),
+        };
+        let target_dir = match (&base_dir, &_temp_guard) {
+            (Some(dir), _) => dir.as_path(),
+            (None, Some(temp)) => temp.path(),
+            (None, None) => unreachable!(),
+        };
+        let outcome = run_cookies_open_scenario_in(target_dir)?;
+        if hold_ms > 0 {
+            std::thread::sleep(Duration::from_millis(hold_ms));
+        }
+        Ok(outcome)
+    })
+    .await
+    .context("cookies-open simulation task panicked")?
+}
+
+/// Runs the dummy `Cookies` open/read simulation under `base_dir` without removing `base_dir`.
+///
+/// When the target `Cookies` file already exists (e.g., pre-created via `--prepare-dir`), only a
+/// read-only `File::open` is issued without calling `File::create`.
+pub fn run_cookies_open_scenario_in(base_dir: &Path) -> Result<CookiesOpenOutcome> {
+    let cookie_path = dummy_cookie_path(base_dir);
+    if !cookie_path.is_file() {
+        if let Some(parent) = cookie_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create dummy Chrome profile dir {}", parent.display())
+            })?;
+        }
+        let mut writer = File::create(&cookie_path)
+            .with_context(|| format!("failed to create dummy Cookies {}", cookie_path.display()))?;
+        writer.write_all(DUMMY_COOKIE_PAYLOAD)?;
+        writer.flush()?;
+    }
+
+    let mut reader = File::open(&cookie_path)
+        .with_context(|| format!("failed to open dummy Cookies {}", cookie_path.display()))?;
+    let mut buf = Vec::new();
+    let bytes_read = reader
+        .read_to_end(&mut buf)
+        .with_context(|| format!("failed to read dummy Cookies {}", cookie_path.display()))?;
+
+    Ok(CookiesOpenOutcome {
+        target_path: cookie_path.display().to_string(),
+        bytes_read,
+        opened: true,
+    })
+}
+
+/// Creates a harmless temp `!00_LocalEDR_Canary_DoNotEdit.docx` file, appends 1 byte, and
+/// returns [`HoneypotWriteOutcome`].
+pub async fn run_honeypot_write_scenario() -> Result<HoneypotWriteOutcome> {
+    run_honeypot_write_scenario_with_hold(0).await
+}
+
+/// Like [`run_honeypot_write_scenario`], spawning a harmless child process and holding for
+/// `hold_ms` milliseconds after modifying the decoy file so tree-level `NtSuspendProcess` E2E
+/// tests can verify parent + child suspension (`L-07`).
+pub async fn run_honeypot_write_scenario_with_hold(hold_ms: u64) -> Result<HoneypotWriteOutcome> {
+    run_honeypot_write_scenario_with_options(None, hold_ms).await
+}
+
+/// Like [`run_honeypot_write_scenario_with_hold`], optionally running inside an existing
+/// `base_dir` without deleting it afterwards.
+pub async fn run_honeypot_write_scenario_with_options(
+    base_dir: Option<PathBuf>,
+    hold_ms: u64,
+) -> Result<HoneypotWriteOutcome> {
+    tokio::task::spawn_blocking(move || {
+        let _temp_guard = match base_dir.as_ref() {
+            Some(_) => None,
+            None => Some(TempSimDir::new("honeypot")?),
+        };
+        let target_dir = match (&base_dir, &_temp_guard) {
+            (Some(dir), _) => dir.as_path(),
+            (None, Some(temp)) => temp.path(),
+            (None, None) => unreachable!(),
+        };
+        let _child_guard = if hold_ms > 0 {
+            let ping_count = (hold_ms / 1000).saturating_add(2).clamp(2, 120);
+            let cmd = format!("ping -n {ping_count} 127.0.0.1 >nul");
+            let child = std::process::Command::new("cmd.exe")
+                .args(["/c", &cmd])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok();
+            ChildGuard(child)
+        } else {
+            ChildGuard(None)
+        };
+
+        let outcome = run_honeypot_write_scenario_in(target_dir)?;
+        if hold_ms > 0 {
+            std::thread::sleep(Duration::from_millis(hold_ms));
+        }
+        Ok(outcome)
+    })
+    .await
+    .context("honeypot-write simulation task panicked")?
+}
+
+/// Runs the dummy honeypot 1-byte append simulation under `base_dir` without removing `base_dir`.
+///
+/// When the target honeypot file already exists (e.g., pre-created via `--prepare-dir`), only
+/// `OpenOptions` append/write is issued without calling `File::create`.
+pub fn run_honeypot_write_scenario_in(base_dir: &Path) -> Result<HoneypotWriteOutcome> {
+    const APPEND_ONE_BYTE: &[u8] = b"!";
+
+    let honeypot_path = dummy_honeypot_path(base_dir);
+    let initial_bytes = if honeypot_path.is_file() {
+        std::fs::metadata(&honeypot_path)
+            .with_context(|| format!("failed to stat honeypot {}", honeypot_path.display()))?
+            .len() as usize
+    } else {
+        std::fs::create_dir_all(base_dir)
+            .with_context(|| format!("failed to create honeypot dir {}", base_dir.display()))?;
+        {
+            let mut creator = File::create(&honeypot_path)
+                .with_context(|| format!("failed to create honeypot {}", honeypot_path.display()))?;
+            creator.write_all(INITIAL_HONEYPOT_BYTES)?;
+            creator.flush()?;
+        }
+        INITIAL_HONEYPOT_BYTES.len()
+    };
+
+    {
+        let mut appender = OpenOptions::new()
+            .append(true)
+            .open(&honeypot_path)
+            .with_context(|| format!("failed to open honeypot {} for append", honeypot_path.display()))?;
+        appender.write_all(APPEND_ONE_BYTE)?;
+        appender.flush()?;
+    }
+
+    let final_bytes = std::fs::metadata(&honeypot_path)
+        .with_context(|| format!("failed to stat honeypot {}", honeypot_path.display()))?
+        .len() as usize;
+
+    Ok(HoneypotWriteOutcome {
+        target_path: honeypot_path.display().to_string(),
+        initial_bytes,
+        appended_bytes: APPEND_ONE_BYTE.len(),
+        final_bytes,
+    })
+}
+
 fn print_usage() {
-    println!("ledr-sim (Phase 1 harmless telemetry simulator)");
+    println!("ledr-sim (Phase 2 harmless telemetry and defense simulator)");
     println!("Target daemon pipe: {IPC_PIPE_NAME}");
     println!();
     println!("Usage:");
-    println!("  ledr-sim <lotl|dns-tcp|run-all> [OPTIONS]");
-    println!("  ledr-sim --scenario <lotl|dns-tcp|all> [OPTIONS]");
+    println!("  ledr-sim <lotl|dns-tcp|cookies-open|honeypot-write|run-all> [OPTIONS]");
+    println!("  ledr-sim --scenario <lotl|dns-tcp|cookies-open|honeypot-write|all> [OPTIONS]");
+    println!("  ledr-sim --prepare-dir <DIR> [--json]");
     println!();
     println!("Options:");
-    println!("  --domain <HOST>   Domain to resolve/connect in dns-tcp (default: {DEFAULT_SIM_DOMAIN})");
-    println!("  --port <PORT>     TCP port for dns-tcp (default: {DEFAULT_SIM_PORT})");
-    println!("  --loopback        Use local 127.0.0.1 TCP listener without external traffic");
-    println!("  --json            Print structured JSON simulation report");
-    println!("  -h, --help        Show this help message");
+    println!("  --domain <HOST>      Domain to resolve/connect in dns-tcp (default: {DEFAULT_SIM_DOMAIN})");
+    println!("  --port <PORT>        TCP port for dns-tcp (default: {DEFAULT_SIM_PORT})");
+    println!("  --loopback           Use local 127.0.0.1 TCP listener without external traffic");
+    println!("  --hold-ms <MS>       Keep process alive after canary/honeypot access for E2E checks");
+    println!("  --prepare-dir <DIR>  Pre-create dummy canary/honeypot fixtures in <DIR> and exit");
+    println!("  --base-dir <DIR>     Run file scenarios inside <DIR> without creating/deleting a temp dir");
+    println!("  --json               Print structured JSON simulation report");
+    println!("  -h, --help           Show this help message");
 }
 
 fn print_report(report: &SimReport, json_output: bool) -> Result<()> {
@@ -444,6 +817,21 @@ fn print_report(report: &SimReport, json_output: bool) -> Result<()> {
             net.note
         );
     }
+    if let Some(cookies) = &report.cookies_open {
+        println!(
+            "[cookies-open] opened={} bytes_read={} path={}",
+            cookies.opened, cookies.bytes_read, cookies.target_path
+        );
+    }
+    if let Some(honeypot) = &report.honeypot_write {
+        println!(
+            "[honeypot-write] initial_bytes={} appended_bytes={} final_bytes={} path={}",
+            honeypot.initial_bytes,
+            honeypot.appended_bytes,
+            honeypot.final_bytes,
+            honeypot.target_path
+        );
+    }
     Ok(())
 }
 
@@ -458,16 +846,45 @@ async fn main() -> Result<()> {
         CliAction::Run(cfg) => cfg,
     };
 
+    if let Some(prepare_dir) = &config.prepare_dir {
+        let prepared = prepare_sim_dir(prepare_dir)?;
+        if config.json_output {
+            println!("{}", serde_json::to_string_pretty(&prepared)?);
+        } else {
+            println!(
+                "[prepare-dir] base_dir={} cookies={} honeypot={}",
+                prepared.base_dir, prepared.cookies_path, prepared.honeypot_path
+            );
+        }
+        return Ok(());
+    }
+
     let lotl = match config.scenario {
         Scenario::Lotl | Scenario::All => Some(run_lotl_scenario().await?),
-        Scenario::DnsTcp => None,
+        Scenario::DnsTcp | Scenario::CookiesOpen | Scenario::HoneypotWrite => None,
     };
 
     let dns_tcp = match config.scenario {
         Scenario::DnsTcp | Scenario::All => {
             Some(run_dns_tcp_scenario(&config.domain, config.port, config.loopback).await?)
         }
-        Scenario::Lotl => None,
+        Scenario::Lotl | Scenario::CookiesOpen | Scenario::HoneypotWrite => None,
+    };
+
+    let cookies_open = match config.scenario {
+        Scenario::CookiesOpen | Scenario::All => Some(
+            run_cookies_open_scenario_with_options(config.base_dir.clone(), config.hold_ms)
+                .await?,
+        ),
+        Scenario::Lotl | Scenario::DnsTcp | Scenario::HoneypotWrite => None,
+    };
+
+    let honeypot_write = match config.scenario {
+        Scenario::HoneypotWrite | Scenario::All => Some(
+            run_honeypot_write_scenario_with_options(config.base_dir.clone(), config.hold_ms)
+                .await?,
+        ),
+        Scenario::Lotl | Scenario::DnsTcp | Scenario::CookiesOpen => None,
     };
 
     let report = SimReport {
@@ -475,6 +892,8 @@ async fn main() -> Result<()> {
         scenario: config.scenario,
         lotl,
         dns_tcp,
+        cookies_open,
+        honeypot_write,
     };
 
     print_report(&report, config.json_output)
@@ -534,6 +953,25 @@ mod tests {
                 port: 8443,
                 loopback: true,
                 json_output: false,
+                hold_ms: 0,
+                prepare_dir: None,
+                base_dir: None,
+            })
+        );
+        assert_eq!(
+            parse_cli_args(["cookies-open", "--hold-ms", "1500"]).unwrap(),
+            CliAction::Run(SimConfig {
+                scenario: Scenario::CookiesOpen,
+                hold_ms: 1500,
+                ..SimConfig::default()
+            })
+        );
+        assert_eq!(
+            parse_cli_args(["honeypot-write", "--hold-ms=250"]).unwrap(),
+            CliAction::Run(SimConfig {
+                scenario: Scenario::HoneypotWrite,
+                hold_ms: 250,
+                ..SimConfig::default()
             })
         );
         assert_eq!(
@@ -548,6 +986,21 @@ mod tests {
             parse_cli_args(["run-all"]).unwrap(),
             CliAction::Run(SimConfig {
                 scenario: Scenario::All,
+                ..SimConfig::default()
+            })
+        );
+        assert_eq!(
+            parse_cli_args(["cookies-open", "--json"]).unwrap(),
+            CliAction::Run(SimConfig {
+                scenario: Scenario::CookiesOpen,
+                json_output: true,
+                ..SimConfig::default()
+            })
+        );
+        assert_eq!(
+            parse_cli_args(["--scenario=honeypot-write"]).unwrap(),
+            CliAction::Run(SimConfig {
+                scenario: Scenario::HoneypotWrite,
                 ..SimConfig::default()
             })
         );
@@ -614,5 +1067,228 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn sim_p2_01_cookies_open_scenario() {
+        let outcome = run_cookies_open_scenario()
+            .await
+            .expect("cookies-open scenario should succeed");
+        assert!(outcome.opened);
+        assert!(outcome.bytes_read > 0);
+        assert!(
+            outcome
+                .target_path
+                .ends_with(r"Google\Chrome\User Data\Default\Cookies")
+                || outcome
+                    .target_path
+                    .ends_with("Google/Chrome/User Data/Default/Cookies"),
+            "unexpected cookie path: {}",
+            outcome.target_path
+        );
+        // Temporary scenario file must have been cleaned up on completion.
+        assert!(
+            !Path::new(&outcome.target_path).exists(),
+            "temp cookie path should be cleaned up"
+        );
+
+        let temp = TempSimDir::new("test-cookies").expect("temp dir");
+        let in_dir = run_cookies_open_scenario_in(temp.path()).expect("cookies-open in temp dir");
+        assert!(in_dir.opened);
+        assert!(in_dir.bytes_read > 0);
+        assert!(Path::new(&in_dir.target_path).is_file());
+    }
+
+    #[tokio::test]
+    async fn sim_p2_02_honeypot_write_scenario() {
+        let outcome = run_honeypot_write_scenario()
+            .await
+            .expect("honeypot-write scenario should succeed");
+        assert_eq!(outcome.appended_bytes, 1);
+        assert_eq!(outcome.final_bytes, outcome.initial_bytes + 1);
+        assert!(
+            outcome.target_path.ends_with(HONEYPOT_DEFAULT_FILENAME),
+            "unexpected honeypot path: {}",
+            outcome.target_path
+        );
+        // Temporary scenario file must have been cleaned up on completion.
+        assert!(
+            !Path::new(&outcome.target_path).exists(),
+            "temp honeypot path should be cleaned up"
+        );
+
+        let temp = TempSimDir::new("test-honeypot").expect("temp dir");
+        let in_dir =
+            run_honeypot_write_scenario_in(temp.path()).expect("honeypot-write in temp dir");
+        assert_eq!(in_dir.appended_bytes, 1);
+        assert_eq!(in_dir.final_bytes, in_dir.initial_bytes + 1);
+        assert_eq!(
+            std::fs::metadata(&in_dir.target_path)
+                .expect("honeypot metadata")
+                .len() as usize,
+            in_dir.final_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn sim_p2_03_hold_ms_keeps_scenario_clean() {
+        let cookie_res = run_cookies_open_scenario_with_hold(30)
+            .await
+            .expect("cookies-open with short hold should succeed");
+        assert!(cookie_res.opened);
+        assert!(!Path::new(&cookie_res.target_path).exists());
+
+        let honeypot_res = run_honeypot_write_scenario_with_hold(30)
+            .await
+            .expect("honeypot-write with short hold should succeed");
+        assert_eq!(honeypot_res.appended_bytes, 1);
+        assert!(!Path::new(&honeypot_res.target_path).exists());
+    }
+
+    #[tokio::test]
+    async fn sim_p2_04_preprepared_dir_cookies_open_is_readonly_and_parses_cli() {
+        assert_eq!(
+            parse_cli_args(["--prepare-dir", r"C:\Temp\sim-prep", "--json"]).unwrap(),
+            CliAction::Run(SimConfig {
+                prepare_dir: Some(PathBuf::from(r"C:\Temp\sim-prep")),
+                json_output: true,
+                ..SimConfig::default()
+            })
+        );
+        assert_eq!(
+            parse_cli_args(["--prepare-dir=C:\\Temp\\sim-prep"]).unwrap(),
+            CliAction::Run(SimConfig {
+                prepare_dir: Some(PathBuf::from(r"C:\Temp\sim-prep")),
+                ..SimConfig::default()
+            })
+        );
+        assert_eq!(
+            parse_cli_args(["cookies-open", "--base-dir", r"C:\Temp\sim-base"]).unwrap(),
+            CliAction::Run(SimConfig {
+                scenario: Scenario::CookiesOpen,
+                base_dir: Some(PathBuf::from(r"C:\Temp\sim-base")),
+                ..SimConfig::default()
+            })
+        );
+        assert_eq!(
+            parse_cli_args(["honeypot-write", "--base-dir=C:\\Temp\\sim-base"]).unwrap(),
+            CliAction::Run(SimConfig {
+                scenario: Scenario::HoneypotWrite,
+                base_dir: Some(PathBuf::from(r"C:\Temp\sim-base")),
+                ..SimConfig::default()
+            })
+        );
+        assert!(parse_cli_args(["--prepare-dir"]).is_err());
+        assert!(parse_cli_args(["--prepare-dir="]).is_err());
+        assert!(parse_cli_args(["--base-dir"]).is_err());
+        assert!(parse_cli_args(["--base-dir", "   "]).is_err());
+
+        let temp = TempSimDir::new("preprepared").expect("temp dir");
+        let prep = prepare_sim_dir(temp.path()).expect("prepare_sim_dir");
+        let cookies_path = PathBuf::from(&prep.cookies_path);
+        let honeypot_path = PathBuf::from(&prep.honeypot_path);
+        assert!(cookies_path.is_file());
+        assert!(honeypot_path.is_file());
+
+        // Write custom sentinel bytes and mark Cookies read-only so any accidental File::create
+        // would fail with PermissionDenied and overwrite contents.
+        const SENTINEL_COOKIES: &[u8] = b"SQLite format 3\0PrePrepared-ReadOnly-Sentinel";
+        std::fs::write(&cookies_path, SENTINEL_COOKIES).expect("write sentinel cookies");
+        let mtime_before = std::fs::metadata(&cookies_path)
+            .expect("cookies metadata before")
+            .modified()
+            .expect("cookies mtime before");
+        let orig_perms = std::fs::metadata(&cookies_path)
+            .expect("cookies permissions")
+            .permissions();
+        let mut readonly_perms = orig_perms.clone();
+        readonly_perms.set_readonly(true);
+        std::fs::set_permissions(&cookies_path, readonly_perms)
+            .expect("set cookies readonly");
+
+        let cookies_outcome =
+            run_cookies_open_scenario_with_options(Some(temp.path().to_path_buf()), 0)
+                .await
+                .expect("cookies-open with preprepared dir must only issue read-only File::open");
+        assert!(cookies_outcome.opened);
+        assert_eq!(cookies_outcome.bytes_read, SENTINEL_COOKIES.len());
+        assert!(temp.path().is_dir(), "--base-dir must not delete directory");
+        assert_eq!(
+            std::fs::read(&cookies_path).expect("read sentinel cookies"),
+            SENTINEL_COOKIES
+        );
+        let mtime_after = std::fs::metadata(&cookies_path)
+            .expect("cookies metadata after")
+            .modified()
+            .expect("cookies mtime after");
+        assert_eq!(mtime_before, mtime_after);
+
+        // Restore original permissions so TempSimDir Drop cleans up cleanly.
+        std::fs::set_permissions(&cookies_path, orig_perms).expect("restore cookies permissions");
+
+        // BUG_0003: --prepare-dir must refuse to overwrite existing fixture files
+        // instead of truncating them (create_new semantics).
+        const SENTINEL_PREP: &[u8] = b"SQLite format 3\0RealUserCookiesDb";
+        std::fs::write(&cookies_path, SENTINEL_PREP).expect("seed real cookies");
+        std::fs::write(&honeypot_path, SENTINEL_HONEYPOT).expect("seed real honeypot");
+        assert!(
+            prepare_sim_dir(temp.path()).is_err(),
+            "prepare_sim_dir must fail when the Cookies file already exists"
+        );
+        assert_eq!(
+            std::fs::read(&cookies_path).expect("read preserved cookies"),
+            SENTINEL_PREP,
+            "existing Cookies content must be preserved"
+        );
+        std::fs::remove_file(&cookies_path).expect("remove cookies for honeypot check");
+        assert!(
+            prepare_sim_dir(temp.path()).is_err(),
+            "prepare_sim_dir must fail when the honeypot already exists"
+        );
+        assert_eq!(
+            std::fs::read(&honeypot_path).expect("read preserved honeypot"),
+            SENTINEL_HONEYPOT,
+            "existing honeypot content must be preserved"
+        );
+
+        // Pre-prepared honeypot must also append directly without File::create overwriting it.
+        const SENTINEL_HONEYPOT: &[u8] = b"CustomHoneypotHeader\n";
+        std::fs::write(&honeypot_path, SENTINEL_HONEYPOT).expect("write sentinel honeypot");
+        let hp_outcome =
+            run_honeypot_write_scenario_with_options(Some(temp.path().to_path_buf()), 0)
+                .await
+                .expect("honeypot-write with preprepared dir must append in place");
+        assert_eq!(hp_outcome.initial_bytes, SENTINEL_HONEYPOT.len());
+        assert_eq!(hp_outcome.appended_bytes, 1);
+        assert_eq!(hp_outcome.final_bytes, SENTINEL_HONEYPOT.len() + 1);
+        let mut expected_hp = SENTINEL_HONEYPOT.to_vec();
+        expected_hp.push(b'!');
+        assert_eq!(
+            std::fs::read(&honeypot_path).expect("read appended honeypot"),
+            expected_hp
+        );
+    }
+
+    #[test]
+    fn sim_p2_05_prepare_dir_rolls_back_created_files() {
+        let temp = TempSimDir::new("prep-retry").expect("temp dir");
+        let base = temp.path();
+
+        // A leftover honeypot conflicts with exclusive creation; the dummy Cookies
+        // written first by this run must be removed so a retry is not self-blocked.
+        let honeypot_path = dummy_honeypot_path(base);
+        std::fs::write(&honeypot_path, b"pre-existing").expect("seed leftover honeypot");
+        assert!(
+            prepare_sim_dir(base).is_err(),
+            "conflicting honeypot must fail prepare"
+        );
+        assert!(
+            !dummy_cookie_path(base).exists(),
+            "failed prepare must remove the Cookies file it created"
+        );
+        std::fs::remove_file(&honeypot_path).expect("clear honeypot conflict");
+        let retried = prepare_sim_dir(base).expect("retry after conflict cleanup");
+        assert!(Path::new(&retried.cookies_path).is_file());
+        assert!(Path::new(&retried.honeypot_path).is_file());
     }
 }

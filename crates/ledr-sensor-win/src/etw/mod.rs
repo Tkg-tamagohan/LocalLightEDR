@@ -1,14 +1,18 @@
-//! ETW real-time trace sessions (`Kernel-Process`, `DNS-Client`, `Kernel-Network`,
-//! `AMSI`, and PowerShell 4104) and Toolhelp32 initial process snapshots (`AUTO-03`, `AUTO-06`).
+//! ETW real-time trace sessions (`Kernel-Process`, `Kernel-File`, `Kernel-Registry`,
+//! `DNS-Client`, `Kernel-Network`, `AMSI`, and PowerShell 4104) and Toolhelp32 initial process
+//! snapshots (`AUTO-03`, `AUTO-06`, `AUTO-08`).
 
+pub mod file_canary;
 mod tdh;
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 
-use ledr_proto::{ProcessIdentity, ScriptSource, SensorBackend, SensorEvent};
+use ledr_proto::{CanaryCategory, ProcessIdentity, ScriptSource, SensorBackend, SensorEvent};
 use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_SUCCESS,
@@ -24,6 +28,11 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 
+pub use self::file_canary::{
+    CanaryMatcher, is_autorun_registry_key, is_autorun_registry_key_u16,
+    is_autorun_registry_value_target, is_autorun_registry_value_target_u16,
+    prefilter_and_classify_canary, prefilter_and_classify_canary_u16,
+};
 use self::tdh::{
     TdhEventInfo, filetime_100ns_to_unix_ms, inspect_process_by_pid, parse_dns_query_results,
 };
@@ -43,11 +52,20 @@ pub const DEFAULT_ETW_SESSION_NAME: &str = "LocalEDR-ETW-Session";
 pub type EventSinkFn = Arc<dyn Fn(SensorEvent) -> bool + Send + Sync>;
 const MAX_SESSION_NAME_CHARS: usize = 128;
 const MAX_LOGFILE_NAME_CHARS: usize = 128;
+const MAX_TRACKED_HONEYPOT_HANDLES: usize = 512;
 const WINEVENT_KEYWORD_PROCESS: u64 = 0x10;
+const KERNEL_FILE_KEYWORDS: u64 = 0x0010 | 0x0020 | 0x0080 | 0x0200 | 0x0400 | 0x0800 | 0x1000;
+// Kernel-Registry keyword bits: CloseKey (0x0001) is included so cached KeyObject
+// names are invalidated when the handle whose KCB they describe is released.
+const KERNEL_REGISTRY_KEYWORDS: u64 = 0x0001 | 0x0100 | 0x0200 | 0x1000 | 0x2000 | 0x4000;
 const ERROR_WMI_INSTANCE_NOT_FOUND_CODE: u32 = 4201;
 
 /// `Microsoft-Windows-Kernel-Process` (`{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}`).
 const KERNEL_PROCESS_GUID: GUID = GUID::from_u128(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716);
+/// `Microsoft-Windows-Kernel-File` (`{EDD08927-9CC4-4E65-B970-C2560FB5C289}`).
+const KERNEL_FILE_GUID: GUID = GUID::from_u128(0xedd08927_9cc4_4e65_b970_c2560fb5c289);
+/// `Microsoft-Windows-Kernel-Registry` (`{70EB4F03-C1DE-4F73-A051-33D13D5413BD}`).
+const KERNEL_REGISTRY_GUID: GUID = GUID::from_u128(0x70eb4f03_c1de_4f73_a051_33d13d5413bd);
 /// `Microsoft-Windows-DNS-Client` (`{1C95126E-7EEA-49A9-A3FE-A378B03DDB4D}`).
 const DNS_CLIENT_GUID: GUID = GUID::from_u128(0x1c95126e_7eea_49a9_a3fe_a378b03ddb4d);
 /// `Microsoft-Windows-Kernel-Network` (`{7DD42A49-5329-4832-8DFD-43D979153A88}`).
@@ -213,13 +231,75 @@ struct ActiveEtwSession {
     worker: Option<JoinHandle<()>>,
 }
 
+struct TrackedHoneypotHandle {
+    target_path: String,
+    triggered: bool,
+}
+
+#[derive(Default)]
+struct HoneypotHandleTracker {
+    by_file_object: HashMap<u64, TrackedHoneypotHandle>,
+    fifo_order: VecDeque<u64>,
+}
+
+impl HoneypotHandleTracker {
+    fn track_open(&mut self, file_object: u64, target_path: String) -> bool {
+        if file_object == 0 {
+            return !self.by_file_object.is_empty();
+        }
+        if let Some(existing) = self.by_file_object.get_mut(&file_object) {
+            existing.target_path = target_path;
+            existing.triggered = false;
+            return true;
+        }
+        while self.by_file_object.len() >= MAX_TRACKED_HONEYPOT_HANDLES {
+            let Some(oldest) = self.fifo_order.pop_front() else {
+                break;
+            };
+            self.by_file_object.remove(&oldest);
+        }
+        self.fifo_order.push_back(file_object);
+        self.by_file_object.insert(
+            file_object,
+            TrackedHoneypotHandle {
+                target_path,
+                triggered: false,
+            },
+        );
+        true
+    }
+
+    fn trigger_write_or_delete(&mut self, file_object: u64) -> Option<String> {
+        let entry = self.by_file_object.get_mut(&file_object)?;
+        if entry.triggered {
+            return None;
+        }
+        entry.triggered = true;
+        Some(entry.target_path.clone())
+    }
+
+    fn close_handle(&mut self, file_object: u64) -> bool {
+        self.by_file_object.remove(&file_object);
+        !self.by_file_object.is_empty()
+    }
+}
+
 struct EtwCallbackContext {
     sink: EventSinkFn,
     dns_cache: Mutex<DnsResolutionCache>,
     volume_map: DosVolumeMap,
+    canary_matcher: Arc<RwLock<CanaryMatcher>>,
+    honeypot_handles: Mutex<HoneypotHandleTracker>,
+    has_honeypot_handles: AtomicBool,
+    registry_kcb_names: Mutex<HashMap<u64, String>>,
     stop_requested: Arc<AtomicBool>,
     session_name_nul: Vec<u16>,
 }
+
+/// Bound on the cached `KeyObject` -> key-path map for autorun registry keys.
+/// Only autorun paths are cached, so this stays small; on overflow the cache is
+/// cleared rather than grown to keep worst-case memory bounded.
+const REGISTRY_KCB_CACHE_CAPACITY: usize = 4096;
 
 impl EtwCallbackContext {
     /// Emits a decoded event directly to the bounded downstream sink.
@@ -236,13 +316,71 @@ impl EtwCallbackContext {
         }
         true
     }
+
+    fn track_honeypot_handle(&self, file_object: u64, target_path: String) {
+        let mut tracker = self
+            .honeypot_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let non_empty = tracker.track_open(file_object, target_path);
+        self.has_honeypot_handles.store(non_empty, Ordering::Release);
+    }
+
+    fn trigger_honeypot_handle(&self, file_object: u64) -> Option<String> {
+        let mut tracker = self
+            .honeypot_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tracker.trigger_write_or_delete(file_object)
+    }
+
+    fn close_honeypot_handle(&self, file_object: u64) {
+        let mut tracker = self
+            .honeypot_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let non_empty = tracker.close_handle(file_object);
+        self.has_honeypot_handles.store(non_empty, Ordering::Release);
+    }
 }
 
-/// Real-time Windows ETW sensor backend subscribing to Process, DNS, Network, AMSI,
-/// and PowerShell 4104 providers (`AUTO-03`, `AUTO-05`, `AUTO-06`).
+/// Caches an autorun registry key's KCB pointer -> path so write events whose
+/// `KeyName` arrives empty (uncached KCB name) can still be attributed.
+fn remember_registry_key(cache: &Mutex<HashMap<u64, String>>, key_object: u64, key_name: &str) {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= REGISTRY_KCB_CACHE_CAPACITY {
+        cache.clear();
+    }
+    cache.insert(key_object, key_name.to_owned());
+}
+
+fn lookup_registry_key(cache: &Mutex<HashMap<u64, String>>, key_object: u64) -> Option<String> {
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key_object)
+        .cloned()
+}
+
+/// Removes and returns the cached path for `key_object`. Called on DeleteKey (the KCB
+/// stops accepting writes), on CloseKey (the pointer may be recycled for a different
+/// key), and whenever an event proves the object is bound to an unmonitored key.
+fn take_registry_key(cache: &Mutex<HashMap<u64, String>>, key_object: u64) -> Option<String> {
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key_object)
+}
+
+/// Real-time Windows ETW sensor backend subscribing to Process, File, Registry, DNS, Network,
+/// AMSI, and PowerShell 4104 providers (`AUTO-03`, `AUTO-05`, `AUTO-06`, `AUTO-08`).
 pub struct WindowsEtwSensor {
     sink: EventSinkFn,
     session_name: String,
+    dev_roots: Vec<PathBuf>,
+    honeypot_paths: Vec<PathBuf>,
+    user_profiles: Vec<PathBuf>,
+    canary_matcher: Arc<RwLock<CanaryMatcher>>,
     state: Mutex<Option<ActiveEtwSession>>,
 }
 
@@ -269,11 +407,75 @@ impl WindowsEtwSensor {
 
     /// Creates a new [`WindowsEtwSensor`] delivering events directly to `sink` (`BUG_0001`).
     pub fn with_sink(sink: EventSinkFn, session_name: impl Into<String>) -> Self {
+        let user_profiles: Vec<PathBuf> = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .into_iter()
+            .collect();
+        let matcher = CanaryMatcher::new(Vec::<PathBuf>::new(), Vec::<PathBuf>::new())
+            .with_user_profiles(user_profiles.iter());
         Self {
             sink,
             session_name: session_name.into(),
+            dev_roots: Vec::new(),
+            honeypot_paths: Vec::new(),
+            user_profiles,
+            canary_matcher: Arc::new(RwLock::new(matcher)),
             state: Mutex::new(None),
         }
+    }
+
+    /// Configures development root directories whose `.env*` files are protected (`L-05`).
+    pub fn with_dev_roots(mut self, dev_roots: Vec<PathBuf>) -> Self {
+        self.set_dev_roots(dev_roots);
+        self
+    }
+
+    /// Configures explicit honeypot decoy file paths in addition to the default filename (`L-06`).
+    pub fn with_honeypot_paths(mut self, honeypot_paths: Vec<PathBuf>) -> Self {
+        self.set_honeypot_paths(honeypot_paths);
+        self
+    }
+
+    /// Configures both development roots and honeypot paths on the sensor.
+    pub fn with_canary_paths(
+        mut self,
+        dev_roots: Vec<PathBuf>,
+        honeypot_paths: Vec<PathBuf>,
+    ) -> Self {
+        self.dev_roots = dev_roots;
+        self.honeypot_paths = honeypot_paths;
+        self.rebuild_canary_matcher();
+        self
+    }
+
+    /// Updates protected development root directories (safe before or after `start()`).
+    pub fn set_dev_roots(&mut self, dev_roots: Vec<PathBuf>) {
+        self.dev_roots = dev_roots;
+        self.rebuild_canary_matcher();
+    }
+
+    /// Updates explicit honeypot decoy paths (safe before or after `start()`).
+    pub fn set_honeypot_paths(&mut self, honeypot_paths: Vec<PathBuf>) {
+        self.honeypot_paths = honeypot_paths;
+        self.rebuild_canary_matcher();
+    }
+
+    /// Returns a snapshot of the configured [`CanaryMatcher`].
+    pub fn canary_matcher(&self) -> CanaryMatcher {
+        self.canary_matcher
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn rebuild_canary_matcher(&self) {
+        let updated = CanaryMatcher::new(&self.dev_roots, &self.honeypot_paths)
+            .with_user_profiles(&self.user_profiles);
+        let mut guard = self
+            .canary_matcher
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = updated;
     }
 
     /// Returns the configured ETW session name.
@@ -353,6 +555,10 @@ impl SensorBackend for WindowsEtwSensor {
             sink: sink_clone,
             dns_cache: Mutex::new(DnsResolutionCache::default()),
             volume_map: DosVolumeMap::from_system(),
+            canary_matcher: Arc::clone(&self.canary_matcher),
+            honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
+            has_honeypot_handles: AtomicBool::new(false),
+            registry_kcb_names: Mutex::new(HashMap::new()),
             stop_requested: Arc::clone(&stop_requested),
             session_name_nul: session_name_nul.clone(),
         });
@@ -487,13 +693,27 @@ fn enable_all_providers(
     session_name: &str,
     session_handle: CONTROLTRACE_HANDLE,
 ) -> Result<(), SensorError> {
-    let providers: [(&str, &GUID, u8, u64, bool); 5] = [
+    let providers: [(&str, &GUID, u8, u64, bool); 7] = [
         (
             "Microsoft-Windows-Kernel-Process",
             &KERNEL_PROCESS_GUID,
             TRACE_LEVEL_INFORMATION as u8,
             WINEVENT_KEYWORD_PROCESS,
             true,
+        ),
+        (
+            "Microsoft-Windows-Kernel-File",
+            &KERNEL_FILE_GUID,
+            TRACE_LEVEL_INFORMATION as u8,
+            KERNEL_FILE_KEYWORDS,
+            true,
+        ),
+        (
+            "Microsoft-Windows-Kernel-Registry",
+            &KERNEL_REGISTRY_GUID,
+            TRACE_LEVEL_INFORMATION as u8,
+            KERNEL_REGISTRY_KEYWORDS,
+            false,
         ),
         (
             "Microsoft-Windows-DNS-Client",
@@ -540,8 +760,12 @@ fn enable_all_providers(
             )
         };
         if status != ERROR_SUCCESS {
-            if !required && status == ERROR_NOT_FOUND {
-                tracing::warn!(provider = name, "optional ETW provider not registered; skipping");
+            if !required && (status == ERROR_NOT_FOUND || status == ERROR_ACCESS_DENIED) {
+                tracing::warn!(
+                    provider = name,
+                    status = status.0,
+                    "optional ETW provider unavailable; skipping"
+                );
                 continue;
             }
             let detail = if status == ERROR_ACCESS_DENIED {
@@ -620,6 +844,10 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
             2 => handle_process_stop(record),
             _ => None,
         }
+    } else if provider == KERNEL_FILE_GUID {
+        handle_kernel_file(record, event_id, ctx)
+    } else if provider == KERNEL_REGISTRY_GUID {
+        handle_kernel_registry(record, event_id, ctx)
     } else if provider == DNS_CLIENT_GUID {
         match event_id {
             3008 | 3018 | 3020 | 3006 => handle_dns_client(record, event_id, ctx),
@@ -792,6 +1020,357 @@ fn handle_script_event(
     })
 }
 
+fn handle_kernel_file(
+    record: &EVENT_RECORD,
+    event_id: u16,
+    ctx: &EtwCallbackContext,
+) -> Option<SensorEvent> {
+    const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+    const WRITE_OR_DELETE_ACCESS_BITS: u32 = 0x4001_0006; // GENERIC_WRITE | DELETE | WRITE_DATA | APPEND_DATA
+
+    match event_id {
+        12 | 30 | 26 | 27 | 28 => {
+            let pid = record.EventHeader.ProcessId;
+            if pid == 0 || pid == u32::MAX {
+                return None;
+            }
+            let info = TdhEventInfo::from_record(record)?;
+            let (is_write_or_delete, access_mask) = match event_id {
+                12 => {
+                    let create_options = info.get_u32("CreateOptions").unwrap_or(0);
+                    let desired_access = info.get_u32("DesiredAccess");
+                    let disposition = (create_options >> 24) & 0xFF;
+                    let write_disp = matches!(disposition, 0 | 2 | 4 | 5);
+                    let delete_on_close = (create_options & FILE_DELETE_ON_CLOSE) != 0;
+                    let write_access =
+                        desired_access.is_some_and(|a| (a & WRITE_OR_DELETE_ACCESS_BITS) != 0);
+                    (
+                        write_disp || delete_on_close || write_access,
+                        desired_access.unwrap_or(create_options),
+                    )
+                }
+                30 => (true, info.get_u32("CreateOptions").unwrap_or(0)),
+                _ => (true, info.get_u32("InfoClass").unwrap_or(0)),
+            };
+
+            let prop_names: &[&str] = match event_id {
+                26..=28 => &["FilePath", "FileName", "OpenPath"],
+                _ => &["FileName", "OpenPath", "FilePath"],
+            };
+
+            let matched = {
+                let matcher = ctx.canary_matcher.read().unwrap_or_else(|e| e.into_inner());
+                info.inspect_first_utf16_property(prop_names, |u16_slice| {
+                    if let Some(cat) =
+                        matcher.classify_u16(u16_slice, &ctx.volume_map, is_write_or_delete)
+                    {
+                        return Some((cat, ctx.volume_map.normalize_u16(u16_slice), false));
+                    }
+                    // Track read/existing opens of honeypot files without alerting so a
+                    // subsequent Write/SetDelete/Rename on the same FileObject is caught (L-06).
+                    if event_id == 12
+                        && !is_write_or_delete
+                        && matcher.is_honeypot_u16(u16_slice, &ctx.volume_map)
+                    {
+                        return Some((
+                            CanaryCategory::Honeypot,
+                            ctx.volume_map.normalize_u16(u16_slice),
+                            true,
+                        ));
+                    }
+                    None
+                })?
+            };
+
+            let (category, target_path, track_only) = matched;
+            if track_only {
+                if let Some(file_object) = info.get_u64("FileObject") {
+                    ctx.track_honeypot_handle(file_object, target_path);
+                }
+                return None;
+            }
+
+            let timestamp_ms =
+                filetime_100ns_to_unix_ms(record.EventHeader.TimeStamp.max(0) as u64);
+            Some(SensorEvent::CanaryFileAccess {
+                pid,
+                target_path,
+                category,
+                access_mask,
+                is_write_or_delete,
+                timestamp_ms,
+            })
+        }
+        16 | 18 | 19 | 29 => {
+            if !ctx.has_honeypot_handles.load(Ordering::Acquire) {
+                return None;
+            }
+            let pid = record.EventHeader.ProcessId;
+            if pid == 0 || pid == u32::MAX {
+                return None;
+            }
+            let info = TdhEventInfo::from_record(record)?;
+            let file_object = info.get_u64("FileObject")?;
+            let target_path = ctx.trigger_honeypot_handle(file_object)?;
+            let access_mask = info
+                .get_u32("IOFlags")
+                .or_else(|| info.get_u32("InfoClass"))
+                .unwrap_or(event_id as u32);
+            let timestamp_ms =
+                filetime_100ns_to_unix_ms(record.EventHeader.TimeStamp.max(0) as u64);
+            Some(SensorEvent::CanaryFileAccess {
+                pid,
+                target_path,
+                category: CanaryCategory::Honeypot,
+                access_mask,
+                is_write_or_delete: true,
+                timestamp_ms,
+            })
+        }
+        14 => {
+            if !ctx.has_honeypot_handles.load(Ordering::Acquire) {
+                return None;
+            }
+            let info = TdhEventInfo::from_record(record)?;
+            if let Some(file_object) = info.get_u64("FileObject") {
+                ctx.close_honeypot_handle(file_object);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn handle_kernel_registry(
+    record: &EVENT_RECORD,
+    event_id: u16,
+    ctx: &EtwCallbackContext,
+) -> Option<SensorEvent> {
+    // CreateKey=1, OpenKey=2, DeleteKey=3, SetValueKey=5, DeleteValueKey=6,
+    // CloseKey=13 for `Microsoft-Windows-Kernel-Registry`.
+    if !matches!(event_id, 1 | 2 | 3 | 5 | 6 | 13) {
+        return None;
+    }
+    let pid = record.EventHeader.ProcessId;
+    if pid == 0 || pid == u32::MAX {
+        return None;
+    }
+    let info = TdhEventInfo::from_record(record)?;
+    let facts = registry_event_facts(&info, record, event_id);
+    // `ValueName` needs a heap read, so decode it lazily only once the event is
+    // confirmed alertable — most SetValueKey traffic is unrelated churn.
+    decide_registry_event(&facts, &ctx.registry_kcb_names, || {
+        info.get_string("ValueName").filter(|v| !v.is_empty())
+    })
+}
+
+/// How the key name that arrived with a Kernel-Registry event classifies against the
+/// autorun watch-lists. Strings are only materialized for autorun names so unrelated
+/// keys stay allocation-free on this hot path (`AUTO-08`).
+enum RegistryKeyName {
+    /// No usable `KeyName`/`BaseName`+`RelativeName` arrived (missing or empty) —
+    /// the `KeyObject` cache may still attribute the event.
+    Missing,
+    /// A name arrived but matches no autorun location: the `KeyObject` is bound to an
+    /// unmonitored key, so any cached entry for it is stale and must be evicted.
+    Unrelated,
+    /// An autorun key whose values are not themselves persistence payloads (e.g.
+    /// `Services\*`): key creation/deletion alerts, value writes are filtered below.
+    AutorunNonValue(String),
+    /// An autorun value target (Run/RunOnce/Winlogon/...): value writes alert.
+    AutorunValue(String),
+}
+
+/// Decoded fields a Kernel-Registry event needs for the canary decision, kept separate
+/// from TDH decoding so the decision path can be driven by unit tests.
+struct RegistryEventFacts {
+    pid: u32,
+    event_id: u16,
+    key_object: Option<u64>,
+    /// NTSTATUS of the operation; `Some(non-zero)` means the operation failed.
+    status: Option<u32>,
+    key_name: RegistryKeyName,
+    disposition: Option<u32>,
+    access_type: Option<u32>,
+    timestamp_ms: i64,
+}
+
+/// Classifies a raw UTF-16 registry key path for the Kernel-Registry decision path.
+/// Returns `None` for absent/empty names so callers can distinguish "no name arrived"
+/// (consult the `KeyObject` cache) from "a known unmonitored name arrived" (evict it).
+fn classify_registry_key_name(u16_name: &[u16]) -> Option<RegistryKeyName> {
+    if u16_name.is_empty() {
+        return None;
+    }
+    if !is_autorun_registry_key_u16(u16_name) {
+        return Some(RegistryKeyName::Unrelated);
+    }
+    Some(if is_autorun_registry_value_target_u16(u16_name) {
+        RegistryKeyName::AutorunValue(String::from_utf16_lossy(u16_name))
+    } else {
+        RegistryKeyName::AutorunNonValue(String::from_utf16_lossy(u16_name))
+    })
+}
+
+fn registry_event_facts(
+    info: &TdhEventInfo,
+    record: &EVENT_RECORD,
+    event_id: u16,
+) -> RegistryEventFacts {
+    // CreateKey/OpenKey carry `BaseName` + `RelativeName`; mutating ops carry `KeyName`.
+    let key_name = if matches!(event_id, 1 | 2) {
+        info.inspect_first_utf16_property(&["KeyName"], classify_registry_key_name)
+            .or_else(|| {
+                info.inspect_joined_utf16_properties(
+                    "BaseName",
+                    "RelativeName",
+                    classify_registry_key_name,
+                )
+            })
+            .unwrap_or(RegistryKeyName::Missing)
+    } else {
+        info.inspect_first_utf16_property(&["KeyName"], classify_registry_key_name)
+            .unwrap_or(RegistryKeyName::Missing)
+    };
+    RegistryEventFacts {
+        pid: record.EventHeader.ProcessId,
+        event_id,
+        key_object: info.get_u64("KeyObject"),
+        status: info.get_u32("Status"),
+        key_name,
+        disposition: info.get_u32("Disposition"),
+        access_type: info.get_u32("Type"),
+        timestamp_ms: filetime_100ns_to_unix_ms(record.EventHeader.TimeStamp.max(0) as u64),
+    }
+}
+
+fn decide_registry_event(
+    facts: &RegistryEventFacts,
+    key_cache: &Mutex<HashMap<u64, String>>,
+    value_name: impl FnOnce() -> Option<String>,
+) -> Option<SensorEvent> {
+    if !matches!(facts.event_id, 1 | 2 | 3 | 5 | 6 | 13) {
+        return None;
+    }
+    // Registry events carry the operation's NTSTATUS. A failed open/set/delete changed
+    // nothing, so it must neither alert nor update the `KeyObject` cache — e.g. a failed
+    // DeleteKey leaves the cached name valid and a failed SetValueKey wrote nothing.
+    if facts.status.is_some_and(|status| status != 0) {
+        return None;
+    }
+    // CloseKey retires the KeyObject; Windows may recycle the pointer for a different
+    // key, so drop its cached name rather than let future empty-name writes inherit a
+    // stale attribution. A second handle sharing the same KCB loses attribution here
+    // (fail-open miss), which is preferable to a false canary hit on a recycled pointer.
+    if facts.event_id == 13 {
+        if let Some(key_object) = facts.key_object {
+            take_registry_key(key_cache, key_object);
+        }
+        return None;
+    }
+
+    const REG_CREATED_NEW_KEY: u32 = 0x0000_0001;
+    // Event 1 (CreateKey) also fires when `RegCreateKeyEx`/`NtCreateKey` merely opens an
+    // existing key (`Disposition` = `REG_OPENED_EXISTING_KEY`), and event 2 (OpenKey)
+    // covers plain `RegOpenKeyEx`/`NtOpenKey`. Only a genuinely new key under an autorun
+    // location is a persistence write, so opens never alert; instead their resolved
+    // autorun path is cached under `KeyObject` (which is stable for the opened handle)
+    // so that later SetValueKey/DeleteValueKey/DeleteKey events on the same handle —
+    // whose `KeyName` arrives empty when the KCB name is not yet populated — can still
+    // be attributed.
+    let key_name = if matches!(facts.event_id, 1 | 2) {
+        if let Some(key_object) = facts.key_object {
+            match &facts.key_name {
+                // Cache only value-write-relevant autorun keys so the map stays small
+                // and is not churned by constant `Services\*` traffic.
+                RegistryKeyName::AutorunValue(name) => {
+                    remember_registry_key(key_cache, key_object, name);
+                }
+                // The handle is bound to a known unmonitored key: evict any stale entry
+                // so a recycled `KeyObject` cannot inherit an old autorun attribution.
+                RegistryKeyName::Unrelated | RegistryKeyName::AutorunNonValue(_) => {
+                    take_registry_key(key_cache, key_object);
+                }
+                RegistryKeyName::Missing => {}
+            }
+        }
+        if facts.event_id == 2
+            || facts
+                .disposition
+                .is_some_and(|disposition| disposition != REG_CREATED_NEW_KEY)
+        {
+            return None;
+        }
+        match &facts.key_name {
+            RegistryKeyName::AutorunValue(name) | RegistryKeyName::AutorunNonValue(name) => {
+                name.clone()
+            }
+            _ => return None,
+        }
+    } else {
+        match (&facts.key_name, facts.key_object) {
+            (RegistryKeyName::AutorunValue(name), Some(key_object)) => {
+                if facts.event_id == 3 {
+                    take_registry_key(key_cache, key_object);
+                } else {
+                    remember_registry_key(key_cache, key_object, name);
+                }
+                name.clone()
+            }
+            (RegistryKeyName::AutorunNonValue(name), Some(key_object)) => {
+                take_registry_key(key_cache, key_object);
+                name.clone()
+            }
+            (RegistryKeyName::Unrelated, Some(key_object)) => {
+                take_registry_key(key_cache, key_object);
+                return None;
+            }
+            (RegistryKeyName::Missing, Some(key_object)) => {
+                if facts.event_id == 3 {
+                    take_registry_key(key_cache, key_object)?
+                } else {
+                    lookup_registry_key(key_cache, key_object)?
+                }
+            }
+            (RegistryKeyName::AutorunValue(name) | RegistryKeyName::AutorunNonValue(name), None) => {
+                name.clone()
+            }
+            (RegistryKeyName::Unrelated, None) | (RegistryKeyName::Missing, None) => return None,
+        }
+    };
+
+    // Value writes only matter under the persistence locations where the written value is
+    // itself the payload (Run/RunOnce entries, Winlogon shell/userinit). Existing
+    // `Services\*` keys see constant benign churn (e.g. `Tcpip\Parameters`), so writes
+    // there are not alerted on; service persistence stays covered by new-key creation.
+    if matches!(facts.event_id, 5 | 6) && !is_autorun_registry_value_target(&key_name) {
+        return None;
+    }
+
+    let target_path = if matches!(facts.event_id, 5 | 6) {
+        match value_name() {
+            Some(value_name) => format!("{key_name}\\{value_name}"),
+            None => key_name,
+        }
+    } else {
+        key_name
+    };
+
+    let access_mask = facts
+        .disposition
+        .or(facts.access_type)
+        .unwrap_or(facts.event_id as u32);
+
+    Some(SensorEvent::CanaryFileAccess {
+        pid: facts.pid,
+        target_path,
+        category: CanaryCategory::AutorunRegistry,
+        access_mask,
+        is_write_or_delete: true,
+        timestamp_ms: facts.timestamp_ms,
+    })
+}
+
 fn utf16_z_to_string(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])
@@ -925,6 +1504,10 @@ mod tests {
             sink: Arc::clone(&sensor.sink),
             dns_cache: Mutex::new(DnsResolutionCache::default()),
             volume_map: DosVolumeMap::with_mappings(Vec::new()),
+            canary_matcher: Arc::new(RwLock::new(CanaryMatcher::default())),
+            honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
+            has_honeypot_handles: AtomicBool::new(false),
+            registry_kcb_names: Mutex::new(HashMap::new()),
             stop_requested: Arc::clone(&stop_requested),
             session_name_nul: session_name_nul.clone(),
         };
@@ -979,6 +1562,10 @@ mod tests {
             sink: Arc::clone(&sensor.sink),
             dns_cache: Mutex::new(DnsResolutionCache::default()),
             volume_map: DosVolumeMap::with_mappings(Vec::new()),
+            canary_matcher: Arc::new(RwLock::new(CanaryMatcher::default())),
+            honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
+            has_honeypot_handles: AtomicBool::new(false),
+            registry_kcb_names: Mutex::new(HashMap::new()),
             stop_requested: Arc::clone(&stop_requested),
             session_name_nul: session_name_nul.clone(),
         });
@@ -1026,5 +1613,214 @@ mod tests {
         }
         sensor.force_abort();
         assert!(abort_flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn sens_etw_canary_config_tdh_bytes_and_honeypot_tracker() {
+        use windows::Win32::System::Diagnostics::Etw::TDH_INTYPE_UNICODESTRING;
+
+        let (tx, _rx) = mpsc::channel();
+        let sensor = WindowsEtwSensor::new(tx)
+            .with_dev_roots(vec![PathBuf::from(r"D:\Code\secret")])
+            .with_honeypot_paths(vec![PathBuf::from(r"D:\Decoy\trap.docx")]);
+        let matcher = sensor.canary_matcher();
+        assert_eq!(matcher.dev_root_count(), 1);
+        assert_eq!(matcher.honeypot_path_count(), 1);
+
+        let vmap = DosVolumeMap::with_mappings(vec![(
+            r"\Device\HarddiskVolume4".encode_utf16().collect(),
+            "D:".to_string(),
+        )]);
+
+        let to_utf16_bytes = |s: &str| -> Vec<u8> {
+            let mut out = Vec::new();
+            for unit in s.encode_utf16().chain(std::iter::once(0u16)) {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+            out
+        };
+
+        let benign_bytes = to_utf16_bytes(r"\Device\HarddiskVolume4\Windows\System32\ntdll.dll");
+        assert_eq!(
+            tdh::inspect_and_classify_canary_bytes(
+                &benign_bytes,
+                TDH_INTYPE_UNICODESTRING.0 as u16,
+                &matcher,
+                &vmap,
+                false,
+            ),
+            None
+        );
+
+        let env_bytes = to_utf16_bytes(r"\Device\HarddiskVolume4\Code\secret\.env.prod");
+        assert_eq!(
+            tdh::inspect_and_classify_canary_bytes(
+                &env_bytes,
+                TDH_INTYPE_UNICODESTRING.0 as u16,
+                &matcher,
+                &vmap,
+                false,
+            ),
+            Some((CanaryCategory::EnvFile, r"D:\Code\secret\.env.prod".to_string()))
+        );
+
+        // Verify FileObject tracking only triggers once on write/delete and clears on close.
+        let mut tracker = HoneypotHandleTracker::default();
+        assert!(tracker.track_open(0xABCD, r"C:\Users\alice\Documents\!00.docx".to_string()));
+        assert_eq!(
+            tracker.trigger_write_or_delete(0xABCD),
+            Some(r"C:\Users\alice\Documents\!00.docx".to_string())
+        );
+        assert_eq!(tracker.trigger_write_or_delete(0xABCD), None);
+        assert!(!tracker.close_handle(0xABCD));
+    }
+
+    fn registry_facts(
+        event_id: u16,
+        key_object: u64,
+        key_name: RegistryKeyName,
+        status: u32,
+    ) -> RegistryEventFacts {
+        RegistryEventFacts {
+            pid: 4242,
+            event_id,
+            key_object: Some(key_object),
+            status: Some(status),
+            key_name,
+            disposition: None,
+            access_type: None,
+            timestamp_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn autorun_run_key() -> RegistryKeyName {
+        RegistryKeyName::AutorunValue(
+            r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".to_string(),
+        )
+    }
+
+    #[test]
+    fn sens_p2_05_registry_recycled_key_object_drops_stale_name() {
+        let cache = Mutex::new(HashMap::new());
+
+        // An open of a monitored autorun key binds its name to the KeyObject.
+        let open = registry_facts(2, 0x1000, autorun_run_key(), 0);
+        assert!(decide_registry_event(&open, &cache, || panic!("unreachable")).is_none());
+        assert!(lookup_registry_key(&cache, 0x1000).is_some());
+
+        // The OS recycles the pointer for an unmonitored key: its named open must evict
+        // the stale entry instead of leaving the old attribution behind.
+        let reopen = registry_facts(2, 0x1000, RegistryKeyName::Unrelated, 0);
+        assert!(decide_registry_event(&reopen, &cache, || panic!("unreachable")).is_none());
+        assert!(
+            lookup_registry_key(&cache, 0x1000).is_none(),
+            "reused KeyObject must drop the stale cached name"
+        );
+
+        // An empty-name SetValueKey on the recycled object must not inherit the old name.
+        let write = registry_facts(5, 0x1000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&write, &cache, || panic!("no alertable path"))
+            .is_none());
+
+        // A write event that arrives with a known non-autorun name evicts rather than
+        // alerts — and must not even decode the value name.
+        let open2 = registry_facts(2, 0x2000, autorun_run_key(), 0);
+        assert!(decide_registry_event(&open2, &cache, || panic!("unreachable")).is_none());
+        let named_write = registry_facts(5, 0x2000, RegistryKeyName::Unrelated, 0);
+        assert!(decide_registry_event(&named_write, &cache, || {
+            panic!("ValueName must not be decoded for unmonitored keys")
+        })
+        .is_none());
+        assert!(lookup_registry_key(&cache, 0x2000).is_none());
+    }
+
+    #[test]
+    fn sens_p2_06_registry_open_then_value_write_alerts() {
+        let cache = Mutex::new(HashMap::new());
+
+        // Opening an existing monitored key must not alert (opens are attribution-only).
+        let open = registry_facts(2, 0x2000, autorun_run_key(), 0);
+        assert!(decide_registry_event(&open, &cache, || panic!("unreachable")).is_none());
+
+        // A subsequent SetValueKey on the same handle arrives with an empty KeyName:
+        // attribution comes from the cache and alerts with the value name appended.
+        let set_value = registry_facts(5, 0x2000, RegistryKeyName::Missing, 0);
+        let event = decide_registry_event(&set_value, &cache, || {
+            Some("Persistence".to_string())
+        })
+        .expect("SetValueKey on a cached autorun key must alert");
+        match event {
+            SensorEvent::CanaryFileAccess {
+                pid,
+                target_path,
+                category,
+                is_write_or_delete,
+                ..
+            } => {
+                assert_eq!(pid, 4242);
+                assert_eq!(category, CanaryCategory::AutorunRegistry);
+                assert!(target_path.ends_with(r"\Persistence"), "{target_path}");
+                assert!(is_write_or_delete);
+            }
+            other => panic!("expected CanaryFileAccess, got {other:?}"),
+        }
+
+        // DeleteValueKey on the same handle also alerts.
+        let delete_value = registry_facts(6, 0x2000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&delete_value, &cache, || None).is_some());
+
+        // CloseKey retires the binding; later empty-name writes stay silent.
+        let close = registry_facts(13, 0x2000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&close, &cache, || panic!("unreachable")).is_none());
+        let after_close = registry_facts(5, 0x2000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&after_close, &cache, || {
+            panic!("ValueName must not be decoded after CloseKey eviction")
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn sens_p2_07_registry_failed_ops_neither_alert_nor_mutate_cache() {
+        let cache = Mutex::new(HashMap::new());
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+
+        let open = registry_facts(2, 0x3000, autorun_run_key(), 0);
+        assert!(decide_registry_event(&open, &cache, || panic!("unreachable")).is_none());
+
+        // Failed SetValueKey / DeleteValueKey on a cached autorun handle must not alert
+        // (and must not even decode the value name).
+        let failed_set = registry_facts(5, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
+        assert!(decide_registry_event(&failed_set, &cache, || {
+            panic!("ValueName must not be decoded for failed ops")
+        })
+        .is_none());
+        let failed_delete_value =
+            registry_facts(6, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
+        assert!(decide_registry_event(&failed_delete_value, &cache, || {
+            panic!("ValueName must not be decoded for failed ops")
+        })
+        .is_none());
+
+        // A failed DeleteKey neither alerts nor clears the cached name.
+        let failed_delete_key =
+            registry_facts(3, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
+        assert!(decide_registry_event(&failed_delete_key, &cache, || {
+            panic!("unreachable")
+        })
+        .is_none());
+        assert!(
+            lookup_registry_key(&cache, 0x3000).is_some(),
+            "failed DeleteKey must keep the cached name"
+        );
+
+        // A failed open must not create a cache binding either.
+        let failed_open = registry_facts(2, 0x4000, autorun_run_key(), STATUS_ACCESS_DENIED);
+        assert!(decide_registry_event(&failed_open, &cache, || panic!("unreachable")).is_none());
+        assert!(lookup_registry_key(&cache, 0x4000).is_none());
+
+        // A successful DeleteKey still alerts with the cached name and evicts it.
+        let delete_key = registry_facts(3, 0x3000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&delete_key, &cache, || panic!("unreachable")).is_some());
+        assert!(lookup_registry_key(&cache, 0x3000).is_none());
     }
 }

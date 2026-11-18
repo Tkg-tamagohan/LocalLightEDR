@@ -153,6 +153,58 @@ impl DosVolumeMap {
         Some(format!("{drive}{rest}"))
     }
 
+    /// Matches a leading NT device object prefix (e.g. `\Device\HarddiskVolume3`) in `path_u16`
+    /// without heap allocation, returning `(dos_drive, prefix_code_units)`.
+    #[inline]
+    pub fn match_device_prefix_u16(&self, path_u16: &[u16]) -> Option<(&str, usize)> {
+        self.match_device_u16(path_u16)
+    }
+
+    /// Splits a raw UTF-16 path into `(dos_drive_u16, remainder_u16, is_unc)` without allocating.
+    ///
+    /// Handles `\Device\HarddiskVolumeX\...`, `\??\C:\...`, `\\?\C:\...`, `\??\UNC\...`,
+    /// `\\?\UNC\...`, standard `C:\...`, and `\\server\share\...` paths while trimming at NUL.
+    pub fn split_dos_prefix_u16<'a>(
+        &self,
+        raw_u16: &'a [u16],
+    ) -> (Option<[u16; 2]>, &'a [u16], bool) {
+        let end = raw_u16
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(raw_u16.len());
+        let slice = &raw_u16[..end];
+        if slice.is_empty() {
+            return (None, slice, false);
+        }
+
+        if let Some(after_nt) = strip_nt_dos_prefix_u16(slice) {
+            if let Some(unc_rest) = strip_unc_subprefix_u16(after_nt) {
+                return (None, unc_rest, true);
+            }
+            if let Some((drive, rest)) = split_drive_letter_u16(after_nt) {
+                return (Some(drive), rest, false);
+            }
+            if let Some((drive, prefix_len)) = self.match_device_u16(after_nt) {
+                return (drive_str_to_u16(drive), &after_nt[prefix_len..], false);
+            }
+            return (None, after_nt, false);
+        }
+
+        if let Some((drive, prefix_len)) = self.match_device_u16(slice) {
+            return (drive_str_to_u16(drive), &slice[prefix_len..], false);
+        }
+
+        if let Some((drive, rest)) = split_drive_letter_u16(slice) {
+            return (Some(drive), rest, false);
+        }
+
+        if slice.len() >= 2 && is_sep_u16(slice[0]) && is_sep_u16(slice[1]) {
+            return (None, &slice[1..], true);
+        }
+
+        (None, slice, false)
+    }
+
     #[inline]
     fn match_device_u16(&self, path_u16: &[u16]) -> Option<(&str, usize)> {
         for (dev_u16, drive) in &self.mappings {
@@ -164,6 +216,59 @@ impl DosVolumeMap {
                 return Some((drive.as_str(), dev_u16.len()));
             }
         }
+        None
+    }
+}
+
+#[inline]
+const fn is_sep_u16(c: u16) -> bool {
+    c == b'\\' as u16 || c == b'/' as u16
+}
+
+#[inline]
+fn strip_nt_dos_prefix_u16(slice: &[u16]) -> Option<&[u16]> {
+    const NT_PREFIX: [u16; 4] = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
+    const WIN32_PREFIX: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    if starts_with_ignore_ascii_case_u16(slice, &NT_PREFIX)
+        || starts_with_ignore_ascii_case_u16(slice, &WIN32_PREFIX)
+    {
+        Some(&slice[4..])
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn strip_unc_subprefix_u16(slice: &[u16]) -> Option<&[u16]> {
+    const UNC_PREFIX: [u16; 4] = [b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
+    if starts_with_ignore_ascii_case_u16(slice, &UNC_PREFIX) {
+        // Keep the leading backslash (`\server\share...`) so segment matching is uniform.
+        Some(&slice[3..])
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn split_drive_letter_u16(slice: &[u16]) -> Option<([u16; 2], &[u16])> {
+    if slice.len() >= 2
+        && ((slice[0] >= b'A' as u16 && slice[0] <= b'Z' as u16)
+            || (slice[0] >= b'a' as u16 && slice[0] <= b'z' as u16))
+        && slice[1] == b':' as u16
+        && (slice.len() == 2 || is_sep_u16(slice[2]))
+    {
+        Some(([slice[0], slice[1]], &slice[2..]))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn drive_str_to_u16(drive: &str) -> Option<[u16; 2]> {
+    let b = drive.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        Some([b[0] as u16, b[1] as u16])
+    } else {
         None
     }
 }

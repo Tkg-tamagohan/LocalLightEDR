@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ledr_proto::{
@@ -50,10 +50,15 @@ impl fmt::Display for ChannelClosedError {
 impl std::error::Error for ChannelClosedError {}
 
 #[derive(Debug)]
+struct TelemetryState {
+    queue: VecDeque<SensorEvent>,
+    closed: bool,
+}
+
+#[derive(Debug)]
 struct TelemetryRing {
     capacity: usize,
-    queue: Mutex<VecDeque<SensorEvent>>,
-    closed: AtomicBool,
+    state: Mutex<TelemetryState>,
     dropped: AtomicU64,
     notify: Notify,
 }
@@ -62,46 +67,52 @@ impl TelemetryRing {
     fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
-            queue: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
-            closed: AtomicBool::new(false),
+            state: Mutex::new(TelemetryState {
+                queue: VecDeque::with_capacity(capacity.min(1024)),
+                closed: false,
+            }),
             dropped: AtomicU64::new(0),
             notify: Notify::new(),
         }
     }
 
     fn push(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(ChannelClosedError(event));
-        }
         {
-            let mut guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.len() >= self.capacity {
-                guard.pop_front();
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.closed {
+                return Err(ChannelClosedError(event));
+            }
+            if guard.queue.len() >= self.capacity {
+                guard.queue.pop_front();
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
-            guard.push_back(event);
+            guard.queue.push_back(event);
         }
         self.notify.notify_one();
         Ok(())
     }
 
     fn try_pop(&self) -> Option<SensorEvent> {
-        let mut guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        guard.pop_front()
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.queue.pop_front()
     }
 
     fn len(&self) -> usize {
-        let guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        guard.len()
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.queue.len()
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.closed = true;
+        }
         self.notify.notify_waiters();
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.closed
     }
 }
 
@@ -110,6 +121,27 @@ struct SharedStats {
     high_capacity: usize,
     high_dropped: AtomicU64,
     closed: AtomicBool,
+    in_flight_high: AtomicUsize,
+    in_flight_notify: Notify,
+}
+
+struct InFlightHighGuard<'a> {
+    stats: &'a SharedStats,
+}
+
+impl<'a> InFlightHighGuard<'a> {
+    fn enter(stats: &'a SharedStats) -> Self {
+        stats.in_flight_high.fetch_add(1, Ordering::SeqCst);
+        Self { stats }
+    }
+}
+
+impl Drop for InFlightHighGuard<'_> {
+    fn drop(&mut self) {
+        if self.stats.in_flight_high.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.stats.in_flight_notify.notify_waiters();
+        }
+    }
 }
 
 /// Cloneable producer handle for [`TwoLaneChannel`].
@@ -147,7 +179,8 @@ impl TwoLaneSender {
 
     /// Sends a high-priority event, waiting for capacity instead of dropping (`L-10`).
     pub async fn send_high_priority(&self, event: SensorEvent) -> Result<(), HighPrioritySendError> {
-        if self.stats.closed.load(Ordering::Acquire) {
+        let _guard = InFlightHighGuard::enter(&self.stats);
+        if self.stats.closed.load(Ordering::SeqCst) {
             return Err(HighPrioritySendError::Closed(event));
         }
         self.high_tx
@@ -158,7 +191,8 @@ impl TwoLaneSender {
 
     /// Attempts to enqueue a high-priority event without awaiting or dropping (`L-10`).
     pub fn try_send_high_priority(&self, event: SensorEvent) -> Result<(), HighPrioritySendError> {
-        if self.stats.closed.load(Ordering::Acquire) {
+        let _guard = InFlightHighGuard::enter(&self.stats);
+        if self.stats.closed.load(Ordering::SeqCst) {
             return Err(HighPrioritySendError::Closed(event));
         }
         self.high_tx.try_send(event).map_err(|err| match err {
@@ -171,7 +205,8 @@ impl TwoLaneSender {
     pub fn blocking_send(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
         match event.default_lane() {
             EventLane::HighPriority => {
-                if self.stats.closed.load(Ordering::Acquire) {
+                let _guard = InFlightHighGuard::enter(&self.stats);
+                if self.stats.closed.load(Ordering::SeqCst) {
                     return Err(ChannelClosedError(event));
                 }
                 self.high_tx
@@ -189,9 +224,10 @@ impl TwoLaneSender {
 
     /// Marks the channel closed so consumers drain all remaining queued events and terminate.
     pub fn close(&self) {
-        self.stats.closed.store(true, Ordering::Release);
+        self.stats.closed.store(true, Ordering::SeqCst);
         self.telemetry.close();
         let _ = self.close_tx.send(true);
+        self.stats.in_flight_notify.notify_waiters();
     }
 
     /// Current queued depth in the high-priority lane.
@@ -236,6 +272,7 @@ impl TwoLaneSender {
 pub struct TwoLaneReceiver {
     high_rx: mpsc::Receiver<SensorEvent>,
     telemetry: Arc<TelemetryRing>,
+    stats: Arc<SharedStats>,
     close_rx: watch::Receiver<bool>,
 }
 
@@ -256,13 +293,32 @@ impl TwoLaneReceiver {
             }
 
             if *self.close_rx.borrow() || self.telemetry.is_closed() {
-                if let Ok(ev) = self.high_rx.try_recv() {
-                    return Some(ev);
+                if self.stats.in_flight_high.load(Ordering::SeqCst) == 0 {
+                    self.high_rx.close();
+                    if let Some(ev) = self.high_rx.recv().await {
+                        return Some(ev);
+                    }
+                    if let Some(ev) = self.telemetry.try_pop() {
+                        return Some(ev);
+                    }
+                    return None;
                 }
-                if let Some(ev) = self.telemetry.try_pop() {
-                    return Some(ev);
+
+                let in_flight_notified = self.stats.in_flight_notify.notified();
+                tokio::pin!(in_flight_notified);
+                if self.stats.in_flight_high.load(Ordering::SeqCst) == 0 {
+                    continue;
                 }
-                return None;
+                tokio::select! {
+                    biased;
+                    maybe_high = self.high_rx.recv() => {
+                        if let Some(ev) = maybe_high {
+                            return Some(ev);
+                        }
+                    }
+                    _ = &mut in_flight_notified => {}
+                }
+                continue;
             }
 
             tokio::select! {
@@ -282,6 +338,11 @@ impl TwoLaneReceiver {
 
     /// Non-blocking drain of all currently buffered events (high-priority first, then telemetry).
     pub fn drain_ready(&mut self) -> Vec<SensorEvent> {
+        if (*self.close_rx.borrow() || self.telemetry.is_closed())
+            && self.stats.in_flight_high.load(Ordering::SeqCst) == 0
+        {
+            self.high_rx.close();
+        }
         let mut out = Vec::new();
         while let Ok(ev) = self.high_rx.try_recv() {
             out.push(ev);
@@ -320,19 +381,23 @@ impl TwoLaneChannel {
         let telemetry = Arc::new(TelemetryRing::new(tel_cap));
         let (close_tx, close_rx) = watch::channel(false);
 
+        let stats = Arc::new(SharedStats {
+            high_capacity: hp_cap,
+            high_dropped: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            in_flight_high: AtomicUsize::new(0),
+            in_flight_notify: Notify::new(),
+        });
         let sender = TwoLaneSender {
             high_tx,
             telemetry: Arc::clone(&telemetry),
-            stats: Arc::new(SharedStats {
-                high_capacity: hp_cap,
-                high_dropped: AtomicU64::new(0),
-                closed: AtomicBool::new(false),
-            }),
+            stats: Arc::clone(&stats),
             close_tx: Arc::new(close_tx),
         };
         let receiver = TwoLaneReceiver {
             high_rx,
             telemetry,
+            stats,
             close_rx,
         };
         Self { sender, receiver }

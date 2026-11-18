@@ -2,7 +2,7 @@
 
 mod schema;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -178,6 +178,11 @@ impl LedrStore {
     /// `CanaryFileAccess`, when `STORE_BATCH_MAX_EVENTS` (500) is reached, or when
     /// `STORE_BATCH_FLUSH_INTERVAL_MS` (1000 ms) has elapsed since the oldest buffered event.
     ///
+    /// Note on `SensorEvent::ScriptEvaluated`: script telemetry (AMSI / PowerShell 4104) is
+    /// evaluated in-memory by `SigmaEngine` (`AUTO-06`, `L-12`) and persisted inside
+    /// `alerts.context_json` upon rule match rather than in a dedicated telemetry table in the
+    /// 7-table SQLite schema, so `ingest_event` skips buffering it and returns `Ok(false)`.
+    ///
     /// Returns `Ok(true)` if an immediate flush occurred.
     pub fn ingest_event(
         &self,
@@ -187,6 +192,7 @@ impl LedrStore {
         action: &str,
     ) -> Result<bool, StoreError> {
         if matches!(event, SensorEvent::ScriptEvaluated { .. }) {
+            // Evaluated in-memory by Layer 2 SigmaEngine and stored in alerts.context_json on match.
             tracing::trace!("skipping direct telemetry table buffering for ScriptEvaluated");
             return Ok(false);
         }
@@ -225,17 +231,25 @@ impl LedrStore {
     /// Writes all currently buffered events in a single SQLite transaction and returns the count flushed.
     pub fn flush_batch(&self) -> Result<usize, StoreError> {
         let mut writer = self.lock_writer()?;
-        let events = self.drain_batch()?;
+        if self.lock_batch()?.events.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = writer.transaction()?;
+        let events = match self.drain_batch() {
+            Ok(events) => events,
+            Err(err) => {
+                let _ = tx.rollback();
+                return Err(err);
+            }
+        };
         if events.is_empty() {
+            let _ = tx.rollback();
             return Ok(0);
         }
 
         let count = events.len();
-        let tx = writer.transaction()?;
-        if let Err(err) = write_buffered_events(&tx, &events).and_then(|()| {
-            tx.commit()?;
-            Ok(())
-        }) {
+        if let Err(err) = execute_batch_tx(tx, &events, None) {
             let _ = self.prepend_batch(events);
             return Err(err);
         }
@@ -280,50 +294,18 @@ impl LedrStore {
     /// Records or updates an alert immediately in a transaction (flushing any pending batch first).
     pub fn record_alert(&self, alert: &AlertRecord) -> Result<(), StoreError> {
         let mut writer = self.lock_writer()?;
-        let events = self.drain_batch()?;
-
         let tx = writer.transaction()?;
-        if !events.is_empty() {
-            if let Err(err) = write_buffered_events(&tx, &events) {
-                drop(tx);
-                let _ = self.prepend_batch(events);
+        let events = match self.drain_batch() {
+            Ok(events) => events,
+            Err(err) => {
+                let _ = tx.rollback();
                 return Err(err);
             }
-        }
+        };
 
-        tx.execute(
-            "INSERT INTO alerts (
-                alert_id, timestamp_ms, severity, source_layer, rule_id, title,
-                process_instance_id, process_suspended, status, context_json, resolved_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(alert_id) DO UPDATE SET
-                timestamp_ms = excluded.timestamp_ms,
-                severity = excluded.severity,
-                source_layer = excluded.source_layer,
-                rule_id = excluded.rule_id,
-                title = excluded.title,
-                process_instance_id = excluded.process_instance_id,
-                process_suspended = excluded.process_suspended,
-                status = excluded.status,
-                context_json = excluded.context_json,
-                resolved_at_ms = excluded.resolved_at_ms",
-            params![
-                alert.alert_id,
-                alert.timestamp_ms,
-                alert.severity.as_db_str(),
-                alert.source_layer,
-                alert.rule_id,
-                alert.title,
-                alert.process_instance_id,
-                i64::from(alert.process_suspended),
-                alert.status.as_db_str(),
-                alert.context_json,
-                alert.resolved_at_ms,
-            ],
-        )?;
-        if let Err(err) = tx.commit() {
+        if let Err(err) = execute_batch_tx(tx, &events, Some(alert)) {
             let _ = self.prepend_batch(events);
-            return Err(StoreError::Sqlite(err));
+            return Err(err);
         }
 
         Ok(())
@@ -661,6 +643,50 @@ impl LedrStore {
         })
     }
 
+    /// Marks running processes (`exited_at_ms IS NULL` and `created_at_ms <= reconciled_at_ms`)
+    /// whose `process_instance_id` is absent from `active_instance_ids` as exited at
+    /// `reconciled_at_ms`, returning the updated row count.
+    pub fn reconcile_stale_running_processes(
+        &self,
+        active_instance_ids: &[String],
+        reconciled_at_ms: i64,
+    ) -> Result<usize, StoreError> {
+        self.flush_batch()?;
+        let mut writer = self.lock_writer()?;
+        let tx = writer.transaction()?;
+
+        let active_set: HashSet<&str> = active_instance_ids.iter().map(String::as_str).collect();
+        let stale_ids: Vec<String> = {
+            let mut select_stmt = tx.prepare(
+                "SELECT process_instance_id FROM processes
+                 WHERE exited_at_ms IS NULL AND created_at_ms <= ?1",
+            )?;
+            let mut rows = select_stmt.query(params![reconciled_at_ms])?;
+            let mut stale = Vec::new();
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                if !active_set.contains(id.as_str()) {
+                    stale.push(id);
+                }
+            }
+            stale
+        };
+
+        let mut updated = 0usize;
+        if !stale_ids.is_empty() {
+            let mut update_stmt = tx.prepare(
+                "UPDATE processes SET exited_at_ms = ?1
+                 WHERE process_instance_id = ?2 AND exited_at_ms IS NULL",
+            )?;
+            for id in &stale_ids {
+                updated += update_stmt.execute(params![reconciled_at_ms, id])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Flushes all buffered events and executes `PRAGMA wal_checkpoint(TRUNCATE);` (`AUTO-10`).
     pub fn checkpoint_truncate(&self) -> Result<(), StoreError> {
         self.flush_batch()?;
@@ -749,6 +775,55 @@ fn clamp_limit(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
+fn insert_alert_row(tx: &Transaction<'_>, alert: &AlertRecord) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO alerts (
+            alert_id, timestamp_ms, severity, source_layer, rule_id, title,
+            process_instance_id, process_suspended, status, context_json, resolved_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(alert_id) DO UPDATE SET
+            timestamp_ms = excluded.timestamp_ms,
+            severity = excluded.severity,
+            source_layer = excluded.source_layer,
+            rule_id = excluded.rule_id,
+            title = excluded.title,
+            process_instance_id = excluded.process_instance_id,
+            process_suspended = excluded.process_suspended,
+            status = excluded.status,
+            context_json = excluded.context_json,
+            resolved_at_ms = excluded.resolved_at_ms",
+        params![
+            alert.alert_id,
+            alert.timestamp_ms,
+            alert.severity.as_db_str(),
+            alert.source_layer,
+            alert.rule_id,
+            alert.title,
+            alert.process_instance_id,
+            i64::from(alert.process_suspended),
+            alert.status.as_db_str(),
+            alert.context_json,
+            alert.resolved_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn execute_batch_tx(
+    tx: Transaction<'_>,
+    events: &[BufferedEvent],
+    alert: Option<&AlertRecord>,
+) -> Result<(), StoreError> {
+    if !events.is_empty() {
+        write_buffered_events(&tx, events)?;
+    }
+    if let Some(alert) = alert {
+        insert_alert_row(&tx, alert)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn upsert_process_row(tx: &Transaction<'_>, process: &ProcessRecord) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO processes (
@@ -769,7 +844,7 @@ fn upsert_process_row(tx: &Transaction<'_>, process: &ProcessRecord) -> Result<(
             END,
             user_sid = COALESCE(excluded.user_sid, processes.user_sid),
             origin_url = COALESCE(excluded.origin_url, processes.origin_url),
-            exited_at_ms = COALESCE(excluded.exited_at_ms, processes.exited_at_ms)",
+            exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)",
         params![
             process.process_instance_id,
             i64::from(process.pid),
@@ -799,33 +874,54 @@ fn instance_id_matches_pid(instance_id: &str, pid: u32) -> bool {
 fn resolve_process_instance_id(
     tx: &Transaction<'_>,
     pid: u32,
+    event_ts_ms: i64,
     hint: Option<&str>,
-    batch_pids: &HashMap<u32, String>,
 ) -> Result<String, StoreError> {
-    if let Some(id) = hint {
-        if instance_id_matches_pid(id, pid) {
-            return Ok(id.to_owned());
+    let valid_hint = match hint.filter(|id| instance_id_matches_pid(id, pid)) {
+        Some(h) => {
+            let window: Option<(i64, Option<i64>)> = tx
+                .query_row(
+                    "SELECT created_at_ms, exited_at_ms FROM processes
+                     WHERE process_instance_id = ?1",
+                    params![h],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            match window {
+                Some((created_at_ms, exited_at_ms))
+                    if created_at_ms > event_ts_ms
+                        || exited_at_ms.is_some_and(|e| event_ts_ms > e) =>
+                {
+                    None
+                }
+                _ => Some(h),
+            }
         }
-    }
-    if let Some(id) = batch_pids.get(&pid) {
-        return Ok(id.clone());
-    }
-    let existing: Option<String> = tx
+        None => None,
+    };
+
+    if let Some(matched) = tx
         .query_row(
             "SELECT process_instance_id FROM processes
              WHERE pid = ?1
-             ORDER BY (exited_at_ms IS NULL) DESC, created_at_ms DESC
+               AND created_at_ms <= ?2
+               AND (exited_at_ms IS NULL OR exited_at_ms >= ?2)
+             ORDER BY created_at_ms DESC
              LIMIT 1",
-            params![i64::from(pid)],
-            |row| row.get(0),
+            params![i64::from(pid), event_ts_ms],
+            |row| row.get::<_, String>(0),
         )
-        .optional()?;
-    Ok(existing.unwrap_or_else(|| format!("{pid}:0")))
+        .optional()?
+    {
+        return Ok(matched);
+    }
+
+    Ok(valid_hint
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{pid}:0")))
 }
 
 fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Result<(), StoreError> {
-    let mut batch_pids: HashMap<u32, String> = HashMap::new();
-
     for item in events {
         let hint = item.parent_instance_id.as_deref();
         match &item.event {
@@ -837,7 +933,6 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                 user_sid,
             } => {
                 let instance_id = identity.instance_id();
-                batch_pids.insert(identity.pid, instance_id.clone());
                 let cmd = (!command_line.is_empty()).then(|| command_line.clone());
                 let record = ProcessRecord {
                     process_instance_id: instance_id,
@@ -865,18 +960,41 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                 exit_code: _,
             } => {
                 let exited_at_ms = filetime_100ns_to_unix_ms(*exit_time_100ns, item.received_at_ms);
-                let mut updated = 0usize;
+                let mut handled_by_hint = false;
                 if let Some(id) = hint.filter(|id| instance_id_matches_pid(id, *pid)) {
-                    updated = tx.execute(
-                        "UPDATE processes SET exited_at_ms = ?1
-                         WHERE process_instance_id = ?2 AND exited_at_ms IS NULL",
-                        params![exited_at_ms, id],
-                    )?;
+                    let existing: Option<(i64, Option<i64>)> = tx
+                        .query_row(
+                            "SELECT created_at_ms, exited_at_ms FROM processes
+                             WHERE process_instance_id = ?1",
+                            params![id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    if let Some((created_at_ms, existing_exit)) = existing {
+                        if created_at_ms <= exited_at_ms {
+                            if existing_exit.is_none() {
+                                tx.execute(
+                                    "UPDATE processes SET exited_at_ms = ?1
+                                     WHERE process_instance_id = ?2 AND exited_at_ms IS NULL",
+                                    params![exited_at_ms, id],
+                                )?;
+                            }
+                            handled_by_hint = true;
+                        }
+                    }
                 }
-                if updated == 0 {
+                if !handled_by_hint {
                     tx.execute(
                         "UPDATE processes SET exited_at_ms = ?1
-                         WHERE pid = ?2 AND exited_at_ms IS NULL",
+                         WHERE process_instance_id = (
+                             SELECT process_instance_id
+                             FROM processes
+                             WHERE pid = ?2
+                               AND exited_at_ms IS NULL
+                               AND created_at_ms <= ?1
+                             ORDER BY created_at_ms DESC
+                             LIMIT 1
+                         )",
                         params![exited_at_ms, i64::from(*pid)],
                     )?;
                 }
@@ -888,7 +1006,8 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                 resolved_ips,
                 timestamp_ms,
             } => {
-                let process_instance_id = resolve_process_instance_id(tx, *pid, hint, &batch_pids)?;
+                let process_instance_id =
+                    resolve_process_instance_id(tx, *pid, *timestamp_ms, hint)?;
                 let ip_strings: Vec<String> =
                     resolved_ips.iter().map(ToString::to_string).collect();
                 let resolved_json = serde_json::to_string(&ip_strings)?;
@@ -914,7 +1033,8 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                 domain_hint,
                 timestamp_ms,
             } => {
-                let process_instance_id = resolve_process_instance_id(tx, *pid, hint, &batch_pids)?;
+                let process_instance_id =
+                    resolve_process_instance_id(tx, *pid, *timestamp_ms, hint)?;
                 tx.execute(
                     "INSERT INTO network_events (
                         timestamp_ms, process_instance_id, protocol, dst_ip, dst_port, domain_hint, action
@@ -938,7 +1058,8 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                 is_write_or_delete: _,
                 timestamp_ms,
             } => {
-                let process_instance_id = resolve_process_instance_id(tx, *pid, hint, &batch_pids)?;
+                let process_instance_id =
+                    resolve_process_instance_id(tx, *pid, *timestamp_ms, hint)?;
                 tx.execute(
                     "INSERT INTO file_canary_events (
                         timestamp_ms, process_instance_id, target_path, category, access_mask, action_taken
@@ -953,6 +1074,7 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                     ],
                 )?;
             }
+            // Evaluated in-memory by Layer 2 SigmaEngine and stored in alerts.context_json on match.
             SensorEvent::ScriptEvaluated { .. } => {}
         }
     }

@@ -13,6 +13,7 @@ pub use channel::{
 };
 pub use engine::{DaemonConfig, DaemonEngine};
 pub use ipc::{
-    inspect_pipe_client_exe, is_authorized_ui_caller, start_ipc_server, IpcServerHandle,
+    inspect_pipe_client_exe, is_authorized_bridge_caller, is_authorized_ui_caller,
+    start_ipc_server, IpcServerHandle,
 };
 pub use process_table::{ActiveProcessEntry, ActiveProcessTable, ProcessStartResolution};

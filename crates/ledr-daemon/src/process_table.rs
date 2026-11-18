@@ -74,7 +74,13 @@ impl ActiveProcessTable {
 
         let (parent_instance_id, parent_exe_path, parent_command_line) =
             if parent_pid != 0 && parent_pid != identity.pid {
-                if let Some(parent_entry) = self.lookup_by_pid(parent_pid) {
+                let parent_opt = self
+                    .lookup_by_pid_at(parent_pid, created_at_ms)
+                    .or_else(|| {
+                        self.lookup_by_pid(parent_pid)
+                            .filter(|entry| entry.identity.create_time_100ns == 0)
+                    });
+                if let Some(parent_entry) = parent_opt {
                     (
                         Some(parent_entry.instance_id.clone()),
                         Some(parent_entry.exe_path.clone()),
@@ -101,10 +107,14 @@ impl ActiveProcessTable {
             if existing.user_sid.is_none() {
                 existing.user_sid = user_sid;
             }
-            self.pid_to_identity.insert(identity.pid, identity);
+            let is_active = existing.exited_at_ms.is_none();
+            let resolved_parent_id = existing.parent_instance_id.clone();
+            if is_active {
+                self.pid_to_identity.insert(identity.pid, identity);
+            }
             return ProcessStartResolution {
                 instance_id,
-                parent_instance_id: existing.parent_instance_id.clone(),
+                parent_instance_id: resolved_parent_id,
                 parent_exe_path,
                 parent_command_line,
             };
@@ -161,21 +171,70 @@ impl ActiveProcessTable {
     /// Marks the active process for `pid` as exited while keeping it cached until capacity eviction
     /// so in-flight telemetry events and immediate child spawns can still resolve its metadata.
     pub fn on_process_stop(&mut self, pid: u32, exited_at_ms: i64) -> Option<String> {
-        let ident = self.pid_to_identity.get(&pid).copied()?;
-        let instance_id = ident.instance_id();
-        let entry = self.entries.get_mut(&instance_id)?;
+        let candidate_id = if let Some(ident) = self.pid_to_identity.get(&pid).copied() {
+            let id = ident.instance_id();
+            match self.entries.get(&id) {
+                Some(entry) if entry.created_at_ms <= exited_at_ms => Some(id),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let target_id = candidate_id.or_else(|| {
+            self.entries
+                .values()
+                .filter(|e| {
+                    e.identity.pid == pid
+                        && e.exited_at_ms.is_none()
+                        && e.created_at_ms <= exited_at_ms
+                })
+                .max_by_key(|e| (e.created_at_ms, e.identity.create_time_100ns))
+                .map(|e| e.instance_id.clone())
+        })?;
+
+        let entry = self.entries.get_mut(&target_id)?;
         if entry.exited_at_ms.is_none() {
             entry.exited_at_ms = Some(exited_at_ms);
             self.active_count = self.active_count.saturating_sub(1);
-            self.exited_fifo.push_back(instance_id.clone());
+            self.exited_fifo.push_back(target_id.clone());
         }
-        Some(instance_id)
+        Some(target_id)
     }
 
     /// O(1) lookup by PID (matches active or recently exited un-evicted entry).
     pub fn lookup_by_pid(&self, pid: u32) -> Option<&ActiveProcessEntry> {
         let ident = self.pid_to_identity.get(&pid)?;
         self.entries.get(&ident.instance_id())
+    }
+
+    /// Time-window lookup by PID (`BUG_0002`), checking the O(1) current mapping first and
+    /// falling back to cached exited incarnations alive at `event_ts_ms` (`created_at_ms <= event_ts_ms <= exited_at_ms`).
+    pub fn lookup_by_pid_at(&self, pid: u32, event_ts_ms: i64) -> Option<&ActiveProcessEntry> {
+        if let Some(entry) = self.lookup_by_pid(pid) {
+            if entry.created_at_ms <= event_ts_ms
+                && entry.exited_at_ms.is_none_or(|exit_ts| event_ts_ms <= exit_ts)
+            {
+                return Some(entry);
+            }
+        }
+        self.entries
+            .values()
+            .filter(|e| {
+                e.identity.pid == pid
+                    && e.created_at_ms <= event_ts_ms
+                    && e.exited_at_ms.is_none_or(|exit_ts| event_ts_ms <= exit_ts)
+            })
+            .max_by_key(|e| (e.created_at_ms, e.identity.create_time_100ns))
+    }
+
+    /// Returns `instance_id`s for all currently unexited processes in the table.
+    pub fn active_instance_ids(&self) -> Vec<String> {
+        self.entries
+            .values()
+            .filter(|e| e.exited_at_ms.is_none())
+            .map(|e| e.instance_id.clone())
+            .collect()
     }
 
     /// O(1) lookup by composite `instance_id` (`"{pid}:{create_time_100ns}"`).
@@ -312,5 +371,43 @@ mod tests {
         assert_eq!(table.total_len(), 3);
         assert!(table.get_by_instance_id("100:1000").is_none());
         assert!(table.get_by_instance_id("200:2000").is_some());
+    }
+
+    #[test]
+    fn process_table_pid_reuse_time_window_and_snapshot_race_preservation() {
+        let mut table = ActiveProcessTable::new(16);
+        let a = ProcessIdentity::new(500, 1000);
+        let b = ProcessIdentity::new(500, 3000);
+
+        table.on_process_start(a, 4, "a.exe".to_string(), String::new(), None, 100);
+        assert_eq!(table.on_process_stop(500, 200), Some(a.instance_id()));
+        table.on_process_start(b, 4, "b.exe".to_string(), String::new(), None, 300);
+
+        // Time-window lookup resolves A within [100, 200] and B at >= 300.
+        assert_eq!(
+            table.lookup_by_pid_at(500, 150).map(|e| e.identity),
+            Some(a)
+        );
+        assert_eq!(
+            table.lookup_by_pid_at(500, 350).map(|e| e.identity),
+            Some(b)
+        );
+        assert!(table.lookup_by_pid_at(500, 250).is_none());
+
+        // Snapshot arriving after ProcessStop must preserve exited_at_ms and not clobber B.
+        table.on_process_start(a, 4, "a_full.exe".to_string(), "a.exe --arg".to_string(), None, 100);
+        let a_entry = table.get_by_instance_id(&a.instance_id()).expect("A retained");
+        assert_eq!(a_entry.exited_at_ms, Some(200));
+        assert_eq!(a_entry.exe_path, "a_full.exe");
+        assert_eq!(table.lookup_by_pid(500).map(|e| e.identity), Some(b));
+
+        // Out-of-order stop for an older incarnation must not mark newer B as exited.
+        assert_eq!(table.on_process_stop(500, 250), None);
+        assert_eq!(
+            table
+                .get_by_instance_id(&b.instance_id())
+                .and_then(|e| e.exited_at_ms),
+            None
+        );
     }
 }

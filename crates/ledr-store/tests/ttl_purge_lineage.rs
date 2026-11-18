@@ -9,6 +9,7 @@ use ledr_proto::{
 use ledr_store::{
     default_alert_status, default_retention_days, sqlite_version, store_version, LedrStore,
 };
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
@@ -749,4 +750,362 @@ fn store_04_process_lineage_order_and_cycle_safety() {
     store
         .checkpoint_truncate()
         .expect("in-memory checkpoint_truncate succeeds");
+}
+
+#[test]
+fn store_05_alert_failure_preserves_buffered_batch() {
+    let dir = TempDir::new().expect("create temp dir");
+    let db_path = dir.path().join("alert_fail_preserves_batch.db");
+    let store = LedrStore::open(&db_path).expect("open LedrStore");
+
+    let (proc_id, proc_start) = make_process_start(
+        700,
+        1_750_000_000_000,
+        4,
+        r"C:\Temp\beacon.exe",
+        "beacon.exe --poll",
+    );
+    let dns = SensorEvent::DnsQuery {
+        pid: 700,
+        query_name: "c2-fail.example.test".to_string(),
+        query_type: 1,
+        resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))],
+        timestamp_ms: 1_750_000_000_100,
+    };
+    let net = SensorEvent::NetworkConnect {
+        pid: 700,
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+        dst_port: 443,
+        domain_hint: Some("c2-fail.example.test".to_string()),
+        timestamp_ms: 1_750_000_000_200,
+    };
+
+    assert!(!store
+        .ingest_event(&proc_start, Some("4:1"), false, "")
+        .expect("buffer proc start"));
+    assert!(!store
+        .ingest_event(&dns, Some(&proc_id.instance_id()), true, "")
+        .expect("buffer dns"));
+    assert!(!store
+        .ingest_event(&net, Some(&proc_id.instance_id()), false, "OBSERVED")
+        .expect("buffer net"));
+    assert_eq!(store.buffered_len(), 3);
+
+    // Inject an INSERT failure on alerts (simulating disk full / SQLite abort).
+    let fault_conn = Connection::open(&db_path).expect("open secondary sqlite connection");
+    fault_conn
+        .execute_batch(
+            "CREATE TRIGGER fail_alert_insert
+             BEFORE INSERT ON alerts
+             BEGIN
+                 SELECT RAISE(ABORT, 'simulated disk full');
+             END;",
+        )
+        .expect("create fail_alert_insert trigger");
+
+    let alert = make_alert(
+        "alrt-fail-05",
+        1_750_000_000_300,
+        Some(&proc_id.instance_id()),
+        AlertStatus::Pending,
+        None,
+    );
+    let err = store
+        .record_alert(&alert)
+        .expect_err("record_alert must fail when trigger aborts");
+    assert!(err.to_string().contains("simulated disk full"));
+
+    // Buffered events must remain intact and uncommitted in the batch buffer.
+    assert_eq!(store.buffered_len(), 3);
+    let pre_snap = store
+        .query_flight_recorder(50, None)
+        .expect("query after failed alert tx");
+    assert!(pre_snap.processes.is_empty());
+    assert!(pre_snap.dns_queries.is_empty());
+    assert!(pre_snap.network_events.is_empty());
+    assert!(store
+        .list_alerts(None, 10)
+        .expect("no alert persisted")
+        .is_empty());
+
+    // Drop the failure trigger and verify flush_batch persists all preserved events.
+    fault_conn
+        .execute_batch("DROP TRIGGER fail_alert_insert;")
+        .expect("drop fail_alert_insert trigger");
+
+    let flushed = store
+        .flush_batch()
+        .expect("flush_batch persists preserved events");
+    assert_eq!(flushed, 3);
+    assert_eq!(store.buffered_len(), 0);
+
+    let post_snap = store
+        .query_flight_recorder(50, Some(&proc_id.instance_id()))
+        .expect("query after flush");
+    assert_eq!(post_snap.processes.len(), 1);
+    assert_eq!(post_snap.dns_queries.len(), 1);
+    assert_eq!(post_snap.network_events.len(), 1);
+    assert_eq!(post_snap.dns_queries[0].query_name, "c2-fail.example.test");
+
+    // Also verify flush_batch failure preserves newly buffered events.
+    let extra_dns = SensorEvent::DnsQuery {
+        pid: 700,
+        query_name: "after-recovery.example.test".to_string(),
+        query_type: 1,
+        resolved_ips: vec![],
+        timestamp_ms: 1_750_000_000_400,
+    };
+    assert!(!store
+        .ingest_event(&extra_dns, Some(&proc_id.instance_id()), false, "")
+        .expect("buffer extra dns"));
+    assert_eq!(store.buffered_len(), 1);
+
+    fault_conn
+        .execute_batch(
+            "CREATE TRIGGER fail_dns_insert
+             BEFORE INSERT ON dns_queries
+             BEGIN
+                 SELECT RAISE(ABORT, 'simulated dns write error');
+             END;",
+        )
+        .expect("create fail_dns_insert trigger");
+    assert!(store.flush_batch().is_err());
+    assert_eq!(store.buffered_len(), 1);
+
+    fault_conn
+        .execute_batch("DROP TRIGGER fail_dns_insert;")
+        .expect("drop fail_dns_insert trigger");
+    assert_eq!(store.flush_batch().expect("flush recovered extra dns"), 1);
+    assert_eq!(store.buffered_len(), 0);
+}
+
+#[test]
+fn store_06_pid_reuse_time_window_attribution() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+
+    let (proc_a, proc_a_start) =
+        make_process_start(42, 1000, 4, r"C:\Temp\proc_a.exe", "proc_a.exe --first");
+    let proc_a_stop = make_process_stop(42, 2000);
+    let (proc_b, proc_b_start) =
+        make_process_start(42, 3000, 4, r"C:\Temp\proc_b.exe", "proc_b.exe --reused");
+
+    store
+        .ingest_event(&proc_a_start, Some("4:1"), false, "")
+        .expect("ingest proc A start");
+    store
+        .ingest_event(&proc_a_stop, Some(&proc_a.instance_id()), false, "")
+        .expect("ingest proc A stop");
+    store
+        .ingest_event(&proc_b_start, Some("4:1"), false, "")
+        .expect("ingest proc B start");
+    store.flush_batch().expect("flush processes");
+
+    // BUG_0006: Upserting a snapshot of Process A with exited_at_ms=None must preserve exited=2000.
+    store
+        .upsert_process_record(&ProcessRecord {
+            process_instance_id: proc_a.instance_id(),
+            pid: 42,
+            parent_instance_id: Some("4:1".to_string()),
+            ppid: 4,
+            exe_path: r"C:\Temp\proc_a.exe".to_string(),
+            command_line: Some("proc_a.exe --first".to_string()),
+            sha256: Some("aaaa".to_string()),
+            signer_subject: None,
+            is_trusted_os: false,
+            user_sid: Some("S-1-5-21-1000".to_string()),
+            origin_url: None,
+            created_at_ms: 1000,
+            exited_at_ms: None,
+        })
+        .expect("upsert snapshot over exited proc A");
+    let snap_a_check = store
+        .query_flight_recorder(10, Some(&proc_a.instance_id()))
+        .expect("query proc A");
+    assert_eq!(snap_a_check.processes[0].exited_at_ms, Some(2000));
+    assert_eq!(snap_a_check.processes[0].sha256.as_deref(), Some("aaaa"));
+
+    // BUG_0006: An older ProcessStop (exit=2000) must never mark newer Process B (created=3000) exited.
+    store
+        .ingest_event(&make_process_stop(42, 2000), None, false, "")
+        .expect("ingest stale stop without hint");
+    store
+        .ingest_event(
+            &make_process_stop(42, 2000),
+            Some(&proc_b.instance_id()),
+            false,
+            "",
+        )
+        .expect("ingest stale stop with wrong hint");
+    store.flush_batch().expect("flush stale stops");
+
+    let snap_b_check = store
+        .query_flight_recorder(10, Some(&proc_b.instance_id()))
+        .expect("query proc B");
+    assert_eq!(snap_b_check.processes[0].exited_at_ms, None);
+
+    // BUG_0002: DnsQuery at ts=1500 must resolve to Process A even when hinted with Process B or None.
+    let dns_wrong_hint = SensorEvent::DnsQuery {
+        pid: 42,
+        query_name: "a-wrong-hint.example.test".to_string(),
+        query_type: 1,
+        resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+        timestamp_ms: 1500,
+    };
+    let dns_no_hint = SensorEvent::DnsQuery {
+        pid: 42,
+        query_name: "a-no-hint.example.test".to_string(),
+        query_type: 1,
+        resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35))],
+        timestamp_ms: 1500,
+    };
+    let dns_during_b = SensorEvent::DnsQuery {
+        pid: 42,
+        query_name: "b-stale-hint.example.test".to_string(),
+        query_type: 1,
+        resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 36))],
+        timestamp_ms: 3500,
+    };
+    let dns_gap = SensorEvent::DnsQuery {
+        pid: 42,
+        query_name: "gap-window.example.test".to_string(),
+        query_type: 1,
+        resolved_ips: vec![],
+        timestamp_ms: 2500,
+    };
+
+    store
+        .ingest_event(&dns_wrong_hint, Some(&proc_b.instance_id()), false, "")
+        .expect("ingest dns with out-of-window hint B");
+    store
+        .ingest_event(&dns_no_hint, None, false, "")
+        .expect("ingest dns with no hint");
+    store
+        .ingest_event(&dns_during_b, Some(&proc_a.instance_id()), false, "")
+        .expect("ingest dns during B with stale hint A");
+    store
+        .ingest_event(&dns_gap, Some(&proc_b.instance_id()), false, "")
+        .expect("ingest dns in gap with out-of-window hint B");
+    store.flush_batch().expect("flush dns queries");
+
+    let snap_a = store
+        .query_flight_recorder(20, Some(&proc_a.instance_id()))
+        .expect("query flight recorder for proc A");
+    let a_domains: Vec<&str> = snap_a
+        .dns_queries
+        .iter()
+        .map(|d| d.query_name.as_str())
+        .collect();
+    assert_eq!(snap_a.dns_queries.len(), 2);
+    assert!(a_domains.contains(&"a-wrong-hint.example.test"));
+    assert!(a_domains.contains(&"a-no-hint.example.test"));
+
+    let snap_b = store
+        .query_flight_recorder(20, Some(&proc_b.instance_id()))
+        .expect("query flight recorder for proc B");
+    assert_eq!(snap_b.dns_queries.len(), 1);
+    assert_eq!(
+        snap_b.dns_queries[0].query_name,
+        "b-stale-hint.example.test"
+    );
+
+    let snap_unknown = store
+        .query_flight_recorder(20, Some("42:0"))
+        .expect("query flight recorder for gap fallback");
+    assert_eq!(snap_unknown.dns_queries.len(), 1);
+    assert_eq!(
+        snap_unknown.dns_queries[0].query_name,
+        "gap-window.example.test"
+    );
+}
+
+#[test]
+fn store_07_reconcile_stale_running_processes_on_restart() {
+    let dir = TempDir::new().expect("create temp dir");
+    let db_path = dir.path().join("reconcile_restart.db");
+    let store = LedrStore::open(&db_path).expect("open LedrStore");
+
+    let now_ms = 1_750_000_000_000i64;
+    let old_created_ms = now_ms - 20 * DAY_MS;
+    let reconciled_at_ms = now_ms - 15 * DAY_MS;
+
+    let (stale_proc, stale_start) = make_process_start(
+        501,
+        old_created_ms,
+        4,
+        r"C:\Temp\stale_worker.exe",
+        "stale_worker.exe",
+    );
+    let (live_proc, live_start) = make_process_start(
+        502,
+        old_created_ms,
+        4,
+        r"C:\Windows\System32\svchost.exe",
+        "svchost.exe -k netsvcs",
+    );
+    let (newer_proc, newer_start) = make_process_start(
+        503,
+        reconciled_at_ms + 5000,
+        4,
+        r"C:\Temp\newer_worker.exe",
+        "newer_worker.exe",
+    );
+
+    // Flush stale_proc and newer_proc, leave live_proc buffered to verify flush_batch runs first.
+    store
+        .ingest_event(&stale_start, Some("4:1"), false, "")
+        .expect("ingest stale_proc");
+    store
+        .ingest_event(&newer_start, Some("4:1"), false, "")
+        .expect("ingest newer_proc");
+    store.flush_batch().expect("flush initial processes");
+
+    store
+        .ingest_event(&live_start, Some("4:1"), false, "")
+        .expect("buffer live_proc");
+    assert_eq!(store.buffered_len(), 1);
+
+    let updated = store
+        .reconcile_stale_running_processes(&[live_proc.instance_id()], reconciled_at_ms)
+        .expect("reconcile stale running processes");
+    assert_eq!(updated, 1);
+    assert_eq!(store.buffered_len(), 0);
+
+    let stale_snap = store
+        .query_flight_recorder(10, Some(&stale_proc.instance_id()))
+        .expect("query stale_proc");
+    assert_eq!(stale_snap.processes.len(), 1);
+    assert_eq!(stale_snap.processes[0].exited_at_ms, Some(reconciled_at_ms));
+
+    let live_snap = store
+        .query_flight_recorder(10, Some(&live_proc.instance_id()))
+        .expect("query live_proc");
+    assert_eq!(live_snap.processes.len(), 1);
+    assert_eq!(live_snap.processes[0].exited_at_ms, None);
+
+    let newer_snap = store
+        .query_flight_recorder(10, Some(&newer_proc.instance_id()))
+        .expect("query newer_proc");
+    assert_eq!(newer_snap.processes.len(), 1);
+    assert_eq!(newer_snap.processes[0].exited_at_ms, None);
+
+    // Stale reconciled process is past 14-day retention TTL and must be purged.
+    let purge_stats = store
+        .purge_expired(now_ms, 14)
+        .expect("purge expired reconciled process");
+    assert_eq!(purge_stats.processes_deleted, 1);
+
+    assert!(store
+        .query_flight_recorder(10, Some(&stale_proc.instance_id()))
+        .expect("stale_proc purged")
+        .processes
+        .is_empty());
+    assert_eq!(
+        store
+            .query_flight_recorder(10, Some(&live_proc.instance_id()))
+            .expect("live_proc retained")
+            .processes
+            .len(),
+        1
+    );
 }

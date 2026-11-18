@@ -1,17 +1,19 @@
 //! Core Layer 2 daemon pipeline wiring [`TwoLaneChannel`], [`ActiveProcessTable`],
 //! [`EarlyPruner`], [`SigmaEngine`], and [`LedrStore`].
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_proto::{
     AlertRecord, AlertStatus, EventLane, PipelineMetrics, SensorEvent,
-    ACTIVE_PROCESS_TABLE_CAPACITY, HIGH_PRIORITY_CHANNEL_CAPACITY, IPC_PIPE_NAME,
-    SHUTDOWN_FLUSH_TIMEOUT_MS, STORE_BATCH_FLUSH_INTERVAL_MS, TELEMETRY_CHANNEL_CAPACITY,
+    ACTIVE_PROCESS_TABLE_CAPACITY, DEFAULT_TTL_RETENTION_DAYS, HIGH_PRIORITY_CHANNEL_CAPACITY,
+    IPC_PIPE_NAME, SHUTDOWN_FLUSH_TIMEOUT_MS, STORE_BATCH_FLUSH_INTERVAL_MS,
+    TELEMETRY_CHANNEL_CAPACITY,
 };
 use ledr_rules::{assess_domain_risk, EarlyPruner, EventContext, SigmaEngine};
-use ledr_store::LedrStore;
+use ledr_store::{LedrStore, PurgeStats, StoreError};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -20,6 +22,9 @@ use crate::process_table::ActiveProcessTable;
 
 const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
 const TICKS_PER_MS: u64 = 10_000;
+const DEFAULT_TTL_PURGE_INTERVAL_MS: u64 = 3_600_000;
+const DEFAULT_MAX_CONCURRENT_IPC_CLIENTS: usize = 16;
+const DEFAULT_IPC_FRAME_TIMEOUT_MS: u64 = 5_000;
 
 /// Configuration options for [`DaemonEngine`] and the Named Pipe IPC server.
 #[derive(Debug, Clone)]
@@ -29,6 +34,10 @@ pub struct DaemonConfig {
     pub active_process_capacity: usize,
     pub batch_flush_interval_ms: u64,
     pub shutdown_flush_timeout_ms: u64,
+    pub ttl_purge_interval_ms: u64,
+    pub ttl_retention_days: u32,
+    pub max_concurrent_ipc_clients: usize,
+    pub ipc_frame_timeout_ms: u64,
     pub pipe_name: String,
     /// When `true` (Phase 1 `--foreground` dev mode), mutating IPC commands bypass the
     /// `C:\Program Files\LocalEDR\ledr-ui.exe` install-path check while still inspecting
@@ -44,6 +53,10 @@ impl Default for DaemonConfig {
             active_process_capacity: ACTIVE_PROCESS_TABLE_CAPACITY,
             batch_flush_interval_ms: STORE_BATCH_FLUSH_INTERVAL_MS,
             shutdown_flush_timeout_ms: SHUTDOWN_FLUSH_TIMEOUT_MS,
+            ttl_purge_interval_ms: DEFAULT_TTL_PURGE_INTERVAL_MS,
+            ttl_retention_days: DEFAULT_TTL_RETENTION_DAYS,
+            max_concurrent_ipc_clients: DEFAULT_MAX_CONCURRENT_IPC_CLIENTS,
+            ipc_frame_timeout_ms: DEFAULT_IPC_FRAME_TIMEOUT_MS,
             pipe_name: IPC_PIPE_NAME.to_string(),
             dev_mode_bypass_ui_auth: true,
         }
@@ -124,17 +137,41 @@ impl DaemonEngine {
     }
 
     /// Seeds the in-memory [`ActiveProcessTable`] and SQLite store with initial OS process snapshots
-    /// (`AUTO-03`), flushing them immediately.
+    /// (`AUTO-03`), flushes them immediately, and reconciles any stale running processes from prior
+    /// daemon sessions (`BUG_0008`).
     pub fn seed_processes(&self, snapshots: Vec<SensorEvent>) -> Result<usize, anyhow::Error> {
         let mut count = 0usize;
+        let mut active_id_set = HashSet::with_capacity(snapshots.len());
         for ev in snapshots {
-            if let SensorEvent::ProcessStart { .. } = &ev {
+            if let SensorEvent::ProcessStart { identity, .. } = &ev {
+                active_id_set.insert(identity.instance_id());
                 self.process_event(&ev);
                 count += 1;
             }
         }
+        if let Ok(table) = self.process_table.lock() {
+            for id in table.active_instance_ids() {
+                active_id_set.insert(id);
+            }
+        }
         self.store.flush_batch()?;
+        let active_ids: Vec<String> = active_id_set.into_iter().collect();
+        let reconciled = self
+            .store
+            .reconcile_stale_running_processes(&active_ids, current_unix_ms())?;
+        if reconciled > 0 {
+            tracing::info!(
+                reconciled_stale_processes = reconciled,
+                "reconciled stale running processes from prior session"
+            );
+        }
         Ok(count)
+    }
+
+    /// Executes a single SQLite TTL purge pass using the configured retention window (`L-11`).
+    pub fn run_ttl_purge_once(&self) -> Result<PurgeStats, StoreError> {
+        self.store
+            .purge_expired(current_unix_ms(), self.config.ttl_retention_days)
     }
 
     /// Returns current [`PipelineMetrics`] (`決定記録 L-10`).
@@ -223,6 +260,13 @@ impl DaemonEngine {
         let mut flush_ticker = tokio::time::interval(Duration::from_millis(interval_ms));
         flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let purge_interval = Duration::from_millis(self.config.ttl_purge_interval_ms.max(50));
+        let mut purge_ticker = tokio::time::interval(purge_interval);
+        purge_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate t=0 tick so TTL purge runs periodically on interval ticks.
+        purge_ticker.tick().await;
+        let mut purge_in_flight: Option<JoinHandle<()>> = None;
+
         loop {
             tokio::select! {
                 biased;
@@ -237,7 +281,24 @@ impl DaemonEngine {
                         tracing::warn!(error = %err, "periodic SQLite batch flush failed");
                     }
                 }
+                _ = purge_ticker.tick() => {
+                    let busy = purge_in_flight.as_ref().is_some_and(|h| !h.is_finished());
+                    if !busy {
+                        let store = self.store.clone();
+                        let retention_days = self.config.ttl_retention_days;
+                        purge_in_flight = Some(tokio::task::spawn_blocking(move || {
+                            let now_ms = current_unix_ms();
+                            if let Err(err) = store.purge_expired(now_ms, retention_days) {
+                                tracing::warn!(error = %err, "periodic SQLite TTL purge failed");
+                            }
+                        }));
+                    }
+                }
             }
+        }
+
+        if let Some(handle) = purge_in_flight {
+            let _ = handle.await;
         }
 
         for remaining in receiver.drain_ready() {
@@ -371,7 +432,7 @@ impl DaemonEngine {
             | SensorEvent::NetworkConnect { pid, .. }
             | SensorEvent::CanaryFileAccess { pid, .. }
             | SensorEvent::ScriptEvaluated { pid, .. } => {
-                let Some(proc_entry) = table.lookup_by_pid(*pid).cloned() else {
+                let Some(proc_entry) = table.lookup_by_pid_at(*pid, event_ts_ms).cloned() else {
                     return ResolvedProcessContext::default();
                 };
                 let (parent_exe, parent_cmd) = proc_entry

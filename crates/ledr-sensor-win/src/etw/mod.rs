@@ -31,7 +31,16 @@ use crate::dns_cache::DnsResolutionCache;
 use crate::path_norm::DosVolumeMap;
 use crate::{OwnedHandle, SensorError};
 
-const DEFAULT_ETW_SESSION_NAME: &str = "LocalEDR-ETW-Session";
+/// Default Windows ETW trace session name for LocalEDR real-time telemetry.
+pub const DEFAULT_ETW_SESSION_NAME: &str = "LocalEDR-ETW-Session";
+
+/// Direct callback sink receiving normalized [`SensorEvent`] values from the ETW consumer
+/// without an unbounded intermediate queue (`BUG_0001`).
+///
+/// Returning `true` indicates the event was accepted (or intentionally shed by a bounded
+/// telemetry ring) and ETW consumption should continue. Returning `false` indicates the
+/// downstream receiver has closed and the ETW consumer should terminate promptly.
+pub type EventSinkFn = Arc<dyn Fn(SensorEvent) -> bool + Send + Sync>;
 const MAX_SESSION_NAME_CHARS: usize = 128;
 const MAX_LOGFILE_NAME_CHARS: usize = 128;
 const WINEVENT_KEYWORD_PROCESS: u64 = 0x10;
@@ -173,17 +182,34 @@ struct ActiveEtwSession {
 }
 
 struct EtwCallbackContext {
-    tx: mpsc::Sender<SensorEvent>,
+    sink: EventSinkFn,
     dns_cache: Mutex<DnsResolutionCache>,
     volume_map: DosVolumeMap,
     stop_requested: Arc<AtomicBool>,
     session_name_nul: Vec<u16>,
 }
 
+impl EtwCallbackContext {
+    /// Emits a decoded event directly to the bounded downstream sink.
+    ///
+    /// Marks `stop_requested` only once the sink returns `false` (downstream receiver closed)
+    /// or if cancellation was already requested.
+    fn dispatch_event(&self, event: SensorEvent) -> bool {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        if !(self.sink)(event) {
+            self.stop_requested.store(true, Ordering::Release);
+            return false;
+        }
+        true
+    }
+}
+
 /// Real-time Windows ETW sensor backend subscribing to Process, DNS, Network, AMSI,
 /// and PowerShell 4104 providers (`AUTO-03`, `AUTO-05`, `AUTO-06`).
 pub struct WindowsEtwSensor {
-    tx: Mutex<mpsc::Sender<SensorEvent>>,
+    sink: EventSinkFn,
     session_name: String,
     state: Mutex<Option<ActiveEtwSession>>,
 }
@@ -199,8 +225,20 @@ impl WindowsEtwSensor {
         tx: mpsc::Sender<SensorEvent>,
         session_name: impl Into<String>,
     ) -> Self {
+        let tx = Mutex::new(tx);
+        let sink: EventSinkFn = Arc::new(move |ev| {
+            tx.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .send(ev)
+                .is_ok()
+        });
+        Self::with_sink(sink, session_name)
+    }
+
+    /// Creates a new [`WindowsEtwSensor`] delivering events directly to `sink` (`BUG_0001`).
+    pub fn with_sink(sink: EventSinkFn, session_name: impl Into<String>) -> Self {
         Self {
-            tx: Mutex::new(tx),
+            sink,
             session_name: session_name.into(),
             state: Mutex::new(None),
         }
@@ -209,6 +247,35 @@ impl WindowsEtwSensor {
     /// Returns the configured ETW session name.
     pub fn session_name(&self) -> &str {
         &self.session_name
+    }
+
+    /// Immediately aborts ETW buffer/record processing without waiting to drain flushed buffers.
+    pub fn force_abort(&mut self) {
+        self.stop_with_mode(true);
+    }
+
+    fn stop_with_mode(&mut self, abort_immediately: bool) {
+        let active = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+
+        if let Some(mut session) = active {
+            if abort_immediately {
+                // Only abort in-flight callbacks on explicit force-abort; graceful stop()
+                // lets ControlTraceW flush buffered events to ProcessTrace before exiting.
+                session.stop_requested.store(true, Ordering::Release);
+            }
+            stop_trace_session(session.session_handle, &session.session_name_nul);
+            if let Some(handle) = session.worker.take() {
+                let _ = handle.join();
+            }
+            tracing::info!(
+                session = %self.session_name,
+                abort_immediately,
+                "ETW real-time sensor stopped"
+            );
+        }
     }
 }
 
@@ -248,10 +315,10 @@ impl SensorBackend for WindowsEtwSensor {
             return Err(err.to_string());
         }
 
-        let tx_clone = self.tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let sink_clone = Arc::clone(&self.sink);
         let stop_requested = Arc::new(AtomicBool::new(false));
         let mut ctx_box = Box::new(EtwCallbackContext {
-            tx: tx_clone,
+            sink: sink_clone,
             dns_cache: Mutex::new(DnsResolutionCache::default()),
             volume_map: DosVolumeMap::from_system(),
             stop_requested: Arc::clone(&stop_requested),
@@ -332,19 +399,10 @@ impl SensorBackend for WindowsEtwSensor {
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        let active = {
-            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            guard.take()
-        };
-
-        if let Some(mut session) = active {
-            session.stop_requested.store(true, Ordering::Release);
-            stop_trace_session(session.session_handle, &session.session_name_nul);
-            if let Some(handle) = session.worker.take() {
-                let _ = handle.join();
-            }
-            tracing::info!(session = %self.session_name, "ETW real-time sensor stopped");
-        }
+        // Leave `stop_requested` false so ControlTraceW(..., EVENT_TRACE_CONTROL_STOP)
+        // flushes remaining ETW buffers to `event_record_callback` before `ProcessTrace`
+        // exits naturally (`BUG_0003`).
+        self.stop_with_mode(false);
         Ok(())
     }
 }
@@ -496,6 +554,8 @@ unsafe extern "system" fn buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) ->
     }
     // SAFETY: `ctx_ptr` remains valid for the lifetime of `ProcessTrace`.
     let ctx = unsafe { &*ctx_ptr };
+    // Return 0 only when cancellation was requested (downstream sink closed or force_abort),
+    // allowing graceful stop() to drain all flushed buffers before ProcessTrace exits.
     if ctx.stop_requested.load(Ordering::Acquire) {
         0
     } else {
@@ -515,7 +575,7 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
     }
     // SAFETY: `ctx_ptr` remains valid until after `ProcessTrace` exits.
     let ctx = unsafe { &*ctx_ptr };
-    if ctx.stop_requested.load(Ordering::Relaxed) {
+    if ctx.stop_requested.load(Ordering::Acquire) {
         return;
     }
 
@@ -549,9 +609,7 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
     let Some(event) = emitted else {
         return;
     };
-    if ctx.tx.send(event).is_err() {
-        ctx.stop_requested.store(true, Ordering::Release);
-    }
+    let _ = ctx.dispatch_event(event);
 }
 
 fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Option<SensorEvent> {
@@ -758,5 +816,162 @@ mod tests {
                 )),
             ]
         );
+    }
+
+    #[test]
+    fn sens_06_custom_sink_and_graceful_stop_drain() {
+        let captured = Arc::new(Mutex::new(Vec::<SensorEvent>::new()));
+        let sink_open = Arc::new(AtomicBool::new(true));
+        let captured_clone = Arc::clone(&captured);
+        let sink_open_clone = Arc::clone(&sink_open);
+
+        let sink: EventSinkFn = Arc::new(move |event| {
+            if !sink_open_clone.load(Ordering::Acquire) {
+                return false;
+            }
+            captured_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event);
+            true
+        });
+
+        let mut sensor = WindowsEtwSensor::with_sink(sink, "LocalEDR-Custom-Sink-Test");
+        assert_eq!(sensor.session_name(), "LocalEDR-Custom-Sink-Test");
+        assert_eq!(sensor.stop(), Ok(()));
+
+        // Backwards-compatible mpsc::Sender constructors delegate to the EventSinkFn path.
+        let (tx, rx) = mpsc::channel();
+        let legacy_sensor = WindowsEtwSensor::new(tx);
+        assert_eq!(legacy_sensor.session_name(), DEFAULT_ETW_SESSION_NAME);
+        let sample_start = SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(4242, 123_456),
+            parent_pid: 4,
+            exe_path: "C:\\Windows\\System32\\cmd.exe".to_string(),
+            command_line: "cmd.exe /c echo ok".to_string(),
+            user_sid: None,
+        };
+        assert!((legacy_sensor.sink)(sample_start.clone()));
+        assert!(rx.try_recv().is_ok());
+        drop(rx);
+        assert!(!(legacy_sensor.sink)(sample_start.clone()));
+
+        let (tx2, _rx2) = mpsc::channel();
+        let named_legacy = WindowsEtwSensor::with_session_name(tx2, "LocalEDR-Legacy-Named");
+        assert_eq!(named_legacy.session_name(), "LocalEDR-Legacy-Named");
+
+        // Verify graceful stop() does NOT set stop_requested before draining flushed buffers.
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let session_name_nul: Vec<u16> =
+            format!("LocalEDR-UnitTest-Drain-{}", std::process::id())
+                .encode_utf16()
+                .chain(std::iter::once(0u16))
+                .collect();
+
+        let worker_ctx = EtwCallbackContext {
+            sink: Arc::clone(&sensor.sink),
+            dns_cache: Mutex::new(DnsResolutionCache::default()),
+            volume_map: DosVolumeMap::with_mappings(Vec::new()),
+            stop_requested: Arc::clone(&stop_requested),
+            session_name_nul: session_name_nul.clone(),
+        };
+        let flushed_start = sample_start.clone();
+        let flushed_dns = SensorEvent::DnsQuery {
+            pid: 4242,
+            query_name: "example.com".to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            timestamp_ms: 1_700_000_000_000,
+        };
+        let worker = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(20));
+            let mut ctx_box = Box::new(worker_ctx);
+            let mut logfile = EVENT_TRACE_LOGFILEW {
+                Context: (&mut *ctx_box as *mut EtwCallbackContext).cast::<c_void>(),
+                ..Default::default()
+            };
+            // SAFETY: `logfile.Context` points to live `ctx_box`.
+            assert_eq!(unsafe { buffer_callback(&mut logfile) }, 1);
+            assert!(ctx_box.dispatch_event(flushed_start));
+            assert!(ctx_box.dispatch_event(flushed_dns));
+            assert_eq!(unsafe { buffer_callback(&mut logfile) }, 1);
+        });
+
+        {
+            let mut guard = sensor.state.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(ActiveEtwSession {
+                session_handle: CONTROLTRACE_HANDLE::default(),
+                session_name_nul: session_name_nul.clone(),
+                stop_requested: Arc::clone(&stop_requested),
+                worker: Some(worker),
+            });
+        }
+
+        assert_eq!(sensor.stop(), Ok(()));
+        assert!(
+            !stop_requested.load(Ordering::Acquire),
+            "graceful stop() must leave stop_requested false while draining flushed buffers"
+        );
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            2,
+            "all flushed events must be delivered during graceful stop()"
+        );
+
+        // Verify stop_requested flips to true ONLY once the downstream sink returns false.
+        let mut post_ctx = Box::new(EtwCallbackContext {
+            sink: Arc::clone(&sensor.sink),
+            dns_cache: Mutex::new(DnsResolutionCache::default()),
+            volume_map: DosVolumeMap::with_mappings(Vec::new()),
+            stop_requested: Arc::clone(&stop_requested),
+            session_name_nul: session_name_nul.clone(),
+        });
+        let mut post_logfile = EVENT_TRACE_LOGFILEW {
+            Context: (&mut *post_ctx as *mut EtwCallbackContext).cast::<c_void>(),
+            ..Default::default()
+        };
+        // SAFETY: `post_logfile.Context` points to live `post_ctx`.
+        assert_eq!(unsafe { buffer_callback(&mut post_logfile) }, 1);
+
+        sink_open.store(false, Ordering::Release);
+        assert!(!post_ctx.dispatch_event(sample_start.clone()));
+        assert!(
+            stop_requested.load(Ordering::Acquire),
+            "stop_requested must flip true once downstream sink returns false"
+        );
+        // SAFETY: `post_logfile.Context` points to live `post_ctx`.
+        assert_eq!(
+            unsafe { buffer_callback(&mut post_logfile) },
+            0,
+            "buffer_callback must return 0 once downstream sink closed"
+        );
+
+        // Even if the sink flag flips back, dispatch_event stays latched closed.
+        sink_open.store(true, Ordering::Release);
+        assert!(!post_ctx.dispatch_event(sample_start));
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            2
+        );
+
+        // Verify explicit force_abort() sets stop_requested before joining worker.
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = sensor.state.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(ActiveEtwSession {
+                session_handle: CONTROLTRACE_HANDLE::default(),
+                session_name_nul,
+                stop_requested: Arc::clone(&abort_flag),
+                worker: Some(thread::spawn(|| {})),
+            });
+        }
+        sensor.force_abort();
+        assert!(abort_flag.load(Ordering::Acquire));
     }
 }

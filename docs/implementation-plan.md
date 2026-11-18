@@ -493,9 +493,9 @@ Background Service Worker は `chrome.downloads.onCreated` と完了遷移の `o
 
 ### Phase 0 基盤構築と共通型の凍結
 
-- [ ] ルートの `Cargo.toml` を作成し、ワークスペース共通の依存クレートと許容ライセンス方針を固定する
-- [ ] `crates/ledr-proto` に `ProcessIdentity`、`SensorEvent`、`AlertStatus`、`AlertDecision`、`ActiveDefenseController`、および IPC メッセージ型を実装して凍結する
-- [ ] 全クレートとアプリ（`ledr-sensor-win`、`ledr-sim`、`ledr-rules`、`ledr-daemon`、`ledr-store`、`ledr-bridge-nm`、`apps/ledr-ui`、`extensions/ledr-chrome-mv3`）のスケルトンを配置し、`cargo check --workspace` を通す
+- [x] ルートの `Cargo.toml` を作成し、ワークスペース共通の依存クレートと許容ライセンス方針を固定する
+- [x] `crates/ledr-proto` に `ProcessIdentity`、`SensorEvent`、`AlertStatus`、`AlertDecision`、`ActiveDefenseController`、および IPC メッセージ型を実装して凍結する
+- [x] 全クレートとアプリ（`ledr-sensor-win`、`ledr-sim`、`ledr-rules`、`ledr-daemon`、`ledr-store`、`ledr-bridge-nm`、`apps/ledr-ui`、`extensions/ledr-chrome-mv3`）のスケルトンを配置し、`cargo check --workspace` を通す
 
 受け入れ条件として、全ワーカーが担当ディレクトリのみを編集できる状態が整い、`cargo check --workspace` が警告なしで通ること。
 

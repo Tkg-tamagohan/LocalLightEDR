@@ -3,15 +3,17 @@
 use std::io::ErrorKind;
 use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ledr_proto::{
     decode_ipc_frame, encode_ipc_frame, AlertRecord, AlertSeverity, AlertStatus,
-    DownloadOriginRecord, IpcRequest, IpcResponse, AUTHORIZED_UI_EXE_PATH, IPC_MAX_FRAME_BYTES,
+    DownloadOriginRecord, IpcRequest, IpcResponse, AUTHORIZED_BRIDGE_EXE_PATH,
+    AUTHORIZED_UI_EXE_PATH, IPC_MAX_FRAME_BYTES,
 };
 use ledr_rules::assess_domain_risk;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use windows::core::PWSTR;
@@ -23,6 +25,8 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::engine::{current_unix_ms, DaemonEngine};
+
+const IPC_READ_CHUNK_BYTES: usize = 8_192;
 
 /// Handle owning the Named Pipe IPC accept loop task.
 pub struct IpcServerHandle {
@@ -62,6 +66,8 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let loop_pipe_name = pipe_name.clone();
+    let max_clients = engine.config().max_concurrent_ipc_clients.max(1);
+    let client_semaphore = Arc::new(Semaphore::new(max_clients));
 
     let join_handle = tokio::spawn(async move {
         let mut server = initial_server;
@@ -76,13 +82,26 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
                 connect_res = server.connect() => {
                     match connect_res {
                         Ok(()) => {
-                            let client_pipe = server;
-                            let client_engine = Arc::clone(&engine);
-                            tokio::spawn(async move {
-                                if let Err(err) = handle_pipe_client(client_pipe, client_engine).await {
-                                    tracing::debug!(error = %err, "IPC client session ended");
+                            match Arc::clone(&client_semaphore).try_acquire_owned() {
+                                Ok(permit) => {
+                                    let client_pipe = server;
+                                    let client_engine = Arc::clone(&engine);
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        if let Err(err) = handle_pipe_client(client_pipe, client_engine).await {
+                                            tracing::debug!(error = %err, "IPC client session ended");
+                                        }
+                                    });
                                 }
-                            });
+                                Err(_) => {
+                                    tracing::warn!(
+                                        pipe = %loop_pipe_name,
+                                        max_concurrent_ipc_clients = max_clients,
+                                        "rejecting IPC client connection: concurrent client limit reached"
+                                    );
+                                    drop(server);
+                                }
+                            }
 
                             match ServerOptions::new().create(&loop_pipe_name) {
                                 Ok(next_server) => server = next_server,
@@ -119,6 +138,14 @@ pub fn is_authorized_ui_caller(caller_exe_path: Option<&str>, dev_mode_bypass: b
         return true;
     }
     caller_exe_path.is_some_and(|path| path.eq_ignore_ascii_case(AUTHORIZED_UI_EXE_PATH))
+}
+
+/// Checks whether a caller executable path is authorized to submit browser bridge events (`L-09`).
+pub fn is_authorized_bridge_caller(caller_exe_path: Option<&str>, dev_mode_bypass: bool) -> bool {
+    if dev_mode_bypass {
+        return true;
+    }
+    caller_exe_path.is_some_and(|path| path.eq_ignore_ascii_case(AUTHORIZED_BRIDGE_EXE_PATH))
 }
 
 /// Resolves the connected client process PID and executable image path via `GetNamedPipeClientProcessId`.
@@ -188,19 +215,21 @@ async fn handle_pipe_client(
         }
     };
 
+    let frame_timeout = Duration::from_millis(engine.config().ipc_frame_timeout_ms.max(50));
+
     loop {
         let mut len_buf = [0u8; 4];
-        match pipe.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-                ) =>
-            {
+        match tokio::time::timeout(frame_timeout, pipe.read_exact(&mut len_buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) if is_disconnect_error(&err) => break,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                tracing::debug!(
+                    timeout_ms = frame_timeout.as_millis(),
+                    "IPC client timed out reading frame header; closing session"
+                );
                 break;
             }
-            Err(err) => return Err(err),
         }
 
         let payload_len = u32::from_le_bytes(len_buf) as usize;
@@ -221,9 +250,34 @@ async fn handle_pipe_client(
             break;
         }
 
-        let mut frame = vec![0u8; 4 + payload_len];
-        frame[..4].copy_from_slice(&len_buf);
-        pipe.read_exact(&mut frame[4..]).await?;
+        let mut frame = Vec::with_capacity(4 + payload_len.min(IPC_READ_CHUNK_BYTES));
+        frame.extend_from_slice(&len_buf);
+        let payload_read = tokio::time::timeout(frame_timeout, async {
+            let mut remaining = payload_len;
+            let mut chunk = [0u8; IPC_READ_CHUNK_BYTES];
+            while remaining > 0 {
+                let to_read = remaining.min(chunk.len());
+                pipe.read_exact(&mut chunk[..to_read]).await?;
+                frame.extend_from_slice(&chunk[..to_read]);
+                remaining -= to_read;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+
+        match payload_read {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) if is_disconnect_error(&err) => break,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                tracing::debug!(
+                    timeout_ms = frame_timeout.as_millis(),
+                    payload_len,
+                    "IPC client timed out reading frame payload; closing session"
+                );
+                break;
+            }
+        }
 
         let response = match decode_ipc_frame::<IpcRequest>(&frame) {
             Ok(req) => dispatch_request(&engine, caller_exe.as_deref(), req),
@@ -237,6 +291,13 @@ async fn handle_pipe_client(
     }
 
     Ok(())
+}
+
+fn is_disconnect_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+    )
 }
 
 async fn write_response(pipe: &mut NamedPipeServer, resp: &IpcResponse) -> std::io::Result<()> {
@@ -265,6 +326,20 @@ fn dispatch_request(
             message: format!(
                 "caller {:?} is not authorized for mutating IPC command (expected {})",
                 caller_exe, AUTHORIZED_UI_EXE_PATH
+            ),
+        };
+    }
+
+    if matches!(
+        req,
+        IpcRequest::ReportDownloadOrigin { .. } | IpcRequest::ReportBrowserEvent { .. }
+    ) && !is_authorized_bridge_caller(caller_exe, engine.config().dev_mode_bypass_ui_auth)
+    {
+        return IpcResponse::Error {
+            code: "UNAUTHORIZED_CALLER".to_string(),
+            message: format!(
+                "caller {:?} is not authorized for browser bridge IPC command (expected {})",
+                caller_exe, AUTHORIZED_BRIDGE_EXE_PATH
             ),
         };
     }

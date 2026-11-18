@@ -1,22 +1,53 @@
 //! Integration tests for `ledr-daemon` two-lane burst budget, LOTL rule detection,
-//! and Named Pipe IPC server round-trip (`BURST-01`..`BURST-03`).
+//! and Named Pipe IPC server round-trip (`BURST-01`..`BURST-06`).
 
 use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_daemon::{
-    start_ipc_server, ActiveProcessTable, DaemonConfig, DaemonEngine, HighPrioritySendError,
-    TwoLaneChannel,
+    is_authorized_bridge_caller, start_ipc_server, ActiveProcessTable, DaemonConfig, DaemonEngine,
+    HighPrioritySendError, TwoLaneChannel,
 };
 use ledr_proto::{
-    read_ipc_frame, write_ipc_frame, AlertSeverity, AlertStatus, CanaryCategory, IpcRequest,
-    IpcResponse, ProcessIdentity, ScriptSource, SensorEvent, ACTIVE_PROCESS_TABLE_CAPACITY,
+    read_ipc_frame, write_ipc_frame, AlertSeverity, AlertStatus, BrowserSecurityEventType,
+    CanaryCategory, IpcRequest, IpcResponse, ProcessIdentity, ScriptSource, SensorEvent,
+    ACTIVE_PROCESS_TABLE_CAPACITY, AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH,
     HIGH_PRIORITY_CHANNEL_CAPACITY, SHUTDOWN_FLUSH_TIMEOUT_MS, TELEMETRY_CHANNEL_CAPACITY,
 };
 use ledr_rules::{EarlyPruner, SigmaEngine};
 use ledr_store::LedrStore;
+
+const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+const TICKS_PER_MS: u64 = 10_000;
+const DAY_MS: i64 = 86_400_000;
+
+struct TestTempDir {
+    path: PathBuf,
+}
+
+impl TestTempDir {
+    fn new(prefix: &str) -> Self {
+        let seq = PIPE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create test temp dir");
+        Self { path }
+    }
+}
+
+impl Drop for TestTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn unix_ms_to_filetime(unix_ms: i64) -> u64 {
+    u64::try_from(unix_ms).expect("positive unix_ms") * TICKS_PER_MS + WINDOWS_TO_UNIX_EPOCH_100NS
+}
 
 static PIPE_SEQ: AtomicU32 = AtomicU32::new(1);
 
@@ -26,12 +57,21 @@ fn unique_test_pipe_name() -> String {
     format!(r"\\.\pipe\localedr-ipc-test-{pid}-{seq}")
 }
 
+fn open_pipe_with_retry(pipe_name: &str) -> std::fs::File {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match OpenOptions::new().read(true).write(true).open(pipe_name) {
+            Ok(file) => return file,
+            Err(err) if Instant::now() < deadline && matches!(err.raw_os_error(), Some(231) | Some(2)) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => panic!("open Named Pipe client handle `{pipe_name}` failed: {err}"),
+        }
+    }
+}
+
 fn send_pipe_request(pipe_name: &str, req: &IpcRequest) -> IpcResponse {
-    let mut pipe = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe_name)
-        .expect("open Named Pipe client handle");
+    let mut pipe = open_pipe_with_retry(pipe_name);
     write_ipc_frame(&mut pipe, req).expect("write IPC request frame");
     read_ipc_frame::<_, IpcResponse>(&mut pipe).expect("read IPC response frame")
 }
@@ -267,7 +307,7 @@ async fn burst_02_lotl_cmd_powershell_end_to_end() {
             query_name: "c2.example.com".to_string(),
             query_type: 1,
             resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
-            timestamp_ms: 1_700_000_500_000,
+            timestamp_ms: 1_732_069_610_500,
         })
         .await
         .expect("send DnsQuery");
@@ -279,7 +319,7 @@ async fn burst_02_lotl_cmd_powershell_end_to_end() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
             dst_port: 443,
             domain_hint: Some("c2.example.com".to_string()),
-            timestamp_ms: 1_700_000_500_100,
+            timestamp_ms: 1_732_069_610_600,
         })
         .await
         .expect("send NetworkConnect");
@@ -419,6 +459,428 @@ async fn burst_03_named_pipe_ipc_roundtrip_and_auth() {
     match unauth_resp {
         IpcResponse::Error { code, .. } => assert_eq!(code, "UNAUTHORIZED"),
         other => panic!("expected UNAUTHORIZED error, got {other:?}"),
+    }
+
+    ipc_handle.shutdown().await;
+    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+}
+
+#[tokio::test]
+async fn burst_04_pid_reuse_telemetry_attribution_and_channel_close_drain() {
+    // Part A: PID reuse time-window attribution (`A start -> A stop -> B start -> A dns`).
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let sigma = SigmaEngine::from_rules(Vec::new()).expect("empty rules");
+    let pruner = EarlyPruner::default();
+    let engine = DaemonEngine::start(
+        store.clone(),
+        sigma,
+        pruner,
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+    );
+    let sender = engine.sender();
+
+    let t0 = 1_750_000_000_000i64;
+    let pid = 4242u32;
+    let proc_a = ProcessIdentity::new(pid, unix_ms_to_filetime(t0));
+    let proc_b = ProcessIdentity::new(pid, unix_ms_to_filetime(t0 + 1000));
+
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: proc_a,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\proc_a.exe".to_string(),
+            command_line: "proc_a.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send proc A start");
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid,
+            exit_time_100ns: unix_ms_to_filetime(t0 + 500),
+            exit_code: 0,
+        })
+        .await
+        .expect("send proc A stop");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: proc_b,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\proc_b.exe".to_string(),
+            command_line: "proc_b.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send proc B start");
+
+    // Ensure high-priority lifecycle events are processed first so active PID mapping points to B.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().high_priority_processed < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for high-priority lifecycle processing"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    sender
+        .send(SensorEvent::DnsQuery {
+            pid,
+            query_name: "proc-a-query.example.test".to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            timestamp_ms: t0 + 200,
+        })
+        .await
+        .expect("send proc A dns");
+    sender
+        .send(SensorEvent::DnsQuery {
+            pid,
+            query_name: "proc-b-query.example.test".to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35))],
+            timestamp_ms: t0 + 1200,
+        })
+        .await
+        .expect("send proc B dns");
+
+    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+
+    let snap_a = store
+        .query_flight_recorder(20, Some(&proc_a.instance_id()))
+        .expect("query proc A");
+    assert_eq!(snap_a.dns_queries.len(), 1);
+    assert_eq!(snap_a.dns_queries[0].query_name, "proc-a-query.example.test");
+
+    let snap_b = store
+        .query_flight_recorder(20, Some(&proc_b.instance_id()))
+        .expect("query proc B");
+    assert_eq!(snap_b.dns_queries.len(), 1);
+    assert_eq!(snap_b.dns_queries[0].query_name, "proc-b-query.example.test");
+
+    // Part B: TwoLaneChannel close while high-priority sender is waiting on capacity 1.
+    let (tx, mut rx) = TwoLaneChannel::with_capacities(1, 4).split();
+    let ev_a = SensorEvent::ProcessStart {
+        identity: ProcessIdentity::new(101, unix_ms_to_filetime(t0)),
+        parent_pid: 4,
+        exe_path: "a.exe".to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    let ev_b = SensorEvent::ProcessStart {
+        identity: ProcessIdentity::new(102, unix_ms_to_filetime(t0 + 1)),
+        parent_pid: 4,
+        exe_path: "b.exe".to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    let ev_c = SensorEvent::ProcessStart {
+        identity: ProcessIdentity::new(103, unix_ms_to_filetime(t0 + 2)),
+        parent_pid: 4,
+        exe_path: "c.exe".to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+
+    tx.send_high_priority(ev_a).await.expect("send A");
+
+    let tx_waiting = tx.clone();
+    let waiting_task = tokio::spawn(async move { tx_waiting.send_high_priority(ev_b).await });
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !waiting_task.is_finished(),
+        "sender B should still be blocked waiting on capacity 1"
+    );
+
+    tx.close();
+    assert!(matches!(
+        tx.try_send_high_priority(ev_c),
+        Err(HighPrioritySendError::Closed(_))
+    ));
+
+    let mut drained = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        drained.push(ev);
+    }
+    waiting_task
+        .await
+        .expect("join waiting sender")
+        .expect("sender B accepted before close must succeed");
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].pid(), 101);
+    assert_eq!(drained[1].pid(), 102);
+}
+
+#[tokio::test]
+async fn burst_05_periodic_ttl_purge_and_startup_stale_reconciliation() {
+    let dir = TestTempDir::new("ledr-burst-05");
+    let db_path = dir.path.join("daemon_ttl_reconcile.db");
+
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+
+    let expired_ident = ProcessIdentity::new(7001, unix_ms_to_filetime(now_ms - 20 * DAY_MS));
+    let stale_ident = ProcessIdentity::new(7002, unix_ms_to_filetime(now_ms - 60_000));
+    let live_ident = ProcessIdentity::new(7003, unix_ms_to_filetime(now_ms - 30_000));
+
+    let live_snapshot = SensorEvent::ProcessStart {
+        identity: live_ident,
+        parent_pid: 4,
+        exe_path: r"C:\Tools\live.exe".to_string(),
+        command_line: "live.exe".to_string(),
+        user_sid: None,
+    };
+
+    // Prior daemon DB session: 1 expired exited proc+DNS, 1 stale running proc, 1 still-running proc.
+    {
+        let store1 = LedrStore::open(&db_path).expect("open prior store");
+        store1
+            .ingest_event(
+                &SensorEvent::ProcessStart {
+                    identity: expired_ident,
+                    parent_pid: 4,
+                    exe_path: r"C:\Tools\old.exe".to_string(),
+                    command_line: String::new(),
+                    user_sid: None,
+                },
+                None,
+                false,
+                "",
+            )
+            .expect("ingest expired start");
+        store1
+            .ingest_event(
+                &SensorEvent::DnsQuery {
+                    pid: expired_ident.pid,
+                    query_name: "expired.example.test".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![],
+                    timestamp_ms: now_ms - 18 * DAY_MS,
+                },
+                Some(&expired_ident.instance_id()),
+                false,
+                "",
+            )
+            .expect("ingest expired dns");
+        store1
+            .ingest_event(
+                &SensorEvent::ProcessStop {
+                    pid: expired_ident.pid,
+                    exit_time_100ns: unix_ms_to_filetime(now_ms - 19 * DAY_MS),
+                    exit_code: 0,
+                },
+                Some(&expired_ident.instance_id()),
+                false,
+                "",
+            )
+            .expect("ingest expired stop");
+
+        store1
+            .ingest_event(
+                &SensorEvent::ProcessStart {
+                    identity: stale_ident,
+                    parent_pid: 4,
+                    exe_path: r"C:\Tools\stale.exe".to_string(),
+                    command_line: String::new(),
+                    user_sid: None,
+                },
+                None,
+                false,
+                "",
+            )
+            .expect("ingest stale start");
+        store1
+            .ingest_event(&live_snapshot, None, false, "")
+            .expect("ingest live start");
+        store1.checkpoint_truncate().expect("checkpoint prior store");
+    }
+
+    // New DaemonEngine session with fast periodic TTL purge ticker (50 ms) and startup seeding.
+    let store2 = LedrStore::open(&db_path).expect("reopen store");
+    let engine = DaemonEngine::start(
+        store2.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty rules"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ttl_purge_interval_ms: 50,
+            ttl_retention_days: 14,
+            ..DaemonConfig::default()
+        },
+    );
+
+    engine
+        .seed_processes(vec![live_snapshot])
+        .expect("seed active processes and reconcile stale ones");
+
+    // Stale running process from prior run is immediately marked exited; live process remains active.
+    let stale_snap = store2
+        .query_flight_recorder(10, Some(&stale_ident.instance_id()))
+        .expect("query stale proc");
+    assert_eq!(stale_snap.processes.len(), 1);
+    assert!(
+        stale_snap.processes[0].exited_at_ms.is_some(),
+        "stale prior-session process must be reconciled on startup"
+    );
+
+    let live_snap = store2
+        .query_flight_recorder(10, Some(&live_ident.instance_id()))
+        .expect("query live proc");
+    assert_eq!(live_snap.processes.len(), 1);
+    assert_eq!(live_snap.processes[0].exited_at_ms, None);
+
+    // Wait for periodic background TTL purge ticker to delete the expired process & DNS row.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let exp_snap = store2
+            .query_flight_recorder(10, Some(&expired_ident.instance_id()))
+            .expect("query expired proc");
+        if exp_snap.processes.is_empty() && exp_snap.dns_queries.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "periodic TTL purge ticker did not purge expired records in time"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Recent reconciled/live processes remain preserved.
+    assert_eq!(
+        store2
+            .query_flight_recorder(10, Some(&stale_ident.instance_id()))
+            .expect("query stale retained")
+            .processes
+            .len(),
+        1
+    );
+    assert_eq!(
+        store2
+            .query_flight_recorder(10, Some(&live_ident.instance_id()))
+            .expect("query live retained")
+            .processes
+            .len(),
+        1
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+}
+
+#[tokio::test]
+async fn burst_06_ipc_bridge_caller_auth_and_stalled_frame_timeout() {
+    assert!(is_authorized_bridge_caller(
+        Some(AUTHORIZED_BRIDGE_EXE_PATH),
+        false
+    ));
+    assert!(is_authorized_bridge_caller(
+        Some(&AUTHORIZED_BRIDGE_EXE_PATH.to_ascii_uppercase()),
+        false
+    ));
+    assert!(!is_authorized_bridge_caller(
+        Some(AUTHORIZED_UI_EXE_PATH),
+        false
+    ));
+    assert!(!is_authorized_bridge_caller(None, false));
+    assert!(is_authorized_bridge_caller(None, true));
+
+    let pipe_name = unique_test_pipe_name();
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let engine = DaemonEngine::start(
+        store,
+        SigmaEngine::from_rules(Vec::new()).expect("empty rules"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_name.clone(),
+            dev_mode_bypass_ui_auth: false,
+            max_concurrent_ipc_clients: 2,
+            ipc_frame_timeout_ms: 100,
+            ..DaemonConfig::default()
+        },
+    );
+
+    let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("bind Named Pipe");
+    let pipe_for_client = pipe_name.clone();
+
+    let (browser_resp, download_resp, stalled_closed, pong_resp) =
+        tokio::task::spawn_blocking(move || {
+            let browser_resp = send_pipe_request(
+                &pipe_for_client,
+                &IpcRequest::ReportBrowserEvent {
+                    event_type: BrowserSecurityEventType::ClickFixPastejacking,
+                    url: "https://example.invalid/".to_string(),
+                    details: Some("test".to_string()),
+                    timestamp_ms: 1_750_000_000_000,
+                },
+            );
+            let download_resp = send_pipe_request(
+                &pipe_for_client,
+                &IpcRequest::ReportDownloadOrigin {
+                    file_path: r"C:\Users\test\Downloads\drop.exe".to_string(),
+                    tab_url: "https://example.invalid/dl".to_string(),
+                    frame_url: None,
+                    referrer_url: None,
+                    downloaded_at_ms: 1_750_000_000_001,
+                },
+            );
+
+            // Stalled partial header (2 bytes) + stalled 1 MiB payload header must time out promptly.
+            let mut stalled_hdr_pipe = open_pipe_with_retry(&pipe_for_client);
+            stalled_hdr_pipe
+                .write_all(&[0x20, 0x00])
+                .expect("write partial 2-byte header");
+            stalled_hdr_pipe.flush().expect("flush partial header");
+
+            let mut stalled_body_pipe = open_pipe_with_retry(&pipe_for_client);
+            stalled_body_pipe
+                .write_all(&(1_048_576u32).to_le_bytes())
+                .expect("write 1 MiB header");
+            stalled_body_pipe.flush().expect("flush 1 MiB header");
+
+            std::thread::sleep(Duration::from_millis(250));
+
+            let mut probe_buf = [0u8; 8];
+            let hdr_closed = matches!(stalled_hdr_pipe.read(&mut probe_buf), Ok(0) | Err(_));
+            let body_closed = matches!(stalled_body_pipe.read(&mut probe_buf), Ok(0) | Err(_));
+
+            let pong_resp = send_pipe_request(&pipe_for_client, &IpcRequest::Ping);
+            (
+                browser_resp,
+                download_resp,
+                hdr_closed && body_closed,
+                pong_resp,
+            )
+        })
+        .await
+        .expect("join IPC client task");
+
+    match browser_resp {
+        IpcResponse::Error { code, .. } => assert_eq!(code, "UNAUTHORIZED_CALLER"),
+        other => panic!("expected UNAUTHORIZED_CALLER for browser event, got {other:?}"),
+    }
+    match download_resp {
+        IpcResponse::Error { code, .. } => assert_eq!(code, "UNAUTHORIZED_CALLER"),
+        other => panic!("expected UNAUTHORIZED_CALLER for download origin, got {other:?}"),
+    }
+    assert!(
+        stalled_closed,
+        "stalled IPC connections must be closed after ipc_frame_timeout_ms"
+    );
+    match pong_resp {
+        IpcResponse::Pong {
+            protocol_version, ..
+        } => assert_eq!(protocol_version, ledr_proto::IPC_PROTOCOL_VERSION),
+        other => panic!("expected Pong after stalled clients timed out, got {other:?}"),
     }
 
     ipc_handle.shutdown().await;

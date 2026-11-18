@@ -2,14 +2,15 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
-use std::thread;
-use std::time::Duration;
+use std::sync::Arc;
 
 use ledr_daemon::{start_ipc_server, DaemonConfig, DaemonEngine};
-use ledr_proto::{SensorBackend, SensorEvent, IPC_PIPE_NAME, PROGRAM_DATA_DIR};
+use ledr_proto::{SensorBackend, IPC_PIPE_NAME, PROGRAM_DATA_DIR};
 use ledr_rules::{load_rules_and_pruner_from_dir, EarlyPruner, SigmaEngine};
-use ledr_sensor_win::etw::{capture_running_processes, NoopSensorBackend, WindowsEtwSensor};
+use ledr_sensor_win::etw::{
+    capture_running_processes, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
+    DEFAULT_ETW_SESSION_NAME,
+};
 use ledr_sensor_win::privileges::enable_required_privileges;
 use ledr_store::LedrStore;
 use tracing_subscriber::EnvFilter;
@@ -171,29 +172,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let engine = DaemonEngine::start(store, sigma, pruner, config);
 
-    let initial_processes = capture_running_processes();
-    let seeded_count = engine.seed_processes(initial_processes)?;
-    tracing::info!(
-        seeded_processes = seeded_count,
-        sigma_rules = rule_count,
-        db = %db_path.display(),
-        "initialized ActiveProcessTable and SQLite WAL store"
-    );
-
-    let (etw_tx, etw_rx) = mpsc::channel::<SensorEvent>();
+    // Start ETW capture directly into TwoLaneSender BEFORE Toolhelp32 snapshot capture so
+    // processes spawned or exiting during snapshot enumeration are not missed (BUG_0001, BUG_0006).
     let bridge_sender = engine.sender();
-    let bridge_handle = thread::Builder::new()
-        .name("ledr-etw-bridge".to_string())
-        .spawn(move || {
-            while let Ok(ev) = etw_rx.recv() {
-                if bridge_sender.blocking_send(ev).is_err() {
-                    break;
-                }
-            }
-        })?;
-
-    let mut etw_sensor = WindowsEtwSensor::new(etw_tx);
-    let mut active_backend: Box<dyn SensorBackend> = match etw_sensor.start() {
+    let etw_sink: EventSinkFn = Arc::new(move |ev| bridge_sender.blocking_send(ev).is_ok());
+    let mut etw_sensor = WindowsEtwSensor::with_sink(etw_sink, DEFAULT_ETW_SESSION_NAME);
+    let active_backend: Box<dyn SensorBackend> = match etw_sensor.start() {
         Ok(()) => {
             tracing::info!("WindowsEtwSensor real-time ETW trace started");
             Box::new(etw_sensor)
@@ -210,6 +194,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let initial_processes = capture_running_processes();
+    let seeded_count = engine.seed_processes(initial_processes)?;
+    tracing::info!(
+        seeded_processes = seeded_count,
+        sigma_rules = rule_count,
+        db = %db_path.display(),
+        "initialized ActiveProcessTable and SQLite WAL store"
+    );
+
     let ipc_handle = start_ipc_server(Arc::clone(&engine))?;
     tracing::info!(
         pipe = %ipc_handle.pipe_name(),
@@ -220,18 +213,18 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     tracing::info!("Ctrl+C received; initiating graceful shutdown and WAL checkpoint");
 
-    if let Err(err) = active_backend.stop() {
-        tracing::warn!(error = %err, "sensor backend stop returned warning");
-    }
-    drop(active_backend);
-
-    let _ = tokio::time::timeout(
-        Duration::from_millis(1000),
-        tokio::task::spawn_blocking(move || {
-            let _ = bridge_handle.join();
-        }),
-    )
+    let stop_res = tokio::task::spawn_blocking(move || {
+        let mut backend = active_backend;
+        let res = backend.stop();
+        drop(backend);
+        res
+    })
     .await;
+    match stop_res {
+        Ok(Err(err)) => tracing::warn!(error = %err, "sensor backend stop returned warning"),
+        Err(err) => tracing::warn!(error = %err, "sensor backend stop task panicked"),
+        Ok(Ok(())) => {}
+    }
 
     ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await?;

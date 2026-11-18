@@ -1,0 +1,437 @@
+//! Core Layer 2 daemon pipeline wiring [`TwoLaneChannel`], [`ActiveProcessTable`],
+//! [`EarlyPruner`], [`SigmaEngine`], and [`LedrStore`].
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use ledr_proto::{
+    AlertRecord, AlertStatus, EventLane, PipelineMetrics, SensorEvent,
+    ACTIVE_PROCESS_TABLE_CAPACITY, HIGH_PRIORITY_CHANNEL_CAPACITY, IPC_PIPE_NAME,
+    SHUTDOWN_FLUSH_TIMEOUT_MS, STORE_BATCH_FLUSH_INTERVAL_MS, TELEMETRY_CHANNEL_CAPACITY,
+};
+use ledr_rules::{assess_domain_risk, EarlyPruner, EventContext, SigmaEngine};
+use ledr_store::LedrStore;
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+use crate::channel::{TwoLaneChannel, TwoLaneReceiver, TwoLaneSender};
+use crate::process_table::ActiveProcessTable;
+
+const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+const TICKS_PER_MS: u64 = 10_000;
+
+/// Configuration options for [`DaemonEngine`] and the Named Pipe IPC server.
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    pub high_priority_capacity: usize,
+    pub telemetry_capacity: usize,
+    pub active_process_capacity: usize,
+    pub batch_flush_interval_ms: u64,
+    pub shutdown_flush_timeout_ms: u64,
+    pub pipe_name: String,
+    /// When `true` (Phase 1 `--foreground` dev mode), mutating IPC commands bypass the
+    /// `C:\Program Files\LocalEDR\ledr-ui.exe` install-path check while still inspecting
+    /// and logging caller process identity.
+    pub dev_mode_bypass_ui_auth: bool,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            high_priority_capacity: HIGH_PRIORITY_CHANNEL_CAPACITY,
+            telemetry_capacity: TELEMETRY_CHANNEL_CAPACITY,
+            active_process_capacity: ACTIVE_PROCESS_TABLE_CAPACITY,
+            batch_flush_interval_ms: STORE_BATCH_FLUSH_INTERVAL_MS,
+            shutdown_flush_timeout_ms: SHUTDOWN_FLUSH_TIMEOUT_MS,
+            pipe_name: IPC_PIPE_NAME.to_string(),
+            dev_mode_bypass_ui_auth: true,
+        }
+    }
+}
+
+/// Resident Layer 2 detection and persistence pipeline engine.
+pub struct DaemonEngine {
+    config: DaemonConfig,
+    store: LedrStore,
+    sigma: SigmaEngine,
+    pruner: EarlyPruner,
+    process_table: Mutex<ActiveProcessTable>,
+    sender: TwoLaneSender,
+    started_at: Instant,
+    high_priority_processed: AtomicU64,
+    telemetry_processed: AtomicU64,
+    pruned_events: AtomicU64,
+    alerts_emitted: AtomicU64,
+    worker_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl DaemonEngine {
+    /// Starts a new [`DaemonEngine`] background pipeline task consuming from a bounded [`TwoLaneChannel`].
+    pub fn start(
+        store: LedrStore,
+        sigma: SigmaEngine,
+        pruner: EarlyPruner,
+        config: DaemonConfig,
+    ) -> Arc<Self> {
+        let (sender, receiver) = TwoLaneChannel::with_capacities(
+            config.high_priority_capacity,
+            config.telemetry_capacity,
+        )
+        .split();
+        let process_table = Mutex::new(ActiveProcessTable::new(config.active_process_capacity));
+
+        let engine = Arc::new(Self {
+            config,
+            store,
+            sigma,
+            pruner,
+            process_table,
+            sender,
+            started_at: Instant::now(),
+            high_priority_processed: AtomicU64::new(0),
+            telemetry_processed: AtomicU64::new(0),
+            pruned_events: AtomicU64::new(0),
+            alerts_emitted: AtomicU64::new(0),
+            worker_handle: tokio::sync::Mutex::new(None),
+        });
+
+        let worker_engine = Arc::clone(&engine);
+        let handle = tokio::spawn(async move {
+            worker_engine.run_pipeline(receiver).await;
+        });
+
+        if let Ok(mut slot) = engine.worker_handle.try_lock() {
+            *slot = Some(handle);
+        }
+
+        engine
+    }
+
+    /// Returns a cloneable [`TwoLaneSender`] handle for submitting events into the pipeline.
+    pub fn sender(&self) -> TwoLaneSender {
+        self.sender.clone()
+    }
+
+    /// Returns a reference to the backing [`LedrStore`].
+    pub fn store(&self) -> &LedrStore {
+        &self.store
+    }
+
+    /// Returns the active [`DaemonConfig`].
+    pub fn config(&self) -> &DaemonConfig {
+        &self.config
+    }
+
+    /// Seeds the in-memory [`ActiveProcessTable`] and SQLite store with initial OS process snapshots
+    /// (`AUTO-03`), flushing them immediately.
+    pub fn seed_processes(&self, snapshots: Vec<SensorEvent>) -> Result<usize, anyhow::Error> {
+        let mut count = 0usize;
+        for ev in snapshots {
+            if let SensorEvent::ProcessStart { .. } = &ev {
+                self.process_event(&ev);
+                count += 1;
+            }
+        }
+        self.store.flush_batch()?;
+        Ok(count)
+    }
+
+    /// Returns current [`PipelineMetrics`] (`決定記録 L-10`).
+    pub fn metrics(&self) -> PipelineMetrics {
+        let active_processes = self
+            .process_table
+            .lock()
+            .map(|t| t.active_count())
+            .unwrap_or(0);
+        let pending_alerts = self
+            .store
+            .list_alerts(Some(AlertStatus::Pending), 1000)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        PipelineMetrics {
+            high_priority_depth: self.sender.high_priority_depth(),
+            high_priority_capacity: self.sender.high_priority_capacity(),
+            high_priority_processed: self.high_priority_processed.load(Ordering::Relaxed),
+            telemetry_depth: self.sender.telemetry_depth(),
+            telemetry_capacity: self.sender.telemetry_capacity(),
+            telemetry_processed: self.telemetry_processed.load(Ordering::Relaxed),
+            telemetry_dropped: self.sender.telemetry_dropped(),
+            active_processes,
+            pending_alerts,
+            uptime_secs: self.started_at.elapsed().as_secs(),
+        }
+    }
+
+    /// Total high-priority events dropped (always `0` per `決定記録 L-10`).
+    pub fn high_priority_dropped(&self) -> u64 {
+        self.sender.high_priority_dropped()
+    }
+
+    /// Total events skipped from Sigma evaluation by [`EarlyPruner`].
+    pub fn pruned_events(&self) -> u64 {
+        self.pruned_events.load(Ordering::Relaxed)
+    }
+
+    /// Total alerts persisted to [`LedrStore`] from Sigma matches.
+    pub fn alerts_emitted(&self) -> u64 {
+        self.alerts_emitted.load(Ordering::Relaxed)
+    }
+
+    /// Number of entries currently retained in [`ActiveProcessTable`].
+    pub fn active_process_table_len(&self) -> usize {
+        self.process_table
+            .lock()
+            .map(|t| t.total_len())
+            .unwrap_or(0)
+    }
+
+    /// Closes ingestion, drains remaining queued events, flushes SQLite batches, and runs
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` within `SHUTDOWN_FLUSH_TIMEOUT_MS` (`3,000 ms`, `AUTO-10`).
+    pub async fn shutdown_and_flush(&self) -> Result<(), anyhow::Error> {
+        self.sender.close();
+
+        let handle = {
+            let mut guard = self.worker_handle.lock().await;
+            guard.take()
+        };
+
+        let timeout = Duration::from_millis(self.config.shutdown_flush_timeout_ms.max(1));
+        if let Some(h) = handle {
+            match tokio::time::timeout(timeout, h).await {
+                Ok(join_res) => {
+                    if let Err(err) = join_res {
+                        tracing::error!(error = %err, "daemon worker task panicked during shutdown");
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = self.config.shutdown_flush_timeout_ms,
+                        "daemon pipeline drain exceeded shutdown flush timeout; forcing checkpoint"
+                    );
+                }
+            }
+        }
+
+        self.store.checkpoint_truncate()?;
+        Ok(())
+    }
+
+    async fn run_pipeline(self: Arc<Self>, mut receiver: TwoLaneReceiver) {
+        let interval_ms = self.config.batch_flush_interval_ms.max(50);
+        let mut flush_ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+        flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+                maybe_event = receiver.recv() => {
+                    match maybe_event {
+                        Some(event) => self.process_event(&event),
+                        None => break,
+                    }
+                }
+                _ = flush_ticker.tick() => {
+                    if let Err(err) = self.store.flush_if_interval_elapsed() {
+                        tracing::warn!(error = %err, "periodic SQLite batch flush failed");
+                    }
+                }
+            }
+        }
+
+        for remaining in receiver.drain_ready() {
+            self.process_event(&remaining);
+        }
+
+        if let Err(err) = self.store.checkpoint_truncate() {
+            tracing::warn!(error = %err, "worker shutdown checkpoint_truncate failed");
+        }
+    }
+
+    fn process_event(&self, event: &SensorEvent) {
+        let now_ms = current_unix_ms();
+        let event_ts_ms = event_timestamp_ms(event, now_ms);
+
+        let proc_ctx = self.resolve_process_context(event, event_ts_ms);
+
+        let ctx = EventContext::with_parent(
+            event,
+            proc_ctx.parent_exe_path.as_deref(),
+            proc_ctx.parent_command_line.as_deref(),
+        );
+
+        if self
+            .pruner
+            .should_prune_with_image(&ctx, proc_ctx.proc_exe_path.as_deref())
+        {
+            self.pruned_events.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let matches = self
+                .sigma
+                .evaluate_with_image(&ctx, proc_ctx.proc_exe_path.as_deref());
+            for m in matches {
+                let context_json = serde_json::json!({
+                    "event": event,
+                    "parent_exe_path": proc_ctx.parent_exe_path,
+                    "parent_command_line": proc_ctx.parent_command_line,
+                    "matched_fields": m.matched_fields,
+                })
+                .to_string();
+
+                let alert = AlertRecord {
+                    alert_id: Uuid::new_v4().to_string(),
+                    timestamp_ms: event_ts_ms,
+                    severity: m.severity,
+                    source_layer: "LAYER_2_RULES".to_string(),
+                    rule_id: m.rule_id,
+                    title: m.title,
+                    process_instance_id: proc_ctx.proc_instance_id.clone(),
+                    process_suspended: false,
+                    status: AlertStatus::Pending,
+                    context_json,
+                    resolved_at_ms: None,
+                };
+                if let Err(err) = self.store.record_alert(&alert) {
+                    tracing::warn!(error = %err, rule_id = %alert.rule_id, "failed to record Sigma alert");
+                } else {
+                    self.alerts_emitted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let is_nrd = if let SensorEvent::DnsQuery { query_name, .. } = event {
+            assess_domain_risk(query_name, None).is_nrd
+        } else {
+            false
+        };
+
+        if let Err(err) =
+            self.store
+                .ingest_event(event, proc_ctx.store_hint.as_deref(), is_nrd, "OBSERVED")
+        {
+            tracing::warn!(error = %err, "failed to ingest event into SQLite store");
+        }
+
+        match event.default_lane() {
+            EventLane::HighPriority => {
+                self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
+            }
+            EventLane::Telemetry => {
+                self.telemetry_processed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn resolve_process_context(
+        &self,
+        event: &SensorEvent,
+        event_ts_ms: i64,
+    ) -> ResolvedProcessContext {
+        let mut table = self
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        match event {
+            SensorEvent::ProcessStart {
+                identity,
+                parent_pid,
+                exe_path,
+                command_line,
+                user_sid,
+            } => {
+                let res = table.on_process_start(
+                    *identity,
+                    *parent_pid,
+                    exe_path.clone(),
+                    command_line.clone(),
+                    user_sid.clone(),
+                    event_ts_ms,
+                );
+                ResolvedProcessContext {
+                    proc_instance_id: Some(res.instance_id),
+                    proc_exe_path: Some(exe_path.clone()),
+                    store_hint: res.parent_instance_id,
+                    parent_exe_path: res.parent_exe_path,
+                    parent_command_line: res.parent_command_line,
+                }
+            }
+            SensorEvent::ProcessStop { pid, .. } => {
+                let id = table.on_process_stop(*pid, event_ts_ms);
+                ResolvedProcessContext {
+                    proc_instance_id: id.clone(),
+                    proc_exe_path: None,
+                    store_hint: id,
+                    parent_exe_path: None,
+                    parent_command_line: None,
+                }
+            }
+            SensorEvent::DnsQuery { pid, .. }
+            | SensorEvent::NetworkConnect { pid, .. }
+            | SensorEvent::CanaryFileAccess { pid, .. }
+            | SensorEvent::ScriptEvaluated { pid, .. } => {
+                let Some(proc_entry) = table.lookup_by_pid(*pid).cloned() else {
+                    return ResolvedProcessContext::default();
+                };
+                let (parent_exe, parent_cmd) = proc_entry
+                    .parent_instance_id
+                    .as_deref()
+                    .and_then(|parent_id| table.get_by_instance_id(parent_id))
+                    .map(|p| {
+                        (
+                            Some(p.exe_path.clone()),
+                            (!p.command_line.is_empty()).then(|| p.command_line.clone()),
+                        )
+                    })
+                    .unwrap_or((None, None));
+                ResolvedProcessContext {
+                    proc_instance_id: Some(proc_entry.instance_id.clone()),
+                    proc_exe_path: Some(proc_entry.exe_path),
+                    store_hint: Some(proc_entry.instance_id),
+                    parent_exe_path: parent_exe,
+                    parent_command_line: parent_cmd,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResolvedProcessContext {
+    proc_instance_id: Option<String>,
+    proc_exe_path: Option<String>,
+    store_hint: Option<String>,
+    parent_exe_path: Option<String>,
+    parent_command_line: Option<String>,
+}
+
+pub(crate) fn current_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn event_timestamp_ms(event: &SensorEvent, fallback_ms: i64) -> i64 {
+    match event {
+        SensorEvent::ProcessStart { identity, .. } => {
+            filetime_100ns_to_unix_ms(identity.create_time_100ns, fallback_ms)
+        }
+        SensorEvent::ProcessStop {
+            exit_time_100ns, ..
+        } => filetime_100ns_to_unix_ms(*exit_time_100ns, fallback_ms),
+        SensorEvent::DnsQuery { timestamp_ms, .. }
+        | SensorEvent::NetworkConnect { timestamp_ms, .. }
+        | SensorEvent::CanaryFileAccess { timestamp_ms, .. }
+        | SensorEvent::ScriptEvaluated { timestamp_ms, .. } => *timestamp_ms,
+    }
+}
+
+fn filetime_100ns_to_unix_ms(ticks: u64, fallback_ms: i64) -> i64 {
+    if ticks >= WINDOWS_TO_UNIX_EPOCH_100NS {
+        let unix_ms = (ticks - WINDOWS_TO_UNIX_EPOCH_100NS) / TICKS_PER_MS;
+        i64::try_from(unix_ms).unwrap_or(fallback_ms)
+    } else {
+        fallback_ms
+    }
+}

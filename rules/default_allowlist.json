@@ -1,0 +1,72 @@
+{
+  "allowlist_rules": [
+    {
+      "rule_id": "ALLOW-OS-WIN-SYS32",
+      "scope": "ProcessAllow",
+      "exe_path_pattern": "C:\\Windows\\System32\\*.exe",
+      "sha256": null,
+      "signer_subject": "CN=Microsoft Windows, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+      "root_thumbprint": "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+      "allowed_target": null,
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    },
+    {
+      "rule_id": "ALLOW-OS-DEFENDER",
+      "scope": "FileCanaryAllow",
+      "exe_path_pattern": "C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\*\\MsMpEng.exe",
+      "sha256": null,
+      "signer_subject": "CN=Microsoft Windows Publisher, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+      "root_thumbprint": "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+      "allowed_target": null,
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    },
+    {
+      "rule_id": "ALLOW-OS-SEARCH-INDEXER",
+      "scope": "FileCanaryAllow",
+      "exe_path_pattern": "C:\\Windows\\System32\\SearchIndexer.exe",
+      "sha256": null,
+      "signer_subject": "CN=Microsoft Windows, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+      "root_thumbprint": "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+      "allowed_target": null,
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    },
+    {
+      "rule_id": "ALLOW-LEDR-DAEMON",
+      "scope": "ProcessAllow",
+      "exe_path_pattern": "C:\\Program Files\\LocalEDR\\ledr-daemon.exe",
+      "sha256": null,
+      "signer_subject": "CN=LocalEDR, O=LocalEDR Contributors",
+      "root_thumbprint": "0000000000000000000000000000000000000000",
+      "allowed_target": null,
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    }
+  ],
+  "early_pruner": {
+    "prune_loopback_network": true,
+    "ignored_dns_names": [
+      "localhost",
+      "wpad",
+      "isatap"
+    ],
+    "ignored_dns_suffixes": [
+      ".local",
+      ".arpa",
+      ".internal"
+    ],
+    "trusted_telemetry_images": [
+      "C:\\Windows\\System32\\svchost.exe",
+      "C:\\Windows\\System32\\SearchIndexer.exe",
+      "C:\\Windows\\System32\\SearchProtocolHost.exe",
+      "C:\\Program Files\\Windows Defender\\MsMpEng.exe"
+    ],
+    "trusted_os_noise_images": [
+      "C:\\Windows\\System32\\SearchProtocolHost.exe",
+      "C:\\Windows\\System32\\backgroundTaskHost.exe",
+      "C:\\Windows\\System32\\conhost.exe"
+    ]
+  }
+}

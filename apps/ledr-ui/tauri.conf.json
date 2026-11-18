@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LocalEDR",
+  "version": "0.1.0",
+  "identifier": "io.localedr.ui",
+  "build": {
+    "frontendDist": "./ui"
+  },
+  "bundle": {
+    "active": false
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self'; script-src 'self'"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "LocalEDR - Process Lineage & Flight Recorder",
+        "width": 1200,
+        "height": 780,
+        "visible": true
+      }
+    ]
+  }
+}

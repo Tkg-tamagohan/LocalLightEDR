@@ -1,6 +1,6 @@
 //! Integration tests for `ledr-daemon` two-lane burst budget, LOTL rule detection,
 //! Named Pipe IPC server round-trip, startup reconciliation, and shutdown purge interruption
-//! (`BURST-01`..`BURST-09`).
+//! (`BURST-01`..`BURST-11`).
 
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -1449,5 +1449,166 @@ async fn burst_09_parent_enrichment_triggers_lotl_alert_and_older_snapshot_prese
             .expect("final alerts")
             .len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn burst_10_older_snapshot_process_gets_inferred_exit_in_store() {
+    let sigma = SigmaEngine::from_rules(Vec::new()).expect("empty rules");
+    let pruner = EarlyPruner::default();
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+
+    let engine = DaemonEngine::start(
+        store.clone(),
+        sigma,
+        pruner,
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+    );
+    let sender = engine.sender();
+
+    // Newer incarnation of PID 42 observed via ETW first, then an older snapshot arrives.
+    // The older row must be persisted with an inferred exited_at_ms instead of staying "running".
+    let t_base = 1_750_000_000_000i64;
+    let newer_42 = ProcessIdentity::new(42, unix_ms_to_filetime(t_base + 2_000));
+    let older_42 = ProcessIdentity::new(42, unix_ms_to_filetime(t_base + 1_000));
+
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: newer_42,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\newer42.exe".to_string(),
+            command_line: "newer42.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send newer PID 42 ETW start");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().high_priority_processed < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for newer PID 42 ETW start"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    engine
+        .seed_processes(vec![SensorEvent::ProcessStart {
+            identity: older_42,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\older42.exe".to_string(),
+            command_line: "older42.exe".to_string(),
+            user_sid: None,
+        }])
+        .expect("seed older PID 42 snapshot");
+
+    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+
+    let snap = store
+        .query_flight_recorder(50, None)
+        .expect("query flight recorder");
+    let older_row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == older_42.instance_id())
+        .expect("older PID 42 row recorded");
+    assert_eq!(
+        older_row.exited_at_ms,
+        Some(t_base + 2_000),
+        "older incarnation must carry the inferred exit time (newer row's created_at_ms)"
+    );
+    let newer_row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == newer_42.instance_id())
+        .expect("newer PID 42 row recorded");
+    assert_eq!(newer_row.exited_at_ms, None);
+}
+
+#[tokio::test]
+async fn burst_11_distinct_script_bodies_each_emit_alert_per_rule() {
+    let lotl_json = include_str!("../../../rules/lotl_core.json");
+    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
+    let sigma = SigmaEngine::from_json_str(lotl_json).expect("compile lotl_core.json");
+    let pruner = EarlyPruner::from_json_str(allowlist_json).expect("build pruner");
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+
+    let engine = DaemonEngine::start(
+        store.clone(),
+        sigma,
+        pruner,
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+    );
+    let sender = engine.sender();
+
+    let t_base = 1_750_000_000_000i64;
+    let ps_ident = ProcessIdentity::new(7100, unix_ms_to_filetime(t_base + 1_000));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ps_ident,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            command_line: "powershell.exe".to_string(),
+            user_sid: Some("S-1-5-21-1000".to_string()),
+        })
+        .await
+        .expect("send powershell ProcessStart");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().high_priority_processed < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for powershell ProcessStart"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Two different script bodies matching the same rule must each emit an alert; replaying the
+    // identical body must still be deduplicated.
+    let script_a = "Invoke-AmsiUtils bypass".to_string();
+    let script_b = "New-Object VirtualAlloc; FromBase64String payload".to_string();
+    for (content, ts) in [
+        (script_a.as_str(), t_base + 2_000),
+        (script_b.as_str(), t_base + 3_000),
+        (script_a.as_str(), t_base + 4_000),
+    ] {
+        sender
+            .send(SensorEvent::ScriptEvaluated {
+                pid: 7100,
+                source: ScriptSource::PowerShell4104,
+                script_content: content.to_string(),
+                timestamp_ms: ts,
+            })
+            .await
+            .expect("send ScriptEvaluated");
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().high_priority_processed < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for ScriptEvaluated processing"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+
+    let alerts = store
+        .list_alerts(Some(AlertStatus::Pending), 20)
+        .expect("list alerts");
+    assert_eq!(
+        alerts.len(),
+        2,
+        "distinct script bodies must each fire LEDR-SCRIPT-001, identical replay deduplicated"
+    );
+    assert!(alerts.iter().all(|a| a.rule_id == "LEDR-SCRIPT-001"));
+    assert!(
+        alerts
+            .iter()
+            .all(|a| a.process_instance_id.as_deref() == Some(ps_ident.instance_id().as_str()))
     );
 }

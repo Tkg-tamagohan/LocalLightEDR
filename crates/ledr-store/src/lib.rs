@@ -42,7 +42,8 @@ SELECT process_instance_id FROM processes
 WHERE pid = ?1
   AND created_at_ms <= ?2
   AND (exited_at_ms IS NULL OR exited_at_ms >= ?2)
-ORDER BY created_at_ms DESC
+ORDER BY created_at_ms DESC,
+         CAST(substr(process_instance_id, instr(process_instance_id, ':') + 1) AS INTEGER) DESC
 LIMIT 1";
 
 /// Returns the store crate version string.
@@ -99,6 +100,9 @@ struct BufferedEvent {
     is_nrd: bool,
     action: String,
     received_at_ms: i64,
+    /// Inferred exit time supplied by the daemon when a `ProcessStart` describes an older
+    /// incarnation already superseded in memory; `None` for every other event.
+    exited_at_ms: Option<i64>,
 }
 
 #[derive(Default)]
@@ -230,6 +234,22 @@ impl LedrStore {
         is_nrd: bool,
         action: &str,
     ) -> Result<bool, StoreError> {
+        self.ingest_event_with_exit(event, parent_instance_id, None, is_nrd, action)
+    }
+
+    /// Same as [`Self::ingest_event`] but also carries an inferred `exited_at_ms` for a
+    /// `ProcessStart` that describes an older incarnation already superseded in memory, so the
+    /// stored row is not left `exited_at_ms IS NULL` (running) forever.
+    ///
+    /// The parameter is ignored for non-`ProcessStart` events.
+    pub fn ingest_event_with_exit(
+        &self,
+        event: &SensorEvent,
+        parent_instance_id: Option<&str>,
+        exited_at_ms: Option<i64>,
+        is_nrd: bool,
+        action: &str,
+    ) -> Result<bool, StoreError> {
         if matches!(event, SensorEvent::ScriptEvaluated { .. }) {
             // Evaluated in-memory by Layer 2 SigmaEngine and stored in alerts.context_json on match.
             tracing::trace!("skipping direct telemetry table buffering for ScriptEvaluated");
@@ -243,6 +263,7 @@ impl LedrStore {
             is_nrd,
             action: action.to_owned(),
             received_at_ms: current_unix_ms(),
+            exited_at_ms,
         };
 
         let should_flush = {
@@ -1114,7 +1135,7 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                         identity.create_time_100ns,
                         item.received_at_ms,
                     ),
-                    exited_at_ms: None,
+                    exited_at_ms: item.exited_at_ms,
                 };
                 upsert_process_row(tx, &record)?;
             }

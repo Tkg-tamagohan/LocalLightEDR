@@ -29,6 +29,9 @@ pub struct ProcessStartResolution {
     pub parent_exe_path: Option<String>,
     pub parent_command_line: Option<String>,
     pub should_evaluate_sigma: bool,
+    /// Inferred exit time set when this `ProcessStart` describes an older incarnation already
+    /// superseded in memory; the engine propagates it to the store row.
+    pub exited_at_ms: Option<i64>,
 }
 
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
@@ -150,6 +153,7 @@ impl ActiveProcessTable {
                 parent_exe_path,
                 parent_command_line,
                 should_evaluate_sigma,
+                exited_at_ms: None,
             };
         }
 
@@ -193,6 +197,7 @@ impl ActiveProcessTable {
                         parent_exe_path,
                         parent_command_line,
                         should_evaluate_sigma: true,
+                        exited_at_ms: Some(inferred_exit_ms),
                     };
                 }
             }
@@ -238,6 +243,7 @@ impl ActiveProcessTable {
             parent_exe_path,
             parent_command_line,
             should_evaluate_sigma: true,
+            exited_at_ms: None,
         }
     }
 

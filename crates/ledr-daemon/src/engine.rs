@@ -1,7 +1,9 @@
 //! Core Layer 2 daemon pipeline wiring [`TwoLaneChannel`], [`ActiveProcessTable`],
 //! [`EarlyPruner`], [`SigmaEngine`], and [`LedrStore`].
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -358,7 +360,17 @@ impl DaemonEngine {
                 .evaluate_with_image(&ctx, proc_ctx.proc_exe_path.as_deref());
             for m in matches {
                 if let Some(ref inst_id) = proc_ctx.proc_instance_id {
-                    if !self.is_new_rule_alert(inst_id, &m.rule_id) {
+                    // Distinct script bodies evaluated in the same process must each be able to
+                    // fire an alert; deduplicate per (instance, rule, content fingerprint).
+                    let dedup_key = match event {
+                        SensorEvent::ScriptEvaluated { script_content, .. } => {
+                            let mut h = DefaultHasher::new();
+                            script_content.hash(&mut h);
+                            format!("{}:{:x}", m.rule_id, h.finish())
+                        }
+                        _ => m.rule_id.clone(),
+                    };
+                    if !self.is_new_rule_alert(inst_id, &dedup_key) {
                         continue;
                     }
                 }
@@ -397,10 +409,13 @@ impl DaemonEngine {
             false
         };
 
-        if let Err(err) =
-            self.store
-                .ingest_event(event, proc_ctx.store_hint.as_deref(), is_nrd, "OBSERVED")
-        {
+        if let Err(err) = self.store.ingest_event_with_exit(
+            event,
+            proc_ctx.store_hint.as_deref(),
+            proc_ctx.exited_at_ms,
+            is_nrd,
+            "OBSERVED",
+        ) {
             tracing::warn!(error = %err, "failed to ingest event into SQLite store");
         }
 
@@ -455,6 +470,7 @@ impl DaemonEngine {
                     parent_exe_path: res.parent_exe_path,
                     parent_command_line: res.parent_command_line,
                     should_evaluate_sigma: res.should_evaluate_sigma,
+                    exited_at_ms: res.exited_at_ms,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
@@ -466,6 +482,7 @@ impl DaemonEngine {
                     parent_exe_path: None,
                     parent_command_line: None,
                     should_evaluate_sigma: true,
+                    exited_at_ms: None,
                 }
             }
             SensorEvent::DnsQuery { pid, .. }
@@ -493,6 +510,7 @@ impl DaemonEngine {
                     parent_exe_path: parent_exe,
                     parent_command_line: parent_cmd,
                     should_evaluate_sigma: true,
+                    exited_at_ms: None,
                 }
             }
         }
@@ -506,6 +524,9 @@ struct ResolvedProcessContext {
     parent_exe_path: Option<String>,
     parent_command_line: Option<String>,
     should_evaluate_sigma: bool,
+    /// Inferred exit time carried from [`ProcessStartResolution`] for older snapshot
+    /// incarnations so the store row does not stay "running" forever.
+    exited_at_ms: Option<i64>,
 }
 
 impl Default for ResolvedProcessContext {
@@ -517,6 +538,7 @@ impl Default for ResolvedProcessContext {
             parent_exe_path: None,
             parent_command_line: None,
             should_evaluate_sigma: true,
+            exited_at_ms: None,
         }
     }
 }

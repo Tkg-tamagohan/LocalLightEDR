@@ -1363,3 +1363,63 @@ fn store_08_pid_created_index_query_plan_and_shutdown_interrupts_purge() {
         .expect("count remaining expired processes");
     assert_eq!(remaining_expired, 1_600);
 }
+
+#[test]
+fn store_09_same_ms_pid_reuse_prefers_newer_create_time_100ns() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+
+    // Two incarnations of PID 42 whose create times differ by 5 ticks (< 1 ms), so both rows
+    // share the same created_at_ms while instance ids differ in the 100 ns component.
+    let base_ms: i64 = 1_750_000_000_000;
+    let older_ident = ProcessIdentity::new(42, unix_ms_to_filetime(base_ms));
+    let newer_ident = ProcessIdentity::new(42, unix_ms_to_filetime(base_ms) + 5);
+    let older_start = SensorEvent::ProcessStart {
+        identity: older_ident,
+        parent_pid: 4,
+        exe_path: r"C:\Temp\older.exe".to_string(),
+        command_line: "older.exe".to_string(),
+        user_sid: Some("S-1-5-21-1000".to_string()),
+    };
+    let newer_start = SensorEvent::ProcessStart {
+        identity: newer_ident,
+        parent_pid: 4,
+        exe_path: r"C:\Temp\newer.exe".to_string(),
+        command_line: "newer.exe".to_string(),
+        user_sid: Some("S-1-5-21-1000".to_string()),
+    };
+
+    store
+        .ingest_event(&older_start, Some("4:1"), false, "")
+        .expect("ingest older same-ms start");
+    store
+        .ingest_event(&newer_start, Some("4:1"), false, "")
+        .expect("ingest newer same-ms start");
+    store.flush_batch().expect("flush same-ms processes");
+
+    let net = SensorEvent::NetworkConnect {
+        pid: 42,
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        dst_port: 443,
+        domain_hint: None,
+        timestamp_ms: base_ms + 500,
+    };
+    store
+        .ingest_event(&net, None, false, "ALLOW")
+        .expect("ingest network event without hint");
+    store.flush_batch().expect("flush network event");
+
+    let snap = store
+        .query_flight_recorder(20, Some(&newer_ident.instance_id()))
+        .expect("query flight recorder for newer row");
+    let net_row = snap
+        .network_events
+        .iter()
+        .find(|n| n.dst_port == 443)
+        .expect("network event recorded");
+    assert_eq!(
+        net_row.process_instance_id,
+        newer_ident.instance_id(),
+        "same-created_at_ms tie must resolve to the row with the newer 100ns create time"
+    );
+}

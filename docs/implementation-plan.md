@@ -501,11 +501,11 @@ Background Service Worker は `chrome.downloads.onCreated` と完了遷移の `o
 
 ### Phase 1 プロセス系譜と DNS 通信ロガーの構築
 
-- [ ] `crates/ledr-sensor-win` に特権有効化、起動時スナップショット、ETW（Process、DNS-Client、Kernel-Network、AMSI、PowerShell 4104）購読、および DNS 相関キャッシュを実装する
-- [ ] `crates/ledr-rules` と `crates/ledr-daemon` に 2 レーン有界チャネル、早期枝刈りフィルタ、Aho-Corasick コンパイル付き軽量 Sigma 評価器、および Named Pipe IPC サーバを実装する
-- [ ] `crates/ledr-store` に SQLite WAL 初期化（メモリ 2 MB PRAGMA）、1 秒または 500 件バッチ書込、3 秒以内終了フラッシュ、14 日 TTL パージ、および系譜クエリ API を実装する
-- [ ] `apps/ledr-ui` に Tauri v2 プロジェクト構築、View 2（プロセス系譜と通信フライトレコーダービュー）、およびウィンドウ閉鎖時の完全終了を実装する
-- [ ] `crates/ledr-sim` に LOTL 擬似起動と外部 DNS および TCP 接続のテストシナリオを実装する
+- [x] `crates/ledr-sensor-win` に特権有効化、起動時スナップショット、ETW（Process、DNS-Client、Kernel-Network、AMSI、PowerShell 4104）購読、および DNS 相関キャッシュを実装する
+- [x] `crates/ledr-rules` と `crates/ledr-daemon` に 2 レーン有界チャネル、早期枝刈りフィルタ、Aho-Corasick コンパイル付き軽量 Sigma 評価器、および Named Pipe IPC サーバを実装する
+- [x] `crates/ledr-store` に SQLite WAL 初期化（メモリ 2 MB PRAGMA）、1 秒または 500 件バッチ書込、3 秒以内終了フラッシュ、14 日 TTL パージ、および系譜クエリ API を実装する
+- [x] `apps/ledr-ui` に Tauri v2 プロジェクト構築、View 2（プロセス系譜と通信フライトレコーダービュー）、およびウィンドウ閉鎖時の完全終了を実装する
+- [x] `crates/ledr-sim` に LOTL 擬似起動と外部 DNS および TCP 接続のテストシナリオを実装する
 
 受け入れ条件として、`ledr-sim` で実行した `cmd` 経由の難読化 PowerShell 起動と外部接続が SQLite へ記録され、UI 起動後 1 秒以内に親子系譜、引数、解決ドメイン、IP が描画されること、かつ UI 閉鎖時に UI プロセスが 0 個でデーモンの常駐メモリが 20 MB 以下、定常時 CPU が 0.5% 未満であることを確認する。
 

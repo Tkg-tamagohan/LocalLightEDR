@@ -3186,6 +3186,7 @@ async fn daemon_p2_29_bug_0001_live_suspended_child_terminate_failure_keeps_unre
         std::process::id(),
         unix_ms_to_filetime(now_ms - 1_000),
     );
+    let extra_child = ProcessIdentity::new(0x7FFF_FFC2, unix_ms_to_filetime(now_ms - 1_000));
 
     let alert = AlertRecord {
         alert_id: "alert-child-terminate-fail".to_string(),
@@ -3199,7 +3200,7 @@ async fn daemon_p2_29_bug_0001_live_suspended_child_terminate_failure_keeps_unre
         status: AlertStatus::Pending,
         context_json: serde_json::json!({
             "exe_path": r"C:\Temp\gone_parent.exe",
-            "suspended_children": [live_child.instance_id()],
+            "suspended_children": [live_child.instance_id(), extra_child.instance_id()],
         })
         .to_string(),
         resolved_at_ms: None,
@@ -3209,16 +3210,28 @@ async fn daemon_p2_29_bug_0001_live_suspended_child_terminate_failure_keeps_unre
     // Parent terminate is tolerated (already gone); the live child's terminate fails.
     defense.add_failing_terminate_pid(gone_parent.pid);
     defense.add_failing_terminate_pid(live_child.pid);
+    let err = engine
+        .resolve_alert(
+            &alert.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+        )
+        .expect_err("terminate failure on a live suspended child must surface as an error");
     assert!(
-        engine
-            .resolve_alert(
-                &alert.alert_id,
-                AlertDecision::TerminateAndBlock {
-                    add_block_rule: true,
-                },
-            )
-            .is_err(),
-        "terminate failure on a live suspended child must surface as an error"
+        err.contains(&format!("PID {})", live_child.pid)),
+        "surfaced error must reference the child's PID, not the parent's: {err}"
+    );
+    // The deferred failure must not abandon remaining recorded descendants: the later
+    // child still gets its terminate attempt (the parent's own call failed and was
+    // tolerated, so it is not recorded by the mock).
+    assert_eq!(
+        defense.terminates(),
+        vec![TerminateCall {
+            target: extra_child,
+            include_children: true,
+        }],
+        "remaining recorded descendants must still be terminated after an earlier child failure"
     );
     assert!(
         store

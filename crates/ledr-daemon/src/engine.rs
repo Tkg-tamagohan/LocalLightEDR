@@ -666,23 +666,34 @@ impl DaemonEngine {
                     ));
                 }
 
+                // Attempt every recorded child and defer the first real failure: a live
+                // or unverifiable child keeps the alert unresolved, but remaining
+                // descendants must still get their terminate attempt — once the parent
+                // is gone, a recorded identifier is the only way to reach them.
+                let mut child_terminate_err: Option<String> = None;
                 for child in &suspended_children {
-                    if let Err(err) = self.defense.terminate_process(child, true) {
-                        // Only tolerate a child confirmed gone or PID-reused: a still-
-                        // running child that cannot be terminated must keep the alert
-                        // unresolved so the triage can be retried (`BUG_0001`).
-                        if is_protected_process_refusal(&err)
-                            || !is_process_gone_or_replaced(&err, child.pid)
+                    match self.defense.terminate_process(child, true) {
+                        Ok(()) => {}
+                        Err(err)
+                            if is_protected_process_refusal(&err)
+                                || !is_process_gone_or_replaced(&err, child.pid) =>
                         {
-                            return Err(err);
+                            child_terminate_err.get_or_insert(err);
                         }
-                        tracing::warn!(
-                            alert_id = %alert_id,
-                            child_pid = child.pid,
-                            error = %err,
-                            "terminate_process failed for suspended child (already exited); continuing"
-                        );
+                        Err(err) => {
+                            // Only tolerate a child confirmed gone or PID-reused
+                            // (`BUG_0001`).
+                            tracing::warn!(
+                                alert_id = %alert_id,
+                                child_pid = child.pid,
+                                error = %err,
+                                "terminate_process failed for suspended child (already exited); continuing"
+                            );
+                        }
                     }
+                }
+                if let Some(err) = child_terminate_err {
+                    return Err(err);
                 }
 
                 if add_block_rule {

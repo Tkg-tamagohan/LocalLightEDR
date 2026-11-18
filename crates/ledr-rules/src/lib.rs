@@ -843,4 +843,39 @@ mod tests {
             }
         }
     }
+
+    /// `RULES-P2-06` (`BUG_0006`): the `ALLOW-BROWSER-BRAVE` signer subject contains a
+    /// comma and must stay quoted in `default_allowlist.json`; unquoted, `split_rdns`
+    /// would split it into two RDNs and the rule could never match.
+    #[test]
+    fn rules_p2_06_default_allowlist_brave_signer_subject_with_comma_matches() {
+        use ledr_proto::{AuthenticodeInfo, RuleScope};
+
+        let allowlist_json = include_str!("../../../rules/default_allowlist.json");
+        let cfg = AllowlistConfig::from_json_str(allowlist_json).expect("parse default allowlist");
+
+        let brave_auth = AuthenticodeInfo {
+            signer_subject:
+                "CN=\"Brave Software, Inc.\", O=\"Brave Software, Inc.\", L=San Francisco, S=California, C=US"
+                    .to_string(),
+            root_thumbprint: "7B0F360B775F76C94A12CA48445AA2D2A875701C".to_string(),
+        };
+        let identity = BinaryIdentity {
+            exe_path: r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+                .to_string(),
+            sha256: None,
+            authenticode: Some(brave_auth),
+        };
+        assert!(
+            is_allowed_by_rules(
+                &identity,
+                Some(
+                    r"C:\Users\alice\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Cookies"
+                ),
+                RuleScope::FileCanaryAllow,
+                &cfg.allowlist_rules
+            ),
+            "Brave signed identity must match ALLOW-BROWSER-BRAVE"
+        );
+    }
 }

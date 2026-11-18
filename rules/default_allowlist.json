@@ -93,7 +93,7 @@
       "scope": "FileCanaryAllow",
       "exe_path_pattern": "C:\\Program Files*\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
       "sha256": null,
-      "signer_subject": "CN=Brave Software, Inc.",
+      "signer_subject": "CN=\"Brave Software, Inc.\"",
       "root_thumbprint": "7B0F360B775F76C94A12CA48445AA2D2A875701C",
       "allowed_target": "*\\BraveSoftware\\Brave-Browser\\User Data\\*",
       "created_at_ms": 0,

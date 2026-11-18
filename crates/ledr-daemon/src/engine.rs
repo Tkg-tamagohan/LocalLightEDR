@@ -668,7 +668,12 @@ impl DaemonEngine {
 
                 for child in &suspended_children {
                     if let Err(err) = self.defense.terminate_process(child, true) {
-                        if is_protected_process_refusal(&err) {
+                        // Only tolerate a child confirmed gone or PID-reused: a still-
+                        // running child that cannot be terminated must keep the alert
+                        // unresolved so the triage can be retried (`BUG_0001`).
+                        if is_protected_process_refusal(&err)
+                            || !is_process_gone_or_replaced(&err, child.pid)
+                        {
                             return Err(err);
                         }
                         tracing::warn!(
@@ -1588,13 +1593,25 @@ fn is_protected_process_refusal(err: &str) -> bool {
     lower.contains("refusing to act on") || lower.contains("never-suspend")
 }
 
-/// Returns `true` when a failed suspend/resume target is actually gone — the process
-/// exited (no PID in the Toolhelp32 snapshot) or its PID was reused (CreationTime
-/// mismatch). Live processes reporting any other error are genuine failures the
-/// caller must surface (`BUG_0004`).
+/// Returns `true` when a failed suspend/resume/terminate target is confirmed gone —
+/// the snapshot positively reports the PID absent or its PID was reused (CreationTime
+/// mismatch). Live processes and unverifiable states are genuine failures the caller
+/// must surface (`BUG_0004`, `BUG_0002`).
 fn is_process_gone_or_replaced(err: &str, pid: u32) -> bool {
+    tolerate_missing_target(err, ledr_sensor_win::defense::process_liveness(pid))
+}
+
+/// `true` only when the failed suspend/resume/terminate target is confirmed gone: a
+/// `CreationTime mismatch` proves PID reuse, or the snapshot positively reports the
+/// PID absent. An unconfirmed absence (`Unknown` — snapshot/enumeration failed) is NOT
+/// tolerated, so the caller surfaces the error and the operation stays retryable
+/// (`BUG_0002`).
+fn tolerate_missing_target(
+    err: &str,
+    liveness: ledr_sensor_win::defense::ProcessLiveness,
+) -> bool {
     err.contains("CreationTime mismatch")
-        || !ledr_sensor_win::defense::process_is_running(pid)
+        || matches!(liveness, ledr_sensor_win::defense::ProcessLiveness::Gone)
 }
 
 fn json_non_empty_str(val: &serde_json::Value, pointer: &str) -> Option<String> {
@@ -1662,5 +1679,34 @@ fn filetime_100ns_to_unix_ms(ticks: u64, fallback_ms: i64) -> i64 {
         i64::try_from(unix_ms).unwrap_or(fallback_ms)
     } else {
         fallback_ms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tolerate_missing_target;
+    use ledr_sensor_win::defense::ProcessLiveness;
+
+    /// `DAEMON-P2-28` (`BUG_0002`): a snapshot/enumeration failure (`Unknown`) must not
+    /// be treated as "gone" — only a positively absent PID or a proven PID reuse may
+    /// swallow a suspend/resume/terminate error.
+    #[test]
+    fn daemon_p2_28_bug_0002_unknown_liveness_is_not_tolerated() {
+        assert!(tolerate_missing_target(
+            "OpenProcess failed",
+            ProcessLiveness::Gone
+        ));
+        assert!(tolerate_missing_target(
+            "PID reused: CreationTime mismatch",
+            ProcessLiveness::Running
+        ));
+        assert!(!tolerate_missing_target(
+            "OpenProcess failed",
+            ProcessLiveness::Running
+        ));
+        assert!(!tolerate_missing_target(
+            "OpenProcess failed",
+            ProcessLiveness::Unknown
+        ));
     }
 }

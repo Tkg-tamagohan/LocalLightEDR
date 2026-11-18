@@ -848,13 +848,27 @@ fn find_process_exe_toolhelp32(pid: u32) -> Option<String> {
         .map(|e| e.exe_name)
 }
 
-/// Returns `true` when a process with `pid` is present in the current Toolhelp32
-/// snapshot (`BUG_0004` — lets callers distinguish "target already exited" from a
-/// genuine suspend/resume failure on a still-running process).
-pub fn process_is_running(pid: u32) -> bool {
-    snapshot_process_entries()
-        .map(|entries| entries.iter().any(|e| e.pid == pid))
-        .unwrap_or(false)
+/// Tri-state liveness of a PID from the Toolhelp32 snapshot. [`ProcessLiveness::Gone`]
+/// means the snapshot enumerated successfully and the PID is absent; `Unknown` means
+/// snapshot creation or enumeration failed, so absence is unconfirmed. Containment
+/// decisions must not treat `Unknown` as "gone" (`BUG_0002`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessLiveness {
+    Running,
+    Gone,
+    Unknown,
+}
+
+/// Probes whether `pid` is present in the current Toolhelp32 snapshot, distinguishing
+/// confirmed absence from snapshot/enumeration failures (`BUG_0004`, `BUG_0002` — lets
+/// callers tell "target already exited" from a genuine suspend/resume/terminate failure
+/// on a still-running process, and both from an unverifiable state).
+pub fn process_liveness(pid: u32) -> ProcessLiveness {
+    match snapshot_process_entries() {
+        Ok(entries) if entries.iter().any(|e| e.pid == pid) => ProcessLiveness::Running,
+        Ok(_) => ProcessLiveness::Gone,
+        Err(_) => ProcessLiveness::Unknown,
+    }
 }
 
 fn utf16_z_to_string(buf: &[u16]) -> String {

@@ -3085,10 +3085,17 @@ async fn daemon_p2_27_bug_0001_terminate_retry_on_gone_suspended_target_saves_bl
         resolved_at_ms: None,
     };
 
-    // Retry scenario: the PID cannot appear in a Toolhelp32 snapshot, so the repeated
-    // terminate fails but the block rule must still be persisted and the alert resolved.
+    // First attempt: termination succeeded, then the alert status update failed and the
+    // fresh block rule was rolled back. A transient store failure cannot be injected
+    // through `LedrStore`, so its durable result is emulated here — a terminated target
+    // (this actuator call), no persisted rule, and a still-unresolved alert — before
+    // driving the retry below.
     let gone_ident =
         ProcessIdentity::new(0x7FFF_FFC0, unix_ms_to_filetime(current_unix_ms() - 1_000));
+    defense
+        .terminate_process(&gone_ident, true)
+        .expect("first attempt termination");
+    assert_eq!(defense.terminates().len(), 1);
     defense.add_failing_terminate_pid(gone_ident.pid);
     let gone_alert = mk_alert("gone-terminate-fail", &gone_ident);
     store.record_alert(&gone_alert).expect("record gone alert");
@@ -3147,6 +3154,87 @@ async fn daemon_p2_27_bug_0001_terminate_retry_on_gone_suspended_target_saves_bl
             .len(),
         1,
         "failed attempt must not persist a second block rule"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P2-29` (`BUG_0001`): when the frozen parent is already gone but a recorded
+/// suspended child is still running and cannot be terminated (e.g. access denied), the
+/// alert must stay unresolved — resolving would strand a suspended child the alert can
+/// no longer terminate or resume, and must not persist the block rule.
+#[tokio::test]
+async fn daemon_p2_29_bug_0001_live_suspended_child_terminate_failure_keeps_unresolved() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    let now_ms = current_unix_ms();
+    let gone_parent = ProcessIdentity::new(0x7FFF_FFC1, unix_ms_to_filetime(now_ms - 1_000));
+    let live_child = ProcessIdentity::new(
+        std::process::id(),
+        unix_ms_to_filetime(now_ms - 1_000),
+    );
+
+    let alert = AlertRecord {
+        alert_id: "alert-child-terminate-fail".to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::Critical,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+        title: "child terminate failure".to_string(),
+        process_instance_id: Some(gone_parent.instance_id()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": r"C:\Temp\gone_parent.exe",
+            "suspended_children": [live_child.instance_id()],
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    store.record_alert(&alert).expect("record alert");
+
+    // Parent terminate is tolerated (already gone); the live child's terminate fails.
+    defense.add_failing_terminate_pid(gone_parent.pid);
+    defense.add_failing_terminate_pid(live_child.pid);
+    assert!(
+        engine
+            .resolve_alert(
+                &alert.alert_id,
+                AlertDecision::TerminateAndBlock {
+                    add_block_rule: true,
+                },
+            )
+            .is_err(),
+        "terminate failure on a live suspended child must surface as an error"
+    );
+    assert!(
+        store
+            .get_alert(&alert.alert_id)
+            .expect("get alert")
+            .expect("alert exists")
+            .status
+            .is_unresolved(),
+        "alert must stay unresolved while a suspended child cannot be terminated"
+    );
+    assert!(
+        store
+            .list_rules(Some(RuleScope::NetworkBlock))
+            .expect("list block rules")
+            .is_empty(),
+        "no block rule must persist while a suspended child cannot be terminated"
     );
 
     engine.shutdown_and_flush().await.expect("shutdown");

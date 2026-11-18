@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / Tauri UI
+**/node_modules/
+**/dist/
+apps/ledr-ui/src-tauri/target/
+apps/ledr-ui/src-tauri/gen/
+
+# SQLite DB / Temporary files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Secrets / Local config
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.log

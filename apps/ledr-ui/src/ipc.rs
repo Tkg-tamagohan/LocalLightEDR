@@ -788,6 +788,16 @@ mod tests {
         //    - rejects untrusted server exe when strict path checking is enforced (`allow_same_pid = false`).
         let verify_pipe_name = format!(r"\\.\pipe\localedr-ui-sec0003-auth-{}", std::process::id());
         let auth_server_pipe = create_strict_pipe(&verify_pipe_name);
+        // Connect the client before spawning the server thread so `ConnectNamedPipe`
+        // deterministically observes the already-connected client (`ERROR_PIPE_CONNECTED`).
+        // The client handle stays open until the thread is joined; an earlier drop lets
+        // `ConnectNamedPipe` see `ERROR_NO_DATA` when it loses the thread start-up race.
+        let client_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(PIPE_CLIENT_ACCESS_MODE)
+            .open(&verify_pipe_name)
+            .expect("open strict pipe with PIPE_CLIENT_ACCESS_MODE");
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let auth_thread = thread::spawn(move || {
             let pipe = auth_server_pipe;
@@ -798,13 +808,6 @@ mod tests {
             }
             let _ = done_rx.recv();
         });
-
-        let client_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .access_mode(PIPE_CLIENT_ACCESS_MODE)
-            .open(&verify_pipe_name)
-            .expect("open strict pipe with PIPE_CLIENT_ACCESS_MODE");
 
         verify_named_pipe_server_process(&client_file)
             .expect("same-PID test harness should pass self-test verification");
@@ -819,9 +822,12 @@ mod tests {
             rogue_err.contains("untrusted pipe server process"),
             "unexpected error message: {rogue_err}"
         );
-        drop(client_file);
+        // Keep the client handle alive until the server thread finishes `ConnectNamedPipe`;
+        // dropping it earlier lets `ConnectNamedPipe` observe `ERROR_NO_DATA` instead of
+        // `ERROR_PIPE_CONNECTED` when the spawned thread loses the start-up race.
         let _ = done_tx.send(());
         auth_thread.join().expect("auth server thread finished");
+        drop(client_file);
 
         // 3. Verify `NtQuerySystemInformation(SystemProcessIdInformation)` + `QueryDosDeviceW` fallback
         //    against the current process (`std::env::current_exe()`).

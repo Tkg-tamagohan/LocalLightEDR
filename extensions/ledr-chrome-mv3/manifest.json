@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "LocalEDR Browser Shield",
+  "version": "0.1.0",
+  "description": "LocalEDR Browser Shield for DNR blocking, ClickFix/Pastejacking detection, NRD/homograph password warnings, and download origin tracking.",
+  "permissions": [
+    "declarativeNetRequest",
+    "downloads",
+    "nativeMessaging",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ruleset_static",
+        "enabled": true,
+        "path": "rules/dnr_static.json"
+      }
+    ]
+  }
+}

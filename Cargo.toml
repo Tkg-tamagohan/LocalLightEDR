@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ledr-proto",
+    "crates/ledr-sensor-win",
+    "crates/ledr-sim",
+    "crates/ledr-rules",
+    "crates/ledr-daemon",
+    "crates/ledr-store",
+    "crates/ledr-bridge-nm",
+    "apps/ledr-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Permitted license policy (L-01 / Phase 0):
+# Only permissive open-source licenses (MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Unicode-3.0, Unlicense) are allowed.
+# Copyleft licenses (GPL, LGPL, AGPL, SSPL) are prohibited.
+[workspace.dependencies]
+ledr-proto = { path = "crates/ledr-proto" }
+ledr-sensor-win = { path = "crates/ledr-sensor-win" }
+ledr-rules = { path = "crates/ledr-rules" }
+ledr-store = { path = "crates/ledr-store" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal", "process"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+aho-corasick = "1.1"
+regex = "1.13"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+strsim = "0.11"
+winreg = "0.56"
+tempfile = "3"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

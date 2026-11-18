@@ -55,7 +55,9 @@ const MAX_LOGFILE_NAME_CHARS: usize = 128;
 const MAX_TRACKED_HONEYPOT_HANDLES: usize = 512;
 const WINEVENT_KEYWORD_PROCESS: u64 = 0x10;
 const KERNEL_FILE_KEYWORDS: u64 = 0x0010 | 0x0020 | 0x0080 | 0x0200 | 0x0400 | 0x0800 | 0x1000;
-const KERNEL_REGISTRY_KEYWORDS: u64 = 0x0100 | 0x0200 | 0x1000 | 0x2000 | 0x4000;
+// Kernel-Registry keyword bits: CloseKey (0x0001) is included so cached KeyObject
+// names are invalidated when the handle whose KCB they describe is released.
+const KERNEL_REGISTRY_KEYWORDS: u64 = 0x0001 | 0x0100 | 0x0200 | 0x1000 | 0x2000 | 0x4000;
 const ERROR_WMI_INSTANCE_NOT_FOUND_CODE: u32 = 4201;
 
 /// `Microsoft-Windows-Kernel-Process` (`{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}`).
@@ -340,36 +342,34 @@ impl EtwCallbackContext {
         let non_empty = tracker.close_handle(file_object);
         self.has_honeypot_handles.store(non_empty, Ordering::Release);
     }
+}
 
-    /// Caches an autorun registry key's KCB pointer -> path so write events whose
-    /// `KeyName` arrives empty (uncached KCB name) can still be attributed.
-    fn remember_registry_key(&self, key_object: u64, key_name: &str) {
-        let mut cache = self
-            .registry_kcb_names
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if cache.len() >= REGISTRY_KCB_CACHE_CAPACITY {
-            cache.clear();
-        }
-        cache.insert(key_object, key_name.to_owned());
+/// Caches an autorun registry key's KCB pointer -> path so write events whose
+/// `KeyName` arrives empty (uncached KCB name) can still be attributed.
+fn remember_registry_key(cache: &Mutex<HashMap<u64, String>>, key_object: u64, key_name: &str) {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= REGISTRY_KCB_CACHE_CAPACITY {
+        cache.clear();
     }
+    cache.insert(key_object, key_name.to_owned());
+}
 
-    fn lookup_registry_key(&self, key_object: u64) -> Option<String> {
-        self.registry_kcb_names
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key_object)
-            .cloned()
-    }
+fn lookup_registry_key(cache: &Mutex<HashMap<u64, String>>, key_object: u64) -> Option<String> {
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key_object)
+        .cloned()
+}
 
-    /// Removes and returns the cached path (used on DeleteKey, after which the
-    /// KCB no longer accepts writes).
-    fn take_registry_key(&self, key_object: u64) -> Option<String> {
-        self.registry_kcb_names
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&key_object)
-    }
+/// Removes and returns the cached path for `key_object`. Called on DeleteKey (the KCB
+/// stops accepting writes), on CloseKey (the pointer may be recycled for a different
+/// key), and whenever an event proves the object is bound to an unmonitored key.
+fn take_registry_key(cache: &Mutex<HashMap<u64, String>>, key_object: u64) -> Option<String> {
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key_object)
 }
 
 /// Real-time Windows ETW sensor backend subscribing to Process, File, Registry, DNS, Network,
@@ -1146,7 +1146,9 @@ fn handle_kernel_registry(
     event_id: u16,
     ctx: &EtwCallbackContext,
 ) -> Option<SensorEvent> {
-    if !matches!(event_id, 1 | 2 | 3 | 5 | 6) {
+    // CreateKey=1, OpenKey=2, DeleteKey=3, SetValueKey=5, DeleteValueKey=6,
+    // CloseKey=13 for `Microsoft-Windows-Kernel-Registry`.
+    if !matches!(event_id, 1 | 2 | 3 | 5 | 6 | 13) {
         return None;
     }
     let pid = record.EventHeader.ProcessId;
@@ -1154,76 +1156,183 @@ fn handle_kernel_registry(
         return None;
     }
     let info = TdhEventInfo::from_record(record)?;
-    let key_object = info.get_u64("KeyObject");
+    let facts = registry_event_facts(&info, record, event_id);
+    decide_registry_event(&facts, &ctx.registry_kcb_names)
+}
 
+/// How the key name that arrived with a Kernel-Registry event classifies against the
+/// autorun watch-lists. Strings are only materialized for autorun names so unrelated
+/// keys stay allocation-free on this hot path (`AUTO-08`).
+enum RegistryKeyName {
+    /// No usable `KeyName`/`BaseName`+`RelativeName` arrived (missing or empty) —
+    /// the `KeyObject` cache may still attribute the event.
+    Missing,
+    /// A name arrived but matches no autorun location: the `KeyObject` is bound to an
+    /// unmonitored key, so any cached entry for it is stale and must be evicted.
+    Unrelated,
+    /// An autorun key whose values are not themselves persistence payloads (e.g.
+    /// `Services\*`): key creation/deletion alerts, value writes are filtered below.
+    AutorunNonValue(String),
+    /// An autorun value target (Run/RunOnce/Winlogon/...): value writes alert.
+    AutorunValue(String),
+}
+
+/// Decoded fields a Kernel-Registry event needs for the canary decision, kept separate
+/// from TDH decoding so the decision path can be driven by unit tests.
+struct RegistryEventFacts {
+    pid: u32,
+    event_id: u16,
+    key_object: Option<u64>,
+    /// NTSTATUS of the operation; `Some(non-zero)` means the operation failed.
+    status: Option<u32>,
+    key_name: RegistryKeyName,
+    disposition: Option<u32>,
+    access_type: Option<u32>,
+    value_name: Option<String>,
+    timestamp_ms: i64,
+}
+
+/// Classifies a raw UTF-16 registry key path for the Kernel-Registry decision path.
+/// Returns `None` for absent/empty names so callers can distinguish "no name arrived"
+/// (consult the `KeyObject` cache) from "a known unmonitored name arrived" (evict it).
+fn classify_registry_key_name(u16_name: &[u16]) -> Option<RegistryKeyName> {
+    if u16_name.is_empty() {
+        return None;
+    }
+    if !is_autorun_registry_key_u16(u16_name) {
+        return Some(RegistryKeyName::Unrelated);
+    }
+    Some(if is_autorun_registry_value_target_u16(u16_name) {
+        RegistryKeyName::AutorunValue(String::from_utf16_lossy(u16_name))
+    } else {
+        RegistryKeyName::AutorunNonValue(String::from_utf16_lossy(u16_name))
+    })
+}
+
+fn registry_event_facts(
+    info: &TdhEventInfo,
+    record: &EVENT_RECORD,
+    event_id: u16,
+) -> RegistryEventFacts {
+    // CreateKey/OpenKey carry `BaseName` + `RelativeName`; mutating ops carry `KeyName`.
+    let key_name = if matches!(event_id, 1 | 2) {
+        info.inspect_first_utf16_property(&["KeyName"], classify_registry_key_name)
+            .or_else(|| {
+                info.inspect_joined_utf16_properties(
+                    "BaseName",
+                    "RelativeName",
+                    classify_registry_key_name,
+                )
+            })
+            .unwrap_or(RegistryKeyName::Missing)
+    } else {
+        info.inspect_first_utf16_property(&["KeyName"], classify_registry_key_name)
+            .unwrap_or(RegistryKeyName::Missing)
+    };
+    RegistryEventFacts {
+        pid: record.EventHeader.ProcessId,
+        event_id,
+        key_object: info.get_u64("KeyObject"),
+        status: info.get_u32("Status"),
+        key_name,
+        disposition: info.get_u32("Disposition"),
+        access_type: info.get_u32("Type"),
+        value_name: info.get_string("ValueName").filter(|v| !v.is_empty()),
+        timestamp_ms: filetime_100ns_to_unix_ms(record.EventHeader.TimeStamp.max(0) as u64),
+    }
+}
+
+fn decide_registry_event(
+    facts: &RegistryEventFacts,
+    key_cache: &Mutex<HashMap<u64, String>>,
+) -> Option<SensorEvent> {
+    if !matches!(facts.event_id, 1 | 2 | 3 | 5 | 6 | 13) {
+        return None;
+    }
+    // Registry events carry the operation's NTSTATUS. A failed open/set/delete changed
+    // nothing, so it must neither alert nor update the `KeyObject` cache — e.g. a failed
+    // DeleteKey leaves the cached name valid and a failed SetValueKey wrote nothing.
+    if facts.status.is_some_and(|status| status != 0) {
+        return None;
+    }
+    // CloseKey retires the KeyObject; Windows may recycle the pointer for a different
+    // key, so drop its cached name rather than let future empty-name writes inherit a
+    // stale attribution. A second handle sharing the same KCB loses attribution here
+    // (fail-open miss), which is preferable to a false canary hit on a recycled pointer.
+    if facts.event_id == 13 {
+        if let Some(key_object) = facts.key_object {
+            take_registry_key(key_cache, key_object);
+        }
+        return None;
+    }
+
+    const REG_CREATED_NEW_KEY: u32 = 0x0000_0001;
     // Event 1 (CreateKey) also fires when `RegCreateKeyEx`/`NtCreateKey` merely opens an
     // existing key (`Disposition` = `REG_OPENED_EXISTING_KEY`), and event 2 (OpenKey)
     // covers plain `RegOpenKeyEx`/`NtOpenKey`. Only a genuinely new key under an autorun
     // location is a persistence write, so opens never alert; instead their resolved
     // autorun path is cached under `KeyObject` (which is stable for the opened handle)
-    // so that later SetValue/DeleteValue/DeleteKey events on the same handle — whose
-    // `KeyName` arrives empty when the KCB name is not yet populated — can still be
-    // attributed.
-    const REG_CREATED_NEW_KEY: u32 = 0x0000_0001;
-    let key_name = if matches!(event_id, 1 | 2) {
-        let key_name = info
-            .inspect_first_utf16_property(&["KeyName"], |u16_slice| {
-                if is_autorun_registry_key_u16(u16_slice) {
-                    Some(String::from_utf16_lossy(u16_slice))
-                } else {
-                    None
+    // so that later SetValueKey/DeleteValueKey/DeleteKey events on the same handle —
+    // whose `KeyName` arrives empty when the KCB name is not yet populated — can still
+    // be attributed.
+    let key_name = if matches!(facts.event_id, 1 | 2) {
+        if let Some(key_object) = facts.key_object {
+            match &facts.key_name {
+                // Cache only value-write-relevant autorun keys so the map stays small
+                // and is not churned by constant `Services\*` traffic.
+                RegistryKeyName::AutorunValue(name) => {
+                    remember_registry_key(key_cache, key_object, name);
                 }
-            })
-            .or_else(|| {
-                info.inspect_joined_utf16_properties("BaseName", "RelativeName", |u16_slice| {
-                    if is_autorun_registry_key_u16(u16_slice) {
-                        Some(String::from_utf16_lossy(u16_slice))
-                    } else {
-                        None
-                    }
-                })
-            });
-        if let (Some(key_object), Some(key_name)) = (key_object, key_name.as_deref()) {
-            // Cache only value-write-relevant autorun keys so the map stays small and is
-            // not churned by constant `Services\*` traffic.
-            if is_autorun_registry_value_target(key_name) {
-                ctx.remember_registry_key(key_object, key_name);
+                // The handle is bound to a known unmonitored key: evict any stale entry
+                // so a recycled `KeyObject` cannot inherit an old autorun attribution.
+                RegistryKeyName::Unrelated | RegistryKeyName::AutorunNonValue(_) => {
+                    take_registry_key(key_cache, key_object);
+                }
+                RegistryKeyName::Missing => {}
             }
         }
-        if event_id == 2
-            || info
-                .get_u32("Disposition")
+        if facts.event_id == 2
+            || facts
+                .disposition
                 .is_some_and(|disposition| disposition != REG_CREATED_NEW_KEY)
         {
             return None;
         }
-        key_name?
+        match &facts.key_name {
+            RegistryKeyName::AutorunValue(name) | RegistryKeyName::AutorunNonValue(name) => {
+                name.clone()
+            }
+            _ => return None,
+        }
     } else {
-        let via_key_name = info.inspect_first_utf16_property(&["KeyName"], |u16_slice| {
-            if is_autorun_registry_key_u16(u16_slice) {
-                Some(String::from_utf16_lossy(u16_slice))
-            } else {
-                None
-            }
-        });
-        match (via_key_name, key_object) {
-            (Some(key_name), Some(key_object)) => {
-                if event_id == 3 {
-                    ctx.take_registry_key(key_object);
-                } else if is_autorun_registry_value_target(&key_name) {
-                    ctx.remember_registry_key(key_object, &key_name);
-                }
-                key_name
-            }
-            (Some(key_name), None) => key_name,
-            (None, Some(key_object)) => {
-                if event_id == 3 {
-                    ctx.take_registry_key(key_object)?
+        match (&facts.key_name, facts.key_object) {
+            (RegistryKeyName::AutorunValue(name), Some(key_object)) => {
+                if facts.event_id == 3 {
+                    take_registry_key(key_cache, key_object);
                 } else {
-                    ctx.lookup_registry_key(key_object)?
+                    remember_registry_key(key_cache, key_object, name);
+                }
+                name.clone()
+            }
+            (RegistryKeyName::AutorunNonValue(name), Some(key_object)) => {
+                take_registry_key(key_cache, key_object);
+                name.clone()
+            }
+            (RegistryKeyName::Unrelated, Some(key_object)) => {
+                take_registry_key(key_cache, key_object);
+                return None;
+            }
+            (RegistryKeyName::Missing, Some(key_object)) => {
+                if facts.event_id == 3 {
+                    take_registry_key(key_cache, key_object)?
+                } else {
+                    lookup_registry_key(key_cache, key_object)?
                 }
             }
-            (None, None) => return None,
+            (RegistryKeyName::AutorunValue(name) | RegistryKeyName::AutorunNonValue(name), None) => {
+                name.clone()
+            }
+            (RegistryKeyName::Unrelated, None) | (RegistryKeyName::Missing, None) => return None,
         }
     };
 
@@ -1231,12 +1340,12 @@ fn handle_kernel_registry(
     // itself the payload (Run/RunOnce entries, Winlogon shell/userinit). Existing
     // `Services\*` keys see constant benign churn (e.g. `Tcpip\Parameters`), so writes
     // there are not alerted on; service persistence stays covered by new-key creation.
-    if matches!(event_id, 5 | 6) && !is_autorun_registry_value_target(&key_name) {
+    if matches!(facts.event_id, 5 | 6) && !is_autorun_registry_value_target(&key_name) {
         return None;
     }
 
-    let target_path = if matches!(event_id, 5 | 6) {
-        match info.get_string("ValueName").filter(|v| !v.is_empty()) {
+    let target_path = if matches!(facts.event_id, 5 | 6) {
+        match &facts.value_name {
             Some(value_name) => format!("{key_name}\\{value_name}"),
             None => key_name,
         }
@@ -1244,19 +1353,18 @@ fn handle_kernel_registry(
         key_name
     };
 
-    let access_mask = info
-        .get_u32("Disposition")
-        .or_else(|| info.get_u32("Type"))
-        .unwrap_or(event_id as u32);
-    let timestamp_ms = filetime_100ns_to_unix_ms(record.EventHeader.TimeStamp.max(0) as u64);
+    let access_mask = facts
+        .disposition
+        .or(facts.access_type)
+        .unwrap_or(facts.event_id as u32);
 
     Some(SensorEvent::CanaryFileAccess {
-        pid,
+        pid: facts.pid,
         target_path,
         category: CanaryCategory::AutorunRegistry,
         access_mask,
         is_write_or_delete: true,
-        timestamp_ms,
+        timestamp_ms: facts.timestamp_ms,
     })
 }
 
@@ -1562,5 +1670,139 @@ mod tests {
         );
         assert_eq!(tracker.trigger_write_or_delete(0xABCD), None);
         assert!(!tracker.close_handle(0xABCD));
+    }
+
+    fn registry_facts(
+        event_id: u16,
+        key_object: u64,
+        key_name: RegistryKeyName,
+        status: u32,
+    ) -> RegistryEventFacts {
+        RegistryEventFacts {
+            pid: 4242,
+            event_id,
+            key_object: Some(key_object),
+            status: Some(status),
+            key_name,
+            disposition: None,
+            access_type: None,
+            value_name: None,
+            timestamp_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn autorun_run_key() -> RegistryKeyName {
+        RegistryKeyName::AutorunValue(
+            r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".to_string(),
+        )
+    }
+
+    #[test]
+    fn sens_p2_05_registry_recycled_key_object_drops_stale_name() {
+        let cache = Mutex::new(HashMap::new());
+
+        // An open of a monitored autorun key binds its name to the KeyObject.
+        let open = registry_facts(2, 0x1000, autorun_run_key(), 0);
+        assert!(decide_registry_event(&open, &cache).is_none());
+        assert!(lookup_registry_key(&cache, 0x1000).is_some());
+
+        // The OS recycles the pointer for an unmonitored key: its named open must evict
+        // the stale entry instead of leaving the old attribution behind.
+        let reopen = registry_facts(2, 0x1000, RegistryKeyName::Unrelated, 0);
+        assert!(decide_registry_event(&reopen, &cache).is_none());
+        assert!(
+            lookup_registry_key(&cache, 0x1000).is_none(),
+            "reused KeyObject must drop the stale cached name"
+        );
+
+        // An empty-name SetValueKey on the recycled object must not inherit the old name.
+        let mut write = registry_facts(5, 0x1000, RegistryKeyName::Missing, 0);
+        write.value_name = Some("Payload".to_string());
+        assert!(decide_registry_event(&write, &cache).is_none());
+
+        // A write event that arrives with a known non-autorun name evicts rather than alerts.
+        let open2 = registry_facts(2, 0x2000, autorun_run_key(), 0);
+        assert!(decide_registry_event(&open2, &cache).is_none());
+        let mut named_write = registry_facts(5, 0x2000, RegistryKeyName::Unrelated, 0);
+        named_write.value_name = Some("Payload".to_string());
+        assert!(decide_registry_event(&named_write, &cache).is_none());
+        assert!(lookup_registry_key(&cache, 0x2000).is_none());
+    }
+
+    #[test]
+    fn sens_p2_06_registry_open_then_value_write_alerts() {
+        let cache = Mutex::new(HashMap::new());
+
+        // Opening an existing monitored key must not alert (opens are attribution-only).
+        let open = registry_facts(2, 0x2000, autorun_run_key(), 0);
+        assert!(decide_registry_event(&open, &cache).is_none());
+
+        // A subsequent SetValueKey on the same handle arrives with an empty KeyName:
+        // attribution comes from the cache and alerts with the value name appended.
+        let mut set_value = registry_facts(5, 0x2000, RegistryKeyName::Missing, 0);
+        set_value.value_name = Some("Persistence".to_string());
+        let event = decide_registry_event(&set_value, &cache)
+            .expect("SetValueKey on a cached autorun key must alert");
+        match event {
+            SensorEvent::CanaryFileAccess {
+                pid,
+                target_path,
+                category,
+                is_write_or_delete,
+                ..
+            } => {
+                assert_eq!(pid, 4242);
+                assert_eq!(category, CanaryCategory::AutorunRegistry);
+                assert!(target_path.ends_with(r"\Persistence"), "{target_path}");
+                assert!(is_write_or_delete);
+            }
+            other => panic!("expected CanaryFileAccess, got {other:?}"),
+        }
+
+        // DeleteValueKey on the same handle also alerts.
+        let delete_value = registry_facts(6, 0x2000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&delete_value, &cache).is_some());
+
+        // CloseKey retires the binding; later empty-name writes stay silent.
+        let close = registry_facts(13, 0x2000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&close, &cache).is_none());
+        let after_close = registry_facts(5, 0x2000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&after_close, &cache).is_none());
+    }
+
+    #[test]
+    fn sens_p2_07_registry_failed_ops_neither_alert_nor_mutate_cache() {
+        let cache = Mutex::new(HashMap::new());
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+
+        let open = registry_facts(2, 0x3000, autorun_run_key(), 0);
+        assert!(decide_registry_event(&open, &cache).is_none());
+
+        // Failed SetValueKey / DeleteValueKey on a cached autorun handle must not alert.
+        let mut failed_set = registry_facts(5, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
+        failed_set.value_name = Some("Persistence".to_string());
+        assert!(decide_registry_event(&failed_set, &cache).is_none());
+        let failed_delete_value =
+            registry_facts(6, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
+        assert!(decide_registry_event(&failed_delete_value, &cache).is_none());
+
+        // A failed DeleteKey neither alerts nor clears the cached name.
+        let failed_delete_key =
+            registry_facts(3, 0x3000, RegistryKeyName::Missing, STATUS_ACCESS_DENIED);
+        assert!(decide_registry_event(&failed_delete_key, &cache).is_none());
+        assert!(
+            lookup_registry_key(&cache, 0x3000).is_some(),
+            "failed DeleteKey must keep the cached name"
+        );
+
+        // A failed open must not create a cache binding either.
+        let failed_open = registry_facts(2, 0x4000, autorun_run_key(), STATUS_ACCESS_DENIED);
+        assert!(decide_registry_event(&failed_open, &cache).is_none());
+        assert!(lookup_registry_key(&cache, 0x4000).is_none());
+
+        // A successful DeleteKey still alerts with the cached name and evicts it.
+        let delete_key = registry_facts(3, 0x3000, RegistryKeyName::Missing, 0);
+        assert!(decide_registry_event(&delete_key, &cache).is_some());
+        assert!(lookup_registry_key(&cache, 0x3000).is_none());
     }
 }

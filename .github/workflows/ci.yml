@@ -33,6 +33,7 @@ jobs:
         run: |
           python3 - <<'EOF'
           import os
+          import pathlib
           import subprocess
 
           ZERO_SHA = "0000000000000000000000000000000000000000"
@@ -107,6 +108,8 @@ jobs:
                       or path.startswith("extensions/")
                       or path.startswith("rules/")
                       or path.startswith(".github/")
+                      or pathlib.Path(path).suffix.lower()
+                      in {".js", ".json", ".html", ".css", ".md", ".yml", ".yaml", ".toml"}
                   ):
                       web = True
 

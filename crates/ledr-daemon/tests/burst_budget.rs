@@ -1,12 +1,15 @@
 //! Integration tests for `ledr-daemon` two-lane burst budget, LOTL rule detection,
-//! and Named Pipe IPC server round-trip (`BURST-01`..`BURST-06`).
+//! Named Pipe IPC server round-trip, startup reconciliation, and shutdown purge interruption
+//! (`BURST-01`..`BURST-08`).
 
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_daemon::{
@@ -587,15 +590,12 @@ async fn burst_04_pid_reuse_telemetry_attribution_and_channel_close_drain() {
 
     tx.send_high_priority(ev_a).await.expect("send A");
 
-    let tx_waiting = tx.clone();
-    let waiting_task = tokio::spawn(async move { tx_waiting.send_high_priority(ev_b).await });
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    let send_b = tx.send_high_priority(ev_b);
+    tokio::pin!(send_b);
+    let mut cx = Context::from_waker(Waker::noop());
     assert!(
-        !waiting_task.is_finished(),
-        "sender B should still be blocked waiting on capacity 1"
+        matches!(send_b.as_mut().poll(&mut cx), Poll::Pending),
+        "sender B must block in Poll::Pending on capacity 1"
     );
 
     tx.close();
@@ -604,14 +604,14 @@ async fn burst_04_pid_reuse_telemetry_attribution_and_channel_close_drain() {
         Err(HighPrioritySendError::Closed(_))
     ));
 
-    let mut drained = Vec::new();
-    while let Some(ev) = rx.recv().await {
-        drained.push(ev);
-    }
-    waiting_task
-        .await
-        .expect("join waiting sender")
-        .expect("sender B accepted before close must succeed");
+    let (send_b_res, drained) = tokio::join!(send_b, async {
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            out.push(ev);
+        }
+        out
+    });
+    send_b_res.expect("sender B accepted before close must succeed");
     assert_eq!(drained.len(), 2);
     assert_eq!(drained[0].pid(), 101);
     assert_eq!(drained[1].pid(), 102);
@@ -883,6 +883,382 @@ async fn burst_06_ipc_bridge_caller_auth_and_stalled_frame_timeout() {
         other => panic!("expected Pong after stalled clients timed out, got {other:?}"),
     }
 
+    // Part B (SEC_0001): Non-reading clients requesting >64 KiB responses time out in
+    // `write_response` and release their `Semaphore` permits while still open.
+    let bulk_snapshots: Vec<SensorEvent> = (0..600u32)
+        .map(|i| SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(30_000 + i, 133_765_432_200_000_000 + u64::from(i)),
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\svchost.exe".to_string(),
+            command_line: format!(
+                "svchost.exe -k netsvcs -p -s Schedule --pad-{i:04}-0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            user_sid: None,
+        })
+        .collect();
+    engine
+        .seed_processes(bulk_snapshots)
+        .expect("seed 600 processes for oversized IPC response");
+
+    let pipe_for_non_reader = pipe_name.clone();
+    let (post_timeout_pong, non_reader_disconnected) = tokio::task::spawn_blocking(move || {
+        let mut non_reader_1 = open_pipe_with_retry(&pipe_for_non_reader);
+        write_ipc_frame(
+            &mut non_reader_1,
+            &IpcRequest::GetFlightRecorder {
+                limit: 600,
+                process_instance_id: None,
+            },
+        )
+        .expect("write GetFlightRecorder frame 1");
+        non_reader_1.flush().expect("flush request 1");
+
+        let mut non_reader_2 = open_pipe_with_retry(&pipe_for_non_reader);
+        write_ipc_frame(
+            &mut non_reader_2,
+            &IpcRequest::GetFlightRecorder {
+                limit: 600,
+                process_instance_id: None,
+            },
+        )
+        .expect("write GetFlightRecorder frame 2");
+        non_reader_2.flush().expect("flush request 2");
+
+        // Wait past `ipc_frame_timeout_ms` (100 ms) while keeping both pipes open & unread.
+        std::thread::sleep(Duration::from_millis(250));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let post_timeout_pong = loop {
+            let mut pipe = open_pipe_with_retry(&pipe_for_non_reader);
+            if write_ipc_frame(&mut pipe, &IpcRequest::Ping).is_ok() {
+                if let Ok(resp) = read_ipc_frame::<_, IpcResponse>(&mut pipe) {
+                    break resp;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Semaphore permit was not released after non-reading client write timeout"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let drain_start = Instant::now();
+        let mut discard = Vec::new();
+        let _ = non_reader_1.read_to_end(&mut discard);
+        let _ = non_reader_2.read_to_end(&mut discard);
+        let disconnected_promptly = drain_start.elapsed() < Duration::from_secs(1);
+
+        (post_timeout_pong, disconnected_promptly)
+    })
+    .await
+    .expect("join non-reading IPC client task");
+
+    match post_timeout_pong {
+        IpcResponse::Pong {
+            protocol_version, ..
+        } => assert_eq!(protocol_version, ledr_proto::IPC_PROTOCOL_VERSION),
+        other => panic!("expected Pong after write_response timeout, got {other:?}"),
+    }
+    assert!(
+        non_reader_disconnected,
+        "non-reading client pipes must be closed promptly after write_response timeout"
+    );
+
     ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+}
+
+#[tokio::test]
+async fn burst_07_startup_reconcile_preserves_new_etw_process_and_deduplicates_alerts() {
+    let dir = TestTempDir::new("ledr-burst-07");
+    let db_path = dir.path.join("daemon_startup_reconcile.db");
+
+    let lotl_json = include_str!("../../../rules/lotl_core.json");
+    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
+    let sigma = SigmaEngine::from_json_str(lotl_json).expect("compile lotl_core.json");
+    let pruner = EarlyPruner::from_json_str(allowlist_json).expect("build pruner");
+
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+
+    let prior_stale_ident = ProcessIdentity::new(8101, unix_ms_to_filetime(now_ms - 60_000));
+    let prior_live_ident = ProcessIdentity::new(8102, unix_ms_to_filetime(now_ms - 30_000));
+    let prior_live_snapshot = SensorEvent::ProcessStart {
+        identity: prior_live_ident,
+        parent_pid: 4,
+        exe_path: r"C:\Tools\prior_live.exe".to_string(),
+        command_line: "prior_live.exe".to_string(),
+        user_sid: None,
+    };
+
+    // Prior daemon DB session: 1 stale running process + 1 still-running process.
+    {
+        let store1 = LedrStore::open(&db_path).expect("open prior store");
+        store1
+            .ingest_event(
+                &SensorEvent::ProcessStart {
+                    identity: prior_stale_ident,
+                    parent_pid: 4,
+                    exe_path: r"C:\Tools\prior_stale.exe".to_string(),
+                    command_line: "prior_stale.exe".to_string(),
+                    user_sid: None,
+                },
+                None,
+                false,
+                "",
+            )
+            .expect("ingest prior stale");
+        store1
+            .ingest_event(&prior_live_snapshot, None, false, "")
+            .expect("ingest prior live");
+        store1.checkpoint_truncate().expect("checkpoint prior store");
+    }
+
+    let store2 = LedrStore::open(&db_path).expect("reopen store");
+    let engine = DaemonEngine::start(
+        store2.clone(),
+        sigma,
+        pruner,
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+    );
+
+    // BUG_0002: empty snapshot must not reconcile prior running processes.
+    assert_eq!(
+        engine.seed_processes(Vec::new()).expect("empty seed"),
+        0
+    );
+    let stale_before = store2
+        .query_flight_recorder(10, Some(&prior_stale_ident.instance_id()))
+        .expect("query prior stale before non-empty seed");
+    assert_eq!(stale_before.processes[0].exited_at_ms, None);
+
+    // BUG_0001 + BUG_0005: simulate ETW delivering new processes after DaemonEngine::start
+    // and before seed_processes runs.
+    let new_etw_cmd_ident = ProcessIdentity::new(8201, unix_ms_to_filetime(now_ms - 500));
+    let lotl_both_ident = ProcessIdentity::new(8202, unix_ms_to_filetime(now_ms - 200));
+    let new_etw_cmd_ev = SensorEvent::ProcessStart {
+        identity: new_etw_cmd_ident,
+        parent_pid: 4,
+        exe_path: r"C:\Windows\System32\cmd.exe".to_string(),
+        command_line: "cmd.exe /c".to_string(),
+        user_sid: Some("S-1-5-21-1000".to_string()),
+    };
+    let lotl_both_ev = SensorEvent::ProcessStart {
+        identity: lotl_both_ident,
+        parent_pid: new_etw_cmd_ident.pid,
+        exe_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+        command_line: "powershell.exe -NoProfile -NonInteractive -EncodedCommand VwByAGkAdABlAA==".to_string(),
+        user_sid: Some("S-1-5-21-1000".to_string()),
+    };
+
+    let sender = engine.sender();
+    sender.send(new_etw_cmd_ev).await.expect("send ETW cmd");
+    sender.send(lotl_both_ev.clone()).await.expect("send ETW lotl");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().high_priority_processed < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for ETW events to process before seed_processes"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    store2.flush_batch().expect("flush ETW events before seed");
+
+    // Seed with prior_live + duplicate lotl_both, intentionally omitting new_etw_cmd_ident and prior_stale.
+    let seeded = engine
+        .seed_processes(vec![prior_live_snapshot, lotl_both_ev])
+        .expect("seed processes");
+    assert_eq!(seeded, 2);
+
+    // Prior stale process is marked exited, prior live and new ETW process remain active (BUG_0001).
+    let stale_after = store2
+        .query_flight_recorder(10, Some(&prior_stale_ident.instance_id()))
+        .expect("query prior stale after seed");
+    assert!(stale_after.processes[0].exited_at_ms.is_some());
+
+    let live_after = store2
+        .query_flight_recorder(10, Some(&prior_live_ident.instance_id()))
+        .expect("query prior live after seed");
+    assert_eq!(live_after.processes[0].exited_at_ms, None);
+
+    let etw_cmd_after = store2
+        .query_flight_recorder(10, Some(&new_etw_cmd_ident.instance_id()))
+        .expect("query new ETW cmd after seed");
+    assert_eq!(etw_cmd_after.processes.len(), 1);
+    assert_eq!(
+        etw_cmd_after.processes[0].exited_at_ms, None,
+        "new ETW process started after DaemonEngine::start must not be marked exited by seed_processes"
+    );
+
+    // BUG_0005: ETW + seed_processes duplicate observation emitted only 1 alert.
+    let alerts_after_dup = store2
+        .list_alerts(Some(AlertStatus::Pending), 20)
+        .expect("list alerts after duplicate");
+    assert_eq!(alerts_after_dup.len(), 1);
+    assert_eq!(alerts_after_dup[0].rule_id, "LEDR-LOTL-001");
+
+    // BUG_0005 enrichment: initial empty command line emits 0 alerts, enriched non-empty emits 1,
+    // and repeat observation emits 0 more.
+    let enriched_ident = ProcessIdentity::new(8203, unix_ms_to_filetime(now_ms - 100));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: enriched_ident,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        })
+        .await
+        .expect("send empty cmdline start");
+    let enriched_ev = SensorEvent::ProcessStart {
+        identity: enriched_ident,
+        parent_pid: 4,
+        exe_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+        command_line: "powershell.exe -Command iex 'payload'".to_string(),
+        user_sid: None,
+    };
+    sender
+        .send(enriched_ev.clone())
+        .await
+        .expect("send enriched cmdline start");
+    sender
+        .send(enriched_ev)
+        .await
+        .expect("send repeat enriched cmdline start");
+
+    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+
+    let final_alerts = store2
+        .list_alerts(Some(AlertStatus::Pending), 20)
+        .expect("list final alerts");
+    assert_eq!(final_alerts.len(), 2);
+    let lotl_001_count = final_alerts
+        .iter()
+        .filter(|a| a.rule_id == "LEDR-LOTL-001")
+        .count();
+    let lotl_002_count = final_alerts
+        .iter()
+        .filter(|a| a.rule_id == "LEDR-LOTL-002")
+        .count();
+    assert_eq!(lotl_001_count, 1);
+    assert_eq!(lotl_002_count, 1);
+}
+
+#[tokio::test]
+async fn burst_08_shutdown_interrupts_large_purge_within_budget() {
+    let dir = TestTempDir::new("ledr-burst-08");
+    let db_path = dir.path.join("daemon_large_purge.db");
+
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+
+    {
+        let store1 = LedrStore::open(&db_path).expect("open seed store");
+        for i in 0..3_000u32 {
+            let ident = ProcessIdentity::new(
+                20_000 + i,
+                unix_ms_to_filetime(now_ms - 20 * DAY_MS - i64::from(i)),
+            );
+            store1
+                .ingest_event(
+                    &SensorEvent::ProcessStart {
+                        identity: ident,
+                        parent_pid: 4,
+                        exe_path: r"C:\Tools\expired.exe".to_string(),
+                        command_line: format!("expired.exe --idx {i}"),
+                        user_sid: None,
+                    },
+                    None,
+                    false,
+                    "",
+                )
+                .expect("ingest expired start");
+            store1
+                .ingest_event(
+                    &SensorEvent::ProcessStop {
+                        pid: ident.pid,
+                        exit_time_100ns: unix_ms_to_filetime(now_ms - 19 * DAY_MS - i64::from(i)),
+                        exit_code: 0,
+                    },
+                    Some(&ident.instance_id()),
+                    false,
+                    "",
+                )
+                .expect("ingest expired stop");
+        }
+        store1.checkpoint_truncate().expect("checkpoint 3k rows");
+    }
+
+    let store2 = LedrStore::open(&db_path).expect("reopen large purge store");
+    let engine = DaemonEngine::start(
+        store2.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty rules"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ttl_purge_interval_ms: 50,
+            ttl_retention_days: 14,
+            ..DaemonConfig::default()
+        },
+    );
+
+    // Wait until periodic purge commits at least one 500-row batch.
+    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snap = store2
+            .query_flight_recorder(3_000, None)
+            .expect("query process count during purge");
+        if snap.processes.len() < 3_000 {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "timed out waiting for periodic purge to begin"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let post_purge_ident = ProcessIdentity::new(29_999, unix_ms_to_filetime(now_ms));
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: post_purge_ident,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\survivor.exe".to_string(),
+            command_line: "survivor.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send survivor process start");
+
+    let shutdown_start = Instant::now();
+    engine
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown_and_flush during large purge");
+    let shutdown_elapsed = shutdown_start.elapsed();
+
+    assert!(
+        shutdown_elapsed < Duration::from_millis(SHUTDOWN_FLUSH_TIMEOUT_MS),
+        "shutdown_and_flush took {shutdown_elapsed:?}, exceeding {SHUTDOWN_FLUSH_TIMEOUT_MS} ms budget"
+    );
+    assert_eq!(store2.buffered_len(), 0);
+    let survivor = store2
+        .query_flight_recorder(10, Some(&post_purge_ident.instance_id()))
+        .expect("query survivor process");
+    assert_eq!(survivor.processes.len(), 1);
 }

@@ -4,6 +4,7 @@ mod schema;
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +37,13 @@ const ALERT_COLS: &str = "alert_id, timestamp_ms, severity, source_layer, rule_i
 const RULE_COLS: &str = "rule_id, scope, exe_path_pattern, sha256, signer_subject, root_thumbprint, allowed_target, created_at_ms, created_by";
 const DOWNLOAD_COLS: &str =
     "id, file_path, sha256, tab_url, frame_url, referrer_url, downloaded_at_ms";
+const PID_TIME_WINDOW_LOOKUP_SQL: &str = "
+SELECT process_instance_id FROM processes
+WHERE pid = ?1
+  AND created_at_ms <= ?2
+  AND (exited_at_ms IS NULL OR exited_at_ms >= ?2)
+ORDER BY created_at_ms DESC
+LIMIT 1";
 
 /// Returns the store crate version string.
 pub fn store_version() -> &'static str {
@@ -103,6 +111,7 @@ struct StoreInner {
     writer: Arc<Mutex<Connection>>,
     reader: Arc<Mutex<Connection>>,
     batch: Mutex<BatchBuffer>,
+    shutdown_requested: AtomicBool,
 }
 
 /// Thread-safe embedded SQLite WAL store with separated write/read connections (`AUTO-09`).
@@ -133,6 +142,7 @@ impl LedrStore {
                 writer: Arc::new(Mutex::new(writer)),
                 reader: Arc::new(Mutex::new(reader)),
                 batch: Mutex::new(BatchBuffer::default()),
+                shutdown_requested: AtomicBool::new(false),
             }),
         })
     }
@@ -149,8 +159,19 @@ impl LedrStore {
                 writer: Arc::clone(&shared),
                 reader: shared,
                 batch: Mutex::new(BatchBuffer::default()),
+                shutdown_requested: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Signals that shutdown is in progress so batched TTL purges abort cleanly between batches (`BUG_0004`).
+    pub fn request_shutdown(&self) {
+        self.inner.shutdown_requested.store(true, Ordering::Release);
+    }
+
+    /// Returns `true` after [`LedrStore::request_shutdown`] has been invoked (`BUG_0004`).
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.inner.shutdown_requested.load(Ordering::Acquire)
     }
 
     fn lock_writer(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
@@ -556,6 +577,9 @@ impl LedrStore {
 
     /// Purges expired records in batches of `TTL_PURGE_BATCH_LIMIT` (500) while preserving
     /// ancestor processes referenced by unpurged children or unresolved alerts (`L-11`).
+    ///
+    /// Releases the writer mutex between batches and exits early if [`LedrStore::request_shutdown`]
+    /// has been signaled (`BUG_0004`).
     pub fn purge_expired(
         &self,
         now_ms: i64,
@@ -565,9 +589,12 @@ impl LedrStore {
         let cutoff_ms = now_ms.saturating_sub(retention_ms);
         let batch_limit = i64::try_from(TTL_PURGE_BATCH_LIMIT).unwrap_or(500);
 
-        let mut writer = self.lock_writer()?;
+        let mut stats = PurgeStats::default();
+        if self.is_shutdown_requested() {
+            return Ok(stats);
+        }
 
-        let alerts_deleted = purge_in_batches(&mut writer, |tx| {
+        stats.alerts_deleted = self.purge_in_batches(|tx| {
             tx.execute(
                 "DELETE FROM alerts
                  WHERE alert_id IN (
@@ -579,38 +606,45 @@ impl LedrStore {
                 params![cutoff_ms, batch_limit],
             )
         })?;
-        let dns_deleted = purge_by_timestamp_id(
-            &mut writer,
-            "dns_queries",
-            "timestamp_ms",
-            cutoff_ms,
-            batch_limit,
-        )?;
-        let network_deleted = purge_by_timestamp_id(
-            &mut writer,
-            "network_events",
-            "timestamp_ms",
-            cutoff_ms,
-            batch_limit,
-        )?;
-        let canary_deleted = purge_by_timestamp_id(
-            &mut writer,
+        if self.is_shutdown_requested() {
+            return Ok(stats);
+        }
+
+        stats.dns_deleted =
+            self.purge_by_timestamp_id("dns_queries", "timestamp_ms", cutoff_ms, batch_limit)?;
+        if self.is_shutdown_requested() {
+            return Ok(stats);
+        }
+
+        stats.network_deleted =
+            self.purge_by_timestamp_id("network_events", "timestamp_ms", cutoff_ms, batch_limit)?;
+        if self.is_shutdown_requested() {
+            return Ok(stats);
+        }
+
+        stats.canary_deleted = self.purge_by_timestamp_id(
             "file_canary_events",
             "timestamp_ms",
             cutoff_ms,
             batch_limit,
         )?;
-        let downloads_deleted = purge_by_timestamp_id(
-            &mut writer,
+        if self.is_shutdown_requested() {
+            return Ok(stats);
+        }
+
+        stats.downloads_deleted = self.purge_by_timestamp_id(
             "download_origins",
             "downloaded_at_ms",
             cutoff_ms,
             batch_limit,
         )?;
+        if self.is_shutdown_requested() {
+            return Ok(stats);
+        }
 
         // Bottom-up batched purge: each pass removes expired exited leaf processes that have
         // neither unpurged children nor unresolved (PENDING / EXPIRED_SUSPENDED) alerts.
-        let processes_deleted = purge_in_batches(&mut writer, |tx| {
+        stats.processes_deleted = self.purge_in_batches(|tx| {
             tx.execute(
                 "DELETE FROM processes
                  WHERE process_instance_id IN (
@@ -633,24 +667,83 @@ impl LedrStore {
             )
         })?;
 
-        Ok(PurgeStats {
-            processes_deleted,
-            dns_deleted,
-            network_deleted,
-            canary_deleted,
-            alerts_deleted,
-            downloads_deleted,
-        })
+        Ok(stats)
+    }
+
+    /// Flushes buffered events and returns all `process_instance_id` values currently marked
+    /// running (`exited_at_ms IS NULL`) in the store (`BUG_0001`).
+    pub fn list_running_process_instance_ids(&self) -> Result<Vec<String>, StoreError> {
+        self.flush_batch()?;
+        let reader = self.lock_reader()?;
+        let mut stmt = reader
+            .prepare("SELECT process_instance_id FROM processes WHERE exited_at_ms IS NULL")?;
+        let mut rows = stmt.query([])?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            ids.push(row.get(0)?);
+        }
+        Ok(ids)
+    }
+
+    /// Marks stale running candidate processes (`process_instance_id` in `candidate_instance_ids`,
+    /// absent from `active_instance_ids`, `exited_at_ms IS NULL`, and `created_at_ms <= reconciled_at_ms`)
+    /// as exited at `reconciled_at_ms`, returning the updated row count (`BUG_0001`, `BUG_0002`).
+    ///
+    /// Immediately returns `Ok(0)` without updating any rows if `candidate_instance_ids` or
+    /// `active_instance_ids` is empty.
+    pub fn reconcile_stale_running_candidates(
+        &self,
+        candidate_instance_ids: &[String],
+        active_instance_ids: &[String],
+        reconciled_at_ms: i64,
+    ) -> Result<usize, StoreError> {
+        if candidate_instance_ids.is_empty() || active_instance_ids.is_empty() {
+            return Ok(0);
+        }
+        self.flush_batch()?;
+
+        let active_set: HashSet<&str> = active_instance_ids.iter().map(String::as_str).collect();
+        let mut seen = HashSet::new();
+        let stale_ids: Vec<&str> = candidate_instance_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !active_set.contains(*id) && seen.insert(*id))
+            .collect();
+        if stale_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut writer = self.lock_writer()?;
+        let tx = writer.transaction()?;
+        let mut updated = 0usize;
+        {
+            let mut update_stmt = tx.prepare(
+                "UPDATE processes SET exited_at_ms = ?1
+                 WHERE process_instance_id = ?2
+                   AND exited_at_ms IS NULL
+                   AND created_at_ms <= ?1",
+            )?;
+            for id in stale_ids {
+                updated += update_stmt.execute(params![reconciled_at_ms, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// Marks running processes (`exited_at_ms IS NULL` and `created_at_ms <= reconciled_at_ms`)
     /// whose `process_instance_id` is absent from `active_instance_ids` as exited at
     /// `reconciled_at_ms`, returning the updated row count.
+    ///
+    /// Immediately returns `Ok(0)` without updating any rows if `active_instance_ids` is empty.
     pub fn reconcile_stale_running_processes(
         &self,
         active_instance_ids: &[String],
         reconciled_at_ms: i64,
     ) -> Result<usize, StoreError> {
+        if active_instance_ids.is_empty() {
+            return Ok(0);
+        }
         self.flush_batch()?;
         let mut writer = self.lock_writer()?;
         let tx = writer.transaction()?;
@@ -734,6 +827,62 @@ impl LedrStore {
                 Ok(false)
             }
         }
+    }
+
+    /// Returns SQLite `EXPLAIN QUERY PLAN` detail lines for the `(pid, event_ts_ms)` time-window
+    /// lookup query used during process attribution (`BUG_0003`).
+    pub fn explain_pid_lookup_plan(&self) -> Result<Vec<String>, StoreError> {
+        let reader = self.lock_reader()?;
+        let sql = format!("EXPLAIN QUERY PLAN\n{PID_TIME_WINDOW_LOOKUP_SQL}");
+        let mut stmt = reader.prepare(&sql)?;
+        let mut rows = stmt.query(params![4i64, 1_750_000_000_000i64])?;
+        let mut details = Vec::new();
+        while let Some(row) = rows.next()? {
+            details.push(row.get::<_, String>(3)?);
+        }
+        Ok(details)
+    }
+
+    fn purge_in_batches<F>(&self, mut delete_batch: F) -> Result<usize, StoreError>
+    where
+        F: FnMut(&Transaction<'_>) -> rusqlite::Result<usize>,
+    {
+        let mut total_deleted = 0usize;
+        loop {
+            if self.is_shutdown_requested() {
+                break;
+            }
+            let deleted = {
+                let mut writer = self.lock_writer()?;
+                let tx = writer.transaction()?;
+                let deleted = delete_batch(&tx)?;
+                tx.commit()?;
+                deleted
+            };
+            total_deleted += deleted;
+            if deleted == 0 {
+                break;
+            }
+        }
+        Ok(total_deleted)
+    }
+
+    fn purge_by_timestamp_id(
+        &self,
+        table: &str,
+        ts_col: &str,
+        cutoff_ms: i64,
+        batch_limit: i64,
+    ) -> Result<usize, StoreError> {
+        let sql = format!(
+            "DELETE FROM {table}
+             WHERE id IN (
+                 SELECT id FROM {table}
+                 WHERE {ts_col} < ?1
+                 LIMIT ?2
+             )"
+        );
+        self.purge_in_batches(|tx| tx.execute(&sql, params![cutoff_ms, batch_limit]))
     }
 
     fn drain_batch(&self) -> Result<Vec<BufferedEvent>, StoreError> {
@@ -888,13 +1037,14 @@ fn resolve_process_instance_id(
                 )
                 .optional()?;
             match window {
-                Some((created_at_ms, exited_at_ms))
-                    if created_at_ms > event_ts_ms
-                        || exited_at_ms.is_some_and(|e| event_ts_ms > e) =>
-                {
+                Some((created_at_ms, exited_at_ms)) => {
+                    if created_at_ms <= event_ts_ms && exited_at_ms.is_none_or(|e| event_ts_ms <= e)
+                    {
+                        return Ok(h.to_owned());
+                    }
                     None
                 }
-                _ => Some(h),
+                None => Some(h),
             }
         }
         None => None,
@@ -902,12 +1052,7 @@ fn resolve_process_instance_id(
 
     if let Some(matched) = tx
         .query_row(
-            "SELECT process_instance_id FROM processes
-             WHERE pid = ?1
-               AND created_at_ms <= ?2
-               AND (exited_at_ms IS NULL OR exited_at_ms >= ?2)
-             ORDER BY created_at_ms DESC
-             LIMIT 1",
+            PID_TIME_WINDOW_LOOKUP_SQL,
             params![i64::from(pid), event_ts_ms],
             |row| row.get::<_, String>(0),
         )
@@ -1082,43 +1227,6 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
     Ok(())
 }
 
-fn purge_in_batches<F>(writer: &mut Connection, mut delete_batch: F) -> Result<usize, StoreError>
-where
-    F: FnMut(&Transaction<'_>) -> rusqlite::Result<usize>,
-{
-    let mut total_deleted = 0usize;
-    loop {
-        let tx = writer.transaction()?;
-        let deleted = delete_batch(&tx)?;
-        tx.commit()?;
-        total_deleted += deleted;
-        if deleted == 0 {
-            break;
-        }
-    }
-    Ok(total_deleted)
-}
-
-fn purge_by_timestamp_id(
-    writer: &mut Connection,
-    table: &str,
-    ts_col: &str,
-    cutoff_ms: i64,
-    batch_limit: i64,
-) -> Result<usize, StoreError> {
-    let sql = format!(
-        "DELETE FROM {table}
-         WHERE id IN (
-             SELECT id FROM {table}
-             WHERE {ts_col} < ?1
-             LIMIT ?2
-         )"
-    );
-    purge_in_batches(writer, |tx| {
-        tx.execute(&sql, params![cutoff_ms, batch_limit])
-    })
-}
-
 fn query_table_rows<T, F>(
     reader: &Connection,
     cols: &str,
@@ -1227,6 +1335,7 @@ mod tests {
             "processes",
         ];
         let expected_indexes = [
+            "idx_alerts_proc_status",
             "idx_alerts_status_ts",
             "idx_canary_ts",
             "idx_dl_path",
@@ -1236,6 +1345,7 @@ mod tests {
             "idx_net_ts_proc",
             "idx_processes_created",
             "idx_processes_parent",
+            "idx_processes_pid_created",
             "idx_processes_sha256",
         ];
 
@@ -1436,5 +1546,151 @@ mod tests {
             .query_flight_recorder(500, None)
             .expect("final snapshot");
         assert_eq!(final_snap.dns_queries.len(), 200);
+    }
+
+    #[test]
+    fn unit_resolve_process_instance_id_fast_hint_and_fallbacks() {
+        let store = LedrStore::open_in_memory().expect("open in-memory store");
+
+        let proc_old = ProcessRecord {
+            process_instance_id: "42:1000".to_string(),
+            pid: 42,
+            parent_instance_id: Some("4:1".to_string()),
+            ppid: 4,
+            exe_path: r"C:\Temp\old.exe".to_string(),
+            command_line: None,
+            sha256: None,
+            signer_subject: None,
+            is_trusted_os: false,
+            user_sid: None,
+            origin_url: None,
+            created_at_ms: 1000,
+            exited_at_ms: Some(2000),
+        };
+        let proc_new = ProcessRecord {
+            process_instance_id: "42:1500".to_string(),
+            pid: 42,
+            parent_instance_id: Some("4:1".to_string()),
+            ppid: 4,
+            exe_path: r"C:\Temp\new.exe".to_string(),
+            command_line: None,
+            sha256: None,
+            signer_subject: None,
+            is_trusted_os: false,
+            user_sid: None,
+            origin_url: None,
+            created_at_ms: 1500,
+            exited_at_ms: None,
+        };
+        store
+            .upsert_process_record(&proc_old)
+            .expect("upsert proc_old");
+        store
+            .upsert_process_record(&proc_new)
+            .expect("upsert proc_new");
+
+        let mut writer = store.lock_writer().expect("lock writer");
+        let tx = writer.transaction().expect("begin tx");
+
+        // Fast valid-hint path: returns "42:1000" immediately without running the WHERE pid = ?1
+        // query (which would otherwise pick "42:1500" via ORDER BY created_at_ms DESC LIMIT 1).
+        assert_eq!(
+            resolve_process_instance_id(&tx, 42, 1700, Some("42:1000")).expect("fast hint mid"),
+            "42:1000"
+        );
+        assert_eq!(
+            resolve_process_instance_id(&tx, 42, 1000, Some("42:1000")).expect("fast hint start"),
+            "42:1000"
+        );
+        assert_eq!(
+            resolve_process_instance_id(&tx, 42, 2000, Some("42:1000")).expect("fast hint end"),
+            "42:1000"
+        );
+
+        // Out-of-window hint falls back to WHERE pid = ?1.
+        assert_eq!(
+            resolve_process_instance_id(&tx, 42, 2500, Some("42:1000"))
+                .expect("stale hint falls back"),
+            "42:1500"
+        );
+        assert_eq!(
+            resolve_process_instance_id(&tx, 42, 500, Some("42:1000"))
+                .expect("early out-of-window hint"),
+            "42:0"
+        );
+
+        // Unpersisted or PID-mismatched hint runs WHERE pid = ?1 first.
+        assert_eq!(
+            resolve_process_instance_id(&tx, 42, 1700, Some("42:9999"))
+                .expect("unpersisted hint resolves persisted row"),
+            "42:1500"
+        );
+        assert_eq!(
+            resolve_process_instance_id(&tx, 42, 1700, Some("999:1000"))
+                .expect("mismatched pid hint resolves persisted row"),
+            "42:1500"
+        );
+        assert_eq!(
+            resolve_process_instance_id(&tx, 88, 1700, Some("88:9999"))
+                .expect("unpersisted hint fallback"),
+            "88:9999"
+        );
+    }
+
+    #[test]
+    fn unit_purge_in_batches_stops_between_batches_on_shutdown() {
+        let store = LedrStore::open_in_memory().expect("open in-memory store");
+        for i in 0..1_200u32 {
+            let pid = 30_000 + i;
+            store
+                .upsert_process_record(&ProcessRecord {
+                    process_instance_id: format!("{pid}:{}", 1000 + i),
+                    pid,
+                    parent_instance_id: None,
+                    ppid: 4,
+                    exe_path: r"C:\Temp\batch_test.exe".to_string(),
+                    command_line: None,
+                    sha256: None,
+                    signer_subject: None,
+                    is_trusted_os: false,
+                    user_sid: None,
+                    origin_url: None,
+                    created_at_ms: 1000,
+                    exited_at_ms: Some(2000),
+                })
+                .expect("seed expired process");
+        }
+
+        let mut batches_run = 0usize;
+        let deleted = store
+            .purge_in_batches(|tx| {
+                batches_run += 1;
+                let count = tx.execute(
+                    "DELETE FROM processes
+                     WHERE process_instance_id IN (
+                         SELECT process_instance_id FROM processes
+                         WHERE exited_at_ms < 5000
+                         LIMIT 500
+                     )",
+                    [],
+                )?;
+                if batches_run == 1 {
+                    store.request_shutdown();
+                }
+                Ok(count)
+            })
+            .expect("purge_in_batches stops after batch 1");
+
+        assert_eq!(batches_run, 1);
+        assert_eq!(deleted, 500);
+        assert!(store.is_shutdown_requested());
+        assert!(store.inner.writer.try_lock().is_ok());
+
+        let remaining: i64 = store
+            .lock_reader()
+            .expect("lock reader")
+            .query_row("SELECT COUNT(*) FROM processes", [], |row| row.get(0))
+            .expect("count remaining rows");
+        assert_eq!(remaining, 700);
     }
 }

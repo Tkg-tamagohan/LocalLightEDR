@@ -23,6 +23,8 @@ pub enum SensorError {
     Etw { session: String, message: String },
     #[error("sensor backend is already running")]
     AlreadyRunning,
+    #[error("process snapshot failed: {0}")]
+    Snapshot(String),
 }
 
 /// RAII guard for Win32 `HANDLE` values that must be closed via `CloseHandle`.

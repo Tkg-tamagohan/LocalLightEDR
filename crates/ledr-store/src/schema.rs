@@ -33,9 +33,10 @@ CREATE TABLE IF NOT EXISTS processes (
     created_at_ms       INTEGER NOT NULL,
     exited_at_ms        INTEGER
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_processes_created ON processes(created_at_ms);
-CREATE INDEX IF NOT EXISTS idx_processes_parent  ON processes(parent_instance_id);
-CREATE INDEX IF NOT EXISTS idx_processes_sha256  ON processes(sha256);
+CREATE INDEX IF NOT EXISTS idx_processes_created     ON processes(created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_processes_parent      ON processes(parent_instance_id);
+CREATE INDEX IF NOT EXISTS idx_processes_pid_created ON processes(pid, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_processes_sha256      ON processes(sha256);
 
 CREATE TABLE IF NOT EXISTS dns_queries (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,7 +86,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     context_json        TEXT NOT NULL,
     resolved_at_ms      INTEGER
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_alerts_status_ts ON alerts(status, timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_status_ts   ON alerts(status, timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_proc_status ON alerts(process_instance_id, status);
 
 CREATE TABLE IF NOT EXISTS allowlist_rules (
     rule_id             TEXT PRIMARY KEY,

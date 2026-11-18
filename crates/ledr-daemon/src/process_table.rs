@@ -17,6 +17,7 @@ pub struct ActiveProcessEntry {
     pub user_sid: Option<String>,
     pub created_at_ms: i64,
     pub exited_at_ms: Option<i64>,
+    pub sigma_evaluated: bool,
 }
 
 /// Resolution result returned when recording a new `ProcessStart` into [`ActiveProcessTable`].
@@ -26,6 +27,7 @@ pub struct ProcessStartResolution {
     pub parent_instance_id: Option<String>,
     pub parent_exe_path: Option<String>,
     pub parent_command_line: Option<String>,
+    pub should_evaluate_sigma: bool,
 }
 
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
@@ -95,6 +97,10 @@ impl ActiveProcessTable {
             };
 
         if let Some(existing) = self.entries.get_mut(&instance_id) {
+            let upgrade_cmd = existing.command_line.is_empty() && !command_line.is_empty();
+            let should_evaluate = !existing.sigma_evaluated || upgrade_cmd;
+            existing.sigma_evaluated = true;
+
             if existing.parent_instance_id.is_none() {
                 existing.parent_instance_id = parent_instance_id.clone();
             }
@@ -117,6 +123,7 @@ impl ActiveProcessTable {
                 parent_instance_id: resolved_parent_id,
                 parent_exe_path,
                 parent_command_line,
+                should_evaluate_sigma: should_evaluate,
             };
         }
 
@@ -153,6 +160,7 @@ impl ActiveProcessTable {
                 user_sid,
                 created_at_ms,
                 exited_at_ms: None,
+                sigma_evaluated: true,
             },
         );
         self.active_count += 1;
@@ -165,6 +173,7 @@ impl ActiveProcessTable {
             parent_instance_id,
             parent_exe_path,
             parent_command_line,
+            should_evaluate_sigma: true,
         }
     }
 
@@ -409,5 +418,63 @@ mod tests {
                 .and_then(|e| e.exited_at_ms),
             None
         );
+    }
+
+    #[test]
+    fn process_table_deduplicates_sigma_evaluation_unless_cmdline_enriched() {
+        let mut table = ActiveProcessTable::new(16);
+        let p1 = ProcessIdentity::new(901, 10_000);
+        let first = table.on_process_start(
+            p1,
+            4,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            "powershell.exe -enc AA==".to_string(),
+            None,
+            100,
+        );
+        assert!(first.should_evaluate_sigma);
+
+        // Duplicate start (e.g., ETW + seed_processes) with non-empty command line does not re-evaluate.
+        let dup = table.on_process_start(
+            p1,
+            4,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            "powershell.exe -enc AA==".to_string(),
+            None,
+            100,
+        );
+        assert!(!dup.should_evaluate_sigma);
+
+        // Process initially observed without command line re-evaluates once enriched.
+        let p2 = ProcessIdentity::new(902, 20_000);
+        let empty_cmd = table.on_process_start(
+            p2,
+            4,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            String::new(),
+            None,
+            200,
+        );
+        assert!(empty_cmd.should_evaluate_sigma);
+
+        let enriched = table.on_process_start(
+            p2,
+            4,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            "powershell.exe -Command iex 'x'".to_string(),
+            None,
+            200,
+        );
+        assert!(enriched.should_evaluate_sigma);
+
+        let post_enrich_dup = table.on_process_start(
+            p2,
+            4,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            "powershell.exe -Command iex 'x'".to_string(),
+            None,
+            200,
+        );
+        assert!(!post_enrich_dup.should_evaluate_sigma);
     }
 }

@@ -8,7 +8,7 @@ use ledr_daemon::{start_ipc_server, DaemonConfig, DaemonEngine};
 use ledr_proto::{SensorBackend, IPC_PIPE_NAME, PROGRAM_DATA_DIR};
 use ledr_rules::{load_rules_and_pruner_from_dir, EarlyPruner, SigmaEngine};
 use ledr_sensor_win::etw::{
-    capture_running_processes, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
+    try_capture_running_processes, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
     DEFAULT_ETW_SESSION_NAME,
 };
 use ledr_sensor_win::privileges::enable_required_privileges;
@@ -194,8 +194,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let initial_processes = capture_running_processes();
-    let seeded_count = engine.seed_processes(initial_processes)?;
+    let seeded_count = match try_capture_running_processes() {
+        Ok(initial_processes) => engine.seed_processes(initial_processes)?,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "initial running-process snapshot failed; skipping process seeding and stale reconciliation"
+            );
+            0
+        }
+    };
     tracing::info!(
         seeded_processes = seeded_count,
         sigma_rules = rule_count,

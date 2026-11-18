@@ -238,7 +238,7 @@ async fn handle_pipe_client(
                 code: "EMPTY_FRAME".to_string(),
                 message: "empty IPC frame".to_string(),
             };
-            write_response(&mut pipe, &err_resp).await?;
+            write_response(&mut pipe, &err_resp, frame_timeout).await?;
             break;
         }
         if payload_len > IPC_MAX_FRAME_BYTES {
@@ -246,7 +246,7 @@ async fn handle_pipe_client(
                 code: "FRAME_TOO_LARGE".to_string(),
                 message: format!("IPC frame {payload_len} exceeds {IPC_MAX_FRAME_BYTES} bytes"),
             };
-            write_response(&mut pipe, &err_resp).await?;
+            write_response(&mut pipe, &err_resp, frame_timeout).await?;
             break;
         }
 
@@ -287,7 +287,7 @@ async fn handle_pipe_client(
             },
         };
 
-        write_response(&mut pipe, &response).await?;
+        write_response(&mut pipe, &response, frame_timeout).await?;
     }
 
     Ok(())
@@ -300,7 +300,11 @@ fn is_disconnect_error(err: &std::io::Error) -> bool {
     )
 }
 
-async fn write_response(pipe: &mut NamedPipeServer, resp: &IpcResponse) -> std::io::Result<()> {
+async fn write_response(
+    pipe: &mut NamedPipeServer,
+    resp: &IpcResponse,
+    frame_timeout: Duration,
+) -> std::io::Result<()> {
     let encoded = encode_ipc_frame(resp).unwrap_or_else(|err| {
         let fallback = IpcResponse::Error {
             code: "ENCODE_ERROR".to_string(),
@@ -308,9 +312,18 @@ async fn write_response(pipe: &mut NamedPipeServer, resp: &IpcResponse) -> std::
         };
         encode_ipc_frame(&fallback).unwrap_or_default()
     });
-    pipe.write_all(&encoded).await?;
-    pipe.flush().await?;
-    Ok(())
+    match tokio::time::timeout(frame_timeout, async {
+        pipe.write_all(&encoded).await?;
+        pipe.flush().await
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Err(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "IPC response write timed out",
+        )),
+    }
 }
 
 fn dispatch_request(

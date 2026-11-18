@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ledr_proto::{
     AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord, CanaryCategory,
@@ -1108,4 +1109,217 @@ fn store_07_reconcile_stale_running_processes_on_restart() {
             .len(),
         1
     );
+}
+
+#[test]
+fn store_08_pid_created_index_query_plan_and_shutdown_interrupts_purge() {
+    let dir = TempDir::new().expect("create temp dir");
+    let db_path = dir.path().join("store_08_index_and_shutdown.db");
+    let store = LedrStore::open(&db_path).expect("open LedrStore");
+
+    // 1. Verify SQLite uses idx_processes_pid_created for (pid, event_ts_ms) time-window lookups
+    //    and idx_alerts_proc_status for purge's unresolved-alert existence check.
+    let plan = store
+        .explain_pid_lookup_plan()
+        .expect("explain pid lookup plan");
+    assert!(
+        plan.iter().any(|detail| {
+            detail.contains("SEARCH processes USING")
+                && detail.contains("idx_processes_pid_created")
+        }),
+        "expected SEARCH processes USING ... idx_processes_pid_created, got: {plan:?}"
+    );
+
+    let inspect_conn = Connection::open(&db_path).expect("open inspection sqlite connection");
+    let mut alert_plan_stmt = inspect_conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT 1 FROM alerts
+             WHERE process_instance_id = ?1
+               AND status IN ('PENDING', 'EXPIRED_SUSPENDED')",
+        )
+        .expect("prepare alert query plan");
+    let alert_plan: Vec<String> = alert_plan_stmt
+        .query_map(["4:1"], |row| row.get(3))
+        .expect("query alert plan")
+        .map(|r| r.expect("alert plan detail"))
+        .collect();
+    assert!(
+        alert_plan.iter().any(|detail| {
+            detail.contains("SEARCH alerts USING") && detail.contains("idx_alerts_proc_status")
+        }),
+        "expected SEARCH alerts USING ... idx_alerts_proc_status, got: {alert_plan:?}"
+    );
+
+    // 2. Verify pre-session candidate reconciliation (BUG_0001 & BUG_0002).
+    let now_ms = 1_750_000_000_000i64;
+    let old_created_ms = now_ms - 20 * DAY_MS;
+    let reconciled_at_ms = now_ms - 15 * DAY_MS;
+
+    let (stale_candidate, stale_start) = make_process_start(
+        601,
+        old_created_ms,
+        4,
+        r"C:\Temp\stale_candidate.exe",
+        "stale_candidate.exe",
+    );
+    let (live_candidate, live_start) = make_process_start(
+        602,
+        old_created_ms,
+        4,
+        r"C:\Windows\System32\svchost.exe",
+        "svchost.exe",
+    );
+
+    store
+        .ingest_event(&stale_start, Some("4:1"), false, "")
+        .expect("ingest stale_candidate");
+    store
+        .ingest_event(&live_start, Some("4:1"), false, "")
+        .expect("buffer live_candidate");
+    assert_eq!(store.buffered_len(), 2);
+
+    let candidates = store
+        .list_running_process_instance_ids()
+        .expect("list running candidates");
+    assert_eq!(store.buffered_len(), 0);
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.contains(&stale_candidate.instance_id()));
+    assert!(candidates.contains(&live_candidate.instance_id()));
+
+    // A new ETW process observed after capturing candidates is NOT in candidates and NOT in
+    // active_instance_ids; reconciliation must leave it running (BUG_0001).
+    let (new_etw_proc, new_etw_start) = make_process_start(
+        603,
+        old_created_ms + 5000,
+        4,
+        r"C:\Temp\new_etw_proc.exe",
+        "new_etw_proc.exe",
+    );
+    store
+        .ingest_event(&new_etw_start, Some("4:1"), false, "")
+        .expect("ingest new_etw_proc");
+    store.flush_batch().expect("flush new_etw_proc");
+
+    // Empty active_instance_ids or empty candidate_instance_ids safety guards (BUG_0002).
+    assert_eq!(
+        store
+            .reconcile_stale_running_candidates(&candidates, &[], reconciled_at_ms)
+            .expect("empty active_ids guard"),
+        0
+    );
+    assert_eq!(
+        store
+            .reconcile_stale_running_candidates(
+                &[],
+                &[live_candidate.instance_id()],
+                reconciled_at_ms
+            )
+            .expect("empty candidates guard"),
+        0
+    );
+    assert_eq!(
+        store
+            .reconcile_stale_running_processes(&[], reconciled_at_ms)
+            .expect("legacy reconcile empty active_ids guard"),
+        0
+    );
+
+    let reconciled = store
+        .reconcile_stale_running_candidates(
+            &candidates,
+            &[live_candidate.instance_id()],
+            reconciled_at_ms,
+        )
+        .expect("reconcile stale candidates");
+    assert_eq!(reconciled, 1);
+
+    assert_eq!(
+        store
+            .query_flight_recorder(10, Some(&stale_candidate.instance_id()))
+            .expect("query stale_candidate")
+            .processes[0]
+            .exited_at_ms,
+        Some(reconciled_at_ms)
+    );
+    assert_eq!(
+        store
+            .query_flight_recorder(10, Some(&live_candidate.instance_id()))
+            .expect("query live_candidate")
+            .processes[0]
+            .exited_at_ms,
+        None
+    );
+    assert_eq!(
+        store
+            .query_flight_recorder(10, Some(&new_etw_proc.instance_id()))
+            .expect("query new_etw_proc")
+            .processes[0]
+            .exited_at_ms,
+        None
+    );
+
+    // 3. Mid-lifecycle checkpoint_truncate must NOT flip shutdown_requested, so purge_expired works.
+    store
+        .checkpoint_truncate()
+        .expect("mid-lifecycle checkpoint_truncate");
+    assert!(!store.is_shutdown_requested());
+    let pre_shutdown_purge = store
+        .purge_expired(now_ms, 14)
+        .expect("purge expired reconciled candidate before shutdown");
+    assert_eq!(pre_shutdown_purge.processes_deleted, 1);
+
+    // 4. Seed >1,500 expired processes, request_shutdown(), and verify purge_expired stops
+    //    immediately (0 deleted) and checkpoint_truncate completes quickly (BUG_0004).
+    let expired_start_ms = now_ms - 20 * DAY_MS;
+    let expired_exit_ms = now_ms - 16 * DAY_MS;
+    for i in 0..1_600u32 {
+        let pid = 20_000 + i;
+        let (proc_id, proc_start) = make_process_start(
+            pid,
+            expired_start_ms + i64::from(i),
+            4,
+            r"C:\Temp\bulk_expired.exe",
+            "",
+        );
+        store
+            .ingest_event(&proc_start, None, false, "")
+            .expect("ingest bulk expired start");
+        store
+            .ingest_event(
+                &make_process_stop(pid, expired_exit_ms + i64::from(i)),
+                Some(&proc_id.instance_id()),
+                false,
+                "",
+            )
+            .expect("ingest bulk expired stop");
+    }
+    store.flush_batch().expect("flush 1600 expired processes");
+
+    store.request_shutdown();
+    assert!(store.is_shutdown_requested());
+
+    let shutdown_purge = store
+        .purge_expired(now_ms, 14)
+        .expect("purge_expired after request_shutdown");
+    assert_eq!(shutdown_purge.processes_deleted, 0);
+
+    let ckpt_start = Instant::now();
+    store
+        .checkpoint_truncate()
+        .expect("checkpoint_truncate after request_shutdown");
+    assert!(
+        ckpt_start.elapsed() < Duration::from_secs(5),
+        "checkpoint_truncate took too long after shutdown: {:?}",
+        ckpt_start.elapsed()
+    );
+
+    let remaining_expired: i64 = inspect_conn
+        .query_row(
+            "SELECT COUNT(*) FROM processes WHERE exited_at_ms IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count remaining expired processes");
+    assert_eq!(remaining_expired, 1_600);
 }

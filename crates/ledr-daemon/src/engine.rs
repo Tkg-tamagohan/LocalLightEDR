@@ -70,6 +70,7 @@ pub struct DaemonEngine {
     sigma: SigmaEngine,
     pruner: EarlyPruner,
     process_table: Mutex<ActiveProcessTable>,
+    prior_running_candidates: Mutex<Vec<String>>,
     sender: TwoLaneSender,
     started_at: Instant,
     high_priority_processed: AtomicU64,
@@ -87,6 +88,7 @@ impl DaemonEngine {
         pruner: EarlyPruner,
         config: DaemonConfig,
     ) -> Arc<Self> {
+        let prior_running_candidates = store.list_running_process_instance_ids().unwrap_or_default();
         let (sender, receiver) = TwoLaneChannel::with_capacities(
             config.high_priority_capacity,
             config.telemetry_capacity,
@@ -100,6 +102,7 @@ impl DaemonEngine {
             sigma,
             pruner,
             process_table,
+            prior_running_candidates: Mutex::new(prior_running_candidates),
             sender,
             started_at: Instant::now(),
             high_priority_processed: AtomicU64::new(0),
@@ -138,7 +141,7 @@ impl DaemonEngine {
 
     /// Seeds the in-memory [`ActiveProcessTable`] and SQLite store with initial OS process snapshots
     /// (`AUTO-03`), flushes them immediately, and reconciles any stale running processes from prior
-    /// daemon sessions (`BUG_0008`).
+    /// daemon sessions (`BUG_0001`, `BUG_0002`).
     pub fn seed_processes(&self, snapshots: Vec<SensorEvent>) -> Result<usize, anyhow::Error> {
         let mut count = 0usize;
         let mut active_id_set = HashSet::with_capacity(snapshots.len());
@@ -149,16 +152,35 @@ impl DaemonEngine {
                 count += 1;
             }
         }
-        if let Ok(table) = self.process_table.lock() {
+        if count == 0 {
+            tracing::warn!(
+                "seed_processes received zero ProcessStart snapshots; skipping stale reconciliation"
+            );
+            return Ok(0);
+        }
+        self.store.flush_batch()?;
+        {
+            let table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for id in table.active_instance_ids() {
                 active_id_set.insert(id);
             }
         }
-        self.store.flush_batch()?;
+        let candidates = {
+            let mut guard = self
+                .prior_running_candidates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
         let active_ids: Vec<String> = active_id_set.into_iter().collect();
-        let reconciled = self
-            .store
-            .reconcile_stale_running_processes(&active_ids, current_unix_ms())?;
+        let reconciled = self.store.reconcile_stale_running_candidates(
+            &candidates,
+            &active_ids,
+            current_unix_ms(),
+        )?;
         if reconciled > 0 {
             tracing::info!(
                 reconciled_stale_processes = reconciled,
@@ -227,6 +249,7 @@ impl DaemonEngine {
     /// Closes ingestion, drains remaining queued events, flushes SQLite batches, and runs
     /// `PRAGMA wal_checkpoint(TRUNCATE)` within `SHUTDOWN_FLUSH_TIMEOUT_MS` (`3,000 ms`, `AUTO-10`).
     pub async fn shutdown_and_flush(&self) -> Result<(), anyhow::Error> {
+        self.store.request_shutdown();
         self.sender.close();
 
         let handle = {
@@ -298,7 +321,9 @@ impl DaemonEngine {
         }
 
         if let Some(handle) = purge_in_flight {
-            let _ = handle.await;
+            if let Err(err) = handle.await {
+                tracing::warn!(error = %err, "TTL purge task panicked during shutdown");
+            }
         }
 
         for remaining in receiver.drain_ready() {
@@ -327,7 +352,7 @@ impl DaemonEngine {
             .should_prune_with_image(&ctx, proc_ctx.proc_exe_path.as_deref())
         {
             self.pruned_events.fetch_add(1, Ordering::Relaxed);
-        } else {
+        } else if proc_ctx.should_evaluate_sigma {
             let matches = self
                 .sigma
                 .evaluate_with_image(&ctx, proc_ctx.proc_exe_path.as_deref());
@@ -416,6 +441,7 @@ impl DaemonEngine {
                     store_hint: res.parent_instance_id,
                     parent_exe_path: res.parent_exe_path,
                     parent_command_line: res.parent_command_line,
+                    should_evaluate_sigma: res.should_evaluate_sigma,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
@@ -426,6 +452,7 @@ impl DaemonEngine {
                     store_hint: id,
                     parent_exe_path: None,
                     parent_command_line: None,
+                    should_evaluate_sigma: true,
                 }
             }
             SensorEvent::DnsQuery { pid, .. }
@@ -452,19 +479,33 @@ impl DaemonEngine {
                     store_hint: Some(proc_entry.instance_id),
                     parent_exe_path: parent_exe,
                     parent_command_line: parent_cmd,
+                    should_evaluate_sigma: true,
                 }
             }
         }
     }
 }
 
-#[derive(Default)]
 struct ResolvedProcessContext {
     proc_instance_id: Option<String>,
     proc_exe_path: Option<String>,
     store_hint: Option<String>,
     parent_exe_path: Option<String>,
     parent_command_line: Option<String>,
+    should_evaluate_sigma: bool,
+}
+
+impl Default for ResolvedProcessContext {
+    fn default() -> Self {
+        Self {
+            proc_instance_id: None,
+            proc_exe_path: None,
+            store_hint: None,
+            parent_exe_path: None,
+            parent_command_line: None,
+            should_evaluate_sigma: true,
+        }
+    }
 }
 
 pub(crate) fn current_unix_ms() -> i64 {

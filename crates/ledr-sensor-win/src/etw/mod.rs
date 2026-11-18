@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use ledr_proto::{ProcessIdentity, ScriptSource, SensorBackend, SensorEvent};
 use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_NOT_FOUND, ERROR_SUCCESS,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_SUCCESS,
 };
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
@@ -71,20 +71,29 @@ impl SensorBackend for NoopSensorBackend {
     }
 }
 
-/// Captures a baseline snapshot of currently running processes using Toolhelp32 (`AUTO-03`).
+/// Captures a baseline snapshot of currently running processes using Toolhelp32 (`AUTO-03`,
+/// `BUG_0002`).
 ///
 /// Queries each accessible process's `CreationTime` (`create_time_100ns`), full Win32 image path,
 /// and command line. Protected system processes that deny `PROCESS_QUERY_LIMITED_INFORMATION`
 /// in non-elevated sessions still emit an entry using the Toolhelp32 executable name fallback.
-pub fn capture_running_processes() -> Vec<SensorEvent> {
+///
+/// Returns `Err(SensorError::Snapshot)` if snapshot creation, initial enumeration, mid-stream
+/// iteration (any `Process32NextW` error other than `ERROR_NO_MORE_FILES`), or zero-process
+/// enumeration occurs so callers never mistake a truncated snapshot for all processes having
+/// exited.
+pub fn try_capture_running_processes() -> Result<Vec<SensorEvent>, SensorError> {
     // SAFETY: `TH32CS_SNAPPROCESS` with PID 0 snapshots all processes on the host.
-    let Ok(raw_snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        tracing::warn!("CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS) failed");
-        return Vec::new();
-    };
-    let Some(snapshot) = OwnedHandle::new(raw_snap) else {
-        return Vec::new();
-    };
+    let raw_snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(|err| {
+        SensorError::Snapshot(format!(
+            "CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS) failed: {err}"
+        ))
+    })?;
+    let snapshot = OwnedHandle::new(raw_snap).ok_or_else(|| {
+        SensorError::Snapshot(
+            "CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS) returned an invalid handle".to_string(),
+        )
+    })?;
 
     let volume_map = DosVolumeMap::from_system();
     let mut events = Vec::new();
@@ -94,10 +103,13 @@ pub fn capture_running_processes() -> Vec<SensorEvent> {
     };
 
     // SAFETY: `snapshot` is a valid process snapshot handle and `entry.dwSize` is initialized.
-    if unsafe { Process32FirstW(snapshot.as_raw(), &mut entry) }.is_err() {
-        return events;
+    if let Err(err) = unsafe { Process32FirstW(snapshot.as_raw(), &mut entry) } {
+        return Err(SensorError::Snapshot(format!(
+            "Process32FirstW failed: {err}"
+        )));
     }
 
+    let no_more_files = ERROR_NO_MORE_FILES.to_hresult();
     loop {
         let pid = entry.th32ProcessID;
         if pid != 0 {
@@ -122,12 +134,32 @@ pub fn capture_running_processes() -> Vec<SensorEvent> {
         }
 
         // SAFETY: `snapshot` and `entry` remain valid across iteration.
-        if unsafe { Process32NextW(snapshot.as_raw(), &mut entry) }.is_err() {
-            break;
+        if let Err(err) = unsafe { Process32NextW(snapshot.as_raw(), &mut entry) } {
+            if err.code() == no_more_files {
+                break;
+            }
+            return Err(SensorError::Snapshot(format!(
+                "Process32NextW failed: {err}"
+            )));
         }
     }
 
-    events
+    if events.is_empty() {
+        return Err(SensorError::Snapshot(
+            "enumerated 0 running processes".to_string(),
+        ));
+    }
+
+    Ok(events)
+}
+
+/// Captures a baseline snapshot of currently running processes using Toolhelp32 (`AUTO-03`).
+///
+/// Backwards-compatible infallible wrapper around [`try_capture_running_processes`]; returns an
+/// empty vector on snapshot errors. Callers performing stale-process reconciliation should prefer
+/// [`try_capture_running_processes`] to distinguish empty snapshots from enumeration failures.
+pub fn capture_running_processes() -> Vec<SensorEvent> {
+    try_capture_running_processes().unwrap_or_default()
 }
 
 #[repr(C)]
@@ -770,13 +802,11 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    #[test]
-    fn sens_03_capture_running_processes_current_pid() {
+    fn assert_snapshot_contains_current_process(events: &[SensorEvent], source: &str) {
         let current_pid = std::process::id();
-        let events = capture_running_processes();
         assert!(
             !events.is_empty(),
-            "expected Toolhelp32 snapshot to list running processes"
+            "{source}: expected Toolhelp32 snapshot to list running processes"
         );
 
         let current_entry = events.iter().find_map(|event| match event {
@@ -787,7 +817,7 @@ mod tests {
         });
 
         let (identity, exe_path) =
-            current_entry.expect("current PID must appear in capture_running_processes()");
+            current_entry.unwrap_or_else(|| panic!("current PID must appear in {source}"));
         assert!(
             identity.create_time_100ns > 0,
             "current process create_time_100ns must be > 0"
@@ -795,6 +825,29 @@ mod tests {
         assert!(
             !exe_path.is_empty(),
             "current process exe_path must be non-empty"
+        );
+    }
+
+    #[test]
+    fn sens_03_capture_running_processes_current_pid() {
+        let events = capture_running_processes();
+        assert_snapshot_contains_current_process(&events, "capture_running_processes()");
+    }
+
+    #[test]
+    fn sens_07_try_capture_running_processes_non_empty() {
+        let events = try_capture_running_processes()
+            .expect("try_capture_running_processes() must succeed on a live host");
+        assert_snapshot_contains_current_process(&events, "try_capture_running_processes()");
+
+        let err = SensorError::Snapshot("enumerated 0 running processes".to_string());
+        assert_eq!(
+            err.to_string(),
+            "process snapshot failed: enumerated 0 running processes"
+        );
+        assert_eq!(
+            windows::core::Error::from(ERROR_NO_MORE_FILES).code(),
+            ERROR_NO_MORE_FILES.to_hresult()
         );
     }
 

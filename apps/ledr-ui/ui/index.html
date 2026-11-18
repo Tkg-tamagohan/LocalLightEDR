@@ -3,23 +3,21 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>LocalEDR - Process Lineage &amp; Flight Recorder</title>
+    <title>LocalEDR</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="brand-group">
         <div class="brand-mark" aria-hidden="true">LE</div>
-        <div>
-          <h1 class="brand-title">LocalEDR</h1>
-          <div class="brand-subtitle">Endpoint Flight Recorder</div>
-        </div>
+        <h1 class="brand-title">LocalEDR</h1>
       </div>
 
       <nav class="view-nav" aria-label="Core Views">
         <button type="button" class="nav-tab" data-view="triage">
           <span>View 1: アラートトリアージ</span>
-          <span class="phase-tag">Phase 2</span>
+          <span id="triage-unresolved-badge" class="count-badge">0</span>
+          <span class="phase-tag is-live">Active</span>
         </button>
         <button type="button" class="nav-tab is-active" data-view="lineage" aria-current="page">
           <span>View 2: プロセス系譜・通信フライトレコーダー</span>
@@ -34,7 +32,7 @@
       <div class="header-controls">
         <span id="launch-mode-pill" class="pill pill-warn hidden"></span>
         <span id="daemon-status-pill" class="pill pill-muted">Daemon: Checking...</span>
-        <span id="metrics-pill" class="pill pill-mono" title="Daemon Pipeline Metrics">
+        <span id="metrics-pill" class="pill pill-mono">
           Procs: - | Alerts: - | Drops: -
         </span>
         <button id="refresh-btn" type="button" class="btn btn-primary">Refresh</button>
@@ -52,98 +50,231 @@
       </div>
     </div>
 
-    <main id="view-lineage" class="workspace">
-      <section class="panel tree-panel" aria-label="Process Lineage Tree">
-        <div class="panel-header">
-          <div>
-            <h2>プロセス系譜ツリー</h2>
-            <span id="tree-summary" class="panel-meta">0 processes</span>
+    <main class="app-main">
+      <section id="view-triage" class="workspace triage-workspace hidden" aria-label="Alert Triage">
+        <section class="panel alert-queue-panel" aria-label="Alert Queue">
+          <div class="panel-header">
+            <div class="panel-title-group">
+              <h2>アラートキュー</h2>
+              <span id="alert-queue-summary" class="panel-meta">0 unresolved</span>
+            </div>
+            <div class="panel-actions">
+              <button
+                id="filter-unresolved-btn"
+                type="button"
+                class="btn btn-xs is-selected"
+                aria-pressed="true"
+              >
+                Unresolved <span id="filter-unresolved-count" class="count-badge">0</span>
+              </button>
+              <button
+                id="filter-all-btn"
+                type="button"
+                class="btn btn-xs"
+                aria-pressed="false"
+              >
+                All <span id="filter-all-count" class="count-badge">0</span>
+              </button>
+            </div>
           </div>
-          <div class="panel-actions">
-            <button id="all-procs-btn" type="button" class="btn btn-xs is-selected">All</button>
-            <button id="expand-all-btn" type="button" class="btn btn-xs">Expand</button>
-            <button id="collapse-all-btn" type="button" class="btn btn-xs">Collapse</button>
+
+          <search class="filter-bar">
+            <label for="alert-filter" class="visually-hidden">Filter alerts</label>
+            <input
+              id="alert-filter"
+              type="search"
+              placeholder="e.g. Cookies, honeypot, powershell.exe"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="none"
+              spellcheck="false"
+            />
+          </search>
+
+          <div id="alert-queue" class="alert-queue-list"></div>
+        </section>
+
+        <section class="panel triage-detail-panel" aria-label="Alert Triage Details">
+          <div id="triage-empty" class="triage-empty">
+            <p id="triage-empty-label" class="empty-state-title">No unresolved alerts</p>
+            <div class="empty-state-actions">
+              <button id="triage-show-all-btn" type="button" class="btn btn-secondary hidden">
+                Show All Alerts
+              </button>
+              <button id="triage-sample-btn" type="button" class="btn btn-ghost hidden">
+                Preview Sample
+              </button>
+            </div>
           </div>
-        </div>
 
-        <div class="filter-bar">
-          <input
-            id="process-filter"
-            type="search"
-            placeholder="Filter by exe path, PID, command line, signer..."
-            autocomplete="off"
-          />
-        </div>
+          <div id="triage-detail" class="triage-detail hidden">
+            <div id="triage-suspend-banner" class="suspend-banner"></div>
 
-        <div id="process-tree" class="tree-container" role="tree"></div>
+            <div class="triage-evidence-scroll">
+              <div class="triage-grid">
+                <section class="triage-card" aria-labelledby="heading-detection">
+                  <h3 id="heading-detection" class="triage-card-title">Detection Context</h3>
+                  <dl id="triage-detection-dl" class="kv-list"></dl>
+                </section>
+
+                <section class="triage-card" aria-labelledby="heading-lineage">
+                  <div class="triage-card-head">
+                    <h3 id="heading-lineage" class="triage-card-title">Process Lineage &amp; Signer</h3>
+                    <button id="inspect-in-view2-btn" type="button" class="btn btn-xs hidden">
+                      Inspect Tree
+                    </button>
+                  </div>
+                  <dl id="triage-lineage-dl" class="kv-list"></dl>
+                </section>
+
+                <section class="triage-card" aria-labelledby="heading-motw">
+                  <h3 id="heading-motw" class="triage-card-title">Browser Origin (MOTW)</h3>
+                  <div id="triage-motw-body" class="triage-card-body"></div>
+                </section>
+
+                <section class="triage-card" aria-labelledby="heading-net">
+                  <h3 id="heading-net" class="triage-card-title">Recent Network &amp; DNS</h3>
+                  <div id="triage-net-body" class="triage-card-body"></div>
+                </section>
+              </div>
+            </div>
+
+            <div class="triage-actions-deck">
+              <div
+                id="triage-action-status"
+                class="triage-feedback hidden"
+                role="status"
+                aria-live="polite"
+              ></div>
+
+              <div class="resolution-tiers">
+                <div class="tier-card tier-danger">
+                  <button id="btn-terminate-block" type="button" class="btn btn-danger-primary">
+                    Terminate &amp; Block
+                  </button>
+                  <div class="tier-option">
+                    <input id="opt-add-block-rule" type="checkbox" checked />
+                    <label for="opt-add-block-rule">Add permanent block rule</label>
+                  </div>
+                  <span class="tier-constraint">Terminates process tree</span>
+                </div>
+
+                <div class="tier-card tier-once">
+                  <button id="btn-allow-once" type="button" class="btn btn-outline">
+                    Allow Once
+                  </button>
+                  <span class="tier-constraint">Resumes process without rule</span>
+                </div>
+
+                <div class="tier-card tier-permanent">
+                  <button id="btn-allow-permanent" type="button" class="btn btn-accent-outline">
+                    Allow Permanent Rule
+                  </button>
+                  <div class="tier-option">
+                    <input id="opt-use-signer" type="checkbox" checked />
+                    <label for="opt-use-signer">Match Authenticode signer</label>
+                  </div>
+                  <span id="signer-constraint-note" class="tier-constraint"></span>
+                  <div class="tier-input-group">
+                    <label for="opt-allow-dest" class="tier-input-label">Target scope (optional)</label>
+                    <input
+                      id="opt-allow-dest"
+                      type="text"
+                      placeholder="e.g. C:\Users\*\Cookies"
+                      autocomplete="off"
+                      autocorrect="off"
+                      autocapitalize="none"
+                      spellcheck="false"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
       </section>
 
-      <section class="panel telemetry-panel" aria-label="Communication Flight Recorder">
-        <div id="process-inspector" class="inspector-card">
-          <div class="inspector-empty">
-            Select a process node to filter DNS queries and outbound connections, or inspect the full timeline.
+      <section id="view-lineage" class="workspace" aria-label="Process Lineage and Flight Recorder">
+        <section class="panel tree-panel" aria-label="Process Lineage Tree">
+          <div class="panel-header">
+            <div>
+              <h2>プロセス系譜ツリー</h2>
+              <span id="tree-summary" class="panel-meta">0 processes</span>
+            </div>
+            <div class="panel-actions">
+              <button id="all-procs-btn" type="button" class="btn btn-xs is-selected">All</button>
+              <button id="expand-all-btn" type="button" class="btn btn-xs">Expand</button>
+              <button id="collapse-all-btn" type="button" class="btn btn-xs">Collapse</button>
+            </div>
           </div>
-        </div>
 
-        <div class="telemetry-toolbar">
-          <div class="tab-group" role="tablist">
-            <button type="button" class="tab-btn is-active" data-tab="all" role="tab">
-              Timeline <span id="count-all" class="count-badge">0</span>
-            </button>
-            <button type="button" class="tab-btn" data-tab="dns" role="tab">
-              DNS Queries <span id="count-dns" class="count-badge">0</span>
-            </button>
-            <button type="button" class="tab-btn" data-tab="network" role="tab">
-              Network <span id="count-network" class="count-badge">0</span>
-            </button>
-            <button type="button" class="tab-btn" data-tab="canary" role="tab">
-              Canary &amp; Downloads <span id="count-canary" class="count-badge">0</span>
-            </button>
+          <search class="filter-bar">
+            <label for="process-filter" class="visually-hidden">Filter processes</label>
+            <input
+              id="process-filter"
+              type="search"
+              placeholder="e.g. powershell.exe, 5380, Microsoft"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="none"
+              spellcheck="false"
+            />
+          </search>
+
+          <div id="process-tree" class="tree-container" role="tree"></div>
+        </section>
+
+        <section class="panel telemetry-panel" aria-label="Communication Flight Recorder">
+          <div id="process-inspector" class="inspector-card">
+            <div class="inspector-empty">No process selected</div>
           </div>
-          <div id="scope-indicator" class="scope-label mono">Scope: All Processes</div>
-        </div>
 
-        <div class="table-wrap">
-          <table class="telemetry-table">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Type</th>
-                <th>Process</th>
-                <th>Target / Query</th>
-                <th>Details / Resolved</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody id="telemetry-body">
-              <tr>
-                <td colspan="6" class="empty-row">Waiting for flight recorder snapshot...</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+          <div class="telemetry-toolbar">
+            <div class="tab-group" role="tablist" aria-label="Telemetry Categories">
+              <button type="button" class="tab-btn is-active" data-tab="all" role="tab" aria-selected="true">
+                Timeline <span id="count-all" class="count-badge">0</span>
+              </button>
+              <button type="button" class="tab-btn" data-tab="dns" role="tab" aria-selected="false">
+                DNS Queries <span id="count-dns" class="count-badge">0</span>
+              </button>
+              <button type="button" class="tab-btn" data-tab="network" role="tab" aria-selected="false">
+                Network <span id="count-network" class="count-badge">0</span>
+              </button>
+              <button type="button" class="tab-btn" data-tab="canary" role="tab" aria-selected="false">
+                Canary &amp; Downloads <span id="count-canary" class="count-badge">0</span>
+              </button>
+            </div>
+            <div id="scope-indicator" class="scope-label mono">Scope: All Processes</div>
+          </div>
+
+          <div class="table-wrap">
+            <table class="telemetry-table">
+              <thead>
+                <tr>
+                  <th scope="col">Time</th>
+                  <th scope="col">Type</th>
+                  <th scope="col">Process</th>
+                  <th scope="col">Target / Query</th>
+                  <th scope="col">Details / Resolved</th>
+                  <th scope="col">Status</th>
+                </tr>
+              </thead>
+              <tbody id="telemetry-body">
+                <tr>
+                  <td colspan="6" class="empty-row">Waiting for flight recorder snapshot...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
       </section>
-    </main>
 
-    <main id="view-triage" class="placeholder-view hidden">
-      <section class="panel placeholder-card">
-        <h2>View 1: アラートトリアージ (Phase 2 Target)</h2>
-        <p>
-          Emergency containment triage view for suspended alerts (<code>PENDING</code> /
-          <code>EXPIRED_SUSPENDED</code>) with 3-tier resolution actions is scheduled for Phase 2.
-        </p>
-        <button type="button" class="btn btn-primary back-to-view2">Return to View 2</button>
-      </section>
-    </main>
-
-    <main id="view-policy" class="placeholder-view hidden">
-      <section class="panel placeholder-card">
-        <h2>View 3: 防御ポリシー・カナリア・ブラウザシールド (Phase 3 Target)</h2>
-        <p>
-          Protected canary paths, decoy files, WFP allow/block rules, and Chrome MV3 shield status
-          management are scheduled for Phase 3.
-        </p>
-        <button type="button" class="btn btn-primary back-to-view2">Return to View 2</button>
+      <section id="view-policy" class="placeholder-view hidden" aria-label="Defense Policy and Browser Shield">
+        <div class="panel placeholder-card">
+          <h2>View 3: 防御ポリシー・カナリア・ブラウザシールド</h2>
+          <p class="empty-state-meta">Phase 3 target</p>
+          <button type="button" class="btn btn-primary back-to-view2">Return to View 2</button>
+        </div>
       </section>
     </main>
 

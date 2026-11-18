@@ -1,8 +1,9 @@
 //! Named Pipe IPC client communicating with `ledr-daemon` over `\\.\pipe\localedr-ipc`.
 
 use ledr_proto::{
-    FlightRecorderSnapshot, IPC_PIPE_NAME, IpcRequest, IpcResponse, PipelineMetrics,
-    read_ipc_frame, write_ipc_frame,
+    AlertDecision, AlertRecord, AlertStatus, AllowlistRuleRecord, FlightRecorderSnapshot,
+    IPC_PIPE_NAME, IpcRequest, IpcResponse, PipelineMetrics, RuleScope, read_ipc_frame,
+    write_ipc_frame,
 };
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read, Write};
@@ -112,6 +113,35 @@ impl IpcClient {
     pub fn get_pipeline_metrics(&self) -> Result<PipelineMetrics, String> {
         parse_metrics_response(self.send_request(&IpcRequest::GetPipelineMetrics)?)
     }
+
+    /// Fetches persisted alerts from `ledr-daemon`, optionally filtered by [`AlertStatus`].
+    pub fn get_alerts(
+        &self,
+        status: Option<AlertStatus>,
+        limit: usize,
+    ) -> Result<Vec<AlertRecord>, String> {
+        let req = IpcRequest::GetAlerts { status, limit };
+        parse_alerts_response(self.send_request(&req)?)
+    }
+
+    /// Resolves an alert with the given [`AlertDecision`] (`L-07`).
+    pub fn resolve_alert(
+        &self,
+        alert_id: String,
+        decision: AlertDecision,
+    ) -> Result<String, String> {
+        let req = IpcRequest::ResolveAlert { alert_id, decision };
+        parse_ack_response(self.send_request(&req)?)
+    }
+
+    /// Lists allowlist/blocklist policy rules from `ledr-daemon`, optionally filtered by [`RuleScope`].
+    pub fn list_rules(
+        &self,
+        scope: Option<RuleScope>,
+    ) -> Result<Vec<AllowlistRuleRecord>, String> {
+        let req = IpcRequest::ListRules { scope };
+        parse_rules_response(self.send_request(&req)?)
+    }
 }
 
 pub(crate) fn parse_ping_response(response: IpcResponse) -> Result<String, String> {
@@ -139,6 +169,29 @@ pub(crate) fn parse_metrics_response(response: IpcResponse) -> Result<PipelineMe
     match response {
         IpcResponse::Metrics(metrics) => Ok(metrics),
         other => Err(unexpected_or_daemon_error(other, "Metrics")),
+    }
+}
+
+pub(crate) fn parse_alerts_response(response: IpcResponse) -> Result<Vec<AlertRecord>, String> {
+    match response {
+        IpcResponse::Alerts(alerts) => Ok(alerts),
+        other => Err(unexpected_or_daemon_error(other, "Alerts")),
+    }
+}
+
+pub(crate) fn parse_ack_response(response: IpcResponse) -> Result<String, String> {
+    match response {
+        IpcResponse::Ack { message } => Ok(message),
+        other => Err(unexpected_or_daemon_error(other, "Ack")),
+    }
+}
+
+pub(crate) fn parse_rules_response(
+    response: IpcResponse,
+) -> Result<Vec<AllowlistRuleRecord>, String> {
+    match response {
+        IpcResponse::Rules(rules) => Ok(rules),
+        other => Err(unexpected_or_daemon_error(other, "Rules")),
     }
 }
 

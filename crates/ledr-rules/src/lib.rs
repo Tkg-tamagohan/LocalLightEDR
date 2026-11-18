@@ -1,6 +1,7 @@
 //! Layer 2 early pruning, Sigma subset rule engine, Authenticode verification,
 //! and newly-registered domain (NRD) / homograph detection crate.
 
+pub mod allowlist;
 pub mod domain;
 pub mod pruner;
 pub mod sigma;
@@ -12,6 +13,10 @@ use ledr_proto::{AllowlistRuleRecord, SensorEvent};
 use sha2::Digest as _;
 use thiserror::Error;
 
+pub use allowlist::{
+    compute_file_sha256_hex, inspect_authenticode, is_allowed_by_rules, matches_path_pattern,
+    signer_subject_matches, BinaryIdentity,
+};
 pub use domain::{assess_domain_risk, DomainRiskAssessment};
 pub use pruner::{AllowlistConfig, EarlyPruner, EarlyPrunerConfig};
 pub use sigma::{
@@ -107,6 +112,33 @@ mod tests {
     use super::*;
     use ledr_proto::{AlertSeverity, CanaryCategory, ProcessIdentity, ScriptSource};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TEST_DIR_SEQ: AtomicU32 = AtomicU32::new(1);
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(prefix: &str) -> Self {
+            let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{seq}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create test temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn rules_01_aho_corasick_prefilter_and_lotl_conjunction() {
@@ -375,6 +407,311 @@ mod tests {
         assert!(!pruner.should_prune_with_image(
             &EventContext::new(&script),
             Some(r"C:\Windows\System32\svchost.exe"),
+        ));
+    }
+
+    #[test]
+    fn rules_p2_01_streaming_sha256_and_path_pattern_normalization() {
+        let tmp_dir = TestTempDir::new("ledr-rules-p2-01");
+        let file_path = tmp_dir.path().join("payload.bin");
+        // > 64 KiB to exercise multi-chunk streaming read.
+        let payload = vec![0xA5u8; 200_000];
+        std::fs::write(&file_path, &payload).expect("write payload");
+
+        let streamed = compute_file_sha256_hex(&file_path).expect("compute streaming sha256");
+        let expected = sha256_hex(&payload);
+        assert_eq!(streamed.len(), 64);
+        assert!(streamed.chars().all(|c| !c.is_ascii_uppercase()));
+        assert_eq!(streamed, expected);
+
+        let missing = tmp_dir.path().join("missing.exe");
+        assert!(compute_file_sha256_hex(&missing).is_err());
+
+        // Wildcard `*`, slash normalization (`/` vs `\`), and ASCII case-insensitivity.
+        assert!(matches_path_pattern(
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.2\MsMpEng.exe",
+            r"c:/programdata/microsoft/windows defender/platform/*/msmpeng.exe"
+        ));
+        assert!(matches_path_pattern(
+            r"C:\Users\Alice\AppData\Local\Google\Chrome\User Data\Default\Cookies",
+            r"*\Google\Chrome\User Data\*\Cookies"
+        ));
+        assert!(!matches_path_pattern(
+            r"C:\Tools\evil.exe",
+            r"C:\Windows\System32\*.exe"
+        ));
+        assert!(!matches_path_pattern(r"C:\Tools\evil.exe", ""));
+    }
+
+    #[test]
+    fn rules_p2_02_authenticode_verification_signed_unsigned_and_missing() {
+        let tmp_dir = TestTempDir::new("ledr-rules-p2-02");
+
+        // Missing file returns None without panicking.
+        assert_eq!(
+            inspect_authenticode(&tmp_dir.path().join("does_not_exist.exe")),
+            None
+        );
+
+        // Unsigned file returns None without panicking.
+        let unsigned_path = tmp_dir.path().join("unsigned.exe");
+        std::fs::write(&unsigned_path, b"MZ-not-signed-pe-content").expect("write unsigned");
+        assert_eq!(inspect_authenticode(&unsigned_path), None);
+
+        // Real Windows OS binary (`SearchIndexer.exe` or `svchost.exe` or `explorer.exe`).
+        let search_indexer = Path::new(r"C:\Windows\System32\SearchIndexer.exe");
+        if search_indexer.is_file() {
+            let auth = inspect_authenticode(search_indexer)
+                .expect("SearchIndexer.exe should verify via Authenticode/catalog");
+            assert!(
+                signer_subject_matches(&auth.signer_subject, "CN=Microsoft Windows"),
+                "unexpected signer_subject: {}",
+                auth.signer_subject
+            );
+            assert_eq!(auth.root_thumbprint.len(), 40);
+            assert!(auth
+                .root_thumbprint
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+
+            // Also confirm it matches `ALLOW-OS-SEARCH-INDEXER` from `default_allowlist.json`.
+            let allowlist_json = include_str!("../../../rules/default_allowlist.json");
+            let cfg = AllowlistConfig::from_json_str(allowlist_json).expect("parse default allowlist");
+            let identity = BinaryIdentity::from_path(search_indexer);
+            assert!(is_allowed_by_rules(
+                &identity,
+                Some(r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx"),
+                ledr_proto::RuleScope::FileCanaryAllow,
+                &cfg.allowlist_rules
+            ));
+        }
+
+        // Also test an embedded-signed Windows binary if present (`git.exe`).
+        let git_exe = Path::new(r"C:\Program Files\Git\cmd\git.exe");
+        if git_exe.is_file() {
+            let auth = inspect_authenticode(git_exe)
+                .expect("git.exe should verify via embedded Authenticode");
+            assert!(!auth.signer_subject.is_empty());
+            assert_eq!(auth.root_thumbprint.len(), 40);
+        }
+
+        // Also test a catalog-signed Windows binary (`explorer.exe`).
+        let explorer = Path::new(r"C:\Windows\explorer.exe");
+        if explorer.is_file() {
+            let auth = inspect_authenticode(explorer)
+                .expect("explorer.exe should verify via Authenticode");
+            assert!(!auth.signer_subject.is_empty());
+            assert_eq!(auth.root_thumbprint.len(), 40);
+        }
+    }
+
+    #[test]
+    fn rules_p2_03_signed_tier_allowlist_rules_and_target_constraints() {
+        use ledr_proto::{AuthenticodeInfo, RuleScope};
+
+        let signed_identity = BinaryIdentity {
+            exe_path: r"C:\Program Files\Example\BackupAgent.exe".to_string(),
+            sha256: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            authenticode: Some(AuthenticodeInfo {
+                signer_subject: "CN=Example Vendor, O=Example Corp, C=US".to_string(),
+                root_thumbprint: "3B1EFD3A66EA28B16697394703A72CA340A05BD5".to_string(),
+            }),
+        };
+
+        let rule_exact_dn = AllowlistRuleRecord {
+            rule_id: "SIGNED-EXACT".to_string(),
+            scope: RuleScope::FileCanaryAllow,
+            exe_path_pattern: r"C:\Program Files\Example\*.exe".to_string(),
+            sha256: None,
+            signer_subject: Some("cn=example vendor, o=example corp, c=us".to_string()),
+            root_thumbprint: Some("3b1efd3a66ea28b16697394703a72ca340a05bd5".to_string()),
+            allowed_target: Some(r"C:\Users\*\.ssh\*".to_string()),
+            created_at_ms: 1,
+            created_by: "test".to_string(),
+        };
+
+        assert!(is_allowed_by_rules(
+            &signed_identity,
+            Some(r"c:/users/alice/.ssh/id_rsa"),
+            RuleScope::FileCanaryAllow,
+            std::slice::from_ref(&rule_exact_dn)
+        ));
+        // Wrong target rejected.
+        assert!(!is_allowed_by_rules(
+            &signed_identity,
+            Some(r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies"),
+            RuleScope::FileCanaryAllow,
+            std::slice::from_ref(&rule_exact_dn)
+        ));
+        // Missing target rejected when allowed_target is set.
+        assert!(!is_allowed_by_rules(
+            &signed_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            std::slice::from_ref(&rule_exact_dn)
+        ));
+        // Wrong scope rejected.
+        assert!(!is_allowed_by_rules(
+            &signed_identity,
+            Some(r"C:\Users\alice\.ssh\id_rsa"),
+            RuleScope::ProcessAllow,
+            std::slice::from_ref(&rule_exact_dn)
+        ));
+
+        // CN-only rule matches full DN; mismatched root thumbprint is rejected.
+        let cn_only_rule = AllowlistRuleRecord {
+            signer_subject: Some("CN=Example Vendor".to_string()),
+            allowed_target: None,
+            ..rule_exact_dn.clone()
+        };
+        assert!(is_allowed_by_rules(
+            &signed_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            &[cn_only_rule]
+        ));
+
+        let wrong_root_rule = AllowlistRuleRecord {
+            root_thumbprint: Some("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF".to_string()),
+            allowed_target: None,
+            ..rule_exact_dn.clone()
+        };
+        assert!(!is_allowed_by_rules(
+            &signed_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            &[wrong_root_rule]
+        ));
+
+        // All-zero root thumbprint permits match without thumbprint pinning.
+        let zero_root_rule = AllowlistRuleRecord {
+            root_thumbprint: Some("0000000000000000000000000000000000000000".to_string()),
+            allowed_target: None,
+            ..rule_exact_dn.clone()
+        };
+        assert!(is_allowed_by_rules(
+            &signed_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            &[zero_root_rule]
+        ));
+
+        // Optional sha256 on signed rule enforces hash match too.
+        let signed_with_bad_hash = AllowlistRuleRecord {
+            sha256: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+            allowed_target: None,
+            ..rule_exact_dn.clone()
+        };
+        assert!(!is_allowed_by_rules(
+            &signed_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            &[signed_with_bad_hash]
+        ));
+
+        // Unsigned binary must NEVER satisfy a signed rule.
+        let unsigned_same_path = BinaryIdentity {
+            authenticode: None,
+            ..signed_identity
+        };
+        assert!(!is_allowed_by_rules(
+            &unsigned_same_path,
+            Some(r"C:\Users\alice\.ssh\id_rsa"),
+            RuleScope::FileCanaryAllow,
+            &[rule_exact_dn]
+        ));
+    }
+
+    #[test]
+    fn rules_p2_04_unsigned_tier_requires_non_empty_sha256() {
+        use ledr_proto::RuleScope;
+
+        let valid_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let unsigned_identity = BinaryIdentity {
+            exe_path: r"C:\Tools\local_sync.exe".to_string(),
+            sha256: Some(valid_hash.to_string()),
+            authenticode: None,
+        };
+
+        // Unsigned rule WITHOUT sha256 must NEVER allow anything (L-04).
+        let no_hash_rule = AllowlistRuleRecord {
+            rule_id: "UNSIGNED-NO-HASH".to_string(),
+            scope: RuleScope::FileCanaryAllow,
+            exe_path_pattern: r"C:\Tools\*".to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 1,
+            created_by: "test".to_string(),
+        };
+        assert!(!is_allowed_by_rules(
+            &unsigned_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            &[no_hash_rule]
+        ));
+
+        // Unsigned rule with empty sha256 must NEVER allow anything.
+        let empty_hash_rule = AllowlistRuleRecord {
+            rule_id: "UNSIGNED-EMPTY-HASH".to_string(),
+            scope: RuleScope::FileCanaryAllow,
+            exe_path_pattern: r"C:\Tools\*".to_string(),
+            sha256: Some("   ".to_string()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 1,
+            created_by: "test".to_string(),
+        };
+        assert!(!is_allowed_by_rules(
+            &unsigned_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            &[empty_hash_rule]
+        ));
+
+        // Unsigned rule with matching path and matching SHA-256 allows access.
+        let valid_unsigned_rule = AllowlistRuleRecord {
+            rule_id: "UNSIGNED-VALID".to_string(),
+            scope: RuleScope::FileCanaryAllow,
+            exe_path_pattern: r"c:/tools/local_sync.exe".to_string(),
+            sha256: Some(valid_hash.to_ascii_uppercase()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some(r"E:\dev\proj\.env*".to_string()),
+            created_at_ms: 2,
+            created_by: "test".to_string(),
+        };
+        assert!(is_allowed_by_rules(
+            &unsigned_identity,
+            Some(r"E:\dev\proj\.env.local"),
+            RuleScope::FileCanaryAllow,
+            std::slice::from_ref(&valid_unsigned_rule)
+        ));
+
+        // Tampered binary (hash mismatch) rejected.
+        let tampered_identity = BinaryIdentity {
+            sha256: Some("deadbeef".repeat(8)),
+            ..unsigned_identity.clone()
+        };
+        assert!(!is_allowed_by_rules(
+            &tampered_identity,
+            Some(r"E:\dev\proj\.env.local"),
+            RuleScope::FileCanaryAllow,
+            std::slice::from_ref(&valid_unsigned_rule)
+        ));
+
+        // Missing binary hash (unreadable file) rejected.
+        let missing_hash_identity = BinaryIdentity {
+            sha256: None,
+            ..unsigned_identity
+        };
+        assert!(!is_allowed_by_rules(
+            &missing_hash_identity,
+            Some(r"E:\dev\proj\.env.local"),
+            RuleScope::FileCanaryAllow,
+            &[valid_unsigned_rule]
         ));
     }
 }

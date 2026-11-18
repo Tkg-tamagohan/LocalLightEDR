@@ -202,18 +202,65 @@ fn query_handle_command_line(handle: windows::Win32::Foundation::HANDLE) -> Opti
 }
 
 /// Decodes TDH `TRACE_EVENT_INFO` metadata for an incoming ETW `EVENT_RECORD`.
+///
+/// Uses an inline 2 KiB stack buffer for typical manifests to avoid heap allocation
+/// during hot ETW callbacks (`AUTO-08`).
 pub(crate) struct TdhEventInfo<'a> {
     record: &'a EVENT_RECORD,
-    buf: Vec<u64>,
+    stack: [u64; 256],
+    stack_byte_len: usize,
+    heap: Vec<u64>,
 }
 
 impl<'a> TdhEventInfo<'a> {
+    #[inline]
+    fn as_u64_slice(&self) -> &[u64] {
+        if self.heap.is_empty() {
+            &self.stack[..self.stack_byte_len.div_ceil(8).min(self.stack.len())]
+        } else {
+            self.heap.as_slice()
+        }
+    }
+
+    #[inline]
+    fn tei_bytes(&self) -> &[u8] {
+        let slice = self.as_u64_slice();
+        let byte_len = if self.heap.is_empty() {
+            self.stack_byte_len.min(slice.len() * 8)
+        } else {
+            self.heap.len() * 8
+        };
+        // SAFETY: `slice` is a contiguous initialized `[u64]` slice and `byte_len <= slice.len() * 8`.
+        unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), byte_len) }
+    }
+
     /// Queries TDH metadata for `record`. Returns `None` if schema decoding is unavailable.
     pub(crate) fn from_record(record: &'a EVENT_RECORD) -> Option<Self> {
-        let mut buf_size: u32 = 0;
-        // SAFETY: `record` is a valid ETW `EVENT_RECORD` reference for the callback duration.
-        let status = unsafe { TdhGetEventInformation(record, None, None, &mut buf_size) };
-        if status != ERROR_INSUFFICIENT_BUFFER.0 && status != 0 {
+        let mut stack = [0u64; 256];
+        let mut buf_size: u32 = (stack.len() * 8) as u32;
+        // SAFETY: `record` is valid for the callback duration and `stack` is 8-byte aligned.
+        let status = unsafe {
+            TdhGetEventInformation(
+                record,
+                None,
+                Some(stack.as_mut_ptr().cast::<TRACE_EVENT_INFO>()),
+                &mut buf_size,
+            )
+        };
+        if status == 0 {
+            if buf_size < std::mem::size_of::<TRACE_EVENT_INFO>() as u32
+                || (buf_size as usize) > stack.len() * 8
+            {
+                return None;
+            }
+            return Some(Self {
+                record,
+                stack,
+                stack_byte_len: buf_size as usize,
+                heap: Vec::new(),
+            });
+        }
+        if status != ERROR_INSUFFICIENT_BUFFER.0 {
             return None;
         }
         if buf_size < std::mem::size_of::<TRACE_EVENT_INFO>() as u32 || buf_size > MAX_TEI_BYTES {
@@ -234,7 +281,12 @@ impl<'a> TdhEventInfo<'a> {
             return None;
         }
 
-        Some(Self { record, buf })
+        Some(Self {
+            record,
+            stack: [0u64; 256],
+            stack_byte_len: 0,
+            heap: buf,
+        })
     }
 
     /// Reads an unsigned 32-bit property matching `target_name` (case-insensitive).
@@ -315,6 +367,187 @@ impl<'a> TdhEventInfo<'a> {
         Some(decode_tdh_string(&bytes, meta.in_type))
     }
 
+    /// Inspects raw UTF-16 code units of the first matching string property in `candidate_names`
+    /// using a stack buffer so non-matching paths incur zero heap allocations (`AUTO-08`).
+    pub(crate) fn inspect_first_utf16_property<F, R>(
+        &self,
+        candidate_names: &[&str],
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&[u16]) -> Option<R>,
+    {
+        for &name in candidate_names {
+            if let Some(meta) = self.find_property(name) {
+                return self.inspect_meta_utf16(&meta, f);
+            }
+        }
+        None
+    }
+
+    /// Inspects two string properties (`first_name`, `second_name`, e.g., `BaseName` + `RelativeName`
+    /// in `Kernel-Registry` `CreateKey`) joined by `\` in a stack UTF-16 buffer without heap
+    /// allocation for paths up to 512 code units.
+    pub(crate) fn inspect_joined_utf16_properties<F, R>(
+        &self,
+        first_name: &str,
+        second_name: &str,
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&[u16]) -> Option<R>,
+    {
+        let mut stack = [0u16; 512];
+        let mut len = 0usize;
+        let mut overflow = false;
+
+        if let Some(meta1) = self.find_property(first_name) {
+            match self.read_meta_utf16_into(&meta1, &mut stack) {
+                Some(Some(n1)) => len = n1,
+                Some(None) => overflow = true,
+                None => {}
+            }
+        }
+
+        if !overflow {
+            if let Some(meta2) = self.find_property(second_name) {
+                let need_sep = len > 0 && stack[len - 1] != b'\\' as u16;
+                let start = if need_sep {
+                    if len < stack.len() {
+                        stack[len] = b'\\' as u16;
+                        len + 1
+                    } else {
+                        overflow = true;
+                        len
+                    }
+                } else {
+                    len
+                };
+                if !overflow {
+                    match self.read_meta_utf16_into(&meta2, &mut stack[start..]) {
+                        Some(Some(n2)) => {
+                            if n2 == 0 && need_sep {
+                                len = start - 1;
+                            } else if need_sep && n2 > 0 && stack[start] == b'\\' as u16 {
+                                stack.copy_within(start + 1..start + n2, start);
+                                len = start + n2 - 1;
+                            } else {
+                                len = start + n2;
+                            }
+                        }
+                        Some(None) => overflow = true,
+                        None => {
+                            if need_sep {
+                                len = start - 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !overflow {
+            return if len == 0 { None } else { f(&stack[..len]) };
+        }
+
+        let part1 = self.get_string(first_name).unwrap_or_default();
+        let part2 = self.get_string(second_name).unwrap_or_default();
+        let joined = match (part1.is_empty(), part2.is_empty()) {
+            (true, true) => return None,
+            (false, true) => part1,
+            (true, false) => part2,
+            (false, false) => {
+                if part1.ends_with('\\') || part2.starts_with('\\') {
+                    format!("{part1}{part2}")
+                } else {
+                    format!("{part1}\\{part2}")
+                }
+            }
+        };
+        let heap: Vec<u16> = joined.encode_utf16().collect();
+        f(&heap)
+    }
+
+    fn inspect_meta_utf16<F, R>(&self, meta: &PropMeta, f: F) -> Option<R>
+    where
+        F: FnOnce(&[u16]) -> Option<R>,
+    {
+        let mut stack_u16 = [0u16; 512];
+        match self.read_meta_utf16_into(meta, &mut stack_u16) {
+            Some(Some(len)) => f(&stack_u16[..len]),
+            Some(None) => {
+                let bytes = self.read_property_vec(meta)?;
+                inspect_raw_utf16_bytes(&bytes, meta.in_type, f)
+            }
+            None => None,
+        }
+    }
+
+    fn read_meta_utf16_into(&self, meta: &PropMeta, out: &mut [u16]) -> Option<Option<usize>> {
+        let desc = PROPERTY_DATA_DESCRIPTOR {
+            PropertyName: meta.as_ptr() as u64,
+            ArrayIndex: u32::MAX,
+            Reserved: 0,
+        };
+        let mut size: u32 = 0;
+        // SAFETY: `self.record` and `desc.PropertyName` are valid NUL-terminated UTF-16 pointers.
+        let status = unsafe { TdhGetPropertySize(self.record, None, &[desc], &mut size) };
+        if status != 0 || size == 0 || size > MAX_PROP_BYTES {
+            return None;
+        }
+        let size_usize = size as usize;
+
+        if is_ansi_in_type(meta.in_type) {
+            if size_usize > out.len() {
+                return Some(None);
+            }
+            let mut ansi_buf = [0u8; 512];
+            if size_usize > ansi_buf.len() {
+                return Some(None);
+            }
+            let target = &mut ansi_buf[..size_usize];
+            // SAFETY: `target` has exact `size` bytes as reported by `TdhGetPropertySize`.
+            let status = unsafe { TdhGetProperty(self.record, None, &[desc], target) };
+            if status != 0 {
+                return None;
+            }
+            let mut len = 0usize;
+            for &b in target.iter() {
+                if b == 0 {
+                    break;
+                }
+                if b.is_ascii() {
+                    out[len] = b as u16;
+                    len += 1;
+                } else {
+                    return Some(None);
+                }
+            }
+            return Some(Some(len));
+        }
+
+        if size_usize > out.len() * 2 {
+            return Some(None);
+        }
+
+        // SAFETY: `out` has capacity `out.len() * 2 >= size_usize` bytes and `u8` has alignment 1.
+        let byte_view = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), size_usize)
+        };
+        // SAFETY: `byte_view` has exact `size` bytes as reported by `TdhGetPropertySize`.
+        let status = unsafe { TdhGetProperty(self.record, None, &[desc], byte_view) };
+        if status != 0 {
+            return None;
+        }
+
+        let unit_count = size_usize / 2;
+        let len = out[..unit_count]
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(unit_count);
+        Some(Some(len))
+    }
+
     /// Reads a Windows SID (`UserSID`) property into `S-1-...` notation when present.
     pub(crate) fn get_sid_string(&self, target_name: &str) -> Option<String> {
         let meta = self.find_property(target_name)?;
@@ -323,18 +556,15 @@ impl<'a> TdhEventInfo<'a> {
         decode_sid_bytes(&bytes, meta.in_type, is_32bit)
     }
 
-    fn tei_bytes(&self) -> &[u8] {
-        // SAFETY: `self.buf` is a contiguous initialized `Vec<u64>`.
-        unsafe { std::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.buf.len() * 8) }
-    }
-
     fn find_property(&self, target_name: &str) -> Option<PropMeta> {
         let raw_bytes = self.tei_bytes();
-        // SAFETY: `self.buf` is 8-byte aligned and validated to hold `TRACE_EVENT_INFO`.
-        let tei = unsafe { &*(self.buf.as_ptr().cast::<TRACE_EVENT_INFO>()) };
+        let u64_slice = self.as_u64_slice();
+        // SAFETY: `u64_slice` is 8-byte aligned and validated to hold `TRACE_EVENT_INFO`.
+        let tei = unsafe { &*(u64_slice.as_ptr().cast::<TRACE_EVENT_INFO>()) };
         let prop_count = tei.TopLevelPropertyCount as usize;
         let array_offset = std::mem::offset_of!(TRACE_EVENT_INFO, EventPropertyInfoArray);
-        let needed = array_offset.checked_add(prop_count * std::mem::size_of::<EVENT_PROPERTY_INFO>())?;
+        let needed =
+            array_offset.checked_add(prop_count * std::mem::size_of::<EVENT_PROPERTY_INFO>())?;
         if needed > raw_bytes.len() {
             return None;
         }
@@ -352,12 +582,11 @@ impl<'a> TdhEventInfo<'a> {
             if name_off >= raw_bytes.len() {
                 continue;
             }
-            let (matched, name_nul_u16) = read_utf16_name_and_eq(&raw_bytes[name_off..], target_name);
-            if matched {
+            if let Some(name_buf) = read_utf16_name_if_eq(&raw_bytes[name_off..], target_name) {
                 // SAFETY: `PropertyStruct` was ruled out above, so `nonStructType` is active.
                 let non_struct = unsafe { prop.Anonymous1.nonStructType };
                 return Some(PropMeta {
-                    name_nul_u16,
+                    name_nul_u16: name_buf,
                     in_type: non_struct.InType,
                 });
             }
@@ -371,7 +600,7 @@ impl<'a> TdhEventInfo<'a> {
         stack: &'b mut [u8; 32],
     ) -> Option<&'b [u8]> {
         let desc = PROPERTY_DATA_DESCRIPTOR {
-            PropertyName: meta.name_nul_u16.as_ptr() as u64,
+            PropertyName: meta.as_ptr() as u64,
             ArrayIndex: u32::MAX,
             Reserved: 0,
         };
@@ -392,7 +621,7 @@ impl<'a> TdhEventInfo<'a> {
 
     fn read_property_vec(&self, meta: &PropMeta) -> Option<Vec<u8>> {
         let desc = PROPERTY_DATA_DESCRIPTOR {
-            PropertyName: meta.name_nul_u16.as_ptr() as u64,
+            PropertyName: meta.as_ptr() as u64,
             ArrayIndex: u32::MAX,
             Reserved: 0,
         };
@@ -412,12 +641,65 @@ impl<'a> TdhEventInfo<'a> {
     }
 }
 
+enum PropNameBuf {
+    Stack([u16; 64]),
+    Heap(Vec<u16>),
+}
+
 struct PropMeta {
-    name_nul_u16: Vec<u16>,
+    name_nul_u16: PropNameBuf,
     in_type: u16,
 }
 
-fn read_utf16_name_and_eq(bytes: &[u8], expected_ascii: &str) -> (bool, Vec<u16>) {
+impl PropMeta {
+    #[inline]
+    fn as_ptr(&self) -> *const u16 {
+        match &self.name_nul_u16 {
+            PropNameBuf::Stack(buf) => buf.as_ptr(),
+            PropNameBuf::Heap(vec) => vec.as_ptr(),
+        }
+    }
+}
+
+fn read_utf16_name_if_eq(bytes: &[u8], expected_ascii: &str) -> Option<PropNameBuf> {
+    if expected_ascii.len() >= 64 {
+        let (matched, vec) = read_utf16_name_and_eq_heap(bytes, expected_ascii);
+        return if matched {
+            Some(PropNameBuf::Heap(vec))
+        } else {
+            None
+        };
+    }
+
+    let mut stack = [0u16; 64];
+    let mut expected_iter = expected_ascii.bytes();
+
+    for (len, &chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let ch = u16::from_le_bytes(chunk);
+        if ch == 0 {
+            if expected_iter.next().is_some() {
+                return None;
+            }
+            if len >= stack.len() {
+                return None;
+            }
+            stack[len] = 0;
+            return Some(PropNameBuf::Stack(stack));
+        }
+        match expected_iter.next() {
+            Some(exp) if ch <= 0x7F && (ch as u8).eq_ignore_ascii_case(&exp) => {}
+            _ => return None,
+        }
+        if len + 1 >= stack.len() {
+            return None;
+        }
+        stack[len] = ch;
+    }
+
+    None
+}
+
+fn read_utf16_name_and_eq_heap(bytes: &[u8], expected_ascii: &str) -> (bool, Vec<u16>) {
     let mut name_u16 = Vec::new();
     let mut expected_iter = expected_ascii.bytes();
     let mut matches = true;
@@ -446,11 +728,82 @@ fn read_utf16_name_and_eq(bytes: &[u8], expected_ascii: &str) -> (bool, Vec<u16>
     (false, Vec::new())
 }
 
-pub(crate) fn decode_tdh_string(bytes: &[u8], in_type: u16) -> String {
-    if in_type == TDH_INTYPE_ANSISTRING.0 as u16
+#[inline]
+const fn is_ansi_in_type(in_type: u16) -> bool {
+    in_type == TDH_INTYPE_ANSISTRING.0 as u16
         || in_type == TDH_INTYPE_COUNTEDANSISTRING.0 as u16
         || in_type == TDH_INTYPE_MANIFEST_COUNTEDANSISTRING.0 as u16
-    {
+}
+
+/// Inspects raw string property bytes (`UnicodeString` UTF-16LE or `AnsiString`) via a stack
+/// UTF-16 buffer for paths up to 512 code units, avoiding heap allocation on non-matching I/O.
+pub(crate) fn inspect_raw_utf16_bytes<F, R>(bytes: &[u8], in_type: u16, f: F) -> Option<R>
+where
+    F: FnOnce(&[u16]) -> Option<R>,
+{
+    if is_ansi_in_type(in_type) {
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let trimmed = &bytes[..end];
+        if trimmed.len() <= 512 && trimmed.iter().all(|b| b.is_ascii()) {
+            let mut stack = [0u16; 512];
+            for (dst, &src) in stack.iter_mut().zip(trimmed.iter()) {
+                *dst = src as u16;
+            }
+            return f(&stack[..trimmed.len()]);
+        }
+        let text = String::from_utf8_lossy(trimmed);
+        let heap: Vec<u16> = text.encode_utf16().collect();
+        return f(&heap);
+    }
+
+    if bytes.len() < 2 {
+        return None;
+    }
+
+    if bytes.len() <= 1024 {
+        let mut stack = [0u16; 512];
+        let mut len = 0usize;
+        for &chunk in bytes.as_chunks::<2>().0.iter() {
+            let ch = u16::from_le_bytes(chunk);
+            if ch == 0 {
+                break;
+            }
+            stack[len] = ch;
+            len += 1;
+        }
+        return f(&stack[..len]);
+    }
+
+    let mut heap = Vec::with_capacity(bytes.len() / 2);
+    for &chunk in bytes.as_chunks::<2>().0.iter() {
+        let ch = u16::from_le_bytes(chunk);
+        if ch == 0 {
+            break;
+        }
+        heap.push(ch);
+    }
+    f(&heap)
+}
+
+/// Inspects raw ETW string property bytes without prematurely allocating a `String` on
+/// non-protected paths, returning `(CanaryCategory, normalized_target_path)` only on a match.
+#[cfg(test)]
+pub(crate) fn inspect_and_classify_canary_bytes(
+    bytes: &[u8],
+    in_type: u16,
+    matcher: &crate::etw::file_canary::CanaryMatcher,
+    volume_map: &DosVolumeMap,
+    is_write_or_delete: bool,
+) -> Option<(ledr_proto::CanaryCategory, String)> {
+    inspect_raw_utf16_bytes(bytes, in_type, |u16_slice| {
+        let category = matcher.classify_u16(u16_slice, volume_map, is_write_or_delete)?;
+        let normalized = volume_map.normalize_u16(u16_slice);
+        Some((category, normalized))
+    })
+}
+
+pub(crate) fn decode_tdh_string(bytes: &[u8], in_type: u16) -> String {
+    if is_ansi_in_type(in_type) {
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         return String::from_utf8_lossy(&bytes[..end]).into_owned();
     }

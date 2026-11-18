@@ -4,9 +4,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ledr_daemon::{start_ipc_server, DaemonConfig, DaemonEngine};
-use ledr_proto::{SensorBackend, IPC_PIPE_NAME, PROGRAM_DATA_DIR};
+use ledr_daemon::{start_ipc_server, DaemonConfig, DaemonEngine, Session0ToastLauncher};
+use ledr_proto::{AUTHORIZED_UI_EXE_PATH, IPC_PIPE_NAME, PROGRAM_DATA_DIR, SensorBackend};
 use ledr_rules::{load_rules_and_pruner_from_dir, EarlyPruner, SigmaEngine};
+use ledr_sensor_win::defense::{HoneypotManager, WindowsDefenseController};
 use ledr_sensor_win::etw::{
     try_capture_running_processes, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
     DEFAULT_ETW_SESSION_NAME,
@@ -133,6 +134,21 @@ fn load_rules_or_default(
     Ok((SigmaEngine::default(), EarlyPruner::default(), Vec::new()))
 }
 
+fn resolve_ui_exe_path(foreground: bool) -> PathBuf {
+    if !foreground {
+        return PathBuf::from(AUTHORIZED_UI_EXE_PATH);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("ledr-ui.exe");
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from(AUTHORIZED_UI_EXE_PATH)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = parse_cli_args(std::env::args_os())?;
@@ -168,15 +184,40 @@ async fn main() -> anyhow::Result<()> {
     let config = DaemonConfig {
         pipe_name: cli.pipe_name.clone(),
         dev_mode_bypass_ui_auth: cli.foreground,
+        strict_pipe_dacl: !cli.foreground,
         ..DaemonConfig::default()
     };
-    let engine = DaemonEngine::start(store, sigma, pruner, config);
+    let ui_exe = resolve_ui_exe_path(cli.foreground);
+    let engine = DaemonEngine::start_with_controllers(
+        store,
+        sigma,
+        pruner,
+        config,
+        Arc::new(WindowsDefenseController::new()),
+        Arc::new(Session0ToastLauncher::new(ui_exe)),
+    );
+
+    let mut honeypot_mgr = HoneypotManager::new();
+    let honeypot_paths = match honeypot_mgr.deploy_honeypots() {
+        Ok(paths) => {
+            tracing::info!(honeypots = paths.len(), "deployed honeypot canary files");
+            paths
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed deploying one or more honeypot canary files; continuing with partial list"
+            );
+            honeypot_mgr.deployed_paths().to_vec()
+        }
+    };
 
     // Start ETW capture directly into TwoLaneSender BEFORE Toolhelp32 snapshot capture so
     // processes spawned or exiting during snapshot enumeration are not missed (BUG_0001, BUG_0006).
     let bridge_sender = engine.sender();
     let etw_sink: EventSinkFn = Arc::new(move |ev| bridge_sender.blocking_send(ev).is_ok());
     let mut etw_sensor = WindowsEtwSensor::with_sink(etw_sink, DEFAULT_ETW_SESSION_NAME);
+    etw_sensor.set_honeypot_paths(honeypot_paths);
     let active_backend: Box<dyn SensorBackend> = match etw_sensor.start() {
         Ok(()) => {
             tracing::info!("WindowsEtwSensor real-time ETW trace started");

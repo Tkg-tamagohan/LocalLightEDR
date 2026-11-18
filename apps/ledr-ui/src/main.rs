@@ -4,9 +4,18 @@ mod ipc;
 mod tree;
 
 use ipc::IpcClient;
-use ledr_proto::{FlightRecorderSnapshot, PipelineMetrics};
+use ledr_proto::{
+    AlertDecision, AlertRecord, AlertStatus, AllowlistRuleRecord, FlightRecorderSnapshot,
+    PipelineMetrics, RuleScope,
+};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
+
+/// Environment variable disabling OS WinRT toast emission during headless/CI tests.
+pub const DISABLE_OS_TOAST_ENV: &str = "LEDR_UI_DISABLE_OS_TOAST";
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Launch mode for the on-demand LocalEDR UI binary (`決定記録 L-08`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,13 +26,39 @@ pub enum LaunchMode {
     AlertFocus(String),
 }
 
-#[derive(Debug, Serialize)]
-struct NotifyStubEvent<'a> {
-    mode: &'static str,
-    alert_id: &'a str,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToastAlertSummary {
+    pub(crate) alert_id: String,
+    pub(crate) title: String,
+    pub(crate) target_path: Option<String>,
+    pub(crate) exe_path: Option<String>,
+    pub(crate) rule_id: Option<String>,
+    pub(crate) severity: Option<String>,
+    pub(crate) process_suspended: bool,
+    pub(crate) is_expired_suspended: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NotifyOneshotEvent {
+    mode: String,
+    alert_id: String,
     launch_uri: String,
-    ipc_pipe: &'a str,
+    ipc_pipe: String,
+    daemon_reachable: bool,
+    alert_found: bool,
+    title: String,
+    target_path: Option<String>,
+    process_suspended: bool,
+    toast_xml: String,
+    os_toast_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os_toast_error: Option<String>,
+    status: String,
+}
+
+struct OsToastOutcome {
     status: &'static str,
+    error: Option<String>,
 }
 
 fn parse_flag_value<I, S>(flag: &str, arg: &str, iter: &mut I) -> Result<Option<String>, String>
@@ -49,10 +84,43 @@ where
     Ok(None)
 }
 
+/// Parses a `ledr://alert/<id>` protocol URI (case-insensitive scheme/host, stripping
+/// query string, fragment, and trailing slashes) into an alert ID (`L-08`, `AUTO-14`).
+fn parse_ledr_alert_uri(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    let Some(scheme) = trimmed.get(..7) else {
+        return Ok(None);
+    };
+    if !scheme.eq_ignore_ascii_case("ledr://") {
+        return Ok(None);
+    }
+
+    let after_scheme = &trimmed[7..];
+    let without_query_frag = after_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+
+    let Some(host_prefix) = without_query_frag.get(..6) else {
+        return Err(format!("invalid ledr URI '{trimmed}': expected ledr://alert/<id>"));
+    };
+    if !host_prefix.eq_ignore_ascii_case("alert/") {
+        return Err(format!("unsupported ledr URI host in '{trimmed}'"));
+    }
+
+    let id = without_query_frag[6..].trim_end_matches('/');
+    if id.is_empty() || id.contains('/') {
+        return Err(format!("missing or invalid alert id in URI '{trimmed}'"));
+    }
+
+    Ok(Some(id.to_string()))
+}
+
 /// Parses CLI arguments into a [`LaunchMode`].
 ///
-/// Supports `--notify <alert_id>` (one-shot WinRT toast mode) and
-/// `--alert-id <id>` (direct alert triage focus mode).
+/// Supports `--notify <alert_id>` (one-shot WinRT toast mode),
+/// `--alert-id <id>` (direct alert triage focus mode), and
+/// `ledr://alert/<id>` / `--uri ledr://alert/<id>` protocol activation (`L-08`, `AUTO-14`).
 fn parse_launch_mode<I, S>(args: I) -> Result<LaunchMode, String>
 where
     I: IntoIterator<Item = S>,
@@ -65,6 +133,14 @@ where
             return Ok(LaunchMode::Notify(alert_id));
         }
         if let Some(alert_id) = parse_flag_value("--alert-id", s, &mut iter)? {
+            return Ok(LaunchMode::AlertFocus(alert_id));
+        }
+        if let Some(uri) = parse_flag_value("--uri", s, &mut iter)? {
+            let alert_id = parse_ledr_alert_uri(&uri)?
+                .ok_or_else(|| format!("invalid --uri value '{uri}': expected ledr://alert/<id>"))?;
+            return Ok(LaunchMode::AlertFocus(alert_id));
+        }
+        if let Some(alert_id) = parse_ledr_alert_uri(s)? {
             return Ok(LaunchMode::AlertFocus(alert_id));
         }
     }
@@ -96,6 +172,41 @@ async fn fetch_pipeline_metrics(
 }
 
 #[tauri::command]
+async fn fetch_alerts(
+    client: tauri::State<'_, IpcClient>,
+    status: Option<AlertStatus>,
+    limit: usize,
+) -> Result<Vec<AlertRecord>, String> {
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.get_alerts(status, limit))
+        .await
+        .map_err(|err| format!("IPC background task failed: {err}"))?
+}
+
+#[tauri::command]
+async fn resolve_alert_action(
+    client: tauri::State<'_, IpcClient>,
+    alert_id: String,
+    decision: AlertDecision,
+) -> Result<String, String> {
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.resolve_alert(alert_id, decision))
+        .await
+        .map_err(|err| format!("IPC background task failed: {err}"))?
+}
+
+#[tauri::command]
+async fn fetch_rules(
+    client: tauri::State<'_, IpcClient>,
+    scope: Option<RuleScope>,
+) -> Result<Vec<AllowlistRuleRecord>, String> {
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.list_rules(scope))
+        .await
+        .map_err(|err| format!("IPC background task failed: {err}"))?
+}
+
+#[tauri::command]
 async fn ping_daemon(client: tauri::State<'_, IpcClient>) -> Result<String, String> {
     let client = client.inner().clone();
     tauri::async_runtime::spawn_blocking(move || client.ping())
@@ -113,16 +224,295 @@ fn build_process_tree_view(snapshot: FlightRecorderSnapshot) -> Vec<tree::Proces
     tree::build_process_tree(&snapshot)
 }
 
-fn dispatch_notify_oneshot(alert_id: &str, ipc_pipe: &str) -> Result<(), String> {
-    let event = NotifyStubEvent {
-        mode: "notify_oneshot",
-        alert_id,
-        launch_uri: format!("ledr://alert/{alert_id}"),
-        ipc_pipe,
-        status: "dispatched_stub",
+pub(crate) fn xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let triple = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn non_empty_str_field(val: &serde_json::Value, key: &str) -> Option<String> {
+    val.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_context_paths(context_json: &str) -> (Option<String>, Option<String>) {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(context_json) else {
+        return (None, None);
     };
+
+    let target_path = non_empty_str_field(&val, "target_path")
+        .or_else(|| {
+            val.get("event")
+                .and_then(|e| e.get("CanaryFileAccess"))
+                .and_then(|c| non_empty_str_field(c, "target_path"))
+        })
+        .or_else(|| {
+            val.get("event")
+                .and_then(|e| e.get("DnsQuery"))
+                .and_then(|d| non_empty_str_field(d, "query_name"))
+        })
+        .or_else(|| non_empty_str_field(&val, "url"));
+
+    let exe_path = non_empty_str_field(&val, "exe_path")
+        .or_else(|| {
+            val.get("event")
+                .and_then(|e| e.get("ProcessStart"))
+                .and_then(|p| non_empty_str_field(p, "exe_path"))
+        })
+        .or_else(|| non_empty_str_field(&val, "process_exe_path"));
+
+    (target_path, exe_path)
+}
+
+fn summarize_alert_for_toast(alert_id: &str, alert: Option<&AlertRecord>) -> ToastAlertSummary {
+    match alert {
+        Some(rec) => {
+            let (target_path, exe_path) = extract_context_paths(&rec.context_json);
+            ToastAlertSummary {
+                alert_id: rec.alert_id.clone(),
+                title: rec.title.clone(),
+                target_path,
+                exe_path,
+                rule_id: Some(rec.rule_id.clone()),
+                severity: Some(rec.severity.as_db_str().to_string()),
+                process_suspended: rec.process_suspended,
+                is_expired_suspended: rec.status == AlertStatus::ExpiredSuspended,
+            }
+        }
+        None => ToastAlertSummary {
+            alert_id: alert_id.to_string(),
+            title: "LocalEDR Security Alert".to_string(),
+            target_path: None,
+            exe_path: None,
+            rule_id: None,
+            severity: None,
+            process_suspended: false,
+            is_expired_suspended: false,
+        },
+    }
+}
+
+/// Builds a WinRT `ToastGeneric` XML payload with `ledr://alert/{alert_id}` protocol activation (`L-08`).
+pub(crate) fn build_winrt_toast_xml(summary: &ToastAlertSummary) -> String {
+    let launch_uri = format!("ledr://alert/{}", summary.alert_id);
+    let escaped_uri = xml_escape(&launch_uri);
+
+    let suspended_badge = if summary.is_expired_suspended {
+        "[EXPIRED_SUSPENDED · FROZEN]"
+    } else if summary.process_suspended {
+        "[SUSPENDED]"
+    } else {
+        "[ALERT]"
+    };
+    let sev_prefix = summary
+        .severity
+        .as_deref()
+        .map(|s| format!("{s} "))
+        .unwrap_or_default();
+
+    let header = xml_escape(&format!(
+        "[LocalEDR] {suspended_badge} {sev_prefix}{}",
+        summary.title
+    ));
+    let target_line = match summary
+        .target_path
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(target) => xml_escape(&format!("Target: {target}")),
+        None => xml_escape(&format!("Alert ID: {}", summary.alert_id)),
+    };
+    let detail_line = match (
+        summary.exe_path.as_deref().filter(|s| !s.trim().is_empty()),
+        summary.rule_id.as_deref().filter(|s| !s.trim().is_empty()),
+    ) {
+        (Some(exe), Some(rule)) => xml_escape(&format!("Process: {exe} | Rule: {rule}")),
+        (Some(exe), None) => xml_escape(&format!("Process: {exe}")),
+        (None, Some(rule)) => xml_escape(&format!("Rule: {rule} | ID: {}", summary.alert_id)),
+        (None, None) => xml_escape(&format!("ID: {}", summary.alert_id)),
+    };
+
+    format!(
+        "<toast launch=\"{escaped_uri}\" activationType=\"protocol\" scenario=\"urgent\">\
+         <visual><binding template=\"ToastGeneric\">\
+         <text>{header}</text>\
+         <text>{target_line}</text>\
+         <text>{detail_line}</text>\
+         </binding></visual>\
+         <actions>\
+         <action content=\"Triage Alert\" activationType=\"protocol\" arguments=\"{escaped_uri}\" />\
+         </actions>\
+         </toast>"
+    )
+}
+
+pub(crate) fn is_os_toast_disabled_value(val: Option<&str>) -> bool {
+    val.map(str::trim).is_some_and(|trimmed| {
+        !trimmed.is_empty()
+            && !trimmed.eq_ignore_ascii_case("0")
+            && !trimmed.eq_ignore_ascii_case("false")
+            && !trimmed.eq_ignore_ascii_case("no")
+    })
+}
+
+fn is_os_toast_disabled() -> bool {
+    is_os_toast_disabled_value(std::env::var(DISABLE_OS_TOAST_ENV).ok().as_deref())
+}
+
+#[cfg(windows)]
+fn dispatch_os_toast_nonblocking(toast_xml: &str, disable_os_toast: bool) -> OsToastOutcome {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    if disable_os_toast {
+        return OsToastOutcome {
+            status: "disabled_by_env",
+            error: None,
+        };
+    }
+
+    let xml_b64 = base64_encode(toast_xml.as_bytes());
+    let ps_script = format!(
+        "$ErrorActionPreference = 'Stop';\n\
+         $xml = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{xml_b64}'));\n\
+         [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;\n\
+         [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;\n\
+         $doc = New-Object Windows.Data.Xml.Dom.XmlDocument;\n\
+         $doc.LoadXml($xml);\n\
+         $toast = [Windows.UI.Notifications.ToastNotification]::new($doc);\n\
+         $appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe';\n\
+         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast);"
+    );
+    let utf16_le: Vec<u8> = ps_script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let encoded_cmd = base64_encode(&utf16_le);
+
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        &encoded_cmd,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .creation_flags(CREATE_NO_WINDOW);
+
+    match cmd.spawn() {
+        Ok(_child) => OsToastOutcome {
+            status: "dispatched",
+            error: None,
+        },
+        Err(err) => OsToastOutcome {
+            status: "spawn_failed",
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn dispatch_os_toast_nonblocking(_toast_xml: &str, disable_os_toast: bool) -> OsToastOutcome {
+    if disable_os_toast {
+        OsToastOutcome {
+            status: "disabled_by_env",
+            error: None,
+        }
+    } else {
+        OsToastOutcome {
+            status: "unsupported_platform",
+            error: None,
+        }
+    }
+}
+
+pub(crate) fn build_notify_oneshot_event(
+    alert_id: &str,
+    ipc_pipe: &str,
+    alerts_result: Result<Vec<AlertRecord>, String>,
+    disable_os_toast: bool,
+) -> NotifyOneshotEvent {
+    let (daemon_reachable, matched_alert) = match alerts_result {
+        Ok(alerts) => (true, alerts.into_iter().find(|a| a.alert_id == alert_id)),
+        Err(_) => (false, None),
+    };
+    let alert_found = matched_alert.is_some();
+    let summary = summarize_alert_for_toast(alert_id, matched_alert.as_ref());
+    let toast_xml = build_winrt_toast_xml(&summary);
+    let outcome = dispatch_os_toast_nonblocking(&toast_xml, disable_os_toast);
+    let overall_status = match outcome.status {
+        "dispatched" => "dispatched",
+        "disabled_by_env" => "disabled_by_env",
+        _ => "toast_unavailable",
+    };
+
+    NotifyOneshotEvent {
+        mode: "notify_oneshot".to_string(),
+        alert_id: alert_id.to_string(),
+        launch_uri: format!("ledr://alert/{alert_id}"),
+        ipc_pipe: ipc_pipe.to_string(),
+        daemon_reachable,
+        alert_found,
+        title: summary.title,
+        target_path: summary.target_path,
+        process_suspended: summary.process_suspended,
+        toast_xml,
+        os_toast_status: outcome.status.to_string(),
+        os_toast_error: outcome.error,
+        status: overall_status.to_string(),
+    }
+}
+
+fn dispatch_notify_oneshot(alert_id: &str, ipc_client: &IpcClient) -> Result<(), String> {
+    let alerts_result = ipc_client.get_alerts(None, 50);
+    let event = build_notify_oneshot_event(
+        alert_id,
+        ipc_client.pipe_name(),
+        alerts_result,
+        is_os_toast_disabled(),
+    );
     let json = serde_json::to_string(&event)
-        .map_err(|err| format!("failed to serialize notify stub event: {err}"))?;
+        .map_err(|err| format!("failed to serialize notify oneshot event: {err}"))?;
     println!("{json}");
     Ok(())
 }
@@ -134,6 +524,9 @@ fn run_gui(launch_mode: LaunchMode, ipc_client: IpcClient) -> Result<(), String>
         .invoke_handler(tauri::generate_handler![
             fetch_flight_recorder,
             fetch_pipeline_metrics,
+            fetch_alerts,
+            resolve_alert_action,
+            fetch_rules,
             ping_daemon,
             get_launch_mode,
             build_process_tree_view,
@@ -167,7 +560,7 @@ fn main() {
     let ipc_client = IpcClient::default_endpoint();
 
     if let LaunchMode::Notify(ref alert_id) = mode {
-        if let Err(err) = dispatch_notify_oneshot(alert_id, ipc_client.pipe_name()) {
+        if let Err(err) = dispatch_notify_oneshot(alert_id, &ipc_client) {
             eprintln!("{err}");
             std::process::exit(1);
         }
@@ -184,11 +577,12 @@ fn main() {
 mod tests {
     use super::*;
     use ipc::{
-        parse_flight_recorder_response, parse_metrics_response, parse_ping_response,
+        parse_ack_response, parse_alerts_response, parse_flight_recorder_response,
+        parse_metrics_response, parse_ping_response, parse_rules_response,
     };
     use ledr_proto::{
-        CanaryCategory, DnsQueryRecord, FileCanaryEventRecord, IpcRequest, IpcResponse,
-        NetworkEventRecord, ProcessRecord, decode_ipc_frame, encode_ipc_frame,
+        AlertSeverity, CanaryCategory, DnsQueryRecord, FileCanaryEventRecord, IpcRequest,
+        IpcResponse, NetworkEventRecord, ProcessRecord, decode_ipc_frame, encode_ipc_frame,
     };
     use std::io::{self, Read, Write};
     use tree::build_process_tree;
@@ -528,5 +922,362 @@ mod tests {
             .ping()
             .expect_err("missing pipe should fail gracefully");
         assert!(offline_err.contains("offline") || offline_err.contains("failed"));
+    }
+
+    #[test]
+    fn ui_p2_01_parse_launch_mode_ledr_alert_uri() {
+        assert_eq!(
+            parse_launch_mode(["ledr-ui", "ledr://alert/alert-123"]),
+            Ok(LaunchMode::AlertFocus("alert-123".to_string()))
+        );
+        assert_eq!(
+            parse_launch_mode(["ledr-ui", "LEDR://alert/alert-456/"]),
+            Ok(LaunchMode::AlertFocus("alert-456".to_string()))
+        );
+        assert_eq!(
+            parse_launch_mode(["ledr-ui", "LeDr://Alert/Alert-Case-789/?source=toast#focus"]),
+            Ok(LaunchMode::AlertFocus("Alert-Case-789".to_string()))
+        );
+        assert_eq!(
+            parse_launch_mode(["ledr-ui", "--uri", "ledr://alert/uri-001"]),
+            Ok(LaunchMode::AlertFocus("uri-001".to_string()))
+        );
+        assert_eq!(
+            parse_launch_mode(["ledr-ui", "--uri=LEDR://alert/uri-002/#action"]),
+            Ok(LaunchMode::AlertFocus("uri-002".to_string()))
+        );
+
+        for invalid in [
+            vec!["ledr-ui", "ledr://alert/"],
+            vec!["ledr-ui", "ledr://alert/?q=1"],
+            vec!["ledr-ui", "ledr://unknown/123"],
+            vec!["ledr-ui", "ledr://alert/a/b"],
+            vec!["ledr-ui", "--uri"],
+            vec!["ledr-ui", "--uri="],
+            vec!["ledr-ui", "--uri", "https://example.invalid/alert/1"],
+        ] {
+            assert!(
+                parse_launch_mode(invalid.iter().copied()).is_err(),
+                "expected invalid URI rejection for {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_p2_02_winrt_toast_xml_escaping_and_launch_uri() {
+        let summary = ToastAlertSummary {
+            alert_id: "alert-&\"'<1>".to_string(),
+            title: "Canary <Access> & 'Exfil' \"Attempt\"".to_string(),
+            target_path: Some(r"C:\Users\A&B\<dev>\Cookies".to_string()),
+            exe_path: Some(r"C:\Temp\steal&run.exe".to_string()),
+            rule_id: Some("CANARY-COOKIE-01".to_string()),
+            severity: Some("CRITICAL".to_string()),
+            process_suspended: true,
+            is_expired_suspended: false,
+        };
+
+        let xml = build_winrt_toast_xml(&summary);
+        let expected_escaped_uri = "ledr://alert/alert-&amp;&quot;&apos;&lt;1&gt;";
+        assert!(xml.contains(&format!("launch=\"{expected_escaped_uri}\"")));
+        assert!(xml.contains("activationType=\"protocol\""));
+        assert!(xml.contains(&format!("arguments=\"{expected_escaped_uri}\"")));
+        assert!(xml.contains("[SUSPENDED]"));
+        assert!(xml.contains("CRITICAL Canary &lt;Access&gt; &amp; &apos;Exfil&apos; &quot;Attempt&quot;"));
+        assert!(xml.contains(r"Target: C:\Users\A&amp;B\&lt;dev&gt;\Cookies"));
+        assert!(xml.contains(r"Process: C:\Temp\steal&amp;run.exe | Rule: CANARY-COOKIE-01"));
+        assert!(xml.contains("<action content=\"Triage Alert\""));
+
+        // Verify EXPIRED_SUSPENDED badge wording and absence of unescaped raw special chars inside text nodes.
+        let expired_summary = ToastAlertSummary {
+            alert_id: "alert-exp-1".to_string(),
+            title: "Honeypot Modified".to_string(),
+            target_path: Some(r"C:\Users\user\Documents\!00_LocalEDR_Canary_DoNotEdit.docx".to_string()),
+            exe_path: None,
+            rule_id: Some("CANARY-HONEYPOT".to_string()),
+            severity: Some("CRITICAL".to_string()),
+            process_suspended: true,
+            is_expired_suspended: true,
+        };
+        let expired_xml = build_winrt_toast_xml(&expired_summary);
+        assert!(expired_xml.contains("[EXPIRED_SUSPENDED · FROZEN]"));
+        assert!(expired_xml.contains("launch=\"ledr://alert/alert-exp-1\""));
+
+        // RFC 4648 base64 sanity check for PowerShell -EncodedCommand encoding.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn ui_p2_03_ipc_get_alerts_and_list_rules_roundtrip() {
+        let sample_alerts = vec![
+            AlertRecord {
+                alert_id: "alert-pending-1".to_string(),
+                timestamp_ms: 1_700_000_010_000,
+                severity: AlertSeverity::High,
+                source_layer: "LAYER_1_CANARY".to_string(),
+                rule_id: "CANARY-COOKIE-DB".to_string(),
+                title: "Chrome Cookies Read".to_string(),
+                process_instance_id: Some("1001:133765432100000000".to_string()),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: r#"{"target_path":"C:\\Users\\dev\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cookies","category":"cookie_db"}"#.to_string(),
+                resolved_at_ms: None,
+            },
+            AlertRecord {
+                alert_id: "alert-expired-2".to_string(),
+                timestamp_ms: 1_700_000_000_000,
+                severity: AlertSeverity::Critical,
+                source_layer: "LAYER_1_CANARY".to_string(),
+                rule_id: "CANARY-HONEYPOT".to_string(),
+                title: "Honeypot Write Detected".to_string(),
+                process_instance_id: Some("2002:133765432100000000".to_string()),
+                process_suspended: true,
+                status: AlertStatus::ExpiredSuspended,
+                context_json: r#"{"target_path":"C:\\Users\\dev\\Documents\\!00_LocalEDR_Canary_DoNotEdit.docx","category":"honeypot","is_write_or_delete":true}"#.to_string(),
+                resolved_at_ms: None,
+            },
+        ];
+
+        let sample_rules = vec![AllowlistRuleRecord {
+            rule_id: "rule-allow-1".to_string(),
+            scope: RuleScope::FileCanaryAllow,
+            exe_path_pattern: r"C:\Program Files\DevTool\tool.exe".to_string(),
+            sha256: Some("deadbeef".repeat(8)),
+            signer_subject: Some("CN=DevTool Corp".to_string()),
+            root_thumbprint: Some("00112233445566778899AABBCCDDEEFF00112233".to_string()),
+            allowed_target: Some(r"C:\Users\*\Cookies".to_string()),
+            created_at_ms: 1_700_000_020_000,
+            created_by: "user".to_string(),
+        }];
+
+        let alerts_clone = sample_alerts.clone();
+        let rules_clone = sample_rules.clone();
+
+        let mut stream = MockIpcStream::new(move |req| match req {
+            IpcRequest::GetAlerts { status, limit } => {
+                assert_eq!(limit, 50);
+                let filtered = match status {
+                    Some(st) => alerts_clone
+                        .iter()
+                        .filter(|a| a.status == st)
+                        .cloned()
+                        .collect(),
+                    None => alerts_clone.clone(),
+                };
+                IpcResponse::Alerts(filtered)
+            }
+            IpcRequest::ListRules { scope } => {
+                let filtered = match scope {
+                    Some(sc) => rules_clone
+                        .iter()
+                        .filter(|r| r.scope == sc)
+                        .cloned()
+                        .collect(),
+                    None => rules_clone.clone(),
+                };
+                IpcResponse::Rules(filtered)
+            }
+            other => panic!("unexpected request: {other:?}"),
+        });
+
+        let all_alerts_resp = IpcClient::send_request_over_stream(
+            &mut stream,
+            &IpcRequest::GetAlerts {
+                status: None,
+                limit: 50,
+            },
+        )
+        .expect("get_alerts roundtrip");
+        assert_eq!(
+            parse_alerts_response(all_alerts_resp).expect("parse alerts"),
+            sample_alerts
+        );
+
+        let expired_resp = IpcClient::send_request_over_stream(
+            &mut stream,
+            &IpcRequest::GetAlerts {
+                status: Some(AlertStatus::ExpiredSuspended),
+                limit: 50,
+            },
+        )
+        .expect("filtered get_alerts roundtrip");
+        let expired_alerts = parse_alerts_response(expired_resp).expect("parse filtered alerts");
+        assert_eq!(expired_alerts.len(), 1);
+        assert_eq!(expired_alerts[0].alert_id, "alert-expired-2");
+
+        let rules_resp = IpcClient::send_request_over_stream(
+            &mut stream,
+            &IpcRequest::ListRules {
+                scope: Some(RuleScope::FileCanaryAllow),
+            },
+        )
+        .expect("list_rules roundtrip");
+        assert_eq!(
+            parse_rules_response(rules_resp).expect("parse rules"),
+            sample_rules
+        );
+
+        let err = parse_rules_response(IpcResponse::Error {
+            code: "STORE_ERROR".to_string(),
+            message: "db locked".to_string(),
+        })
+        .expect_err("error variant should return Err");
+        assert!(err.contains("STORE_ERROR"));
+    }
+
+    #[test]
+    fn ui_p2_04_ipc_resolve_alert_all_decisions_roundtrip() {
+        let decisions = vec![
+            (
+                "alert-1",
+                AlertDecision::TerminateAndBlock {
+                    add_block_rule: true,
+                },
+                "resolved TERMINATED_BLOCKED",
+            ),
+            ("alert-2", AlertDecision::AllowOnce, "resolved APPROVED_ONCE"),
+            (
+                "alert-3",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: Some(r"C:\Users\*\Cookies".to_string()),
+                },
+                "resolved APPROVED_RULE",
+            ),
+        ];
+
+        let mut stream = MockIpcStream::new(|req| match req {
+            IpcRequest::ResolveAlert { alert_id, decision } => {
+                if alert_id == "missing-alert" {
+                    IpcResponse::Error {
+                        code: "NOT_FOUND".to_string(),
+                        message: "alert not found".to_string(),
+                    }
+                } else {
+                    IpcResponse::Ack {
+                        message: format!(
+                            "resolved {} for {alert_id}",
+                            decision.resulting_status().as_db_str()
+                        ),
+                    }
+                }
+            }
+            other => panic!("unexpected request: {other:?}"),
+        });
+
+        for (alert_id, decision, expected_fragment) in decisions {
+            let resp = IpcClient::send_request_over_stream(
+                &mut stream,
+                &IpcRequest::ResolveAlert {
+                    alert_id: alert_id.to_string(),
+                    decision,
+                },
+            )
+            .expect("resolve_alert roundtrip");
+            let msg = parse_ack_response(resp).expect("parse ack");
+            assert!(msg.contains(expected_fragment), "got ack: {msg}");
+            assert!(msg.contains(alert_id));
+        }
+
+        let err_resp = IpcClient::send_request_over_stream(
+            &mut stream,
+            &IpcRequest::ResolveAlert {
+                alert_id: "missing-alert".to_string(),
+                decision: AlertDecision::AllowOnce,
+            },
+        )
+        .expect("missing alert roundtrip");
+        let err = parse_ack_response(err_resp).expect_err("not found returns Err");
+        assert!(err.contains("NOT_FOUND"));
+    }
+
+    #[test]
+    fn ui_p2_05_notify_oneshot_json_output() {
+        assert!(is_os_toast_disabled_value(Some("1")));
+        assert!(is_os_toast_disabled_value(Some("true")));
+        assert!(is_os_toast_disabled_value(Some("YES")));
+        assert!(!is_os_toast_disabled_value(None));
+        assert!(!is_os_toast_disabled_value(Some("")));
+        assert!(!is_os_toast_disabled_value(Some("0")));
+        assert!(!is_os_toast_disabled_value(Some("false")));
+
+        let live_alert = AlertRecord {
+            alert_id: "alert-cookie-42".to_string(),
+            timestamp_ms: 1_700_000_050_000,
+            severity: AlertSeverity::Critical,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "CANARY-COOKIE-DB".to_string(),
+            title: "Chrome Cookies Accessed".to_string(),
+            process_instance_id: Some("4242:133765432100000000".to_string()),
+            process_suspended: true,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "target_path": r"C:\Users\dev\AppData\Local\Google\Chrome\User Data\Default\Cookies",
+                "exe_path": r"C:\Users\dev\Downloads\stealer.exe",
+                "category": "cookie_db",
+                "is_write_or_delete": false,
+                "access_mask": 0x00120089
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        };
+
+        let online_event = build_notify_oneshot_event(
+            "alert-cookie-42",
+            r"\\.\pipe\localedr-ipc",
+            Ok(vec![live_alert]),
+            true,
+        );
+        let online_json = serde_json::to_string(&online_event).expect("serialize online event");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&online_json).expect("valid JSON output");
+
+        assert_eq!(parsed["mode"], "notify_oneshot");
+        assert_eq!(parsed["alert_id"], "alert-cookie-42");
+        assert_eq!(parsed["launch_uri"], "ledr://alert/alert-cookie-42");
+        assert_eq!(parsed["daemon_reachable"], true);
+        assert_eq!(parsed["alert_found"], true);
+        assert_eq!(parsed["process_suspended"], true);
+        assert_eq!(parsed["os_toast_status"], "disabled_by_env");
+        assert_eq!(parsed["status"], "disabled_by_env");
+        assert_eq!(
+            parsed["target_path"],
+            r"C:\Users\dev\AppData\Local\Google\Chrome\User Data\Default\Cookies"
+        );
+        let toast_xml = parsed["toast_xml"].as_str().expect("toast_xml string");
+        assert!(toast_xml.contains("launch=\"ledr://alert/alert-cookie-42\""));
+        assert!(toast_xml.contains("[SUSPENDED]"));
+        assert!(toast_xml.contains("Chrome Cookies Accessed"));
+
+        // Graceful fallback when daemon is offline.
+        let offline_client = IpcClient::new(r"\\.\pipe\localedr-ui-nonexistent-test-pipe");
+        let offline_event = build_notify_oneshot_event(
+            "alert-offline-99",
+            offline_client.pipe_name(),
+            offline_client.get_alerts(None, 50),
+            true,
+        );
+        assert!(!offline_event.daemon_reachable);
+        assert!(!offline_event.alert_found);
+        assert_eq!(offline_event.launch_uri, "ledr://alert/alert-offline-99");
+        assert!(offline_event
+            .toast_xml
+            .contains("launch=\"ledr://alert/alert-offline-99\""));
+        assert!(dispatch_notify_oneshot_disabled_check(&offline_client).is_ok());
+    }
+
+    fn dispatch_notify_oneshot_disabled_check(offline_client: &IpcClient) -> Result<(), String> {
+        let ev = build_notify_oneshot_event(
+            "alert-check",
+            offline_client.pipe_name(),
+            offline_client.get_alerts(None, 50),
+            true,
+        );
+        serde_json::to_string(&ev)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
     }
 }

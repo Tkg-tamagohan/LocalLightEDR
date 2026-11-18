@@ -1,5 +1,6 @@
 //! Named Pipe IPC server (`\\.\pipe\localedr-ipc`, `決定記録 L-09`, `AUTO-11`).
 
+use std::ffi::c_void;
 use std::io::ErrorKind;
 use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
@@ -10,23 +11,111 @@ use ledr_proto::{
     DownloadOriginRecord, IpcRequest, IpcResponse, AUTHORIZED_BRIDGE_EXE_PATH,
     AUTHORIZED_UI_EXE_PATH, IPC_MAX_FRAME_BYTES,
 };
-use ledr_rules::assess_domain_risk;
+use ledr_rules::{assess_domain_risk, signer_subject_matches, BinaryIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::engine::{current_unix_ms, DaemonEngine};
+use crate::engine::DaemonEngine;
 
 const IPC_READ_CHUNK_BYTES: usize = 8_192;
+const SDDL_REVISION_1: u32 = 1;
+
+/// Strict Named Pipe SDDL permitting full access to `SYSTEM` and `Administrators`,
+/// and read/write access to `Interactive` users (`決定記録 L-09`).
+pub const SERVICE_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+
+/// Owned self-relative Windows security descriptor converted from SDDL (`L-09`).
+pub struct PipeSecurityDescriptor {
+    sd: PSECURITY_DESCRIPTOR,
+    sd_len: u32,
+}
+
+// SAFETY: A converted Windows self-relative security descriptor is immutable raw buffer
+// memory freed exactly once via `LocalFree` on `Drop` with no thread affinity.
+unsafe impl Send for PipeSecurityDescriptor {}
+// SAFETY: Shared references only expose read-only pointer metadata.
+unsafe impl Sync for PipeSecurityDescriptor {}
+
+impl PipeSecurityDescriptor {
+    /// Parses an SDDL string into an owned Windows `SECURITY_DESCRIPTOR` via
+    /// `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+    pub fn from_sddl(sddl: &str) -> std::io::Result<Self> {
+        let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut raw_sd: *mut c_void = std::ptr::null_mut();
+        let mut sd_len: u32 = 0;
+
+        // SAFETY: `sddl_w` is NUL-terminated UTF-16; `raw_sd` is owned and freed by `LocalFree`.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl_w.as_ptr(),
+                SDDL_REVISION_1,
+                &mut raw_sd,
+                &mut sd_len,
+            )
+        };
+        if ok == 0 || raw_sd.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            sd: PSECURITY_DESCRIPTOR(raw_sd),
+            sd_len,
+        })
+    }
+
+    /// Returns a `SECURITY_ATTRIBUTES` struct referencing this security descriptor.
+    /// The returned value must not outlive `self`.
+    pub fn security_attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.sd.0,
+            bInheritHandle: false.into(),
+        }
+    }
+
+    /// Returns the size in bytes of the converted self-relative security descriptor.
+    pub fn byte_len(&self) -> u32 {
+        self.sd_len
+    }
+}
+
+impl Drop for PipeSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.sd.0.is_null() {
+            // SAFETY: `self.sd.0` was allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.sd.0)));
+            }
+            self.sd.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Builds the Phase 2+ strict Named Pipe security descriptor (`SERVICE_PIPE_SDDL`, `L-09`).
+pub fn build_service_pipe_security_descriptor() -> std::io::Result<PipeSecurityDescriptor> {
+    PipeSecurityDescriptor::from_sddl(SERVICE_PIPE_SDDL)
+}
+
+#[link(name = "advapi32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+extern "system" {
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string_security_descriptor: *const u16,
+        string_sd_revision: u32,
+        security_descriptor: *mut *mut c_void,
+        security_descriptor_size: *mut u32,
+    ) -> i32;
+}
 
 /// Handle owning the Named Pipe IPC accept loop task.
 pub struct IpcServerHandle {
@@ -50,19 +139,41 @@ impl IpcServerHandle {
     }
 }
 
+fn create_pipe_server(
+    pipe_name: &str,
+    first_instance: bool,
+    strict_dacl: bool,
+) -> std::io::Result<NamedPipeServer> {
+    let mut opts = ServerOptions::new();
+    if first_instance {
+        opts.first_pipe_instance(true);
+    }
+    if strict_dacl {
+        let sd = build_service_pipe_security_descriptor()?;
+        let mut sa = sd.security_attributes();
+        // SAFETY: `sa` points to `sd` which lives until after `create_with_security_attributes_raw` returns.
+        unsafe {
+            opts.create_with_security_attributes_raw(
+                pipe_name,
+                &mut sa as *mut SECURITY_ATTRIBUTES as *mut c_void,
+            )
+        }
+    } else {
+        opts.create(pipe_name)
+    }
+}
+
 /// Binds the initial Named Pipe instance synchronously (preventing client connection races)
 /// and spawns an asynchronous accept loop serving 4-byte LE JSON frames.
 ///
-/// Note on Phase 1 security posture (`決定記録 L-09`):
-/// In Phase 1 `--foreground` dev mode, the pipe uses the process default security descriptor
-/// (accessible to the interactive user, administrators, and SYSTEM). Phase 2+ service mode
-/// restricts the creation DACL to `SYSTEM`, `Administrators`, and `Interactive` and enforces
-/// `AUTHORIZED_UI_EXE_PATH` / Authenticode / SHA-256 caller verification on mutating requests.
+/// In `--foreground` dev mode (`strict_pipe_dacl: false`), uses the process default security
+/// descriptor. In `--service-strict` mode (`strict_pipe_dacl: true`), applies
+/// [`SERVICE_PIPE_SDDL`] restricting access to `SYSTEM`, `Administrators`, and `Interactive`
+/// users (`決定記録 L-09`).
 pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerHandle> {
     let pipe_name = engine.config().pipe_name.clone();
-    let initial_server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(&pipe_name)?;
+    let strict_dacl = engine.config().strict_pipe_dacl;
+    let initial_server = create_pipe_server(&pipe_name, true, strict_dacl)?;
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let loop_pipe_name = pipe_name.clone();
@@ -103,7 +214,7 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
                                 }
                             }
 
-                            match ServerOptions::new().create(&loop_pipe_name) {
+                            match create_pipe_server(&loop_pipe_name, false, strict_dacl) {
                                 Ok(next_server) => server = next_server,
                                 Err(err) => {
                                     tracing::error!(
@@ -134,18 +245,135 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
 
 /// Checks whether a caller executable path is authorized to execute mutating UI commands (`L-09`).
 pub fn is_authorized_ui_caller(caller_exe_path: Option<&str>, dev_mode_bypass: bool) -> bool {
-    if dev_mode_bypass {
-        return true;
-    }
-    caller_exe_path.is_some_and(|path| path.eq_ignore_ascii_case(AUTHORIZED_UI_EXE_PATH))
+    verify_authorized_caller_binary(
+        caller_exe_path,
+        AUTHORIZED_UI_EXE_PATH,
+        None,
+        None,
+        None,
+        dev_mode_bypass,
+    )
 }
 
 /// Checks whether a caller executable path is authorized to submit browser bridge events (`L-09`).
 pub fn is_authorized_bridge_caller(caller_exe_path: Option<&str>, dev_mode_bypass: bool) -> bool {
+    verify_authorized_caller_binary(
+        caller_exe_path,
+        AUTHORIZED_BRIDGE_EXE_PATH,
+        None,
+        None,
+        None,
+        dev_mode_bypass,
+    )
+}
+
+/// Verifies an IPC caller executable against an expected protected path AND optional
+/// expected SHA-256 digest and Authenticode signer (`L-09`), preserving `dev_mode_bypass`.
+pub fn verify_authorized_caller_binary(
+    caller_exe_path: Option<&str>,
+    expected_exe_path: &str,
+    expected_sha256: Option<&str>,
+    expected_signer: Option<&str>,
+    expected_root_thumbprint: Option<&str>,
+    dev_mode_bypass: bool,
+) -> bool {
     if dev_mode_bypass {
         return true;
     }
-    caller_exe_path.is_some_and(|path| path.eq_ignore_ascii_case(AUTHORIZED_BRIDGE_EXE_PATH))
+    let Some(caller_path) = caller_exe_path.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if !normalized_path_eq_ascii_ci(caller_path, expected_exe_path) {
+        return false;
+    }
+
+    let has_sha_pin = expected_sha256
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    let has_signer_pin = expected_signer
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+
+    if !has_sha_pin && !has_signer_pin {
+        return true;
+    }
+
+    let identity = BinaryIdentity::from_path(caller_path);
+    verify_caller_identity(
+        Some(&identity),
+        expected_exe_path,
+        expected_sha256,
+        expected_signer,
+        expected_root_thumbprint,
+        false,
+    )
+}
+
+/// Pure identity verification helper matching path, optional SHA-256, and optional
+/// Authenticode signer + root thumbprint (`L-09`).
+pub fn verify_caller_identity(
+    caller_identity: Option<&BinaryIdentity>,
+    expected_exe_path: &str,
+    expected_sha256: Option<&str>,
+    expected_signer: Option<&str>,
+    expected_root_thumbprint: Option<&str>,
+    dev_mode_bypass: bool,
+) -> bool {
+    if dev_mode_bypass {
+        return true;
+    }
+    let Some(identity) = caller_identity else {
+        return false;
+    };
+    if !normalized_path_eq_ascii_ci(identity.exe_path.trim(), expected_exe_path) {
+        return false;
+    }
+
+    if let Some(expected_sha) = expected_sha256
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let matches = identity
+            .sha256
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected_sha));
+        if !matches {
+            return false;
+        }
+    }
+
+    if let Some(expected_subj) = expected_signer
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let Some(auth) = identity.authenticode.as_ref() else {
+            return false;
+        };
+        if !signer_subject_matches(&auth.signer_subject, expected_subj) {
+            return false;
+        }
+        if let Some(expected_tp) = expected_root_thumbprint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let all_zeros = expected_tp.chars().all(|c| c == '0');
+            if !all_zeros
+                && (auth.root_thumbprint.trim().is_empty()
+                    || !auth.root_thumbprint.trim().eq_ignore_ascii_case(expected_tp))
+            {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn normalized_path_eq_ascii_ci(a: &str, b: &str) -> bool {
+    let na = a.trim().replace('/', "\\");
+    let nb = b.trim().replace('/', "\\");
+    !na.is_empty() && na.eq_ignore_ascii_case(&nb)
 }
 
 /// Resolves the connected client process PID and executable image path via `GetNamedPipeClientProcessId`.
@@ -331,8 +559,16 @@ fn dispatch_request(
     caller_exe: Option<&str>,
     req: IpcRequest,
 ) -> IpcResponse {
+    let cfg = engine.config();
     if req.requires_ui_authorization()
-        && !is_authorized_ui_caller(caller_exe, engine.config().dev_mode_bypass_ui_auth)
+        && !verify_authorized_caller_binary(
+            caller_exe,
+            AUTHORIZED_UI_EXE_PATH,
+            cfg.authorized_ui_sha256.as_deref(),
+            cfg.authorized_ui_signer.as_deref(),
+            cfg.authorized_ui_root_thumbprint.as_deref(),
+            cfg.dev_mode_bypass_ui_auth,
+        )
     {
         return IpcResponse::Error {
             code: "UNAUTHORIZED".to_string(),
@@ -346,8 +582,14 @@ fn dispatch_request(
     if matches!(
         req,
         IpcRequest::ReportDownloadOrigin { .. } | IpcRequest::ReportBrowserEvent { .. }
-    ) && !is_authorized_bridge_caller(caller_exe, engine.config().dev_mode_bypass_ui_auth)
-    {
+    ) && !verify_authorized_caller_binary(
+        caller_exe,
+        AUTHORIZED_BRIDGE_EXE_PATH,
+        cfg.authorized_bridge_sha256.as_deref(),
+        cfg.authorized_bridge_signer.as_deref(),
+        cfg.authorized_bridge_root_thumbprint.as_deref(),
+        cfg.dev_mode_bypass_ui_auth,
+    ) {
         return IpcResponse::Error {
             code: "UNAUTHORIZED_CALLER".to_string(),
             message: format!(
@@ -389,16 +631,27 @@ fn dispatch_request(
             }
         }
         IpcRequest::ResolveAlert { alert_id, decision } => {
-            let new_status = decision.resulting_status();
-            match store.update_alert_status(&alert_id, new_status, Some(current_unix_ms())) {
-                Ok(true) => IpcResponse::Ack {
-                    message: format!("alert {alert_id} resolved to {}", new_status.as_db_str()),
+            match engine.resolve_alert(&alert_id, decision) {
+                Ok(resolved) => IpcResponse::Ack {
+                    message: format!(
+                        "alert {} resolved to {}",
+                        resolved.alert_id,
+                        resolved.status.as_db_str()
+                    ),
                 },
-                Ok(false) => IpcResponse::Error {
-                    code: "NOT_FOUND".to_string(),
-                    message: format!("alert {alert_id} not found"),
-                },
-                Err(err) => store_error_response(err),
+                Err(msg) => {
+                    let code = if msg.contains("not found") {
+                        "NOT_FOUND"
+                    } else if msg.contains("already resolved") {
+                        "ALREADY_RESOLVED"
+                    } else {
+                        "RESOLVE_ERROR"
+                    };
+                    IpcResponse::Error {
+                        code: code.to_string(),
+                        message: msg,
+                    }
+                }
             }
         }
         IpcRequest::UpsertRule { rule } => match store.upsert_rule(&rule) {

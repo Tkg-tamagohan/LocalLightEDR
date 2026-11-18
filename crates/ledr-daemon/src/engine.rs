@@ -357,6 +357,11 @@ impl DaemonEngine {
                 .sigma
                 .evaluate_with_image(&ctx, proc_ctx.proc_exe_path.as_deref());
             for m in matches {
+                if let Some(ref inst_id) = proc_ctx.proc_instance_id {
+                    if !self.is_new_rule_alert(inst_id, &m.rule_id) {
+                        continue;
+                    }
+                }
                 let context_json = serde_json::json!({
                     "event": event,
                     "parent_exe_path": proc_ctx.parent_exe_path,
@@ -407,6 +412,14 @@ impl DaemonEngine {
                 self.telemetry_processed.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    fn is_new_rule_alert(&self, instance_id: &str, rule_id: &str) -> bool {
+        let mut table = self
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        table.mark_rule_alert_emitted(instance_id, rule_id)
     }
 
     fn resolve_process_context(

@@ -1,6 +1,6 @@
 //! Bounded O(1) in-memory active process table for parent-child correlation (`決定記録 L-12`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use ledr_proto::{ProcessIdentity, ACTIVE_PROCESS_TABLE_CAPACITY};
 
@@ -18,6 +18,7 @@ pub struct ActiveProcessEntry {
     pub created_at_ms: i64,
     pub exited_at_ms: Option<i64>,
     pub sigma_evaluated: bool,
+    pub emitted_rule_ids: HashSet<String>,
 }
 
 /// Resolution result returned when recording a new `ProcessStart` into [`ActiveProcessTable`].
@@ -74,7 +75,7 @@ impl ActiveProcessTable {
     ) -> ProcessStartResolution {
         let instance_id = identity.instance_id();
 
-        let (parent_instance_id, parent_exe_path, parent_command_line) =
+        let (mut parent_instance_id, mut parent_exe_path, mut parent_command_line) =
             if parent_pid != 0 && parent_pid != identity.pid {
                 let parent_opt = self
                     .lookup_by_pid_at(parent_pid, created_at_ms)
@@ -96,9 +97,34 @@ impl ActiveProcessTable {
                 (None, None, None)
             };
 
-        if let Some(existing) = self.entries.get_mut(&instance_id) {
-            let upgrade_cmd = existing.command_line.is_empty() && !command_line.is_empty();
-            let should_evaluate = !existing.sigma_evaluated || upgrade_cmd;
+        if self.entries.contains_key(&instance_id) {
+            // Before mutating `existing`, populate parent metadata from `existing.parent_instance_id`
+            // if `parent_pid` lookup returned `None`.
+            if parent_instance_id.is_none() {
+                let existing_parent_id = self
+                    .entries
+                    .get(&instance_id)
+                    .and_then(|e| e.parent_instance_id.clone());
+                if let Some(ref existing_pid) = existing_parent_id {
+                    if let Some(parent_entry) = self.entries.get(existing_pid) {
+                        parent_instance_id = Some(parent_entry.instance_id.clone());
+                        parent_exe_path = Some(parent_entry.exe_path.clone());
+                        parent_command_line = (!parent_entry.command_line.is_empty())
+                            .then(|| parent_entry.command_line.clone());
+                    }
+                }
+            }
+
+            let existing = self
+                .entries
+                .get_mut(&instance_id)
+                .expect("entry presence verified");
+            let upgraded_parent =
+                existing.parent_instance_id.is_none() && parent_instance_id.is_some();
+            let upgraded_cmd = existing.command_line.is_empty() && !command_line.is_empty();
+            let upgraded_exe = existing.exe_path.is_empty() && !exe_path.is_empty();
+            let should_evaluate_sigma =
+                !existing.sigma_evaluated || upgraded_parent || upgraded_cmd || upgraded_exe;
             existing.sigma_evaluated = true;
 
             if existing.parent_instance_id.is_none() {
@@ -123,11 +149,10 @@ impl ActiveProcessTable {
                 parent_instance_id: resolved_parent_id,
                 parent_exe_path,
                 parent_command_line,
-                should_evaluate_sigma: should_evaluate,
+                should_evaluate_sigma,
             };
         }
 
-        // If a previous process with the same PID is still marked active (missed stop), mark it exited.
         if let Some(prev_id) = self
             .pid_to_identity
             .get(&identity.pid)
@@ -135,6 +160,44 @@ impl ActiveProcessTable {
             .filter(|prev| *prev != identity)
             .map(|prev| prev.instance_id())
         {
+            if let Some(prev_entry) = self.entries.get(&prev_id) {
+                if (prev_entry.created_at_ms, prev_entry.identity.create_time_100ns)
+                    > (created_at_ms, identity.create_time_100ns)
+                {
+                    // Arriving ProcessStart is older than the already-registered process for this PID:
+                    // preserve the newer active mapping and record this older incarnation as exited.
+                    let inferred_exit_ms = prev_entry.created_at_ms;
+                    self.entries.insert(
+                        instance_id.clone(),
+                        ActiveProcessEntry {
+                            identity,
+                            instance_id: instance_id.clone(),
+                            pid: identity.pid,
+                            ppid: parent_pid,
+                            parent_instance_id: parent_instance_id.clone(),
+                            exe_path,
+                            command_line,
+                            user_sid,
+                            created_at_ms,
+                            exited_at_ms: Some(inferred_exit_ms),
+                            sigma_evaluated: true,
+                            emitted_rule_ids: HashSet::new(),
+                        },
+                    );
+                    self.exited_fifo.push_back(instance_id.clone());
+                    self.insertion_fifo.push_back(instance_id.clone());
+                    self.evict_if_over_capacity(&instance_id);
+                    return ProcessStartResolution {
+                        instance_id,
+                        parent_instance_id,
+                        parent_exe_path,
+                        parent_command_line,
+                        should_evaluate_sigma: true,
+                    };
+                }
+            }
+
+            // If a previous process with the same PID is still marked active (missed stop), mark it exited.
             if let Some(prev_entry) = self
                 .entries
                 .get_mut(&prev_id)
@@ -161,6 +224,7 @@ impl ActiveProcessTable {
                 created_at_ms,
                 exited_at_ms: None,
                 sigma_evaluated: true,
+                emitted_rule_ids: HashSet::new(),
             },
         );
         self.active_count += 1;
@@ -249,6 +313,15 @@ impl ActiveProcessTable {
     /// O(1) lookup by composite `instance_id` (`"{pid}:{create_time_100ns}"`).
     pub fn get_by_instance_id(&self, instance_id: &str) -> Option<&ActiveProcessEntry> {
         self.entries.get(instance_id)
+    }
+
+    /// Marks `rule_id` as having emitted an alert for `instance_id`, returning `true` only on
+    /// the first alert for that `(instance_id, rule_id)` pair (or when `instance_id` is uncached).
+    pub fn mark_rule_alert_emitted(&mut self, instance_id: &str, rule_id: &str) -> bool {
+        match self.entries.get_mut(instance_id) {
+            Some(entry) => entry.emitted_rule_ids.insert(rule_id.to_string()),
+            None => true,
+        }
     }
 
     /// Returns the number of non-exited processes currently tracked.
@@ -476,5 +549,99 @@ mod tests {
             200,
         );
         assert!(!post_enrich_dup.should_evaluate_sigma);
+    }
+
+    #[test]
+    fn process_table_parent_enrichment_dedup_and_older_snapshot_preservation() {
+        let mut table = ActiveProcessTable::new(16);
+        let parent = ProcessIdentity::new(1100, 10_000);
+        let child = ProcessIdentity::new(1200, 20_000);
+
+        // Child arrives before parent, with empty exe_path initially.
+        let initial_child = table.on_process_start(
+            child,
+            1100,
+            String::new(),
+            "powershell.exe -enc AA==".to_string(),
+            None,
+            200,
+        );
+        assert!(initial_child.should_evaluate_sigma);
+        assert_eq!(initial_child.parent_instance_id, None);
+        assert!(table.mark_rule_alert_emitted(&child.instance_id(), "LEDR-LOTL-002"));
+        assert!(!table.mark_rule_alert_emitted(&child.instance_id(), "LEDR-LOTL-002"));
+        assert!(table.mark_rule_alert_emitted("9999:1", "LEDR-LOTL-001"));
+
+        // Parent arrives, then child is re-observed -> upgrades parent and exe_path.
+        table.on_process_start(
+            parent,
+            4,
+            r"C:\Windows\System32\cmd.exe".to_string(),
+            "cmd.exe".to_string(),
+            None,
+            100,
+        );
+        let enriched_child = table.on_process_start(
+            child,
+            1100,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            "powershell.exe -enc AA==".to_string(),
+            None,
+            200,
+        );
+        assert!(enriched_child.should_evaluate_sigma);
+        assert_eq!(
+            enriched_child.parent_instance_id.as_deref(),
+            Some("1100:10000")
+        );
+        assert_eq!(
+            enriched_child.parent_exe_path.as_deref(),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert!(table.mark_rule_alert_emitted(&child.instance_id(), "LEDR-LOTL-001"));
+        assert!(!table.mark_rule_alert_emitted(&child.instance_id(), "LEDR-LOTL-002"));
+
+        // Re-observing child with parent_pid=0 still resolves parent metadata from existing.parent_instance_id
+        // without triggering re-evaluation.
+        let fallback_parent = table.on_process_start(
+            child,
+            0,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            "powershell.exe -enc AA==".to_string(),
+            None,
+            200,
+        );
+        assert!(!fallback_parent.should_evaluate_sigma);
+        assert_eq!(
+            fallback_parent.parent_exe_path.as_deref(),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+
+        // Older snapshot for PID 42 arriving after newer ETW start preserves newer active entry.
+        let newer_42 = ProcessIdentity::new(42, 2000);
+        let older_42 = ProcessIdentity::new(42, 1000);
+        table.on_process_start(newer_42, 4, "new42.exe".to_string(), String::new(), None, 2000);
+        let active_before = table.active_count();
+        let older_res =
+            table.on_process_start(older_42, 4, "old42.exe".to_string(), String::new(), None, 1000);
+        assert!(older_res.should_evaluate_sigma);
+        assert_eq!(table.active_count(), active_before);
+        assert_eq!(table.lookup_by_pid(42).map(|e| e.identity), Some(newer_42));
+        assert_eq!(
+            table.lookup_by_pid_at(42, 2500).map(|e| e.identity),
+            Some(newer_42)
+        );
+        assert_eq!(
+            table
+                .get_by_instance_id(&newer_42.instance_id())
+                .and_then(|e| e.exited_at_ms),
+            None
+        );
+        assert_eq!(
+            table
+                .get_by_instance_id(&older_42.instance_id())
+                .and_then(|e| e.exited_at_ms),
+            Some(2000)
+        );
     }
 }

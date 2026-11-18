@@ -4,7 +4,7 @@ mod schema;
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -112,6 +112,8 @@ struct StoreInner {
     reader: Arc<Mutex<Connection>>,
     batch: Mutex<BatchBuffer>,
     shutdown_requested: AtomicBool,
+    purge_batches_completed: AtomicUsize,
+    purge_batch_delay_ms: AtomicU64,
 }
 
 /// Thread-safe embedded SQLite WAL store with separated write/read connections (`AUTO-09`).
@@ -143,6 +145,8 @@ impl LedrStore {
                 reader: Arc::new(Mutex::new(reader)),
                 batch: Mutex::new(BatchBuffer::default()),
                 shutdown_requested: AtomicBool::new(false),
+                purge_batches_completed: AtomicUsize::new(0),
+                purge_batch_delay_ms: AtomicU64::new(0),
             }),
         })
     }
@@ -160,6 +164,8 @@ impl LedrStore {
                 reader: shared,
                 batch: Mutex::new(BatchBuffer::default()),
                 shutdown_requested: AtomicBool::new(false),
+                purge_batches_completed: AtomicUsize::new(0),
+                purge_batch_delay_ms: AtomicU64::new(0),
             }),
         })
     }
@@ -172,6 +178,18 @@ impl LedrStore {
     /// Returns `true` after [`LedrStore::request_shutdown`] has been invoked (`BUG_0004`).
     pub fn is_shutdown_requested(&self) -> bool {
         self.inner.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    /// Configures an optional per-batch sleep delay (in milliseconds) after each committed TTL purge batch.
+    pub fn set_purge_batch_delay_ms(&self, delay_ms: u64) {
+        self.inner
+            .purge_batch_delay_ms
+            .store(delay_ms, Ordering::Release);
+    }
+
+    /// Returns the number of non-empty TTL purge batches committed so far.
+    pub fn purge_batches_completed(&self) -> usize {
+        self.inner.purge_batches_completed.load(Ordering::Acquire)
     }
 
     fn lock_writer(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
@@ -863,6 +881,13 @@ impl LedrStore {
             if deleted == 0 {
                 break;
             }
+            self.inner
+                .purge_batches_completed
+                .fetch_add(1, Ordering::Release);
+            let delay_ms = self.inner.purge_batch_delay_ms.load(Ordering::Acquire);
+            if delay_ms > 0 && !self.is_shutdown_requested() {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
         }
         Ok(total_deleted)
     }
@@ -1026,30 +1051,6 @@ fn resolve_process_instance_id(
     event_ts_ms: i64,
     hint: Option<&str>,
 ) -> Result<String, StoreError> {
-    let valid_hint = match hint.filter(|id| instance_id_matches_pid(id, pid)) {
-        Some(h) => {
-            let window: Option<(i64, Option<i64>)> = tx
-                .query_row(
-                    "SELECT created_at_ms, exited_at_ms FROM processes
-                     WHERE process_instance_id = ?1",
-                    params![h],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            match window {
-                Some((created_at_ms, exited_at_ms)) => {
-                    if created_at_ms <= event_ts_ms && exited_at_ms.is_none_or(|e| event_ts_ms <= e)
-                    {
-                        return Ok(h.to_owned());
-                    }
-                    None
-                }
-                None => Some(h),
-            }
-        }
-        None => None,
-    };
-
     if let Some(matched) = tx
         .query_row(
             PID_TIME_WINDOW_LOOKUP_SQL,
@@ -1061,9 +1062,27 @@ fn resolve_process_instance_id(
         return Ok(matched);
     }
 
-    Ok(valid_hint
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("{pid}:0")))
+    if let Some(h) = hint.filter(|id| instance_id_matches_pid(id, pid)) {
+        let window: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT created_at_ms, exited_at_ms FROM processes
+                 WHERE process_instance_id = ?1",
+                params![h],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let hint_valid = match window {
+            Some((created_at_ms, exited_at_ms)) => {
+                created_at_ms <= event_ts_ms && exited_at_ms.is_none_or(|e| event_ts_ms <= e)
+            }
+            None => true,
+        };
+        if hint_valid {
+            return Ok(h.to_owned());
+        }
+    }
+
+    Ok(format!("{pid}:0"))
 }
 
 fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Result<(), StoreError> {
@@ -1592,25 +1611,33 @@ mod tests {
         let mut writer = store.lock_writer().expect("lock writer");
         let tx = writer.transaction().expect("begin tx");
 
-        // Fast valid-hint path: returns "42:1000" immediately without running the WHERE pid = ?1
-        // query (which would otherwise pick "42:1500" via ORDER BY created_at_ms DESC LIMIT 1).
+        // Index-first priority: even when a stale hint ("42:1000") is valid at ts=1700/2000,
+        // PID_TIME_WINDOW_LOOKUP_SQL selects the newest overlapping incarnation ("42:1500").
         assert_eq!(
-            resolve_process_instance_id(&tx, 42, 1700, Some("42:1000")).expect("fast hint mid"),
+            resolve_process_instance_id(&tx, 42, 1700, Some("42:1000"))
+                .expect("index-first selects newest overlapping mid"),
+            "42:1500"
+        );
+        assert_eq!(
+            resolve_process_instance_id(&tx, 42, 2000, Some("42:1000"))
+                .expect("index-first selects newest overlapping end"),
+            "42:1500"
+        );
+        // Before proc_new starts at 1500, index selects proc_old ("42:1000") regardless of hint.
+        assert_eq!(
+            resolve_process_instance_id(&tx, 42, 1000, Some("42:1000")).expect("index start"),
             "42:1000"
         );
         assert_eq!(
-            resolve_process_instance_id(&tx, 42, 1000, Some("42:1000")).expect("fast hint start"),
-            "42:1000"
-        );
-        assert_eq!(
-            resolve_process_instance_id(&tx, 42, 2000, Some("42:1000")).expect("fast hint end"),
+            resolve_process_instance_id(&tx, 42, 1200, Some("42:1500"))
+                .expect("index ignores future hint"),
             "42:1000"
         );
 
-        // Out-of-window hint falls back to WHERE pid = ?1.
+        // Post-exit of proc_old selects proc_new; pre-start falls back to "{pid}:0".
         assert_eq!(
             resolve_process_instance_id(&tx, 42, 2500, Some("42:1000"))
-                .expect("stale hint falls back"),
+                .expect("stale hint selects newer"),
             "42:1500"
         );
         assert_eq!(
@@ -1619,7 +1646,7 @@ mod tests {
             "42:0"
         );
 
-        // Unpersisted or PID-mismatched hint runs WHERE pid = ?1 first.
+        // Unpersisted or PID-mismatched hint resolves persisted row via index first.
         assert_eq!(
             resolve_process_instance_id(&tx, 42, 1700, Some("42:9999"))
                 .expect("unpersisted hint resolves persisted row"),
@@ -1630,10 +1657,16 @@ mod tests {
                 .expect("mismatched pid hint resolves persisted row"),
             "42:1500"
         );
+        // Hint fallback applies only when index query finds no row and hint PID/window matches.
         assert_eq!(
             resolve_process_instance_id(&tx, 88, 1700, Some("88:9999"))
                 .expect("unpersisted hint fallback"),
             "88:9999"
+        );
+        assert_eq!(
+            resolve_process_instance_id(&tx, 88, 1700, Some("999:1000"))
+                .expect("mismatched pid hint fallback"),
+            "88:0"
         );
     }
 

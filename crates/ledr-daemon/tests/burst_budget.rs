@@ -1,6 +1,6 @@
 //! Integration tests for `ledr-daemon` two-lane burst budget, LOTL rule detection,
 //! Named Pipe IPC server round-trip, startup reconciliation, and shutdown purge interruption
-//! (`BURST-01`..`BURST-08`).
+//! (`BURST-01`..`BURST-09`).
 
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -1204,6 +1204,7 @@ async fn burst_08_shutdown_interrupts_large_purge_within_budget() {
     }
 
     let store2 = LedrStore::open(&db_path).expect("reopen large purge store");
+    store2.set_purge_batch_delay_ms(40);
     let engine = DaemonEngine::start(
         store2.clone(),
         SigmaEngine::from_rules(Vec::new()).expect("empty rules"),
@@ -1218,18 +1219,12 @@ async fn burst_08_shutdown_interrupts_large_purge_within_budget() {
 
     // Wait until periodic purge commits at least one 500-row batch.
     let wait_deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let snap = store2
-            .query_flight_recorder(3_000, None)
-            .expect("query process count during purge");
-        if snap.processes.len() < 3_000 {
-            break;
-        }
+    while store2.purge_batches_completed() < 1 {
         assert!(
             Instant::now() < wait_deadline,
             "timed out waiting for periodic purge to begin"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
     let post_purge_ident = ProcessIdentity::new(29_999, unix_ms_to_filetime(now_ms));
@@ -1257,8 +1252,202 @@ async fn burst_08_shutdown_interrupts_large_purge_within_budget() {
         "shutdown_and_flush took {shutdown_elapsed:?}, exceeding {SHUTDOWN_FLUSH_TIMEOUT_MS} ms budget"
     );
     assert_eq!(store2.buffered_len(), 0);
+    let remaining_snap = store2
+        .query_flight_recorder(3_000, None)
+        .expect("query remaining processes after interrupted purge");
+    let remaining_expired = remaining_snap
+        .processes
+        .iter()
+        .filter(|p| p.exited_at_ms.is_some())
+        .count();
+    assert!(
+        !remaining_snap.processes.is_empty() && remaining_snap.processes.len() < 3_000,
+        "expected partially purged process count in (0, 3000), got {}",
+        remaining_snap.processes.len()
+    );
+    assert!(
+        remaining_expired > 0 && remaining_expired < 3_000,
+        "expected remaining expired processes in (0, 3000), got {remaining_expired}"
+    );
     let survivor = store2
         .query_flight_recorder(10, Some(&post_purge_ident.instance_id()))
         .expect("query survivor process");
     assert_eq!(survivor.processes.len(), 1);
+}
+
+#[tokio::test]
+async fn burst_09_parent_enrichment_triggers_lotl_alert_and_older_snapshot_preserves_newer_pid() {
+    let lotl_json = include_str!("../../../rules/lotl_core.json");
+    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
+    let sigma = SigmaEngine::from_json_str(lotl_json).expect("compile lotl_core.json");
+    let pruner = EarlyPruner::from_json_str(allowlist_json).expect("build pruner");
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+
+    let engine = DaemonEngine::start(
+        store.clone(),
+        sigma,
+        pruner,
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+    );
+    let sender = engine.sender();
+
+    let t_base = 1_750_000_000_000i64;
+    let cmd_ident = ProcessIdentity::new(6100, unix_ms_to_filetime(t_base + 1_000));
+    let ps_ident = ProcessIdentity::new(6200, unix_ms_to_filetime(t_base + 1_100));
+
+    let cmd_ev = SensorEvent::ProcessStart {
+        identity: cmd_ident,
+        parent_pid: 4,
+        exe_path: r"C:\Windows\System32\cmd.exe".to_string(),
+        command_line: "cmd.exe /c powershell.exe".to_string(),
+        user_sid: Some("S-1-5-21-1000".to_string()),
+    };
+    let ps_ev = SensorEvent::ProcessStart {
+        identity: ps_ident,
+        parent_pid: cmd_ident.pid,
+        exe_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+        command_line: "powershell.exe -NoP -EncodedCommand VwByAGkAdABlAA==".to_string(),
+        user_sid: Some("S-1-5-21-1000".to_string()),
+    };
+
+    // 1. Child seen by ETW before parent exists: 0 alerts initially.
+    sender
+        .send(ps_ev.clone())
+        .await
+        .expect("send child powershell before parent");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().high_priority_processed < 1 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for initial child ProcessStart"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    store.flush_batch().expect("flush initial child");
+    assert!(
+        store
+            .list_alerts(Some(AlertStatus::Pending), 20)
+            .expect("list initial alerts")
+            .is_empty(),
+        "child without parent context must not match LEDR-LOTL-001 initially"
+    );
+
+    // Seed parent + child snapshots -> parent_instance_id is enriched and LEDR-LOTL-001 triggers once.
+    engine
+        .seed_processes(vec![cmd_ev, ps_ev.clone()])
+        .expect("seed cmd and powershell snapshots");
+    let ps_snap = store
+        .query_flight_recorder(10, Some(&ps_ident.instance_id()))
+        .expect("query enriched child");
+    assert_eq!(ps_snap.processes.len(), 1);
+    assert_eq!(
+        ps_snap.processes[0].parent_instance_id.as_deref(),
+        Some(cmd_ident.instance_id().as_str())
+    );
+    let alerts_after_seed = store
+        .list_alerts(Some(AlertStatus::Pending), 20)
+        .expect("list alerts after parent enrichment");
+    assert_eq!(alerts_after_seed.len(), 1);
+    assert_eq!(alerts_after_seed[0].rule_id, "LEDR-LOTL-001");
+    assert_eq!(
+        alerts_after_seed[0].process_instance_id.as_deref(),
+        Some(ps_ident.instance_id().as_str())
+    );
+
+    // Re-sending the same ProcessStart must NOT duplicate the alert.
+    sender
+        .send(ps_ev)
+        .await
+        .expect("resend duplicate powershell ProcessStart");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().high_priority_processed < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for duplicate child ProcessStart"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        store
+            .list_alerts(Some(AlertStatus::Pending), 20)
+            .expect("list alerts after duplicate ProcessStart")
+            .len(),
+        1
+    );
+
+    // 2. Newer ETW ProcessStart(PID 42, t=2000) followed by older snapshot ProcessStart(PID 42, t=1000):
+    //    DnsQuery(PID 42, t=2500) must attribute to 42:<t=2000>, not 42:<t=1000>.
+    let newer_42 = ProcessIdentity::new(42, unix_ms_to_filetime(t_base + 2_000));
+    let older_42 = ProcessIdentity::new(42, unix_ms_to_filetime(t_base + 1_000));
+
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: newer_42,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\newer42.exe".to_string(),
+            command_line: "newer42.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send newer PID 42 ETW start");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().high_priority_processed < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for newer PID 42 ETW start"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    engine
+        .seed_processes(vec![SensorEvent::ProcessStart {
+            identity: older_42,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\older42.exe".to_string(),
+            command_line: "older42.exe".to_string(),
+            user_sid: None,
+        }])
+        .expect("process older PID 42 snapshot");
+
+    sender
+        .send(SensorEvent::DnsQuery {
+            pid: 42,
+            query_name: "newer-pid42.example.test".to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            timestamp_ms: t_base + 2_500,
+        })
+        .await
+        .expect("send DnsQuery for PID 42 at t=2500");
+
+    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+
+    let snap = store
+        .query_flight_recorder(50, None)
+        .expect("query flight recorder");
+    let dns = snap
+        .dns_queries
+        .iter()
+        .find(|d| d.query_name == "newer-pid42.example.test")
+        .expect("DnsQuery recorded");
+    assert_eq!(dns.process_instance_id, newer_42.instance_id());
+    assert_ne!(dns.process_instance_id, older_42.instance_id());
+
+    let newer_row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == newer_42.instance_id())
+        .expect("newer PID 42 row recorded");
+    assert_eq!(newer_row.exited_at_ms, None);
+
+    assert_eq!(
+        store
+            .list_alerts(Some(AlertStatus::Pending), 20)
+            .expect("final alerts")
+            .len(),
+        1
+    );
 }

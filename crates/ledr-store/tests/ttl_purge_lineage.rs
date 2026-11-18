@@ -1018,6 +1018,46 @@ fn store_06_pid_reuse_time_window_attribution() {
         snap_unknown.dns_queries[0].query_name,
         "gap-window.example.test"
     );
+
+    // Overlapping active rows for PID 42 with a stale hint for the older incarnation must
+    // still resolve to the newer incarnation via index-first lookup.
+    let overlap_store = LedrStore::open_in_memory().expect("open overlap store");
+    let (overlap_old, overlap_old_start) =
+        make_process_start(42, 1000, 4, r"C:\Temp\overlap_old.exe", "overlap_old.exe");
+    let (overlap_new, overlap_new_start) =
+        make_process_start(42, 2000, 4, r"C:\Temp\overlap_new.exe", "overlap_new.exe");
+    overlap_store
+        .ingest_event(&overlap_new_start, Some("4:1"), false, "")
+        .expect("ingest overlap new");
+    overlap_store
+        .ingest_event(&overlap_old_start, Some("4:1"), false, "")
+        .expect("ingest overlap old");
+    overlap_store.flush_batch().expect("flush overlapping procs");
+
+    let overlap_dns = SensorEvent::DnsQuery {
+        pid: 42,
+        query_name: "overlap-stale-hint.example.test".to_string(),
+        query_type: 1,
+        resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 37))],
+        timestamp_ms: 2500,
+    };
+    overlap_store
+        .ingest_event(&overlap_dns, Some(&overlap_old.instance_id()), false, "")
+        .expect("ingest dns with stale older hint");
+    overlap_store.flush_batch().expect("flush overlap dns");
+
+    let overlap_new_snap = overlap_store
+        .query_flight_recorder(10, Some(&overlap_new.instance_id()))
+        .expect("query overlap new");
+    assert_eq!(overlap_new_snap.dns_queries.len(), 1);
+    assert_eq!(
+        overlap_new_snap.dns_queries[0].query_name,
+        "overlap-stale-hint.example.test"
+    );
+    let overlap_old_snap = overlap_store
+        .query_flight_recorder(10, Some(&overlap_old.instance_id()))
+        .expect("query overlap old");
+    assert!(overlap_old_snap.dns_queries.is_empty());
 }
 
 #[test]

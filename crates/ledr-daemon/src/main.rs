@@ -118,6 +118,13 @@ where
         }
     }
 
+    // `--ui-signer` without `--ui-root-thumbprint` can never verify: the caller check
+    // requires the signer/root-thumbprint pair and would reject every mutating IPC
+    // command at runtime. Fail fast at startup instead (BUG_0007).
+    if parsed.ui_signer.is_some() && parsed.ui_root_thumbprint.is_none() {
+        anyhow::bail!("--ui-signer requires --ui-root-thumbprint");
+    }
+
     Ok(parsed)
 }
 
@@ -417,6 +424,22 @@ mod tests {
         assert!(parse_cli_args(["ledr-daemon", "--db"]).is_err());
         assert!(parse_cli_args(["ledr-daemon", "--ui-sha256"]).is_err());
         assert!(parse_cli_args(["ledr-daemon", "--ui-signer"]).is_err());
+        // BUG_0007: --ui-signer without --ui-root-thumbprint must be rejected at startup.
+        assert!(
+            parse_cli_args(["ledr-daemon", "--ui-signer", "CN=LocalEDR"]).is_err(),
+            "--ui-signer alone must fail (root thumbprint pin required)"
+        );
+        assert!(
+            parse_cli_args([
+                "ledr-daemon",
+                "--ui-signer",
+                "CN=LocalEDR",
+                "--ui-root-thumbprint",
+                "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+            ])
+            .is_ok(),
+            "signer + root thumbprint pair must be accepted"
+        );
         assert!(parse_cli_args(["ledr-daemon", "--ui-root-thumbprint"]).is_err());
         assert!(parse_cli_args(["ledr-daemon", "--unknown"]).is_err());
     }

@@ -489,11 +489,21 @@ impl DaemonEngine {
             | SensorEvent::NetworkConnect { pid, .. }
             | SensorEvent::CanaryFileAccess { pid, .. }
             | SensorEvent::ScriptEvaluated { pid, .. } => {
-                let Some(proc_entry) = table.lookup_by_pid_at(*pid, event_ts_ms).cloned() else {
+                // Clone only the fields the context needs: cloning the whole entry would copy
+                // `emitted_rule_ids`, which grows with every distinct fired (rule, script) pair.
+                let Some((instance_id, exe_path, parent_instance_id)) = table
+                    .lookup_by_pid_at(*pid, event_ts_ms)
+                    .map(|e| {
+                        (
+                            e.instance_id.clone(),
+                            e.exe_path.clone(),
+                            e.parent_instance_id.clone(),
+                        )
+                    })
+                else {
                     return ResolvedProcessContext::default();
                 };
-                let (parent_exe, parent_cmd) = proc_entry
-                    .parent_instance_id
+                let (parent_exe, parent_cmd) = parent_instance_id
                     .as_deref()
                     .and_then(|parent_id| table.get_by_instance_id(parent_id))
                     .map(|p| {
@@ -504,9 +514,9 @@ impl DaemonEngine {
                     })
                     .unwrap_or((None, None));
                 ResolvedProcessContext {
-                    proc_instance_id: Some(proc_entry.instance_id.clone()),
-                    proc_exe_path: Some(proc_entry.exe_path),
-                    store_hint: Some(proc_entry.instance_id),
+                    proc_instance_id: Some(instance_id.clone()),
+                    proc_exe_path: Some(exe_path),
+                    store_hint: Some(instance_id),
                     parent_exe_path: parent_exe,
                     parent_command_line: parent_cmd,
                     should_evaluate_sigma: true,

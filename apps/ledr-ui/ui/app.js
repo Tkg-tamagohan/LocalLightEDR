@@ -1112,10 +1112,11 @@
 
     let decision;
     let previewStatus;
+    const addBlockRule = Boolean(el.optAddBlockRule.checked);
     if (kind === "terminate") {
       decision = {
         TerminateAndBlock: {
-          add_block_rule: Boolean(el.optAddBlockRule.checked),
+          add_block_rule: addBlockRule,
         },
       };
       previewStatus = "TerminatedBlocked";
@@ -1138,9 +1139,17 @@
       alert.status = previewStatus;
       alert.process_suspended = false;
       alert.resolved_at_ms = Date.now();
+      const previewMessage =
+        kind === "terminate"
+          ? `Preview: ${alert.alert_id} → ${previewStatus} — process tree terminated; ${
+              addBlockRule
+                ? "NetworkBlock rule saved, WFP applies in Phase 3"
+                : "no NetworkBlock rule saved"
+            }`
+          : `Preview: ${alert.alert_id} → ${previewStatus}`;
       state.triageFeedback = {
         ok: true,
-        message: `Preview: ${alert.alert_id} → ${previewStatus}`,
+        message: previewMessage,
       };
       renderTriageView();
       return;
@@ -1165,7 +1174,15 @@
         alertId: alert.alert_id,
         decision,
       });
-      state.triageFeedback = { ok: true, message: ackMessage };
+      const feedbackMessage =
+        kind === "terminate"
+          ? `${ackMessage} — process tree terminated; ${
+              addBlockRule
+                ? "NetworkBlock rule saved, WFP applies in Phase 3"
+                : "no NetworkBlock rule saved"
+            }`
+          : ackMessage;
+      state.triageFeedback = { ok: true, message: feedbackMessage };
       await refreshAll();
     } catch (err) {
       state.triageFeedback = { ok: false, message: String(err) };

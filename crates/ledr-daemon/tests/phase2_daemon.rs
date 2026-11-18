@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ledr_daemon::{
     build_service_pipe_security_descriptor, start_ipc_server, verify_authorized_caller_binary,
     verify_caller_identity, BinaryInspector, DaemonConfig, DaemonEngine, NotificationDispatcher,
-    Session0ToastLauncher, SERVICE_PIPE_SDDL,
+    Session0ToastLauncher, WindowsBinaryInspector, SERVICE_PIPE_SDDL,
 };
 use ledr_proto::{
     read_ipc_frame, write_ipc_frame, ActiveDefenseController, AlertDecision, AlertRecord,
@@ -51,7 +51,14 @@ fn current_unix_ms() -> i64 {
 fn open_pipe_with_retry(pipe_name: &str) -> std::fs::File {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        match OpenOptions::new().read(true).write(true).open(pipe_name) {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            opts.access_mode(0x0012_019B);
+        }
+        match opts.open(pipe_name) {
             Ok(file) => return file,
             Err(err)
                 if Instant::now() < deadline
@@ -89,6 +96,8 @@ struct MockDefenseController {
     terminates: Mutex<Vec<TerminateCall>>,
     fail_suspend: Mutex<bool>,
     terminate_error: Mutex<Option<String>>,
+    failing_terminate_pids: Mutex<Vec<u32>>,
+    failing_resume_pids: Mutex<Vec<u32>>,
 }
 
 impl MockDefenseController {
@@ -106,6 +115,20 @@ impl MockDefenseController {
 
     fn set_terminate_error(&self, err: Option<String>) {
         *self.terminate_error.lock().expect("lock terminate_error") = err;
+    }
+
+    fn add_failing_terminate_pid(&self, pid: u32) {
+        self.failing_terminate_pids
+            .lock()
+            .expect("lock failing_terminate_pids")
+            .push(pid);
+    }
+
+    fn add_failing_resume_pid(&self, pid: u32) {
+        self.failing_resume_pids
+            .lock()
+            .expect("lock failing_resume_pids")
+            .push(pid);
     }
 }
 
@@ -126,6 +149,17 @@ impl ActiveDefenseController for MockDefenseController {
     }
 
     fn resume_process(&self, target: &ProcessIdentity) -> Result<(), String> {
+        if self
+            .failing_resume_pids
+            .lock()
+            .expect("lock failing_resume_pids")
+            .contains(&target.pid)
+        {
+            return Err(format!(
+                "OpenProcess(PID {}) failed: The parameter is incorrect.",
+                target.pid
+            ));
+        }
         self.resumes.lock().expect("lock resumes").push(*target);
         Ok(())
     }
@@ -142,6 +176,17 @@ impl ActiveDefenseController for MockDefenseController {
             .clone()
         {
             return Err(err);
+        }
+        if self
+            .failing_terminate_pids
+            .lock()
+            .expect("lock failing_terminate_pids")
+            .contains(&target.pid)
+        {
+            return Err(format!(
+                "OpenProcess(PID {}) failed: The parameter is incorrect.",
+                target.pid
+            ));
         }
         self.terminates
             .lock()
@@ -933,10 +978,15 @@ fn daemon_p2_05_session0_toast_launcher_fallback_and_validation() {
     };
     assert!(missing_launcher.notify_alert(&bad_alert).is_err());
 
-    // 3. Existing binary spawns cleanly via foreground fallback with CREATE_NO_WINDOW.
+    // 3. Existing binary spawns cleanly via foreground fallback with CREATE_NO_WINDOW when enabled outside Session 0.
     let harmless_exe = Path::new(r"C:\Windows\System32\hostname.exe");
     if harmless_exe.is_file() {
-        let launcher = Session0ToastLauncher::new(harmless_exe);
+        let safe_default = Session0ToastLauncher::new(harmless_exe);
+        assert!(!safe_default.allow_foreground_fallback());
+        assert!(safe_default.notify_alert(&sample_alert).is_ok());
+
+        let launcher = Session0ToastLauncher::with_foreground_fallback(harmless_exe, true);
+        assert!(launcher.allow_foreground_fallback());
         assert!(launcher.notify_alert(&sample_alert).is_ok());
     }
 }
@@ -945,12 +995,32 @@ fn daemon_p2_05_session0_toast_launcher_fallback_and_validation() {
 async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
     assert_eq!(
         SERVICE_PIPE_SDDL,
-        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)"
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)"
     );
 
-    // 1. SDDL security descriptor builds cleanly and exposes valid SECURITY_ATTRIBUTES.
+    // 1. SDDL security descriptor builds cleanly, converts back to SDDL, and omits FILE_CREATE_PIPE_INSTANCE (0x0004).
     let sd = build_service_pipe_security_descriptor().expect("build SDDL security descriptor");
     assert!(sd.byte_len() > 0);
+    let sddl_roundtrip = sd.to_sddl_string().expect("convert SD back to SDDL");
+    assert!(sddl_roundtrip.contains(";;;IU)"));
+    assert!(!sddl_roundtrip.contains("GRGW"));
+    assert!(!sddl_roundtrip.contains("FW"));
+    let iu_ace = sddl_roundtrip
+        .split('(')
+        .find(|ace| ace.contains(";;;IU)"))
+        .expect("IU ACE present in roundtrip SDDL");
+    let iu_rights = iu_ace.split(';').nth(2).expect("IU ACE rights field");
+    let hex_str = iu_rights
+        .strip_prefix("0x")
+        .or_else(|| iu_rights.strip_prefix("0X"))
+        .unwrap_or_else(|| panic!("expected hex access mask in IU ACE, got {iu_ace}"));
+    let mask = u32::from_str_radix(hex_str, 16).expect("parse IU hex access mask");
+    assert_eq!(
+        mask & 0x0004,
+        0,
+        "IU ACE must exclude FILE_CREATE_PIPE_INSTANCE (0x0004), got {iu_ace}"
+    );
+    assert_eq!(mask & 0x0012_019B, 0x0012_019B);
     let sa = sd.security_attributes();
     assert_eq!(
         sa.nLength as usize,
@@ -975,7 +1045,7 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
     let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("bind strict SDDL Named Pipe");
 
     let pipe_client = strict_pipe.clone();
-    let (ping_resp, unauth_resolve) = tokio::task::spawn_blocking(move || {
+    let (ping_resp, unauth_resolve, metrics_resp) = tokio::task::spawn_blocking(move || {
         let ping = send_pipe_request(&pipe_client, &IpcRequest::Ping);
         let unauth = send_pipe_request(
             &pipe_client,
@@ -984,7 +1054,8 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
                 decision: AlertDecision::AllowOnce,
             },
         );
-        (ping, unauth)
+        let metrics = send_pipe_request(&pipe_client, &IpcRequest::GetPipelineMetrics);
+        (ping, unauth, metrics)
     })
     .await
     .expect("join strict IPC client");
@@ -994,11 +1065,12 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
         unauth_resolve,
         IpcResponse::Error { ref code, .. } if code == "UNAUTHORIZED"
     ));
+    assert!(matches!(metrics_resp, IpcResponse::Metrics(_)));
 
     ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await.expect("shutdown");
 
-    // 3. `verify_authorized_caller_binary` and `verify_caller_identity` checks (L-09).
+    // 3. `verify_authorized_caller_binary` and `verify_caller_identity` checks (L-09, SEC_0002, SEC_0006).
     let tmp_dir = std::env::temp_dir().join(format!("ledr-caller-auth-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
     let fake_ui = tmp_dir.join("ledr-ui.exe");
@@ -1006,6 +1078,16 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
     let fake_ui_str = fake_ui.to_string_lossy().into_owned();
     let fake_ui_sha = compute_file_sha256_hex(&fake_ui).expect("hash fake ui");
 
+    // SEC_0002: unpinned + unsigned binary MUST be rejected even on exact path match.
+    assert!(!verify_authorized_caller_binary(
+        Some(&fake_ui_str),
+        &fake_ui_str,
+        None,
+        None,
+        None,
+        false
+    ));
+    // Pinned SHA-256 matches and succeeds.
     assert!(verify_authorized_caller_binary(
         Some(&fake_ui_str),
         &fake_ui_str,
@@ -1014,6 +1096,19 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
         None,
         false
     ));
+    // Real Authenticode-signed Windows binary succeeds even without explicit hash/signer pins.
+    let signed_os_exe = Path::new(r"C:\Windows\System32\SearchIndexer.exe");
+    if signed_os_exe.is_file() {
+        let signed_os_str = signed_os_exe.to_string_lossy().into_owned();
+        assert!(verify_authorized_caller_binary(
+            Some(&signed_os_str),
+            &signed_os_str,
+            None,
+            None,
+            None,
+            false
+        ));
+    }
     assert!(!verify_authorized_caller_binary(
         Some(&fake_ui_str),
         &fake_ui_str,
@@ -1055,6 +1150,32 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
         Some("0123456789ABCDEF0123456789ABCDEF01234567"),
         false
     ));
+    // Signed identity accepted without explicit pins (SEC_0002).
+    assert!(verify_caller_identity(
+        Some(&signed_caller),
+        AUTHORIZED_UI_EXE_PATH,
+        None,
+        None,
+        None,
+        false
+    ));
+    // SEC_0006: all-zero or missing root thumbprint MUST be rejected when signer pin is used.
+    assert!(!verify_caller_identity(
+        Some(&signed_caller),
+        AUTHORIZED_UI_EXE_PATH,
+        Some(&fake_ui_sha),
+        Some("CN=LocalEDR"),
+        Some("0000000000000000000000000000000000000000"),
+        false
+    ));
+    assert!(!verify_caller_identity(
+        Some(&signed_caller),
+        AUTHORIZED_UI_EXE_PATH,
+        Some(&fake_ui_sha),
+        Some("CN=LocalEDR"),
+        None,
+        false
+    ));
     assert!(!verify_caller_identity(
         Some(&signed_caller),
         AUTHORIZED_UI_EXE_PATH,
@@ -1083,9 +1204,15 @@ async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolb
                 .to_string(),
         root_thumbprint: "3B1EFD3A66EA28B16697394703A72CA340A05BD5".to_string(),
     };
+    let chrome_auth = AuthenticodeInfo {
+        signer_subject: "CN=Google LLC, O=Google LLC, L=Mountain View, S=California, C=US"
+            .to_string(),
+        root_thumbprint: "DDFB16CD4931C973A2037D3FC83A4D7D775D05E4".to_string(),
+    };
 
     let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string();
     let search_exe = r"C:\Windows\System32\SearchIndexer.exe".to_string();
+    let chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string();
 
     let inspector = Arc::new(MockBinaryInspector::default());
     inspector.insert(BinaryIdentity {
@@ -1097,6 +1224,11 @@ async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolb
         exe_path: search_exe.clone(),
         sha256: Some("0000000000000000000000000000000000000000000000000000000000000002".to_string()),
         authenticode: Some(ms_auth),
+    });
+    inspector.insert(BinaryIdentity {
+        exe_path: chrome_exe.clone(),
+        sha256: Some("0000000000000000000000000000000000000000000000000000000000000003".to_string()),
+        authenticode: Some(chrome_auth),
     });
 
     let defense = Arc::new(MockDefenseController::default());
@@ -1117,6 +1249,7 @@ async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolb
     let t0 = current_unix_ms() - 5_000;
     let ps_ident = ProcessIdentity::new(5100, unix_ms_to_filetime(t0));
     let search_ident = ProcessIdentity::new(5200, unix_ms_to_filetime(t0 + 50));
+    let chrome_ident = ProcessIdentity::new(5300, unix_ms_to_filetime(t0 + 100));
 
     let sender = engine.sender();
     sender
@@ -1139,9 +1272,32 @@ async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolb
         })
         .await
         .expect("send search start");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: chrome_ident,
+            parent_pid: 4,
+            exe_path: chrome_exe,
+            command_line: "chrome.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send chrome start");
 
     let cookie_path = r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies";
     let honeypot_path = r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx";
+
+    // Chrome accessing its own Cookies has explicit `ALLOW-BROWSER-CHROME` -> ALLOWED (BUG_0002).
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: chrome_ident.pid,
+            target_path: cookie_path.to_string(),
+            category: CanaryCategory::CookieDb,
+            access_mask: 0x0012_0089,
+            is_write_or_delete: false,
+            timestamp_ms: t0 + 150,
+        })
+        .await
+        .expect("send chrome canary");
 
     // SearchIndexer.exe has explicit `FileCanaryAllow` -> ALLOWED.
     sender
@@ -1180,7 +1336,7 @@ async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolb
         .await
         .expect("send ps honeypot write");
 
-    wait_for_hp_processed(&engine, 5).await;
+    wait_for_hp_processed(&engine, 7).await;
 
     assert_eq!(
         defense.suspends(),
@@ -1203,6 +1359,10 @@ async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolb
     assert_eq!(notifier.alerts().len(), 2);
 
     let snap = store.query_flight_recorder(20, None).expect("query fr");
+    assert!(snap
+        .file_canary_events
+        .iter()
+        .any(|e| e.process_instance_id == chrome_ident.instance_id() && e.action_taken == "ALLOWED"));
     assert!(snap
         .file_canary_events
         .iter()
@@ -1440,6 +1600,786 @@ async fn daemon_p2_09_canary_burst_deduplicates_alerts_and_suspends() {
             .count(),
         2
     );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_p2_10_bug_0001_zero_or_missing_create_time_never_suspends() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier.clone(),
+    );
+
+    let now_ms = current_unix_ms();
+    let sender = engine.sender();
+
+    // 1. Unknown PID (not in ActiveProcessTable -> proc_identity = None): must alert without suspending.
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: 7701,
+            target_path: r"C:\Users\alice\.ssh\id_rsa".to_string(),
+            category: CanaryCategory::SshKey,
+            access_mask: 1,
+            is_write_or_delete: false,
+            timestamp_ms: now_ms - 200,
+        })
+        .await
+        .expect("send unknown-pid canary");
+
+    // 2. Process with create_time_100ns == 0: must NEVER suspend (BUG_0001).
+    let zero_ident = ProcessIdentity::new(7702, 0);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: zero_ident,
+            parent_pid: 4,
+            exe_path: r"C:\Temp\zero_ts.exe".to_string(),
+            command_line: "zero_ts.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send zero create_time start");
+    wait_for_hp_processed(&engine, 2).await;
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: zero_ident.pid,
+            target_path: r"C:\Users\alice\.aws\credentials".to_string(),
+            category: CanaryCategory::CloudCredential,
+            access_mask: 1,
+            is_write_or_delete: false,
+            timestamp_ms: current_unix_ms() + 100,
+        })
+        .await
+        .expect("send zero-ts canary");
+
+    wait_for_hp_processed(&engine, 3).await;
+
+    assert!(
+        defense.suspends().is_empty(),
+        "BUG_0001: processes without non-zero create_time_100ns must never be suspended"
+    );
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    assert_eq!(alerts.len(), 2);
+    assert!(alerts.iter().all(|a| !a.process_suspended));
+    assert_eq!(notifier.alerts().len(), 2);
+
+    let snap = store.query_flight_recorder(20, None).expect("query fr");
+    assert_eq!(snap.file_canary_events.len(), 2);
+    assert!(snap
+        .file_canary_events
+        .iter()
+        .all(|e| e.action_taken == "ALERTED"));
+
+    // Resolving a non-suspended alert with missing/zero identity succeeds without touching defense.
+    let zero_alert = alerts
+        .iter()
+        .find(|a| a.process_instance_id.as_deref() == Some("7702:0"))
+        .expect("zero alert");
+    let resolved = engine
+        .resolve_alert(&zero_alert.alert_id, AlertDecision::AllowOnce)
+        .expect("resolve non-suspended zero-ts alert");
+    assert_eq!(resolved.status, AlertStatus::ApprovedOnce);
+    assert!(defense.resumes().is_empty());
+
+    // Manually forged suspended alert with pid:0 + context pid fallback must be rejected in resolve_alert.
+    let forged_suspended = AlertRecord {
+        alert_id: "forged-zero-suspended".to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
+        title: "Forged Zero Identity".to_string(),
+        process_instance_id: Some("7703:0".to_string()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({ "pid": 7703 }).to_string(),
+        resolved_at_ms: None,
+    };
+    store.record_alert(&forged_suspended).expect("record forged");
+    assert!(engine
+        .resolve_alert(
+            &forged_suspended.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: false
+            }
+        )
+        .is_err());
+    assert!(defense.terminates().is_empty());
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_p2_11_bug_0003_sibling_alerts_keep_suspended_until_last_allowed_and_cascade_terminate()
+{
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MockBinaryInspector::default());
+
+    let proc_a_exe = r"C:\Temp\multi_stealer_a.exe".to_string();
+    let proc_b_exe = r"C:\Temp\multi_stealer_b.exe".to_string();
+    for exe in [&proc_a_exe, &proc_b_exe] {
+        inspector.insert(BinaryIdentity {
+            exe_path: exe.clone(),
+            sha256: Some("1212121212121212121212121212121212121212121212121212121212121212".to_string()),
+            authenticode: None,
+        });
+    }
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector,
+    );
+
+    let t0 = current_unix_ms() - 5_000;
+    let ident_a = ProcessIdentity::new(7801, unix_ms_to_filetime(t0));
+    let ident_b = ProcessIdentity::new(7802, unix_ms_to_filetime(t0 + 10));
+    let sender = engine.sender();
+
+    for (ident, exe) in [(ident_a, &proc_a_exe), (ident_b, &proc_b_exe)] {
+        sender
+            .send(SensorEvent::ProcessStart {
+                identity: ident,
+                parent_pid: 4,
+                exe_path: exe.clone(),
+                command_line: exe.clone(),
+                user_sid: None,
+            })
+            .await
+            .expect("send start");
+        sender
+            .send(SensorEvent::CanaryFileAccess {
+                pid: ident.pid,
+                target_path: r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies"
+                    .to_string(),
+                category: CanaryCategory::CookieDb,
+                access_mask: 1,
+                is_write_or_delete: false,
+                timestamp_ms: t0 + 100,
+            })
+            .await
+            .expect("send cookie canary");
+        sender
+            .send(SensorEvent::CanaryFileAccess {
+                pid: ident.pid,
+                target_path: r"C:\Users\alice\.ssh\id_rsa".to_string(),
+                category: CanaryCategory::SshKey,
+                access_mask: 1,
+                is_write_or_delete: false,
+                timestamp_ms: t0 + 110,
+            })
+            .await
+            .expect("send ssh canary");
+    }
+
+    wait_for_hp_processed(&engine, 6).await;
+    let all_alerts = store.list_alerts(None, 20).expect("list alerts");
+    let a_alerts: Vec<_> = all_alerts
+        .iter()
+        .filter(|a| a.process_instance_id.as_deref() == Some(ident_a.instance_id().as_str()))
+        .collect();
+    let b_alerts: Vec<_> = all_alerts
+        .iter()
+        .filter(|a| a.process_instance_id.as_deref() == Some(ident_b.instance_id().as_str()))
+        .collect();
+    assert_eq!(a_alerts.len(), 2);
+    assert_eq!(b_alerts.len(), 2);
+
+    // Part A: Resolving first alert for proc A keeps it suspended while second alert is unresolved.
+    let res_a1 = engine
+        .resolve_alert(&a_alerts[0].alert_id, AlertDecision::AllowOnce)
+        .expect("resolve first A alert");
+    assert_eq!(res_a1.status, AlertStatus::ApprovedOnce);
+    assert!(
+        defense.resumes().is_empty(),
+        "BUG_0003: process must stay suspended while sibling unresolved suspended alert exists"
+    );
+
+    // Resolving the last unresolved suspended alert for proc A resumes it.
+    let res_a2 = engine
+        .resolve_alert(
+            &a_alerts[1].alert_id,
+            AlertDecision::AllowPermanent {
+                use_signer_if_available: false,
+                allow_dest: None,
+            },
+        )
+        .expect("resolve second A alert");
+    assert_eq!(res_a2.status, AlertStatus::ApprovedRule);
+    assert_eq!(defense.resumes(), vec![ident_a]);
+
+    // Part B: TerminateAndBlock on one alert for proc B cascades TerminatedBlocked to sibling alert.
+    let res_b1 = engine
+        .resolve_alert(
+            &b_alerts[0].alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: false,
+            },
+        )
+        .expect("terminate proc B");
+    assert_eq!(res_b1.status, AlertStatus::TerminatedBlocked);
+    let sibling_b2 = store
+        .get_alert(&b_alerts[1].alert_id)
+        .expect("get sibling alert")
+        .expect("sibling exists");
+    assert_eq!(sibling_b2.status, AlertStatus::TerminatedBlocked);
+    assert!(sibling_b2.resolved_at_ms.is_some());
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_p2_12_bug_0004_record_alert_error_compensates_suspension_dedup_and_skips_notify() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier.clone(),
+    );
+
+    let t0 = current_unix_ms() - 5_000;
+    let parent_ident = ProcessIdentity::new(7901, unix_ms_to_filetime(t0));
+    let child_ident = ProcessIdentity::new(7902, unix_ms_to_filetime(t0 + 50));
+    let honeypot_path = r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx".to_string();
+
+    let sender = engine.sender();
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: parent_ident,
+            parent_pid: 4,
+            exe_path: r"C:\Temp\comp_parent.exe".to_string(),
+            command_line: "comp_parent.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send parent");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: child_ident,
+            parent_pid: parent_ident.pid,
+            exe_path: r"C:\Temp\comp_child.exe".to_string(),
+            command_line: "comp_child.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send child");
+    wait_for_hp_processed(&engine, 2).await;
+
+    // Force record_alert to fail on the next canary alert.
+    engine.set_fail_record_alert_for_test(true);
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: parent_ident.pid,
+            target_path: honeypot_path.clone(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x0012_0116,
+            is_write_or_delete: true,
+            timestamp_ms: t0 + 200,
+        })
+        .await
+        .expect("send failing canary");
+    wait_for_hp_processed(&engine, 3).await;
+
+    // Suspension was triggered then compensated (parent + child resumed), no toast sent, no alert persisted.
+    assert_eq!(
+        defense.suspends(),
+        vec![SuspendCall {
+            target: parent_ident,
+            include_children: true,
+        }]
+    );
+    assert_eq!(defense.resumes(), vec![parent_ident, child_ident]);
+    assert!(notifier.alerts().is_empty());
+    assert!(store.list_alerts(None, 20).expect("list alerts").is_empty());
+    assert_eq!(engine.alerts_emitted(), 0);
+
+    let snap = store.query_flight_recorder(20, None).expect("query fr");
+    assert_eq!(snap.file_canary_events.len(), 1);
+    assert_eq!(snap.file_canary_events[0].action_taken, "ALERTED");
+
+    // Re-enabling alert recording must NOT be suppressed by stale dedup state.
+    engine.set_fail_record_alert_for_test(false);
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: parent_ident.pid,
+            target_path: honeypot_path,
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x0012_0116,
+            is_write_or_delete: true,
+            timestamp_ms: t0 + 300,
+        })
+        .await
+        .expect("send recovered canary");
+    wait_for_hp_processed(&engine, 4).await;
+
+    assert_eq!(defense.suspends().len(), 2);
+    assert_eq!(store.list_alerts(None, 20).expect("list alerts").len(), 1);
+    assert_eq!(notifier.alerts().len(), 1);
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_p2_13_bug_0005_honeypot_tracks_suspended_children_and_resolves_tree() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    let t0 = current_unix_ms() - 5_000;
+    let parent_ident = ProcessIdentity::new(8001, unix_ms_to_filetime(t0));
+    let child_ident = ProcessIdentity::new(8002, unix_ms_to_filetime(t0 + 20));
+    let grandchild_ident = ProcessIdentity::new(8003, unix_ms_to_filetime(t0 + 40));
+
+    let sender = engine.sender();
+    for (ident, ppid, exe) in [
+        (parent_ident, 4, r"C:\Temp\tree_root.exe"),
+        (child_ident, parent_ident.pid, r"C:\Temp\tree_child.exe"),
+        (grandchild_ident, child_ident.pid, r"C:\Temp\tree_grand.exe"),
+    ] {
+        sender
+            .send(SensorEvent::ProcessStart {
+                identity: ident,
+                parent_pid: ppid,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("send tree process start");
+    }
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: parent_ident.pid,
+            target_path: r"C:\Users\alice\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x0012_0116,
+            is_write_or_delete: true,
+            timestamp_ms: t0 + 100,
+        })
+        .await
+        .expect("send honeypot write");
+    wait_for_hp_processed(&engine, 4).await;
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    assert_eq!(alerts.len(), 1);
+    let ctx: serde_json::Value =
+        serde_json::from_str(&alerts[0].context_json).expect("parse alert context");
+    let children_json = ctx["suspended_children"]
+        .as_array()
+        .expect("suspended_children array recorded");
+    let expected_ids = vec![
+        serde_json::Value::String(child_ident.instance_id()),
+        serde_json::Value::String(grandchild_ident.instance_id()),
+    ];
+    assert_eq!(children_json, &expected_ids);
+
+    // Mark grandchild as already exited during AllowOnce resume; parent + child resume and alert resolves cleanly.
+    defense.add_failing_resume_pid(grandchild_ident.pid);
+    let resumed = engine
+        .resolve_alert(&alerts[0].alert_id, AlertDecision::AllowOnce)
+        .expect("AllowOnce must succeed even if child already exited");
+    assert_eq!(resumed.status, AlertStatus::ApprovedOnce);
+    assert_eq!(defense.resumes(), vec![parent_ident, child_ident]);
+
+    // Also test TerminateAndBlock terminating parent + tracked children while ignoring already-exited child.
+    defense.add_failing_terminate_pid(child_ident.pid);
+    let term_alert = AlertRecord {
+        alert_id: "tree-terminate-alert".to_string(),
+        timestamp_ms: t0 + 200,
+        severity: AlertSeverity::Critical,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+        title: "Honeypot Tree Terminate".to_string(),
+        process_instance_id: Some(parent_ident.instance_id()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": r"C:\Temp\tree_root.exe",
+            "suspended_children": [child_ident.instance_id(), grandchild_ident.instance_id(), "9999:0"],
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    store.record_alert(&term_alert).expect("record term alert");
+    let terminated = engine
+        .resolve_alert(
+            &term_alert.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: false,
+            },
+        )
+        .expect("TerminateAndBlock must succeed when child already exited");
+    assert_eq!(terminated.status, AlertStatus::TerminatedBlocked);
+    assert_eq!(
+        defense.terminates(),
+        vec![
+            TerminateCall {
+                target: parent_ident,
+                include_children: true,
+            },
+            TerminateCall {
+                target: grandchild_ident,
+                include_children: true,
+            },
+        ]
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_p2_14_bug_0006_allow_once_clears_canary_dedup_for_reevaluation() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier.clone(),
+    );
+
+    let t0 = current_unix_ms() - 5_000;
+    let ident = ProcessIdentity::new(8101, unix_ms_to_filetime(t0));
+    let target = r"C:\Users\alice\.ssh\id_ed25519".to_string();
+    let sender = engine.sender();
+
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: r"C:\Temp\retry_stealer.exe".to_string(),
+            command_line: "retry_stealer.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send start");
+
+    // 1. First access triggers alert #1 + suspension; immediate duplicate is suppressed.
+    for offset in [100i64, 110] {
+        sender
+            .send(SensorEvent::CanaryFileAccess {
+                pid: ident.pid,
+                target_path: target.clone(),
+                category: CanaryCategory::SshKey,
+                access_mask: 1,
+                is_write_or_delete: false,
+                timestamp_ms: t0 + offset,
+            })
+            .await
+            .expect("send canary");
+    }
+    wait_for_hp_processed(&engine, 3).await;
+    let initial_alerts = store.list_alerts(None, 20).expect("list alerts");
+    assert_eq!(initial_alerts.len(), 1);
+    assert_eq!(defense.suspends().len(), 1);
+
+    // 2. AllowOnce clears dedup key so subsequent access to the same target re-evaluates.
+    engine
+        .resolve_alert(&initial_alerts[0].alert_id, AlertDecision::AllowOnce)
+        .expect("resolve AllowOnce");
+    assert_eq!(defense.resumes(), vec![ident]);
+
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: ident.pid,
+            target_path: target,
+            category: CanaryCategory::SshKey,
+            access_mask: 1,
+            is_write_or_delete: false,
+            timestamp_ms: t0 + 500,
+        })
+        .await
+        .expect("send post-AllowOnce canary");
+    wait_for_hp_processed(&engine, 4).await;
+
+    let final_alerts = store.list_alerts(None, 20).expect("list final alerts");
+    assert_eq!(final_alerts.len(), 2);
+    assert_eq!(defense.suspends().len(), 2);
+    assert_eq!(notifier.alerts().len(), 2);
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[test]
+fn daemon_p2_15_sec_0004_session0_blocks_foreground_fallback() {
+    let tmp_dir = std::env::temp_dir().join(format!("ledr-sec0004-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+    // A non-PE file on disk: if spawn_foreground_fallback runs, Command::spawn fails with Err;
+    // when blocked by SEC_0004 guards, notify_alert_with_session returns Ok(()) without spawning.
+    let invalid_pe = tmp_dir.join("not-a-pe-ledr-ui.exe");
+    std::fs::write(&invalid_pe, b"not-a-valid-pe-executable").expect("write marker file");
+
+    let alert = AlertRecord {
+        alert_id: "sec-0004-toast".to_string(),
+        timestamp_ms: 1_750_000_000_000,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
+        title: "Session 0 Guard Test".to_string(),
+        process_instance_id: Some("100:100".to_string()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: "{}".to_string(),
+        resolved_at_ms: None,
+    };
+
+    // 1. When allow_foreground_fallback is false, Session 1 also skips fallback safely.
+    let disabled_launcher = Session0ToastLauncher::with_foreground_fallback(&invalid_pe, false);
+    assert!(disabled_launcher
+        .notify_alert_with_session(&alert, Ok(1))
+        .is_ok());
+
+    // 2. Even when allow_foreground_fallback is true, Session 0 MUST NEVER spawn foreground fallback.
+    let enabled_launcher = Session0ToastLauncher::with_foreground_fallback(&invalid_pe, true);
+    assert!(enabled_launcher
+        .notify_alert_with_session(&alert, Ok(0))
+        .is_ok());
+
+    // 3. Session query failure also fails closed without spawning fallback.
+    assert!(enabled_launcher
+        .notify_alert_with_session(&alert, Err("ProcessIdToSessionId failed".to_string()))
+        .is_ok());
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn daemon_p2_16_sec_0005_binary_inspector_detects_same_size_and_mtime_replacement() {
+    let tmp_dir = std::env::temp_dir().join(format!("ledr-sec0005-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+    let target = tmp_dir.join("swapped_tool.exe");
+
+    let payload_a = vec![0x41u8; 256];
+    let payload_b = vec![0x42u8; 256];
+    std::fs::write(&target, &payload_a).expect("write payload A");
+    let orig_mtime = std::fs::metadata(&target)
+        .expect("meta A")
+        .modified()
+        .expect("mtime A");
+
+    let inspector = WindowsBinaryInspector::new();
+    let target_str = target.to_string_lossy().into_owned();
+    let first = inspector.inspect(&target_str);
+    let expected_sha_a = compute_file_sha256_hex(&target).expect("hash A");
+    assert_eq!(first.sha256.as_deref(), Some(expected_sha_a.as_str()));
+
+    // Replace binary in-place with identical length AND restore exact original mtime.
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&target)
+            .expect("reopen for replace");
+        std::io::Write::write_all(&mut f, &payload_b).expect("write payload B");
+        f.set_modified(orig_mtime).expect("preserve mtime");
+    }
+    let meta_b = std::fs::metadata(&target).expect("meta B");
+    assert_eq!(meta_b.len(), 256);
+    assert_eq!(meta_b.modified().expect("mtime B"), orig_mtime);
+
+    let second = inspector.inspect(&target_str);
+    let expected_sha_b = compute_file_sha256_hex(&target).expect("hash B");
+    assert_ne!(expected_sha_a, expected_sha_b);
+    assert_eq!(second.sha256.as_deref(), Some(expected_sha_b.as_str()));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn daemon_p2_17_sec_0003_strict_pipe_isolates_malformed_and_timed_out_clients() {
+    use std::io::{Read, Write};
+
+    let strict_pipe = unique_test_pipe_name();
+    let store = LedrStore::open_in_memory().expect("open store");
+    let engine = DaemonEngine::start(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: strict_pipe.clone(),
+            dev_mode_bypass_ui_auth: false,
+            strict_pipe_dacl: true,
+            ipc_frame_timeout_ms: 80,
+            ..DaemonConfig::default()
+        },
+    );
+    let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("bind strict SDDL Named Pipe");
+
+    let pipe_for_clients = strict_pipe.clone();
+    let (empty_err_code, pong_after_empty, stalled_eof, pong_after_timeout) =
+        tokio::task::spawn_blocking(move || {
+            // 1. Client 1 sends EMPTY_FRAME (0x0000_0000) + trailing garbage bytes in the same write.
+            let empty_err_code = {
+                let mut c1 = open_pipe_with_retry(&pipe_for_clients);
+                c1.write_all(&[0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF, b'b', b'a', b'd'])
+                    .expect("write EMPTY_FRAME + trailing garbage");
+                c1.flush().expect("flush EMPTY_FRAME");
+                match read_ipc_frame::<_, IpcResponse>(&mut c1).expect("read EMPTY_FRAME error") {
+                    IpcResponse::Error { code, .. } => code,
+                    other => panic!("expected Error response, got {other:?}"),
+                }
+            };
+
+            // 2. Client 2 connects after Client 1 drops and must receive a clean Pong (no byte leak).
+            let pong_after_empty = send_pipe_request(&pipe_for_clients, &IpcRequest::Ping);
+
+            // 3. Client 1b stalls mid-frame past ipc_frame_timeout_ms (80ms).
+            let stalled_eof = {
+                let mut c1b = open_pipe_with_retry(&pipe_for_clients);
+                c1b.write_all(&[0x20, 0x00]).expect("write partial header");
+                c1b.flush().expect("flush partial header");
+                std::thread::sleep(Duration::from_millis(160));
+                let mut probe = [0u8; 8];
+                matches!(c1b.read(&mut probe), Ok(0) | Err(_))
+            };
+
+            // 4. Client 2b must still connect and receive a clean Pong (no ERROR_OPERATION_ABORTED).
+            let pong_after_timeout = send_pipe_request(&pipe_for_clients, &IpcRequest::Ping);
+
+            (empty_err_code, pong_after_empty, stalled_eof, pong_after_timeout)
+        })
+        .await
+        .expect("join strict pipe isolation clients");
+
+    assert_eq!(empty_err_code, "EMPTY_FRAME");
+    assert!(matches!(pong_after_empty, IpcResponse::Pong { .. }));
+    assert!(stalled_eof, "stalled client must be disconnected on timeout");
+    assert!(matches!(pong_after_timeout, IpcResponse::Pong { .. }));
+
+    ipc_handle.shutdown().await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_p2_18_bug_0003_bug_0005_honeypot_sibling_resumes_children_on_last_resolve() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    let t0 = current_unix_ms() - 5_000;
+    let parent_ident = ProcessIdentity::new(8201, unix_ms_to_filetime(t0));
+    let child_ident = ProcessIdentity::new(8202, unix_ms_to_filetime(t0 + 20));
+    let sender = engine.sender();
+
+    for (ident, ppid, exe) in [
+        (parent_ident, 4, r"C:\Temp\combo_root.exe"),
+        (child_ident, parent_ident.pid, r"C:\Temp\combo_child.exe"),
+    ] {
+        sender
+            .send(SensorEvent::ProcessStart {
+                identity: ident,
+                parent_pid: ppid,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("send start");
+    }
+
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: parent_ident.pid,
+            target_path: r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x0012_0116,
+            is_write_or_delete: true,
+            timestamp_ms: t0 + 100,
+        })
+        .await
+        .expect("send honeypot write");
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: parent_ident.pid,
+            target_path: r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies"
+                .to_string(),
+            category: CanaryCategory::CookieDb,
+            access_mask: 0x0012_0089,
+            is_write_or_delete: false,
+            timestamp_ms: t0 + 110,
+        })
+        .await
+        .expect("send cookie read");
+
+    wait_for_hp_processed(&engine, 4).await;
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    assert_eq!(alerts.len(), 2);
+
+    let honeypot_alert = alerts
+        .iter()
+        .find(|a| a.rule_id == "LEDR-CANARY-HONEYPOT")
+        .expect("honeypot alert");
+    let cookie_alert = alerts
+        .iter()
+        .find(|a| a.rule_id == "LEDR-CANARY-COOKIE_DB")
+        .expect("cookie alert");
+
+    // Resolve Honeypot alert first: parent and child stay suspended because CookieDb sibling is pending.
+    engine
+        .resolve_alert(&honeypot_alert.alert_id, AlertDecision::AllowOnce)
+        .expect("resolve honeypot first");
+    assert!(defense.resumes().is_empty());
+
+    // Resolve CookieDb sibling last: must resume BOTH parent AND the honeypot's child.
+    engine
+        .resolve_alert(&cookie_alert.alert_id, AlertDecision::AllowOnce)
+        .expect("resolve cookie last");
+    assert_eq!(defense.resumes(), vec![parent_ident, child_ident]);
 
     engine.shutdown_and_flush().await.expect("shutdown");
 }

@@ -5,20 +5,21 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_proto::{
     is_never_suspend_process, ActiveDefenseController, AlertDecision, AlertRecord, AlertSeverity,
-    AlertStatus, AllowlistRuleRecord, CanaryCategory, EventLane, PipelineMetrics, ProcessIdentity,
-    RuleScope, SensorEvent, ACTIVE_PROCESS_TABLE_CAPACITY, DEFAULT_ALERT_TIMEOUT_SECS,
-    DEFAULT_TTL_RETENTION_DAYS, HIGH_PRIORITY_CHANNEL_CAPACITY, IPC_PIPE_NAME,
-    SHUTDOWN_FLUSH_TIMEOUT_MS, STORE_BATCH_FLUSH_INTERVAL_MS, TELEMETRY_CHANNEL_CAPACITY,
+    AlertStatus, AllowlistRuleRecord, AuthenticodeInfo, CanaryCategory, EventLane, PipelineMetrics,
+    ProcessIdentity, RuleScope, SensorEvent, ACTIVE_PROCESS_TABLE_CAPACITY,
+    DEFAULT_ALERT_TIMEOUT_SECS, DEFAULT_TTL_RETENTION_DAYS, HIGH_PRIORITY_CHANNEL_CAPACITY,
+    IPC_PIPE_NAME, SHUTDOWN_FLUSH_TIMEOUT_MS, STORE_BATCH_FLUSH_INTERVAL_MS,
+    TELEMETRY_CHANNEL_CAPACITY,
 };
 use ledr_rules::{
-    assess_domain_risk, is_allowed_by_rules, BinaryIdentity, EarlyPruner, EventContext,
-    SigmaEngine,
+    assess_domain_risk, compute_file_sha256_hex, inspect_authenticode, is_allowed_by_rules,
+    BinaryIdentity, EarlyPruner, EventContext, SigmaEngine,
 };
 use ledr_sensor_win::NoopDefenseController;
 use ledr_store::{LedrStore, PurgeStats, StoreError};
@@ -41,18 +42,12 @@ pub trait BinaryInspector: Send + Sync {
     fn inspect(&self, exe_path: &str) -> BinaryIdentity;
 }
 
-#[derive(Debug, Clone)]
-struct CachedBinaryIdentity {
-    file_len: u64,
-    modified_ns: u128,
-    identity: BinaryIdentity,
-}
-
-/// Default Windows binary inspector computing streaming SHA-256 and Authenticode
-/// verification with `(len, mtime)` bounded caching (`L-04`).
+/// Default Windows binary inspector computing fresh streaming SHA-256 on every call
+/// and caching only `Option<AuthenticodeInfo>` keyed by `(lowercase_exe_path, fresh_sha256)`
+/// (`L-04`, `SEC_0005` — prevents size/mtime `SetFileTime` cache spoofing).
 #[derive(Debug, Default)]
 pub struct WindowsBinaryInspector {
-    cache: Mutex<HashMap<String, CachedBinaryIdentity>>,
+    authenticode_cache: Mutex<HashMap<(String, String), Option<AuthenticodeInfo>>>,
 }
 
 impl WindowsBinaryInspector {
@@ -87,41 +82,39 @@ impl BinaryInspector for WindowsBinaryInspector {
             };
         }
 
-        let file_len = meta.len();
-        let modified_ns = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_nanos());
-        let cache_key = exe_path.to_ascii_lowercase();
+        // Always recompute SHA-256 directly from file contents (SEC_0005).
+        let Some(fresh_sha256) = compute_file_sha256_hex(path).ok() else {
+            return BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: None,
+                authenticode: None,
+            };
+        };
 
-        if let Ok(guard) = self.cache.lock() {
-            if let Some(cached) = guard.get(&cache_key) {
-                if cached.file_len == file_len && cached.modified_ns == modified_ns {
-                    return BinaryIdentity {
-                        exe_path: exe_path.to_string(),
-                        sha256: cached.identity.sha256.clone(),
-                        authenticode: cached.identity.authenticode.clone(),
-                    };
-                }
+        let cache_key = (exe_path.to_ascii_lowercase(), fresh_sha256.clone());
+        if let Ok(guard) = self.authenticode_cache.lock() {
+            if let Some(cached_auth) = guard.get(&cache_key) {
+                return BinaryIdentity {
+                    exe_path: exe_path.to_string(),
+                    sha256: Some(fresh_sha256),
+                    authenticode: cached_auth.clone(),
+                };
             }
         }
 
-        let computed = BinaryIdentity::from_path(path);
-        if let Ok(mut guard) = self.cache.lock() {
+        let authenticode = inspect_authenticode(path);
+        if let Ok(mut guard) = self.authenticode_cache.lock() {
             if guard.len() >= BINARY_INSPECTOR_CACHE_CAPACITY {
                 guard.clear();
             }
-            guard.insert(
-                cache_key,
-                CachedBinaryIdentity {
-                    file_len,
-                    modified_ns,
-                    identity: computed.clone(),
-                },
-            );
+            guard.insert(cache_key, authenticode.clone());
         }
-        computed
+
+        BinaryIdentity {
+            exe_path: exe_path.to_string(),
+            sha256: Some(fresh_sha256),
+            authenticode,
+        }
     }
 }
 
@@ -143,8 +136,8 @@ pub struct DaemonConfig {
     /// `C:\Program Files\LocalEDR\ledr-ui.exe` install-path check while still inspecting
     /// and logging caller process identity.
     pub dev_mode_bypass_ui_auth: bool,
-    /// When `true` (`--service-strict` mode), applies the restricted `SERVICE_PIPE_SDDL`
-    /// DACL (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`) when creating the Named Pipe.
+    /// When `true` (strict mode, default unless `--dev-bypass-auth` is set), applies `SERVICE_PIPE_SDDL`
+    /// (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)`) when creating the Named Pipe.
     pub strict_pipe_dacl: bool,
     /// Optional expected lowercase SHA-256 hex digest for the authorized UI binary (`L-09`).
     pub authorized_ui_sha256: Option<String>,
@@ -203,6 +196,7 @@ pub struct DaemonEngine {
     telemetry_processed: AtomicU64,
     pruned_events: AtomicU64,
     alerts_emitted: AtomicU64,
+    fail_record_alert_for_test: AtomicBool,
     worker_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -280,6 +274,7 @@ impl DaemonEngine {
             telemetry_processed: AtomicU64::new(0),
             pruned_events: AtomicU64::new(0),
             alerts_emitted: AtomicU64::new(0),
+            fail_record_alert_for_test: AtomicBool::new(false),
             worker_handle: tokio::sync::Mutex::new(None),
         });
 
@@ -308,6 +303,12 @@ impl DaemonEngine {
     /// Returns the active [`DaemonConfig`].
     pub fn config(&self) -> &DaemonConfig {
         &self.config
+    }
+
+    #[doc(hidden)]
+    pub fn set_fail_record_alert_for_test(&self, fail: bool) {
+        self.fail_record_alert_for_test
+            .store(fail, Ordering::Release);
     }
 
     /// Seeds the in-memory [`ActiveProcessTable`] and SQLite store with initial OS process snapshots
@@ -375,6 +376,32 @@ impl DaemonEngine {
         self.store.expire_pending_alerts(cutoff_ms)
     }
 
+    /// Collects unexited descendant [`ProcessIdentity`] values for `root_ident` by combining
+    /// the in-memory [`ActiveProcessTable`] with live OS Toolhelp32 descendants (`BUG_0005`).
+    pub fn collect_descendant_identities_for_pid(
+        &self,
+        root_ident: &ProcessIdentity,
+    ) -> Vec<ProcessIdentity> {
+        if root_ident.create_time_100ns == 0 {
+            return Vec::new();
+        }
+        let mut combined = {
+            let table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            table.collect_unexited_descendants(root_ident)
+        };
+        let mut seen: HashSet<ProcessIdentity> = combined.iter().copied().collect();
+        seen.insert(*root_ident);
+        for live in ledr_sensor_win::defense::collect_live_descendants(root_ident) {
+            if live.create_time_100ns != 0 && seen.insert(live) {
+                combined.push(live);
+            }
+        }
+        combined
+    }
+
     /// Applies a user triage decision (`AllowOnce`, `AllowPermanent`, `TerminateAndBlock`)
     /// to an unresolved (`Pending` or `ExpiredSuspended`) alert (`L-04`, `L-07`).
     pub fn resolve_alert(
@@ -402,13 +429,31 @@ impl DaemonEngine {
             .process_instance_id
             .as_deref()
             .and_then(ProcessIdentity::from_instance_id)
-            .or_else(|| {
-                ctx_val
-                    .get("pid")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|p| u32::try_from(p).ok())
-                    .map(|pid| ProcessIdentity::new(pid, 0))
-            });
+            .filter(|id| id.create_time_100ns != 0);
+
+        let mut seen_children = HashSet::new();
+        let mut suspended_children = Vec::new();
+        collect_suspended_children_from_ctx(&ctx_val, identity, &mut seen_children, &mut suspended_children);
+        if let Some(ref proc_inst_id) = alert.process_instance_id {
+            if let Ok(all_alerts) = self.store.list_alerts(None, 1000) {
+                for other in all_alerts {
+                    if other.alert_id != alert_id
+                        && other.process_instance_id.as_deref() == Some(proc_inst_id.as_str())
+                    {
+                        if let Ok(other_ctx) =
+                            serde_json::from_str::<serde_json::Value>(&other.context_json)
+                        {
+                            collect_suspended_children_from_ctx(
+                                &other_ctx,
+                                identity,
+                                &mut seen_children,
+                                &mut suspended_children,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let mut exe_path = json_non_empty_str(&ctx_val, "/exe_path")
             .or_else(|| json_non_empty_str(&ctx_val, "/event/ProcessStart/exe_path"))
@@ -464,6 +509,7 @@ impl DaemonEngine {
 
         let now_ms = current_unix_ms();
         let new_status = decision.resulting_status();
+        let is_terminate = matches!(decision, AlertDecision::TerminateAndBlock { .. });
 
         match decision {
             AlertDecision::AllowOnce => {
@@ -471,7 +517,16 @@ impl DaemonEngine {
                     let ident = identity.ok_or_else(|| {
                         format!("missing process identity to resume suspended alert {alert_id}")
                     })?;
-                    self.defense.resume_process(&ident)?;
+                    if !self.has_other_unresolved_suspended_alert(
+                        alert_id,
+                        alert.process_instance_id.as_deref(),
+                    )? {
+                        self.resume_process_and_children(
+                            alert_id,
+                            &ident,
+                            &suspended_children,
+                        )?;
+                    }
                 }
             }
             AlertDecision::AllowPermanent {
@@ -525,13 +580,27 @@ impl DaemonEngine {
                     let ident = identity.ok_or_else(|| {
                         format!("missing process identity to resume suspended alert {alert_id}")
                     })?;
-                    self.defense.resume_process(&ident)?;
+                    if !self.has_other_unresolved_suspended_alert(
+                        alert_id,
+                        alert.process_instance_id.as_deref(),
+                    )? {
+                        self.resume_process_and_children(
+                            alert_id,
+                            &ident,
+                            &suspended_children,
+                        )?;
+                    }
                 }
             }
             AlertDecision::TerminateAndBlock { add_block_rule } => {
                 if let Some(ident) = identity {
                     if let Err(err) = self.defense.terminate_process(&ident, true) {
                         if alert.process_suspended || is_protected_process_refusal(&err) {
+                            if !is_protected_process_refusal(&err) {
+                                for child in &suspended_children {
+                                    let _ = self.defense.terminate_process(child, true);
+                                }
+                            }
                             return Err(err);
                         }
                         tracing::warn!(
@@ -545,6 +614,20 @@ impl DaemonEngine {
                     return Err(format!(
                         "missing process identity to terminate suspended alert {alert_id}"
                     ));
+                }
+
+                for child in &suspended_children {
+                    if let Err(err) = self.defense.terminate_process(child, true) {
+                        if is_protected_process_refusal(&err) {
+                            return Err(err);
+                        }
+                        tracing::warn!(
+                            alert_id = %alert_id,
+                            child_pid = child.pid,
+                            error = %err,
+                            "terminate_process failed for suspended child (already exited); continuing"
+                        );
+                    }
                 }
 
                 if add_block_rule {
@@ -576,9 +659,130 @@ impl DaemonEngine {
             return Err(format!("alert {alert_id} not found"));
         }
 
+        if let Some(ref proc_inst_id) = alert.process_instance_id {
+            self.clear_canary_dedup_from_context_val(proc_inst_id, &ctx_val);
+            if is_terminate {
+                self.resolve_sibling_alerts_as_terminated(alert_id, proc_inst_id, now_ms);
+            }
+        }
+
         alert.status = new_status;
         alert.resolved_at_ms = Some(now_ms);
         Ok(alert)
+    }
+
+    fn has_other_unresolved_suspended_alert(
+        &self,
+        alert_id: &str,
+        process_instance_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let Some(proc_inst_id) = process_instance_id else {
+            return Ok(false);
+        };
+        let unresolved = self
+            .store
+            .list_unresolved_alerts(1000)
+            .map_err(|err| format!("failed to query unresolved alerts: {err}"))?;
+        let exists = unresolved.into_iter().any(|other| {
+            other.alert_id != alert_id
+                && other.process_suspended
+                && other.process_instance_id.as_deref() == Some(proc_inst_id)
+        });
+        if exists {
+            tracing::info!(
+                alert_id = %alert_id,
+                process_instance_id = %proc_inst_id,
+                "keeping process suspended because another unresolved suspended alert exists"
+            );
+        }
+        Ok(exists)
+    }
+
+    fn resume_process_and_children(
+        &self,
+        alert_id: &str,
+        ident: &ProcessIdentity,
+        suspended_children: &[ProcessIdentity],
+    ) -> Result<(), String> {
+        if let Err(err) = self.defense.resume_process(ident) {
+            if is_protected_process_refusal(&err) {
+                return Err(err);
+            }
+            tracing::warn!(
+                alert_id = %alert_id,
+                pid = ident.pid,
+                error = %err,
+                "resume_process failed for parent (process may have exited); continuing child resume and alert resolution"
+            );
+        }
+        for child in suspended_children {
+            if let Err(err) = self.defense.resume_process(child) {
+                if is_protected_process_refusal(&err) {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    alert_id = %alert_id,
+                    child_pid = child.pid,
+                    error = %err,
+                    "resume_process failed for suspended child (already exited); continuing"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_sibling_alerts_as_terminated(
+        &self,
+        resolved_alert_id: &str,
+        proc_inst_id: &str,
+        now_ms: i64,
+    ) {
+        let Ok(unresolved) = self.store.list_unresolved_alerts(1000) else {
+            return;
+        };
+        for other in unresolved {
+            if other.alert_id != resolved_alert_id
+                && other.process_instance_id.as_deref() == Some(proc_inst_id)
+            {
+                match self.store.update_alert_status(
+                    &other.alert_id,
+                    AlertStatus::TerminatedBlocked,
+                    Some(now_ms),
+                ) {
+                    Ok(true) => {
+                        let ctx: serde_json::Value = serde_json::from_str(&other.context_json)
+                            .unwrap_or(serde_json::Value::Null);
+                        self.clear_canary_dedup_from_context_val(proc_inst_id, &ctx);
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            sibling_alert_id = %other.alert_id,
+                            error = %err,
+                            "failed to mark sibling alert as TerminatedBlocked"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_canary_dedup_from_context_val(
+        &self,
+        instance_id: &str,
+        ctx_val: &serde_json::Value,
+    ) {
+        if let (Some(category), Some(target_path)) = (
+            json_non_empty_str(ctx_val, "/category"),
+            json_non_empty_str(ctx_val, "/target_path"),
+        ) {
+            let dedup_key = format!(
+                "CANARY:{}:{}",
+                category.to_ascii_lowercase(),
+                target_path.trim().replace('/', "\\").to_ascii_lowercase()
+            );
+            self.clear_rule_alert(instance_id, &dedup_key);
+        }
     }
 
     /// Returns current [`PipelineMetrics`] (`決定記録 L-10`).
@@ -805,7 +1009,16 @@ impl DaemonEngine {
                     context_json,
                     resolved_at_ms: None,
                 };
-                if let Err(err) = self.store.record_alert(&alert) {
+                let record_result = if self.fail_record_alert_for_test.load(Ordering::Acquire) {
+            Err(StoreError::InvalidValue {
+                field: "alerts.test_injection",
+                value: "injected record_alert failure".to_string(),
+            })
+        } else {
+            self.store.record_alert(&alert)
+        };
+
+        if let Err(err) = record_result {
                     tracing::warn!(error = %err, rule_id = %alert.rule_id, "failed to record Sigma alert");
                 } else {
                     self.alerts_emitted.fetch_add(1, Ordering::Relaxed);
@@ -913,9 +1126,9 @@ impl DaemonEngine {
         }
 
         let include_children = matches!(category, CanaryCategory::Honeypot);
-        let target_ident = proc_ctx
+        let verified_ident = proc_ctx
             .proc_identity
-            .unwrap_or_else(|| ProcessIdentity::new(*pid, 0));
+            .filter(|id| id.create_time_100ns != 0);
 
         let mut process_suspended = false;
         if is_never_suspend_process(&exe_path) {
@@ -925,8 +1138,8 @@ impl DaemonEngine {
                 target_path = %target_path,
                 "never-suspend guard skipped suspension on canary alert"
             );
-        } else {
-            match self.defense.suspend_process(&target_ident, include_children) {
+        } else if let Some(ident) = verified_ident {
+            match self.defense.suspend_process(&ident, include_children) {
                 Ok(()) => process_suspended = true,
                 Err(err) => {
                     tracing::warn!(
@@ -938,9 +1151,29 @@ impl DaemonEngine {
                     );
                 }
             }
+        } else {
+            tracing::warn!(
+                pid = *pid,
+                exe_path = %exe_path,
+                target_path = %target_path,
+                "skipping process suspension on canary alert: missing non-zero ProcessIdentity create_time_100ns (BUG_0001)"
+            );
         }
 
-        let context_json = serde_json::json!({
+        let suspended_child_idents = if include_children && process_suspended {
+            verified_ident
+                .as_ref()
+                .map(|ident| self.collect_descendant_identities_for_pid(ident))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let suspended_children: Vec<String> = suspended_child_idents
+            .iter()
+            .map(ProcessIdentity::instance_id)
+            .collect();
+
+        let mut context_obj = serde_json::json!({
             "target_path": target_path,
             "category": category.as_str(),
             "access_mask": access_mask,
@@ -954,8 +1187,16 @@ impl DaemonEngine {
             "signer_subject": bin_identity.authenticode.as_ref().map(|a| a.signer_subject.as_str()),
             "root_thumbprint": bin_identity.authenticode.as_ref().map(|a| a.root_thumbprint.as_str()),
             "include_children": include_children,
-        })
-        .to_string();
+        });
+        if include_children && process_suspended {
+            if let Some(map) = context_obj.as_object_mut() {
+                map.insert(
+                    "suspended_children".to_string(),
+                    serde_json::json!(suspended_children),
+                );
+            }
+        }
+        let context_json = context_obj.to_string();
 
         let alert = AlertRecord {
             alert_id: Uuid::new_v4().to_string(),
@@ -971,11 +1212,63 @@ impl DaemonEngine {
             resolved_at_ms: None,
         };
 
-        if let Err(err) = self.store.record_alert(&alert) {
-            tracing::warn!(error = %err, alert_id = %alert.alert_id, "failed to record canary alert");
+        let record_result = if self.fail_record_alert_for_test.load(Ordering::Acquire) {
+            Err(StoreError::InvalidValue {
+                field: "alerts.test_injection",
+                value: "injected record_alert failure".to_string(),
+            })
         } else {
-            self.alerts_emitted.fetch_add(1, Ordering::Relaxed);
+            self.store.record_alert(&alert)
+        };
+
+        if let Err(err) = record_result {
+            tracing::warn!(
+                error = %err,
+                alert_id = %alert.alert_id,
+                "failed to record canary alert; compensating suspension and dedup state (BUG_0004)"
+            );
+            if process_suspended {
+                if let Some(ident) = verified_ident {
+                    if let Err(resume_err) = self.defense.resume_process(&ident) {
+                        tracing::warn!(
+                            pid = ident.pid,
+                            error = %resume_err,
+                            "compensation resume_process failed for parent after record_alert error"
+                        );
+                    }
+                    for child in &suspended_child_idents {
+                        if let Err(resume_err) = self.defense.resume_process(child) {
+                            tracing::debug!(
+                                child_pid = child.pid,
+                                error = %resume_err,
+                                "compensation resume_process skipped for child after record_alert error"
+                            );
+                        }
+                    }
+                }
+                process_suspended = false;
+            }
+            if let Some(ref inst_id) = proc_ctx.proc_instance_id {
+                self.clear_rule_alert(inst_id, &dedup_key);
+            }
+            let action = if process_suspended {
+                "SUSPENDED"
+            } else {
+                "ALERTED"
+            };
+            if let Err(ingest_err) = self.store.ingest_event_with_exit(
+                event,
+                proc_ctx.store_hint.as_deref(),
+                None,
+                false,
+                action,
+            ) {
+                tracing::warn!(error = %ingest_err, "failed to ingest canary event after alert error");
+            }
+            return;
         }
+
+        self.alerts_emitted.fetch_add(1, Ordering::Relaxed);
 
         let action = if process_suspended {
             "SUSPENDED"
@@ -1007,6 +1300,14 @@ impl DaemonEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         table.mark_rule_alert_emitted(instance_id, rule_id)
+    }
+
+    fn clear_rule_alert(&self, instance_id: &str, rule_id: &str) -> bool {
+        let mut table = self
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        table.clear_rule_alert_emitted(instance_id, rule_id)
     }
 
     fn resolve_process_context(
@@ -1132,6 +1433,27 @@ impl Default for ResolvedProcessContext {
             parent_command_line: None,
             should_evaluate_sigma: true,
             exited_at_ms: None,
+        }
+    }
+}
+
+fn collect_suspended_children_from_ctx(
+    ctx_val: &serde_json::Value,
+    parent_identity: Option<ProcessIdentity>,
+    seen: &mut HashSet<ProcessIdentity>,
+    out: &mut Vec<ProcessIdentity>,
+) {
+    if let Some(arr) = ctx_val.get("suspended_children").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(id) = item
+                .as_str()
+                .and_then(ProcessIdentity::from_instance_id)
+                .filter(|id| id.create_time_100ns != 0 && Some(*id) != parent_identity)
+            {
+                if seen.insert(id) {
+                    out.push(id);
+                }
+            }
         }
     }
 }

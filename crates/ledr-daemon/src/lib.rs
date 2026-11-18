@@ -18,5 +18,8 @@ pub use ipc::{
     is_authorized_ui_caller, start_ipc_server, verify_authorized_caller_binary,
     verify_caller_identity, IpcServerHandle, PipeSecurityDescriptor, SERVICE_PIPE_SDDL,
 };
-pub use notify::{NoopNotificationDispatcher, NotificationDispatcher, Session0ToastLauncher};
+pub use notify::{
+    current_process_session_id, NoopNotificationDispatcher, NotificationDispatcher,
+    Session0ToastLauncher,
+};
 pub use process_table::{ActiveProcessEntry, ActiveProcessTable, ProcessStartResolution};

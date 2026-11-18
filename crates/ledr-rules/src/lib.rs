@@ -583,17 +583,53 @@ mod tests {
             &[wrong_root_rule]
         ));
 
-        // All-zero root thumbprint permits match without thumbprint pinning.
+        // Missing, empty, or all-zero root thumbprints MUST be rejected (SEC_0006 / L-04).
         let zero_root_rule = AllowlistRuleRecord {
             root_thumbprint: Some("0000000000000000000000000000000000000000".to_string()),
             allowed_target: None,
             ..rule_exact_dn.clone()
         };
-        assert!(is_allowed_by_rules(
+        assert!(!is_allowed_by_rules(
             &signed_identity,
             None,
             RuleScope::FileCanaryAllow,
             &[zero_root_rule]
+        ));
+
+        let none_root_rule = AllowlistRuleRecord {
+            root_thumbprint: None,
+            allowed_target: None,
+            ..rule_exact_dn.clone()
+        };
+        assert!(!is_allowed_by_rules(
+            &signed_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            &[none_root_rule]
+        ));
+
+        let empty_root_rule = AllowlistRuleRecord {
+            root_thumbprint: Some(String::new()),
+            allowed_target: None,
+            ..rule_exact_dn.clone()
+        };
+        assert!(!is_allowed_by_rules(
+            &signed_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            &[empty_root_rule]
+        ));
+
+        let blank_root_rule = AllowlistRuleRecord {
+            root_thumbprint: Some("   ".to_string()),
+            allowed_target: None,
+            ..rule_exact_dn.clone()
+        };
+        assert!(!is_allowed_by_rules(
+            &signed_identity,
+            None,
+            RuleScope::FileCanaryAllow,
+            &[blank_root_rule]
         ));
 
         // Optional sha256 on signed rule enforces hash match too.
@@ -713,5 +749,98 @@ mod tests {
             RuleScope::FileCanaryAllow,
             &[valid_unsigned_rule]
         ));
+    }
+
+    #[test]
+    fn rules_p2_05_default_allowlist_browsers_and_openssh_on_disk() {
+        use ledr_proto::RuleScope;
+
+        let allowlist_json = include_str!("../../../rules/default_allowlist.json");
+        let cfg = AllowlistConfig::from_json_str(allowlist_json).expect("parse default allowlist");
+
+        // Every signed rule in default_allowlist.json must pin a non-empty, non-zero root thumbprint.
+        for rule in &cfg.allowlist_rules {
+            if rule.signer_subject.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                let tp = rule
+                    .root_thumbprint
+                    .as_deref()
+                    .map(str::trim)
+                    .expect("signed default rule must set root_thumbprint");
+                assert!(
+                    !tp.is_empty() && !tp.chars().all(|c| c == '0'),
+                    "default rule {} has invalid all-zero/empty root_thumbprint",
+                    rule.rule_id
+                );
+            }
+        }
+
+        let candidates: &[(&[&str], &str, &str)] = &[
+            (
+                &[
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                ],
+                r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies",
+                r"C:\Users\alice\AppData\Local\Microsoft\Edge\User Data\Default\Cookies",
+            ),
+            (
+                &[
+                    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                ],
+                r"C:\Users\alice\AppData\Local\Microsoft\Edge\User Data\Default\Cookies",
+                r"C:\Users\alice\.ssh\id_ed25519",
+            ),
+            (
+                &[
+                    r"C:\Program Files\Mozilla Firefox\firefox.exe",
+                    r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+                ],
+                r"C:\Users\alice\AppData\Roaming\Mozilla\Firefox\Profiles\abc.default\cookies.sqlite",
+                r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx",
+            ),
+            (
+                &[r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"],
+                r"C:\Users\alice\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Cookies",
+                r"C:\Users\alice\.aws\credentials",
+            ),
+            (
+                &[r"C:\Windows\System32\OpenSSH\ssh.exe"],
+                r"C:\Users\alice\.ssh\id_ed25519",
+                r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies",
+            ),
+        ];
+
+        for (exe_candidates, allowed_target, disallowed_target) in candidates {
+            for exe in *exe_candidates {
+                let path = Path::new(exe);
+                if path.is_file() {
+                    let identity = BinaryIdentity::from_path(path);
+                    assert!(
+                        identity.authenticode.is_some(),
+                        "expected valid Authenticode on {exe}"
+                    );
+                    assert!(
+                        is_allowed_by_rules(
+                            &identity,
+                            Some(allowed_target),
+                            RuleScope::FileCanaryAllow,
+                            &cfg.allowlist_rules
+                        ),
+                        "expected {exe} ({:?}) to be allowed for {allowed_target}",
+                        identity.authenticode
+                    );
+                    assert!(
+                        !is_allowed_by_rules(
+                            &identity,
+                            Some(disallowed_target),
+                            RuleScope::FileCanaryAllow,
+                            &cfg.allowlist_rules
+                        ),
+                        "expected {exe} NOT to be allowed for {disallowed_target}"
+                    );
+                }
+            }
+        }
     }
 }

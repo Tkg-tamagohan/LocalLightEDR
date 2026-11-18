@@ -7,7 +7,9 @@ pub mod path_norm;
 pub mod privileges;
 pub mod wfp;
 
-pub use defense::{HoneypotManager, WindowsDefenseController, validate_target_process};
+pub use defense::{
+    HoneypotManager, WindowsDefenseController, collect_live_descendants, validate_target_process,
+};
 pub use etw::file_canary::{
     CanaryMatcher, is_autorun_registry_key, is_autorun_registry_key_u16,
     prefilter_and_classify_canary, prefilter_and_classify_canary_u16,

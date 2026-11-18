@@ -467,7 +467,7 @@ TTL パージは 1 時間周期でバックグラウンド実行し、ロック�
 ### Layer 4 オンデマンド UI と Chrome 拡張連携
 
 Worker 4 が担当する `apps/ledr-ui` は Tauri v2 で構築し、ウィンドウ閉鎖時はタスクトレイへ常駐させず WebView2 を含む全プロセスを即座に終了させてメモリ消費を 0 MB に戻す（`決定記録 L-08`）。
-`--notify <alert_id>` 引数で起動された場合はメインウィンドウを生成せずに WinRT トースト通知を発行して即終了し、ユーザーが通知（`ledr://alert/<id>`）をクリックした際は `--alert-id <id>` 付きで 1,000 ms 以内に起動する（`決定記録 L-08`）。
+`--notify <alert_id>` 引数で起動された場合はメインウィンドウを生成せずに WinRT トースト通知を発行して即終了し、ユーザーが通知（`ledr://alert/<id>`）をクリックした際は `--alert-id <id>` 付きで 1,000 ms 以内に起動する（`決定記録 L-08`）。プロトコル起動にはユーザー単位の `HKCU\Software\Classes\ledr` 登録を使用し、`--notify` 実行時（OS トースト有効時）に自動登録するほか `ledr-ui --register-uri` で手動登録できる（システム全体への登録は Phase 4 `AUTO-14` で対応）。
 
 画面は 3 つのコアビューで構成する（`決定記録 L-13`）。
 
@@ -557,7 +557,7 @@ cargo test -p ledr-store --test ttl_purge_lineage
 
 ### 実機検証
 
-1. 疑似攻撃シナリオ検証（Windows 10/11 の管理者昇格 PowerShell で実行）では、`ledr-daemon.exe` を稼働させた状態で `ledr-sim.exe run-all` を実行し、Phase 1〜3 の受け入れ条件（親子系譜記録、ダミー機密ファイルアクセス時のサスペンドと再開、おとり書込によるツリー封じ込め、WFP 動的遮断と強制終了時の通信不能回避）を確認する。
+1. 疑似攻撃シナリオ検証（Windows 10/11 の管理者昇格 PowerShell で実行）では、`ledr-daemon.exe` を稼働させた状態で `ledr-sim.exe run-all` を実行し、Phase 1〜3 の受け入れ条件（親子系譜記録、ダミー機密ファイルアクセス時のサスペンドと再開、おとり書込によるツリー封じ込め、WFP 動的遮断と強制終了時の通信不能回避）を確認する。なお、トースト通知（`ledr://alert/<id>`）クリック起動の検証にはユーザー単位の `HKCU\Software\Classes\ledr` 登録（`--notify` 実行時の自動登録または `ledr-ui --register-uri` の事前実行）を用い、システム全体のレジストリ登録は Phase 4 インストーラ（`AUTO-14`）で実施する。
 2. リソース上限の計測（10 分間アイドルおよび `cargo build` 負荷計測）では、ウィンドウ閉鎖状態で `Get-Process ledr-ui -ErrorAction SilentlyContinue` が 0 件（UI メモリ 0 MB）であること、`Get-Process ledr-daemon` の Working Set が 20 MB 以下かつ定常時 CPU 平均使用率が 0.5% 未満であることを確認する。
 3. Chrome 拡張 E2E 検証（Phase 4）では、`extensions/ledr-chrome-mv3` を Chrome のデベロッパーモードで読み込み、ローカル検証用 HTML 上で ClickFix 疑似ボタンと疑似 NRD パスワードフォームを操作してブラウザ警告と `ledr-ui` の記録を確認し、さらにローカルサーバーからダウンロードしたテスト実行ファイルの起動時にオリジン URL が View 1 と View 2 に表示されることを確認する。
 

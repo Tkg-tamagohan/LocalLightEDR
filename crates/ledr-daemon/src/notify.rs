@@ -19,13 +19,26 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
 };
-use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows::Win32::System::RemoteDesktop::{
+    ProcessIdToSessionId, WTSGetActiveConsoleSessionId, WTSQueryUserToken,
+};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    CreateProcessAsUserW, GetCurrentProcessId, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 const WTS_NO_CONSOLE_SESSION: u32 = 0xFFFF_FFFF;
+
+/// Queries the Windows session ID of the current process (`SEC_0004`).
+pub fn current_process_session_id() -> Result<u32, String> {
+    // SAFETY: `GetCurrentProcessId` takes no pointers and always succeeds.
+    let pid = unsafe { GetCurrentProcessId() };
+    let mut session_id: u32 = 0;
+    // SAFETY: `session_id` is a valid writable `u32` pointer for `ProcessIdToSessionId`.
+    unsafe { ProcessIdToSessionId(pid, &mut session_id) }
+        .map_err(|err| format!("ProcessIdToSessionId({pid}) failed: {err}"))?;
+    Ok(session_id)
+}
 
 /// Abstraction boundary for dispatching alert notifications (`L-08`).
 pub trait NotificationDispatcher: Send + Sync {
@@ -46,23 +59,37 @@ impl NotificationDispatcher for NoopNotificationDispatcher {
 ///
 /// When running in Session 0 (`LocalSystem` Windows Service), transitions across the session
 /// boundary into the active interactive user's token via `WTSQueryUserToken`, `DuplicateTokenEx`,
-/// and `CreateProcessAsUserW(..., CREATE_NO_WINDOW)`. When running non-privileged in `--foreground`
-/// dev mode (`ERROR_PRIVILEGE_NOT_HELD`, etc.), falls back to normal child spawning if
+/// and `CreateProcessAsUserW(..., CREATE_NO_WINDOW)`. When `allow_foreground_fallback` is
+/// `true` AND the daemon is NOT running in Session 0, falls back to normal child spawning if
 /// `ui_exe_path` exists, or logs a warning and returns `Ok(())` if missing.
 #[derive(Debug, Clone)]
 pub struct Session0ToastLauncher {
     ui_exe_path: PathBuf,
+    allow_foreground_fallback: bool,
 }
 
 impl Session0ToastLauncher {
-    /// Creates a [`Session0ToastLauncher`] targeting the specified `ledr-ui.exe` path.
+    /// Creates a [`Session0ToastLauncher`] targeting `ui_exe_path` with foreground fallback disabled
+    /// (safe-by-default for service contexts, `SEC_0004`).
     pub fn new(ui_exe_path: impl Into<PathBuf>) -> Self {
+        Self::with_foreground_fallback(ui_exe_path, false)
+    }
+
+    /// Creates a [`Session0ToastLauncher`] with explicit `allow_foreground_fallback` policy.
+    /// Even when `allow_foreground_fallback` is `true`, fallback is refused if the current
+    /// process runs in Session 0 (`SEC_0004`).
+    pub fn with_foreground_fallback(
+        ui_exe_path: impl Into<PathBuf>,
+        allow_foreground_fallback: bool,
+    ) -> Self {
         Self {
             ui_exe_path: ui_exe_path.into(),
+            allow_foreground_fallback,
         }
     }
 
-    /// Creates a [`Session0ToastLauncher`] pointing at [`AUTHORIZED_UI_EXE_PATH`].
+    /// Creates a [`Session0ToastLauncher`] pointing at [`AUTHORIZED_UI_EXE_PATH`] with
+    /// foreground fallback disabled.
     pub fn default_install_path() -> Self {
         Self::new(AUTHORIZED_UI_EXE_PATH)
     }
@@ -71,26 +98,75 @@ impl Session0ToastLauncher {
     pub fn ui_exe_path(&self) -> &Path {
         &self.ui_exe_path
     }
-}
 
-impl NotificationDispatcher for Session0ToastLauncher {
-    fn notify_alert(&self, alert: &AlertRecord) -> Result<(), String> {
+    /// Returns whether non-Session-0 foreground fallback spawning is enabled.
+    pub fn allow_foreground_fallback(&self) -> bool {
+        self.allow_foreground_fallback
+    }
+
+    /// Dispatches a toast notification using an explicit `current_session_id` result (useful for
+    /// deterministic Session 0 guard testing, `SEC_0004`).
+    pub fn notify_alert_with_session(
+        &self,
+        alert: &AlertRecord,
+        current_session_id: Result<u32, String>,
+    ) -> Result<(), String> {
         let alert_id = alert.alert_id.trim();
         if alert_id.is_empty() || alert_id.chars().any(|c| c == '\0' || c == '\r' || c == '\n') {
             return Err("invalid alert_id for toast notification".to_string());
         }
 
         if let Err(session0_err) = self.try_launch_in_active_session(alert_id) {
-            tracing::debug!(
-                alert_id = %alert_id,
-                ui_exe = %self.ui_exe_path.display(),
-                reason = %session0_err,
-                "Session 0 WTS toast launch unavailable; attempting foreground fallback"
-            );
-            return self.spawn_foreground_fallback(alert_id, &session0_err);
+            if !self.allow_foreground_fallback {
+                tracing::warn!(
+                    alert_id = %alert_id,
+                    ui_exe = %self.ui_exe_path.display(),
+                    reason = %session0_err,
+                    "Session 0 WTS toast launch unavailable and foreground fallback is disabled; skipping UI launch"
+                );
+                return Ok(());
+            }
+
+            match current_session_id {
+                Ok(0) => {
+                    tracing::warn!(
+                        alert_id = %alert_id,
+                        ui_exe = %self.ui_exe_path.display(),
+                        reason = %session0_err,
+                        "refusing foreground UI toast fallback in Session 0 (LocalSystem privilege boundary, SEC_0004)"
+                    );
+                    return Ok(());
+                }
+                Err(session_err) => {
+                    tracing::warn!(
+                        alert_id = %alert_id,
+                        ui_exe = %self.ui_exe_path.display(),
+                        wts_reason = %session0_err,
+                        session_err = %session_err,
+                        "refusing foreground UI toast fallback: unable to determine current session ID"
+                    );
+                    return Ok(());
+                }
+                Ok(session_id) => {
+                    tracing::debug!(
+                        alert_id = %alert_id,
+                        session_id,
+                        ui_exe = %self.ui_exe_path.display(),
+                        reason = %session0_err,
+                        "Session 0 WTS toast launch unavailable; attempting foreground fallback"
+                    );
+                    return self.spawn_foreground_fallback(alert_id, &session0_err);
+                }
+            }
         }
 
         Ok(())
+    }
+}
+
+impl NotificationDispatcher for Session0ToastLauncher {
+    fn notify_alert(&self, alert: &AlertRecord) -> Result<(), String> {
+        self.notify_alert_with_session(alert, current_process_session_id())
     }
 }
 

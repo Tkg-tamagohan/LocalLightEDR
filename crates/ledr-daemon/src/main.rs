@@ -5,8 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ledr_daemon::{start_ipc_server, DaemonConfig, DaemonEngine, Session0ToastLauncher};
-use ledr_proto::{AUTHORIZED_UI_EXE_PATH, IPC_PIPE_NAME, PROGRAM_DATA_DIR, SensorBackend};
-use ledr_rules::{load_rules_and_pruner_from_dir, EarlyPruner, SigmaEngine};
+use ledr_proto::{
+    AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, IPC_PIPE_NAME, PROGRAM_DATA_DIR,
+    SensorBackend,
+};
+use ledr_rules::{
+    compute_file_sha256_hex, load_rules_and_pruner_from_dir, EarlyPruner, SigmaEngine,
+};
 use ledr_sensor_win::defense::{HoneypotManager, WindowsDefenseController};
 use ledr_sensor_win::etw::{
     try_capture_running_processes, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
@@ -19,9 +24,13 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
     foreground: bool,
+    dev_bypass_auth: bool,
     db_path: Option<PathBuf>,
     rules_dir: Option<PathBuf>,
     pipe_name: String,
+    ui_sha256: Option<String>,
+    ui_signer: Option<String>,
+    ui_root_thumbprint: Option<String>,
     show_help: bool,
 }
 
@@ -29,9 +38,13 @@ impl Default for CliArgs {
     fn default() -> Self {
         Self {
             foreground: true,
+            dev_bypass_auth: false,
             db_path: None,
             rules_dir: None,
             pipe_name: IPC_PIPE_NAME.to_string(),
+            ui_sha256: None,
+            ui_signer: None,
+            ui_root_thumbprint: None,
             show_help: false,
         }
     }
@@ -51,6 +64,7 @@ where
         match text.as_ref() {
             "--foreground" => parsed.foreground = true,
             "--service-strict" => parsed.foreground = false,
+            "--dev-bypass-auth" => parsed.dev_bypass_auth = true,
             "--db" => {
                 let val = iter
                     .next()
@@ -69,12 +83,60 @@ where
                     .ok_or_else(|| anyhow::anyhow!("--pipe requires a Named Pipe path argument"))?;
                 parsed.pipe_name = val.to_string_lossy().into_owned();
             }
+            "--ui-sha256" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--ui-sha256 requires a SHA-256 hex argument"))?;
+                let trimmed = val.to_string_lossy().trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--ui-sha256 cannot be empty");
+                }
+                parsed.ui_sha256 = Some(trimmed);
+            }
+            "--ui-signer" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--ui-signer requires a signer subject argument"))?;
+                let trimmed = val.to_string_lossy().trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--ui-signer cannot be empty");
+                }
+                parsed.ui_signer = Some(trimmed);
+            }
+            "--ui-root-thumbprint" => {
+                let val = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--ui-root-thumbprint requires a thumbprint hex argument")
+                })?;
+                let trimmed = val.to_string_lossy().trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--ui-root-thumbprint cannot be empty");
+                }
+                parsed.ui_root_thumbprint = Some(trimmed);
+            }
             "--help" | "-h" => parsed.show_help = true,
             other => anyhow::bail!("unrecognized argument: {other}"),
         }
     }
 
     Ok(parsed)
+}
+
+fn resolve_existing_sha256(candidates: &[&Path]) -> Option<String> {
+    for path in candidates {
+        if path.is_file() {
+            match compute_file_sha256_hex(path) {
+                Ok(hash) => return Some(hash),
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "failed to compute SHA-256 for authorized IPC binary"
+                    );
+                }
+            }
+        }
+    }
+    None
 }
 
 fn open_store_with_fallback(explicit_db: Option<&Path>) -> anyhow::Result<(LedrStore, PathBuf)> {
@@ -154,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = parse_cli_args(std::env::args_os())?;
     if cli.show_help {
         println!(
-            "ledr-daemon [--foreground] [--db <path>] [--rules <dir>] [--pipe <name>]"
+            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>]"
         );
         return Ok(());
     }
@@ -181,20 +243,37 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let ui_exe = resolve_ui_exe_path(cli.foreground);
+    let authorized_ui_sha256 = cli.ui_sha256.clone().or_else(|| {
+        if cli.ui_signer.is_some() {
+            None
+        } else {
+            resolve_existing_sha256(&[Path::new(AUTHORIZED_UI_EXE_PATH), ui_exe.as_path()])
+        }
+    });
+    let authorized_bridge_sha256 =
+        resolve_existing_sha256(&[Path::new(AUTHORIZED_BRIDGE_EXE_PATH)]);
+
     let config = DaemonConfig {
         pipe_name: cli.pipe_name.clone(),
-        dev_mode_bypass_ui_auth: cli.foreground,
-        strict_pipe_dacl: !cli.foreground,
+        dev_mode_bypass_ui_auth: cli.dev_bypass_auth,
+        strict_pipe_dacl: !cli.dev_bypass_auth,
+        authorized_ui_sha256,
+        authorized_ui_signer: cli.ui_signer.clone(),
+        authorized_ui_root_thumbprint: cli.ui_root_thumbprint.clone(),
+        authorized_bridge_sha256,
         ..DaemonConfig::default()
     };
-    let ui_exe = resolve_ui_exe_path(cli.foreground);
     let engine = DaemonEngine::start_with_controllers(
         store,
         sigma,
         pruner,
         config,
         Arc::new(WindowsDefenseController::new()),
-        Arc::new(Session0ToastLauncher::new(ui_exe)),
+        Arc::new(Session0ToastLauncher::with_foreground_fallback(
+            ui_exe,
+            cli.foreground,
+        )),
     );
 
     let mut honeypot_mgr = HoneypotManager::new();
@@ -290,27 +369,55 @@ mod tests {
     fn cli_parses_defaults_and_flags() {
         let def = parse_cli_args(["ledr-daemon"]).expect("default args");
         assert!(def.foreground);
+        assert!(!def.dev_bypass_auth);
         assert_eq!(def.db_path, None);
         assert_eq!(def.rules_dir, None);
         assert_eq!(def.pipe_name, IPC_PIPE_NAME);
+        assert_eq!(def.ui_sha256, None);
+        assert_eq!(def.ui_signer, None);
+        assert_eq!(def.ui_root_thumbprint, None);
 
         let custom = parse_cli_args([
             "ledr-daemon",
             "--foreground",
+            "--dev-bypass-auth",
             "--db",
             r"C:\Temp\test.db",
             "--rules",
             r"C:\Temp\rules",
             "--pipe",
             r"\\.\pipe\custom-pipe",
+            "--ui-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--ui-signer",
+            "CN=LocalEDR",
+            "--ui-root-thumbprint",
+            "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
         ])
         .expect("custom args");
         assert!(custom.foreground);
+        assert!(custom.dev_bypass_auth);
         assert_eq!(custom.db_path, Some(PathBuf::from(r"C:\Temp\test.db")));
         assert_eq!(custom.rules_dir, Some(PathBuf::from(r"C:\Temp\rules")));
         assert_eq!(custom.pipe_name, r"\\.\pipe\custom-pipe");
+        assert_eq!(
+            custom.ui_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(custom.ui_signer.as_deref(), Some("CN=LocalEDR"));
+        assert_eq!(
+            custom.ui_root_thumbprint.as_deref(),
+            Some("3B1EFD3A66EA28B16697394703A72CA340A05BD5")
+        );
+
+        let service_strict = parse_cli_args(["ledr-daemon", "--service-strict"]).expect("service strict");
+        assert!(!service_strict.foreground);
+        assert!(!service_strict.dev_bypass_auth);
 
         assert!(parse_cli_args(["ledr-daemon", "--db"]).is_err());
+        assert!(parse_cli_args(["ledr-daemon", "--ui-sha256"]).is_err());
+        assert!(parse_cli_args(["ledr-daemon", "--ui-signer"]).is_err());
+        assert!(parse_cli_args(["ledr-daemon", "--ui-root-thumbprint"]).is_err());
         assert!(parse_cli_args(["ledr-daemon", "--unknown"]).is_err());
     }
 }

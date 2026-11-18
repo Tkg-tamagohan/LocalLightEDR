@@ -30,10 +30,12 @@ use crate::engine::DaemonEngine;
 
 const IPC_READ_CHUNK_BYTES: usize = 8_192;
 const SDDL_REVISION_1: u32 = 1;
+const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
 
 /// Strict Named Pipe SDDL permitting full access to `SYSTEM` and `Administrators`,
-/// and read/write access to `Interactive` users (`決定記録 L-09`).
-pub const SERVICE_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+/// and `FILE_GENERIC_READ | FILE_WRITE_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES` (`0x12019B`)
+/// to `Interactive` users (`決定記録 L-09`, `SEC_0003` — omits `FILE_CREATE_PIPE_INSTANCE = 0x0004`).
+pub const SERVICE_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)";
 
 /// Owned self-relative Windows security descriptor converted from SDDL (`L-09`).
 pub struct PipeSecurityDescriptor {
@@ -88,6 +90,43 @@ impl PipeSecurityDescriptor {
     pub fn byte_len(&self) -> u32 {
         self.sd_len
     }
+
+    /// Formats the DACL back into an SDDL string via `ConvertSecurityDescriptorToStringSecurityDescriptorW`.
+    pub fn to_sddl_string(&self) -> std::io::Result<String> {
+        struct LocalWideGuard(*mut u16);
+        impl Drop for LocalWideGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: Buffer was allocated by `ConvertSecurityDescriptorToStringSecurityDescriptorW`.
+                    unsafe {
+                        let _ = LocalFree(Some(HLOCAL(self.0 as *mut c_void)));
+                    }
+                    self.0 = std::ptr::null_mut();
+                }
+            }
+        }
+
+        let mut string_sd: *mut u16 = std::ptr::null_mut();
+        let mut string_sd_len: u32 = 0;
+        // SAFETY: `self.sd.0` is a valid self-relative security descriptor; `string_sd` is freed by `LocalWideGuard`.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                self.sd.0,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut string_sd,
+                &mut string_sd_len,
+            )
+        };
+        if ok == 0 || string_sd.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let _guard = LocalWideGuard(string_sd);
+        // SAFETY: `string_sd` contains at least `string_sd_len` UTF-16 code units.
+        let slice = unsafe { std::slice::from_raw_parts(string_sd, string_sd_len as usize) };
+        let nul_trimmed = slice.split(|&ch| ch == 0).next().unwrap_or(slice);
+        Ok(String::from_utf16_lossy(nul_trimmed))
+    }
 }
 
 impl Drop for PipeSecurityDescriptor {
@@ -114,6 +153,13 @@ extern "system" {
         string_sd_revision: u32,
         security_descriptor: *mut *mut c_void,
         security_descriptor_size: *mut u32,
+    ) -> i32;
+    fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        security_descriptor: *const c_void,
+        requested_string_sd_revision: u32,
+        security_information: u32,
+        string_security_descriptor: *mut *mut u16,
+        string_security_descriptor_len: *mut u32,
     ) -> i32;
 }
 
@@ -145,6 +191,7 @@ fn create_pipe_server(
     strict_dacl: bool,
 ) -> std::io::Result<NamedPipeServer> {
     let mut opts = ServerOptions::new();
+    opts.reject_remote_clients(true);
     if first_instance {
         opts.first_pipe_instance(true);
     }
@@ -193,29 +240,70 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
                 connect_res = server.connect() => {
                     match connect_res {
                         Ok(()) => {
-                            match Arc::clone(&client_semaphore).try_acquire_owned() {
-                                Ok(permit) => {
-                                    let client_pipe = server;
-                                    let client_engine = Arc::clone(&engine);
-                                    tokio::spawn(async move {
-                                        let _permit = permit;
-                                        if let Err(err) = handle_pipe_client(client_pipe, client_engine).await {
-                                            tracing::debug!(error = %err, "IPC client session ended");
-                                        }
-                                    });
-                                }
-                                Err(_) => {
-                                    tracing::warn!(
-                                        pipe = %loop_pipe_name,
-                                        max_concurrent_ipc_clients = max_clients,
-                                        "rejecting IPC client connection: concurrent client limit reached"
-                                    );
-                                    drop(server);
-                                }
-                            }
-
                             match create_pipe_server(&loop_pipe_name, false, strict_dacl) {
-                                Ok(next_server) => server = next_server,
+                                Ok(next_server) => {
+                                    let client_pipe = std::mem::replace(&mut server, next_server);
+                                    match Arc::clone(&client_semaphore).try_acquire_owned() {
+                                        Ok(permit) => {
+                                            let client_engine = Arc::clone(&engine);
+                                            tokio::spawn(async move {
+                                                let _permit = permit;
+                                                if let Err(err) =
+                                                    handle_pipe_client(client_pipe, client_engine)
+                                                        .await
+                                                {
+                                                    tracing::debug!(error = %err, "IPC client session ended");
+                                                }
+                                            });
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!(
+                                                pipe = %loop_pipe_name,
+                                                max_concurrent_ipc_clients = max_clients,
+                                                "rejecting IPC client connection: concurrent client limit reached"
+                                            );
+                                            drop(client_pipe);
+                                        }
+                                    }
+                                }
+                                Err(err)
+                                    if strict_dacl && err.kind() == ErrorKind::PermissionDenied =>
+                                {
+                                    // Under SERVICE_PIPE_SDDL, Interactive Users lack
+                                    // FILE_CREATE_PIPE_INSTANCE (0x0004), so a non-elevated
+                                    // daemon cannot open a second pipe instance. Finish and drop
+                                    // `client_pipe` completely so mio/kernel state resets cleanly,
+                                    // then recreate a brand-new NamedPipeServer instance.
+                                    tracing::debug!(
+                                        pipe = %loop_pipe_name,
+                                        "strict pipe ACL denies secondary instance creation in non-elevated context; cycling single pipe instance"
+                                    );
+                                    let client_pipe = server;
+                                    let mut stop_after_client = false;
+                                    tokio::select! {
+                                        biased;
+                                        _ = shutdown_rx.changed() => {
+                                            if *shutdown_rx.borrow() {
+                                                stop_after_client = true;
+                                            }
+                                        }
+                                        res = handle_pipe_client(client_pipe, Arc::clone(&engine)) => {
+                                            if let Err(io_err) = res {
+                                                tracing::debug!(error = %io_err, "IPC client session ended");
+                                            }
+                                        }
+                                    }
+                                    if stop_after_client {
+                                        break;
+                                    }
+                                    let Some(fresh_server) =
+                                        recreate_strict_pipe_with_retry(&loop_pipe_name, &mut shutdown_rx)
+                                            .await
+                                    else {
+                                        break;
+                                    };
+                                    server = fresh_server;
+                                }
                                 Err(err) => {
                                     tracing::error!(
                                         pipe = %loop_pipe_name,
@@ -243,6 +331,49 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
     })
 }
 
+async fn recreate_strict_pipe_with_retry(
+    pipe_name: &str,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<NamedPipeServer> {
+    const MAX_RECREATE_ATTEMPTS: usize = 50;
+    const RECREATE_RETRY_DELAY: Duration = Duration::from_millis(4);
+
+    for attempt in 0..MAX_RECREATE_ATTEMPTS {
+        match create_pipe_server(pipe_name, true, true) {
+            Ok(next_server) => return Some(next_server),
+            Err(err)
+                if attempt + 1 < MAX_RECREATE_ATTEMPTS
+                    && (err.kind() == ErrorKind::PermissionDenied
+                        || matches!(err.raw_os_error(), Some(231))) =>
+            {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            return None;
+                        }
+                    }
+                    _ = tokio::time::sleep(RECREATE_RETRY_DELAY) => {}
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    pipe = %pipe_name,
+                    error = %err,
+                    "failed to recreate strict Named Pipe instance after client close"
+                );
+                return None;
+            }
+        }
+    }
+
+    tracing::error!(
+        pipe = %pipe_name,
+        "timed out waiting for previous strict Named Pipe handle teardown"
+    );
+    None
+}
+
 /// Checks whether a caller executable path is authorized to execute mutating UI commands (`L-09`).
 pub fn is_authorized_ui_caller(caller_exe_path: Option<&str>, dev_mode_bypass: bool) -> bool {
     verify_authorized_caller_binary(
@@ -267,8 +398,12 @@ pub fn is_authorized_bridge_caller(caller_exe_path: Option<&str>, dev_mode_bypas
     )
 }
 
-/// Verifies an IPC caller executable against an expected protected path AND optional
-/// expected SHA-256 digest and Authenticode signer (`L-09`), preserving `dev_mode_bypass`.
+/// Verifies an IPC caller executable against an expected protected path AND cryptographic
+/// identity (`L-09`, `SEC_0002`, `SEC_0006`), preserving `dev_mode_bypass`.
+///
+/// When `!dev_mode_bypass` and neither `expected_sha256` nor `expected_signer` is specified,
+/// fails closed unless the binary at `caller_exe_path` carries a valid Authenticode signature
+/// with a non-empty, non-zero root thumbprint (never trusting path alone).
 pub fn verify_authorized_caller_binary(
     caller_exe_path: Option<&str>,
     expected_exe_path: &str,
@@ -287,17 +422,6 @@ pub fn verify_authorized_caller_binary(
         return false;
     }
 
-    let has_sha_pin = expected_sha256
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty());
-    let has_signer_pin = expected_signer
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty());
-
-    if !has_sha_pin && !has_signer_pin {
-        return true;
-    }
-
     let identity = BinaryIdentity::from_path(caller_path);
     verify_caller_identity(
         Some(&identity),
@@ -309,8 +433,8 @@ pub fn verify_authorized_caller_binary(
     )
 }
 
-/// Pure identity verification helper matching path, optional SHA-256, and optional
-/// Authenticode signer + root thumbprint (`L-09`).
+/// Pure identity verification helper matching path, optional SHA-256, and Authenticode
+/// signer + non-zero root thumbprint (`L-09`, `SEC_0002`, `SEC_0006`).
 pub fn verify_caller_identity(
     caller_identity: Option<&BinaryIdentity>,
     expected_exe_path: &str,
@@ -329,41 +453,67 @@ pub fn verify_caller_identity(
         return false;
     }
 
-    if let Some(expected_sha) = expected_sha256
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let sha_pin = expected_sha256.map(str::trim).filter(|s| !s.is_empty());
+    let signer_pin = expected_signer.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(expected_sha) = sha_pin {
         let matches = identity
             .sha256
             .as_deref()
             .map(str::trim)
-            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected_sha));
+            .is_some_and(|actual| !actual.is_empty() && actual.eq_ignore_ascii_case(expected_sha));
         if !matches {
             return false;
         }
     }
 
-    if let Some(expected_subj) = expected_signer
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(expected_subj) = signer_pin {
         let Some(auth) = identity.authenticode.as_ref() else {
             return false;
         };
         if !signer_subject_matches(&auth.signer_subject, expected_subj) {
             return false;
         }
-        if let Some(expected_tp) = expected_root_thumbprint
+        let Some(expected_tp) = expected_root_thumbprint
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.chars().all(|c| c == '0'))
+        else {
+            return false;
+        };
+        let actual_tp = auth.root_thumbprint.trim();
+        if actual_tp.is_empty()
+            || actual_tp.chars().all(|c| c == '0')
+            || !actual_tp.eq_ignore_ascii_case(expected_tp)
         {
-            let all_zeros = expected_tp.chars().all(|c| c == '0');
-            if !all_zeros
-                && (auth.root_thumbprint.trim().is_empty()
-                    || !auth.root_thumbprint.trim().eq_ignore_ascii_case(expected_tp))
-            {
-                return false;
-            }
+            return false;
+        }
+    } else if let Some(raw_tp) = expected_root_thumbprint {
+        let expected_tp = raw_tp.trim();
+        if expected_tp.is_empty() || expected_tp.chars().all(|c| c == '0') {
+            return false;
+        }
+        let Some(auth) = identity.authenticode.as_ref() else {
+            return false;
+        };
+        let actual_tp = auth.root_thumbprint.trim();
+        if actual_tp.is_empty()
+            || actual_tp.chars().all(|c| c == '0')
+            || !actual_tp.eq_ignore_ascii_case(expected_tp)
+        {
+            return false;
+        }
+    }
+
+    // SEC_0002: If neither SHA-256 nor signer was pinned, never allow on path match alone;
+    // require a valid Authenticode signature with a non-empty, non-zero root thumbprint.
+    if sha_pin.is_none() && signer_pin.is_none() {
+        let has_valid_authenticode = identity.authenticode.as_ref().is_some_and(|auth| {
+            let subj = auth.signer_subject.trim();
+            let tp = auth.root_thumbprint.trim();
+            !subj.is_empty() && !tp.is_empty() && !tp.chars().all(|c| c == '0')
+        });
+        if !has_valid_authenticode {
+            return false;
         }
     }
 

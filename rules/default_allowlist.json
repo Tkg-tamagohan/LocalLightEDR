@@ -34,13 +34,79 @@
       "created_by": "default_allowlist"
     },
     {
-      "rule_id": "ALLOW-LEDR-DAEMON",
-      "scope": "ProcessAllow",
-      "exe_path_pattern": "C:\\Program Files\\LocalEDR\\ledr-daemon.exe",
+      "rule_id": "ALLOW-BROWSER-CHROME",
+      "scope": "FileCanaryAllow",
+      "exe_path_pattern": "C:\\Program Files*\\Google\\Chrome\\Application\\chrome.exe",
       "sha256": null,
-      "signer_subject": "CN=LocalEDR, O=LocalEDR Contributors",
-      "root_thumbprint": "0000000000000000000000000000000000000000",
-      "allowed_target": null,
+      "signer_subject": "CN=Google LLC",
+      "root_thumbprint": "DDFB16CD4931C973A2037D3FC83A4D7D775D05E4",
+      "allowed_target": "*\\Google\\Chrome\\User Data\\*",
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    },
+    {
+      "rule_id": "ALLOW-BROWSER-CHROME-LEGACY-ROOT",
+      "scope": "FileCanaryAllow",
+      "exe_path_pattern": "C:\\Program Files*\\Google\\Chrome\\Application\\chrome.exe",
+      "sha256": null,
+      "signer_subject": "CN=Google LLC",
+      "root_thumbprint": "0563B8630D62D75ABBC8AB1E4BDFB5A899B24D43",
+      "allowed_target": "*\\Google\\Chrome\\User Data\\*",
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    },
+    {
+      "rule_id": "ALLOW-BROWSER-EDGE",
+      "scope": "FileCanaryAllow",
+      "exe_path_pattern": "C:\\Program Files*\\Microsoft\\Edge\\Application\\msedge.exe",
+      "sha256": null,
+      "signer_subject": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+      "root_thumbprint": "8F43288AD272F3103B6FB1428485EA3014C0BCFE",
+      "allowed_target": "*\\Microsoft\\Edge\\User Data\\*",
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    },
+    {
+      "rule_id": "ALLOW-BROWSER-FIREFOX",
+      "scope": "FileCanaryAllow",
+      "exe_path_pattern": "C:\\Program Files*\\Mozilla Firefox\\firefox.exe",
+      "sha256": null,
+      "signer_subject": "CN=Mozilla Corporation",
+      "root_thumbprint": "DDFB16CD4931C973A2037D3FC83A4D7D775D05E4",
+      "allowed_target": "*\\Mozilla\\Firefox\\Profiles\\*",
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    },
+    {
+      "rule_id": "ALLOW-BROWSER-FIREFOX-LEGACY-ROOT",
+      "scope": "FileCanaryAllow",
+      "exe_path_pattern": "C:\\Program Files*\\Mozilla Firefox\\firefox.exe",
+      "sha256": null,
+      "signer_subject": "CN=Mozilla Corporation",
+      "root_thumbprint": "0563B8630D62D75ABBC8AB1E4BDFB5A899B24D43",
+      "allowed_target": "*\\Mozilla\\Firefox\\Profiles\\*",
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    },
+    {
+      "rule_id": "ALLOW-BROWSER-BRAVE",
+      "scope": "FileCanaryAllow",
+      "exe_path_pattern": "C:\\Program Files*\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+      "sha256": null,
+      "signer_subject": "CN=Brave Software, Inc.",
+      "root_thumbprint": "7B0F360B775F76C94A12CA48445AA2D2A875701C",
+      "allowed_target": "*\\BraveSoftware\\Brave-Browser\\User Data\\*",
+      "created_at_ms": 0,
+      "created_by": "default_allowlist"
+    },
+    {
+      "rule_id": "ALLOW-OS-OPENSSH",
+      "scope": "FileCanaryAllow",
+      "exe_path_pattern": "C:\\Windows\\System32\\OpenSSH\\ssh*.exe",
+      "sha256": null,
+      "signer_subject": "CN=Microsoft Windows, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+      "root_thumbprint": "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+      "allowed_target": "*\\Users\\*\\.ssh\\*",
       "created_at_ms": 0,
       "created_by": "default_allowlist"
     }

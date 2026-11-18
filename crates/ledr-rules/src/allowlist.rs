@@ -94,8 +94,10 @@ fn normalize_path_char(ch: char) -> char {
 /// under `scope` using the `L-04` two-tier model:
 /// - **Signed tier**: when `rule.signer_subject` is present and non-empty, requires
 ///   `identity.authenticode` present, matching `signer_subject` (case-insensitive exact or CN),
-///   matching non-zero `root_thumbprint` (ignored if all `'0'`), optional `rule.sha256` match if set,
-///   `exe_path_pattern` match, and optional `allowed_target` match.
+///   a non-empty non-all-zero `rule.root_thumbprint` matching `authenticode.root_thumbprint`
+///   case-insensitively, optional `rule.sha256` match if set, `exe_path_pattern` match, and
+///   optional `allowed_target` match. Signed rules with missing, empty, or all-zero
+///   `root_thumbprint` never match.
 /// - **Unsigned tier**: when `rule.signer_subject` is absent/empty, requires `exe_path_pattern`
 ///   match, non-empty `rule.sha256` matching `identity.sha256`, and optional `allowed_target` match.
 ///   Never allows an unsigned rule with `sha256: None` or empty.
@@ -144,19 +146,20 @@ fn rule_matches_identity(
             if !signer_subject_matches(&auth.signer_subject, rule_signer) {
                 return false;
             }
-            if let Some(rule_tp) = rule
+            let Some(rule_tp) = rule
                 .root_thumbprint
                 .as_deref()
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && !s.chars().all(|c| c == '0'))
+            else {
+                return false;
+            };
+            let actual_tp = auth.root_thumbprint.trim();
+            if actual_tp.is_empty()
+                || actual_tp.chars().all(|c| c == '0')
+                || !actual_tp.eq_ignore_ascii_case(rule_tp)
             {
-                let all_zeros = rule_tp.chars().all(|c| c == '0');
-                if !all_zeros
-                    && (auth.root_thumbprint.trim().is_empty()
-                        || !auth.root_thumbprint.trim().eq_ignore_ascii_case(rule_tp))
-                {
-                    return false;
-                }
+                return false;
             }
             if let Some(rule_sha) = rule
                 .sha256
@@ -672,9 +675,16 @@ fn read_cert_subject_name(cert: *const CERT_CONTEXT) -> Option<String> {
     None
 }
 
-fn read_chain_root_thumbprint(
+const CERT_TRUST_IS_NOT_SIGNATURE_VALID: u32 = 0x0000_0008;
+const CERT_TRUST_IS_UNTRUSTED_ROOT: u32 = 0x0000_0020;
+const CERT_TRUST_IS_PARTIAL_CHAIN: u32 = 0x0001_0000;
+const CHAIN_FALLBACK_ERROR_MASK: u32 =
+    CERT_TRUST_IS_NOT_SIGNATURE_VALID | CERT_TRUST_IS_UNTRUSTED_ROOT | CERT_TRUST_IS_PARTIAL_CHAIN;
+
+fn build_chain_root_thumbprint(
     signer_cert: *const CERT_CONTEXT,
     additional_store: *mut c_void,
+    require_clean_trust: bool,
 ) -> Option<String> {
     let mut chain_para: CERT_CHAIN_PARA = unsafe { std::mem::zeroed() };
     chain_para.cb_size = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
@@ -701,6 +711,9 @@ fn read_chain_root_thumbprint(
     // SAFETY: `chain_ctx` was populated by `CertGetCertificateChain`.
     let chain = unsafe { &*chain_ctx };
     if chain.c_chain == 0 || chain.rgp_chain.is_null() {
+        return None;
+    }
+    if require_clean_trust && (chain.trust_status.dw_error_status & CHAIN_FALLBACK_ERROR_MASK) != 0 {
         return None;
     }
     // SAFETY: `rgp_chain` has at least `c_chain >= 1` entries.
@@ -743,6 +756,22 @@ fn read_chain_root_thumbprint(
 
     let used = (hash_len as usize).min(hash.len());
     Some(hash[..used].iter().map(|b| format!("{b:02X}")).collect())
+}
+
+fn read_chain_root_thumbprint(
+    signer_cert: *const CERT_CONTEXT,
+    additional_store: *mut c_void,
+) -> Option<String> {
+    // Prefer the direct system-store chain first so embedded cross-signed CA certs (e.g. DigiCert
+    // Trusted Root G4 cross-signed by Assured ID Root CA) do not shadow the direct Root anchor;
+    // fall back to `additional_store` when an intermediate CA is not cached locally.
+    if let Some(tp) = build_chain_root_thumbprint(signer_cert, ptr::null_mut(), true) {
+        return Some(tp);
+    }
+    if !additional_store.is_null() {
+        return build_chain_root_thumbprint(signer_cert, additional_store, false);
+    }
+    build_chain_root_thumbprint(signer_cert, ptr::null_mut(), false)
 }
 
 struct CatAdminGuard(isize);

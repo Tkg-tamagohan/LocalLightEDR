@@ -147,6 +147,18 @@ pub(crate) fn query_pragma_summary(conn: &Connection) -> Result<(String, i64, i6
     Ok((journal_mode, cache_size, mmap_size))
 }
 
+pub(crate) const PROCESS_COLS: &str = "process_instance_id, pid, parent_instance_id, ppid, exe_path, command_line, sha256, signer_subject, is_trusted_os, user_sid, origin_url, created_at_ms, exited_at_ms";
+pub(crate) const DNS_COLS: &str =
+    "id, timestamp_ms, process_instance_id, query_name, query_type, resolved_ips, is_nrd";
+pub(crate) const NETWORK_COLS: &str =
+    "id, timestamp_ms, process_instance_id, protocol, dst_ip, dst_port, domain_hint, action";
+pub(crate) const CANARY_COLS: &str =
+    "id, timestamp_ms, process_instance_id, target_path, category, access_mask, action_taken";
+pub(crate) const ALERT_COLS: &str = "alert_id, timestamp_ms, severity, source_layer, rule_id, title, process_instance_id, process_suspended, status, context_json, resolved_at_ms";
+pub(crate) const RULE_COLS: &str = "rule_id, scope, exe_path_pattern, sha256, signer_subject, root_thumbprint, allowed_target, created_at_ms, created_by";
+pub(crate) const DOWNLOAD_COLS: &str =
+    "id, file_path, sha256, tab_url, frame_url, referrer_url, downloaded_at_ms";
+
 fn to_u32(val: i64, field: &'static str) -> Result<u32, StoreError> {
     u32::try_from(val).map_err(|_| StoreError::InvalidValue {
         field,

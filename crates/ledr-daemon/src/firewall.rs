@@ -12,7 +12,8 @@ use ledr_proto::{
 use ledr_rules::{
     canonical_ip, evaluate_outbound_policy, matches_app_wide_network_allow,
     matches_app_wide_network_block, matches_network_allow_rule, matches_network_block_rule,
-    matches_path_pattern, BinaryIdentity, OutboundDecision,
+    matches_network_target, matches_path_pattern, parse_cidr_target, BinaryIdentity,
+    OutboundDecision,
 };
 
 use crate::engine::BinaryInspector;
@@ -69,6 +70,29 @@ pub struct WfpFailedOp {
     pub error: String,
 }
 
+/// Canonical key identifying a non-startup WFP operation failure (`(exe_key, remote_ip, is_remove)`).
+pub type WfpFailedOpKey = (String, Option<IpAddr>, bool);
+
+/// Snapshot of a filter origin promoted/demoted during reconciliation (plus any alert containment
+/// bindings cleared on promotion) so SQLite rollback can restore the exact pre-reconcile state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotedFilterSnapshot {
+    pub key: WfpTargetKey,
+    pub prev_origin: WfpFilterOrigin,
+    pub bound_alert_ids: Vec<String>,
+}
+
+/// Snapshot of a [`WfpFilterOrigin::DomainPolicy`] filter removed during reconciliation so
+/// SQLite rollback can re-install it in BFE (since `reconcile_persisted_rules` only rebuilds
+/// static [`WfpFilterOrigin::PersistedPolicy`] filters).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedDomainFilterSnapshot {
+    pub exe_path: String,
+    pub remote_ip: IpAddr,
+    pub allow: bool,
+    pub domain_hint: String,
+}
+
 /// Summary of a persisted-rule reconciliation pass against [`ActiveDefenseController`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WfpReconcileReport {
@@ -78,6 +102,9 @@ pub struct WfpReconcileReport {
     pub skipped_wildcard: usize,
     pub failed: usize,
     pub failed_ops: Vec<WfpFailedOp>,
+    pub prior_failed_keys: HashSet<WfpFailedOpKey>,
+    pub promoted_backups: Vec<PromotedFilterSnapshot>,
+    pub removed_domain_filters: Vec<RemovedDomainFilterSnapshot>,
 }
 
 impl WfpReconcileReport {
@@ -91,10 +118,77 @@ impl WfpReconcileReport {
 
     /// Formats a concise human-readable summary of all non-startup-preemptive WFP failures.
     pub fn policy_failure_summary(&self) -> String {
-        let details: Vec<String> = self
-            .failed_ops
+        Self::format_ops(self.failed_ops.iter().filter(|op| !op.is_startup_preemptive))
+    }
+
+    /// Returns the canonical keys of all non-startup failures observed in this report.
+    pub fn non_startup_failed_keys(&self) -> HashSet<WfpFailedOpKey> {
+        self.failed_ops
             .iter()
             .filter(|op| !op.is_startup_preemptive)
+            .map(|op| (op.exe_key.clone(), op.remote_ip, op.is_remove))
+            .collect()
+    }
+
+    /// Returns a formatted error summary ONLY if this reconciliation encountered a new
+    /// non-startup WFP failure affecting at least one rule in `affected_rules` (ignoring
+    /// pre-existing failures in `prior_failed_keys` and failures on unrelated executables/targets).
+    pub fn failure_summary_for_rules(&self, affected_rules: &[&AllowlistRuleRecord]) -> Option<String> {
+        let relevant: Vec<&WfpFailedOp> = self
+            .failed_ops
+            .iter()
+            .filter(|op| {
+                if op.is_startup_preemptive {
+                    return false;
+                }
+                let op_key = (op.exe_key.clone(), op.remote_ip, op.is_remove);
+                if self.prior_failed_keys.contains(&op_key) {
+                    return false;
+                }
+                affected_rules.iter().any(|rule| Self::op_matches_rule(op, rule))
+            })
+            .collect();
+        if relevant.is_empty() {
+            None
+        } else {
+            Some(Self::format_ops(relevant.into_iter()))
+        }
+    }
+
+    fn op_matches_rule(op: &WfpFailedOp, rule: &AllowlistRuleRecord) -> bool {
+        let pat = rule.exe_path_pattern.trim();
+        if pat.is_empty() {
+            return false;
+        }
+        let exe_matches = if !WfpRuleManager::is_wildcard_pattern(pat) {
+            WfpRuleManager::exe_key(pat) == op.exe_key
+        } else {
+            matches_path_pattern(&op.exe_key, pat)
+        };
+        if !exe_matches {
+            return false;
+        }
+        let Some(ip) = op.remote_ip else {
+            return true;
+        };
+        let Some(target) = rule
+            .allowed_target
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return true;
+        };
+        if parse_literal_target_ip(target).is_some() || parse_cidr_target(target).is_ok() {
+            return matches_network_target(target, ip, None);
+        }
+        // Domain / wildcard target rules only touch IP-specific WFP entries when removing
+        // DomainPolicy filters or updating IP permissions for that exe.
+        true
+    }
+
+    fn format_ops<'a>(ops: impl Iterator<Item = &'a WfpFailedOp>) -> String {
+        let details: Vec<String> = ops
             .map(|op| {
                 let verb = if op.is_remove { "remove" } else { "apply" };
                 match op.remote_ip {
@@ -115,6 +209,7 @@ pub struct WfpRuleManager {
     bound_alerts: HashMap<String, WfpTargetKey>,
     once_allowed_processes: HashMap<String, String>,
     startup_preemptive_exes: HashMap<String, String>,
+    last_non_startup_failures: HashSet<WfpFailedOpKey>,
     has_wildcard_network_rules: bool,
     has_domain_network_rules: bool,
 }
@@ -188,10 +283,21 @@ impl WfpRuleManager {
     }
 
     /// Returns `true` when at least one persisted `NetworkBlock`/`NetworkAllow` rule has a
-    /// non-empty non-literal-IP `allowed_target` (domain or wildcard target) eligible for
-    /// `DnsQuery` WFP pre-materialization.
+    /// non-empty domain or wildcard `allowed_target` (excluding literal IPs and CIDRs) requiring
+    /// `DnsQuery` high-priority lane promotion and WFP pre-materialization.
     pub fn has_domain_network_rules(&self) -> bool {
         self.has_domain_network_rules
+    }
+
+    /// Returns the tracking origin for an active WFP filter key if installed.
+    pub fn filter_origin(&self, exe_path: &str, remote_ip: Option<IpAddr>) -> Option<&WfpFilterOrigin> {
+        let key = Self::target_key(exe_path, remote_ip);
+        self.installed.get(&key).map(|e| &e.origin)
+    }
+
+    /// Returns `true` when `alert_id` is currently bound to a non-persisted app-wide block.
+    pub fn is_alert_bound(&self, alert_id: &str) -> bool {
+        self.bound_alerts.contains_key(alert_id)
     }
 
     /// Returns `true` when `process_instance_id` received an `AllowOnce` network approval.
@@ -871,7 +977,10 @@ impl WfpRuleManager {
         inspector: &dyn BinaryInspector,
         defense: &dyn ActiveDefenseController,
     ) -> WfpReconcileReport {
-        let mut report = WfpReconcileReport::default();
+        let mut report = WfpReconcileReport {
+            prior_failed_keys: self.last_non_startup_failures.clone(),
+            ..Default::default()
+        };
 
         // 1. Collect candidate concrete executable paths from persisted rules, running processes,
         //    and startup-pinned pre-restricted executables.
@@ -891,7 +1000,9 @@ impl WfpRuleManager {
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .is_some_and(|target| parse_literal_target_ip(target).is_none())
+                .is_some_and(|target| {
+                    parse_literal_target_ip(target).is_none() && parse_cidr_target(target).is_err()
+                })
             {
                 has_domain_rules = true;
             }
@@ -1087,24 +1198,22 @@ impl WfpRuleManager {
             }
         }
 
-        for key in keys_to_promote {
-            if let Some(entry) = self.installed.get_mut(&key) {
-                entry.origin = WfpFilterOrigin::PersistedPolicy;
-                report.promoted += 1;
-            }
-            self.bound_alerts.retain(|_, k| k != &key);
-        }
-
-        for key in keys_to_demote_preemptive {
-            if let Some(entry) = self.installed.get_mut(&key) {
-                entry.origin = WfpFilterOrigin::Preemptive;
-            }
-        }
+        let mut failed_exe_keys: HashSet<String> = HashSet::new();
 
         for key in keys_to_remove {
             if let Some(entry) = self.installed.get(&key).cloned() {
                 match defense.remove_wfp_rule(entry.handle) {
                     Ok(()) => {
+                        if let WfpFilterOrigin::DomainPolicy { domain_hint } = &entry.origin {
+                            if let Some(remote_ip) = key.1 {
+                                report.removed_domain_filters.push(RemovedDomainFilterSnapshot {
+                                    exe_path: entry.exe_path.clone(),
+                                    remote_ip,
+                                    allow: entry.allow,
+                                    domain_hint: domain_hint.clone(),
+                                });
+                            }
+                        }
                         self.installed.remove(&key);
                         self.bound_alerts.retain(|_, k| k != &key);
                         report.removed += 1;
@@ -1116,6 +1225,7 @@ impl WfpRuleManager {
                             error = %err,
                             "failed to remove obsolete WFP rule during reconciliation"
                         );
+                        failed_exe_keys.insert(key.0.clone());
                         report.failed += 1;
                         report.failed_ops.push(WfpFailedOp {
                             exe_key: key.0,
@@ -1166,6 +1276,7 @@ impl WfpRuleManager {
                         error = %err,
                         "failed to apply persisted WFP firewall rule"
                     );
+                    failed_exe_keys.insert(key.0.clone());
                     report.failed += 1;
                     report.failed_ops.push(WfpFailedOp {
                         exe_key: key.0,
@@ -1175,6 +1286,44 @@ impl WfpRuleManager {
                         error: err,
                     });
                 }
+            }
+        }
+
+        // 4b. Promote/demote matching existing filters ONLY AFTER remove & add succeed for `exe_k`,
+        //     capturing snapshots so any subsequent rollback restores pre-promote origins & bindings.
+        for key in keys_to_promote {
+            if failed_exe_keys.contains(&key.0) {
+                continue;
+            }
+            if let Some(entry) = self.installed.get_mut(&key) {
+                let bound_alert_ids: Vec<String> = self
+                    .bound_alerts
+                    .iter()
+                    .filter(|(_, k)| *k == &key)
+                    .map(|(alert_id, _)| alert_id.clone())
+                    .collect();
+                report.promoted_backups.push(PromotedFilterSnapshot {
+                    key: key.clone(),
+                    prev_origin: entry.origin.clone(),
+                    bound_alert_ids,
+                });
+                entry.origin = WfpFilterOrigin::PersistedPolicy;
+                report.promoted += 1;
+            }
+            self.bound_alerts.retain(|_, k| k != &key);
+        }
+
+        for key in keys_to_demote_preemptive {
+            if failed_exe_keys.contains(&key.0) {
+                continue;
+            }
+            if let Some(entry) = self.installed.get_mut(&key) {
+                report.promoted_backups.push(PromotedFilterSnapshot {
+                    key: key.clone(),
+                    prev_origin: entry.origin.clone(),
+                    bound_alert_ids: Vec::new(),
+                });
+                entry.origin = WfpFilterOrigin::Preemptive;
             }
         }
 
@@ -1224,7 +1373,61 @@ impl WfpRuleManager {
             }
         }
 
+        self.last_non_startup_failures = report.non_startup_failed_keys();
         report
+    }
+
+    /// Restores filter origins and alert containment bindings overwritten during a failed
+    /// reconciliation pass whose SQLite mutation was rolled back.
+    pub fn restore_promoted_filter_states(&mut self, backups: &[PromotedFilterSnapshot]) {
+        for snap in backups {
+            if let Some(entry) = self.installed.get_mut(&snap.key) {
+                entry.origin = snap.prev_origin.clone();
+                for alert_id in &snap.bound_alert_ids {
+                    self.bound_alerts
+                        .insert(alert_id.clone(), snap.key.clone());
+                }
+            }
+        }
+    }
+
+    /// Best-effort restoration of [`WfpFilterOrigin::DomainPolicy`] IP filters removed before a
+    /// subsequent WFP failure caused SQLite rollback.
+    pub fn restore_removed_domain_filters(
+        &mut self,
+        removed: &[RemovedDomainFilterSnapshot],
+        defense: &dyn ActiveDefenseController,
+    ) {
+        for snap in removed {
+            let key = Self::target_key(&snap.exe_path, Some(snap.remote_ip));
+            if self.installed.contains_key(&key) {
+                continue;
+            }
+            match defense.add_wfp_app_rule(Path::new(&snap.exe_path), Some(snap.remote_ip), snap.allow) {
+                Ok(handle) => {
+                    self.installed.insert(
+                        key,
+                        InstalledWfpFilter {
+                            handle,
+                            exe_path: snap.exe_path.clone(),
+                            allow: snap.allow,
+                            origin: WfpFilterOrigin::DomainPolicy {
+                                domain_hint: snap.domain_hint.clone(),
+                            },
+                        },
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        exe_path = %snap.exe_path,
+                        remote_ip = %snap.remote_ip,
+                        allow = snap.allow,
+                        error = %err,
+                        "failed to restore removed DomainPolicy WFP filter during rollback"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1395,5 +1598,130 @@ mod tests {
         assert_eq!(revoked, 1);
         assert!(!fw.has_any_permit_filter_for_exe(app));
         assert!(fw.has_active_filter(app, Some(shared_ip), false));
+    }
+
+    #[test]
+    fn firewall_reconcile_scoping_and_rollback_fidelity() {
+        let mut fw = WfpRuleManager::new();
+        let defense = StubDefense::new();
+        let inspector = StubInspector("a".repeat(64));
+
+        // 1. Pre-existing failure on broken.exe + CIDR rule does NOT flip `has_domain_network_rules`.
+        let broken_exe = r"C:\Tools\broken.exe";
+        let healthy_exe = r"C:\Tools\healthy.exe";
+        let cidr_exe = r"C:\Tools\cidr.exe";
+        defense.fail_exes.lock().unwrap().push("broken.exe".to_string());
+
+        let broken_rule = AllowlistRuleRecord {
+            rule_id: "R-broken".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: broken_exe.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 1,
+            created_by: "test".to_string(),
+        };
+        let cidr_rule = AllowlistRuleRecord {
+            rule_id: "R-cidr".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: cidr_exe.to_string(),
+            sha256: Some("a".repeat(64)),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("198.51.100.0/24".to_string()),
+            created_at_ms: 2,
+            created_by: "test".to_string(),
+        };
+        let r1 = fw.reconcile_persisted_rules(&[broken_rule.clone(), cidr_rule.clone()], &[], &inspector, &defense);
+        assert!(!fw.has_domain_network_rules(), "CIDR rule must not count as domain rule");
+        assert!(r1.failure_summary_for_rules(&[&broken_rule]).is_some());
+        assert!(r1.failure_summary_for_rules(&[&cidr_rule]).is_none());
+
+        // Subsequent unrelated healthy rule mutation ignores pre-existing `broken.exe` failure.
+        let healthy_rule = AllowlistRuleRecord {
+            rule_id: "R-healthy".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: healthy_exe.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 3,
+            created_by: "test".to_string(),
+        };
+        let r2 = fw.reconcile_persisted_rules(
+            &[broken_rule.clone(), cidr_rule.clone(), healthy_rule.clone()],
+            &[],
+            &inspector,
+            &defense,
+        );
+        assert!(
+            r2.failure_summary_for_rules(&[&healthy_rule]).is_none(),
+            "pre-existing unrelated failure must not fail healthy rule mutation"
+        );
+        assert!(fw.has_active_filter(healthy_exe, None, false));
+
+        // 2. Promotion / DomainPolicy remove rollback snapshots:
+        //    Simulate `healthy_exe` having both a TransientContainment block bound to alert "AL-1"
+        //    and a DomainPolicy IP block while removing `healthy_rule` fails on `remove_wfp_rule`.
+        let transient_app = r"C:\Tools\transient.exe";
+        let h_tr = defense.add_wfp_app_rule(Path::new(transient_app), None, false).unwrap();
+        fw.register_transient_containment("AL-1", transient_app, h_tr, &defense);
+        let dom_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
+        fw.ensure_domain_policy_block(transient_app, dom_ip, "bad.example", &defense)
+            .unwrap();
+        let tr_rule = AllowlistRuleRecord {
+            rule_id: "R-tr-block".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: transient_app.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 4,
+            created_by: "test".to_string(),
+        };
+        let dom_rule = AllowlistRuleRecord {
+            rule_id: "R-dom-block".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: transient_app.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("bad.example".to_string()),
+            created_at_ms: 5,
+            created_by: "test".to_string(),
+        };
+
+        // Reconcile succeeds: `TransientContainment` promoted to `PersistedPolicy` and `AL-1` unbound,
+        // and `promoted_backups` records pre-promote snapshot.
+        let r3 = fw.reconcile_persisted_rules(&[tr_rule.clone(), dom_rule], &[], &inspector, &defense);
+        assert_eq!(fw.filter_origin(transient_app, None), Some(&WfpFilterOrigin::PersistedPolicy));
+        assert!(!fw.is_alert_bound("AL-1"));
+        assert_eq!(r3.promoted_backups.len(), 1);
+
+        // Restoring promotion snapshot brings back TransientContainment + AL-1 binding.
+        fw.restore_promoted_filter_states(&r3.promoted_backups);
+        assert_eq!(
+            fw.filter_origin(transient_app, None),
+            Some(&WfpFilterOrigin::TransientContainment)
+        );
+        assert!(fw.is_alert_bound("AL-1"));
+
+        // Removing `dom_rule` deletes `DomainPolicy` filter and captures `removed_domain_filters`;
+        // rollback re-installs `DomainPolicy` filter into BFE + `WfpRuleManager`.
+        let r4 = fw.reconcile_persisted_rules(&[], &[], &inspector, &defense);
+        assert_eq!(r4.removed_domain_filters.len(), 1);
+        assert!(!fw.has_active_filter(transient_app, Some(dom_ip), false));
+        fw.restore_removed_domain_filters(&r4.removed_domain_filters, &defense);
+        assert!(fw.has_active_filter(transient_app, Some(dom_ip), false));
+        assert_eq!(
+            fw.filter_origin(transient_app, Some(dom_ip)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hint: "bad.example".to_string()
+            })
+        );
     }
 }

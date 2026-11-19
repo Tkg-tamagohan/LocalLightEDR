@@ -262,9 +262,109 @@ pub fn classify_outbound_risk(exe_path: &str) -> OutboundRiskClass {
     OutboundRiskClass::GeneralUnknown
 }
 
+/// Parses an IPv4 or IPv6 CIDR target (`a.b.c.d/prefix` or `addr/prefix`), normalizing the
+/// network address by zeroing host bits and canonicalizing IPv4-mapped IPv6 prefixes (`>= 96`).
+pub fn parse_cidr_target(pattern: &str) -> Result<(IpAddr, u8), String> {
+    let trimmed = pattern.trim();
+    let Some((addr_part, prefix_part)) = trimmed.split_once('/') else {
+        return Err(format!("invalid CIDR `{trimmed}`: missing `/prefix`"));
+    };
+    if prefix_part.contains('/') {
+        return Err(format!("invalid CIDR `{trimmed}`: multiple `/` separators"));
+    }
+    let addr_str = addr_part.trim();
+    let prefix_str = prefix_part.trim();
+    if prefix_str.is_empty() || !prefix_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "invalid CIDR prefix length in `{trimmed}`: expected unsigned integer"
+        ));
+    }
+    let prefix_len: u8 = prefix_str
+        .parse::<u8>()
+        .map_err(|_| format!("invalid CIDR prefix length in `{trimmed}`"))?;
+    let addr: IpAddr = addr_str
+        .parse()
+        .map_err(|_| format!("invalid CIDR base IP `{addr_str}` in `{trimmed}`"))?;
+
+    match addr {
+        IpAddr::V4(v4) => {
+            if prefix_len > 32 {
+                return Err(format!(
+                    "IPv4 CIDR prefix length {prefix_len} out of range 0..=32 in `{trimmed}`"
+                ));
+            }
+            let mask: u32 = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            Ok((IpAddr::V4(Ipv4Addr::from(u32::from(v4) & mask)), prefix_len))
+        }
+        IpAddr::V6(v6) => {
+            if prefix_len > 128 {
+                return Err(format!(
+                    "IPv6 CIDR prefix length {prefix_len} out of range 0..=128 in `{trimmed}`"
+                ));
+            }
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                if prefix_len >= 96 {
+                    let v4_prefix = prefix_len - 96;
+                    let mask: u32 = if v4_prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - v4_prefix)
+                    };
+                    return Ok((
+                        IpAddr::V4(Ipv4Addr::from(u32::from(mapped_v4) & mask)),
+                        v4_prefix,
+                    ));
+                }
+            }
+            let mask: u128 = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            Ok((
+                IpAddr::V6(Ipv6Addr::from(u128::from(v6) & mask)),
+                prefix_len,
+            ))
+        }
+    }
+}
+
+fn matches_cidr(network: IpAddr, prefix_len: u8, canon_dst: IpAddr) -> bool {
+    match (network, canon_dst) {
+        (IpAddr::V4(net), IpAddr::V4(dst)) => {
+            if prefix_len > 32 {
+                return false;
+            }
+            let mask: u32 = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            (u32::from(dst) & mask) == u32::from(net)
+        }
+        (IpAddr::V6(net), IpAddr::V6(dst)) => {
+            if prefix_len > 128 {
+                return false;
+            }
+            let mask: u128 = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            (u128::from(dst) & mask) == u128::from(net)
+        }
+        _ => false,
+    }
+}
+
 /// Matches a network rule target pattern (`allowed_target`) against `dst_ip` and optional
 /// `domain_hint` (canonical IP comparison supporting IPv4-mapped IPv6 and uncompressed IPv6,
-/// plus ASCII case-insensitive wildcard `*` matching normalizing trailing DNS dots).
+/// IPv4/IPv6 CIDR matching, plus ASCII case-insensitive wildcard `*` matching normalizing trailing
+/// DNS dots).
 pub fn matches_network_target(
     pattern: &str,
     dst_ip: IpAddr,
@@ -275,6 +375,10 @@ pub fn matches_network_target(
         return true;
     }
     let canon_dst = canonical_ip(dst_ip);
+    if pat.contains('/') {
+        return parse_cidr_target(pat)
+            .is_ok_and(|(net, prefix_len)| matches_cidr(net, prefix_len, canon_dst));
+    }
     if !pat.contains('*') {
         if let Ok(pat_ip) = pat.parse::<IpAddr>() {
             if canonical_ip(pat_ip) == canon_dst {
@@ -302,7 +406,8 @@ pub fn matches_network_target(
 /// - valid 64-char hex `sha256` whenever specified,
 /// - consistent `(signer_subject, non-zero root_thumbprint)` pairing whenever either is specified,
 /// - `L-04` identity requirement on all `*Allow` scopes (`sha256` or `signer_subject` + non-zero `root_thumbprint`),
-/// - `AUTO-02` Never-Block protection rejecting concrete `NetworkBlock` rules for protected OS / LocalEDR binaries.
+/// - `AUTO-02` Never-Block protection rejecting concrete `NetworkBlock` rules for protected OS / LocalEDR binaries,
+/// - valid IPv4/IPv6 CIDR syntax when `NetworkAllow` / `NetworkBlock` specifies a `/prefix` target.
 pub fn validate_policy_rule(rule: &AllowlistRuleRecord) -> Result<(), String> {
     if rule.rule_id.trim().is_empty() {
         return Err("rule_id cannot be empty".to_string());
@@ -344,6 +449,19 @@ pub fn validate_policy_rule(rule: &AllowlistRuleRecord) -> Result<(), String> {
     }
     if thumbprint.is_some() && signer.is_none() {
         return Err("root_thumbprint requires signer_subject (L-04)".to_string());
+    }
+
+    if matches!(rule.scope, RuleScope::NetworkAllow | RuleScope::NetworkBlock) {
+        if let Some(target) = rule
+            .allowed_target
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if target.contains('/') {
+                parse_cidr_target(target)?;
+            }
+        }
     }
 
     match rule.scope {

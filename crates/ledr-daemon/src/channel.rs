@@ -377,6 +377,7 @@ impl TwoLaneReceiver {
 #[derive(Debug)]
 pub struct OutboundLaneClassifier {
     outbound_firewall_enabled: bool,
+    has_domain_rules: AtomicBool,
     protected_pids: RwLock<HashSet<u32>>,
     steady_pids: RwLock<HashSet<u32>>,
 }
@@ -386,6 +387,7 @@ impl OutboundLaneClassifier {
     pub fn new(outbound_firewall_enabled: bool) -> Self {
         Self {
             outbound_firewall_enabled,
+            has_domain_rules: AtomicBool::new(false),
             protected_pids: RwLock::new(HashSet::new()),
             steady_pids: RwLock::new(HashSet::new()),
         }
@@ -394,6 +396,19 @@ impl OutboundLaneClassifier {
     /// Returns `true` when outbound firewall lane promotion is enabled.
     pub fn outbound_firewall_enabled(&self) -> bool {
         self.outbound_firewall_enabled
+    }
+
+    /// Updates whether any persisted domain/wildcard network rule is active so [`ClassifiedEventSender`]
+    /// promotes external [`SensorEvent::DnsQuery`] events onto `HighPriority` ahead of
+    /// [`SensorEvent::NetworkConnect`] without losing domain correlation under telemetry pressure.
+    pub fn set_has_domain_rules(&self, has_domain_rules: bool) {
+        self.has_domain_rules
+            .store(has_domain_rules, Ordering::Release);
+    }
+
+    /// Returns `true` when domain-scoped outbound policy rules require lossless DNS ingestion.
+    pub fn has_domain_rules(&self) -> bool {
+        self.has_domain_rules.load(Ordering::Acquire)
     }
 
     /// Returns `true` when `pid` is currently marked steady (protected OS, app-wide allowed,
@@ -409,6 +424,15 @@ impl OutboundLaneClassifier {
     /// promoted to the high-priority lane (`L-10`).
     pub fn should_promote_network_connect(&self, pid: u32, dst_ip: IpAddr) -> bool {
         self.outbound_firewall_enabled && is_external_ip(dst_ip) && !self.is_steady_pid(pid)
+    }
+
+    /// Returns `true` when an external [`SensorEvent::DnsQuery`] for `pid` must be promoted to the
+    /// high-priority lane so domain-scoped network rules are never starved behind telemetry overflow.
+    pub fn should_promote_dns_query(&self, pid: u32, resolved_ips: &[IpAddr]) -> bool {
+        self.outbound_firewall_enabled
+            && self.has_domain_rules()
+            && !self.is_steady_pid(pid)
+            && resolved_ips.iter().any(|ip| is_external_ip(*ip))
     }
 
     /// Marks `pid` as steady (bounded at `ACTIVE_PROCESS_TABLE_CAPACITY`).
@@ -494,11 +518,15 @@ impl ClassifiedEventSender {
 
     /// Returns `true` when `event` will be promoted to the high-priority lane.
     pub fn should_promote(&self, event: &SensorEvent) -> bool {
-        matches!(
-            event,
-            SensorEvent::NetworkConnect { pid, dst_ip, .. }
-                if self.classifier.should_promote_network_connect(*pid, *dst_ip)
-        )
+        match event {
+            SensorEvent::NetworkConnect { pid, dst_ip, .. } => {
+                self.classifier.should_promote_network_connect(*pid, *dst_ip)
+            }
+            SensorEvent::DnsQuery {
+                pid, resolved_ips, ..
+            } => self.classifier.should_promote_dns_query(*pid, resolved_ips),
+            _ => false,
+        }
     }
 
     /// Sends `event`, promoting unverified external `NetworkConnect` events to high-priority.
@@ -771,8 +799,80 @@ mod tests {
         assert_eq!(drained[0], (unknown_ext, EventLane::HighPriority));
         assert_eq!(drained.len(), 4);
 
-        // Disabled firewall mode never promotes NetworkConnect.
+        // Disabled firewall mode never promotes NetworkConnect or DnsQuery.
         let disabled = OutboundLaneClassifier::new(false);
         assert!(!disabled.should_promote_network_connect(500, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        disabled.set_has_domain_rules(true);
+        assert!(!disabled.should_promote_dns_query(500, &[IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]));
+    }
+
+    #[tokio::test]
+    async fn classified_sender_promotes_dns_query_only_when_domain_rules_active() {
+        let (tx, mut rx) = TwoLaneChannel::with_capacities(8, 2).split();
+        let classifier = Arc::new(OutboundLaneClassifier::new(true));
+        let classified = ClassifiedEventSender::new(tx, Arc::clone(&classifier));
+        classifier.mark_steady(99);
+
+        let ext_dns = SensorEvent::DnsQuery {
+            pid: 500,
+            query_name: "api.allowed.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            timestamp_ms: 1,
+        };
+        let steady_dns = SensorEvent::DnsQuery {
+            pid: 99,
+            query_name: "steady.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            timestamp_ms: 2,
+        };
+        let local_dns = SensorEvent::DnsQuery {
+            pid: 500,
+            query_name: "intranet.local".to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))],
+            timestamp_ms: 3,
+        };
+
+        // Without domain rules, DnsQuery stays on Telemetry so telemetry backpressure can shed it.
+        assert!(!classified.should_promote(&ext_dns));
+
+        // Enabling domain rules promotes non-steady external DnsQuery onto HighPriority in order
+        // before NetworkConnect, even while Telemetry drops older messages.
+        classifier.set_has_domain_rules(true);
+        assert!(classified.should_promote(&ext_dns));
+        assert!(!classified.should_promote(&steady_dns));
+        assert!(!classified.should_promote(&local_dns));
+
+        let connect = SensorEvent::NetworkConnect {
+            pid: 500,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: 4,
+        };
+        classified.send(ext_dns.clone()).await.expect("dns");
+        classified.send(connect.clone()).await.expect("connect");
+
+        // Overflow Telemetry with steady noise; HighPriority DNS + Connect remain lossless & ordered.
+        for i in 0..5 {
+            classified
+                .send(SensorEvent::DnsQuery {
+                    pid: 99,
+                    query_name: format!("overflow-{i}.example"),
+                    query_type: 1,
+                    resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+                    timestamp_ms: 10 + i,
+                })
+                .await
+                .expect("noise");
+        }
+        assert_eq!(classified.telemetry_dropped(), 3);
+        classified.close();
+        let drained = rx.drain_ready_with_lane();
+        assert_eq!(drained[0], (ext_dns, EventLane::HighPriority));
+        assert_eq!(drained[1], (connect, EventLane::HighPriority));
     }
 }

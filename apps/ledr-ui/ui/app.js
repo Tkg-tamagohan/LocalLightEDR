@@ -820,6 +820,13 @@
     const riskClass = ctx.risk_class || null;
     const wfpBlocked = Boolean(ctx.wfp_blocked);
     const wfpFilterId = ctx.wfp_filter_id ?? null;
+    const attribution = ctx.attribution || null;
+    const candidatePids = Array.isArray(ctx.candidate_pids)
+      ? ctx.candidate_pids
+      : [];
+    const candidateInstanceIds = Array.isArray(ctx.candidate_instance_ids)
+      ? ctx.candidate_instance_ids
+      : [];
     const isNrd = Boolean(ctx.is_nrd);
     const isHomograph = Boolean(ctx.is_homograph);
     const isFirstSeenDomain = Boolean(ctx.is_first_seen_domain);
@@ -923,6 +930,9 @@
       riskClass,
       wfpBlocked,
       wfpFilterId,
+      attribution,
+      candidatePids,
+      candidateInstanceIds,
       isNrd,
       isHomograph,
       isFirstSeenDomain,
@@ -1193,9 +1203,12 @@
           ? "Process tree frozen (NtSuspendProcess) — awaiting decision"
           : "Process frozen (NtSuspendProcess) — awaiting decision";
     } else if (alert.status === "Pending") {
-      subline = details.wfpBlocked
-        ? "Dynamic WFP outbound block active — awaiting decision"
-        : "Active alert — process not suspended";
+      subline =
+        details.attribution === "app_level_ambiguous"
+          ? "Dynamic WFP block active (multi-instance PID ambiguous — no process suspended)"
+          : details.wfpBlocked
+            ? "Dynamic WFP outbound block active — awaiting decision"
+            : "Active alert — process not suspended";
     } else if (alert.status === "TerminatedBlocked") {
       bannerClass += " is-terminated";
       subline = alert.resolved_at_ms
@@ -1257,6 +1270,10 @@
       const riskClassBadge = details.riskClass
         ? `<span class="badge badge-metric">${escapeHtml(details.riskClass)}</span>`
         : "";
+      const attributionBadge =
+        details.attribution === "app_level_ambiguous"
+          ? `<span class="badge badge-unsigned" title="Multiple concurrent instances matched WFP executable path; no individual PID was suspended">App-Level (Ambiguous PID)</span>`
+          : "";
 
       el.triageDetectionDl.innerHTML = `
         <dt>Destination</dt>
@@ -1264,7 +1281,7 @@
         <dt>Domain / Risk</dt>
         <dd class="mono-wrap">${escapeHtml(details.domainHint || "-")} ${riskBadges.join(" ")}</dd>
         <dt>Containment</dt>
-        <dd>${wfpBadge} ${riskClassBadge}</dd>
+        <dd>${wfpBadge} ${riskClassBadge} ${attributionBadge}</dd>
         <dt>Rule ID</dt>
         <dd class="mono-wrap">${escapeHtml(alert.rule_id)}${
           details.matchedRuleId
@@ -1312,13 +1329,20 @@
         }`
       : `<span class="badge badge-unsigned">Unsigned</span>`;
 
+    const pidInstanceLabel =
+      details.attribution === "app_level_ambiguous"
+        ? `Ambiguous (candidates: ${
+            details.candidatePids.length > 0 ? details.candidatePids.join(", ") : "none"
+          }) | app-level`
+        : `${
+            details.pid !== null && details.pid !== undefined ? String(details.pid) : "-"
+          } | ${details.processInstanceId || "-"}`;
+
     el.triageLineageDl.innerHTML = `
       <dt>Executable</dt>
       <dd class="mono-wrap">${escapeHtml(details.exePath || "-")}</dd>
       <dt>PID / Instance</dt>
-      <dd class="mono-wrap">${escapeHtml(
-        details.pid !== null && details.pid !== undefined ? String(details.pid) : "-",
-      )} | ${escapeHtml(details.processInstanceId || "-")}</dd>
+      <dd class="mono-wrap">${escapeHtml(pidInstanceLabel)}</dd>
       <dt>Signer</dt>
       <dd>${signerHtml}</dd>
       <dt>SHA-256</dt>
@@ -1420,7 +1444,7 @@
     }
     const domainEntered = isNetworkDomainTarget("NetworkAllow", el.optAllowDest.value);
     el.targetScopeNote.textContent =
-      "Network domain targets match resolved IPs (shared CDN IPs inherit rule; Deny wins).";
+      "Accepts literal IP, CIDR (e.g. 198.51.100.0/24), or domain/wildcard (WFP enforces matched IPs; Deny wins).";
     el.targetScopeNote.className = domainEntered
       ? "tier-constraint is-warn"
       : "tier-constraint";
@@ -1453,10 +1477,10 @@
     el.optAddBlockRule.disabled = !unresolved || state.isResolvingAlert;
     el.optAllowDest.disabled = !unresolved || state.isResolvingAlert;
     el.optAllowDest.placeholder = details.isNetworkAlert
-      ? "e.g. 93.184.216.34 or *.example.com"
+      ? "e.g. 93.184.216.34, 198.51.100.0/24, or *.example.com"
       : "e.g. C:\\Users\\*\\Cookies";
     el.optAllowDest.title = details.isNetworkAlert
-      ? "IP/CIDR or domain (WFP enforces resolved IPs; shared CDN IPs inherit rule; Deny wins)"
+      ? "Literal IP, CIDR prefix, or domain/wildcard (WFP enforces matched IPs; shared CDN IPs inherit rule; Deny wins)"
       : "Optional file path pattern (e.g. C:\\Users\\*\\Cookies)";
     syncTriageTargetScopeNote(details.isNetworkAlert);
     el.btnTerminateBlock.disabled = !unresolved || state.isResolvingAlert;
@@ -1496,6 +1520,14 @@
       previewStatus = "ApprovedOnce";
     } else {
       const allowDestRaw = el.optAllowDest.value.trim();
+      if (details.isNetworkAlert && allowDestRaw.includes("/") && !isLiteralIpOrCidr(allowDestRaw)) {
+        state.triageFeedback = {
+          ok: false,
+          message: "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
+        };
+        renderTriageView();
+        return;
+      }
       decision = {
         AllowPermanent: {
           use_signer_if_available:
@@ -2107,12 +2139,12 @@
   function syncPolicyFormHints() {
     const scope = el.ruleScopeInput.value;
     if (scope === "NetworkBlock" || scope === "NetworkAllow") {
-      el.ruleTargetInput.placeholder = "e.g. 93.184.216.34 or *.example.com";
+      el.ruleTargetInput.placeholder = "e.g. 93.184.216.34, 198.51.100.0/24, or *.example.com";
       el.ruleTargetInput.title =
-        "IP/CIDR or domain (WFP enforces resolved IPs; shared CDN IPs affected)";
+        "Literal IP, CIDR prefix, or domain/wildcard (WFP enforces matched/resolved IPs; shared CDN IPs affected)";
       const domainEntered = isNetworkDomainTarget(scope, el.ruleTargetInput.value);
       el.policyScopeNote.textContent =
-        "Network domain targets enforce per resolved WFP IP (shared CDN IPs match; Deny overrides Allow).";
+        "Accepts literal IP, CIDR (e.g. 198.51.100.0/24), or domain/wildcard (WFP enforces matched IPs; Deny overrides Allow).";
       el.policyScopeNote.className = domainEntered
         ? "tier-constraint is-warn"
         : "tier-constraint";
@@ -2189,6 +2221,19 @@
       state.policyFeedback = {
         ok: false,
         message: "Allow rules require SHA-256 or Signer Subject + Root Thumbprint (L-04).",
+      };
+      renderPolicyView();
+      return;
+    }
+
+    if (
+      (scope === "NetworkBlock" || scope === "NetworkAllow") &&
+      target.includes("/") &&
+      !isLiteralIpOrCidr(target)
+    ) {
+      state.policyFeedback = {
+        ok: false,
+        message: "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
       };
       renderPolicyView();
       return;

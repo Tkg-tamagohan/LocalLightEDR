@@ -19,7 +19,13 @@ use crate::RulesError;
 struct NrdCancelState {
     cancelled: AtomicBool,
     #[cfg(windows)]
-    active_request_handle: std::sync::Mutex<Option<usize>>,
+    active_request: std::sync::Mutex<Option<ActiveWinHttpRequest>>,
+}
+
+#[cfg(windows)]
+struct ActiveWinHttpRequest {
+    raw_handle: usize,
+    ctx: Arc<AsyncWinHttpContext>,
 }
 
 /// Cooperative cancellation token for [`fetch_nrd_feed_url_cancellable`] and
@@ -50,26 +56,29 @@ impl NrdCancelToken {
 
     /// Cancels any current or future NRD fetch associated with this token.
     ///
-    /// On Windows, atomically takes and closes any active WinHTTP request handle so an in-flight
-    /// synchronous request aborts immediately without waiting for network timeouts.
+    /// On Windows, wakes any waiting async WinHTTP operation immediately and atomically takes and
+    /// closes the active asynchronous WinHTTP request handle (whose `AsyncWinHttpContext` stays
+    /// alive via `Arc` until `WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING` fires).
     pub fn cancel(&self) {
         self.state.cancelled.store(true, Ordering::SeqCst);
         #[cfg(windows)]
         {
-            let raw_handle = {
+            let active = {
                 let mut guard = self
                     .state
-                    .active_request_handle
+                    .active_request
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 guard.take()
             };
-            if let Some(handle_addr) = raw_handle {
-                // SAFETY: `handle_addr` was registered from `WinHttpOpenRequest` and `take()`
+            if let Some(req) = active {
+                req.ctx.mark_cancelled();
+                // SAFETY: `req.raw_handle` was opened with `WINHTTP_FLAG_ASYNC` and `take()`
                 // guarantees `WinHttpCloseHandle` is invoked at most once across `cancel()` and
-                // `CancellableWinHttpHandle::drop()`.
+                // `CancellableWinHttpHandle::drop()`. `req.ctx` stays alive until
+                // `WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING`.
                 unsafe {
-                    let _ = winhttp_ffi::WinHttpCloseHandle(handle_addr as *mut std::ffi::c_void);
+                    let _ = winhttp_ffi::WinHttpCloseHandle(req.raw_handle as *mut std::ffi::c_void);
                 }
             }
         }
@@ -860,8 +869,35 @@ mod winhttp_ffi {
     pub const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
     pub const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
     pub const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+    pub const WINHTTP_FLAG_ASYNC: u32 = 0x1000_0000;
     pub const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
     pub const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+    pub const WINHTTP_OPTION_CONTEXT_VALUE: u32 = 45;
+    pub const WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS: u32 = 0xFFFF_FFFF;
+    pub const WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING: u32 = 0x0000_0800;
+    pub const WINHTTP_CALLBACK_STATUS_SECURE_FAILURE: u32 = 0x0001_0000;
+    pub const WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE: u32 = 0x0002_0000;
+    pub const WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE: u32 = 0x0004_0000;
+    pub const WINHTTP_CALLBACK_STATUS_READ_COMPLETE: u32 = 0x0008_0000;
+    pub const WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: u32 = 0x0020_0000;
+    pub const WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE: u32 = 0x0040_0000;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct WinHttpAsyncResult {
+        pub dw_result: usize,
+        pub dw_error: u32,
+    }
+
+    pub type WinHttpStatusCallback = Option<
+        unsafe extern "system" fn(
+            h_internet: *mut c_void,
+            dw_context: usize,
+            dw_internet_status: u32,
+            lpv_status_information: *mut c_void,
+            dw_status_information_length: u32,
+        ),
+    >;
 
     #[link(name = "winhttp.dll", kind = "raw-dylib", modifiers = "+verbatim")]
     extern "system" {
@@ -893,6 +929,18 @@ mod winhttp_ffi {
             pwsz_referrer: *const u16,
             ppwsz_accept_types: *const *const u16,
             dw_flags: u32,
+        ) -> *mut c_void;
+        pub fn WinHttpSetOption(
+            h_internet: *mut c_void,
+            dw_option: u32,
+            lp_buffer: *const c_void,
+            dw_buffer_length: u32,
+        ) -> i32;
+        pub fn WinHttpSetStatusCallback(
+            h_internet: *mut c_void,
+            lpfn_internet_callback: WinHttpStatusCallback,
+            dw_notification_flags: u32,
+            dw_reserved: usize,
         ) -> *mut c_void;
         pub fn WinHttpSendRequest(
             h_request: *mut c_void,
@@ -927,6 +975,216 @@ mod winhttp_ffi {
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
+enum AsyncWaitOutcome {
+    Pending,
+    SendRequestComplete,
+    HeadersAvailable,
+    DataAvailable(u32),
+    ReadComplete(u32),
+    Error(String),
+    Cancelled,
+}
+
+#[cfg(windows)]
+struct AsyncWinHttpState {
+    outcome: AsyncWaitOutcome,
+    last_secure_failure_flags: Option<u32>,
+    cancelled: bool,
+}
+
+#[cfg(windows)]
+struct AsyncWinHttpContext {
+    expected_handle: usize,
+    callback_released: AtomicBool,
+    state: std::sync::Mutex<AsyncWinHttpState>,
+    cv: std::sync::Condvar,
+    // Heap-backed I/O buffer kept inside this `Arc`-owned context so that even if
+    // cancellation causes `fetch_http_winhttp_cancellable` to unwind before
+    // `WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING`, WinHTTP never sees a dangling stack buffer.
+    io_buf: std::sync::Mutex<Vec<u8>>,
+}
+
+#[cfg(windows)]
+impl AsyncWinHttpContext {
+    fn new(expected_handle: usize) -> Self {
+        Self {
+            expected_handle,
+            callback_released: AtomicBool::new(false),
+            state: std::sync::Mutex::new(AsyncWinHttpState {
+                outcome: AsyncWaitOutcome::Pending,
+                last_secure_failure_flags: None,
+                cancelled: false,
+            }),
+            cv: std::sync::Condvar::new(),
+            io_buf: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn prepare_wait(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.outcome = if guard.cancelled {
+            AsyncWaitOutcome::Cancelled
+        } else {
+            AsyncWaitOutcome::Pending
+        };
+    }
+
+    fn wait_for_outcome(&self, cancel: &NrdCancelToken) -> AsyncWaitOutcome {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if guard.cancelled || cancel.is_cancelled() {
+                return AsyncWaitOutcome::Cancelled;
+            }
+            match &guard.outcome {
+                AsyncWaitOutcome::Pending => {
+                    let (next_guard, _) = self
+                        .cv
+                        .wait_timeout(guard, std::time::Duration::from_millis(250))
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = next_guard;
+                }
+                _ => {
+                    return std::mem::replace(&mut guard.outcome, AsyncWaitOutcome::Pending);
+                }
+            }
+        }
+    }
+
+    fn mark_cancelled(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.cancelled = true;
+        guard.outcome = AsyncWaitOutcome::Cancelled;
+        self.cv.notify_all();
+    }
+
+    fn complete(&self, outcome: AsyncWaitOutcome) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.cancelled {
+            guard.outcome = outcome;
+        }
+        self.cv.notify_all();
+    }
+
+    fn record_secure_failure(&self, flags: Option<u32>) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.last_secure_failure_flags = flags;
+    }
+
+    fn complete_request_error(&self, msg: String) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.cancelled {
+            let full_msg = if let Some(flags) = guard.last_secure_failure_flags {
+                format!("{msg} (tls_flags=0x{flags:08X})")
+            } else {
+                msg
+            };
+            guard.outcome = AsyncWaitOutcome::Error(full_msg);
+        }
+        self.cv.notify_all();
+    }
+
+    fn complete_handle_closing(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(guard.outcome, AsyncWaitOutcome::Pending) {
+            guard.outcome = if guard.cancelled {
+                AsyncWaitOutcome::Cancelled
+            } else {
+                AsyncWaitOutcome::Error("WinHTTP request handle closed unexpectedly".to_string())
+            };
+        }
+        self.cv.notify_all();
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn winhttp_async_status_callback(
+    h_internet: *mut std::ffi::c_void,
+    dw_context: usize,
+    dw_internet_status: u32,
+    lpv_status_information: *mut std::ffi::c_void,
+    dw_status_information_length: u32,
+) {
+    use winhttp_ffi::*;
+
+    if dw_context == 0 {
+        return;
+    }
+    let ctx_ptr = dw_context as *const AsyncWinHttpContext;
+    // SAFETY: `cb_ptr = Arc::into_raw(...)` keeps `AsyncWinHttpContext` alive until
+    // `WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING` releases that ref below, which WinHTTP guarantees
+    // is the final callback ever delivered for this handle.
+    let ctx = unsafe { &*ctx_ptr };
+    if (h_internet as usize) != ctx.expected_handle {
+        return;
+    }
+
+    match dw_internet_status {
+        WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => {
+            ctx.complete(AsyncWaitOutcome::SendRequestComplete);
+        }
+        WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => {
+            ctx.complete(AsyncWaitOutcome::HeadersAvailable);
+        }
+        WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE => {
+            if !lpv_status_information.is_null()
+                && dw_status_information_length as usize >= std::mem::size_of::<u32>()
+            {
+                // SAFETY: WinHTTP passes `*const u32` (`DWORD*`) for `DATA_AVAILABLE`.
+                let avail = unsafe { *(lpv_status_information as *const u32) };
+                ctx.complete(AsyncWaitOutcome::DataAvailable(avail));
+            } else {
+                ctx.complete(AsyncWaitOutcome::Error(
+                    "WinHTTP DATA_AVAILABLE missing byte count".to_string(),
+                ));
+            }
+        }
+        WINHTTP_CALLBACK_STATUS_READ_COMPLETE => {
+            ctx.complete(AsyncWaitOutcome::ReadComplete(dw_status_information_length));
+        }
+        WINHTTP_CALLBACK_STATUS_SECURE_FAILURE => {
+            let flags = if !lpv_status_information.is_null()
+                && dw_status_information_length as usize >= std::mem::size_of::<u32>()
+            {
+                // SAFETY: WinHTTP passes `*const u32` (`DWORD*`) flags for `SECURE_FAILURE`.
+                Some(unsafe { *(lpv_status_information as *const u32) })
+            } else {
+                None
+            };
+            ctx.record_secure_failure(flags);
+        }
+        WINHTTP_CALLBACK_STATUS_REQUEST_ERROR => {
+            let msg = if !lpv_status_information.is_null()
+                && dw_status_information_length as usize
+                    >= std::mem::size_of::<WinHttpAsyncResult>()
+            {
+                // SAFETY: WinHTTP passes `*const WinHttpAsyncResult` for `REQUEST_ERROR`.
+                let res = unsafe { &*(lpv_status_information as *const WinHttpAsyncResult) };
+                let os_err = std::io::Error::from_raw_os_error(res.dw_error as i32);
+                format!(
+                    "async error {} ({os_err}) at op={}",
+                    res.dw_error, res.dw_result
+                )
+            } else {
+                "unknown async WinHTTP request error".to_string()
+            };
+            ctx.complete_request_error(msg);
+        }
+        WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING => {
+            ctx.complete_handle_closing();
+            if !ctx.callback_released.swap(true, Ordering::AcqRel) {
+                // SAFETY: Releases the `Arc::into_raw` count reserved for the WinHTTP callback.
+                // No WinHTTP callback can fire for this handle after `HANDLE_CLOSING`.
+                unsafe {
+                    drop(Arc::from_raw(ctx_ptr));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(windows)]
 fn fetch_http_winhttp_cancellable(
     parsed: &ParsedHttpUrl,
     max_bytes: usize,
@@ -949,57 +1207,79 @@ fn fetch_http_winhttp_cancellable(
         }
     }
 
-    // RAII guard for the cancellable request handle: `take()`s from `active_request_handle`
+    // RAII guard for the cancellable async request handle: `take()`s from `active_request`
     // before closing so `NrdCancelToken::cancel()` and `Drop` NEVER double-close the same
-    // HINTERNET handle (`BUG_0005`).
+    // HINTERNET handle.
     struct CancellableWinHttpHandle<'a> {
         cancel: &'a NrdCancelToken,
         raw: *mut c_void,
+        ctx: Arc<AsyncWinHttpContext>,
+        cb_raw: usize,
     }
 
     impl<'a> CancellableWinHttpHandle<'a> {
-        fn register(cancel: &'a NrdCancelToken, raw_request: *mut c_void) -> Result<Self, String> {
+        fn register(
+            cancel: &'a NrdCancelToken,
+            raw_request: *mut c_void,
+            ctx: Arc<AsyncWinHttpContext>,
+            cb_raw: usize,
+        ) -> Result<Self, String> {
             let mut guard = cancel
                 .state
-                .active_request_handle
+                .active_request
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if cancel.state.cancelled.load(Ordering::SeqCst) {
                 drop(guard);
-                // SAFETY: `raw_request` was opened by `WinHttpOpenRequest` and never published.
+                ctx.mark_cancelled();
+                // SAFETY: `raw_request` has callback installed; `WinHttpCloseHandle` triggers
+                // `WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING` which releases `cb_raw`'s `Arc`.
                 unsafe {
                     let _ = WinHttpCloseHandle(raw_request);
                 }
                 return Err("NRD feed download cancelled".to_string());
             }
-            *guard = Some(raw_request as usize);
+            *guard = Some(ActiveWinHttpRequest {
+                raw_handle: raw_request as usize,
+                ctx: Arc::clone(&ctx),
+            });
             Ok(Self {
                 cancel,
                 raw: raw_request,
+                ctx,
+                cb_raw,
             })
         }
 
         fn raw(&self) -> *mut c_void {
             self.raw
         }
+
+        fn ctx(&self) -> &AsyncWinHttpContext {
+            &self.ctx
+        }
+
+        fn context_value(&self) -> usize {
+            self.cb_raw
+        }
     }
 
     impl Drop for CancellableWinHttpHandle<'_> {
         fn drop(&mut self) {
-            let raw_handle = {
+            let active = {
                 let mut guard = self
                     .cancel
                     .state
-                    .active_request_handle
+                    .active_request
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 guard.take()
             };
-            if let Some(handle_addr) = raw_handle {
+            if let Some(req) = active {
                 // SAFETY: `take()` ensures `WinHttpCloseHandle` is called at most once
                 // between `NrdCancelToken::cancel()` and `CancellableWinHttpHandle::drop()`.
                 unsafe {
-                    let _ = WinHttpCloseHandle(handle_addr as *mut c_void);
+                    let _ = WinHttpCloseHandle(req.raw_handle as *mut c_void);
                 }
             }
         }
@@ -1015,6 +1295,8 @@ fn fetch_http_winhttp_cancellable(
     let verb_w = to_wide("GET");
     let path_w = to_wide(&parsed.path_and_query);
 
+    // Open session in true async mode (`WINHTTP_FLAG_ASYNC`) so cross-thread
+    // `WinHttpCloseHandle` from `NrdCancelToken::cancel()` obeys WinHTTP's handle contract.
     // SAFETY: All pointers are NUL-terminated UTF-16 or NULL; returned handles use RAII guards.
     let raw_session = unsafe {
         let h = WinHttpOpen(
@@ -1022,7 +1304,7 @@ fn fetch_http_winhttp_cancellable(
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             ptr::null(),
             ptr::null(),
-            0,
+            WINHTTP_FLAG_ASYNC,
         );
         if h.is_null() {
             WinHttpOpen(
@@ -1030,7 +1312,7 @@ fn fetch_http_winhttp_cancellable(
                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                 ptr::null(),
                 ptr::null(),
-                0,
+                WINHTTP_FLAG_ASYNC,
             )
         } else {
             h
@@ -1057,14 +1339,13 @@ fn fetch_http_winhttp_cancellable(
     // SAFETY: `session.0` is valid and `host_w` is NUL-terminated UTF-16.
     let raw_connect = unsafe { WinHttpConnect(session.0, host_w.as_ptr(), parsed.port, 0) };
     if raw_connect.is_null() {
+        let err = std::io::Error::last_os_error();
         if cancel.is_cancelled() {
             return Err("NRD feed download cancelled".to_string());
         }
         return Err(format!(
-            "WinHttpConnect(`{}:{}`) failed: {}",
-            parsed.host,
-            parsed.port,
-            std::io::Error::last_os_error()
+            "WinHttpConnect(`{}:{}`) failed: {err}",
+            parsed.host, parsed.port
         ));
     }
     let connect = OwnedWinHttpHandle(raw_connect);
@@ -1091,49 +1372,129 @@ fn fetch_http_winhttp_cancellable(
         )
     };
     if raw_request.is_null() {
+        let err = std::io::Error::last_os_error();
         if cancel.is_cancelled() {
             return Err("NRD feed download cancelled".to_string());
         }
         return Err(format!(
-            "WinHttpOpenRequest(`{}`) failed: {}",
-            parsed.path_and_query,
-            std::io::Error::last_os_error()
+            "WinHttpOpenRequest(`{}`) failed: {err}",
+            parsed.path_and_query
         ));
     }
-    let request = CancellableWinHttpHandle::register(cancel, raw_request)?;
+
+    if cancel.is_cancelled() {
+        // SAFETY: `raw_request` was opened above and no callback is installed yet.
+        unsafe {
+            let _ = WinHttpCloseHandle(raw_request);
+        }
+        return Err("NRD feed download cancelled".to_string());
+    }
+
+    let ctx = Arc::new(AsyncWinHttpContext::new(raw_request as usize));
+    let cb_ptr = Arc::into_raw(Arc::clone(&ctx));
+    let cb_raw = cb_ptr as usize;
+
+    // SAFETY: Sets `cb_raw` (`*const AsyncWinHttpContext`) as request context before callback
+    // registration so `HANDLE_CLOSING` always receives a valid context pointer.
+    let set_ctx_ok = unsafe {
+        WinHttpSetOption(
+            raw_request,
+            WINHTTP_OPTION_CONTEXT_VALUE,
+            (&cb_raw as *const usize).cast::<c_void>(),
+            std::mem::size_of::<usize>() as u32,
+        )
+    };
+    if set_ctx_ok == 0 {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: Callback is not installed yet; reclaim `cb_ptr` and close `raw_request`.
+        unsafe {
+            drop(Arc::from_raw(cb_ptr));
+            let _ = WinHttpCloseHandle(raw_request);
+        }
+        return Err(format!("WinHttpSetOption(CONTEXT_VALUE) failed: {err}"));
+    }
+
+    // SAFETY: `raw_request` is valid and `cb_ptr` stays alive until `HANDLE_CLOSING`.
+    let prev_cb = unsafe {
+        WinHttpSetStatusCallback(
+            raw_request,
+            Some(winhttp_async_status_callback),
+            WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS,
+            0,
+        )
+    };
+    if (prev_cb as usize) == usize::MAX {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: Callback installation failed (`WINHTTP_INVALID_STATUS_CALLBACK`); reclaim `cb_ptr`.
+        unsafe {
+            drop(Arc::from_raw(cb_ptr));
+            let _ = WinHttpCloseHandle(raw_request);
+        }
+        return Err(format!("WinHttpSetStatusCallback failed: {err}"));
+    }
+
+    let request = CancellableWinHttpHandle::register(cancel, raw_request, ctx, cb_raw)?;
 
     if cancel.is_cancelled() {
         return Err("NRD feed download cancelled".to_string());
     }
 
-    // SAFETY: `request.raw()` is a valid WinHTTP request handle.
+    request.ctx().prepare_wait();
+    // SAFETY: `request.raw()` is a valid async WinHTTP request handle with `cb_raw` context.
     let send_ok = unsafe {
-        WinHttpSendRequest(request.raw(), ptr::null(), 0, ptr::null_mut(), 0, 0, 0)
+        WinHttpSendRequest(
+            request.raw(),
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            0,
+            0,
+            request.context_value(),
+        )
     };
     if send_ok == 0 {
+        let err = std::io::Error::last_os_error();
         if cancel.is_cancelled() {
             return Err("NRD feed download cancelled".to_string());
         }
-        return Err(format!(
-            "WinHttpSendRequest failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("WinHttpSendRequest failed: {err}"));
+    }
+    match request.ctx().wait_for_outcome(cancel) {
+        AsyncWaitOutcome::SendRequestComplete => {}
+        AsyncWaitOutcome::Cancelled => return Err("NRD feed download cancelled".to_string()),
+        AsyncWaitOutcome::Error(msg) => return Err(format!("WinHttpSendRequest failed: {msg}")),
+        other => {
+            return Err(format!(
+                "WinHttpSendRequest unexpected async outcome: {other:?}"
+            ))
+        }
     }
 
     if cancel.is_cancelled() {
         return Err("NRD feed download cancelled".to_string());
     }
 
-    // SAFETY: `request.raw()` has a sent HTTP request.
+    request.ctx().prepare_wait();
+    // SAFETY: `request.raw()` completed `WinHttpSendRequest`.
     let recv_ok = unsafe { WinHttpReceiveResponse(request.raw(), ptr::null_mut()) };
     if recv_ok == 0 {
+        let err = std::io::Error::last_os_error();
         if cancel.is_cancelled() {
             return Err("NRD feed download cancelled".to_string());
         }
-        return Err(format!(
-            "WinHttpReceiveResponse failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("WinHttpReceiveResponse failed: {err}"));
+    }
+    match request.ctx().wait_for_outcome(cancel) {
+        AsyncWaitOutcome::HeadersAvailable => {}
+        AsyncWaitOutcome::Cancelled => return Err("NRD feed download cancelled".to_string()),
+        AsyncWaitOutcome::Error(msg) => {
+            return Err(format!("WinHttpReceiveResponse failed: {msg}"))
+        }
+        other => {
+            return Err(format!(
+                "WinHttpReceiveResponse unexpected async outcome: {other:?}"
+            ))
+        }
     }
 
     if cancel.is_cancelled() {
@@ -1142,7 +1503,7 @@ fn fetch_http_winhttp_cancellable(
 
     let mut status_code: u32 = 0;
     let mut status_len = std::mem::size_of::<u32>() as u32;
-    // SAFETY: Queries HTTP status code into `status_code` (`DWORD`).
+    // SAFETY: Queries HTTP status code into `status_code` (`DWORD`) after `HEADERS_AVAILABLE`.
     let hdr_ok = unsafe {
         WinHttpQueryHeaders(
             request.raw(),
@@ -1154,13 +1515,11 @@ fn fetch_http_winhttp_cancellable(
         )
     };
     if hdr_ok == 0 {
+        let err = std::io::Error::last_os_error();
         if cancel.is_cancelled() {
             return Err("NRD feed download cancelled".to_string());
         }
-        return Err(format!(
-            "WinHttpQueryHeaders(STATUS_CODE) failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("WinHttpQueryHeaders(STATUS_CODE) failed: {err}"));
     }
     if !(200..300).contains(&status_code) {
         return Err(format!("HTTP status {status_code}"));
@@ -1170,18 +1529,30 @@ fn fetch_http_winhttp_cancellable(
         if cancel.is_cancelled() {
             return Err("NRD feed download cancelled".to_string());
         }
-        let mut avail: u32 = 0;
-        // SAFETY: `request.raw()` has received response headers.
-        let avail_ok = unsafe { WinHttpQueryDataAvailable(request.raw(), &mut avail) };
+
+        request.ctx().prepare_wait();
+        // SAFETY: In `WINHTTP_FLAG_ASYNC` mode, `WinHttpQueryDataAvailable` requires NULL for
+        // `lpdw_number_of_bytes_available` and reports byte count via `DATA_AVAILABLE` callback.
+        let avail_ok = unsafe { WinHttpQueryDataAvailable(request.raw(), ptr::null_mut()) };
         if avail_ok == 0 {
+            let err = std::io::Error::last_os_error();
             if cancel.is_cancelled() {
                 return Err("NRD feed download cancelled".to_string());
             }
-            return Err(format!(
-                "WinHttpQueryDataAvailable failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(format!("WinHttpQueryDataAvailable failed: {err}"));
         }
+        let avail = match request.ctx().wait_for_outcome(cancel) {
+            AsyncWaitOutcome::DataAvailable(avail) => avail,
+            AsyncWaitOutcome::Cancelled => return Err("NRD feed download cancelled".to_string()),
+            AsyncWaitOutcome::Error(msg) => {
+                return Err(format!("WinHttpQueryDataAvailable failed: {msg}"))
+            }
+            other => {
+                return Err(format!(
+                    "WinHttpQueryDataAvailable unexpected async outcome: {other:?}"
+                ))
+            }
+        };
         if avail == 0 {
             return Ok(None);
         }
@@ -1190,31 +1561,59 @@ fn fetch_http_winhttp_cancellable(
         }
 
         let to_read = (avail as usize).min(want).max(1);
-        let mut chunk = vec![0u8; to_read];
-        let mut read_len: u32 = 0;
-        // SAFETY: `chunk` has length `to_read`.
+        let buf_ptr = {
+            let mut io = request
+                .ctx()
+                .io_buf
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if io.len() < to_read {
+                io.resize(to_read, 0);
+            }
+            io.as_mut_ptr()
+        };
+
+        request.ctx().prepare_wait();
+        // SAFETY: `buf_ptr` points to heap memory inside `Arc<AsyncWinHttpContext>` of at least
+        // `to_read` bytes, untouched until `READ_COMPLETE` or `HANDLE_CLOSING`. Async mode requires
+        // NULL for `lpdw_number_of_bytes_read`.
         let read_ok = unsafe {
             WinHttpReadData(
                 request.raw(),
-                chunk.as_mut_ptr().cast::<c_void>(),
+                buf_ptr.cast::<c_void>(),
                 to_read as u32,
-                &mut read_len,
+                ptr::null_mut(),
             )
         };
         if read_ok == 0 {
+            let err = std::io::Error::last_os_error();
             if cancel.is_cancelled() {
                 return Err("NRD feed download cancelled".to_string());
             }
-            return Err(format!(
-                "WinHttpReadData failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(format!("WinHttpReadData failed: {err}"));
         }
+        let read_len = match request.ctx().wait_for_outcome(cancel) {
+            AsyncWaitOutcome::ReadComplete(read_len) => read_len,
+            AsyncWaitOutcome::Cancelled => return Err("NRD feed download cancelled".to_string()),
+            AsyncWaitOutcome::Error(msg) => {
+                return Err(format!("WinHttpReadData failed: {msg}"))
+            }
+            other => {
+                return Err(format!(
+                    "WinHttpReadData unexpected async outcome: {other:?}"
+                ))
+            }
+        };
         if read_len == 0 {
             return Ok(None);
         }
-        chunk.truncate((read_len as usize).min(to_read));
-        Ok(Some(chunk))
+        let n = (read_len as usize).min(to_read);
+        let io = request
+            .ctx()
+            .io_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Ok(Some(io[..n].to_vec()))
     })
 }
 

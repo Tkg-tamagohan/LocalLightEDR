@@ -10,6 +10,7 @@ use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ledr_proto::is_never_suspend_process;
@@ -474,6 +475,7 @@ impl Drop for OwnedWfpEngineHandle {
 }
 
 struct NetEventCallbackContext {
+    active: AtomicBool,
     filter_index: Arc<RwLock<HashMap<u64, WfpFilterMeta>>>,
     sink: WfpDropSinkFn,
 }
@@ -481,6 +483,67 @@ struct NetEventCallbackContext {
 struct NetEventSubscription {
     events_handle: HANDLE,
     ctx_ptr: *mut NetEventCallbackContext,
+}
+
+#[derive(Default)]
+struct NetEventSubscriptionState {
+    sub: Option<NetEventSubscription>,
+    enabled_net_events_by_us: bool,
+}
+
+impl NetEventSubscriptionState {
+    fn unsubscribe_with<F, G>(
+        &mut self,
+        unsubscribe_fn: F,
+        disable_collect_fn: G,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(HANDLE) -> Result<(), u32>,
+        G: FnOnce() -> Result<(), u32>,
+    {
+        let mut first_err: Option<String> = None;
+
+        // CRITICAL ordering: deactivate sink dispatch first, call `FwpmNetEventUnsubscribe0`,
+        // and ONLY free `ctx_ptr` (`Box::from_raw`) if unsubscribe succeeded. If unsubscribe fails,
+        // BFE may still invoke the callback, so keep `sub` (without freeing `ctx_ptr`).
+        if let Some(sub) = self.sub.take() {
+            // SAFETY: `sub.ctx_ptr` stays valid while owned by `self.sub`.
+            unsafe {
+                (*sub.ctx_ptr).active.store(false, Ordering::Release);
+            }
+            match unsubscribe_fn(sub.events_handle) {
+                Ok(()) => {
+                    // SAFETY: `FwpmNetEventUnsubscribe0` succeeded and waited for in-flight
+                    // callbacks to complete; `sub.ctx_ptr` was allocated via `Box::into_raw`.
+                    unsafe { drop(Box::from_raw(sub.ctx_ptr)) };
+                }
+                Err(status) => {
+                    self.sub = Some(sub);
+                    first_err = Some(format!("FwpmNetEventUnsubscribe0 failed: 0x{status:08X}"));
+                }
+            }
+        }
+
+        if self.enabled_net_events_by_us && self.sub.is_none() {
+            match disable_collect_fn() {
+                Ok(()) => {
+                    self.enabled_net_events_by_us = false;
+                }
+                Err(status) => {
+                    if first_err.is_none() {
+                        first_err = Some(format!(
+                            "FwpmEngineSetOption0(FWPM_ENGINE_COLLECT_NET_EVENTS=0) failed: 0x{status:08X}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
 }
 
 // SAFETY: `events_handle` is a BFE net-event subscription handle from `FwpmNetEventSubscribe1`
@@ -496,9 +559,12 @@ unsafe extern "system" fn wfp_net_event_callback(
     if context.is_null() || event.is_null() {
         return;
     }
-    // SAFETY: `context` points to a live `NetEventCallbackContext` owned by `LiveWfpBackend`
-    // until after `FwpmNetEventUnsubscribe0` returns.
+    // SAFETY: `context` points to a live `NetEventCallbackContext` kept alive until
+    // `FwpmNetEventUnsubscribe0` returns `ERROR_SUCCESS`.
     let ctx = unsafe { &*(context as *const NetEventCallbackContext) };
+    if !ctx.active.load(Ordering::Acquire) {
+        return;
+    }
     // SAFETY: `event` is non-null and valid for the callback duration.
     let ev = unsafe { &*event };
     if ev.r#type != FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
@@ -518,7 +584,9 @@ unsafe extern "system" fn wfp_net_event_callback(
         parse_wfp_classify_drop_fields(ev.r#type, &ev.header, classify_drop, &index)
     };
     if let Some(drop_event) = parsed {
-        (ctx.sink)(drop_event);
+        if ctx.active.load(Ordering::Acquire) {
+            (ctx.sink)(drop_event);
+        }
     }
 }
 
@@ -527,8 +595,7 @@ unsafe extern "system" fn wfp_net_event_callback(
 pub struct LiveWfpBackend {
     engine: OwnedWfpEngineHandle,
     loopback_filter_ids: Vec<u64>,
-    net_event_sub: Option<NetEventSubscription>,
-    enabled_net_events_by_us: bool,
+    net_event_state: NetEventSubscriptionState,
 }
 
 impl LiveWfpBackend {
@@ -575,52 +642,42 @@ impl LiveWfpBackend {
         Ok(Self {
             engine,
             loopback_filter_ids,
-            net_event_sub: None,
-            enabled_net_events_by_us: false,
+            net_event_state: NetEventSubscriptionState::default(),
         })
     }
 
     fn unsubscribe_net_events(&mut self) -> Result<(), String> {
-        let mut first_err: Option<String> = None;
-
-        // CRITICAL ordering: ALWAYS call `FwpmNetEventUnsubscribe0` FIRST and wait for it to
-        // return BEFORE freeing `Box::from_raw(ctx_ptr)` or restoring `FWPM_ENGINE_COLLECT_NET_EVENTS`.
-        if let Some(sub) = self.net_event_sub.take() {
-            // SAFETY: `self.engine.raw()` and `sub.events_handle` are valid WFP handles.
-            let status = unsafe { FwpmNetEventUnsubscribe0(self.engine.raw(), sub.events_handle) };
-            if status != ERROR_SUCCESS_U32 {
-                first_err = Some(format!("FwpmNetEventUnsubscribe0 failed: 0x{status:08X}"));
-            }
-            // SAFETY: `FwpmNetEventUnsubscribe0` waits for any running callback to complete;
-            // `sub.ctx_ptr` was allocated via `Box::into_raw` and is freed exactly once here.
-            unsafe { drop(Box::from_raw(sub.ctx_ptr)) };
-        }
-
-        if self.enabled_net_events_by_us {
-            self.enabled_net_events_by_us = false;
-            let disable_val = FWP_VALUE0 {
-                r#type: FWP_UINT32,
-                Anonymous: FWP_VALUE0_0 { uint32: 0 },
-            };
-            // SAFETY: `self.engine.raw()` is open and `disable_val` stays live across the call.
-            let status = unsafe {
-                FwpmEngineSetOption0(
-                    self.engine.raw(),
-                    FWPM_ENGINE_COLLECT_NET_EVENTS,
-                    &disable_val,
-                )
-            };
-            if status != ERROR_SUCCESS_U32 && first_err.is_none() {
-                first_err = Some(format!(
-                    "FwpmEngineSetOption0(FWPM_ENGINE_COLLECT_NET_EVENTS=0) failed: 0x{status:08X}"
-                ));
-            }
-        }
-
-        match first_err {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+        let engine_raw = self.engine.raw();
+        self.net_event_state.unsubscribe_with(
+            |events_handle| {
+                // SAFETY: `engine_raw` and `events_handle` are valid WFP handles.
+                let status = unsafe { FwpmNetEventUnsubscribe0(engine_raw, events_handle) };
+                if status == ERROR_SUCCESS_U32 {
+                    Ok(())
+                } else {
+                    Err(status)
+                }
+            },
+            || {
+                let disable_val = FWP_VALUE0 {
+                    r#type: FWP_UINT32,
+                    Anonymous: FWP_VALUE0_0 { uint32: 0 },
+                };
+                // SAFETY: `engine_raw` is open and `disable_val` stays live across the call.
+                let status = unsafe {
+                    FwpmEngineSetOption0(
+                        engine_raw,
+                        FWPM_ENGINE_COLLECT_NET_EVENTS,
+                        &disable_val,
+                    )
+                };
+                if status == ERROR_SUCCESS_U32 {
+                    Ok(())
+                } else {
+                    Err(status)
+                }
+            },
+        )
     }
 }
 
@@ -1028,15 +1085,19 @@ impl WfpBackend for LiveWfpBackend {
                     "FwpmEngineSetOption0(FWPM_ENGINE_COLLECT_NET_EVENTS=1) failed: 0x{set_status:08X}"
                 ));
             }
-            self.enabled_net_events_by_us = true;
+            self.net_event_state.enabled_net_events_by_us = true;
         }
 
-        let ctx_ptr = Box::into_raw(Box::new(NetEventCallbackContext { filter_index, sink }));
+        let ctx_ptr = Box::into_raw(Box::new(NetEventCallbackContext {
+            active: AtomicBool::new(true),
+            filter_index,
+            sink,
+        }));
         let subscription = FWPM_NET_EVENT_SUBSCRIPTION0::default();
         let mut events_handle = HANDLE::default();
         // SAFETY: `self.engine.raw()` is open, `subscription` stays valid across the call,
         // `wfp_net_event_callback` matches `FWPM_NET_EVENT_CALLBACK1`, and `ctx_ptr` remains
-        // valid until after `FwpmNetEventUnsubscribe0` returns.
+        // valid until `FwpmNetEventUnsubscribe0` returns `ERROR_SUCCESS`.
         let sub_status = unsafe {
             FwpmNetEventSubscribe1(
                 self.engine.raw(),
@@ -1053,7 +1114,7 @@ impl WfpBackend for LiveWfpBackend {
             return Err(format!("FwpmNetEventSubscribe1 failed: 0x{sub_status:08X}"));
         }
 
-        self.net_event_sub = Some(NetEventSubscription {
+        self.net_event_state.sub = Some(NetEventSubscription {
             events_handle,
             ctx_ptr,
         });
@@ -1961,5 +2022,127 @@ mod tests {
         let s = state.lock().unwrap();
         assert!(s.drop_sink.is_none());
         assert_eq!(s.set_drop_sink_calls, 2);
+    }
+
+    #[test]
+    fn sens_p3_12_net_event_unsubscribe_failure_keeps_context_alive_and_gates_callback() {
+        use std::sync::atomic::AtomicUsize;
+        use windows::core::BOOL;
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FWPM_NET_EVENT2_0, FWPM_NET_EVENT_HEADER2_1,
+        };
+
+        struct DropObserver(Arc<AtomicUsize>);
+        impl Drop for DropObserver {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let sink_drops = Arc::new(AtomicUsize::new(0));
+        let sink_calls = Arc::new(AtomicUsize::new(0));
+        let observer = DropObserver(Arc::clone(&sink_drops));
+        let sink_calls_ref = Arc::clone(&sink_calls);
+        let sink: WfpDropSinkFn = Arc::new(move |_ev| {
+            let _keep = &observer;
+            sink_calls_ref.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let mut map = HashMap::new();
+        map.insert(
+            555u64,
+            WfpFilterMeta {
+                rule_handle: 1,
+                exe_path: r"C:\Temp\blocked.exe".to_string(),
+                allow: false,
+            },
+        );
+        let filter_index = Arc::new(RwLock::new(map));
+        let ctx_ptr = Box::into_raw(Box::new(NetEventCallbackContext {
+            active: AtomicBool::new(true),
+            filter_index,
+            sink,
+        }));
+
+        let mut drop_data = FWPM_NET_EVENT_CLASSIFY_DROP2 {
+            filterId: 555,
+            isLoopback: BOOL(0),
+            ..Default::default()
+        };
+        let net_ev = FWPM_NET_EVENT2 {
+            header: FWPM_NET_EVENT_HEADER2 {
+                timeStamp: FILETIME::default(),
+                flags: FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET
+                    | FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET
+                    | FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET,
+                ipVersion: FWP_IP_VERSION_V4,
+                ipProtocol: 6,
+                Anonymous2: FWPM_NET_EVENT_HEADER2_1 {
+                    remoteAddrV4: 0x0101_0101,
+                },
+                remotePort: 443,
+                ..Default::default()
+            },
+            r#type: FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+            Anonymous: FWPM_NET_EVENT2_0 {
+                classifyDrop: &mut drop_data,
+            },
+        };
+
+        // 1. Active callback invokes sink before unsubscribe.
+        unsafe { wfp_net_event_callback(ctx_ptr.cast(), &net_ev) };
+        assert_eq!(sink_calls.load(Ordering::SeqCst), 1);
+
+        let mut state = NetEventSubscriptionState {
+            sub: Some(NetEventSubscription {
+                events_handle: HANDLE(0x1234usize as *mut c_void),
+                ctx_ptr,
+            }),
+            enabled_net_events_by_us: true,
+        };
+
+        // 2. When FwpmNetEventUnsubscribe0 fails, `ctx_ptr` MUST NOT be freed (`sink_drops == 0`),
+        //    `sub` stays intact for retry, `COLLECT_NET_EVENTS` disable is skipped, and late
+        //    callbacks are suppressed safely via `active == false`.
+        let mut disable_calls = 0usize;
+        let err = state
+            .unsubscribe_with(|_| Err(0x8032_0001), || {
+                disable_calls += 1;
+                Ok(())
+            })
+            .expect_err("failed unsubscribe must return Err");
+        assert!(err.contains("0x80320001"), "{err}");
+        assert!(state.sub.is_some(), "subscription handle must remain for retry");
+        assert!(state.enabled_net_events_by_us);
+        assert_eq!(disable_calls, 0);
+        assert_eq!(sink_drops.load(Ordering::SeqCst), 0);
+
+        unsafe { wfp_net_event_callback(ctx_ptr.cast(), &net_ev) };
+        assert_eq!(sink_calls.load(Ordering::SeqCst), 1, "deactivated callback must not invoke sink");
+
+        // 3. If FwpmNetEventUnsubscribe0 later succeeds while disable fails, `ctx_ptr` IS freed
+        //    (`sink_drops == 1`) and `enabled_net_events_by_us` remains true for retry.
+        let err2 = state
+            .unsubscribe_with(|_| Ok(()), || {
+                disable_calls += 1;
+                Err(0x8032_0005)
+            })
+            .expect_err("failed disable option must return Err");
+        assert!(err2.contains("0x80320005"), "{err2}");
+        assert!(state.sub.is_none());
+        assert!(state.enabled_net_events_by_us);
+        assert_eq!(disable_calls, 1);
+        assert_eq!(sink_drops.load(Ordering::SeqCst), 1);
+
+        // 4. Final retry disables COLLECT_NET_EVENTS cleanly.
+        state
+            .unsubscribe_with(|_| unreachable!(), || {
+                disable_calls += 1;
+                Ok(())
+            })
+            .expect("retry disable succeeds");
+        assert!(!state.enabled_net_events_by_us);
+        assert_eq!(disable_calls, 2);
     }
 }

@@ -365,6 +365,37 @@ impl ActiveProcessTable {
         matches
     }
 
+    /// Time-windowed variant of [`Self::candidates_by_exe_key`] returning only instances whose
+    /// lifetime overlaps `event_ts_ms` (allowing minor `+- 1,000 ms` sensor timestamp skew).
+    pub fn candidates_by_exe_key_at(
+        &self,
+        target_exe_key: &str,
+        event_ts_ms: i64,
+    ) -> Vec<&ActiveProcessEntry> {
+        let mut matches: Vec<&ActiveProcessEntry> = self
+            .entries
+            .values()
+            .filter(|entry| {
+                !entry.exe_path.trim().is_empty()
+                    && normalized_exe_key_eq(&entry.exe_path, target_exe_key)
+                    && entry.created_at_ms <= event_ts_ms.saturating_add(1_000)
+                    && entry
+                        .exited_at_ms
+                        .is_none_or(|ex| event_ts_ms <= ex.saturating_add(1_000))
+            })
+            .collect();
+        matches.sort_by(|a, b| {
+            let a_exited = a.exited_at_ms.is_some();
+            let b_exited = b.exited_at_ms.is_some();
+            a_exited
+                .cmp(&b_exited)
+                .then_with(|| b.exited_at_ms.cmp(&a.exited_at_ms))
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| b.identity.create_time_100ns.cmp(&a.identity.create_time_100ns))
+        });
+        matches
+    }
+
     /// O(1) lookup by composite `instance_id` (`"{pid}:{create_time_100ns}"`).
     pub fn get_by_instance_id(&self, instance_id: &str) -> Option<&ActiveProcessEntry> {
         self.entries.get(instance_id)
@@ -806,5 +837,22 @@ mod tests {
         let candidates = table.candidates_by_exe_key(exe_key);
         let pids: Vec<u32> = candidates.iter().map(|e| e.pid).collect();
         assert_eq!(pids, vec![7003, 7002, 7001]);
+
+        // Time-windowed query excludes long-exited or future-spawned instances.
+        let at_2200 = table.candidates_by_exe_key_at(exe_key, 250);
+        let at_250_pids: Vec<u32> = at_2200.iter().map(|e| e.pid).collect();
+        assert_eq!(at_250_pids, vec![7003, 7002, 7001]);
+
+        let future_ts = table.candidates_by_exe_key_at(exe_key, 10_000);
+        let future_pids: Vec<u32> = future_ts.iter().map(|e| e.pid).collect();
+        assert_eq!(future_pids, vec![7003]);
+
+        // Instance started well after event_ts_ms (> +1000 ms skew) is excluded.
+        let past_ts = table.candidates_by_exe_key_at(exe_key, 50);
+        assert!(past_ts.iter().all(|e| e.created_at_ms <= 1_050));
+        let early_pid = ProcessIdentity::new(7004, 4000);
+        table.on_process_start(early_pid, 4, exe.to_string(), String::new(), None, 5_000);
+        let before_spawn = table.candidates_by_exe_key_at(exe_key, 2_000);
+        assert!(!before_spawn.iter().any(|e| e.pid == 7004));
     }
 }

@@ -30,8 +30,8 @@ pub use outbound::{
     canonical_ip, classify_outbound_risk, discover_default_prerestricted_interpreters,
     evaluate_outbound_policy, is_external_ip, is_high_risk_executable_path, is_script_interpreter,
     matches_app_wide_network_allow, matches_app_wide_network_block, matches_network_allow_rule,
-    matches_network_block_rule, matches_network_target, validate_policy_rule, OutboundDecision,
-    OutboundRiskClass,
+    matches_network_block_rule, matches_network_target, parse_cidr_target, validate_policy_rule,
+    OutboundDecision, OutboundRiskClass,
 };
 pub use pruner::{AllowlistConfig, EarlyPruner, EarlyPrunerConfig};
 pub use sigma::{
@@ -1615,5 +1615,181 @@ brand-new.org
             body_elapsed < Duration::from_secs(1),
             "mid-body NRD fetch took too long to abort after cancel(): {body_elapsed:?}"
         );
+    }
+
+    #[test]
+    fn rules_p3_10_cidr_matching_and_validation() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use ledr_proto::{AllowlistRuleRecord, RuleScope};
+
+        // IPv4 CIDR parsing and host-bit normalization.
+        assert_eq!(
+            parse_cidr_target("198.51.100.42/24").expect("valid IPv4 CIDR"),
+            (IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24)
+        );
+        assert_eq!(
+            parse_cidr_target("0.0.0.0/0").expect("valid /0 IPv4 CIDR"),
+            (IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
+        );
+        assert_eq!(
+            parse_cidr_target("::ffff:198.51.100.42/120").expect("valid mapped IPv6 CIDR"),
+            (IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24)
+        );
+        assert_eq!(
+            parse_cidr_target("2001:db8:0:1::abcd/48").expect("valid IPv6 CIDR"),
+            (
+                IpAddr::V6("2001:db8::".parse::<Ipv6Addr>().unwrap()),
+                48
+            )
+        );
+
+        // Malformed CIDRs must fail validation.
+        for bad in [
+            "198.51.100.0",
+            "198.51.100.0/",
+            "198.51.100.0/33",
+            "198.51.100.0/+24",
+            "198.51.100.0/-1",
+            "198.51.100.0/24/8",
+            "2001:db8::/129",
+            "not-an-ip/24",
+            "198.*.100.0/24",
+        ] {
+            assert!(parse_cidr_target(bad).is_err(), "expected invalid CIDR: {bad}");
+        }
+
+        // CIDR matching including IPv4-mapped IPv6 canonicalization.
+        assert!(matches_network_target(
+            "198.51.100.0/24",
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 200)),
+            None
+        ));
+        assert!(matches_network_target(
+            "198.51.100.0/24",
+            IpAddr::V6("::ffff:198.51.100.77".parse().unwrap()),
+            None
+        ));
+        assert!(!matches_network_target(
+            "198.51.100.0/24",
+            IpAddr::V4(Ipv4Addr::new(198, 51, 101, 1)),
+            None
+        ));
+        assert!(matches_network_target(
+            "0.0.0.0/0",
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            None
+        ));
+        assert!(!matches_network_target(
+            "0.0.0.0/0",
+            IpAddr::V6("2001:4860:4860::8888".parse().unwrap()),
+            None
+        ));
+        assert!(matches_network_target(
+            "2001:db8::/32",
+            IpAddr::V6("2001:0db8:85a3::8a2e".parse().unwrap()),
+            None
+        ));
+        assert!(!matches_network_target(
+            "2001:db8::/32",
+            IpAddr::V6("2001:0db9::1".parse().unwrap()),
+            None
+        ));
+        // Invalid CIDR in pattern must never fall through to wildcard matching.
+        assert!(!matches_network_target(
+            "198.51.100.0/99",
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            Some("198.51.100.0/99")
+        ));
+
+        // validate_policy_rule rejects malformed CIDR on NetworkAllow / NetworkBlock.
+        let valid_rule = AllowlistRuleRecord {
+            rule_id: "net-cidr-allow".to_string(),
+            exe_path_pattern: r"c:\tools\client.exe".to_string(),
+            sha256: Some("a".repeat(64)),
+            signer_subject: None,
+            root_thumbprint: None,
+            scope: RuleScope::NetworkAllow,
+            allowed_target: Some("203.0.113.0/24".to_string()),
+            created_by: "test".to_string(),
+            created_at_ms: 1,
+        };
+        assert!(validate_policy_rule(&valid_rule).is_ok());
+
+        let mut bad_allow = valid_rule.clone();
+        bad_allow.allowed_target = Some("203.0.113.0/33".to_string());
+        assert!(validate_policy_rule(&bad_allow).is_err());
+
+        let bad_block = AllowlistRuleRecord {
+            rule_id: "net-cidr-block".to_string(),
+            exe_path_pattern: r"c:\tools\client.exe".to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            scope: RuleScope::NetworkBlock,
+            allowed_target: Some("10.0.0.0/+8".to_string()),
+            created_by: "test".to_string(),
+            created_at_ms: 1,
+        };
+        assert!(validate_policy_rule(&bad_block).is_err());
+    }
+
+    #[test]
+    fn rules_p3_11_async_winhttp_multi_chunk_and_http_errors() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        // 1. Multi-chunk streaming body exercises repeated async WinHttpQueryDataAvailable /
+        //    WinHttpReadData cycles plus truncation trimming on a partial line.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind multi-chunk listener");
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept multi-chunk client");
+            let mut req_buf = [0u8; 512];
+            let _ = stream.read(&mut req_buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            let c1 = b"alpha-one.xyz\nbeta-two.top\n";
+            let _ = write!(stream, "{:x}\r\n", c1.len());
+            let _ = stream.write_all(c1);
+            let _ = stream.write_all(b"\r\n");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(20));
+
+            let c2 = b"gamma-three.club\ndelta-four.site\n";
+            let _ = write!(stream, "{:x}\r\n", c2.len());
+            let _ = stream.write_all(c2);
+            let _ = stream.write_all(b"\r\n0\r\n\r\n");
+            let _ = stream.flush();
+        });
+
+        let url = format!("http://127.0.0.1:{}/chunked.txt", addr.port());
+        let token = NrdCancelToken::new();
+        let (full_bytes, full_trunc) = fetch_nrd_feed_url_cancellable(&url, 4096, &token)
+            .expect("multi-chunk async WinHTTP fetch must succeed");
+        assert!(!full_trunc);
+        assert_eq!(
+            String::from_utf8_lossy(&full_bytes),
+            "alpha-one.xyz\nbeta-two.top\ngamma-three.club\ndelta-four.site\n"
+        );
+        server.join().expect("join multi-chunk server");
+
+        // 2. Non-2xx status code fails cleanly.
+        let err_listener = TcpListener::bind("127.0.0.1:0").expect("bind 503 listener");
+        let err_addr = err_listener.local_addr().unwrap();
+        let err_server = std::thread::spawn(move || {
+            let (mut stream, _) = err_listener.accept().expect("accept 503 client");
+            let mut req_buf = [0u8; 512];
+            let _ = stream.read(&mut req_buf);
+            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.flush();
+        });
+        let err_url = format!("http://127.0.0.1:{}/fail.txt", err_addr.port());
+        let status_err = fetch_nrd_feed_url_cancellable(&err_url, 1024, &token)
+            .expect_err("HTTP 503 must error");
+        assert!(status_err.contains("503"), "{status_err}");
+        err_server.join().expect("join 503 server");
     }
 }

@@ -341,6 +341,30 @@ impl ActiveProcessTable {
         })
     }
 
+    /// Returns candidate entries matching `target_exe_key` (as normalized by
+    /// `WfpRuleManager::exe_key`), ordered active processes first (newest `created_at_ms`
+    /// first), followed by recently exited entries (most recently exited/created first).
+    pub fn candidates_by_exe_key(&self, target_exe_key: &str) -> Vec<&ActiveProcessEntry> {
+        let mut matches: Vec<&ActiveProcessEntry> = self
+            .entries
+            .values()
+            .filter(|entry| {
+                !entry.exe_path.trim().is_empty()
+                    && normalized_exe_key_eq(&entry.exe_path, target_exe_key)
+            })
+            .collect();
+        matches.sort_by(|a, b| {
+            let a_exited = a.exited_at_ms.is_some();
+            let b_exited = b.exited_at_ms.is_some();
+            a_exited
+                .cmp(&b_exited)
+                .then_with(|| b.exited_at_ms.cmp(&a.exited_at_ms))
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| b.identity.create_time_100ns.cmp(&a.identity.create_time_100ns))
+        });
+        matches
+    }
+
     /// O(1) lookup by composite `instance_id` (`"{pid}:{create_time_100ns}"`).
     pub fn get_by_instance_id(&self, instance_id: &str) -> Option<&ActiveProcessEntry> {
         self.entries.get(instance_id)
@@ -761,5 +785,26 @@ mod tests {
                 .and_then(|e| e.exited_at_ms),
             Some(2000)
         );
+    }
+
+    #[test]
+    fn process_table_candidates_by_exe_key_prefers_active_then_recent_exited() {
+        let mut table = ActiveProcessTable::new(16);
+        let exe = r"\\?\C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let exe_key = r"c:\windows\system32\windowspowershell\v1.0\powershell.exe";
+
+        let exited_old = ProcessIdentity::new(7001, 1000);
+        let exited_recent = ProcessIdentity::new(7002, 2000);
+        let active_one = ProcessIdentity::new(7003, 3000);
+
+        table.on_process_start(exited_old, 4, exe.to_string(), String::new(), None, 100);
+        table.on_process_stop(7001, 150);
+        table.on_process_start(exited_recent, 4, exe.to_string(), String::new(), None, 200);
+        table.on_process_stop(7002, 250);
+        table.on_process_start(active_one, 4, exe.to_string(), String::new(), None, 300);
+
+        let candidates = table.candidates_by_exe_key(exe_key);
+        let pids: Vec<u32> = candidates.iter().map(|e| e.pid).collect();
+        assert_eq!(pids, vec![7003, 7002, 7001]);
     }
 }

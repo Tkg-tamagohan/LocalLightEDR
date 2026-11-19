@@ -39,6 +39,7 @@
     isSamplePreview: false,
     isDaemonOnline: false,
     isResolvingAlert: false,
+    selectedAlertIsNetwork: false,
     triageFeedback: null,
   };
 
@@ -69,6 +70,7 @@
     alertQueue: document.getElementById("alert-queue"),
     triageEmpty: document.getElementById("triage-empty"),
     triageEmptyLabel: document.getElementById("triage-empty-label"),
+    triageEmptyFeedback: document.getElementById("triage-empty-feedback"),
     triageShowAllBtn: document.getElementById("triage-show-all-btn"),
     triageSampleBtn: document.getElementById("triage-sample-btn"),
     triageDetail: document.getElementById("triage-detail"),
@@ -86,6 +88,7 @@
     optUseSigner: document.getElementById("opt-use-signer"),
     signerConstraintNote: document.getElementById("signer-constraint-note"),
     optAllowDest: document.getElementById("opt-allow-dest"),
+    targetScopeNote: document.getElementById("target-scope-note"),
     // View 2 elements
     treeSummary: document.getElementById("tree-summary"),
     processFilter: document.getElementById("process-filter"),
@@ -118,6 +121,7 @@
     ruleSha256Input: document.getElementById("rule-sha256-input"),
     ruleSignerInput: document.getElementById("rule-signer-input"),
     ruleThumbprintInput: document.getElementById("rule-thumbprint-input"),
+    policyScopeNote: document.getElementById("policy-scope-note"),
     cancelAddRuleBtn: document.getElementById("cancel-add-rule-btn"),
     submitAddRuleBtn: document.getElementById("submit-add-rule-btn"),
     policyFeedback: document.getElementById("policy-feedback"),
@@ -199,6 +203,60 @@
 
   function isUnresolvedAlert(alert) {
     return alert && (alert.status === "Pending" || alert.status === "ExpiredSuspended");
+  }
+
+  function isValidIpv4(ip) {
+    if (!/^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/.test(ip)) {
+      return false;
+    }
+    return ip.split(".").every((octet) => Number(octet) <= 255);
+  }
+
+  function isValidIpv6(ip) {
+    if (!ip || !ip.includes(":") || /[^0-9a-fA-F:.]/.test(ip)) {
+      return false;
+    }
+    try {
+      const url = new URL(`http://[${ip}]/`);
+      return url.hostname.startsWith("[") && url.hostname.endsWith("]");
+    } catch {
+      return false;
+    }
+  }
+
+  function isLiteralIpOrCidr(raw) {
+    const trimmed = String(raw || "").trim();
+    if (!trimmed) return false;
+    const slashIdx = trimmed.indexOf("/");
+    if (slashIdx === -1) {
+      return isValidIpv4(trimmed) || isValidIpv6(trimmed);
+    }
+    if (trimmed.indexOf("/", slashIdx + 1) !== -1) {
+      return false;
+    }
+    const addr = trimmed.slice(0, slashIdx);
+    const prefixStr = trimmed.slice(slashIdx + 1);
+    if (!/^(?:0|[1-9]\d{0,2})$/.test(prefixStr)) {
+      return false;
+    }
+    const prefix = Number(prefixStr);
+    if (isValidIpv4(addr)) return prefix <= 32;
+    if (isValidIpv6(addr)) return prefix <= 128;
+    return false;
+  }
+
+  function isNetworkDomainTarget(scope, allowedTarget) {
+    if (scope !== "NetworkBlock" && scope !== "NetworkAllow") return false;
+    const trimmed = String(allowedTarget || "").trim();
+    if (!trimmed) return false;
+    return !isLiteralIpOrCidr(trimmed);
+  }
+
+  function formatBackendError(err) {
+    if (err && typeof err === "object" && typeof err.message === "string") {
+      return err.message;
+    }
+    return String(err ?? "Unknown error");
   }
 
   function buildSampleData() {
@@ -1051,17 +1109,27 @@
     const selected =
       allAlerts.find((a) => a.alert_id === state.selectedAlertId) || null;
     if (!selected) {
+      state.selectedAlertIsNetwork = false;
       el.triageDetail.classList.add("hidden");
       el.triageEmpty.classList.remove("hidden");
 
-      if (state.triageFeedback && state.triageFeedback.message) {
-        el.triageEmptyLabel.textContent = state.triageFeedback.message;
-      } else if (state.alertQueueFilter === "unresolved" && allAlerts.length > 0) {
+      if (state.alertQueueFilter === "unresolved" && allAlerts.length > 0) {
         el.triageEmptyLabel.textContent = "No unresolved alerts";
       } else {
         el.triageEmptyLabel.textContent = state.isDaemonOnline
           ? "No alerts recorded"
           : "Daemon offline — no alerts loaded";
+      }
+
+      if (state.triageFeedback && state.triageFeedback.message) {
+        el.triageEmptyFeedback.textContent = state.triageFeedback.message;
+        el.triageEmptyFeedback.className = `triage-feedback ${
+          state.triageFeedback.ok ? "is-ok" : "is-error"
+        }`;
+        el.triageEmptyFeedback.setAttribute("role", state.triageFeedback.ok ? "status" : "alert");
+        el.triageEmptyFeedback.classList.remove("hidden");
+      } else {
+        el.triageEmptyFeedback.classList.add("hidden");
       }
 
       el.triageShowAllBtn.classList.toggle(
@@ -1075,6 +1143,7 @@
       return;
     }
 
+    el.triageEmptyFeedback.classList.add("hidden");
     el.triageEmpty.classList.add("hidden");
     el.triageDetail.classList.remove("hidden");
 
@@ -1343,9 +1412,25 @@
     el.triageNetBody.innerHTML = `<ul class="mini-events-list">${rows.join("")}</ul>`;
   }
 
+  function syncTriageTargetScopeNote(isNetworkAlert) {
+    if (!isNetworkAlert) {
+      el.targetScopeNote.textContent = "";
+      el.targetScopeNote.className = "tier-constraint hidden";
+      return;
+    }
+    const domainEntered = isNetworkDomainTarget("NetworkAllow", el.optAllowDest.value);
+    el.targetScopeNote.textContent =
+      "Network domain targets match resolved IPs (shared CDN IPs inherit rule; Deny wins).";
+    el.targetScopeNote.className = domainEntered
+      ? "tier-constraint is-warn"
+      : "tier-constraint";
+    el.targetScopeNote.classList.remove("hidden");
+  }
+
   function syncResolutionControls(alert, details) {
     const unresolved = isUnresolvedAlert(alert);
     const hasSigner = Boolean(details.signerSubject);
+    state.selectedAlertIsNetwork = Boolean(details.isNetworkAlert);
 
     if (state.lastSyncedAlertId !== alert.alert_id) {
       state.lastSyncedAlertId = alert.alert_id;
@@ -1370,6 +1455,10 @@
     el.optAllowDest.placeholder = details.isNetworkAlert
       ? "e.g. 93.184.216.34 or *.example.com"
       : "e.g. C:\\Users\\*\\Cookies";
+    el.optAllowDest.title = details.isNetworkAlert
+      ? "IP/CIDR or domain (WFP enforces resolved IPs; shared CDN IPs inherit rule; Deny wins)"
+      : "Optional file path pattern (e.g. C:\\Users\\*\\Cookies)";
+    syncTriageTargetScopeNote(details.isNetworkAlert);
     el.btnTerminateBlock.disabled = !unresolved || state.isResolvingAlert;
     el.btnAllowOnce.disabled = !unresolved || state.isResolvingAlert;
     el.btnAllowPermanent.disabled = !unresolved || state.isResolvingAlert;
@@ -1379,6 +1468,7 @@
       el.triageActionStatus.className = `triage-feedback ${
         state.triageFeedback.ok ? "is-ok" : "is-error"
       }`;
+      el.triageActionStatus.setAttribute("role", state.triageFeedback.ok ? "status" : "alert");
       el.triageActionStatus.classList.remove("hidden");
     } else {
       el.triageActionStatus.classList.add("hidden");
@@ -1460,8 +1550,8 @@
       state.triageFeedback = { ok: true, message: ackMessage };
       await refreshAll();
     } catch (err) {
-      state.triageFeedback = { ok: false, message: String(err) };
-      renderTriageView();
+      state.triageFeedback = { ok: false, message: formatBackendError(err) };
+      await refreshAll();
     } finally {
       state.isResolvingAlert = false;
       renderTriageView();
@@ -1813,6 +1903,7 @@
       el.policyFeedback.className = `triage-feedback policy-feedback ${
         state.policyFeedback.ok ? "is-ok" : "is-error"
       }`;
+      el.policyFeedback.setAttribute("role", state.policyFeedback.ok ? "status" : "alert");
       el.policyFeedback.classList.remove("hidden");
     } else {
       el.policyFeedback.classList.add("hidden");
@@ -1863,13 +1954,21 @@
             identityParts.push(`<span class="panel-meta">Path only</span>`);
           }
           const targetText = rule.allowed_target || "All targets";
+          const domainIpBadge = isNetworkDomainTarget(rule.scope, rule.allowed_target)
+            ? `<span class="badge badge-domain-ip" title="WFP enforces resolved IPs; shared CDN/proxy IPs are also affected (deny overrides allow)">IP-resolved</span>`
+            : "";
           return `
             <tr>
               <td>${scopeBadgeHtml(rule.scope)}</td>
               <td class="mono-wrap" title="${escapeHtml(rule.rule_id)}">${escapeHtml(
                 rule.exe_path_pattern,
               )}</td>
-              <td class="mono-wrap">${escapeHtml(targetText)}</td>
+              <td>
+                <div class="policy-target-cell">
+                  <span class="mono-wrap">${escapeHtml(targetText)}</span>
+                  ${domainIpBadge}
+                </div>
+              </td>
               <td>${identityParts.join(" ")}</td>
               <td class="mono">${escapeHtml(formatTime(rule.created_at_ms))}</td>
               <td>
@@ -2005,10 +2104,38 @@
     }
   }
 
+  function syncPolicyFormHints() {
+    const scope = el.ruleScopeInput.value;
+    if (scope === "NetworkBlock" || scope === "NetworkAllow") {
+      el.ruleTargetInput.placeholder = "e.g. 93.184.216.34 or *.example.com";
+      el.ruleTargetInput.title =
+        "IP/CIDR or domain (WFP enforces resolved IPs; shared CDN IPs affected)";
+      const domainEntered = isNetworkDomainTarget(scope, el.ruleTargetInput.value);
+      el.policyScopeNote.textContent =
+        "Network domain targets enforce per resolved WFP IP (shared CDN IPs match; Deny overrides Allow).";
+      el.policyScopeNote.className = domainEntered
+        ? "tier-constraint is-warn"
+        : "tier-constraint";
+    } else if (scope === "FileCanaryAllow") {
+      el.ruleTargetInput.placeholder = "e.g. C:\\Users\\*\\Documents\\*";
+      el.ruleTargetInput.title = "Optional canary file path glob pattern";
+      el.policyScopeNote.textContent =
+        "Canary rule: file path glob pattern scoped to protected files.";
+      el.policyScopeNote.className = "tier-constraint";
+    } else {
+      el.ruleTargetInput.placeholder = "(unused for ProcessAllow)";
+      el.ruleTargetInput.title = "Leave blank for ProcessAllow rules";
+      el.policyScopeNote.textContent =
+        "Process rule: requires SHA-256 or Signer + Root Thumbprint (L-04).";
+      el.policyScopeNote.className = "tier-constraint";
+    }
+  }
+
   function setAddRuleFormVisible(visible) {
     el.policyAddForm.classList.toggle("hidden", !visible);
     el.toggleAddRuleBtn.setAttribute("aria-expanded", visible ? "true" : "false");
     if (visible) {
+      syncPolicyFormHints();
       el.ruleExeInput.focus();
     }
   }
@@ -2086,6 +2213,7 @@
         message: `Preview: saved ${rule.scope} rule (${rule.exe_path_pattern})`,
       };
       el.policyAddForm.reset();
+      syncPolicyFormHints();
       setAddRuleFormVisible(false);
       renderPolicyView();
       return;
@@ -2108,11 +2236,12 @@
       const ack = await invoke("upsert_rule_action", { rule });
       state.policyFeedback = { ok: true, message: ack };
       el.policyAddForm.reset();
+      syncPolicyFormHints();
       setAddRuleFormVisible(false);
       await refreshAll();
     } catch (err) {
-      state.policyFeedback = { ok: false, message: String(err) };
-      renderPolicyView();
+      state.policyFeedback = { ok: false, message: formatBackendError(err) };
+      await refreshAll();
     } finally {
       state.isMutatingRule = false;
       renderPolicyView();
@@ -2150,8 +2279,8 @@
       state.policyFeedback = { ok: true, message: ack };
       await refreshAll();
     } catch (err) {
-      state.policyFeedback = { ok: false, message: String(err) };
-      renderPolicyView();
+      state.policyFeedback = { ok: false, message: formatBackendError(err) };
+      await refreshAll();
     } finally {
       state.isMutatingRule = false;
       renderPolicyView();
@@ -2249,7 +2378,7 @@
       state.metrics = metrics;
       if (alertsRes.ok) {
         state.alerts = Array.isArray(alertsRes.data) ? alertsRes.data : [];
-      } else {
+      } else if (!(state.triageFeedback && !state.triageFeedback.ok)) {
         state.triageFeedback = {
           ok: false,
           message: `Failed to refresh alerts: ${alertsRes.error}`,
@@ -2257,7 +2386,7 @@
       }
       if (rulesRes.ok) {
         state.rules = Array.isArray(rulesRes.data) ? rulesRes.data : [];
-      } else {
+      } else if (!(state.policyFeedback && !state.policyFeedback.ok)) {
         state.policyFeedback = {
           ok: false,
           message: `Failed to refresh policy rules: ${rulesRes.error}`,
@@ -2366,8 +2495,12 @@
 
   el.cancelAddRuleBtn.addEventListener("click", () => {
     el.policyAddForm.reset();
+    syncPolicyFormHints();
     setAddRuleFormVisible(false);
   });
+
+  el.ruleScopeInput.addEventListener("change", syncPolicyFormHints);
+  el.ruleTargetInput.addEventListener("input", syncPolicyFormHints);
 
   el.policyAddForm.addEventListener("submit", handleUpsertRule);
 
@@ -2403,10 +2536,17 @@
   el.alertQueue.addEventListener("click", (event) => {
     const btn = event.target.closest("[data-alert-id]");
     if (!btn) return;
+    const nextAlertId = btn.dataset.alertId;
     state.launchFocusAlertId = null;
-    state.selectedAlertId = btn.dataset.alertId;
-    state.triageFeedback = null;
+    if (state.selectedAlertId !== nextAlertId) {
+      state.triageFeedback = null;
+    }
+    state.selectedAlertId = nextAlertId;
     renderTriageView();
+  });
+
+  el.optAllowDest.addEventListener("input", () => {
+    syncTriageTargetScopeNote(state.selectedAlertIsNetwork);
   });
 
   el.inspectInView2Btn.addEventListener("click", () => {
@@ -2477,6 +2617,7 @@
   });
 
   document.addEventListener("DOMContentLoaded", async () => {
+    syncPolicyFormHints();
     await loadLaunchMode();
     await refreshAll();
   });

@@ -10,22 +10,27 @@ use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use ledr_proto::is_never_suspend_process;
 use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWPM_ACTION0, FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0,
-    FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_NONE, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC,
+    FWPM_ENGINE_COLLECT_NET_EVENTS, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_NONE,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_NET_EVENT2,
+    FWPM_NET_EVENT_CLASSIFY_DROP2, FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET,
+    FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET, FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET,
+    FWPM_NET_EVENT_HEADER2, FWPM_NET_EVENT_SUBSCRIPTION0, FWPM_NET_EVENT_TYPE,
+    FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC,
     FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE,
     FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0,
-    FWP_MATCH_EQUAL, FWP_UINT32, FWP_UINT8, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
-    FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0, FwpmEngineClose0,
-    FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteById0, FwpmFreeMemory0,
-    FwpmGetAppIdFromFileName0, FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0,
-    FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
+    FWP_IP_VERSION_V4, FWP_IP_VERSION_V6, FWP_MATCH_EQUAL, FWP_UINT32, FWP_UINT8,
+    FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0,
+    FWP_VALUE0_0, FwpmEngineClose0, FwpmEngineGetOption0, FwpmEngineOpen0, FwpmEngineSetOption0,
+    FwpmFilterAdd0, FwpmFilterDeleteById0, FwpmFreeMemory0, FwpmGetAppIdFromFileName0,
+    FwpmNetEventSubscribe1, FwpmNetEventUnsubscribe0, FwpmProviderAdd0, FwpmProviderDeleteByKey0,
+    FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
     FwpmTransactionCommit0,
 };
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
@@ -303,6 +308,94 @@ pub fn build_wfp_filter_specs(
     Ok(specs)
 }
 
+/// Metadata indexed per OS WFP filter ID so BFE net-event drop callbacks can map dropped
+/// connections back to the owning rule handle and executable without acquiring engine locks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WfpFilterMeta {
+    pub rule_handle: u64,
+    pub exe_path: String,
+    pub allow: bool,
+}
+
+/// Outbound connection drop captured from WFP net-event subscriptions for pre-emptively or
+/// policy-blocked executables (`BUG_0001`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WfpDropEvent {
+    pub os_filter_id: u64,
+    pub rule_handle: u64,
+    pub exe_path: String,
+    pub protocol: u8,
+    pub dst_ip: IpAddr,
+    pub dst_port: u16,
+    pub timestamp_ms: i64,
+}
+
+/// Callback sink invoked when a LocalEDR-managed WFP block filter drops an outbound connection.
+pub type WfpDropSinkFn = Arc<dyn Fn(WfpDropEvent) + Send + Sync>;
+
+/// Pure parser converting Win32 `FWPM_NET_EVENT2` classify-drop header and drop payload fields
+/// into a [`WfpDropEvent`] when the event represents a non-loopback drop on an active
+/// LocalEDR block (`!meta.allow`) filter.
+pub fn parse_wfp_classify_drop_fields(
+    event_type: FWPM_NET_EVENT_TYPE,
+    header: &FWPM_NET_EVENT_HEADER2,
+    classify_drop: Option<&FWPM_NET_EVENT_CLASSIFY_DROP2>,
+    filter_index: &HashMap<u64, WfpFilterMeta>,
+) -> Option<WfpDropEvent> {
+    if event_type != FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
+        return None;
+    }
+    let drop_info = classify_drop?;
+    if drop_info.isLoopback.as_bool() {
+        return None;
+    }
+    let meta = filter_index.get(&drop_info.filterId)?;
+    if meta.allow {
+        return None;
+    }
+    if (header.flags & FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET) == 0 {
+        return None;
+    }
+
+    let dst_ip = match header.ipVersion {
+        FWP_IP_VERSION_V4 => {
+            // SAFETY: `header.ipVersion == FWP_IP_VERSION_V4` selects `remoteAddrV4` (host order).
+            let v4_host = unsafe { header.Anonymous2.remoteAddrV4 };
+            IpAddr::V4(Ipv4Addr::from(v4_host))
+        }
+        FWP_IP_VERSION_V6 => {
+            // SAFETY: `header.ipVersion == FWP_IP_VERSION_V6` selects `remoteAddrV6` (network order).
+            let v6_bytes = unsafe { header.Anonymous2.remoteAddrV6.byteArray16 };
+            IpAddr::V6(Ipv6Addr::from(v6_bytes))
+        }
+        _ => return None,
+    };
+
+    let protocol = if (header.flags & FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET) != 0 {
+        header.ipProtocol
+    } else {
+        0
+    };
+    let dst_port = if (header.flags & FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET) != 0 {
+        header.remotePort
+    } else {
+        0
+    };
+
+    let ft_100ns = crate::etw::tdh::filetime_to_u64(header.timeStamp);
+    let timestamp_ms = crate::etw::tdh::filetime_100ns_to_unix_ms(ft_100ns);
+
+    Some(WfpDropEvent {
+        os_filter_id: drop_info.filterId,
+        rule_handle: meta.rule_handle,
+        exe_path: meta.exe_path.clone(),
+        protocol,
+        dst_ip,
+        dst_port,
+        timestamp_ms,
+    })
+}
+
 /// Low-level WFP operations boundary allowing unit tests to verify dual-stack transaction
 /// atomicity, rollback, handle bookkeeping, and dynamic session invariants without elevation.
 pub trait WfpBackend: Send {
@@ -312,6 +405,13 @@ pub trait WfpBackend: Send {
     fn add_filter(&mut self, spec: &WfpFilterSpec) -> Result<u64, String>;
     fn delete_filter(&mut self, os_filter_id: u64) -> Result<(), String>;
     fn is_dynamic_session(&self) -> bool;
+    fn set_drop_sink(
+        &mut self,
+        _filter_index: Arc<RwLock<HashMap<u64, WfpFilterMeta>>>,
+        _sink: Option<WfpDropSinkFn>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 struct OwnedFwpByteBlob(*mut FWP_BYTE_BLOB);
@@ -373,11 +473,62 @@ impl Drop for OwnedWfpEngineHandle {
     }
 }
 
+struct NetEventCallbackContext {
+    filter_index: Arc<RwLock<HashMap<u64, WfpFilterMeta>>>,
+    sink: WfpDropSinkFn,
+}
+
+struct NetEventSubscription {
+    events_handle: HANDLE,
+    ctx_ptr: *mut NetEventCallbackContext,
+}
+
+// SAFETY: `events_handle` is a BFE net-event subscription handle from `FwpmNetEventSubscribe1`
+// and `ctx_ptr` points to a heap-allocated `NetEventCallbackContext` containing `Send + Sync`
+// fields. `LiveWfpBackend` is synchronized by `Mutex` in `WfpDynamicEngine` and unsubscribes
+// via `FwpmNetEventUnsubscribe0` before freeing `ctx_ptr`.
+unsafe impl Send for NetEventSubscription {}
+
+unsafe extern "system" fn wfp_net_event_callback(
+    context: *mut c_void,
+    event: *const FWPM_NET_EVENT2,
+) {
+    if context.is_null() || event.is_null() {
+        return;
+    }
+    // SAFETY: `context` points to a live `NetEventCallbackContext` owned by `LiveWfpBackend`
+    // until after `FwpmNetEventUnsubscribe0` returns.
+    let ctx = unsafe { &*(context as *const NetEventCallbackContext) };
+    // SAFETY: `event` is non-null and valid for the callback duration.
+    let ev = unsafe { &*event };
+    if ev.r#type != FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
+        return;
+    }
+    // SAFETY: `ev.r#type == FWPM_NET_EVENT_TYPE_CLASSIFY_DROP` selects `classifyDrop`.
+    let drop_ptr = unsafe { ev.Anonymous.classifyDrop };
+    let classify_drop = if drop_ptr.is_null() {
+        None
+    } else {
+        // SAFETY: BFE guarantees `classifyDrop` is valid when non-null.
+        Some(unsafe { &*drop_ptr })
+    };
+
+    let parsed = {
+        let index = ctx.filter_index.read().unwrap_or_else(|e| e.into_inner());
+        parse_wfp_classify_drop_fields(ev.r#type, &ev.header, classify_drop, &index)
+    };
+    if let Some(drop_event) = parsed {
+        (ctx.sink)(drop_event);
+    }
+}
+
 /// Live Windows Filtering Platform backend backed by `fwpuclnt.dll` with
 /// `FWPM_SESSION_FLAG_DYNAMIC` and LocalEDR's dedicated SubLayer (`L-03`, `AUTO-04`).
 pub struct LiveWfpBackend {
     engine: OwnedWfpEngineHandle,
     loopback_filter_ids: Vec<u64>,
+    net_event_sub: Option<NetEventSubscription>,
+    enabled_net_events_by_us: bool,
 }
 
 impl LiveWfpBackend {
@@ -424,15 +575,65 @@ impl LiveWfpBackend {
         Ok(Self {
             engine,
             loopback_filter_ids,
+            net_event_sub: None,
+            enabled_net_events_by_us: false,
         })
+    }
+
+    fn unsubscribe_net_events(&mut self) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+
+        // CRITICAL ordering: ALWAYS call `FwpmNetEventUnsubscribe0` FIRST and wait for it to
+        // return BEFORE freeing `Box::from_raw(ctx_ptr)` or restoring `FWPM_ENGINE_COLLECT_NET_EVENTS`.
+        if let Some(sub) = self.net_event_sub.take() {
+            // SAFETY: `self.engine.raw()` and `sub.events_handle` are valid WFP handles.
+            let status = unsafe { FwpmNetEventUnsubscribe0(self.engine.raw(), sub.events_handle) };
+            if status != ERROR_SUCCESS_U32 {
+                first_err = Some(format!("FwpmNetEventUnsubscribe0 failed: 0x{status:08X}"));
+            }
+            // SAFETY: `FwpmNetEventUnsubscribe0` waits for any running callback to complete;
+            // `sub.ctx_ptr` was allocated via `Box::into_raw` and is freed exactly once here.
+            unsafe { drop(Box::from_raw(sub.ctx_ptr)) };
+        }
+
+        if self.enabled_net_events_by_us {
+            self.enabled_net_events_by_us = false;
+            let disable_val = FWP_VALUE0 {
+                r#type: FWP_UINT32,
+                Anonymous: FWP_VALUE0_0 { uint32: 0 },
+            };
+            // SAFETY: `self.engine.raw()` is open and `disable_val` stays live across the call.
+            let status = unsafe {
+                FwpmEngineSetOption0(
+                    self.engine.raw(),
+                    FWPM_ENGINE_COLLECT_NET_EVENTS,
+                    &disable_val,
+                )
+            };
+            if status != ERROR_SUCCESS_U32 && first_err.is_none() {
+                first_err = Some(format!(
+                    "FwpmEngineSetOption0(FWPM_ENGINE_COLLECT_NET_EVENTS=0) failed: 0x{status:08X}"
+                ));
+            }
+        }
+
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 
 impl Drop for LiveWfpBackend {
     fn drop(&mut self) {
-        // Best-effort cleanup of dynamic loopback filters and non-persistent SubLayer/Provider;
-        // `OwnedWfpEngineHandle::drop` immediately follows with `FwpmEngineClose0`, which
-        // unconditionally deletes every dynamic filter added in this session (`AUTO-04`).
+        // CRITICAL lifetime/drop order:
+        // 1. `FwpmNetEventUnsubscribe0` + wait for return -> free `ctx_ptr` -> restore option.
+        // 2. Delete dynamic loopback filters, SubLayer, and Provider.
+        // 3. `OwnedWfpEngineHandle::drop` calls `FwpmEngineClose0` (`AUTO-04`).
+        if let Err(err) = self.unsubscribe_net_events() {
+            tracing::debug!(error = %err, "LiveWfpBackend net-event cleanup warning on drop");
+        }
+
         let handle = self.engine.raw();
         if !handle.is_invalid() && !handle.0.is_null() {
             // SAFETY: `handle` is an open WFP engine handle and GUIDs/filter IDs are valid.
@@ -769,6 +970,95 @@ impl WfpBackend for LiveWfpBackend {
     fn is_dynamic_session(&self) -> bool {
         true
     }
+
+    fn set_drop_sink(
+        &mut self,
+        filter_index: Arc<RwLock<HashMap<u64, WfpFilterMeta>>>,
+        sink: Option<WfpDropSinkFn>,
+    ) -> Result<(), String> {
+        self.unsubscribe_net_events()?;
+        let Some(sink) = sink else {
+            return Ok(());
+        };
+
+        let mut current_opt: *mut FWP_VALUE0 = ptr::null_mut();
+        // SAFETY: `self.engine.raw()` is open and `current_opt` receives a BFE-allocated
+        // `FWP_VALUE0` freed immediately below via `FwpmFreeMemory0`.
+        let get_status = unsafe {
+            FwpmEngineGetOption0(
+                self.engine.raw(),
+                FWPM_ENGINE_COLLECT_NET_EVENTS,
+                &mut current_opt,
+            )
+        };
+        if get_status != ERROR_SUCCESS_U32 || current_opt.is_null() {
+            return Err(format!(
+                "FwpmEngineGetOption0(FWPM_ENGINE_COLLECT_NET_EVENTS) failed: 0x{get_status:08X}"
+            ));
+        }
+        let current_val = unsafe {
+            let res = if (*current_opt).r#type == FWP_UINT32 {
+                Ok((*current_opt).Anonymous.uint32)
+            } else {
+                Err(format!(
+                    "unexpected FWP_VALUE0 type {} for FWPM_ENGINE_COLLECT_NET_EVENTS",
+                    (*current_opt).r#type.0
+                ))
+            };
+            let mut raw = current_opt.cast::<c_void>();
+            FwpmFreeMemory0(&mut raw);
+            res
+        }?;
+
+        if current_val == 0 {
+            let enable_val = FWP_VALUE0 {
+                r#type: FWP_UINT32,
+                Anonymous: FWP_VALUE0_0 { uint32: 1 },
+            };
+            // SAFETY: `self.engine.raw()` is open and `enable_val` stays live across the call.
+            let set_status = unsafe {
+                FwpmEngineSetOption0(
+                    self.engine.raw(),
+                    FWPM_ENGINE_COLLECT_NET_EVENTS,
+                    &enable_val,
+                )
+            };
+            if set_status != ERROR_SUCCESS_U32 {
+                return Err(format!(
+                    "FwpmEngineSetOption0(FWPM_ENGINE_COLLECT_NET_EVENTS=1) failed: 0x{set_status:08X}"
+                ));
+            }
+            self.enabled_net_events_by_us = true;
+        }
+
+        let ctx_ptr = Box::into_raw(Box::new(NetEventCallbackContext { filter_index, sink }));
+        let subscription = FWPM_NET_EVENT_SUBSCRIPTION0::default();
+        let mut events_handle = HANDLE::default();
+        // SAFETY: `self.engine.raw()` is open, `subscription` stays valid across the call,
+        // `wfp_net_event_callback` matches `FWPM_NET_EVENT_CALLBACK1`, and `ctx_ptr` remains
+        // valid until after `FwpmNetEventUnsubscribe0` returns.
+        let sub_status = unsafe {
+            FwpmNetEventSubscribe1(
+                self.engine.raw(),
+                &subscription,
+                Some(wfp_net_event_callback),
+                Some(ctx_ptr.cast::<c_void>()),
+                &mut events_handle,
+            )
+        };
+        if sub_status != ERROR_SUCCESS_U32 || events_handle.is_invalid() || events_handle.0.is_null() {
+            // SAFETY: Registration failed so no callback was installed; reclaim `ctx_ptr` now.
+            unsafe { drop(Box::from_raw(ctx_ptr)) };
+            let _ = self.unsubscribe_net_events();
+            return Err(format!("FwpmNetEventSubscribe1 failed: 0x{sub_status:08X}"));
+        }
+
+        self.net_event_sub = Some(NetEventSubscription {
+            events_handle,
+            ctx_ptr,
+        });
+        Ok(())
+    }
 }
 
 struct WfpEngineState {
@@ -781,6 +1071,8 @@ struct WfpEngineState {
 /// single opaque `u64` rule handle (`L-03`, `AUTO-04`).
 pub struct WfpDynamicEngine {
     state: Mutex<WfpEngineState>,
+    // Separate lock from `state` so BFE net-event callbacks never deadlock against BFE writes.
+    filter_index: Arc<RwLock<HashMap<u64, WfpFilterMeta>>>,
 }
 
 impl std::fmt::Debug for WfpDynamicEngine {
@@ -818,7 +1110,24 @@ impl WfpDynamicEngine {
                 next_handle: 1,
                 handles: HashMap::new(),
             }),
+            filter_index: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Subscribes to WFP net-event drops for active LocalEDR block filters (`BUG_0001`).
+    pub fn set_drop_sink(&self, sink: WfpDropSinkFn) -> Result<(), String> {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .backend
+            .set_drop_sink(Arc::clone(&self.filter_index), Some(sink))
+    }
+
+    /// Unsubscribes any active WFP net-event drop sink.
+    pub fn clear_drop_sink(&self) -> Result<(), String> {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .backend
+            .set_drop_sink(Arc::clone(&self.filter_index), None)
     }
 
     /// Atomically adds a dynamic outbound Block or Permit rule for `exe_path` (single-stack when
@@ -831,6 +1140,7 @@ impl WfpDynamicEngine {
         allow: bool,
     ) -> Result<u64, String> {
         let specs = build_wfp_filter_specs(exe_path, remote_ip, allow)?;
+        let exe_path_norm = specs[0].exe_path.clone();
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         guard.backend.begin_transaction()?;
@@ -853,6 +1163,17 @@ impl WfpDynamicEngine {
         guard.next_handle = guard.next_handle.checked_add(1).unwrap_or(1);
         if guard.next_handle == 0 {
             guard.next_handle = 1;
+        }
+        {
+            let mut index = self.filter_index.write().unwrap_or_else(|e| e.into_inner());
+            let meta = WfpFilterMeta {
+                rule_handle: handle,
+                exe_path: exe_path_norm,
+                allow,
+            };
+            for &os_id in &os_filter_ids {
+                index.insert(os_id, meta.clone());
+            }
         }
         guard.handles.insert(handle, os_filter_ids);
         Ok(handle)
@@ -881,7 +1202,22 @@ impl WfpDynamicEngine {
         }
 
         guard.handles.remove(&handle_id);
+        {
+            let mut index = self.filter_index.write().unwrap_or_else(|e| e.into_inner());
+            for os_id in &os_ids {
+                index.remove(os_id);
+            }
+        }
         Ok(())
+    }
+
+    /// Returns a snapshot of indexed filter metadata for `os_filter_id` (diagnostics/tests).
+    pub fn filter_meta(&self, os_filter_id: u64) -> Option<WfpFilterMeta> {
+        self.filter_index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&os_filter_id)
+            .cloned()
     }
 
     /// Returns the number of currently active opaque rule handles.
@@ -935,6 +1271,9 @@ mod tests {
         fail_delete_os_id: Option<u64>,
         tx_aborts: usize,
         tx_commits: usize,
+        drop_filter_index: Option<Arc<RwLock<HashMap<u64, WfpFilterMeta>>>>,
+        drop_sink: Option<WfpDropSinkFn>,
+        set_drop_sink_calls: usize,
     }
 
     struct MockWfpBackend {
@@ -1015,6 +1354,18 @@ mod tests {
 
         fn is_dynamic_session(&self) -> bool {
             self.shared.lock().unwrap().dynamic_session
+        }
+
+        fn set_drop_sink(
+            &mut self,
+            filter_index: Arc<RwLock<HashMap<u64, WfpFilterMeta>>>,
+            sink: Option<WfpDropSinkFn>,
+        ) -> Result<(), String> {
+            let mut s = self.shared.lock().unwrap();
+            s.drop_filter_index = Some(filter_index);
+            s.drop_sink = sink;
+            s.set_drop_sink_calls += 1;
+            Ok(())
         }
     }
 
@@ -1277,5 +1628,338 @@ mod tests {
             assert!(WFP_WEIGHT_PERMIT_SPECIFIC > WFP_WEIGHT_BLOCK_APP);
             assert!(WFP_WEIGHT_BLOCK_APP > WFP_WEIGHT_PERMIT_APP);
         }
+    }
+
+    #[test]
+    fn sens_p3_09_parse_wfp_classify_drop_fields_v4_v6_flags_and_filter_matching() {
+        use windows::core::BOOL;
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FWPM_NET_EVENT_HEADER2_1, FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW, FWP_BYTE_ARRAY16,
+            FWP_IP_VERSION_NONE,
+        };
+
+        const UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+        let expected_ts_ms: i64 = 1_760_123_456_789;
+        let ft_100ns = UNIX_EPOCH_100NS + (expected_ts_ms as u64) * 10_000;
+        let ts = FILETIME {
+            dwLowDateTime: ft_100ns as u32,
+            dwHighDateTime: (ft_100ns >> 32) as u32,
+        };
+
+        let mut filter_index = HashMap::new();
+        filter_index.insert(
+            7001,
+            WfpFilterMeta {
+                rule_handle: 11,
+                exe_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                allow: false,
+            },
+        );
+        filter_index.insert(
+            7002,
+            WfpFilterMeta {
+                rule_handle: 12,
+                exe_path: r"C:\Tools\allowed.exe".to_string(),
+                allow: true,
+            },
+        );
+
+        let v4_header = FWPM_NET_EVENT_HEADER2 {
+            timeStamp: ts,
+            flags: FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET
+                | FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET
+                | FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET,
+            ipVersion: FWP_IP_VERSION_V4,
+            ipProtocol: 6,
+            Anonymous2: FWPM_NET_EVENT_HEADER2_1 {
+                remoteAddrV4: 0x5DB8_D822, // 93.184.216.34 in host byte order
+            },
+            remotePort: 443,
+            ..Default::default()
+        };
+        let v4_drop = FWPM_NET_EVENT_CLASSIFY_DROP2 {
+            filterId: 7001,
+            isLoopback: BOOL(0),
+            ..Default::default()
+        };
+
+        // 1. Valid IPv4 non-loopback drop on a LocalEDR block filter emits WfpDropEvent.
+        let parsed_v4 = parse_wfp_classify_drop_fields(
+            FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+            &v4_header,
+            Some(&v4_drop),
+            &filter_index,
+        )
+        .expect("expected valid IPv4 WfpDropEvent");
+        assert_eq!(
+            parsed_v4,
+            WfpDropEvent {
+                os_filter_id: 7001,
+                rule_handle: 11,
+                exe_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                dst_port: 443,
+                timestamp_ms: expected_ts_ms,
+            }
+        );
+
+        // 2. Valid IPv6 non-loopback drop decodes `[u8; 16]` network-order IP and host-order port.
+        let v6 = Ipv6Addr::new(0x2606, 0x2800, 0x0220, 0x0001, 0x0248, 0x1893, 0x25c8, 0x1946);
+        let v6_header = FWPM_NET_EVENT_HEADER2 {
+            timeStamp: ts,
+            flags: FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET
+                | FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET
+                | FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET,
+            ipVersion: FWP_IP_VERSION_V6,
+            ipProtocol: 17,
+            Anonymous2: FWPM_NET_EVENT_HEADER2_1 {
+                remoteAddrV6: FWP_BYTE_ARRAY16 {
+                    byteArray16: v6.octets(),
+                },
+            },
+            remotePort: 8443,
+            ..Default::default()
+        };
+        let parsed_v6 = parse_wfp_classify_drop_fields(
+            FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+            &v6_header,
+            Some(&v4_drop),
+            &filter_index,
+        )
+        .expect("expected valid IPv6 WfpDropEvent");
+        assert_eq!(parsed_v6.dst_ip, IpAddr::V6(v6));
+        assert_eq!(parsed_v6.protocol, 17);
+        assert_eq!(parsed_v6.dst_port, 8443);
+
+        // 3. Loopback drops, non-drop types, missing payload, unknown filters, and allow filters are ignored.
+        let loopback_drop = FWPM_NET_EVENT_CLASSIFY_DROP2 {
+            filterId: 7001,
+            isLoopback: BOOL(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_wfp_classify_drop_fields(
+                FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+                &v4_header,
+                Some(&loopback_drop),
+                &filter_index,
+            ),
+            None
+        );
+        assert_eq!(
+            parse_wfp_classify_drop_fields(
+                FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW,
+                &v4_header,
+                Some(&v4_drop),
+                &filter_index,
+            ),
+            None
+        );
+        assert_eq!(
+            parse_wfp_classify_drop_fields(
+                FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+                &v4_header,
+                None,
+                &filter_index,
+            ),
+            None
+        );
+        let other_app_drop = FWPM_NET_EVENT_CLASSIFY_DROP2 {
+            filterId: 9999,
+            isLoopback: BOOL(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_wfp_classify_drop_fields(
+                FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+                &v4_header,
+                Some(&other_app_drop),
+                &filter_index,
+            ),
+            None
+        );
+        let permit_filter_drop = FWPM_NET_EVENT_CLASSIFY_DROP2 {
+            filterId: 7002,
+            isLoopback: BOOL(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_wfp_classify_drop_fields(
+                FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+                &v4_header,
+                Some(&permit_filter_drop),
+                &filter_index,
+            ),
+            None
+        );
+
+        // 4. Missing REMOTE_ADDR_SET or FWP_IP_VERSION_NONE returns None; missing IP_PROTOCOL_SET
+        //    or REMOTE_PORT_SET zeroes unflagged protocol/port rather than leaking garbage values.
+        let no_addr_hdr = FWPM_NET_EVENT_HEADER2 {
+            flags: FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET | FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET,
+            ..v4_header
+        };
+        assert_eq!(
+            parse_wfp_classify_drop_fields(
+                FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+                &no_addr_hdr,
+                Some(&v4_drop),
+                &filter_index,
+            ),
+            None
+        );
+        let bad_ver_hdr = FWPM_NET_EVENT_HEADER2 {
+            ipVersion: FWP_IP_VERSION_NONE,
+            ..v4_header
+        };
+        assert_eq!(
+            parse_wfp_classify_drop_fields(
+                FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+                &bad_ver_hdr,
+                Some(&v4_drop),
+                &filter_index,
+            ),
+            None
+        );
+        let partial_flags_hdr = FWPM_NET_EVENT_HEADER2 {
+            flags: FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET,
+            ipProtocol: 6,
+            remotePort: 443,
+            ..v4_header
+        };
+        let partial = parse_wfp_classify_drop_fields(
+            FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+            &partial_flags_hdr,
+            Some(&v4_drop),
+            &filter_index,
+        )
+        .expect("drop without protocol/port flags still extracts remote addr");
+        assert_eq!(partial.protocol, 0);
+        assert_eq!(partial.dst_port, 0);
+    }
+
+    #[test]
+    fn sens_p3_10_wfp_dynamic_engine_filter_index_and_drop_sink_lifecycle() {
+        use windows::core::BOOL;
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_NET_EVENT_HEADER2_1;
+
+        let (backend, state) = MockWfpBackend::new_dynamic();
+        let engine = WfpDynamicEngine::from_backend(Box::new(backend)).expect("dynamic engine");
+
+        let received = Arc::new(Mutex::new(Vec::<WfpDropEvent>::new()));
+        let received_clone = Arc::clone(&received);
+        let sink: WfpDropSinkFn = Arc::new(move |ev| {
+            received_clone.lock().unwrap().push(ev);
+        });
+        engine.set_drop_sink(sink).expect("set_drop_sink");
+
+        // Transaction failure must NOT populate `filter_index`.
+        state.lock().unwrap().fail_on_layer = Some(WfpLayer::AleAuthConnectV6);
+        assert!(engine
+            .add_app_rule(Path::new(r"C:\Temp\blocked.exe"), None, false)
+            .is_err());
+        state.lock().unwrap().fail_on_layer = None;
+        assert!(engine.filter_meta(100).is_none());
+
+        // Add dual-stack block rule and single-stack permit rule.
+        let block_handle = engine
+            .add_app_rule(Path::new(r"\\?\C:/Temp/blocked.exe"), None, false)
+            .expect("add block rule");
+        let block_os_ids = engine.os_filter_ids_for_handle(block_handle).unwrap();
+        assert_eq!(block_os_ids.len(), 2);
+        for &os_id in &block_os_ids {
+            let meta = engine.filter_meta(os_id).expect("indexed block filter");
+            assert_eq!(meta.rule_handle, block_handle);
+            assert_eq!(meta.exe_path, r"C:\Temp\blocked.exe");
+            assert!(!meta.allow);
+        }
+
+        let permit_handle = engine
+            .add_app_rule(
+                Path::new(r"C:\Temp\allowed.exe"),
+                Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+                true,
+            )
+            .expect("add permit rule");
+        let permit_os_ids = engine.os_filter_ids_for_handle(permit_handle).unwrap();
+        let permit_meta = engine.filter_meta(permit_os_ids[0]).expect("indexed permit");
+        assert!(permit_meta.allow);
+
+        // Simulate BFE callback hitting `filter_index` captured via `set_drop_sink`.
+        let (index_arc, active_sink) = {
+            let s = state.lock().unwrap();
+            (
+                s.drop_filter_index.clone().expect("index captured"),
+                s.drop_sink.clone().expect("sink captured"),
+            )
+        };
+        let header = FWPM_NET_EVENT_HEADER2 {
+            timeStamp: FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            flags: FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET
+                | FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET
+                | FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET,
+            ipVersion: FWP_IP_VERSION_V4,
+            ipProtocol: 6,
+            Anonymous2: FWPM_NET_EVENT_HEADER2_1 {
+                remoteAddrV4: 0x0808_0808,
+            },
+            remotePort: 443,
+            ..Default::default()
+        };
+        let drop_block = FWPM_NET_EVENT_CLASSIFY_DROP2 {
+            filterId: block_os_ids[0],
+            isLoopback: BOOL(0),
+            ..Default::default()
+        };
+        let drop_permit = FWPM_NET_EVENT_CLASSIFY_DROP2 {
+            filterId: permit_os_ids[0],
+            isLoopback: BOOL(0),
+            ..Default::default()
+        };
+
+        {
+            let guard = index_arc.read().unwrap();
+            if let Some(ev) = parse_wfp_classify_drop_fields(
+                FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+                &header,
+                Some(&drop_block),
+                &guard,
+            ) {
+                active_sink(ev);
+            }
+            if let Some(ev) = parse_wfp_classify_drop_fields(
+                FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+                &header,
+                Some(&drop_permit),
+                &guard,
+            ) {
+                active_sink(ev);
+            }
+        }
+
+        let captured = received.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].os_filter_id, block_os_ids[0]);
+        assert_eq!(captured[0].rule_handle, block_handle);
+        assert_eq!(captured[0].dst_ip, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(captured[0].dst_port, 443);
+        drop(captured);
+
+        // Removing the block rule removes its OS filter IDs from `filter_index`.
+        engine.remove_rule(block_handle).expect("remove block");
+        for os_id in &block_os_ids {
+            assert!(engine.filter_meta(*os_id).is_none());
+        }
+
+        engine.clear_drop_sink().expect("clear_drop_sink");
+        let s = state.lock().unwrap();
+        assert!(s.drop_sink.is_none());
+        assert_eq!(s.set_drop_sink_calls, 2);
     }
 }

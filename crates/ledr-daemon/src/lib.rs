@@ -11,13 +11,14 @@ pub mod notify;
 pub mod process_table;
 
 pub use channel::{
-    ChannelClosedError, HighPrioritySendError, TwoLaneChannel, TwoLaneReceiver, TwoLaneSender,
+    ChannelClosedError, ClassifiedEventSender, HighPrioritySendError, OutboundLaneClassifier,
+    TwoLaneChannel, TwoLaneReceiver, TwoLaneSender,
 };
 pub use engine::{
     BinaryInspector, DaemonConfig, DaemonEngine, PolicyRuleError, WindowsBinaryInspector,
 };
 pub use firewall::{
-    InstalledWfpFilter, WfpFilterOrigin, WfpReconcileReport, WfpRuleManager,
+    InstalledWfpFilter, WfpFailedOp, WfpFilterOrigin, WfpReconcileReport, WfpRuleManager,
 };
 pub use ipc::{
     build_service_pipe_security_descriptor, inspect_pipe_client_exe, is_authorized_bridge_caller,

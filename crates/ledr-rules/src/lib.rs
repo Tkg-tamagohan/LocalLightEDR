@@ -21,8 +21,9 @@ pub use allowlist::{
 };
 pub use domain::{assess_domain_risk, DomainRiskAssessment};
 pub use nrd::{
-    fetch_nrd_feed_url, normalize_nrd_domain, parse_file_url, parse_http_url, parse_nrd_feed_bytes,
-    parse_nrd_line, refresh_nrd_cache, NrdCache, NrdRefreshStats, ParsedHttpUrl,
+    fetch_nrd_feed_url, fetch_nrd_feed_url_cancellable, normalize_nrd_domain, parse_file_url,
+    parse_http_url, parse_nrd_feed_bytes, parse_nrd_line, refresh_nrd_cache,
+    refresh_nrd_cache_cancellable, NrdCache, NrdCancelToken, NrdRefreshStats, ParsedHttpUrl,
     DEFAULT_NRD_FEED_URLS, NRD_MAX_ENTRIES, NRD_MAX_RESPONSE_BYTES, NRD_REFRESH_INTERVAL_MS,
 };
 pub use outbound::{
@@ -1446,5 +1447,173 @@ brand-new.org
                 "protected OS binary must never be pre-restricted: {p}"
             );
         }
+    }
+
+    #[test]
+    fn rules_p3_09_nrd_cancel_token_aborts_in_flight_winhttp_and_chunks() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{mpsc, Arc};
+        use std::time::{Duration, Instant};
+
+        // 1. Pre-cancelled token immediately aborts file://, http://, refresh, and chunk reader.
+        let pre_cancelled = NrdCancelToken::new();
+        assert!(!pre_cancelled.is_cancelled());
+        pre_cancelled.cancel();
+        assert!(pre_cancelled.is_cancelled());
+        // Calling cancel() multiple times is idempotent and safe.
+        pre_cancelled.cancel();
+
+        let tmp = TestTempDir::new("ledr-rules-p3-cancel");
+        let feed_file = tmp.path().join("feed.txt");
+        std::fs::write(&feed_file, "example.xyz\n").expect("write feed");
+        let file_url = format!("file:///{}", feed_file.to_string_lossy().replace('\\', "/"));
+
+        let err = fetch_nrd_feed_url_cancellable(&file_url, 1024, &pre_cancelled)
+            .expect_err("pre-cancelled file:// fetch must fail");
+        assert!(err.contains("cancelled"), "{err}");
+
+        let err = refresh_nrd_cache_cancellable(
+            &[file_url],
+            NRD_MAX_ENTRIES,
+            NRD_MAX_RESPONSE_BYTES,
+            1_760_000_000_000,
+            &pre_cancelled,
+        )
+        .expect_err("pre-cancelled refresh_nrd_cache_cancellable must fail");
+        assert!(err.contains("cancelled"), "{err}");
+
+        let mid_cancel = NrdCancelToken::new();
+        let mut chunk_idx = 0usize;
+        let err = crate::nrd::read_bounded_chunks_cancellable(1024, &mid_cancel, |_| {
+            chunk_idx += 1;
+            if chunk_idx == 1 {
+                Ok(Some(b"first.xyz\n".to_vec()))
+            } else {
+                mid_cancel.cancel();
+                Ok(Some(b"second.xyz\n".to_vec()))
+            }
+        })
+        .expect_err("chunk reader must abort promptly once token is cancelled");
+        assert!(err.contains("cancelled"), "{err}");
+
+        // 2. Uncancelled loopback HTTP 200 OK fetch succeeds.
+        let ok_listener = TcpListener::bind("127.0.0.1:0").expect("bind ok listener");
+        let ok_addr = ok_listener.local_addr().unwrap();
+        let ok_server = std::thread::spawn(move || {
+            let (mut stream, _) = ok_listener.accept().expect("accept ok client");
+            let mut req_buf = [0u8; 512];
+            let _ = stream.read(&mut req_buf);
+            let body = "new-phish.xyz\nfresh-c2.top\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).expect("write response");
+            stream.flush().expect("flush");
+        });
+        let ok_url = format!("http://127.0.0.1:{}/nrd.txt", ok_addr.port());
+        let ok_token = NrdCancelToken::new();
+        let (bytes, trunc) = fetch_nrd_feed_url_cancellable(&ok_url, 1024, &ok_token)
+            .expect("loopback HTTP fetch should succeed");
+        assert!(!trunc);
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "new-phish.xyz\nfresh-c2.top\n"
+        );
+        ok_server.join().expect("join ok server");
+
+        // 3. Hanging TCP server (accepts request and never sends response headers):
+        //    calling NrdCancelToken::cancel() aborts in-flight fetch well under 1 second.
+        let hang_listener = TcpListener::bind("127.0.0.1:0").expect("bind hang listener");
+        let hang_addr = hang_listener.local_addr().unwrap();
+        let (req_seen_tx, req_seen_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let hang_server = std::thread::spawn(move || {
+            let (mut stream, _) = hang_listener.accept().expect("accept hang client");
+            let mut req_buf = [0u8; 512];
+            let _ = stream.read(&mut req_buf);
+            let _ = req_seen_tx.send(());
+            // Keep socket open up to 10s unless test finishes early.
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+
+        let hang_url = format!("http://127.0.0.1:{}/hang.txt", hang_addr.port());
+        let cancel_token = Arc::new(NrdCancelToken::new());
+        let worker_token = Arc::clone(&cancel_token);
+        let fetch_handle = std::thread::spawn(move || {
+            fetch_nrd_feed_url_cancellable(&hang_url, NRD_MAX_RESPONSE_BYTES, &worker_token)
+        });
+
+        req_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("WinHTTP client should connect and send GET to hanging server");
+        // Small grace period so WinHTTP enters WinHttpReceiveResponse.
+        std::thread::sleep(Duration::from_millis(30));
+
+        let cancel_started = Instant::now();
+        cancel_token.cancel();
+        let fetch_res = fetch_handle.join().expect("fetch thread must not panic");
+        let elapsed = cancel_started.elapsed();
+        let _ = release_tx.send(());
+        hang_server.join().expect("join hang server");
+
+        let cancel_err = fetch_res.expect_err("cancelled in-flight HTTP fetch must return Err");
+        assert!(
+            cancel_err.contains("cancelled"),
+            "unexpected error after cancel: {cancel_err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "in-flight NRD fetch took too long to abort after cancel(): {elapsed:?}"
+        );
+
+        // 4. Mid-body hanging TCP server (sends 200 OK + partial body, then stalls):
+        //    cancel() aborts WinHttpQueryDataAvailable / WinHttpReadData well under 1 second.
+        let body_listener = TcpListener::bind("127.0.0.1:0").expect("bind body hang listener");
+        let body_addr = body_listener.local_addr().unwrap();
+        let (body_seen_tx, body_seen_rx) = mpsc::channel::<()>();
+        let (body_release_tx, body_release_rx) = mpsc::channel::<()>();
+        let body_server = std::thread::spawn(move || {
+            let (mut stream, _) = body_listener.accept().expect("accept body hang client");
+            let mut req_buf = [0u8; 512];
+            let _ = stream.read(&mut req_buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\npartial-one.xyz\n",
+            );
+            let _ = stream.flush();
+            let _ = body_seen_tx.send(());
+            let _ = body_release_rx.recv_timeout(Duration::from_secs(10));
+        });
+
+        let body_url = format!("http://127.0.0.1:{}/mid-body-hang.txt", body_addr.port());
+        let body_token = Arc::new(NrdCancelToken::new());
+        let body_worker_token = Arc::clone(&body_token);
+        let body_fetch = std::thread::spawn(move || {
+            fetch_nrd_feed_url_cancellable(&body_url, NRD_MAX_RESPONSE_BYTES, &body_worker_token)
+        });
+
+        body_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("body hang server should flush initial chunk");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let body_cancel_started = Instant::now();
+        body_token.cancel();
+        let body_res = body_fetch.join().expect("body fetch thread must not panic");
+        let body_elapsed = body_cancel_started.elapsed();
+        let _ = body_release_tx.send(());
+        body_server.join().expect("join body hang server");
+
+        let body_err = body_res.expect_err("cancelled mid-body HTTP fetch must return Err");
+        assert!(
+            body_err.contains("cancelled"),
+            "unexpected error after mid-body cancel: {body_err}"
+        );
+        assert!(
+            body_elapsed < Duration::from_secs(1),
+            "mid-body NRD fetch took too long to abort after cancel(): {body_elapsed:?}"
+        );
     }
 }

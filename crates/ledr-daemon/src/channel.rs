@@ -4,14 +4,17 @@
 //! - Telemetry lane (`TELEMETRY_CHANNEL_CAPACITY` = 8,192): drop-oldest ring buffer (`VecDeque`)
 //!   that counts evicted events in `telemetry_dropped`.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ledr_proto::{
-    EventLane, SensorEvent, HIGH_PRIORITY_CHANNEL_CAPACITY, TELEMETRY_CHANNEL_CAPACITY,
+    EventLane, SensorEvent, ACTIVE_PROCESS_TABLE_CAPACITY, HIGH_PRIORITY_CHANNEL_CAPACITY,
+    TELEMETRY_CHANNEL_CAPACITY,
 };
+use ledr_rules::is_external_ip;
 use tokio::sync::{mpsc, watch, Notify};
 
 /// Error returned when a high-priority event cannot be sent immediately or the channel is closed.
@@ -204,17 +207,20 @@ impl TwoLaneSender {
     /// Blocking send for synchronous producer threads (such as the ETW callback bridge).
     pub fn blocking_send(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
         match event.default_lane() {
-            EventLane::HighPriority => {
-                let _guard = InFlightHighGuard::enter(&self.stats);
-                if self.stats.closed.load(Ordering::SeqCst) {
-                    return Err(ChannelClosedError(event));
-                }
-                self.high_tx
-                    .blocking_send(event)
-                    .map_err(|mpsc::error::SendError(ev)| ChannelClosedError(ev))
-            }
+            EventLane::HighPriority => self.blocking_send_high_priority(event),
             EventLane::Telemetry => self.send_telemetry(event),
         }
+    }
+
+    /// Blocking send directly into the non-dropping high-priority lane (`L-10`).
+    pub fn blocking_send_high_priority(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
+        let _guard = InFlightHighGuard::enter(&self.stats);
+        if self.stats.closed.load(Ordering::SeqCst) {
+            return Err(ChannelClosedError(event));
+        }
+        self.high_tx
+            .blocking_send(event)
+            .map_err(|mpsc::error::SendError(ev)| ChannelClosedError(ev))
     }
 
     /// Enqueues a telemetry event into the drop-oldest ring buffer (`L-10`).
@@ -280,26 +286,30 @@ impl TwoLaneReceiver {
     /// Receives the next event, strictly prioritizing the high-priority lane over telemetry.
     /// Returns `None` only after the channel is closed AND both lanes are completely drained.
     pub async fn recv(&mut self) -> Option<SensorEvent> {
+        self.recv_with_lane().await.map(|(ev, _)| ev)
+    }
+
+    pub(crate) async fn recv_with_lane(&mut self) -> Option<(SensorEvent, EventLane)> {
         loop {
             if let Ok(ev) = self.high_rx.try_recv() {
-                return Some(ev);
+                return Some((ev, EventLane::HighPriority));
             }
 
             let notified = self.telemetry.notify.notified();
             tokio::pin!(notified);
 
             if let Some(ev) = self.telemetry.try_pop() {
-                return Some(ev);
+                return Some((ev, EventLane::Telemetry));
             }
 
             if *self.close_rx.borrow() || self.telemetry.is_closed() {
                 if self.stats.in_flight_high.load(Ordering::SeqCst) == 0 {
                     self.high_rx.close();
                     if let Some(ev) = self.high_rx.recv().await {
-                        return Some(ev);
+                        return Some((ev, EventLane::HighPriority));
                     }
                     if let Some(ev) = self.telemetry.try_pop() {
-                        return Some(ev);
+                        return Some((ev, EventLane::Telemetry));
                     }
                     return None;
                 }
@@ -313,7 +323,7 @@ impl TwoLaneReceiver {
                     biased;
                     maybe_high = self.high_rx.recv() => {
                         if let Some(ev) = maybe_high {
-                            return Some(ev);
+                            return Some((ev, EventLane::HighPriority));
                         }
                     }
                     _ = &mut in_flight_notified => {}
@@ -325,7 +335,7 @@ impl TwoLaneReceiver {
                 biased;
                 maybe_high = self.high_rx.recv() => {
                     if let Some(ev) = maybe_high {
-                        return Some(ev);
+                        return Some((ev, EventLane::HighPriority));
                     }
                     // High-priority senders dropped; drain any remaining telemetry and exit on next pass.
                     self.telemetry.close();
@@ -338,6 +348,13 @@ impl TwoLaneReceiver {
 
     /// Non-blocking drain of all currently buffered events (high-priority first, then telemetry).
     pub fn drain_ready(&mut self) -> Vec<SensorEvent> {
+        self.drain_ready_with_lane()
+            .into_iter()
+            .map(|(ev, _)| ev)
+            .collect()
+    }
+
+    pub(crate) fn drain_ready_with_lane(&mut self) -> Vec<(SensorEvent, EventLane)> {
         if (*self.close_rx.borrow() || self.telemetry.is_closed())
             && self.stats.in_flight_high.load(Ordering::SeqCst) == 0
         {
@@ -345,12 +362,212 @@ impl TwoLaneReceiver {
         }
         let mut out = Vec::new();
         while let Ok(ev) = self.high_rx.try_recv() {
-            out.push(ev);
+            out.push((ev, EventLane::HighPriority));
         }
         while let Some(ev) = self.telemetry.try_pop() {
-            out.push(ev);
+            out.push((ev, EventLane::Telemetry));
         }
         out
+    }
+}
+
+/// Bounded per-PID steady-state tracker used by [`ClassifiedEventSender`] to promote
+/// unverified external [`SensorEvent::NetworkConnect`] events onto the non-dropping
+/// high-priority lane (`決定記録 L-10`) while routing steady/known traffic via telemetry.
+#[derive(Debug)]
+pub struct OutboundLaneClassifier {
+    outbound_firewall_enabled: bool,
+    protected_pids: RwLock<HashSet<u32>>,
+    steady_pids: RwLock<HashSet<u32>>,
+}
+
+impl OutboundLaneClassifier {
+    /// Creates a new [`OutboundLaneClassifier`] bound to `outbound_firewall_enabled`.
+    pub fn new(outbound_firewall_enabled: bool) -> Self {
+        Self {
+            outbound_firewall_enabled,
+            protected_pids: RwLock::new(HashSet::new()),
+            steady_pids: RwLock::new(HashSet::new()),
+        }
+    }
+
+    /// Returns `true` when outbound firewall lane promotion is enabled.
+    pub fn outbound_firewall_enabled(&self) -> bool {
+        self.outbound_firewall_enabled
+    }
+
+    /// Returns `true` when `pid` is currently marked steady (protected OS, app-wide allowed,
+    /// `AllowOnce`, or dedup-suppressed with no persisted network rules).
+    pub fn is_steady_pid(&self, pid: u32) -> bool {
+        self.steady_pids
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&pid)
+    }
+
+    /// Returns `true` when an external [`SensorEvent::NetworkConnect`] for `pid` must be
+    /// promoted to the high-priority lane (`L-10`).
+    pub fn should_promote_network_connect(&self, pid: u32, dst_ip: IpAddr) -> bool {
+        self.outbound_firewall_enabled && is_external_ip(dst_ip) && !self.is_steady_pid(pid)
+    }
+
+    /// Marks `pid` as steady (bounded at `ACTIVE_PROCESS_TABLE_CAPACITY`).
+    pub fn mark_steady(&self, pid: u32) {
+        let protected = self
+            .protected_pids
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut steady = self.steady_pids.write().unwrap_or_else(|e| e.into_inner());
+        if !steady.contains(&pid) && steady.len() >= ACTIVE_PROCESS_TABLE_CAPACITY {
+            steady.retain(|p| protected.contains(p));
+            if steady.len() >= ACTIVE_PROCESS_TABLE_CAPACITY {
+                steady.clear();
+            }
+        }
+        steady.insert(pid);
+    }
+
+    /// Marks `pid` as a `ProtectedOs` process and retains it as steady across policy updates.
+    pub fn mark_protected_os(&self, pid: u32) {
+        let mut protected = self
+            .protected_pids
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if !protected.contains(&pid) && protected.len() >= ACTIVE_PROCESS_TABLE_CAPACITY {
+            protected.clear();
+        }
+        protected.insert(pid);
+        let mut steady = self.steady_pids.write().unwrap_or_else(|e| e.into_inner());
+        if !steady.contains(&pid) && steady.len() >= ACTIVE_PROCESS_TABLE_CAPACITY {
+            steady.retain(|p| protected.contains(p));
+            if steady.len() >= ACTIVE_PROCESS_TABLE_CAPACITY {
+                steady.clear();
+            }
+        }
+        steady.insert(pid);
+    }
+
+    /// Clears steady state for `pid` (e.g. on `ProcessStart` or `ProcessStop`).
+    pub fn remove_pid(&self, pid: u32) {
+        let mut protected = self
+            .protected_pids
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut steady = self.steady_pids.write().unwrap_or_else(|e| e.into_inner());
+        protected.remove(&pid);
+        steady.remove(&pid);
+    }
+
+    /// Clears all non-`ProtectedOs` steady PIDs (called on policy changes or permit revocation).
+    pub fn clear_non_protected(&self) {
+        let protected = self
+            .protected_pids
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut steady = self.steady_pids.write().unwrap_or_else(|e| e.into_inner());
+        steady.retain(|pid| protected.contains(pid));
+    }
+
+    /// Returns the number of PIDs currently tracked as steady.
+    pub fn steady_pid_count(&self) -> usize {
+        self.steady_pids
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+}
+
+/// Cloneable producer handle wrapping [`TwoLaneSender`] + [`OutboundLaneClassifier`] (without
+/// referencing [`crate::DaemonEngine`]) so unknown external `NetworkConnect` events promote onto
+/// the non-dropping high-priority lane (`L-10`).
+#[derive(Debug, Clone)]
+pub struct ClassifiedEventSender {
+    inner: TwoLaneSender,
+    classifier: Arc<OutboundLaneClassifier>,
+}
+
+impl ClassifiedEventSender {
+    /// Creates a new [`ClassifiedEventSender`].
+    pub fn new(inner: TwoLaneSender, classifier: Arc<OutboundLaneClassifier>) -> Self {
+        Self { inner, classifier }
+    }
+
+    /// Returns `true` when `event` will be promoted to the high-priority lane.
+    pub fn should_promote(&self, event: &SensorEvent) -> bool {
+        matches!(
+            event,
+            SensorEvent::NetworkConnect { pid, dst_ip, .. }
+                if self.classifier.should_promote_network_connect(*pid, *dst_ip)
+        )
+    }
+
+    /// Sends `event`, promoting unverified external `NetworkConnect` events to high-priority.
+    pub async fn send(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
+        if self.should_promote(&event) {
+            self.inner
+                .send_high_priority(event)
+                .await
+                .map_err(|err| match err {
+                    HighPrioritySendError::Full(ev) | HighPrioritySendError::Closed(ev) => {
+                        ChannelClosedError(ev)
+                    }
+                })
+        } else {
+            self.inner.send(event).await
+        }
+    }
+
+    /// Non-blocking send with high-priority promotion for unverified external `NetworkConnect`.
+    pub fn try_send(&self, event: SensorEvent) -> Result<(), HighPrioritySendError> {
+        if self.should_promote(&event) {
+            self.inner.try_send_high_priority(event)
+        } else {
+            self.inner.try_send(event)
+        }
+    }
+
+    /// Blocking send for synchronous producers (ETW callback bridge) with high-priority promotion.
+    pub fn blocking_send(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
+        if self.should_promote(&event) {
+            self.inner.blocking_send_high_priority(event)
+        } else {
+            self.inner.blocking_send(event)
+        }
+    }
+
+    /// Returns a reference to the underlying [`TwoLaneSender`].
+    pub fn inner(&self) -> &TwoLaneSender {
+        &self.inner
+    }
+
+    /// Returns a reference to the shared [`OutboundLaneClassifier`].
+    pub fn classifier(&self) -> &OutboundLaneClassifier {
+        &self.classifier
+    }
+
+    /// Current queued depth in the high-priority lane.
+    pub fn high_priority_depth(&self) -> usize {
+        self.inner.high_priority_depth()
+    }
+
+    /// Current queued depth in the telemetry lane.
+    pub fn telemetry_depth(&self) -> usize {
+        self.inner.telemetry_depth()
+    }
+
+    /// Total oldest telemetry events evicted because the telemetry ring buffer was full.
+    pub fn telemetry_dropped(&self) -> u64 {
+        self.inner.telemetry_dropped()
+    }
+
+    /// Total high-priority events dropped (always `0`).
+    pub fn high_priority_dropped(&self) -> u64 {
+        self.inner.high_priority_dropped()
+    }
+
+    /// Marks the underlying channel closed.
+    pub fn close(&self) {
+        self.inner.close();
     }
 }
 
@@ -475,5 +692,87 @@ mod tests {
             SensorEvent::DnsQuery { query_name, .. } => assert_eq!(query_name, "d2.test"),
             other => panic!("expected d2.test, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn classified_sender_promotes_unknown_external_connect_over_saturated_telemetry() {
+        let (tx, mut rx) = TwoLaneChannel::with_capacities(4, 3).split();
+        let classifier = Arc::new(OutboundLaneClassifier::new(true));
+        let classified = ClassifiedEventSender::new(tx.clone(), Arc::clone(&classifier));
+
+        classifier.mark_protected_os(42);
+        classifier.mark_steady(99);
+
+        // Private IP is NOT promoted; steady/protected PID external IP is NOT promoted.
+        let private_ev = SensorEvent::NetworkConnect {
+            pid: 500,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: 1,
+        };
+        let steady_ev = SensorEvent::NetworkConnect {
+            pid: 99,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: 2,
+        };
+        assert!(!classified.should_promote(&private_ev));
+        assert!(!classified.should_promote(&steady_ev));
+
+        // Unknown external NetworkConnect IS promoted via high-priority lane even when telemetry overflows.
+        let unknown_ext = SensorEvent::NetworkConnect {
+            pid: 500,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            dst_port: 443,
+            domain_hint: Some("unknown.example".to_string()),
+            timestamp_ms: 3,
+        };
+        assert!(classified.should_promote(&unknown_ext));
+
+        // Send promoted event synchronously from a non-runtime OS thread via `blocking_send`.
+        let classified_bg = classified.clone();
+        let promoted_clone = unknown_ext.clone();
+        std::thread::spawn(move || {
+            classified_bg
+                .blocking_send(promoted_clone)
+                .expect("blocking_send promoted");
+        })
+        .join()
+        .expect("join producer");
+
+        // Saturate telemetry AFTER sending unknown_ext so telemetry drops older entries.
+        for i in 0..6 {
+            classified
+                .send(SensorEvent::DnsQuery {
+                    pid: 99,
+                    query_name: format!("noise-{i}.example"),
+                    query_type: 1,
+                    resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))],
+                    timestamp_ms: 10 + i,
+                })
+                .await
+                .expect("noise dns");
+        }
+        assert_eq!(classified.telemetry_dropped(), 3);
+        assert_eq!(classified.high_priority_depth(), 1);
+
+        // Policy invalidation clears non-protected steady PID 99 while retaining protected PID 42.
+        classifier.clear_non_protected();
+        assert!(!classifier.is_steady_pid(99));
+        assert!(classifier.is_steady_pid(42));
+
+        classified.close();
+        let drained = rx.drain_ready_with_lane();
+        assert_eq!(drained[0], (unknown_ext, EventLane::HighPriority));
+        assert_eq!(drained.len(), 4);
+
+        // Disabled firewall mode never promotes NetworkConnect.
+        let disabled = OutboundLaneClassifier::new(false);
+        assert!(!disabled.should_promote_network_connect(500, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 }

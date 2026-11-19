@@ -5,13 +5,13 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_daemon::{
     start_ipc_server, BinaryInspector, DaemonConfig, DaemonEngine, NotificationDispatcher,
-    WindowsBinaryInspector,
+    PolicyRuleError, WindowsBinaryInspector,
 };
 use ledr_proto::{
     read_ipc_frame, write_ipc_frame, ActiveDefenseController, AlertDecision, AlertRecord,
@@ -19,6 +19,7 @@ use ledr_proto::{
     ProcessIdentity, RuleScope, SensorEvent,
 };
 use ledr_rules::{BinaryIdentity, EarlyPruner, SigmaEngine};
+use ledr_sensor_win::WfpDropEvent;
 use ledr_store::LedrStore;
 
 static PIPE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -82,6 +83,9 @@ struct MockWfpDefense {
     removed_wfp: Mutex<Vec<u64>>,
     active_wfp: Mutex<HashMap<u64, WfpCall>>,
     fail_wfp_add: Mutex<bool>,
+    fail_wfp_add_permits: Mutex<bool>,
+    fail_wfp_add_exes: Mutex<Vec<String>>,
+    fail_wfp_remove: Mutex<bool>,
     fail_suspend: Mutex<bool>,
     failing_resume_pids: Mutex<Vec<u32>>,
 }
@@ -125,6 +129,24 @@ impl MockWfpDefense {
 
     fn set_fail_wfp_add(&self, fail: bool) {
         *self.fail_wfp_add.lock().expect("lock fail_wfp_add") = fail;
+    }
+
+    fn set_fail_wfp_add_permits(&self, fail: bool) {
+        *self
+            .fail_wfp_add_permits
+            .lock()
+            .expect("lock fail_wfp_add_permits") = fail;
+    }
+
+    fn add_fail_wfp_exe(&self, exe_substr: &str) {
+        self.fail_wfp_add_exes
+            .lock()
+            .expect("lock fail_wfp_add_exes")
+            .push(exe_substr.to_ascii_lowercase());
+    }
+
+    fn set_fail_wfp_remove(&self, fail: bool) {
+        *self.fail_wfp_remove.lock().expect("lock fail_wfp_remove") = fail;
     }
 
     fn set_fail_suspend(&self, fail: bool) {
@@ -193,7 +215,17 @@ impl ActiveDefenseController for MockWfpDefense {
         remote_ip: Option<IpAddr>,
         allow: bool,
     ) -> Result<u64, String> {
-        if *self.fail_wfp_add.lock().expect("lock fail_wfp_add") {
+        let exe_lower = exe_path.to_string_lossy().to_ascii_lowercase();
+        let exe_matched = self
+            .fail_wfp_add_exes
+            .lock()
+            .expect("lock fail_wfp_add_exes")
+            .iter()
+            .any(|pat| exe_lower.contains(pat));
+        if *self.fail_wfp_add.lock().expect("lock fail_wfp_add")
+            || (allow && *self.fail_wfp_add_permits.lock().expect("lock fail_wfp_add_permits"))
+            || exe_matched
+        {
             return Err(format!(
                 "mock WFP add_wfp_app_rule failure for {}",
                 exe_path.display()
@@ -218,6 +250,9 @@ impl ActiveDefenseController for MockWfpDefense {
     }
 
     fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+        if *self.fail_wfp_remove.lock().expect("lock fail_wfp_remove") {
+            return Err(format!("mock WFP remove_wfp_rule failure for {filter_id}"));
+        }
         self.removed_wfp
             .lock()
             .expect("lock removed_wfp")
@@ -324,7 +359,7 @@ async fn daemon_p3_01_high_risk_and_script_interpreter_preemptive_wfp_and_guards
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
     let sender = engine.sender();
     let now_ms = current_unix_ms();
@@ -470,7 +505,7 @@ async fn daemon_p3_02_unknown_process_coupled_containment_and_allow_permanent_va
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
     let sender = engine.sender();
     let now_ms = current_unix_ms();
@@ -705,7 +740,7 @@ async fn daemon_p3_03_single_side_failure_compensation_leaves_no_orphaned_state(
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
     let sender = engine.sender();
     let now_ms = current_unix_ms();
@@ -873,7 +908,7 @@ async fn daemon_p3_04_allow_once_and_allow_permanent_rollback_invariants() {
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
     let sender = engine.sender();
     let now_ms = current_unix_ms();
@@ -1118,7 +1153,7 @@ async fn daemon_p3_05_terminate_and_block_promotion_and_release_without_block() 
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
     let sender = engine.sender();
     let now_ms = current_unix_ms();
@@ -1281,7 +1316,7 @@ async fn daemon_p3_06_startup_redeployment_and_ipc_rule_reconciliation() {
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
 
     // Persisted firewall rules are redeployed automatically at engine startup.
@@ -1554,7 +1589,7 @@ async fn daemon_p3_08_overdue_network_alert_expires_without_resuming_or_lifting_
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
     let sender = engine.sender();
     let old_ts = current_unix_ms() - 5_000;
@@ -1874,7 +1909,7 @@ async fn daemon_p3_11_wildcard_block_on_process_start_and_dedup_never_bypasses_n
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
     let sender = engine.sender();
     let now_ms = current_unix_ms();
@@ -2013,7 +2048,7 @@ async fn daemon_p3_12_sibling_alert_unbind_on_record_error_and_preemptive_siblin
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
     let sender = engine.sender();
     let now_ms = current_unix_ms();
@@ -2366,7 +2401,7 @@ async fn daemon_p3_15_failed_allow_permanent_rollback_preserves_alert_binding_on
         },
         defense.clone(),
         notifier,
-        inspector,
+        inspector.clone(),
     );
     let sender = engine.sender();
     let now_ms = current_unix_ms();
@@ -3036,4 +3071,1373 @@ async fn daemon_p3_18_startup_prerestriction_retention_across_stop_and_allow_ove
     );
 
     engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-19` (`#2`): Multi-instance `AllowOnce` preserves the exemption when sibling
+/// instances start or connect externally (deferring shared app-wide WFP block while still
+/// suspending the new instance and setting `"wfp_shared_allow_once_deferred": true`), and
+/// restores the automatic `Preemptive` block when the last `AllowOnce` instance exits while
+/// startup-pinned or another active instance remains.
+#[tokio::test]
+async fn daemon_p3_19_allow_once_multi_instance_preserves_sibling_and_restores_on_exit() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let dl_exe = r"C:\Users\alice\Downloads\multi_tool.exe";
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            preemptive_startup_executables: vec![ps_exe.to_string()],
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector.clone(),
+    );
+    let sender = engine.sender();
+    let now_ms = current_unix_ms();
+
+    // Part A: Startup-pinned powershell.exe (P1 gets AllowOnce, then P2 starts & connects)
+    assert!(engine.has_active_wfp_filter(ps_exe, None, false));
+    let ps1 = ProcessIdentity::new(7101, unix_ms_to_filetime(now_ms - 5_000));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ps1,
+            parent_pid: 4,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start ps1");
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: ps1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("connect ps1");
+    assert!(
+        wait_until(2_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| v.len() == 1)
+                .unwrap_or(false)
+        })
+        .await
+    );
+    let a1 = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap()[0].clone();
+    engine
+        .resolve_alert(&a1.alert_id, AlertDecision::AllowOnce)
+        .expect("AllowOnce ps1");
+    assert!(
+        !engine.has_active_wfp_filter(ps_exe, None, false),
+        "AllowOnce on P1 lifts Preemptive WFP block"
+    );
+
+    // P2 starts -> MUST NOT re-apply Preemptive block while P1 holds AllowOnce.
+    let ps2 = ProcessIdentity::new(7102, unix_ms_to_filetime(now_ms - 4_000));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ps2,
+            parent_pid: 4,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start ps2");
+    assert!(wait_until(1_000, || engine.active_process_table_len() >= 2).await);
+    assert!(
+        !engine.has_active_wfp_filter(ps_exe, None, false),
+        "starting sibling P2 must NOT re-arm app-wide Preemptive block while P1 has AllowOnce"
+    );
+
+    // P1 follow-up connect remains ALLOWED.
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: ps1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 5,
+        })
+        .await
+        .expect("follow-up connect ps1");
+
+    // P2 external connect -> P2 MUST suspend and emit alert with deferred WFP flag,
+    // without adding an app-wide WFP block that would sever P1!
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: ps2.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 10,
+        })
+        .await
+        .expect("connect ps2");
+    assert!(
+        wait_until(2_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| v.len() == 1)
+                .unwrap_or(false)
+        })
+        .await
+    );
+    let a2 = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap()[0].clone();
+    assert!(a2.process_suspended);
+    assert!(defense.suspends().contains(&ps2));
+    assert!(
+        !engine.has_active_wfp_filter(ps_exe, None, false),
+        "app-wide TransientContainment WFP block must be deferred while sibling P1 holds AllowOnce"
+    );
+    assert!(
+        a2.context_json
+            .contains("\"wfp_shared_allow_once_deferred\":true"),
+        "alert context must record wfp_shared_allow_once_deferred=true: {}",
+        a2.context_json
+    );
+
+    // P1 exits -> startup-pinned Preemptive block immediately restores!
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: ps1.pid,
+            exit_time_100ns: unix_ms_to_filetime(now_ms + 20),
+            exit_code: 0,
+        })
+        .await
+        .expect("stop ps1");
+    assert!(
+        wait_until(1_000, || engine.has_active_wfp_filter(ps_exe, None, false)).await,
+        "startup-pinned Preemptive block must restore when last AllowOnce instance P1 exits"
+    );
+    engine
+        .resolve_alert(
+            &a2.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: false,
+            },
+        )
+        .expect("terminate ps2");
+
+    // Part B: Non-startup high-risk Downloads executable with two active instances (P3, P4).
+    let dl1 = ProcessIdentity::new(7103, unix_ms_to_filetime(now_ms - 3_000));
+    let dl2 = ProcessIdentity::new(7104, unix_ms_to_filetime(now_ms - 2_000));
+    let dl3 = ProcessIdentity::new(7105, unix_ms_to_filetime(now_ms - 1_000));
+    for p in [dl1, dl2] {
+        sender
+            .send(SensorEvent::ProcessStart {
+                identity: p,
+                parent_pid: 4,
+                exe_path: dl_exe.to_string(),
+                command_line: dl_exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("start dl");
+    }
+    assert!(wait_until(1_000, || engine.has_active_wfp_filter(dl_exe, None, false)).await);
+
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: dl1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 30)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 30,
+        })
+        .await
+        .expect("connect dl1");
+    assert!(
+        wait_until(2_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| v.len() == 1)
+                .unwrap_or(false)
+        })
+        .await
+    );
+    let a_dl1 = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap()[0].clone();
+    engine
+        .resolve_alert(&a_dl1.alert_id, AlertDecision::AllowOnce)
+        .expect("AllowOnce dl1");
+    assert!(!engine.has_active_wfp_filter(dl_exe, None, false));
+
+    // dl3 starts while dl1 holds AllowOnce -> no Preemptive block added yet.
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: dl3,
+            parent_pid: 4,
+            exe_path: dl_exe.to_string(),
+            command_line: dl_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start dl3");
+    assert!(wait_until(1_000, || engine.active_process_table_len() >= 5).await);
+    assert!(!engine.has_active_wfp_filter(dl_exe, None, false));
+
+    // dl1 (only AllowOnce instance) stops while dl2 and dl3 are STILL active -> Preemptive
+    // block MUST restore automatically!
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: dl1.pid,
+            exit_time_100ns: unix_ms_to_filetime(now_ms + 40),
+            exit_code: 0,
+        })
+        .await
+        .expect("stop dl1");
+    assert!(
+        wait_until(1_000, || engine.has_active_wfp_filter(dl_exe, None, false)).await,
+        "Preemptive block must restore when last AllowOnce exits and sibling instances remain active"
+    );
+
+    // When dl2 and dl3 also stop, the non-startup Preemptive block cleans up.
+    for p in [dl2, dl3] {
+        sender
+            .send(SensorEvent::ProcessStop {
+                pid: p.pid,
+                exit_time_100ns: unix_ms_to_filetime(now_ms + 50),
+                exit_code: 0,
+            })
+            .await
+            .expect("stop remaining dl");
+    }
+    assert!(
+        wait_until(1_000, || !engine.has_active_wfp_filter(dl_exe, None, false)).await,
+        "Preemptive block must clean up once all non-startup instances exit"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-20` (`#3`): Shared-IP conflict visibility & deny-overrides-allow precedence when
+/// a blocked domain and an allowed domain resolve to the same CDN/proxy IP address.
+#[tokio::test]
+async fn daemon_p3_20_shared_ip_block_precedence_for_domain_rules() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let ps_sha = "1212121212121212121212121212121212121212121212121212121212121212";
+    inspector.register(ps_exe, Some(ps_sha), None);
+
+    let now_ms = current_unix_ms();
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "RULE-SHARED-BLOCK".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: ps_exe.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("blocked.example".to_string()),
+            created_at_ms: now_ms,
+            created_by: "user_policy".to_string(),
+        })
+        .expect("seed domain block");
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "RULE-SHARED-ALLOW".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: ps_exe.to_string(),
+            sha256: Some(ps_sha.to_string()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("api.example".to_string()),
+            created_at_ms: now_ms,
+            created_by: "user_policy".to_string(),
+        })
+        .expect("seed domain allow");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense,
+        notifier,
+        inspector,
+    );
+    let sender = engine.sender();
+    let ps_id = ProcessIdentity::new(7201, unix_ms_to_filetime(now_ms - 1_000));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ps_id,
+            parent_pid: 4,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start ps");
+
+    let shared_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50));
+    sender
+        .send(SensorEvent::DnsQuery {
+            pid: ps_id.pid,
+            query_name: "blocked.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("dns blocked");
+    sender
+        .send(SensorEvent::DnsQuery {
+            pid: ps_id.pid,
+            query_name: "api.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: now_ms + 1,
+        })
+        .await
+        .expect("dns allowed same IP");
+
+    assert!(
+        wait_until(2_000, || {
+            engine.has_active_wfp_filter(ps_exe, Some(shared_ip), false)
+        })
+        .await,
+        "shared CDN IP must keep the IP-level Block filter"
+    );
+    assert!(
+        !engine.has_active_wfp_filter(ps_exe, Some(shared_ip), true),
+        "allowed domain sharing the same IP must not override the IP-level Block filter"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-21` (`#4`, `Analysis #7`): WFP synchronization failures compensate SQLite and surface
+/// `WFP_SYNC_ERROR` over IPC (`UpsertRule` / `DeleteRule`) and fail alert resolution rollback
+/// (`AllowPermanent` / `TerminateAndBlock`) without silently diverging SQLite vs BFE; startup
+/// pre-emptive failures never fail unrelated user policy mutations; scope changes away from
+/// network re-arm active pre-emptive blocks.
+#[tokio::test]
+async fn daemon_p3_21_wfp_sync_failure_compensation_ipc_error_and_scope_change() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let startup_ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let app_exe = r"C:\Tools\sync_test_app.exe";
+    let dl_exe = r"C:\Users\alice\Downloads\scope_swap.exe";
+    let dl_sha = "3434343434343434343434343434343434343434343434343434343434343434";
+    let app_sha = "4545454545454545454545454545454545454545454545454545454545454545";
+    inspector.register(dl_exe, Some(dl_sha), None);
+    inspector.register(app_exe, Some(app_sha), None);
+
+    // Startup-pinned interpreter fails WFP add — user policy mutations for other exes must STILL succeed!
+    defense.add_fail_wfp_exe("powershell.exe");
+
+    let pipe_name = unique_test_pipe_name();
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_name.clone(),
+            dev_mode_bypass_ui_auth: true,
+            preemptive_startup_executables: vec![startup_ps.to_string()],
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector.clone(),
+    );
+    let ipc = start_ipc_server(Arc::clone(&engine)).expect("start IPC");
+    let now_ms = current_unix_ms();
+
+    // 1. Upsert rule succeeds despite startup-pinned interpreter failing WFP!
+    let valid_block = AllowlistRuleRecord {
+        rule_id: "RULE-SYNC-TEST".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: app_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: now_ms,
+        created_by: "user_policy".to_string(),
+    };
+    let pipe_c = pipe_name.clone();
+    let rule_clone = valid_block.clone();
+    let ack = tokio::task::spawn_blocking(move || {
+        send_pipe_request(&pipe_c, &IpcRequest::UpsertRule { rule: rule_clone })
+    })
+    .await
+    .expect("join IPC");
+    assert!(matches!(ack, IpcResponse::Ack { .. }));
+    assert!(engine.has_active_wfp_filter(app_exe, None, false));
+
+    // 2. Inject WFP add failure -> UpsertRule for a new NetworkBlock returns WFP_SYNC_ERROR and
+    //    rolls back SQLite cleanly.
+    defense.set_fail_wfp_add(true);
+    let failing_new = AllowlistRuleRecord {
+        rule_id: "RULE-FAIL-ADD".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: r"C:\Tools\never_persisted.exe".to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: now_ms,
+        created_by: "user_policy".to_string(),
+    };
+    let pipe_c = pipe_name.clone();
+    let fail_resp = tokio::task::spawn_blocking(move || {
+        send_pipe_request(&pipe_c, &IpcRequest::UpsertRule { rule: failing_new })
+    })
+    .await
+    .expect("join IPC");
+    match fail_resp {
+        IpcResponse::Error { code, .. } => assert_eq!(code, "WFP_SYNC_ERROR"),
+        other => panic!("expected WFP_SYNC_ERROR, got {other:?}"),
+    }
+    assert!(
+        store.get_rule("RULE-FAIL-ADD").unwrap().is_none(),
+        "failed UpsertRule must be rolled back from SQLite"
+    );
+
+    // 3. Inject WFP remove failure -> DeleteRule returns WFP_SYNC_ERROR and restores rule in SQLite!
+    defense.set_fail_wfp_add(false);
+    defense.set_fail_wfp_remove(true);
+    let pipe_c = pipe_name.clone();
+    let del_err = tokio::task::spawn_blocking(move || {
+        send_pipe_request(
+            &pipe_c,
+            &IpcRequest::DeleteRule {
+                rule_id: "RULE-SYNC-TEST".to_string(),
+            },
+        )
+    })
+    .await
+    .expect("join IPC");
+    match del_err {
+        IpcResponse::Error { code, .. } => assert_eq!(code, "WFP_SYNC_ERROR"),
+        other => panic!("expected WFP_SYNC_ERROR, got {other:?}"),
+    }
+    assert!(
+        store.get_rule("RULE-SYNC-TEST").unwrap().is_some(),
+        "failed DeleteRule must restore rule in SQLite"
+    );
+    assert!(
+        engine.has_active_wfp_filter(app_exe, None, false),
+        "live WFP block must stay tracked after failed DeleteRule"
+    );
+    defense.set_fail_wfp_remove(false);
+
+    // 4. Analysis #7: UpsertRule changing scope away from NetworkAllow -> FileCanaryAllow removes
+    //    the Permit filter AND re-arms Preemptive Block for active high-risk binary!
+    let dl_proc = ProcessIdentity::new(7301, unix_ms_to_filetime(now_ms - 500));
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: dl_proc,
+            parent_pid: 4,
+            exe_path: dl_exe.to_string(),
+            command_line: dl_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start dl_exe");
+    assert!(wait_until(1_000, || engine.has_active_wfp_filter(dl_exe, None, false)).await);
+
+    let swap_rule = AllowlistRuleRecord {
+        rule_id: "RULE-SCOPE-SWAP".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: dl_exe.to_string(),
+        sha256: Some(dl_sha.to_string()),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: now_ms,
+        created_by: "user_policy".to_string(),
+    };
+    engine.upsert_policy_rule(&swap_rule).expect("allow dl_exe");
+    assert!(engine.has_active_wfp_filter(dl_exe, None, true));
+    assert!(!engine.has_active_wfp_filter(dl_exe, None, false));
+
+    let non_net_rule = AllowlistRuleRecord {
+        scope: RuleScope::FileCanaryAllow,
+        ..swap_rule.clone()
+    };
+    engine
+        .upsert_policy_rule(&non_net_rule)
+        .expect("scope swap away from network");
+    assert!(!engine.has_active_wfp_filter(dl_exe, None, true));
+    assert!(
+        engine.has_active_wfp_filter(dl_exe, None, false),
+        "changing rule scope away from NetworkAllow must re-arm Preemptive block for active high-risk exe"
+    );
+
+    // Updating an existing rule from NetworkBlock -> NetworkAllow when Permit add fails restores
+    // the previous NetworkBlock rule in SQLite.
+    let err_upd = engine.upsert_policy_rule(&AllowlistRuleRecord {
+        rule_id: "RULE-SYNC-TEST".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: app_exe.to_string(),
+        sha256: Some(app_sha.to_string()),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: now_ms,
+        created_by: "user_policy".to_string(),
+    });
+    assert!(err_upd.is_ok(), "healthy add succeeds");
+    defense.set_fail_wfp_add(true);
+    let err_back = engine.upsert_policy_rule(&valid_block);
+    assert!(matches!(err_back, Err(PolicyRuleError::FirewallSync(_))));
+    assert_eq!(
+        store.get_rule("RULE-SYNC-TEST").unwrap().unwrap().scope,
+        RuleScope::NetworkAllow
+    );
+    defense.set_fail_wfp_add(false);
+
+    // 5. resolve_alert_with_outcome: AllowPermanent Permit failure & TerminateAndBlock Block
+    //    failure keep the alert unresolved, roll back saved rules, and allow clean retry!
+    let dl_connect_proc = ProcessIdentity::new(7302, unix_ms_to_filetime(now_ms - 400));
+    let dl_retry_exe = r"C:\Users\alice\Downloads\retry_triage.exe";
+    let dl_retry_sha = "5656565656565656565656565656565656565656565656565656565656565656";
+    inspector.register(dl_retry_exe, Some(dl_retry_sha), None);
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: dl_connect_proc,
+            parent_pid: 4,
+            exe_path: dl_retry_exe.to_string(),
+            command_line: dl_retry_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start retry_triage");
+    engine
+        .sender()
+        .send(SensorEvent::NetworkConnect {
+            pid: dl_connect_proc.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            dst_port: 443,
+            domain_hint: Some("retry.example".to_string()),
+            timestamp_ms: now_ms + 5,
+        })
+        .await
+        .expect("connect retry_triage");
+    assert!(
+        wait_until(2_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| v.len() == 1)
+                .unwrap_or(false)
+        })
+        .await
+    );
+    let alert = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap()[0].clone();
+
+    // 5a: Domain-scoped AllowPermanent fails when IP Permit add fails
+    defense.set_fail_wfp_add_permits(true);
+    let domain_perm_err = engine.resolve_alert_with_outcome(
+        &alert.alert_id,
+        AlertDecision::AllowPermanent {
+            use_signer_if_available: false,
+            allow_dest: Some("retry.example".to_string()),
+        },
+    );
+    assert!(domain_perm_err.is_err());
+    assert!(
+        store.list_rules(Some(RuleScope::NetworkAllow)).unwrap().into_iter().all(|r| r.exe_path_pattern != dl_retry_exe),
+        "failed domain AllowPermanent must roll back saved rule"
+    );
+    assert_eq!(
+        store.get_alert(&alert.alert_id).unwrap().unwrap().status,
+        AlertStatus::Pending
+    );
+    assert!(engine.has_active_wfp_filter(dl_retry_exe, None, false));
+
+    // 5b: Unscoped AllowPermanent fails when Permit add fails -> rolls back NetworkAllow,
+    //     re-arms Preemptive Block, and keeps alert Pending.
+    let app_perm_err = engine.resolve_alert_with_outcome(
+        &alert.alert_id,
+        AlertDecision::AllowPermanent {
+            use_signer_if_available: false,
+            allow_dest: None,
+        },
+    );
+    assert!(app_perm_err.is_err());
+    assert!(
+        store
+            .list_rules(Some(RuleScope::NetworkAllow))
+            .unwrap()
+            .into_iter()
+            .all(|r| r.exe_path_pattern != dl_retry_exe),
+        "failed unscoped AllowPermanent must roll back saved rule"
+    );
+    assert!(
+        engine.has_active_wfp_filter(dl_retry_exe, None, false),
+        "Preemptive block must be re-armed after failed unscoped AllowPermanent"
+    );
+    assert!(!engine.has_active_wfp_filter(dl_retry_exe, None, true));
+    assert_eq!(
+        store.get_alert(&alert.alert_id).unwrap().unwrap().status,
+        AlertStatus::Pending
+    );
+    defense.set_fail_wfp_add_permits(false);
+
+    // 5c: TerminateAndBlock { add_block_rule: true } on an exe without an existing app-wide
+    //     block fails when add_wfp_app_rule fails, rolling back the block rule and keeping alert Pending!
+    let term_exe = r"C:\Tools\term_sync_fail.exe";
+    let term_proc = ProcessIdentity::new(7303, unix_ms_to_filetime(now_ms - 300));
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: term_proc,
+            parent_pid: 4,
+            exe_path: term_exe.to_string(),
+            command_line: term_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start term_exe");
+    engine
+        .sender()
+        .send(SensorEvent::NetworkConnect {
+            pid: term_proc.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 90)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 6,
+        })
+        .await
+        .expect("connect term_exe");
+    assert!(
+        wait_until(2_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| v.len() == 2)
+                .unwrap_or(false)
+        })
+        .await
+    );
+    let term_alert = store
+        .list_alerts(Some(AlertStatus::Pending), 10)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(term_proc.instance_id().as_str()))
+        .expect("term_alert");
+
+    // Simulate lifted/absent block (e.g., AllowOnce failed/absent or general process without
+    // transient block when WFP previously failed, or clear transient by first AllowOnce? Wait:
+    // if AllowOnce lifted it isn't Pending. Instead test a non-suspended alert or remove block via
+    // transient fail on connect + retry on resolve!):
+    // Create a second general exe whose connect WFP add fails initially (alert emitted, no WFP filter),
+    // then TerminateAndBlock { add_block_rule: true } fails WFP add -> keeps alert Pending!
+    let term2_exe = r"C:\Tools\term2_sync_fail.exe";
+    let term2_proc = ProcessIdentity::new(7304, unix_ms_to_filetime(now_ms - 250));
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: term2_proc,
+            parent_pid: 4,
+            exe_path: term2_exe.to_string(),
+            command_line: term2_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start term2");
+    assert!(wait_until(1_000, || engine.active_process_table_len() >= 3).await);
+    defense.set_fail_wfp_add(true);
+    engine
+        .sender()
+        .send(SensorEvent::NetworkConnect {
+            pid: term2_proc.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 91)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 7,
+        })
+        .await
+        .expect("connect term2 while WFP fails");
+    assert!(
+        wait_until(2_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| v.len() == 3)
+                .unwrap_or(false)
+        })
+        .await
+    );
+    let term2_alert = store
+        .list_alerts(Some(AlertStatus::Pending), 10)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(term2_proc.instance_id().as_str()))
+        .expect("term2_alert");
+
+    let tb_err = engine.resolve_alert_with_outcome(
+        &term2_alert.alert_id,
+        AlertDecision::TerminateAndBlock {
+            add_block_rule: true,
+        },
+    );
+    assert!(tb_err.is_err());
+    assert!(
+        store
+            .list_rules(Some(RuleScope::NetworkBlock))
+            .unwrap()
+            .into_iter()
+            .all(|r| r.exe_path_pattern != term2_exe),
+        "failed TerminateAndBlock must roll back saved NetworkBlock rule"
+    );
+    assert_eq!(
+        store
+            .get_alert(&term2_alert.alert_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AlertStatus::Pending
+    );
+
+    // Recover WFP -> retry TerminateAndBlock succeeds!
+    defense.set_fail_wfp_add(false);
+    let _ = term_alert;
+    let tb_ok = engine
+        .resolve_alert_with_outcome(
+            &term2_alert.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+        )
+        .expect("retry TerminateAndBlock succeeds");
+    assert_eq!(tb_ok.alert.status, AlertStatus::TerminatedBlocked);
+    assert!(engine.has_active_wfp_filter(term2_exe, None, false));
+
+    ipc.shutdown().await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-22` (`#6`, `L-10`): Unknown external `NetworkConnect` events submitted via
+/// `ClassifiedEventSender` promote onto the high-priority lane and quarantine even when the
+/// telemetry lane is heavily saturated (`telemetry_dropped > 0`). Steady PIDs stay on telemetry
+/// and are invalidated on policy updates.
+#[tokio::test]
+async fn daemon_p3_22_high_priority_promotion_over_saturated_telemetry() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            telemetry_capacity: 8,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector.clone(),
+    );
+    let classified = engine.classified_sender();
+    let now_ms = current_unix_ms();
+
+    let unknown_id = ProcessIdentity::new(7401, unix_ms_to_filetime(now_ms - 1_000));
+    let unknown_exe = r"C:\Tools\single_shot_beacon.exe";
+    classified
+        .send(SensorEvent::ProcessStart {
+            identity: unknown_id,
+            parent_pid: 4,
+            exe_path: unknown_exe.to_string(),
+            command_line: unknown_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start unknown");
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 1).await);
+
+    // Flood telemetry synchronously without yielding so the 8-slot telemetry ring overflows,
+    // then immediately send a single external NetworkConnect from unknown_id via classified_sender.
+    for i in 0..200 {
+        classified
+            .try_send(SensorEvent::DnsQuery {
+                pid: 9999,
+                query_name: format!("flood-{i}.example"),
+                query_type: 1,
+                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))],
+                timestamp_ms: now_ms + i,
+            })
+            .expect("telemetry flood");
+    }
+    let unknown_connect = SensorEvent::NetworkConnect {
+        pid: unknown_id.pid,
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99)),
+        dst_port: 443,
+        domain_hint: Some("exfil.example".to_string()),
+        timestamp_ms: now_ms + 300,
+    };
+    assert!(classified.should_promote(&unknown_connect));
+    classified
+        .send(unknown_connect)
+        .await
+        .expect("send unknown external connect");
+    // Flood another 200 telemetry events right after.
+    for i in 200..400 {
+        classified
+            .try_send(SensorEvent::DnsQuery {
+                pid: 9999,
+                query_name: format!("flood-{i}.example"),
+                query_type: 1,
+                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))],
+                timestamp_ms: now_ms + i + 301,
+            })
+            .expect("post telemetry flood");
+    }
+
+    assert!(
+        wait_until(2_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| v.len() == 1)
+                .unwrap_or(false)
+        })
+        .await,
+        "unknown external NetworkConnect must survive saturated telemetry via high-priority lane"
+    );
+    assert!(classified.telemetry_dropped() > 0);
+    assert_eq!(engine.high_priority_dropped(), 0);
+    assert!(defense.suspends().contains(&unknown_id));
+    assert!(engine.has_active_wfp_filter(unknown_exe, None, false));
+
+    // Steady PID tracking: after resolving AllowOnce and one follow-up connect, PID becomes steady
+    // (routed to telemetry); upserting a policy rule invalidates non-protected steady PIDs.
+    let alert = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap()[0].clone();
+    engine
+        .resolve_alert(&alert.alert_id, AlertDecision::AllowOnce)
+        .expect("AllowOnce");
+    classified
+        .send(SensorEvent::NetworkConnect {
+            pid: unknown_id.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 100)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 800,
+        })
+        .await
+        .expect("connect while once allowed");
+    assert!(
+        wait_until(1_000, || classified.classifier().is_steady_pid(unknown_id.pid)).await,
+        "AllowOnce PID must become steady after evaluation"
+    );
+    engine
+        .upsert_policy_rule(&AllowlistRuleRecord {
+            rule_id: "RULE-INVALIDATE-STEADY".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: r"C:\Tools\unrelated_policy.exe".to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: now_ms + 900,
+            created_by: "user_policy".to_string(),
+        })
+        .expect("upsert policy rule");
+    assert!(
+        !classified.classifier().is_steady_pid(unknown_id.pid),
+        "policy mutation must invalidate non-protected steady PIDs"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-23` (`#8`): Replacing an allowlisted binary on disk revokes stale WFP Permit
+/// filters on `ProcessStart` (re-arming `Preemptive` block for high-risk/script binaries) and
+/// revokes leftover Permits before registering transient containment on `NetworkConnect`.
+#[tokio::test]
+async fn daemon_p3_23_binary_replacement_revokes_stale_wfp_permits() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let dl_exe = r"C:\Users\alice\Downloads\replaceable_tool.exe";
+    let gen_exe = r"C:\Tools\replaceable_general.exe";
+    let sha_good_dl = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let sha_evil_dl = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let sha_good_gen = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let sha_evil_gen = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    inspector.register(dl_exe, Some(sha_good_dl), None);
+    inspector.register(gen_exe, Some(sha_good_gen), None);
+
+    let now_ms = current_unix_ms();
+    for (id, exe, sha) in [
+        ("RULE-ALLOW-DL", dl_exe, sha_good_dl),
+        ("RULE-ALLOW-GEN", gen_exe, sha_good_gen),
+    ] {
+        store
+            .upsert_rule(&AllowlistRuleRecord {
+                rule_id: id.to_string(),
+                scope: RuleScope::NetworkAllow,
+                exe_path_pattern: exe.to_string(),
+                sha256: Some(sha.to_string()),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: None,
+                created_at_ms: now_ms,
+                created_by: "user_policy".to_string(),
+            })
+            .expect("seed allow");
+    }
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector.clone(),
+    );
+    let sender = engine.sender();
+    assert!(engine.has_active_wfp_filter(dl_exe, None, true));
+    assert!(engine.has_active_wfp_filter(gen_exe, None, true));
+
+    // Case A: Replace high-risk binary on disk BEFORE ProcessStart.
+    inspector.register(dl_exe, Some(sha_evil_dl), None);
+    let p_dl = ProcessIdentity::new(7501, unix_ms_to_filetime(now_ms));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: p_dl,
+            parent_pid: 4,
+            exe_path: dl_exe.to_string(),
+            command_line: dl_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start replaced dl_exe");
+    assert!(
+        wait_until(2_000, || {
+            !engine.has_active_wfp_filter(dl_exe, None, true)
+                && engine.has_active_wfp_filter(dl_exe, None, false)
+        })
+        .await,
+        "replaced high-risk binary must have stale Permit revoked and Preemptive Block armed on ProcessStart"
+    );
+
+    // Case B: General binary starts while still valid, then gets overwritten on disk BEFORE
+    // its NetworkConnect -> handle_network_connect must revoke stale Permit, apply Transient
+    // Block, suspend, and emit alert!
+    let p_gen = ProcessIdentity::new(7502, unix_ms_to_filetime(now_ms + 10));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: p_gen,
+            parent_pid: 4,
+            exe_path: gen_exe.to_string(),
+            command_line: gen_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start valid gen_exe");
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 2).await);
+    assert!(engine.has_active_wfp_filter(gen_exe, None, true));
+
+    inspector.register(gen_exe, Some(sha_evil_gen), None);
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: p_gen.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            dst_port: 443,
+            domain_hint: Some("c2.example".to_string()),
+            timestamp_ms: now_ms + 20,
+        })
+        .await
+        .expect("connect replaced gen_exe");
+    assert!(
+        wait_until(2_000, || {
+            !engine.has_active_wfp_filter(gen_exe, None, true)
+                && engine.has_active_wfp_filter(gen_exe, None, false)
+                && defense.suspends().contains(&p_gen)
+        })
+        .await,
+        "replaced general binary connecting externally must revoke stale Permit and enter coupled containment"
+    );
+    assert_eq!(store.list_alerts(Some(AlertStatus::Pending), 10).unwrap().len(), 1);
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-24` (`#9` Layer 2): Per-instance DNS history blocks cross-process `domain_hint`
+/// contamination from bypassing domain-scoped `NetworkAllow` rules while preserving isolated
+/// `NetworkConnect` tests where no conflicting process resolved that `(domain, ip)`.
+#[tokio::test]
+async fn daemon_p3_24_cross_process_dns_isolation_layer2() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let allow_sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let good_exe = r"C:\Tools\legit_browser.exe";
+    let hijack_exe = r"C:\Tools\impostor_client.exe";
+    let isolated_exe = r"C:\Tools\isolated_client.exe";
+    for exe in [good_exe, hijack_exe, isolated_exe] {
+        inspector.register(exe, Some(allow_sha), None);
+    }
+
+    let now_ms = current_unix_ms();
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "RULE-DOMAIN-TRUSTED".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: r"C:\Tools\*.exe".to_string(),
+            sha256: Some(allow_sha.to_string()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("trusted.example".to_string()),
+            created_at_ms: now_ms,
+            created_by: "user_policy".to_string(),
+        })
+        .expect("seed trusted domain rule");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector.clone(),
+    );
+    let sender = engine.sender();
+
+    let p_good = ProcessIdentity::new(7601, unix_ms_to_filetime(now_ms - 3_000));
+    let p_hijack = ProcessIdentity::new(7602, unix_ms_to_filetime(now_ms - 2_000));
+    let p_isolated = ProcessIdentity::new(7603, unix_ms_to_filetime(now_ms - 1_000));
+    for (p, exe) in [
+        (p_good, good_exe),
+        (p_hijack, hijack_exe),
+        (p_isolated, isolated_exe),
+    ] {
+        sender
+            .send(SensorEvent::ProcessStart {
+                identity: p,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("start proc");
+    }
+
+    let trusted_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
+    // 1. Isolated connect with domain_hint and NO conflicting DnsQuery preserves domain_hint!
+    let iso_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: p_isolated.pid,
+            protocol: 6,
+            dst_ip: iso_ip,
+            dst_port: 443,
+            domain_hint: Some("trusted.example".to_string()),
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("isolated connect");
+
+    // 2. Now p_good resolves trusted.example -> trusted_ip.
+    sender
+        .send(SensorEvent::DnsQuery {
+            pid: p_good.pid,
+            query_name: "trusted.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![trusted_ip],
+            timestamp_ms: now_ms + 5,
+        })
+        .await
+        .expect("good dns");
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: p_good.pid,
+            protocol: 6,
+            dst_ip: trusted_ip,
+            dst_port: 443,
+            domain_hint: Some("trusted.example".to_string()),
+            timestamp_ms: now_ms + 10,
+        })
+        .await
+        .expect("good connect");
+
+    // 3. p_hijack NEVER queried trusted.example, yet receives poisoned domain_hint -> Layer 2
+    //    MUST drop domain_hint and quarantine p_hijack!
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: p_hijack.pid,
+            protocol: 6,
+            dst_ip: trusted_ip,
+            dst_port: 443,
+            domain_hint: Some("trusted.example".to_string()),
+            timestamp_ms: now_ms + 15,
+        })
+        .await
+        .expect("hijack connect");
+
+    assert!(
+        wait_until(2_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| v.len() == 1)
+                .unwrap_or(false)
+        })
+        .await,
+        "only p_hijack must trigger quarantine alert via cross-process DNS hint rejection"
+    );
+    let alerts = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap();
+    assert_eq!(
+        alerts[0].process_instance_id.as_deref(),
+        Some(p_hijack.instance_id().as_str())
+    );
+    assert!(alerts[0].process_suspended);
+    assert!(!defense.suspends().contains(&p_good));
+    assert!(!defense.suspends().contains(&p_isolated));
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-25` (`#1`): `DaemonEngine::wfp_drop_sink` captures ONLY `Weak<DaemonEngine>`,
+/// correlates `WfpDropEvent` against active/recent processes and per-instance DNS history,
+/// deduplicates rapid retries within 250 ms, promotes to high-priority triage, and lifts the
+/// pre-emptive WFP block on `AllowOnce`.
+#[tokio::test]
+async fn daemon_p3_25_wfp_drop_sink_correlation_dedup_and_weak_ref() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            preemptive_startup_executables: vec![ps_exe.to_string()],
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector.clone(),
+    );
+    let strong_before = Arc::strong_count(&engine);
+    let drop_sink = engine.wfp_drop_sink();
+    assert_eq!(
+        Arc::strong_count(&engine),
+        strong_before,
+        "wfp_drop_sink must capture Weak<DaemonEngine> only (no reference cycle)"
+    );
+
+    let sender = engine.sender();
+    let now_ms = current_unix_ms();
+    let ps_proc = ProcessIdentity::new(7701, unix_ms_to_filetime(now_ms - 1_000));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ps_proc,
+            parent_pid: 4,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start ps");
+    let drop_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+    sender
+        .send(SensorEvent::DnsQuery {
+            pid: ps_proc.pid,
+            query_name: "blocked-drop.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![drop_ip],
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("dns ps");
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 1).await);
+
+    // Emit pre-emptive WFP drop event -> correlated with ps_proc + DNS history -> triage alert!
+    let ev1 = WfpDropEvent {
+        os_filter_id: 99,
+        rule_handle: 100,
+        exe_path: ps_exe.to_string(),
+        protocol: 6,
+        dst_ip: drop_ip,
+        dst_port: 443,
+        timestamp_ms: now_ms + 10,
+    };
+    assert!(engine.ingest_wfp_drop_event(ev1.clone()));
+    // Rapid retry within 250ms is deduplicated!
+    let ev_dup = WfpDropEvent {
+        timestamp_ms: now_ms + 60,
+        ..ev1.clone()
+    };
+    assert!(!engine.ingest_wfp_drop_event(ev_dup));
+
+    assert!(
+        wait_until(2_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| v.len() == 1)
+                .unwrap_or(false)
+        })
+        .await,
+        "correlated WFP drop event must emit high-priority triage alert"
+    );
+    let alert = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap()[0].clone();
+    assert_eq!(alert.rule_id, "LEDR-NET-SCRIPT-INTERPRETER");
+    assert!(alert.process_suspended);
+    assert!(defense.suspends().contains(&ps_proc));
+    assert!(
+        alert.context_json.contains("blocked-drop.example"),
+        "alert context must retain DNS domain correlated from process_dns_history: {}",
+        alert.context_json
+    );
+
+    // User chooses AllowOnce -> lifts pre-emptive WFP block and resumes ps_proc.
+    engine
+        .resolve_alert(&alert.alert_id, AlertDecision::AllowOnce)
+        .expect("AllowOnce from WFP drop alert");
+    assert!(!engine.has_active_wfp_filter(ps_exe, None, false));
+    assert!(defense.resumes().contains(&ps_proc));
+
+    // After 250ms window passes, dedup allows re-ingestion for the same tuple.
+    let ev_after_window = WfpDropEvent {
+        timestamp_ms: now_ms + 300,
+        ..ev1.clone()
+    };
+    assert!(engine.ingest_wfp_drop_event(ev_after_window));
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    assert!(
+        weak.upgrade().is_none(),
+        "wfp_drop_sink must not keep DaemonEngine alive after drop"
+    );
+    // Calling drop_sink after engine drop is a safe no-op.
+    drop_sink(ev1);
+}
+
+/// `DAEMON-P3-26` (`#5`): Background NRD refresh runs on an independent `std::thread` holding
+/// zero `Arc<DaemonEngine>`, and `shutdown_and_flush` cancels an in-flight WinHTTP request
+/// against a hanging HTTP server cleanly in well under 500 ms.
+#[tokio::test]
+async fn daemon_p3_26_nrd_hanging_http_shutdown_cancels_rapidly() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking listener");
+
+    let accepted = Arc::new(AtomicBool::new(false));
+    let stop_server = Arc::new(AtomicBool::new(false));
+    let accepted_bg = Arc::clone(&accepted);
+    let stop_bg = Arc::clone(&stop_server);
+
+    let server_thread = std::thread::spawn(move || {
+        let mut held_sockets = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stop_bg.load(Ordering::Acquire) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted_bg.store(true, Ordering::Release);
+                    held_sockets.push(stream);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            nrd_refresh_enabled: true,
+            nrd_refresh_interval_ms: 200,
+            nrd_feed_urls: vec![format!("http://127.0.0.1:{port}/nrd.txt")],
+            ..DaemonConfig::default()
+        },
+        defense,
+        notifier,
+        inspector,
+    );
+
+    assert!(
+        wait_until(3_000, || accepted.load(Ordering::Acquire)).await,
+        "WinHTTP NRD refresh thread must connect to hanging mock server"
+    );
+
+    let started = Instant::now();
+    engine
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown_and_flush");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "shutdown_and_flush must cancel hanging WinHTTP NRD refresh in < 500 ms (took {elapsed:?})"
+    );
+    assert_eq!(
+        Arc::strong_count(&engine),
+        1,
+        "background NRD thread must hold zero Arc<DaemonEngine> references after shutdown"
+    );
+    drop(engine);
+
+    stop_server.store(true, Ordering::Release);
+    let _ = server_thread.join();
 }

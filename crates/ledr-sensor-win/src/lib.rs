@@ -17,9 +17,10 @@ pub use etw::file_canary::{
 pub use wfp::{
     LEDR_WFP_PROVIDER_GUID, LEDR_WFP_SUBLAYER_GUID, WFP_WEIGHT_BLOCK_APP,
     WFP_WEIGHT_BLOCK_SPECIFIC, WFP_WEIGHT_LOOPBACK_PERMIT, WFP_WEIGHT_PERMIT_APP,
-    WFP_WEIGHT_PERMIT_SPECIFIC, WfpBackend, WfpDynamicEngine, WfpFilterAction, WfpFilterSpec,
-    WfpLayer, WfpLoopbackCondition, WfpLoopbackFilterSpec, WfpRemoteAddress,
-    build_loopback_permit_filter_specs, build_wfp_filter_specs, validate_wfp_rule_request,
+    WFP_WEIGHT_PERMIT_SPECIFIC, WfpBackend, WfpDropEvent, WfpDropSinkFn, WfpDynamicEngine,
+    WfpFilterAction, WfpFilterMeta, WfpFilterSpec, WfpLayer, WfpLoopbackCondition,
+    WfpLoopbackFilterSpec, WfpRemoteAddress, build_loopback_permit_filter_specs,
+    build_wfp_filter_specs, parse_wfp_classify_drop_fields, validate_wfp_rule_request,
 };
 
 use std::net::IpAddr;

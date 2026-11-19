@@ -59,6 +59,16 @@ pub struct RemovedBlockSnapshot {
     pub origin: WfpFilterOrigin,
 }
 
+/// Individual WFP filter operation failure captured during reconciliation (`#4`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WfpFailedOp {
+    pub exe_key: String,
+    pub remote_ip: Option<IpAddr>,
+    pub is_remove: bool,
+    pub is_startup_preemptive: bool,
+    pub error: String,
+}
+
 /// Summary of a persisted-rule reconciliation pass against [`ActiveDefenseController`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WfpReconcileReport {
@@ -67,6 +77,34 @@ pub struct WfpReconcileReport {
     pub promoted: usize,
     pub skipped_wildcard: usize,
     pub failed: usize,
+    pub failed_ops: Vec<WfpFailedOp>,
+}
+
+impl WfpReconcileReport {
+    /// Returns `true` when any non-startup-preemptive WFP filter operation failed.
+    ///
+    /// Failures on unrelated startup-pinned interpreters (e.g., running non-elevated without
+    /// BFE access on system paths) must not fail explicit user policy mutations.
+    pub fn has_policy_failures(&self) -> bool {
+        self.failed_ops.iter().any(|op| !op.is_startup_preemptive)
+    }
+
+    /// Formats a concise human-readable summary of all non-startup-preemptive WFP failures.
+    pub fn policy_failure_summary(&self) -> String {
+        let details: Vec<String> = self
+            .failed_ops
+            .iter()
+            .filter(|op| !op.is_startup_preemptive)
+            .map(|op| {
+                let verb = if op.is_remove { "remove" } else { "apply" };
+                match op.remote_ip {
+                    Some(ip) => format!("{verb} {} ({ip}): {}", op.exe_key, op.error),
+                    None => format!("{verb} {}: {}", op.exe_key, op.error),
+                }
+            })
+            .collect();
+        details.join("; ")
+    }
 }
 
 /// Tracks active dynamic WFP rule handles, alert containment bindings, wildcard/domain rule
@@ -249,6 +287,85 @@ impl WfpRuleManager {
             .is_some_and(|entry| entry.allow == allow)
     }
 
+    /// Returns `true` if any live WFP Permit (`allow: true`) filter—app-wide or IP-scoped—is
+    /// currently tracked for `exe_path`.
+    pub fn has_any_permit_filter_for_exe(&self, exe_path: &str) -> bool {
+        let exe_k = Self::exe_key(exe_path);
+        self.installed
+            .iter()
+            .any(|((k_exe, _), entry)| k_exe == &exe_k && entry.allow)
+    }
+
+    /// Removes all live WFP Permit (`allow: true`) filters—app-wide and IP-scoped—for
+    /// `exe_path`, returning the number of filters successfully removed.
+    pub fn revoke_permits_for_exe(
+        &mut self,
+        exe_path: &str,
+        defense: &dyn ActiveDefenseController,
+    ) -> usize {
+        let exe_k = Self::exe_key(exe_path);
+        let permit_keys: Vec<WfpTargetKey> = self
+            .installed
+            .iter()
+            .filter(|((k_exe, _), entry)| k_exe == &exe_k && entry.allow)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut removed = 0usize;
+        for key in permit_keys {
+            if let Some(entry) = self.installed.get(&key).cloned() {
+                match defense.remove_wfp_rule(entry.handle) {
+                    Ok(()) => {
+                        self.installed.remove(&key);
+                        removed += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            exe_path = %entry.exe_path,
+                            remote_ip = ?key.1,
+                            wfp_handle = entry.handle,
+                            error = %err,
+                            "failed to revoke stale WFP Permit filter"
+                        );
+                    }
+                }
+            }
+        }
+        removed
+    }
+
+    /// Removes a specific live WFP Permit (`allow: true`) filter for `(exe_path, remote_ip)`
+    /// if present, returning `true` if a filter was removed.
+    pub fn revoke_permit_for_target(
+        &mut self,
+        exe_path: &str,
+        remote_ip: Option<IpAddr>,
+        defense: &dyn ActiveDefenseController,
+    ) -> bool {
+        let key = Self::target_key(exe_path, remote_ip);
+        let Some(entry) = self.installed.get(&key).cloned() else {
+            return false;
+        };
+        if !entry.allow {
+            return false;
+        }
+        match defense.remove_wfp_rule(entry.handle) {
+            Ok(()) => {
+                self.installed.remove(&key);
+                true
+            }
+            Err(err) => {
+                tracing::warn!(
+                    exe_path = %entry.exe_path,
+                    remote_ip = ?key.1,
+                    wfp_handle = entry.handle,
+                    error = %err,
+                    "failed to revoke stale target WFP Permit filter"
+                );
+                false
+            }
+        }
+    }
+
     /// Returns the total number of active WFP filter handles currently tracked.
     pub fn active_filter_count(&self) -> usize {
         self.installed.len()
@@ -256,9 +373,10 @@ impl WfpRuleManager {
 
     /// Records a newly installed pre-emptive app-wide WFP Block handle.
     ///
-    /// If another thread concurrently installed any filter for `exe_path` while `add_wfp_app_rule`
-    /// was running, immediately removes the redundant `handle` so no BFE handle is leaked and no
-    /// `PersistedPolicy` filter is overwritten.
+    /// If another thread concurrently installed any filter for `exe_path` OR granted an `AllowOnce`
+    /// exemption while `add_wfp_app_rule` was running, immediately removes the redundant `handle`
+    /// so no BFE handle is leaked, no `PersistedPolicy` filter is overwritten, and no `AllowOnce`
+    /// sibling instance is severed (`#2`).
     pub fn register_preemptive_block(
         &mut self,
         exe_path: &str,
@@ -266,13 +384,13 @@ impl WfpRuleManager {
         defense: &dyn ActiveDefenseController,
     ) -> bool {
         let key = Self::target_key(exe_path, None);
-        if self.installed.contains_key(&key) {
+        if self.installed.contains_key(&key) || self.has_once_allowed_for_exe(&key.0) {
             if let Err(err) = defense.remove_wfp_rule(handle) {
                 tracing::warn!(
                     exe_path = %exe_path,
                     wfp_handle = handle,
                     error = %err,
-                    "failed removing redundant pre-emptive WFP handle after concurrent insert"
+                    "failed removing redundant pre-emptive WFP handle after concurrent insert or AllowOnce"
                 );
             }
             return false;
@@ -493,7 +611,14 @@ impl WfpRuleManager {
             if existing.allow {
                 return Ok(Some(existing.handle));
             }
-            // Do not override an explicit IP-specific Block filter.
+            // Do not override an explicit/domain IP-specific Block filter (deny-overrides-allow).
+            tracing::warn!(
+                exe_path = %exe_path,
+                dst_ip = %canon_ip,
+                allowed_domain_hint = %domain_hint,
+                existing_origin = ?existing.origin,
+                "suppressing IP-level WFP Permit for allowed domain because an existing IP Block shares this destination IP (deny-overrides-allow)"
+            );
             return Ok(None);
         }
 
@@ -992,6 +1117,13 @@ impl WfpRuleManager {
                             "failed to remove obsolete WFP rule during reconciliation"
                         );
                         report.failed += 1;
+                        report.failed_ops.push(WfpFailedOp {
+                            exe_key: key.0,
+                            remote_ip: key.1,
+                            is_remove: true,
+                            is_startup_preemptive: false,
+                            error: err,
+                        });
                     }
                 }
             }
@@ -1005,11 +1137,12 @@ impl WfpRuleManager {
         desired_sorted.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
 
         for (key, exe_path, allow) in desired_sorted {
-            if self
-                .installed
-                .get(&key)
-                .is_some_and(|e| e.allow == allow)
-            {
+            if let Some(existing) = self.installed.get(&key) {
+                if existing.allow == allow {
+                    continue;
+                }
+                // Obsolete filter removal in step 3 failed; do not overwrite the tracked handle
+                // and leak a duplicate BFE filter (`report.failed_ops` already records the error).
                 continue;
             }
             match defense.add_wfp_app_rule(Path::new(&exe_path), key.1, allow) {
@@ -1034,6 +1167,13 @@ impl WfpRuleManager {
                         "failed to apply persisted WFP firewall rule"
                     );
                     report.failed += 1;
+                    report.failed_ops.push(WfpFailedOp {
+                        exe_key: key.0,
+                        remote_ip: key.1,
+                        is_remove: false,
+                        is_startup_preemptive: false,
+                        error: err,
+                    });
                 }
             }
         }
@@ -1073,6 +1213,13 @@ impl WfpRuleManager {
                         "startup pre-emptive WFP block unavailable for interpreter"
                     );
                     report.failed += 1;
+                    report.failed_ops.push(WfpFailedOp {
+                        exe_key: exe_k,
+                        remote_ip: None,
+                        is_remove: false,
+                        is_startup_preemptive: true,
+                        error: err,
+                    });
                 }
             }
         }
@@ -1089,4 +1236,164 @@ pub fn parse_literal_target_ip(raw: &str) -> Option<IpAddr> {
         return None;
     }
     trimmed.parse::<IpAddr>().ok().map(canonical_ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ledr_proto::ProcessIdentity;
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    struct StubInspector(String);
+
+    impl BinaryInspector for StubInspector {
+        fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+            BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: Some(self.0.clone()),
+                authenticode: None,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct StubDefense {
+        next_handle: AtomicU64,
+        removed: Mutex<Vec<u64>>,
+        fail_exes: Mutex<Vec<String>>,
+        fail_removes: Mutex<bool>,
+    }
+
+    impl StubDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(1),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl ActiveDefenseController for StubDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(
+            &self,
+            exe_path: &Path,
+            _remote_ip: Option<IpAddr>,
+            _allow: bool,
+        ) -> Result<u64, String> {
+            let s = exe_path.to_string_lossy().to_ascii_lowercase();
+            if self
+                .fail_exes
+                .lock()
+                .expect("lock fail_exes")
+                .iter()
+                .any(|pat| s.contains(pat))
+            {
+                return Err(format!("mock WFP add failure for {s}"));
+            }
+            Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
+        }
+        fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+            if *self.fail_removes.lock().expect("lock fail_removes") {
+                return Err(format!("mock WFP remove failure for {filter_id}"));
+            }
+            self.removed.lock().expect("lock removed").push(filter_id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn firewall_register_preemptive_block_respects_active_allow_once() {
+        let mut fw = WfpRuleManager::new();
+        let defense = StubDefense::new();
+        let ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        fw.mark_once_allowed("100:1", ps);
+        let h = defense.add_wfp_app_rule(Path::new(ps), None, false).unwrap();
+        assert!(!fw.register_preemptive_block(ps, h, &defense));
+        assert!(!fw.has_any_app_filter(ps));
+        assert_eq!(*defense.removed.lock().unwrap(), vec![h]);
+    }
+
+    #[test]
+    fn firewall_reconcile_distinguishes_startup_preemptive_and_policy_failures() {
+        let mut fw = WfpRuleManager::new();
+        let defense = StubDefense::new();
+        let inspector = StubInspector("a".repeat(64));
+        let startup_ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let policy_app = r"C:\Tools\policy_app.exe";
+
+        fw.set_startup_preemptive_executables(&[startup_ps.to_string()]);
+        defense
+            .fail_exes
+            .lock()
+            .unwrap()
+            .push("powershell.exe".to_string());
+
+        // Only startup-pinned interpreter fails -> has_policy_failures() MUST be false!
+        let report1 = fw.reconcile_persisted_rules(
+            &[AllowlistRuleRecord {
+                rule_id: "R1".to_string(),
+                scope: RuleScope::NetworkBlock,
+                exe_path_pattern: policy_app.to_string(),
+                sha256: None,
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: None,
+                created_at_ms: 1,
+                created_by: "test".to_string(),
+            }],
+            &[],
+            &inspector,
+            &defense,
+        );
+        assert_eq!(report1.applied, 1);
+        assert_eq!(report1.failed, 1);
+        assert!(!report1.has_policy_failures());
+        assert!(report1.policy_failure_summary().is_empty());
+
+        // Removing R1 fails when remove_wfp_rule fails -> has_policy_failures() MUST be true!
+        *defense.fail_removes.lock().unwrap() = true;
+        let report2 = fw.reconcile_persisted_rules(&[], &[], &inspector, &defense);
+        assert!(report2.has_policy_failures());
+        assert!(report2.policy_failure_summary().contains("remove"));
+        assert!(report2.policy_failure_summary().contains("policy_app.exe"));
+    }
+
+    #[test]
+    fn firewall_shared_ip_deny_suppresses_permit_and_revoke_permits_clears_all() {
+        let mut fw = WfpRuleManager::new();
+        let defense = StubDefense::new();
+        let app = r"C:\Tools\shared_cdn.exe";
+        let shared_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50));
+        let other_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 51));
+
+        fw.ensure_domain_policy_block(app, shared_ip, "blocked.example", &defense)
+            .expect("domain block");
+        let permit_res = fw
+            .ensure_ip_permit_for_domain_rule(app, shared_ip, "allowed.example", &defense)
+            .expect("shared ip check");
+        assert_eq!(permit_res, None, "existing IP block must suppress domain permit");
+        assert!(fw.has_active_filter(app, Some(shared_ip), false));
+        assert!(!fw.has_active_filter(app, Some(shared_ip), true));
+
+        let p_handle = fw
+            .ensure_ip_permit_for_domain_rule(app, other_ip, "allowed.example", &defense)
+            .expect("other ip permit");
+        assert!(p_handle.is_some());
+        assert!(fw.has_any_permit_filter_for_exe(app));
+        let revoked = fw.revoke_permits_for_exe(app, &defense);
+        assert_eq!(revoked, 1);
+        assert!(!fw.has_any_permit_filter_for_exe(app));
+        assert!(fw.has_active_filter(app, Some(shared_ip), false));
+    }
 }

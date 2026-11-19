@@ -855,6 +855,10 @@ fn dispatch_request(
                 code: "INVALID_RULE".to_string(),
                 message: msg,
             },
+            Err(PolicyRuleError::FirewallSync(msg)) => IpcResponse::Error {
+                code: "WFP_SYNC_ERROR".to_string(),
+                message: msg,
+            },
             Err(PolicyRuleError::Store(err)) => store_error_response(err),
         },
         IpcRequest::DeleteRule { rule_id } => match engine.delete_policy_rule(&rule_id) {
@@ -865,7 +869,15 @@ fn dispatch_request(
                 code: "NOT_FOUND".to_string(),
                 message: format!("rule {rule_id} not found"),
             },
-            Err(err) => store_error_response(err),
+            Err(PolicyRuleError::FirewallSync(msg)) => IpcResponse::Error {
+                code: "WFP_SYNC_ERROR".to_string(),
+                message: msg,
+            },
+            Err(PolicyRuleError::Invalid(msg)) => IpcResponse::Error {
+                code: "INVALID_RULE".to_string(),
+                message: msg,
+            },
+            Err(PolicyRuleError::Store(err)) => store_error_response(err),
         },
         IpcRequest::ReportDownloadOrigin {
             file_path,

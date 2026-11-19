@@ -328,6 +328,8 @@ async fn main() -> anyhow::Result<()> {
         nrd_feed_urls,
         ..DaemonConfig::default()
     };
+    let wfp_defense = Arc::clone(&defense_controller);
+    let outbound_firewall_enabled = config.outbound_firewall_enabled;
     let engine = DaemonEngine::start_with_controllers(
         store,
         sigma,
@@ -339,6 +341,14 @@ async fn main() -> anyhow::Result<()> {
             cli.foreground,
         )),
     );
+    if outbound_firewall_enabled {
+        if let Err(err) = wfp_defense.set_wfp_drop_sink(engine.wfp_drop_sink()) {
+            tracing::warn!(
+                error = %err,
+                "WFP net-event drop sink could not be attached (non-elevated session?); continuing without WFP drop capture"
+            );
+        }
+    }
 
     let mut honeypot_mgr = HoneypotManager::new();
     let honeypot_paths = match honeypot_mgr.deploy_honeypots() {
@@ -355,9 +365,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start ETW capture directly into TwoLaneSender BEFORE Toolhelp32 snapshot capture so
-    // processes spawned or exiting during snapshot enumeration are not missed (BUG_0001, BUG_0006).
-    let bridge_sender = engine.sender();
+    // Start ETW capture directly into ClassifiedEventSender BEFORE Toolhelp32 snapshot capture so
+    // processes spawned or exiting during snapshot enumeration are not missed (BUG_0001, BUG_0006, L-10).
+    let bridge_sender = engine.classified_sender();
     let etw_sink: EventSinkFn = Arc::new(move |ev| bridge_sender.blocking_send(ev).is_ok());
     let mut etw_sensor = WindowsEtwSensor::with_sink(etw_sink, DEFAULT_ETW_SESSION_NAME);
     etw_sensor.set_honeypot_paths(honeypot_paths);
@@ -422,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(Ok(())) => {}
     }
 
+    wfp_defense.clear_wfp_drop_sink();
     ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await?;
     tracing::info!("ledr-daemon shutdown complete");

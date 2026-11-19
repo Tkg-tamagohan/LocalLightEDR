@@ -10,9 +10,71 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::RulesError;
+
+#[derive(Default)]
+struct NrdCancelState {
+    cancelled: AtomicBool,
+    #[cfg(windows)]
+    active_request_handle: std::sync::Mutex<Option<usize>>,
+}
+
+/// Cooperative cancellation token for [`fetch_nrd_feed_url_cancellable`] and
+/// [`refresh_nrd_cache_cancellable`].
+#[derive(Clone, Default)]
+pub struct NrdCancelToken {
+    state: Arc<NrdCancelState>,
+}
+
+impl std::fmt::Debug for NrdCancelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NrdCancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl NrdCancelToken {
+    /// Creates a new uncancelled [`NrdCancelToken`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if [`NrdCancelToken::cancel`] has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Cancels any current or future NRD fetch associated with this token.
+    ///
+    /// On Windows, atomically takes and closes any active WinHTTP request handle so an in-flight
+    /// synchronous request aborts immediately without waiting for network timeouts.
+    pub fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::SeqCst);
+        #[cfg(windows)]
+        {
+            let raw_handle = {
+                let mut guard = self
+                    .state
+                    .active_request_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.take()
+            };
+            if let Some(handle_addr) = raw_handle {
+                // SAFETY: `handle_addr` was registered from `WinHttpOpenRequest` and `take()`
+                // guarantees `WinHttpCloseHandle` is invoked at most once across `cancel()` and
+                // `CancellableWinHttpHandle::drop()`.
+                unsafe {
+                    let _ = winhttp_ffi::WinHttpCloseHandle(handle_addr as *mut std::ffi::c_void);
+                }
+            }
+        }
+    }
+}
 
 static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -528,13 +590,29 @@ pub(crate) fn is_loopback_http_host(host: &str) -> bool {
 /// Returns `(bytes, truncated)`. When `truncated` is `true`, any partial trailing line is
 /// trimmed at the final newline so parsers never see half a domain name.
 pub fn fetch_nrd_feed_url(url: &str, max_bytes: usize) -> Result<(Vec<u8>, bool), String> {
+    fetch_nrd_feed_url_cancellable(url, max_bytes, &NrdCancelToken::new())
+}
+
+/// Cancellable variant of [`fetch_nrd_feed_url`] controlled by [`NrdCancelToken`].
+pub fn fetch_nrd_feed_url_cancellable(
+    url: &str,
+    max_bytes: usize,
+    cancel: &NrdCancelToken,
+) -> Result<(Vec<u8>, bool), String> {
+    if cancel.is_cancelled() {
+        return Err("NRD feed download cancelled".to_string());
+    }
     let trimmed = url.trim();
     if trimmed
         .get(..7)
         .is_some_and(|p| p.eq_ignore_ascii_case("file://"))
     {
         let path = parse_file_url(trimmed)?;
-        return read_bounded_file(&path, max_bytes);
+        let res = read_bounded_file(&path, max_bytes)?;
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
+        return Ok(res);
     }
     if trimmed
         .get(..8)
@@ -549,7 +627,7 @@ pub fn fetch_nrd_feed_url(url: &str, max_bytes: usize) -> Result<(Vec<u8>, bool)
                 "refusing unencrypted remote HTTP NRD feed URL `{trimmed}` (https:// required for non-loopback hosts)"
             ));
         }
-        return fetch_http_winhttp(&parsed, max_bytes);
+        return fetch_http_winhttp_cancellable(&parsed, max_bytes, cancel);
     }
     Err(format!(
         "unsupported NRD feed URL `{trimmed}` (expected https://, file://, or loopback http://)"
@@ -587,8 +665,21 @@ fn trim_partial_trailing_line(buf: &mut Vec<u8>) {
 /// Reads chunks from a streaming source via `next_chunk(max_to_read)` until EOF (`Ok(None)`) or
 /// `max_bytes` is exceeded. When truncated, trims any partial trailing line (clearing the buffer
 /// if no newline was seen) so NRD parsers never ingest a half-domain.
+#[cfg(test)]
 pub(crate) fn read_bounded_chunks<F>(
     max_bytes: usize,
+    next_chunk: F,
+) -> Result<(Vec<u8>, bool), String>
+where
+    F: FnMut(usize) -> Result<Option<Vec<u8>>, String>,
+{
+    read_bounded_chunks_cancellable(max_bytes, &NrdCancelToken::new(), next_chunk)
+}
+
+/// Cancellable variant of [`read_bounded_chunks`].
+pub(crate) fn read_bounded_chunks_cancellable<F>(
+    max_bytes: usize,
+    cancel: &NrdCancelToken,
     mut next_chunk: F,
 ) -> Result<(Vec<u8>, bool), String>
 where
@@ -599,6 +690,9 @@ where
     let mut truncated = false;
 
     loop {
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
         let remaining_budget = cap.saturating_sub(body.len());
         let want = if remaining_budget == 0 {
             1
@@ -608,6 +702,9 @@ where
         let Some(chunk) = next_chunk(want)? else {
             break;
         };
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
         if chunk.is_empty() {
             break;
         }
@@ -638,6 +735,26 @@ pub fn refresh_nrd_cache(
     max_bytes_per_feed: usize,
     now_ms: i64,
 ) -> Result<(NrdCache, NrdRefreshStats), String> {
+    refresh_nrd_cache_cancellable(
+        feed_urls,
+        max_entries,
+        max_bytes_per_feed,
+        now_ms,
+        &NrdCancelToken::new(),
+    )
+}
+
+/// Cancellable variant of [`refresh_nrd_cache`] controlled by [`NrdCancelToken`].
+pub fn refresh_nrd_cache_cancellable(
+    feed_urls: &[String],
+    max_entries: usize,
+    max_bytes_per_feed: usize,
+    now_ms: i64,
+    cancel: &NrdCancelToken,
+) -> Result<(NrdCache, NrdRefreshStats), String> {
+    if cancel.is_cancelled() {
+        return Err("NRD feed refresh cancelled".to_string());
+    }
     if feed_urls.is_empty() {
         return Err("no NRD feed URLs configured".to_string());
     }
@@ -647,7 +764,10 @@ pub fn refresh_nrd_cache(
     let mut stats = NrdRefreshStats::default();
 
     for url in feed_urls {
-        match fetch_nrd_feed_url(url, max_bytes_per_feed) {
+        if cancel.is_cancelled() {
+            return Err("NRD feed refresh cancelled".to_string());
+        }
+        match fetch_nrd_feed_url_cancellable(url, max_bytes_per_feed, cancel) {
             Ok((bytes, byte_truncated)) => {
                 stats.feeds_succeeded += 1;
                 let (_, entry_truncated) = parse_nrd_feed_bytes(&bytes, &mut merged, cap);
@@ -656,10 +776,17 @@ pub fn refresh_nrd_cache(
                 }
             }
             Err(err) => {
+                if cancel.is_cancelled() {
+                    return Err("NRD feed refresh cancelled".to_string());
+                }
                 stats.feeds_failed += 1;
                 stats.errors.push(format!("{url}: {err}"));
             }
         }
+    }
+
+    if cancel.is_cancelled() {
+        return Err("NRD feed refresh cancelled".to_string());
     }
 
     if stats.feeds_succeeded == 0 {
@@ -727,39 +854,38 @@ fn replace_file_atomically(tmp_path: &Path, dest_path: &Path) -> Result<(), std:
 }
 
 #[cfg(windows)]
-fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u8>, bool), String> {
+mod winhttp_ffi {
     use std::ffi::c_void;
-    use std::ptr;
 
-    const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
-    const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
-    const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
-    const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
-    const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+    pub const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
+    pub const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
+    pub const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+    pub const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
+    pub const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 
     #[link(name = "winhttp.dll", kind = "raw-dylib", modifiers = "+verbatim")]
     extern "system" {
-        fn WinHttpOpen(
+        pub fn WinHttpOpen(
             psz_agent_w: *const u16,
             dw_access_type: u32,
             psz_proxy_w: *const u16,
             psz_proxy_bypass_w: *const u16,
             dw_flags: u32,
         ) -> *mut c_void;
-        fn WinHttpSetTimeouts(
+        pub fn WinHttpSetTimeouts(
             h_internet: *mut c_void,
             n_resolve_timeout: i32,
             n_connect_timeout: i32,
             n_send_timeout: i32,
             n_receive_timeout: i32,
         ) -> i32;
-        fn WinHttpConnect(
+        pub fn WinHttpConnect(
             h_session: *mut c_void,
             pswz_server_name: *const u16,
             n_server_port: u16,
             dw_reserved: u32,
         ) -> *mut c_void;
-        fn WinHttpOpenRequest(
+        pub fn WinHttpOpenRequest(
             h_connect: *mut c_void,
             pwsz_verb: *const u16,
             pwsz_object_name: *const u16,
@@ -768,7 +894,7 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
             ppwsz_accept_types: *const *const u16,
             dw_flags: u32,
         ) -> *mut c_void;
-        fn WinHttpSendRequest(
+        pub fn WinHttpSendRequest(
             h_request: *mut c_void,
             lpsz_headers: *const u16,
             dw_headers_length: u32,
@@ -777,8 +903,8 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
             dw_total_length: u32,
             dw_context: usize,
         ) -> i32;
-        fn WinHttpReceiveResponse(h_request: *mut c_void, lp_reserved: *mut c_void) -> i32;
-        fn WinHttpQueryHeaders(
+        pub fn WinHttpReceiveResponse(h_request: *mut c_void, lp_reserved: *mut c_void) -> i32;
+        pub fn WinHttpQueryHeaders(
             h_request: *mut c_void,
             dw_info_level: u32,
             pwsz_name: *const u16,
@@ -786,18 +912,29 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
             lpdw_buffer_length: *mut u32,
             lpdw_index: *mut u32,
         ) -> i32;
-        fn WinHttpQueryDataAvailable(
+        pub fn WinHttpQueryDataAvailable(
             h_request: *mut c_void,
             lpdw_number_of_bytes_available: *mut u32,
         ) -> i32;
-        fn WinHttpReadData(
+        pub fn WinHttpReadData(
             h_request: *mut c_void,
             lp_buffer: *mut c_void,
             dw_number_of_bytes_to_read: u32,
             lpdw_number_of_bytes_read: *mut u32,
         ) -> i32;
-        fn WinHttpCloseHandle(h_internet: *mut c_void) -> i32;
+        pub fn WinHttpCloseHandle(h_internet: *mut c_void) -> i32;
     }
+}
+
+#[cfg(windows)]
+fn fetch_http_winhttp_cancellable(
+    parsed: &ParsedHttpUrl,
+    max_bytes: usize,
+    cancel: &NrdCancelToken,
+) -> Result<(Vec<u8>, bool), String> {
+    use std::ffi::c_void;
+    use std::ptr;
+    use winhttp_ffi::*;
 
     struct OwnedWinHttpHandle(*mut c_void);
     impl Drop for OwnedWinHttpHandle {
@@ -810,6 +947,66 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
                 self.0 = ptr::null_mut();
             }
         }
+    }
+
+    // RAII guard for the cancellable request handle: `take()`s from `active_request_handle`
+    // before closing so `NrdCancelToken::cancel()` and `Drop` NEVER double-close the same
+    // HINTERNET handle (`BUG_0005`).
+    struct CancellableWinHttpHandle<'a> {
+        cancel: &'a NrdCancelToken,
+        raw: *mut c_void,
+    }
+
+    impl<'a> CancellableWinHttpHandle<'a> {
+        fn register(cancel: &'a NrdCancelToken, raw_request: *mut c_void) -> Result<Self, String> {
+            let mut guard = cancel
+                .state
+                .active_request_handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cancel.state.cancelled.load(Ordering::SeqCst) {
+                drop(guard);
+                // SAFETY: `raw_request` was opened by `WinHttpOpenRequest` and never published.
+                unsafe {
+                    let _ = WinHttpCloseHandle(raw_request);
+                }
+                return Err("NRD feed download cancelled".to_string());
+            }
+            *guard = Some(raw_request as usize);
+            Ok(Self {
+                cancel,
+                raw: raw_request,
+            })
+        }
+
+        fn raw(&self) -> *mut c_void {
+            self.raw
+        }
+    }
+
+    impl Drop for CancellableWinHttpHandle<'_> {
+        fn drop(&mut self) {
+            let raw_handle = {
+                let mut guard = self
+                    .cancel
+                    .state
+                    .active_request_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.take()
+            };
+            if let Some(handle_addr) = raw_handle {
+                // SAFETY: `take()` ensures `WinHttpCloseHandle` is called at most once
+                // between `NrdCancelToken::cancel()` and `CancellableWinHttpHandle::drop()`.
+                unsafe {
+                    let _ = WinHttpCloseHandle(handle_addr as *mut c_void);
+                }
+            }
+        }
+    }
+
+    if cancel.is_cancelled() {
+        return Err("NRD feed download cancelled".to_string());
     }
 
     let to_wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
@@ -853,9 +1050,16 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
         let _ = WinHttpSetTimeouts(session.0, 10_000, 10_000, 10_000, 20_000);
     }
 
+    if cancel.is_cancelled() {
+        return Err("NRD feed download cancelled".to_string());
+    }
+
     // SAFETY: `session.0` is valid and `host_w` is NUL-terminated UTF-16.
     let raw_connect = unsafe { WinHttpConnect(session.0, host_w.as_ptr(), parsed.port, 0) };
     if raw_connect.is_null() {
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
         return Err(format!(
             "WinHttpConnect(`{}:{}`) failed: {}",
             parsed.host,
@@ -864,6 +1068,10 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
         ));
     }
     let connect = OwnedWinHttpHandle(raw_connect);
+
+    if cancel.is_cancelled() {
+        return Err("NRD feed download cancelled".to_string());
+    }
 
     let flags = if parsed.is_https {
         WINHTTP_FLAG_SECURE
@@ -883,32 +1091,53 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
         )
     };
     if raw_request.is_null() {
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
         return Err(format!(
             "WinHttpOpenRequest(`{}`) failed: {}",
             parsed.path_and_query,
             std::io::Error::last_os_error()
         ));
     }
-    let request = OwnedWinHttpHandle(raw_request);
+    let request = CancellableWinHttpHandle::register(cancel, raw_request)?;
 
-    // SAFETY: `request.0` is a valid WinHTTP request handle.
+    if cancel.is_cancelled() {
+        return Err("NRD feed download cancelled".to_string());
+    }
+
+    // SAFETY: `request.raw()` is a valid WinHTTP request handle.
     let send_ok = unsafe {
-        WinHttpSendRequest(request.0, ptr::null(), 0, ptr::null_mut(), 0, 0, 0)
+        WinHttpSendRequest(request.raw(), ptr::null(), 0, ptr::null_mut(), 0, 0, 0)
     };
     if send_ok == 0 {
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
         return Err(format!(
             "WinHttpSendRequest failed: {}",
             std::io::Error::last_os_error()
         ));
     }
 
-    // SAFETY: `request.0` has a sent HTTP request.
-    let recv_ok = unsafe { WinHttpReceiveResponse(request.0, ptr::null_mut()) };
+    if cancel.is_cancelled() {
+        return Err("NRD feed download cancelled".to_string());
+    }
+
+    // SAFETY: `request.raw()` has a sent HTTP request.
+    let recv_ok = unsafe { WinHttpReceiveResponse(request.raw(), ptr::null_mut()) };
     if recv_ok == 0 {
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
         return Err(format!(
             "WinHttpReceiveResponse failed: {}",
             std::io::Error::last_os_error()
         ));
+    }
+
+    if cancel.is_cancelled() {
+        return Err("NRD feed download cancelled".to_string());
     }
 
     let mut status_code: u32 = 0;
@@ -916,7 +1145,7 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
     // SAFETY: Queries HTTP status code into `status_code` (`DWORD`).
     let hdr_ok = unsafe {
         WinHttpQueryHeaders(
-            request.0,
+            request.raw(),
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             ptr::null(),
             (&mut status_code as *mut u32).cast::<c_void>(),
@@ -925,6 +1154,9 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
         )
     };
     if hdr_ok == 0 {
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
         return Err(format!(
             "WinHttpQueryHeaders(STATUS_CODE) failed: {}",
             std::io::Error::last_os_error()
@@ -934,11 +1166,17 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
         return Err(format!("HTTP status {status_code}"));
     }
 
-    read_bounded_chunks(max_bytes, |want| {
+    read_bounded_chunks_cancellable(max_bytes, cancel, |want| {
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
         let mut avail: u32 = 0;
-        // SAFETY: `request.0` has received response headers.
-        let avail_ok = unsafe { WinHttpQueryDataAvailable(request.0, &mut avail) };
+        // SAFETY: `request.raw()` has received response headers.
+        let avail_ok = unsafe { WinHttpQueryDataAvailable(request.raw(), &mut avail) };
         if avail_ok == 0 {
+            if cancel.is_cancelled() {
+                return Err("NRD feed download cancelled".to_string());
+            }
             return Err(format!(
                 "WinHttpQueryDataAvailable failed: {}",
                 std::io::Error::last_os_error()
@@ -947,6 +1185,9 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
         if avail == 0 {
             return Ok(None);
         }
+        if cancel.is_cancelled() {
+            return Err("NRD feed download cancelled".to_string());
+        }
 
         let to_read = (avail as usize).min(want).max(1);
         let mut chunk = vec![0u8; to_read];
@@ -954,13 +1195,16 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
         // SAFETY: `chunk` has length `to_read`.
         let read_ok = unsafe {
             WinHttpReadData(
-                request.0,
+                request.raw(),
                 chunk.as_mut_ptr().cast::<c_void>(),
                 to_read as u32,
                 &mut read_len,
             )
         };
         if read_ok == 0 {
+            if cancel.is_cancelled() {
+                return Err("NRD feed download cancelled".to_string());
+            }
             return Err(format!(
                 "WinHttpReadData failed: {}",
                 std::io::Error::last_os_error()
@@ -975,6 +1219,13 @@ fn fetch_http_winhttp(parsed: &ParsedHttpUrl, max_bytes: usize) -> Result<(Vec<u
 }
 
 #[cfg(not(windows))]
-fn fetch_http_winhttp(_parsed: &ParsedHttpUrl, _max_bytes: usize) -> Result<(Vec<u8>, bool), String> {
+fn fetch_http_winhttp_cancellable(
+    _parsed: &ParsedHttpUrl,
+    _max_bytes: usize,
+    cancel: &NrdCancelToken,
+) -> Result<(Vec<u8>, bool), String> {
+    if cancel.is_cancelled() {
+        return Err("NRD feed download cancelled".to_string());
+    }
     Err("WinHTTP NRD feed fetch is only supported on Windows".to_string())
 }

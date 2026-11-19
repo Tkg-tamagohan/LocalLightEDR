@@ -97,6 +97,12 @@
         <section class="panel triage-detail-panel" aria-label="Alert Triage Details">
           <div id="triage-empty" class="triage-empty">
             <p id="triage-empty-label" class="empty-state-title">No unresolved alerts</p>
+            <div
+              id="triage-empty-feedback"
+              class="triage-feedback hidden"
+              role="status"
+              aria-live="polite"
+            ></div>
             <div class="empty-state-actions">
               <button id="triage-show-all-btn" type="button" class="btn btn-secondary hidden">
                 Show All Alerts
@@ -186,6 +192,7 @@
                       autocapitalize="none"
                       spellcheck="false"
                     />
+                    <span id="target-scope-note" class="tier-constraint hidden"></span>
                   </div>
                 </div>
               </div>
@@ -339,6 +346,7 @@
                   id="rule-target-input"
                   type="text"
                   placeholder="e.g. 93.184.216.34 or *.example.com"
+                  title="IP/CIDR or domain (WFP enforces resolved IPs; shared CDN IPs affected)"
                   autocomplete="off"
                   spellcheck="false"
                 />
@@ -375,7 +383,7 @@
               </div>
             </div>
             <div class="policy-form-actions">
-              <span class="tier-constraint">NetworkBlock overrides NetworkAllow (WFP dynamic session)</span>
+              <span id="policy-scope-note" class="tier-constraint">Network domain targets enforce per resolved WFP IP (shared CDN IPs match; Deny overrides Allow).</span>
               <div class="panel-actions">
                 <button id="cancel-add-rule-btn" type="button" class="btn btn-ghost btn-xs">Cancel</button>
                 <button id="submit-add-rule-btn" type="submit" class="btn btn-primary btn-xs">Save Rule</button>

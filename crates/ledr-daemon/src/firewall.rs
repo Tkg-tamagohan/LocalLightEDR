@@ -699,6 +699,20 @@ impl WfpRuleManager {
         domain_hint: &str,
         defense: &dyn ActiveDefenseController,
     ) -> Result<u64, String> {
+        self.ensure_domain_policy_block_hints(exe_path, dst_ip, &[domain_hint], defense)
+    }
+
+    /// Like [`WfpRuleManager::ensure_domain_policy_block`], merging all non-empty
+    /// `domain_hints` into the `DomainPolicy` Block metadata (deduplicated and bounded by
+    /// [`MAX_DOMAIN_HINTS_PER_FILTER`]). Passing an empty slice creates or reuses an untagged
+    /// (`domain_hints: []`) static/CIDR-backed `DomainPolicy` Block without polluting hints.
+    pub fn ensure_domain_policy_block_hints<S: AsRef<str>>(
+        &mut self,
+        exe_path: &str,
+        dst_ip: IpAddr,
+        domain_hints: &[S],
+        defense: &dyn ActiveDefenseController,
+    ) -> Result<u64, String> {
         let clean = exe_path.trim().trim_end_matches(['.', ' ']);
         if is_never_suspend_process(exe_path) || is_never_suspend_process(clean) {
             return Err(format!(
@@ -706,14 +720,20 @@ impl WfpRuleManager {
             ));
         }
         let canon_ip = canonical_ip(dst_ip);
+        let mut normalized_hints = Vec::new();
+        for raw in domain_hints {
+            merge_domain_hint(&mut normalized_hints, raw.as_ref());
+        }
         let key = (Self::exe_key(exe_path), Some(canon_ip));
         if let Some(existing) = self.installed.get_mut(&key) {
             if !existing.allow {
                 if let WfpFilterOrigin::DomainPolicy {
-                    ref mut domain_hints,
+                    domain_hints: ref mut cur_hints,
                 } = existing.origin
                 {
-                    merge_domain_hint(domain_hints, domain_hint);
+                    for hint in &normalized_hints {
+                        merge_domain_hint(cur_hints, hint);
+                    }
                 }
                 return Ok(existing.handle);
             }
@@ -724,15 +744,15 @@ impl WfpRuleManager {
 
         self.evict_domain_policy_if_full(defense);
         let handle = defense.add_wfp_app_rule(Path::new(exe_path), Some(canon_ip), false)?;
-        let mut domain_hints = Vec::new();
-        merge_domain_hint(&mut domain_hints, domain_hint);
         self.installed.insert(
             key,
             InstalledWfpFilter {
                 handle,
                 exe_path: exe_path.to_string(),
                 allow: false,
-                origin: WfpFilterOrigin::DomainPolicy { domain_hints },
+                origin: WfpFilterOrigin::DomainPolicy {
+                    domain_hints: normalized_hints,
+                },
             },
         );
         Ok(handle)
@@ -2746,6 +2766,47 @@ mod tests {
                 .failure_summary_for_rules(&[&unrelated_rule])
                 .is_none(),
             "failed DomainPolicy Permit removal must not block unrelated rules on same exe"
+        );
+
+        // 10. `ensure_domain_policy_block_hints` supports empty untagged slices (CIDR-only blocks),
+        //     multi-hint normalization/dedup merging on reuse, and conflicting Permit replacement.
+        let hints_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 90));
+        let h_empty = fw
+            .ensure_domain_policy_block_hints(perm_app, hints_ip, &[] as &[&str], &defense)
+            .expect("install untagged CIDR DomainPolicy block");
+        assert_eq!(
+            fw.filter_origin(perm_app, Some(hints_ip)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: Vec::new(),
+            })
+        );
+        let h_merged = fw
+            .ensure_domain_policy_block_hints(
+                perm_app,
+                hints_ip,
+                &["Blk1.Example.", "blk2.example", "blk1.example", ""],
+                &defense,
+            )
+            .expect("merge multi-domain hints onto existing block");
+        assert_eq!(h_empty, h_merged);
+        assert_eq!(
+            fw.filter_origin(perm_app, Some(hints_ip)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: vec!["blk1.example".to_string(), "blk2.example".to_string()],
+            })
+        );
+        let replace_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 91));
+        fw.ensure_ip_permit_for_domain_rule(perm_app, replace_ip, "ok.example", &defense)
+            .expect("install permit before block override");
+        fw.ensure_domain_policy_block_hints(perm_app, replace_ip, &[] as &[&str], &defense)
+            .expect("replace permit with untagged CIDR block");
+        assert!(fw.has_active_filter(perm_app, Some(replace_ip), false));
+        assert!(!fw.has_active_filter(perm_app, Some(replace_ip), true));
+        assert_eq!(
+            fw.filter_origin(perm_app, Some(replace_ip)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: Vec::new(),
+            })
         );
     }
 }

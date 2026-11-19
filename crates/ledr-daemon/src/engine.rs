@@ -1702,9 +1702,12 @@ impl DaemonEngine {
                                                 } else {
                                                     exe_domains
                                                 };
-                                            let fallback_domain =
-                                                (parse_cidr_target(target_pat).is_err())
-                                                    .then_some(target_pat);
+                                            let fallback_domain = (parse_cidr_target(target_pat)
+                                                .is_err()
+                                                && !matches_network_target(
+                                                    target_pat, dst_ip, None,
+                                                ))
+                                            .then_some(target_pat);
                                             let mut fw = self
                                                 .firewall
                                                 .lock()
@@ -3119,26 +3122,68 @@ impl DaemonEngine {
                         .and_then(|r| r.allowed_target.as_deref())
                         .map(str::trim)
                         .filter(|s| !s.is_empty());
+                    let needs_domain_block = matched_target
+                        .is_some_and(|target_pat| parse_literal_target_ip(target_pat).is_none());
+                    let domain_blocked_hints = if needs_domain_block {
+                        let mut block_hint_candidates =
+                            vec![(norm_query.to_ascii_lowercase(), i64::MAX)];
+                        {
+                            let history = self
+                                .process_dns_history
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            for dom in history.domains_for_exe_ip(&exe_k, ip) {
+                                if !block_hint_candidates
+                                    .iter()
+                                    .any(|(existing, _)| existing.eq_ignore_ascii_case(&dom))
+                                {
+                                    block_hint_candidates.push((dom, 0));
+                                }
+                            }
+                        }
+                        collect_domain_specific_blocked_hints(
+                            &bin_identity,
+                            ip,
+                            &block_hint_candidates,
+                            &rules,
+                        )
+                    } else {
+                        Vec::new()
+                    };
                     let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                     let res = match matched_target {
                         None => fw.ensure_policy_block(exe_path, None, &*self.defense),
                         Some(target_pat) if parse_literal_target_ip(target_pat).is_some() => {
                             fw.ensure_policy_block(exe_path, Some(ip), &*self.defense)
                         }
-                        Some(target_pat) if parse_cidr_target(target_pat).is_ok() => {
-                            let has_domain_block = rules.iter().any(|r| {
-                                matches_network_block_rule(r, &bin_identity, ip, Some(norm_query))
-                                    && !matches_network_block_rule(r, &bin_identity, ip, None)
-                            });
-                            let label = if has_domain_block { norm_query } else { "" };
-                            fw.ensure_domain_policy_block(exe_path, ip, label, &*self.defense)
+                        Some(target_pat)
+                            if parse_cidr_target(target_pat).is_ok()
+                                || matches_network_target(target_pat, ip, None) =>
+                        {
+                            fw.ensure_domain_policy_block_hints(
+                                exe_path,
+                                ip,
+                                &domain_blocked_hints,
+                                &*self.defense,
+                            )
                         }
-                        Some(_) => fw.ensure_domain_policy_block(
-                            exe_path,
-                            ip,
-                            norm_query,
-                            &*self.defense,
-                        ),
+                        Some(_) => {
+                            if !domain_blocked_hints.is_empty() {
+                                fw.ensure_domain_policy_block_hints(
+                                    exe_path,
+                                    ip,
+                                    &domain_blocked_hints,
+                                    &*self.defense,
+                                )
+                            } else {
+                                fw.ensure_domain_policy_block(
+                                    exe_path,
+                                    ip,
+                                    norm_query,
+                                    &*self.defense,
+                                )
+                            }
+                        }
                     };
                     if let Err(err) = res {
                         tracing::debug!(
@@ -3817,7 +3862,9 @@ impl DaemonEngine {
                     list
                 };
                 let fallback_domain = matched_target.filter(|t| {
-                    parse_literal_target_ip(t).is_none() && parse_cidr_target(t).is_err()
+                    parse_literal_target_ip(t).is_none()
+                        && parse_cidr_target(t).is_err()
+                        && !matches_network_target(t, item.dst_ip, None)
                 });
                 let permit_res = {
                     let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
@@ -3912,6 +3959,18 @@ impl DaemonEngine {
                             .and_then(|r| r.allowed_target.as_deref())
                             .map(str::trim)
                             .filter(|s| !s.is_empty());
+                        let domain_blocked_hints = if matched_target
+                            .is_some_and(|target_pat| parse_literal_target_ip(target_pat).is_none())
+                        {
+                            collect_domain_specific_blocked_hints(
+                                &bin_identity,
+                                item.dst_ip,
+                                &cand_domains,
+                                &rules,
+                            )
+                        } else {
+                            Vec::new()
+                        };
                         let wfp_handle = {
                             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                             let active_app = fw.active_app_block(canonical_exe).map(|(h, _)| h);
@@ -3940,12 +3999,38 @@ impl DaemonEngine {
                                     // DNS expires or moves (`BUG_..._0003`).
                                     active_app.ok_or_else(String::new)
                                 }
-                                Some(target_pat) => fw.ensure_domain_policy_block(
-                                    canonical_exe,
-                                    item.dst_ip,
-                                    blocked_dom_from_cand.as_deref().unwrap_or(target_pat),
-                                    &*self.defense,
-                                ),
+                                Some(target_pat)
+                                    if parse_cidr_target(target_pat).is_ok()
+                                        || matches_network_target(
+                                            target_pat,
+                                            item.dst_ip,
+                                            None,
+                                        ) =>
+                                {
+                                    fw.ensure_domain_policy_block_hints(
+                                        canonical_exe,
+                                        item.dst_ip,
+                                        &domain_blocked_hints,
+                                        &*self.defense,
+                                    )
+                                }
+                                Some(target_pat) => {
+                                    if !domain_blocked_hints.is_empty() {
+                                        fw.ensure_domain_policy_block_hints(
+                                            canonical_exe,
+                                            item.dst_ip,
+                                            &domain_blocked_hints,
+                                            &*self.defense,
+                                        )
+                                    } else {
+                                        fw.ensure_domain_policy_block(
+                                            canonical_exe,
+                                            item.dst_ip,
+                                            blocked_dom_from_cand.as_deref().unwrap_or(target_pat),
+                                            &*self.defense,
+                                        )
+                                    }
+                                }
                             };
                             res.ok()
                                 .or(active_app)
@@ -4280,6 +4365,7 @@ impl DaemonEngine {
                             let fallback_domain = matched_target.filter(|t| {
                                 parse_literal_target_ip(t).is_none()
                                     && parse_cidr_target(t).is_err()
+                                    && !matches_network_target(t, dst_ip, None)
                             });
                             let domain_label = effective_domain_hint
                                 .as_deref()
@@ -4318,6 +4404,34 @@ impl DaemonEngine {
                     .and_then(|r| r.allowed_target.as_deref())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
+                let needs_domain_block = matched_target
+                    .is_some_and(|target_pat| parse_literal_target_ip(target_pat).is_none());
+                let domain_blocked_hints = if needs_domain_block {
+                    let mut block_hint_candidates: Vec<(String, i64)> = domain_candidates.to_vec();
+                    let exe_k = WfpRuleManager::exe_key(exe_path);
+                    {
+                        let history = self
+                            .process_dns_history
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        for dom in history.domains_for_exe_ip(&exe_k, dst_ip) {
+                            if !block_hint_candidates
+                                .iter()
+                                .any(|(existing, _)| existing.eq_ignore_ascii_case(&dom))
+                            {
+                                block_hint_candidates.push((dom, 0));
+                            }
+                        }
+                    }
+                    collect_domain_specific_blocked_hints(
+                        &bin_identity,
+                        dst_ip,
+                        &block_hint_candidates,
+                        &rules,
+                    )
+                } else {
+                    Vec::new()
+                };
                 let wfp_handle = {
                     let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                     let res = match matched_target {
@@ -4325,13 +4439,38 @@ impl DaemonEngine {
                         Some(target_pat) if parse_literal_target_ip(target_pat).is_some() => {
                             fw.ensure_policy_block(exe_path, Some(dst_ip), &*self.defense)
                         }
+                        Some(target_pat)
+                            if parse_cidr_target(target_pat).is_ok()
+                                || matches_network_target(target_pat, dst_ip, None) =>
+                        {
+                            fw.ensure_domain_policy_block_hints(
+                                exe_path,
+                                dst_ip,
+                                &domain_blocked_hints,
+                                &*self.defense,
+                            )
+                        }
                         Some(target_pat) => {
-                            let label = effective_domain_hint
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or(target_pat);
-                            fw.ensure_domain_policy_block(exe_path, dst_ip, label, &*self.defense)
+                            if !domain_blocked_hints.is_empty() {
+                                fw.ensure_domain_policy_block_hints(
+                                    exe_path,
+                                    dst_ip,
+                                    &domain_blocked_hints,
+                                    &*self.defense,
+                                )
+                            } else {
+                                let label = effective_domain_hint
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(target_pat);
+                                fw.ensure_domain_policy_block(
+                                    exe_path,
+                                    dst_ip,
+                                    label,
+                                    &*self.defense,
+                                )
+                            }
                         }
                     };
                     match res {
@@ -5961,6 +6100,43 @@ fn select_outbound_decision_for_domains(
         first_decision.unwrap_or(base_decision),
         Some(ordered[0].0.clone()),
     )
+}
+
+/// Collects all distinct normalized domain hints from `candidates` that match at least one
+/// domain-specific `NetworkBlock` rule (excluding rules that already match `dst_ip` statically
+/// with `domain_hint = None`, such as app-wide, literal-IP, CIDR, or wildcard-IP rules).
+fn collect_domain_specific_blocked_hints(
+    bin_identity: &BinaryIdentity,
+    dst_ip: IpAddr,
+    candidates: &[(String, i64)],
+    rules: &[AllowlistRuleRecord],
+) -> Vec<String> {
+    let mut ordered: Vec<(String, i64)> = Vec::with_capacity(candidates.len());
+    for (dom, ts) in candidates {
+        let norm = dom.trim().trim_end_matches('.').to_ascii_lowercase();
+        if norm.is_empty() {
+            continue;
+        }
+        if let Some(existing) = ordered.iter_mut().find(|(d, _)| d == &norm) {
+            existing.1 = existing.1.max(*ts);
+        } else {
+            ordered.push((norm, *ts));
+        }
+    }
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut hints = Vec::new();
+    for (norm, _) in ordered {
+        let matches_domain_block = rules.iter().any(|r| {
+            r.scope == RuleScope::NetworkBlock
+                && matches_network_block_rule(r, bin_identity, dst_ip, Some(norm.as_str()))
+                && !matches_network_block_rule(r, bin_identity, dst_ip, None)
+        });
+        if matches_domain_block && !hints.iter().any(|existing| existing == &norm) {
+            hints.push(norm);
+        }
+    }
+    hints
 }
 
 fn network_allow_rule_identity_matches(
@@ -7953,6 +8129,955 @@ mod tests {
                 latest_len <= 4,
                 "DaemonConfig::dns_history_capacity must bound latest_domain_by_exe (got {latest_len})"
             );
+
+            // Part G, H, I: Dedicated clean engine covering:
+            // - G: `BlockedByRule` DomainPolicy Block hint hygiene (pure CIDR, wildcard IP,
+            //      hybrid CIDR + domain, and multi-domain blocks across `reconcile_persisted_rules_with_baseline`)
+            // - H: `AllowPermanent` on ambiguous (`process_instance_id: None`, `candidate_instance_ids`)
+            //      alerts (multi-hint propagation + exe-level deny-overrides-allow suppression)
+            // - I: `handle_ambiguous_wfp_drop` with multiple fresh domains on a shared IP (CIDR allow
+            //      multi-hint Permit, CIDR allow deny-overrides-allow without sticky IP block and
+            //      overriding an existing live Permit, non-CIDR live Permit suppression / no-Permit
+            //      alert / blocked-candidate non-suppression, and CIDR Block pure vs hybrid hints).
+            let store_g = LedrStore::open_in_memory().expect("open store_g");
+            let defense_g = Arc::new(CountingDefense {
+                next_handle: AtomicU64::new(100),
+                suspends: AtomicUsize::new(0),
+                fail_removes: std::sync::atomic::AtomicBool::new(false),
+            });
+            let engine_g = DaemonEngine::start_with_dependencies(
+                store_g.clone(),
+                SigmaEngine::default(),
+                EarlyPruner::default(),
+                DaemonConfig {
+                    outbound_firewall_enabled: true,
+                    wfp_drop_dns_grace_ms: 500,
+                    dns_history_capacity: 64,
+                    ..DaemonConfig::default()
+                },
+                defense_g.clone(),
+                Arc::new(StubNotifier),
+                Arc::new(FixedShaInspector(sha.clone())),
+            );
+            if let Some(h) = engine_g.worker_handle.lock().await.take() {
+                h.abort();
+                let _ = h.await;
+            }
+
+            let exe_g = r"C:\Temp\block_hygiene_app.exe";
+            let exe_g_key = WfpRuleManager::exe_key(exe_g);
+            let gp1 = ProcessIdentity::new(9701, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: gp1,
+                    parent_pid: 4,
+                    exe_path: exe_g.to_string(),
+                    command_line: exe_g.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(engine_g.has_active_wfp_filter(exe_g, None, false));
+
+            let mk_net_rule = |rule_id: &str, scope: RuleScope, target: &str, created_at_ms: i64| {
+                AllowlistRuleRecord {
+                    rule_id: rule_id.to_string(),
+                    scope,
+                    exe_path_pattern: exe_g.to_string(),
+                    sha256: Some(sha.clone()),
+                    signer_subject: None,
+                    root_thumbprint: None,
+                    allowed_target: Some(target.to_string()),
+                    created_at_ms,
+                    created_by: "test".to_string(),
+                }
+            };
+
+            // Part G1: Pure CIDR NetworkBlock connect (with no DNS and with unblocked domain) and
+            // prematerialize must keep `domain_hints: []` (never tagging CIDR literal or innocent domain).
+            let cidr_no_dns_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+            let cidr_innocent_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11));
+            let cidr_premat_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 12));
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "innocent.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![cidr_innocent_ip],
+                    timestamp_ms: now_ms + 100,
+                },
+                EventLane::HighPriority,
+            );
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-CIDR-PURE",
+                    RuleScope::NetworkBlock,
+                    "203.0.113.0/24",
+                    now_ms + 105,
+                ))
+                .expect("upsert pure CIDR block");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_no_dns_ip), false));
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_innocent_ip), false));
+
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: gp1.pid,
+                    protocol: 6,
+                    dst_ip: cidr_no_dns_ip,
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: now_ms + 110,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(cidr_no_dns_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: Vec::new(),
+                }),
+                "pure CIDR connect without DNS must leave domain_hints empty, not tag CIDR literal"
+            );
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: gp1.pid,
+                    protocol: 6,
+                    dst_ip: cidr_innocent_ip,
+                    dst_port: 443,
+                    domain_hint: Some("innocent.example".to_string()),
+                    timestamp_ms: now_ms + 115,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(cidr_innocent_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: Vec::new(),
+                }),
+                "pure CIDR connect with unblocked domain must leave domain_hints empty"
+            );
+            // When any domain-scoped rule exists (enabling DNS prematerialization), a DnsQuery
+            // for an unblocked domain resolving inside `R-CIDR-PURE` must also materialize an
+            // untagged (`domain_hints: []`) CIDR block rather than tagging `innocent2.example`.
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-UNRELATED-DOM-G1",
+                    RuleScope::NetworkBlock,
+                    "unrelated-g1.example",
+                    now_ms + 118,
+                ))
+                .expect("upsert unrelated domain rule to enable prematerialize");
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "innocent2.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![cidr_premat_ip],
+                    timestamp_ms: now_ms + 120,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(cidr_premat_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: Vec::new(),
+                }),
+                "pure CIDR prematerialize must keep domain_hints empty"
+            );
+            engine_g
+                .delete_policy_rule("R-UNRELATED-DOM-G1")
+                .expect("delete unrelated domain rule");
+            engine_g
+                .delete_policy_rule("R-CIDR-PURE")
+                .expect("delete pure CIDR block");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_no_dns_ip), false));
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_innocent_ip), false));
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_premat_ip), false));
+
+            // Part G2: Hybrid CIDR + domain block where `innocent.example` is newer than
+            // `blk.example`. Connect must tag ONLY `["blk.example"]`, and deleting `R-CIDR-HYBRID`
+            // must keep the block filter active until `R-BLK-HYBRID` is also deleted.
+            let hybrid_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "blk.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![hybrid_ip],
+                    timestamp_ms: now_ms + 200,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "innocent.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![hybrid_ip],
+                    timestamp_ms: now_ms + 300,
+                },
+                EventLane::HighPriority,
+            );
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-CIDR-HYBRID",
+                    RuleScope::NetworkBlock,
+                    "203.0.113.0/24",
+                    now_ms + 305,
+                ))
+                .expect("upsert hybrid CIDR block");
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-BLK-HYBRID",
+                    RuleScope::NetworkBlock,
+                    "blk.example",
+                    now_ms + 306,
+                ))
+                .expect("upsert hybrid domain block");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(hybrid_ip), false));
+
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: gp1.pid,
+                    protocol: 6,
+                    dst_ip: hybrid_ip,
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: now_ms + 310,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(hybrid_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec!["blk.example".to_string()],
+                }),
+                "hybrid CIDR + domain connect must record only domain-specific blocked hint blk.example"
+            );
+            engine_g
+                .delete_policy_rule("R-CIDR-HYBRID")
+                .expect("delete hybrid CIDR block");
+            assert!(
+                engine_g.has_active_wfp_filter(exe_g, Some(hybrid_ip), false),
+                "deleting R-CIDR-HYBRID must keep DomainPolicy Block alive while R-BLK-HYBRID remains"
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(hybrid_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec!["blk.example".to_string()],
+                })
+            );
+            engine_g
+                .delete_policy_rule("R-BLK-HYBRID")
+                .expect("delete hybrid domain block");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(hybrid_ip), false));
+
+            // Part G3: Two domain blocks (`R-BLK-1` + `R-BLK-2`) added after DNS on a shared IP
+            // alongside a newer unblocked domain. Connect must record both `blk1.example` and
+            // `blk2.example` (excluding `innocent-multi.example`), and deleting `R-BLK-1` must
+            // preserve the block filter with `["blk2.example"]`.
+            let multi_blk_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30));
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "blk2.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![multi_blk_ip],
+                    timestamp_ms: now_ms + 400,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "blk1.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![multi_blk_ip],
+                    timestamp_ms: now_ms + 500,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "innocent-multi.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![multi_blk_ip],
+                    timestamp_ms: now_ms + 600,
+                },
+                EventLane::HighPriority,
+            );
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-BLK-1",
+                    RuleScope::NetworkBlock,
+                    "blk1.example",
+                    now_ms + 605,
+                ))
+                .expect("upsert R-BLK-1");
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-BLK-2",
+                    RuleScope::NetworkBlock,
+                    "blk2.example",
+                    now_ms + 606,
+                ))
+                .expect("upsert R-BLK-2");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(multi_blk_ip), false));
+
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: gp1.pid,
+                    protocol: 6,
+                    dst_ip: multi_blk_ip,
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: now_ms + 610,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(multi_blk_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec!["blk1.example".to_string(), "blk2.example".to_string()],
+                }),
+                "multi-domain blocked connect must retain all domain-specific blocked hints and skip innocent domains"
+            );
+            engine_g
+                .delete_policy_rule("R-BLK-1")
+                .expect("delete R-BLK-1");
+            assert!(
+                engine_g.has_active_wfp_filter(exe_g, Some(multi_blk_ip), false),
+                "deleting R-BLK-1 must preserve DomainPolicy Block while R-BLK-2 remains active"
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(multi_blk_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec!["blk2.example".to_string()],
+                })
+            );
+            engine_g
+                .delete_policy_rule("R-BLK-2")
+                .expect("delete R-BLK-2");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(multi_blk_ip), false));
+
+            // Part G4: Wildcard-IP NetworkBlock (`203.0.113.*`) with an unblocked domain must also
+            // stay untagged (`domain_hints: []`) instead of tagging the wildcard or unblocked domain.
+            let wc_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 25));
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "innocent-wc.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![wc_ip],
+                    timestamp_ms: now_ms + 700,
+                },
+                EventLane::HighPriority,
+            );
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-WC-BLK",
+                    RuleScope::NetworkBlock,
+                    "203.0.113.*",
+                    now_ms + 705,
+                ))
+                .expect("upsert wildcard-IP block");
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: gp1.pid,
+                    protocol: 6,
+                    dst_ip: wc_ip,
+                    dst_port: 443,
+                    domain_hint: Some("innocent-wc.example".to_string()),
+                    timestamp_ms: now_ms + 710,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(wc_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: Vec::new(),
+                }),
+                "wildcard-IP static block must not pollute domain_hints"
+            );
+            engine_g
+                .delete_policy_rule("R-WC-BLK")
+                .expect("delete wildcard-IP block");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(wc_ip), false));
+
+            // Part H: `AllowPermanent` on ambiguous (`process_instance_id: None`,
+            // `candidate_instance_ids`) alerts with multiple shared-IP domains.
+            let gp2 = ProcessIdentity::new(9702, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: gp2,
+                    parent_pid: 4,
+                    exe_path: exe_g.to_string(),
+                    command_line: exe_g.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+            let ambig_clean_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 40));
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "ambig-a.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ambig_clean_ip],
+                    timestamp_ms: now_ms + 1_000,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp2.pid,
+                    query_name: "ambig-b.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ambig_clean_ip],
+                    timestamp_ms: now_ms + 1_010,
+                },
+                EventLane::HighPriority,
+            );
+            let ambig_clean_alert = ledr_proto::AlertRecord {
+                alert_id: "AL-P3-46A-AMBIG-CLEAN".to_string(),
+                timestamp_ms: now_ms + 1_020,
+                severity: ledr_proto::AlertSeverity::High,
+                source_layer: "LAYER_3_NETWORK".to_string(),
+                rule_id: "LEDR-NET-HIGH-RISK-PATH".to_string(),
+                title: "Ambiguous multi-domain alert".to_string(),
+                process_instance_id: None,
+                process_suspended: false,
+                status: ledr_proto::AlertStatus::Pending,
+                context_json: serde_json::json!({
+                    "attribution": "app_level_ambiguous",
+                    "candidate_instance_ids": [gp1.instance_id(), gp2.instance_id()],
+                    "exe_path": exe_g,
+                    "dst_ip": ambig_clean_ip.to_string(),
+                    "domain_hint": serde_json::Value::Null,
+                    "sha256": sha,
+                })
+                .to_string(),
+                resolved_at_ms: None,
+            };
+            store_g
+                .record_alert(&ambig_clean_alert)
+                .expect("record ambiguous clean alert");
+            engine_g
+                .resolve_alert(
+                    &ambig_clean_alert.alert_id,
+                    ledr_proto::AlertDecision::AllowPermanent {
+                        use_signer_if_available: false,
+                        allow_dest: Some("ambig-a.example".to_string()),
+                    },
+                )
+                .expect("AllowPermanent on ambiguous alert");
+            assert!(engine_g.has_active_wfp_filter(exe_g, Some(ambig_clean_ip), true));
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(ambig_clean_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec![
+                        "ambig-a.example".to_string(),
+                        "ambig-b.example".to_string(),
+                    ],
+                }),
+                "AllowPermanent on ambiguous alert must propagate all candidate_instance_ids shared-IP hints"
+            );
+            // Blocking the sibling hint `ambig-b.example` must immediately revoke the Permit.
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-BLK-AMBIG-B",
+                    RuleScope::NetworkBlock,
+                    "ambig-b.example",
+                    now_ms + 1_030,
+                ))
+                .expect("upsert block for ambig-b.example");
+            assert!(
+                !engine_g.has_active_wfp_filter(exe_g, Some(ambig_clean_ip), true),
+                "blocking sibling candidate domain must revoke ambiguous AllowPermanent Permit"
+            );
+            engine_g
+                .delete_policy_rule("R-BLK-AMBIG-B")
+                .expect("cleanup R-BLK-AMBIG-B");
+
+            // Part H2: Exe-level deny-overrides-allow suppression on an ambiguous alert when an
+            // exited third instance (`gp3`, absent from `candidate_instance_ids`) resolved a
+            // blocked domain on the same shared IP.
+            let ambig_deny_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 41));
+            let gp3 = ProcessIdentity::new(9703, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: gp3,
+                    parent_pid: 4,
+                    exe_path: exe_g.to_string(),
+                    command_line: exe_g.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp3.pid,
+                    query_name: "ambig-evil.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ambig_deny_ip],
+                    timestamp_ms: now_ms + 1_100,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::ProcessStop {
+                    pid: gp3.pid,
+                    exit_code: 0,
+                    exit_time_100ns: ((now_ms + 1_110) as u64 + 11_644_473_600_000) * 10_000,
+                },
+                EventLane::HighPriority,
+            );
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-BLK-AMBIG-EVIL",
+                    RuleScope::NetworkBlock,
+                    "ambig-evil.example",
+                    now_ms + 1_115,
+                ))
+                .expect("upsert R-BLK-AMBIG-EVIL");
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "ambig-good1.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ambig_deny_ip],
+                    timestamp_ms: now_ms + 1_120,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp2.pid,
+                    query_name: "ambig-good2.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ambig_deny_ip],
+                    timestamp_ms: now_ms + 1_130,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(ambig_deny_ip), false));
+            let ambig_deny_alert = ledr_proto::AlertRecord {
+                alert_id: "AL-P3-46A-AMBIG-DENY".to_string(),
+                timestamp_ms: now_ms + 1_140,
+                severity: ledr_proto::AlertSeverity::High,
+                source_layer: "LAYER_3_NETWORK".to_string(),
+                rule_id: "LEDR-NET-HIGH-RISK-PATH".to_string(),
+                title: "Ambiguous deny-override alert".to_string(),
+                process_instance_id: None,
+                process_suspended: false,
+                status: ledr_proto::AlertStatus::Pending,
+                context_json: serde_json::json!({
+                    "attribution": "app_level_ambiguous",
+                    "candidate_instance_ids": [gp1.instance_id(), gp2.instance_id()],
+                    "exe_path": exe_g,
+                    "dst_ip": ambig_deny_ip.to_string(),
+                    "domain_hint": serde_json::Value::Null,
+                    "sha256": sha,
+                })
+                .to_string(),
+                resolved_at_ms: None,
+            };
+            store_g
+                .record_alert(&ambig_deny_alert)
+                .expect("record ambiguous deny alert");
+            engine_g
+                .resolve_alert(
+                    &ambig_deny_alert.alert_id,
+                    ledr_proto::AlertDecision::AllowPermanent {
+                        use_signer_if_available: false,
+                        allow_dest: Some("ambig-good1.example".to_string()),
+                    },
+                )
+                .expect("AllowPermanent succeeds saving rule even when IP Permit is suppressed");
+            assert!(
+                !engine_g.has_active_wfp_filter(exe_g, Some(ambig_deny_ip), true),
+                "ambiguous AllowPermanent must suppress IP Permit when exe-wide DNS history has blocked ambig-evil.example"
+            );
+            engine_g
+                .delete_policy_rule("R-BLK-AMBIG-EVIL")
+                .expect("cleanup R-BLK-AMBIG-EVIL");
+
+            // Part I: `handle_ambiguous_wfp_drop` with two live instances (`gp1`, `gp2`) and
+            // multiple fresh shared-IP domains (timestamps >= now_ms + 3_000 so exited `gp3` is
+            // outside the 1s exit window).
+            let cidr_allow_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 50));
+            let cidr_deny_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 51));
+            let cidr_override_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 52));
+            for (pid, dom, ip, ts) in [
+                (gp1.pid, "cdn-1.example", cidr_allow_ip, now_ms + 3_000),
+                (gp2.pid, "cdn-2.example", cidr_allow_ip, now_ms + 3_010),
+                (gp1.pid, "cdn-ok.example", cidr_deny_ip, now_ms + 3_020),
+                (gp2.pid, "i2-evil.example", cidr_deny_ip, now_ms + 3_015),
+                (gp1.pid, "ov-blk1.example", cidr_override_ip, now_ms + 3_030),
+                (gp2.pid, "ov-blk2.example", cidr_override_ip, now_ms + 3_035),
+            ] {
+                let _ = engine_g.process_event_with_lane(
+                    &SensorEvent::DnsQuery {
+                        pid,
+                        query_name: dom.to_string(),
+                        query_type: 1,
+                        resolved_ips: vec![ip],
+                        timestamp_ms: ts,
+                    },
+                    EventLane::HighPriority,
+                );
+            }
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-CIDR-ALLOW-I",
+                    RuleScope::NetworkAllow,
+                    "198.51.100.48/29",
+                    now_ms + 3_040,
+                ))
+                .expect("upsert CIDR allow for Part I");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_allow_ip), true));
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_deny_ip), true));
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_override_ip), true));
+
+            let has_alert_for_ip = |ip: IpAddr, rule_id: Option<&str>| -> bool {
+                let ip_s = ip.to_string();
+                store_g
+                    .list_alerts(None, 100)
+                    .unwrap()
+                    .into_iter()
+                    .any(|a| {
+                        rule_id.is_none_or(|rid| a.rule_id == rid)
+                            && serde_json::from_str::<serde_json::Value>(&a.context_json)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("dst_ip")
+                                        .and_then(|x| x.as_str())
+                                        .map(|s| s == ip_s)
+                                })
+                                .unwrap_or(false)
+                    })
+            };
+            let mk_drop = |dst_ip: IpAddr, timestamp_ms: i64| QueuedWfpDrop {
+                exe_path: exe_g.to_string(),
+                exe_key: exe_g_key.clone(),
+                dst_ip,
+                dst_port: 443,
+                protocol: 6,
+                timestamp_ms,
+                os_filter_id: 1,
+            };
+
+            // I1: CIDR allow materializes Permit carrying ALL fresh candidate domain hints.
+            engine_g.handle_wfp_drop_event_now(&mk_drop(cidr_allow_ip, now_ms + 3_050));
+            assert!(
+                !has_alert_for_ip(cidr_allow_ip, None),
+                "CIDR-allowed ambiguous drop must not emit an alert"
+            );
+            assert!(engine_g.has_active_wfp_filter(exe_g, Some(cidr_allow_ip), true));
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(cidr_allow_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec!["cdn-2.example".to_string(), "cdn-1.example".to_string()],
+                }),
+                "handle_ambiguous_wfp_drop CIDR allow must propagate all fresh candidate domain hints"
+            );
+
+            // I2a: CIDR allow overridden by fresh blocked candidate (`i2-evil.example` older than
+            // `cdn-ok.example` but still < 60s) under active app block: denies Permit, avoids
+            // pinning a sticky IP Block (`BUG_..._0003`), and emits `LEDR-NET-POLICY-BLOCK`.
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-BLK-I2",
+                    RuleScope::NetworkBlock,
+                    "i2-evil.example",
+                    now_ms + 3_055,
+                ))
+                .expect("upsert R-BLK-I2");
+            engine_g.handle_wfp_drop_event_now(&mk_drop(cidr_deny_ip, now_ms + 3_060));
+            assert!(
+                !engine_g.has_active_wfp_filter(exe_g, Some(cidr_deny_ip), true),
+                "fresh blocked candidate must suppress CIDR allow Permit (deny-overrides-allow)"
+            );
+            assert!(
+                !engine_g.has_active_wfp_filter(exe_g, Some(cidr_deny_ip), false),
+                "ambiguous drop under active app block with no conflicting IP Permit must not pin sticky IP Block"
+            );
+            assert!(has_alert_for_ip(cidr_deny_ip, Some("LEDR-NET-POLICY-BLOCK")));
+
+            // I2b: When a conflicting live IP Permit DOES exist on `cidr_override_ip`, ambiguous
+            // drop with TWO fresh blocked candidates replaces the Permit with a `DomainPolicy`
+            // Block carrying BOTH blocked hints so deleting one rule keeps the block alive.
+            engine_g.handle_wfp_drop_event_now(&mk_drop(cidr_override_ip, now_ms + 3_065));
+            assert!(engine_g.has_active_wfp_filter(exe_g, Some(cidr_override_ip), true));
+            store_g
+                .upsert_rule(&mk_net_rule(
+                    "R-OV-BLK1",
+                    RuleScope::NetworkBlock,
+                    "ov-blk1.example",
+                    now_ms + 3_066,
+                ))
+                .expect("seed R-OV-BLK1");
+            store_g
+                .upsert_rule(&mk_net_rule(
+                    "R-OV-BLK2",
+                    RuleScope::NetworkBlock,
+                    "ov-blk2.example",
+                    now_ms + 3_067,
+                ))
+                .expect("seed R-OV-BLK2");
+            engine_g.handle_wfp_drop_event_now(&mk_drop(cidr_override_ip, now_ms + 3_070));
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_override_ip), true));
+            assert!(engine_g.has_active_wfp_filter(exe_g, Some(cidr_override_ip), false));
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(cidr_override_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec![
+                        "ov-blk2.example".to_string(),
+                        "ov-blk1.example".to_string(),
+                    ],
+                }),
+                "ambiguous drop replacing live Permit must merge all fresh domain-specific blocked hints"
+            );
+            engine_g
+                .delete_policy_rule("R-OV-BLK1")
+                .expect("delete R-OV-BLK1");
+            assert!(
+                engine_g.has_active_wfp_filter(exe_g, Some(cidr_override_ip), false),
+                "deleting R-OV-BLK1 must keep block alive for ov-blk2.example"
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(cidr_override_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec!["ov-blk2.example".to_string()],
+                })
+            );
+            engine_g
+                .delete_policy_rule("R-OV-BLK2")
+                .expect("delete R-OV-BLK2");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_override_ip), false));
+
+            // I3: Non-CIDR ambiguous drop:
+            // - Live IP Permit + fresh allowed candidate alongside newer unallowed candidate
+            //   suppresses false ambiguous drop alert.
+            // - Without a live IP Permit, non-CIDR domain allow does NOT materialize a Permit and
+            //   emits an ambiguous drop alert.
+            // - With a live IP Permit AND a fresh blocked candidate, deny-overrides-allow prevents
+            //   live-Permit suppression and emits an alert.
+            let non_cidr_live_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 60));
+            let non_cidr_noperm_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 61));
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-ALLOW-I3",
+                    RuleScope::NetworkAllow,
+                    "i3-allow.example",
+                    now_ms + 3_090,
+                ))
+                .expect("upsert R-ALLOW-I3");
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "i3-allow.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![non_cidr_live_ip],
+                    timestamp_ms: now_ms + 3_100,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp2.pid,
+                    query_name: "i3-other.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![non_cidr_live_ip],
+                    timestamp_ms: now_ms + 3_110,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(engine_g.has_active_wfp_filter(exe_g, Some(non_cidr_live_ip), true));
+            engine_g.handle_wfp_drop_event_now(&mk_drop(non_cidr_live_ip, now_ms + 3_120));
+            assert!(
+                !has_alert_for_ip(non_cidr_live_ip, None),
+                "non-CIDR live IP Permit + allowed candidate must suppress false ambiguous drop alert"
+            );
+
+            let _ = engine_g.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: gp1.pid,
+                    query_name: "i3-noperm.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![non_cidr_noperm_ip],
+                    timestamp_ms: now_ms + 3_130,
+                },
+                EventLane::HighPriority,
+            );
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-ALLOW-I3B",
+                    RuleScope::NetworkAllow,
+                    "i3-noperm.example",
+                    now_ms + 3_135,
+                ))
+                .expect("upsert R-ALLOW-I3B");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(non_cidr_noperm_ip), true));
+            engine_g.handle_wfp_drop_event_now(&mk_drop(non_cidr_noperm_ip, now_ms + 3_140));
+            assert!(
+                !engine_g.has_active_wfp_filter(exe_g, Some(non_cidr_noperm_ip), true),
+                "non-CIDR ambiguous drop without live Permit must not install a Permit"
+            );
+            assert!(
+                has_alert_for_ip(non_cidr_noperm_ip, Some("LEDR-NET-HIGH-RISK-PATH")),
+                "non-CIDR ambiguous drop without live Permit must emit ambiguous alert"
+            );
+
+            // Seed a block rule for `i3-other.example` directly (leaving the live Permit intact)
+            // to verify `cand_decision == BlockedByRule` disables live-Permit suppression.
+            store_g
+                .upsert_rule(&mk_net_rule(
+                    "R-BLK-I3-OTHER",
+                    RuleScope::NetworkBlock,
+                    "i3-other.example",
+                    now_ms + 3_145,
+                ))
+                .expect("seed R-BLK-I3-OTHER");
+            engine_g.handle_wfp_drop_event_now(&mk_drop(non_cidr_live_ip, now_ms + 3_150));
+            assert!(
+                has_alert_for_ip(non_cidr_live_ip, Some("LEDR-NET-HIGH-RISK-PATH")),
+                "fresh blocked candidate must prevent non-CIDR live-Permit suppression"
+            );
+
+            // I4: Ambiguous drop hitting a CIDR NetworkBlock: pure CIDR keeps `domain_hints: []`,
+            // while hybrid CIDR + fresh domain block retains `["blk-ah.example"]` across CIDR deletion.
+            let ambig_cidr_pure_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 80));
+            let ambig_cidr_hybrid_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 81));
+            for (pid, dom, ip, ts) in [
+                (gp1.pid, "innocent-ap.example", ambig_cidr_pure_ip, now_ms + 3_200),
+                (gp1.pid, "innocent-ah.example", ambig_cidr_hybrid_ip, now_ms + 3_220),
+                (gp2.pid, "blk-ah.example", ambig_cidr_hybrid_ip, now_ms + 3_210),
+            ] {
+                let _ = engine_g.process_event_with_lane(
+                    &SensorEvent::DnsQuery {
+                        pid,
+                        query_name: dom.to_string(),
+                        query_type: 1,
+                        resolved_ips: vec![ip],
+                        timestamp_ms: ts,
+                    },
+                    EventLane::HighPriority,
+                );
+            }
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-AMBIG-CIDR-BLK",
+                    RuleScope::NetworkBlock,
+                    "203.0.113.80/30",
+                    now_ms + 3_230,
+                ))
+                .expect("upsert R-AMBIG-CIDR-BLK");
+            engine_g
+                .upsert_policy_rule(&mk_net_rule(
+                    "R-AMBIG-DOM-BLK",
+                    RuleScope::NetworkBlock,
+                    "blk-ah.example",
+                    now_ms + 3_231,
+                ))
+                .expect("upsert R-AMBIG-DOM-BLK");
+            engine_g.handle_wfp_drop_event_now(&mk_drop(ambig_cidr_pure_ip, now_ms + 3_250));
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(ambig_cidr_pure_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: Vec::new(),
+                }),
+                "ambiguous pure CIDR block must leave domain_hints empty"
+            );
+            engine_g.handle_wfp_drop_event_now(&mk_drop(ambig_cidr_hybrid_ip, now_ms + 3_250));
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(ambig_cidr_hybrid_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec!["blk-ah.example".to_string()],
+                }),
+                "ambiguous hybrid CIDR + domain block must retain fresh domain-specific blocked hint"
+            );
+            engine_g
+                .delete_policy_rule("R-AMBIG-CIDR-BLK")
+                .expect("delete R-AMBIG-CIDR-BLK");
+            assert!(
+                !engine_g.has_active_wfp_filter(exe_g, Some(ambig_cidr_pure_ip), false),
+                "pure CIDR block must be removed when R-AMBIG-CIDR-BLK is deleted"
+            );
+            assert!(
+                engine_g.has_active_wfp_filter(exe_g, Some(ambig_cidr_hybrid_ip), false),
+                "hybrid block must survive R-AMBIG-CIDR-BLK deletion while R-AMBIG-DOM-BLK remains"
+            );
+            assert_eq!(
+                engine_g
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .filter_origin(exe_g, Some(ambig_cidr_hybrid_ip)),
+                Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
+                    domain_hints: vec!["blk-ah.example".to_string()],
+                })
+            );
+            engine_g
+                .delete_policy_rule("R-AMBIG-DOM-BLK")
+                .expect("delete R-AMBIG-DOM-BLK");
+            assert!(!engine_g.has_active_wfp_filter(exe_g, Some(ambig_cidr_hybrid_ip), false));
         });
     }
 

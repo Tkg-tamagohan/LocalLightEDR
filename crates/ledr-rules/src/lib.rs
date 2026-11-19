@@ -1795,7 +1795,6 @@ brand-new.org
 
     #[test]
     fn rules_p3_12_async_winhttp_concurrent_cancel_stress() {
-        use std::io::Read;
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -1813,12 +1812,8 @@ brand-new.org
             while !stop_bg.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut s, _)) => {
-                        let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
-                        let mut buf = [0u8; 512];
-                        if let Ok(n) = s.read(&mut buf) {
-                            if buf[..n].starts_with(b"GET ") {
-                                reqs_bg.fetch_add(1, Ordering::AcqRel);
-                            }
+                        if read_http_get_prefix(&mut s, &stop_bg) {
+                            reqs_bg.fetch_add(1, Ordering::AcqRel);
                         }
                         held.push(s);
                     }
@@ -1895,5 +1890,62 @@ brand-new.org
 
         stop.store(true, Ordering::Release);
         srv.join().expect("join stress server");
+    }
+
+    fn read_http_get_prefix(
+        s: &mut std::net::TcpStream,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> bool {
+        use std::io::Read;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let _ = s.set_nonblocking(false);
+        let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+        let mut buf = [0u8; 512];
+        let mut total = 0usize;
+        let read_deadline = Instant::now() + Duration::from_millis(250);
+        while total < 4 && Instant::now() < read_deadline && !stop.load(Ordering::Acquire) {
+            match s.read(&mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(_) => break,
+            }
+        }
+        total >= 4 && &buf[..4] == b"GET "
+    }
+
+    #[test]
+    fn rules_p3_13_split_http_get_prefix_detected() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind split listener");
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            read_http_get_prefix(&mut s, &stop_bg)
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client.write_all(b"G").expect("send G");
+        client.flush().expect("flush G");
+        std::thread::sleep(Duration::from_millis(20));
+        client.write_all(b"ET /stress.txt HTTP/1.1\r\n\r\n").expect("send ET");
+        client.flush().expect("flush ET");
+
+        assert!(srv.join().expect("join split server"));
     }
 }

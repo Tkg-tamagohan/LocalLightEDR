@@ -53,6 +53,7 @@ const WFP_DROP_DEDUP_WINDOW_MS: i64 = 250;
 const DEFAULT_WFP_DROP_DNS_GRACE_MS: u64 = 300;
 const MAX_PENDING_WFP_DROPS: usize = 512;
 const APP_WFP_ALERT_DEDUP_CAPACITY: usize = 512;
+const AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS: i64 = 60_000;
 
 /// Abstraction for inspecting binary SHA-256 and Authenticode metadata (`L-04`).
 pub trait BinaryInspector: Send + Sync {
@@ -441,6 +442,10 @@ pub struct DaemonEngine {
     /// observe "another unresolved suspended alert exists" and leave the process
     /// suspended forever (`BUG_0002`).
     resolve_lock: Mutex<()>,
+    /// Serializes SQLite network rule mutations + baseline WFP reconciliation across
+    /// `upsert_policy_rule`, `delete_policy_rule`, and `resolve_alert_with_outcome`
+    /// (`resolve_lock -> policy_lock -> store/firewall`).
+    policy_lock: Mutex<()>,
     prior_running_candidates: Mutex<Vec<String>>,
     sender: TwoLaneSender,
     started_at: Instant,
@@ -449,7 +454,7 @@ pub struct DaemonEngine {
     pruned_events: AtomicU64,
     alerts_emitted: AtomicU64,
     fail_record_alert_for_test: AtomicBool,
-    worker_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    worker_handle: tokio::sync::Mutex<Option<JoinHandle<Result<(), StoreError>>>>,
 }
 
 impl DaemonEngine {
@@ -573,6 +578,7 @@ impl DaemonEngine {
             nrd_in_flight: Arc::new(AtomicBool::new(false)),
             nrd_thread_handle: Mutex::new(None),
             resolve_lock: Mutex::new(()),
+            policy_lock: Mutex::new(()),
             prior_running_candidates: Mutex::new(prior_running_candidates),
             sender,
             started_at: Instant::now(),
@@ -598,7 +604,7 @@ impl DaemonEngine {
 
         let worker_engine = Arc::clone(&engine);
         let handle = tokio::spawn(async move {
-            worker_engine.run_pipeline(receiver, wfp_drop_rx).await;
+            worker_engine.run_pipeline(receiver, wfp_drop_rx).await
         });
 
         if let Ok(mut slot) = engine.worker_handle.try_lock() {
@@ -771,6 +777,13 @@ impl DaemonEngine {
     /// Reconciles live WFP dynamic filters against persisted `NetworkBlock` and `NetworkAllow`
     /// rules in SQLite with deny-overrides-allow precedence (`L-03`, `L-04`).
     pub fn deploy_persisted_network_rules(&self) -> WfpReconcileReport {
+        self.deploy_persisted_network_rules_with_baseline(None)
+    }
+
+    fn deploy_persisted_network_rules_with_baseline(
+        &self,
+        prev_rules: Option<&[AllowlistRuleRecord]>,
+    ) -> WfpReconcileReport {
         if !self.config.outbound_firewall_enabled {
             self.outbound_classifier.set_has_domain_rules(false);
             return WfpReconcileReport::default();
@@ -786,7 +799,9 @@ impl DaemonEngine {
                         remote_ip: None,
                         is_remove: false,
                         is_startup_preemptive: false,
+                        newly_required: false,
                         source_rule_ids: Vec::new(),
+                        domain_hint: None,
                         error: format!("failed to load persisted network rules: {err}"),
                     }],
                     ..Default::default()
@@ -798,10 +813,11 @@ impl DaemonEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .active_exe_paths();
-        let (mut report, has_domain_rules) = {
+        let (report, has_domain_rules) = {
             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-            let mut rep = fw.reconcile_persisted_rules(
+            let mut rep = fw.reconcile_persisted_rules_with_baseline(
                 &rules,
+                prev_rules,
                 &active_exes,
                 &*self.inspector,
                 &*self.defense,
@@ -813,18 +829,33 @@ impl DaemonEngine {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 for (exe_k, exe_path, ip) in unnamed {
-                    let doms = dns_hist.domains_for_ip(&ip);
+                    if classify_outbound_risk(&exe_path) == OutboundRiskClass::ProtectedOs {
+                        continue;
+                    }
+                    let doms = dns_hist.domains_for_exe_ip(&exe_k, ip);
                     if doms.is_empty() {
                         continue;
                     }
                     let identity = self.inspector.inspect(&exe_path);
-                    let blocked = doms.iter().any(|dom| {
-                        matches!(
-                            evaluate_outbound_policy(&identity, ip, Some(dom), &rules),
-                            OutboundDecision::BlockedByRule { .. }
-                        )
-                    });
-                    if blocked {
+                    let mut blocking_rule_ids: Vec<String> = Vec::new();
+                    let mut matched_doms: Vec<String> = Vec::new();
+                    for dom in &doms {
+                        let mut dom_blocked = false;
+                        for rule in &rules {
+                            if rule.scope == RuleScope::NetworkBlock
+                                && matches_network_block_rule(rule, &identity, ip, Some(dom))
+                            {
+                                dom_blocked = true;
+                                if !blocking_rule_ids.contains(&rule.rule_id) {
+                                    blocking_rule_ids.push(rule.rule_id.clone());
+                                }
+                            }
+                        }
+                        if dom_blocked {
+                            matched_doms.push(dom.clone());
+                        }
+                    }
+                    if !blocking_rule_ids.is_empty() {
                         match fw.remove_domain_policy_permit(&exe_path, ip, &*self.defense) {
                             Ok(Some(snap)) => {
                                 rep.removed += 1;
@@ -838,7 +869,9 @@ impl DaemonEngine {
                                     remote_ip: Some(ip),
                                     is_remove: true,
                                     is_startup_preemptive: false,
-                                    source_rule_ids: Vec::new(),
+                                    newly_required: false,
+                                    source_rule_ids: blocking_rule_ids,
+                                    domain_hint: matched_doms.into_iter().next(),
                                     error: err,
                                 });
                             }
@@ -848,7 +881,6 @@ impl DaemonEngine {
             }
             (rep, fw.has_domain_network_rules())
         };
-        let _ = &mut report;
         self.outbound_classifier
             .set_has_domain_rules(has_domain_rules);
         report
@@ -880,15 +912,20 @@ impl DaemonEngine {
         rule: &AllowlistRuleRecord,
     ) -> Result<WfpReconcileReport, PolicyRuleError> {
         validate_policy_rule(rule).map_err(PolicyRuleError::Invalid)?;
+        let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
         let previous = self.store.get_rule(&rule.rule_id)?;
         let previous_was_network = previous
             .as_ref()
             .is_some_and(|r| matches!(r.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow));
         let new_is_network = matches!(rule.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow);
+        let prev_network_rules =
+            (self.config.outbound_firewall_enabled && (previous_was_network || new_is_network))
+                .then(|| self.store.list_network_rules())
+                .transpose()?;
 
         self.store.upsert_rule(rule)?;
-        if self.config.outbound_firewall_enabled && (previous_was_network || new_is_network) {
-            let report = self.deploy_persisted_network_rules();
+        if let Some(ref prev_rules) = prev_network_rules {
+            let report = self.deploy_persisted_network_rules_with_baseline(Some(prev_rules));
             let mut affected: Vec<&AllowlistRuleRecord> = Vec::with_capacity(2);
             if new_is_network {
                 affected.push(rule);
@@ -953,45 +990,48 @@ impl DaemonEngine {
         &self,
         rule_id: &str,
     ) -> Result<(bool, WfpReconcileReport), PolicyRuleError> {
+        let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
         let existing = self.store.get_rule(rule_id)?;
+        let existing_is_network = existing.as_ref().is_some_and(|r| {
+            matches!(r.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow)
+        });
+        let prev_network_rules = (self.config.outbound_firewall_enabled && existing_is_network)
+            .then(|| self.store.list_network_rules())
+            .transpose()?;
         let deleted = self.store.delete_rule(rule_id)?;
-        if deleted
-            && self.config.outbound_firewall_enabled
-            && existing.as_ref().is_some_and(|r| {
-                matches!(r.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow)
-            })
-        {
-            let report = self.deploy_persisted_network_rules();
-            let err_summary = existing
-                .as_ref()
-                .and_then(|prev| report.failure_summary_for_rules(&[prev]));
-            if let Some(err_summary) = err_summary {
-                if let Some(ref prev) = existing {
-                    if let Err(comp_err) = self.store.upsert_rule(prev) {
-                        tracing::warn!(
-                            rule_id = %rule_id,
-                            error = %comp_err,
-                            "failed compensating SQLite after WFP sync failure in delete_policy_rule"
-                        );
-                    } else {
-                        self.compensate_failed_wfp_report(&report);
+        if deleted {
+            if let Some(ref prev_rules) = prev_network_rules {
+                let report = self.deploy_persisted_network_rules_with_baseline(Some(prev_rules));
+                let err_summary = existing
+                    .as_ref()
+                    .and_then(|prev| report.failure_summary_for_rules(&[prev]));
+                if let Some(err_summary) = err_summary {
+                    if let Some(ref prev) = existing {
+                        if let Err(comp_err) = self.store.upsert_rule(prev) {
+                            tracing::warn!(
+                                rule_id = %rule_id,
+                                error = %comp_err,
+                                "failed compensating SQLite after WFP sync failure in delete_policy_rule"
+                            );
+                        } else {
+                            self.compensate_failed_wfp_report(&report);
+                        }
                     }
+                    return Err(PolicyRuleError::FirewallSync(err_summary));
                 }
-                return Err(PolicyRuleError::FirewallSync(err_summary));
+                self.invalidate_non_protected_steady_pids();
+                let active_exes = self
+                    .process_table
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .active_exe_paths();
+                for exe in active_exes {
+                    self.maybe_apply_preemptive_wfp_block(&exe);
+                }
+                return Ok((true, report));
             }
-            self.invalidate_non_protected_steady_pids();
-            let active_exes = self
-                .process_table
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .active_exe_paths();
-            for exe in active_exes {
-                self.maybe_apply_preemptive_wfp_block(&exe);
-            }
-            Ok((true, report))
-        } else {
-            Ok((deleted, WfpReconcileReport::default()))
         }
+        Ok((deleted, WfpReconcileReport::default()))
     }
 
     /// Returns the number of live WFP dynamic rule handles currently tracked by the daemon.
@@ -1375,12 +1415,20 @@ impl DaemonEngine {
                     created_by: "user_triage".to_string(),
                 };
 
-                self.store
-                    .upsert_rule(&rule)
-                    .map_err(|err| format!("failed to store permanent allowlist rule: {err}"))?;
-                saved_rule_id = Some(rule.rule_id.clone());
+                let prev_network_rules = {
+                    let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let prev_rules = (scope == RuleScope::NetworkAllow
+                        && self.config.outbound_firewall_enabled)
+                        .then(|| self.store.list_network_rules().unwrap_or_default());
+                    self.store
+                        .upsert_rule(&rule)
+                        .map_err(|err| format!("failed to store permanent allowlist rule: {err}"))?;
+                    saved_rule_id = Some(rule.rule_id.clone());
+                    prev_rules
+                };
 
                 if scope == RuleScope::NetworkAllow && self.config.outbound_firewall_enabled {
+                    let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
                     let release_res = {
                         let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                         fw.release_transient_containment_for_alert(
@@ -1417,7 +1465,9 @@ impl DaemonEngine {
 
                     let sync_res =
                         (|| -> Result<WfpReconcileReport, Box<(String, WfpReconcileReport)>> {
-                            let report = self.deploy_persisted_network_rules();
+                            let report = self.deploy_persisted_network_rules_with_baseline(
+                                prev_network_rules.as_deref(),
+                            );
                             if let Some(summary) = report.failure_summary_for_rules(&[&rule]) {
                                 return Err(Box::new((
                                     format!(
@@ -1531,18 +1581,23 @@ impl DaemonEngine {
                         Ok(())
                     })();
                     if let Err(err) = resume_result {
-                        self.rollback_saved_rule(&rule.rule_id);
-                        if scope == RuleScope::NetworkAllow && self.config.outbound_firewall_enabled
                         {
-                            // Reconcile first so any newly added PersistedPolicy/DomainPolicy
-                            // Permit is removed, then restore any promoted/removed filter state and
-                            // re-arm any Preemptive Block BEFORE rebinding `alert_id`.
-                            if let Some(rep) = applied_wfp_report.take() {
-                                self.compensate_failed_wfp_report(&rep);
-                            } else {
-                                let _ = self.deploy_persisted_network_rules();
+                            let _policy_guard =
+                                self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+                            self.rollback_saved_rule(&rule.rule_id);
+                            if scope == RuleScope::NetworkAllow
+                                && self.config.outbound_firewall_enabled
+                            {
+                                // Reconcile first so any newly added PersistedPolicy/DomainPolicy
+                                // Permit is removed, then restore any promoted/removed filter state and
+                                // re-arm any Preemptive Block BEFORE rebinding `alert_id`.
+                                if let Some(rep) = applied_wfp_report.take() {
+                                    self.compensate_failed_wfp_report(&rep);
+                                } else {
+                                    let _ = self.deploy_persisted_network_rules();
+                                }
+                                self.maybe_apply_preemptive_wfp_block(&exe);
                             }
-                            self.maybe_apply_preemptive_wfp_block(&exe);
                         }
                         self.rollback_allow_once_wfp(
                             alert_id,
@@ -1628,12 +1683,20 @@ impl DaemonEngine {
                             created_at_ms: now_ms,
                             created_by: "user_quarantine".to_string(),
                         };
+                        let _policy_guard =
+                            self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let prev_network_rules = self
+                            .config
+                            .outbound_firewall_enabled
+                            .then(|| self.store.list_network_rules().unwrap_or_default());
                         self.store
                             .upsert_rule(&block_rule)
                             .map_err(|err| format!("failed to store block rule: {err}"))?;
                         saved_rule_id = Some(block_rule.rule_id.clone());
                         if self.config.outbound_firewall_enabled {
-                            let report = self.deploy_persisted_network_rules();
+                            let report = self.deploy_persisted_network_rules_with_baseline(
+                                prev_network_rules.as_deref(),
+                            );
                             if let Some(summary) = report.failure_summary_for_rules(&[&block_rule]) {
                                 self.rollback_saved_rule(&block_rule.rule_id);
                                 self.compensate_failed_wfp_report(&report);
@@ -1691,6 +1754,7 @@ impl DaemonEngine {
             });
         if let Err(err) = status_result {
             if let Some(rule_id) = saved_rule_id.take() {
+                let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
                 self.rollback_saved_rule(&rule_id);
                 if self.config.outbound_firewall_enabled {
                     if let Some(rep) = applied_wfp_report.take() {
@@ -2026,35 +2090,14 @@ impl DaemonEngine {
     /// threads, flushes SQLite batches, and runs `PRAGMA wal_checkpoint(TRUNCATE)` within
     /// `SHUTDOWN_FLUSH_TIMEOUT_MS` (`3,000 ms`, `AUTO-10`).
     pub async fn shutdown_and_flush(&self) -> Result<(), anyhow::Error> {
-        let shutdown_started = Instant::now();
         let total_budget = Duration::from_millis(self.config.shutdown_flush_timeout_ms.max(1));
-        let checkpoint_reserve = Duration::from_millis(200).min(total_budget / 3);
-        let drain_budget = total_budget.saturating_sub(checkpoint_reserve);
+        let deadline = tokio::time::Instant::now() + total_budget;
         self.nrd_cancel.cancel();
         self.store.request_shutdown();
         self.sender.close();
 
-        let handle = {
-            let mut guard = self.worker_handle.lock().await;
-            guard.take()
-        };
-
-        if let Some(h) = handle {
-            match tokio::time::timeout(drain_budget, h).await {
-                Ok(join_res) => {
-                    if let Err(err) = join_res {
-                        tracing::error!(error = %err, "daemon worker task panicked during shutdown");
-                    }
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        timeout_ms = self.config.shutdown_flush_timeout_ms,
-                        "daemon pipeline drain exceeded shutdown flush timeout; forcing checkpoint"
-                    );
-                }
-            }
-        }
-
+        // Join any in-flight NRD thread concurrently with the worker drain so it consumes no
+        // serial tail budget after pipeline draining completes.
         let nrd_handle = {
             let mut guard = self
                 .nrd_thread_handle
@@ -2062,15 +2105,65 @@ impl DaemonEngine {
                 .unwrap_or_else(|e| e.into_inner());
             guard.take()
         };
-        if let Some(jh) = nrd_handle {
+        let nrd_join_task = nrd_handle.and_then(|jh| {
             if jh.is_finished() {
                 if jh.join().is_err() {
                     tracing::warn!("background NRD refresh thread panicked during shutdown");
                 }
+                None
             } else {
-                let remaining = drain_budget.saturating_sub(shutdown_started.elapsed());
+                Some(tokio::task::spawn_blocking(move || jh.join()))
+            }
+        });
+
+        let handle = {
+            let mut guard = self.worker_handle.lock().await;
+            guard.take()
+        };
+
+        let mut worker_checkpointed = false;
+        let mut drain_err: Option<anyhow::Error> = None;
+        if let Some(h) = handle {
+            match tokio::time::timeout_at(deadline, h).await {
+                Ok(Ok(Ok(()))) => {
+                    worker_checkpointed = true;
+                }
+                Ok(Ok(Err(store_err))) => {
+                    drain_err = Some(anyhow::Error::new(store_err));
+                }
+                Ok(Err(join_err)) => {
+                    tracing::error!(error = %join_err, "daemon worker task panicked during shutdown");
+                    drain_err = Some(anyhow::anyhow!(
+                        "daemon worker task panicked during shutdown: {join_err}"
+                    ));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = self.config.shutdown_flush_timeout_ms,
+                        "daemon pipeline drain exceeded shutdown flush timeout; forcing best-effort checkpoint"
+                    );
+                    drain_err = Some(anyhow::anyhow!(
+                        "daemon pipeline drain exceeded {} ms shutdown flush timeout",
+                        self.config.shutdown_flush_timeout_ms
+                    ));
+                }
+            }
+        }
+
+        if let Some(join_task) = nrd_join_task {
+            if join_task.is_finished() {
+                match join_task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_panic_payload)) => {
+                        tracing::warn!("background NRD refresh thread panicked during shutdown");
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(error = %join_err, "blocking join task for NRD refresh thread failed");
+                    }
+                }
+            } else {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if !remaining.is_zero() {
-                    let join_task = tokio::task::spawn_blocking(move || jh.join());
                     match tokio::time::timeout(remaining, join_task).await {
                         Ok(Ok(Ok(()))) => {}
                         Ok(Ok(Err(_panic_payload))) => {
@@ -2089,13 +2182,18 @@ impl DaemonEngine {
                 } else {
                     tracing::warn!(
                         timeout_ms = self.config.shutdown_flush_timeout_ms,
-                        "shutdown budget exhausted prior to SQLite checkpoint; skipping NRD thread join wait"
+                        "shutdown budget exhausted; skipping remaining NRD thread join wait"
                     );
                 }
             }
         }
 
-        self.store.checkpoint_truncate()?;
+        if !worker_checkpointed {
+            self.store.checkpoint_truncate()?;
+        }
+        if let Some(err) = drain_err {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -2103,7 +2201,7 @@ impl DaemonEngine {
         self: Arc<Self>,
         mut receiver: TwoLaneReceiver,
         mut wfp_drop_rx: tokio::sync::mpsc::Receiver<QueuedWfpDrop>,
-    ) {
+    ) -> Result<(), StoreError> {
         let interval_ms = self.config.batch_flush_interval_ms.max(50);
         let mut flush_ticker = tokio::time::interval(Duration::from_millis(interval_ms));
         flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2380,8 +2478,12 @@ impl DaemonEngine {
             self.handle_wfp_drop_event_now(&pending.item);
         }
 
-        if let Err(err) = self.store.checkpoint_truncate() {
-            tracing::warn!(error = %err, "worker shutdown checkpoint_truncate failed");
+        match self.store.checkpoint_truncate() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                tracing::warn!(error = %err, "worker shutdown checkpoint_truncate failed");
+                Err(err)
+            }
         }
     }
 
@@ -2565,14 +2667,23 @@ impl DaemonEngine {
                 ..
             } => {
                 if !resolved_ips.is_empty() {
+                    let exe_k_opt = proc_ctx
+                        .proc_exe_path
+                        .as_deref()
+                        .map(WfpRuleManager::exe_key);
                     if let Some(ref inst_id) = proc_ctx.proc_instance_id {
                         self.process_dns_history
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .record(inst_id, query_name, resolved_ips, event_ts_ms);
-                        if let Some(ref exe_path) = proc_ctx.proc_exe_path {
-                            dns_correlation_key =
-                                Some((inst_id.clone(), WfpRuleManager::exe_key(exe_path)));
+                            .record_for_exe(
+                                inst_id,
+                                exe_k_opt.as_deref().unwrap_or(""),
+                                query_name,
+                                resolved_ips,
+                                event_ts_ms,
+                            );
+                        if let Some(exe_k) = exe_k_opt {
+                            dns_correlation_key = Some((inst_id.clone(), exe_k));
                         }
                     }
                     if self.config.outbound_firewall_enabled {
@@ -2651,18 +2762,74 @@ impl DaemonEngine {
             return;
         }
 
+        let mut all_canon_ips: Vec<IpAddr> = Vec::with_capacity(resolved_ips.len());
         let mut external_ips: Vec<IpAddr> = Vec::new();
         for &ip in resolved_ips {
             let canon = canonical_ip(ip);
+            if !all_canon_ips.contains(&canon) {
+                all_canon_ips.push(canon);
+            }
             if is_external_ip(canon) && !external_ips.contains(&canon) {
                 external_ips.push(canon);
             }
         }
+
+        // When a domain moves to a new IP set, purge any stale `DomainPolicy` Block filter
+        // left behind by an earlier resolution of `norm_query` unless the old IP is still
+        // blocked by a static rule or another active DNS record (`BUG_..._0003`).
+        let candidate_block_ips = {
+            let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+            fw.domain_policy_block_ips(exe_path)
+        };
+        let mut cached_rules: Option<Vec<AllowlistRuleRecord>> = None;
+        let mut cached_identity: Option<BinaryIdentity> = None;
+        if !candidate_block_ips.is_empty() {
+            let rules = self.store.list_network_rules().unwrap_or_default();
+            let bin_identity = self.inspector.inspect(exe_path);
+            let exe_k = WfpRuleManager::exe_key(exe_path);
+            let active_dns_entries = {
+                let history = self
+                    .process_dns_history
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                history.active_domains_by_ip_for_exe(&exe_k)
+            };
+            let mut still_blocked_ips: HashSet<IpAddr> = HashSet::new();
+            for cand_ip in &candidate_block_ips {
+                if matches!(
+                    evaluate_outbound_policy(&bin_identity, *cand_ip, None, &rules),
+                    OutboundDecision::BlockedByRule { .. }
+                ) {
+                    still_blocked_ips.insert(*cand_ip);
+                }
+            }
+            for (entry_ip, entry_dom) in active_dns_entries {
+                if matches!(
+                    evaluate_outbound_policy(&bin_identity, entry_ip, Some(&entry_dom), &rules),
+                    OutboundDecision::BlockedByRule { .. }
+                ) {
+                    still_blocked_ips.insert(entry_ip);
+                }
+            }
+            {
+                let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                fw.invalidate_stale_domain_blocks_for_query(
+                    exe_path,
+                    norm_query,
+                    &all_canon_ips,
+                    &still_blocked_ips,
+                    &*self.defense,
+                );
+            }
+            cached_rules = Some(rules);
+            cached_identity = Some(bin_identity);
+        }
+
         if external_ips.is_empty() {
             return;
         }
 
-        let rules = self.store.list_network_rules().unwrap_or_default();
+        let rules = cached_rules.unwrap_or_else(|| self.store.list_network_rules().unwrap_or_default());
         let matching_path_rules: Vec<&AllowlistRuleRecord> = rules
             .iter()
             .filter(|r| {
@@ -2689,7 +2856,7 @@ impl DaemonEngine {
             return;
         }
 
-        let bin_identity = self.inspector.inspect(exe_path);
+        let bin_identity = cached_identity.unwrap_or_else(|| self.inspector.inspect(exe_path));
         for ip in external_ips {
             let decision = evaluate_outbound_policy(&bin_identity, ip, Some(norm_query), &rules);
             match decision {
@@ -3248,18 +3415,27 @@ impl DaemonEngine {
                 .unwrap_or_else(|e| e.into_inner());
             candidates
                 .iter()
-                .filter_map(|c| history.lookup_for_process(&c.instance_id, item.dst_ip))
+                .filter_map(|c| {
+                    history.lookup_fresh_for_process(
+                        &c.instance_id,
+                        item.dst_ip,
+                        item.timestamp_ms,
+                        AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS,
+                    )
+                })
                 .map(|(dom, _)| dom)
                 .collect()
         };
         let mut decision = evaluate_outbound_policy(&bin_identity, item.dst_ip, None, &rules);
+        let mut blocked_dom_from_cand: Option<String> = None;
         if matches!(decision, OutboundDecision::AllowedByRule { .. }) {
-            if let Some(blk_rule_id) = cand_domains.iter().find_map(|dom| {
+            if let Some((dom, blk_rule_id)) = cand_domains.iter().find_map(|dom| {
                 match evaluate_outbound_policy(&bin_identity, item.dst_ip, Some(dom), &rules) {
-                    OutboundDecision::BlockedByRule { rule_id } => Some(rule_id),
+                    OutboundDecision::BlockedByRule { rule_id } => Some((dom.clone(), rule_id)),
                     _ => None,
                 }
             }) {
+                blocked_dom_from_cand = Some(dom);
                 decision = OutboundDecision::BlockedByRule {
                     rule_id: blk_rule_id,
                 };
@@ -3386,6 +3562,7 @@ impl DaemonEngine {
                             .filter(|s| !s.is_empty());
                         let wfp_handle = {
                             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                            let active_app = fw.active_app_block(canonical_exe).map(|(h, _)| h);
                             let res = match matched_target {
                                 None => fw.ensure_policy_block(canonical_exe, None, &*self.defense),
                                 Some(target_pat) if parse_literal_target_ip(target_pat).is_some() => {
@@ -3395,15 +3572,22 @@ impl DaemonEngine {
                                         &*self.defense,
                                     )
                                 }
+                                Some(_) if blocked_dom_from_cand.is_some() && active_app.is_some() => {
+                                    // Ambiguous multi-instance DNS correlation must not pin a sticky
+                                    // IP-level DomainPolicy Block when the app-wide block is already
+                                    // active; otherwise future permitted CIDR traffic to the same IP
+                                    // would stay blocked after DNS expires or moves (`BUG_..._0003`).
+                                    active_app.ok_or_else(String::new)
+                                }
                                 Some(target_pat) => fw.ensure_domain_policy_block(
                                     canonical_exe,
                                     item.dst_ip,
-                                    target_pat,
+                                    blocked_dom_from_cand.as_deref().unwrap_or(target_pat),
                                     &*self.defense,
                                 ),
                             };
                             res.ok()
-                                .or_else(|| fw.active_app_block(canonical_exe).map(|(h, _)| h))
+                                .or(active_app)
                                 .or((item.os_filter_id != 0).then_some(item.os_filter_id))
                         };
                         (
@@ -4754,11 +4938,20 @@ impl WfpDropDedupCache {
 
 const CROSS_PROCESS_DNS_CONFLICT_WINDOW_MS: i64 = 3_600_000;
 
+#[derive(Debug, Clone)]
+struct DnsHistoryEntry {
+    exe_key: String,
+    domain: String,
+    timestamp_ms: i64,
+}
+
 #[derive(Debug, Default)]
 struct ProcessDnsHistory {
     capacity: usize,
-    entries: HashMap<(String, IpAddr), (String, i64)>,
+    entries: HashMap<(String, IpAddr), DnsHistoryEntry>,
     insertion_order: VecDeque<(String, IpAddr)>,
+    latest_domain_by_exe: HashMap<(String, String), (Vec<IpAddr>, i64)>,
+    latest_domain_order: VecDeque<(String, String)>,
 }
 
 impl ProcessDnsHistory {
@@ -4767,9 +4960,12 @@ impl ProcessDnsHistory {
             capacity: capacity.max(1),
             entries: HashMap::new(),
             insertion_order: VecDeque::new(),
+            latest_domain_by_exe: HashMap::new(),
+            latest_domain_order: VecDeque::new(),
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record(
         &mut self,
         process_instance_id: &str,
@@ -4777,15 +4973,100 @@ impl ProcessDnsHistory {
         resolved_ips: &[IpAddr],
         timestamp_ms: i64,
     ) {
+        self.record_for_exe(process_instance_id, "", query_name, resolved_ips, timestamp_ms);
+    }
+
+    fn record_for_exe(
+        &mut self,
+        process_instance_id: &str,
+        exe_key: &str,
+        query_name: &str,
+        resolved_ips: &[IpAddr],
+        timestamp_ms: i64,
+    ) {
         let norm_domain = query_name.trim().trim_end_matches('.').to_ascii_lowercase();
-        if norm_domain.is_empty() {
+        if norm_domain.is_empty() || resolved_ips.is_empty() {
             return;
         }
+        let exe_norm = exe_key.trim().to_ascii_lowercase();
+        let mut canon_ips: Vec<IpAddr> = Vec::with_capacity(resolved_ips.len());
         for &ip in resolved_ips {
-            let canon = canonical_ip(ip);
+            let c = canonical_ip(ip);
+            if !canon_ips.contains(&c) {
+                canon_ips.push(c);
+            }
+        }
+        let has_v4 = canon_ips.iter().any(IpAddr::is_ipv4);
+        let has_v6 = canon_ips.iter().any(IpAddr::is_ipv6);
+
+        if !exe_norm.is_empty() {
+            let domain_key = (exe_norm.clone(), norm_domain.clone());
+            if let Some((prev_ips, prev_ts)) = self.latest_domain_by_exe.get(&domain_key).cloned() {
+                if timestamp_ms < prev_ts {
+                    let prev_has_v4 = prev_ips.iter().any(IpAddr::is_ipv4);
+                    let prev_has_v6 = prev_ips.iter().any(IpAddr::is_ipv6);
+                    canon_ips.retain(|ip| {
+                        let same_family_updated =
+                            (ip.is_ipv4() && prev_has_v4) || (ip.is_ipv6() && prev_has_v6);
+                        !same_family_updated || prev_ips.contains(ip)
+                    });
+                    if canon_ips.is_empty() {
+                        return;
+                    }
+                } else {
+                    let mut merged: Vec<IpAddr> = prev_ips
+                        .into_iter()
+                        .filter(|ip| (!has_v4 && ip.is_ipv4()) || (!has_v6 && ip.is_ipv6()))
+                        .collect();
+                    for &ip in &canon_ips {
+                        if !merged.contains(&ip) {
+                            merged.push(ip);
+                        }
+                    }
+                    self.latest_domain_by_exe
+                        .insert(domain_key, (merged, timestamp_ms));
+                }
+            } else {
+                let domain_cap = self.capacity.max(1);
+                while self.latest_domain_by_exe.len() >= domain_cap {
+                    let Some(oldest) = self.latest_domain_order.pop_front() else {
+                        break;
+                    };
+                    self.latest_domain_by_exe.remove(&oldest);
+                }
+                self.latest_domain_order.push_back(domain_key.clone());
+                self.latest_domain_by_exe
+                    .insert(domain_key, (canon_ips.clone(), timestamp_ms));
+            }
+        }
+
+        let mut removed_keys: Vec<(String, IpAddr)> = Vec::new();
+        self.entries.retain(|(inst_id, entry_ip), entry| {
+            let same_scope = inst_id == process_instance_id
+                || (!exe_norm.is_empty() && entry.exe_key == exe_norm);
+            let same_family = (has_v4 && entry_ip.is_ipv4()) || (has_v6 && entry_ip.is_ipv6());
+            let should_evict = same_scope
+                && same_family
+                && entry.domain == norm_domain
+                && entry.timestamp_ms <= timestamp_ms
+                && !canon_ips.contains(entry_ip);
+            if should_evict {
+                removed_keys.push((inst_id.clone(), *entry_ip));
+            }
+            !should_evict
+        });
+        if !removed_keys.is_empty() {
+            self.insertion_order.retain(|k| !removed_keys.contains(k));
+        }
+
+        for canon in canon_ips {
             let key = (process_instance_id.to_string(), canon);
             if let Some(existing) = self.entries.get_mut(&key) {
-                *existing = (norm_domain.clone(), timestamp_ms);
+                *existing = DnsHistoryEntry {
+                    exe_key: exe_norm.clone(),
+                    domain: norm_domain.clone(),
+                    timestamp_ms,
+                };
             } else {
                 while self.entries.len() >= self.capacity {
                     let Some(oldest) = self.insertion_order.pop_front() else {
@@ -4794,9 +5075,33 @@ impl ProcessDnsHistory {
                     self.entries.remove(&oldest);
                 }
                 self.insertion_order.push_back(key.clone());
-                self.entries.insert(key, (norm_domain.clone(), timestamp_ms));
+                self.entries.insert(
+                    key,
+                    DnsHistoryEntry {
+                        exe_key: exe_norm.clone(),
+                        domain: norm_domain.clone(),
+                        timestamp_ms,
+                    },
+                );
             }
         }
+    }
+
+    fn is_entry_superseded(&self, entry: &DnsHistoryEntry, ip: IpAddr) -> bool {
+        if entry.exe_key.is_empty() {
+            return false;
+        }
+        let Some((latest_ips, latest_ts)) = self
+            .latest_domain_by_exe
+            .get(&(entry.exe_key.clone(), entry.domain.clone()))
+        else {
+            return false;
+        };
+        if *latest_ts < entry.timestamp_ms || latest_ips.contains(&ip) {
+            return false;
+        }
+        (ip.is_ipv4() && latest_ips.iter().any(IpAddr::is_ipv4))
+            || (ip.is_ipv6() && latest_ips.iter().any(IpAddr::is_ipv6))
     }
 
     fn remove_process(&mut self, process_instance_id: &str) {
@@ -4807,22 +5112,63 @@ impl ProcessDnsHistory {
     }
 
     fn lookup_for_process(&self, process_instance_id: &str, ip: IpAddr) -> Option<(String, i64)> {
-        self.entries
-            .get(&(process_instance_id.to_string(), canonical_ip(ip)))
-            .cloned()
+        let canon = canonical_ip(ip);
+        let entry = self
+            .entries
+            .get(&(process_instance_id.to_string(), canon))?;
+        if self.is_entry_superseded(entry, canon) {
+            return None;
+        }
+        Some((entry.domain.clone(), entry.timestamp_ms))
     }
 
-    fn domains_for_ip(&self, ip: &IpAddr) -> Vec<String> {
-        let canon = canonical_ip(*ip);
+    fn lookup_fresh_for_process(
+        &self,
+        process_instance_id: &str,
+        ip: IpAddr,
+        event_ts_ms: i64,
+        max_age_ms: i64,
+    ) -> Option<(String, i64)> {
+        let (domain, ts_ms) = self.lookup_for_process(process_instance_id, ip)?;
+        if event_ts_ms.saturating_sub(ts_ms) <= max_age_ms
+            && ts_ms <= event_ts_ms.saturating_add(60_000)
+        {
+            Some((domain, ts_ms))
+        } else {
+            None
+        }
+    }
+
+    fn domains_for_exe_ip(&self, exe_key: &str, ip: IpAddr) -> Vec<String> {
+        let canon = canonical_ip(ip);
+        let exe_norm = exe_key.trim().to_ascii_lowercase();
         let mut out: Vec<String> = self
             .entries
             .iter()
-            .filter(|((_, entry_ip), _)| *entry_ip == canon)
-            .map(|(_, (dom, _))| dom.clone())
+            .filter(|((_, entry_ip), entry)| {
+                *entry_ip == canon
+                    && (exe_norm.is_empty() || entry.exe_key == exe_norm)
+                    && !self.is_entry_superseded(entry, canon)
+            })
+            .map(|(_, entry)| entry.domain.clone())
             .collect();
         out.sort();
         out.dedup();
         out
+    }
+
+    fn active_domains_by_ip_for_exe(&self, exe_key: &str) -> Vec<(IpAddr, String)> {
+        let exe_norm = exe_key.trim().to_ascii_lowercase();
+        if exe_norm.is_empty() {
+            return Vec::new();
+        }
+        self.entries
+            .iter()
+            .filter(|((_, entry_ip), entry)| {
+                entry.exe_key == exe_norm && !self.is_entry_superseded(entry, *entry_ip)
+            })
+            .map(|((_, entry_ip), entry)| (*entry_ip, entry.domain.clone()))
+            .collect()
     }
 
     fn another_process_resolved(
@@ -4837,15 +5183,15 @@ impl ProcessDnsHistory {
             return false;
         }
         let canon = canonical_ip(ip);
-        self.entries
-            .iter()
-            .any(|((inst_id, entry_ip), (entry_domain, ts_ms))| {
-                Some(inst_id.as_str()) != current_inst_id
-                    && *entry_ip == canon
-                    && *entry_domain == norm_domain
-                    && event_ts_ms.saturating_sub(*ts_ms) <= CROSS_PROCESS_DNS_CONFLICT_WINDOW_MS
-                    && *ts_ms <= event_ts_ms.saturating_add(60_000)
-            })
+        self.entries.iter().any(|((inst_id, entry_ip), entry)| {
+            Some(inst_id.as_str()) != current_inst_id
+                && *entry_ip == canon
+                && entry.domain == norm_domain
+                && !self.is_entry_superseded(entry, canon)
+                && event_ts_ms.saturating_sub(entry.timestamp_ms)
+                    <= CROSS_PROCESS_DNS_CONFLICT_WINDOW_MS
+                && entry.timestamp_ms <= event_ts_ms.saturating_add(60_000)
+        })
     }
 }
 
@@ -4916,5 +5262,47 @@ mod tests {
         hist.remove_process("200:2");
         assert!(hist.lookup_for_process("200:2", ip2).is_none());
         assert_eq!(hist.entries.len(), 1);
+    }
+
+    #[test]
+    fn process_dns_history_invalidates_retired_ipv4_preserves_v6_and_enforces_freshness() {
+        use std::net::Ipv6Addr;
+
+        let mut hist = ProcessDnsHistory::new(16);
+        let v4_old = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+        let v4_new = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
+        let v6_a = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+
+        hist.record_for_exe("10:1", r"c:\tools\app.exe", "Evil.Example.", &[v4_old], 1_000);
+        hist.record_for_exe("10:1", r"c:\tools\app.exe", "Evil.Example.", &[v6_a], 1_010);
+        assert!(
+            hist.lookup_for_process("10:1", v4_old).is_some(),
+            "AAAA query must not erase active IPv4 mapping"
+        );
+        assert!(hist.lookup_for_process("10:1", v6_a).is_some());
+
+        // Rotating IPv4 via a sibling instance of the same executable invalidates `v4_old` across
+        // instances while leaving `v6_a` and unrelated executables intact.
+        hist.record_for_exe("30:1", r"c:\tools\other.exe", "Evil.Example.", &[v4_old], 1_020);
+        hist.record_for_exe("20:1", r"c:\tools\app.exe", "Evil.Example.", &[v4_new], 2_000);
+        assert!(hist.lookup_for_process("10:1", v4_old).is_none());
+        assert!(hist.lookup_for_process("20:1", v4_new).is_some());
+        assert!(hist.lookup_for_process("10:1", v6_a).is_some());
+        assert!(hist.lookup_for_process("30:1", v4_old).is_some());
+
+        // Freshness check obeys `max_age_ms` and exe scoping.
+        assert!(hist
+            .lookup_fresh_for_process("20:1", v4_new, 62_000, 60_000)
+            .is_some());
+        assert!(hist
+            .lookup_fresh_for_process("20:1", v4_new, 62_001, 60_000)
+            .is_none());
+        assert_eq!(
+            hist.domains_for_exe_ip(r"c:\tools\app.exe", v4_new),
+            vec!["evil.example".to_string()]
+        );
+        assert!(hist
+            .domains_for_exe_ip(r"c:\tools\other.exe", v4_new)
+            .is_empty());
     }
 }

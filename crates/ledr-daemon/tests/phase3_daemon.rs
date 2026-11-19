@@ -6001,3 +6001,791 @@ async fn daemon_p3_36_same_exe_unrelated_app_allow_failure_allows_domain_block_s
     drop(server);
     engine.shutdown_and_flush().await.expect("shutdown");
 }
+
+struct GateBinaryInspector {
+    target_substr: String,
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    wait_cap: Duration,
+}
+
+impl BinaryInspector for GateBinaryInspector {
+    fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+        if exe_path.to_ascii_lowercase().contains(&self.target_substr) {
+            self.entered.store(true, Ordering::Release);
+            let deadline = Instant::now() + self.wait_cap;
+            while !self.release.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        BinaryIdentity {
+            exe_path: exe_path.to_string(),
+            sha256: Some("f".repeat(64)),
+            authenticode: None,
+        }
+    }
+}
+
+/// `DAEMON-P3-37` (`BUG_..._0001`): `shutdown_and_flush` grants the worker task the full
+/// `shutdown_flush_timeout_ms` budget (draining events that finish past `total_budget - 200ms`
+/// without silent loss), and returns an error after best-effort checkpointing when draining
+/// genuinely exceeds the budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p3_37_shutdown_uses_full_drain_budget_and_reports_timeout_error() {
+    // Part A: Drain completes at ~650ms (past the old `800 - 200 = 600ms` cutoff, within 800ms).
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let inspector = Arc::new(GateBinaryInspector {
+            target_substr: "slow_gate.exe".to_string(),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            wait_cap: Duration::from_secs(3),
+        });
+
+        let engine = Arc::new(DaemonEngine::start_with_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                shutdown_flush_timeout_ms: 800,
+                batch_flush_interval_ms: 500,
+                ..DaemonConfig::default()
+            },
+            defense,
+            notifier,
+            inspector,
+        ));
+
+        let now_ms = current_unix_ms();
+        let gate_proc = ProcessIdentity::new(8001, unix_ms_to_filetime(now_ms - 1_000));
+        let trailing_proc = ProcessIdentity::new(8002, unix_ms_to_filetime(now_ms - 500));
+        let trailing_id = format!("{}:{}", trailing_proc.pid, trailing_proc.create_time_100ns);
+
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: gate_proc,
+                parent_pid: 4,
+                exe_path: r"C:\Tools\slow_gate.exe".to_string(),
+                command_line: r"C:\Tools\slow_gate.exe".to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("send slow_gate start");
+        assert!(wait_until(1_000, || engine.active_process_table_len() == 1).await);
+
+        // External NetworkConnect triggers GateBinaryInspector::inspect on the worker task.
+        engine
+            .sender()
+            .send(SensorEvent::NetworkConnect {
+                pid: gate_proc.pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                dst_port: 443,
+                domain_hint: None,
+                timestamp_ms: now_ms,
+            })
+            .await
+            .expect("send slow_gate connect");
+        assert!(
+            wait_until(1_000, || entered.load(Ordering::Acquire)).await,
+            "worker must enter slow_gate inspect"
+        );
+
+        // Enqueue trailing ProcessStart while worker is blocked in inspect, then call shutdown.
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: trailing_proc,
+                parent_pid: 4,
+                exe_path: r"C:\Tools\trailing_drained.exe".to_string(),
+                command_line: r"C:\Tools\trailing_drained.exe".to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("send trailing start");
+
+        let engine_c = Arc::clone(&engine);
+        let shutdown_task = tokio::spawn(async move { engine_c.shutdown_and_flush().await });
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        release.store(true, Ordering::Release);
+
+        let shutdown_res = shutdown_task.await.expect("join shutdown task");
+        assert!(
+            shutdown_res.is_ok(),
+            "drain finishing at 650ms inside 800ms budget must succeed: {shutdown_res:?}"
+        );
+        let persisted = store
+            .list_running_process_instance_ids()
+            .expect("list running processes");
+        assert!(
+            persisted.contains(&trailing_id),
+            "trailing queued ProcessStart ({trailing_id}) must survive full-budget drain: {persisted:?}"
+        );
+    }
+
+    // Part B: Drain genuinely exceeding `shutdown_flush_timeout_ms` returns Err after checkpoint.
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let inspector = Arc::new(GateBinaryInspector {
+            target_substr: "slow_gate.exe".to_string(),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            wait_cap: Duration::from_secs(2),
+        });
+
+        let engine = DaemonEngine::start_with_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                shutdown_flush_timeout_ms: 150,
+                batch_flush_interval_ms: 500,
+                ..DaemonConfig::default()
+            },
+            defense,
+            notifier,
+            inspector,
+        );
+
+        let now_ms = current_unix_ms();
+        let gate_proc = ProcessIdentity::new(8101, unix_ms_to_filetime(now_ms - 1_000));
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: gate_proc,
+                parent_pid: 4,
+                exe_path: r"C:\Tools\slow_gate.exe".to_string(),
+                command_line: r"C:\Tools\slow_gate.exe".to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("send slow_gate start");
+        assert!(wait_until(1_000, || engine.active_process_table_len() == 1).await);
+
+        engine
+            .sender()
+            .send(SensorEvent::NetworkConnect {
+                pid: gate_proc.pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+                dst_port: 443,
+                domain_hint: None,
+                timestamp_ms: now_ms,
+            })
+            .await
+            .expect("send slow_gate connect");
+        assert!(wait_until(1_000, || entered.load(Ordering::Acquire)).await);
+
+        let err = engine
+            .shutdown_and_flush()
+            .await
+            .expect_err("over-budget drain timeout must return Err");
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("timeout"),
+            "timeout error must be descriptive, got: {err}"
+        );
+        // Best-effort checkpoint kept store operational.
+        assert!(store.list_running_process_instance_ids().is_ok());
+        release.store(true, Ordering::Release);
+    }
+}
+
+/// `DAEMON-P3-38` (`BUG_..._0002` / `PRRT_..._W1_R`): Deleting or narrowing a shadowing
+/// `NetworkBlock` rule uncovers an underlying `NetworkAllow`; if adding that uncovered Permit
+/// fails, the delete/edit must roll back SQLite + WFP Block and return `FirewallSync`, while
+/// editing unrelated rules on the same exe when another allow already failed still succeeds.
+#[tokio::test]
+async fn daemon_p3_38_shadowing_block_delete_or_narrow_rolls_back_on_permit_restore_failure() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let exe = r"C:\Tools\shadow_test.exe";
+    let sha = "a".repeat(64);
+    inspector.register(exe, Some(&sha), None);
+    let ip_shadowed = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+    let ip_other = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+    let now_ms = current_unix_ms();
+
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-ALLOW-198".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("198.51.100.10".to_string()),
+            created_at_ms: now_ms,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed allow 198");
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-BLOCK-198".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("198.51.100.10".to_string()),
+            created_at_ms: now_ms + 1,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed block 198");
+    // Pre-existing Permit failure on `ip_other` (unrelated to R-BLOCK-99 below).
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-ALLOW-OTHER".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("203.0.113.5".to_string()),
+            created_at_ms: now_ms + 2,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed allow other");
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-BLOCK-99".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("203.0.113.99".to_string()),
+            created_at_ms: now_ms + 3,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed unrelated block 99");
+
+    // Permit adds fail from startup (`R-ALLOW-OTHER` is already unapplied; `R-BLOCK-198` &
+    // `R-BLOCK-99` are Block filters so they install cleanly).
+    defense.set_fail_wfp_add_permits(true);
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector,
+    );
+    assert!(engine.has_active_wfp_filter(exe, Some(ip_shadowed), false));
+    assert!(!engine.has_active_wfp_filter(exe, Some(ip_other), true));
+
+    // 1. Deleting shadowing `R-BLOCK-198` uncovers `R-ALLOW-198` whose Permit add fails ->
+    //    MUST fail with `FirewallSync` and roll back both SQLite + WFP Block!
+    let del_err = engine
+        .delete_policy_rule("R-BLOCK-198")
+        .expect_err("delete shadowing block with failing uncovered permit must fail");
+    assert!(
+        matches!(del_err, PolicyRuleError::FirewallSync(_)),
+        "expected FirewallSync, got {del_err:?}"
+    );
+    assert!(
+        store.get_rule("R-BLOCK-198").unwrap().is_some(),
+        "R-BLOCK-198 must be restored in SQLite after rollback"
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(ip_shadowed), false),
+        "WFP Block on 198.51.100.10 must be restored after rollback"
+    );
+
+    // 2. Narrowing `R-BLOCK-198` to 198.51.100.99 also uncovers `R-ALLOW-198` ->
+    //    MUST fail with `FirewallSync` and restore old target + WFP Block!
+    let narrowed = AllowlistRuleRecord {
+        rule_id: "R-BLOCK-198".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: exe.to_string(),
+        sha256: Some(sha),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("198.51.100.99".to_string()),
+        created_at_ms: now_ms + 10,
+        created_by: "ui".to_string(),
+    };
+    let narrow_err = engine
+        .upsert_policy_rule(&narrowed)
+        .expect_err("narrowing shadowing block with failing uncovered permit must fail");
+    assert!(matches!(narrow_err, PolicyRuleError::FirewallSync(_)));
+    assert_eq!(
+        store
+            .get_rule("R-BLOCK-198")
+            .unwrap()
+            .unwrap()
+            .allowed_target
+            .as_deref(),
+        Some("198.51.100.10")
+    );
+    assert!(engine.has_active_wfp_filter(exe, Some(ip_shadowed), false));
+
+    // 3. Negative control: deleting unrelated `R-BLOCK-99` does NOT newly uncover `R-ALLOW-OTHER`
+    //    (its Permit failure was pre-existing), so deleting `R-BLOCK-99` MUST succeed!
+    engine
+        .delete_policy_rule("R-BLOCK-99")
+        .expect("deleting unrelated block despite pre-existing unrelated permit failure must succeed");
+    assert!(store.get_rule("R-BLOCK-99").unwrap().is_none());
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-39` (`BUG_..._0003`): Retired DNS history (domain moved to a new IP or >60s old
+/// on ambiguous multi-instance drops) must not continue blocking a CIDR-allowed IP or pin a
+/// sticky `DomainPolicy` IP Block filter.
+#[tokio::test]
+async fn daemon_p3_39_rotated_or_stale_dns_history_stops_blocking_cidr_allowed_ip() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let exe = r"C:\Tools\cidr_dns_app.exe";
+    let sha = "b".repeat(64);
+    inspector.register(exe, Some(&sha), None);
+    let now_ms = current_unix_ms();
+
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-CIDR-ALLOW".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("198.51.100.0/24".to_string()),
+            created_at_ms: now_ms,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed cidr allow");
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-DOM-BLOCK-EVIL".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("evil.example".to_string()),
+            created_at_ms: now_ms + 1,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed evil block");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            preemptive_startup_executables: vec![exe.to_string()],
+            wfp_drop_dns_grace_ms: 40,
+            ..DaemonConfig::default()
+        },
+        defense,
+        notifier,
+        inspector,
+    );
+
+    let p1 = ProcessIdentity::new(9101, unix_ms_to_filetime(now_ms - 500));
+    let p2 = ProcessIdentity::new(9102, unix_ms_to_filetime(now_ms - 400));
+    for proc_id in [p1, p2] {
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: proc_id,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("start proc");
+    }
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 2).await);
+
+    // Part A: `evil.example` first resolves to `198.51.100.50` (inside allowed CIDR), then
+    // migrates to `203.0.113.77`. The old `DomainPolicy` Block and DNS history for `.50` must
+    // be invalidated so reconnects to `.50` are allowed by CIDR.
+    let old_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 50));
+    let new_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "evil.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![old_ip],
+            timestamp_ms: now_ms + 10,
+        })
+        .await
+        .expect("evil dns old ip");
+    assert!(
+        wait_until(1_000, || engine.has_active_wfp_filter(exe, Some(old_ip), false)).await,
+        "initial evil.example DnsQuery must materialize DomainPolicy Block on old_ip"
+    );
+
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "evil.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![new_ip],
+            timestamp_ms: now_ms + 20,
+        })
+        .await
+        .expect("evil dns new ip");
+    assert!(
+        wait_until(1_000, || {
+            engine.has_active_wfp_filter(exe, Some(new_ip), false)
+                && !engine.has_active_wfp_filter(exe, Some(old_ip), false)
+        })
+        .await,
+        "evil.example migration must add DomainPolicy Block on new_ip and remove stale Block on old_ip"
+    );
+
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 1,
+        rule_handle: 1,
+        exe_path: exe.to_string(),
+        protocol: 6,
+        dst_ip: old_ip,
+        dst_port: 443,
+        timestamp_ms: now_ms + 30,
+    }));
+    assert!(
+        wait_until(1_000, || engine.has_active_wfp_filter(exe, Some(old_ip), true)).await,
+        "CIDR allow must materialize Permit for retired old_ip"
+    );
+    assert!(store.list_alerts(None, 20).unwrap().is_empty());
+
+    // Part B: Ambiguous drop with fresh (<60s) DNS for a blocked domain alerts under the app
+    // block WITHOUT minting a sticky `DomainPolicy` Block filter; once >60s old, CIDR allow wins.
+    let shared_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 60));
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p2.pid,
+            query_name: "stale-trap.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: now_ms + 40,
+        })
+        .await
+        .expect("dns before block rule");
+    let p3 = ProcessIdentity::new(9103, unix_ms_to_filetime(now_ms - 300));
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: p3,
+            parent_pid: 4,
+            exe_path: exe.to_string(),
+            command_line: exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("marker proc");
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 3).await);
+
+    engine
+        .upsert_policy_rule(&AllowlistRuleRecord {
+            rule_id: "R-DOM-BLOCK-STALE".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("stale-trap.example".to_string()),
+            created_at_ms: now_ms + 50,
+            created_by: "ui".to_string(),
+        })
+        .expect("add stale-trap block");
+
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 2,
+        rule_handle: 2,
+        exe_path: exe.to_string(),
+        protocol: 6,
+        dst_ip: shared_ip,
+        dst_port: 443,
+        timestamp_ms: now_ms + 5_000,
+    }));
+    assert!(
+        wait_until(1_000, || {
+            store
+                .list_alerts(None, 20)
+                .unwrap()
+                .iter()
+                .any(|a| a.rule_id == "LEDR-NET-POLICY-BLOCK")
+        })
+        .await,
+        "fresh ambiguous DNS drop must emit LEDR-NET-POLICY-BLOCK"
+    );
+    assert!(
+        !engine.has_active_wfp_filter(exe, Some(shared_ip), false),
+        "ambiguous DNS correlation must not pin a sticky DomainPolicy IP Block under active_app_block"
+    );
+
+    // Once DNS entry exceeds the 60s freshness window, ambiguous drop falls back cleanly to CIDR allow.
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 3,
+        rule_handle: 3,
+        exe_path: exe.to_string(),
+        protocol: 6,
+        dst_ip: shared_ip,
+        dst_port: 443,
+        timestamp_ms: now_ms + 70_000,
+    }));
+    assert!(
+        wait_until(1_000, || engine.has_active_wfp_filter(exe, Some(shared_ip), true)).await,
+        "after >60s stale DNS expiry, CIDR allow must permit shared_ip"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-40` (`BUG_..._0004`): A failing `remove_domain_policy_permit` caused by an existing
+/// block on `evil.example` must be attributed to `evil.example`'s blocking rule(s) rather than
+/// blocking edits/saves of unrelated domain rules (`good.example`) on the same executable.
+#[tokio::test]
+async fn daemon_p3_40_unrelated_domain_permit_removal_failure_scoped_away_from_good_domain() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let exe = r"C:\Tools\multi_dom.exe";
+    let sha = "c".repeat(64);
+    inspector.register(exe, Some(&sha), None);
+    let now_ms = current_unix_ms();
+
+    let evil_rule = AllowlistRuleRecord {
+        rule_id: "R-BLK-EVIL".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: exe.to_string(),
+        sha256: Some(sha.clone()),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("evil.example".to_string()),
+        created_at_ms: now_ms,
+        created_by: "seed".to_string(),
+    };
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-CIDR-ALLOW".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("198.51.100.0/24".to_string()),
+            created_at_ms: now_ms + 1,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed cidr allow");
+    store.upsert_rule(&evil_rule).expect("seed evil block");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            preemptive_startup_executables: vec![exe.to_string()],
+            wfp_drop_dns_grace_ms: 40,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector,
+    );
+
+    let p1 = ProcessIdentity::new(9201, unix_ms_to_filetime(now_ms - 500));
+    let p2 = ProcessIdentity::new(9202, unix_ms_to_filetime(now_ms - 400));
+    for proc_id in [p1, p2] {
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: proc_id,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("start proc");
+    }
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 2).await);
+
+    // Ambiguous CIDR drop before DNS creates an unnamed (`domain_hint: ""`) Permit for `ip`.
+    let shared_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88));
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 1,
+        rule_handle: 1,
+        exe_path: exe.to_string(),
+        protocol: 6,
+        dst_ip: shared_ip,
+        dst_port: 443,
+        timestamp_ms: now_ms + 10,
+    }));
+    assert!(wait_until(1_000, || {
+        engine.has_active_wfp_filter(exe, Some(shared_ip), true)
+    })
+    .await);
+
+    let permit_handle = defense
+        .active_wfp()
+        .into_iter()
+        .find(|w| w.allow && w.remote_ip == Some(shared_ip))
+        .expect("live IP permit filter")
+        .handle;
+    defense.add_fail_wfp_remove_handle(permit_handle);
+
+    // Associate `shared_ip` with blocked `evil.example` in DNS history (`p3` acts as barrier).
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "evil.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: now_ms + 20,
+        })
+        .await
+        .expect("send evil dns");
+    let p3 = ProcessIdentity::new(9203, unix_ms_to_filetime(now_ms - 300));
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: p3,
+            parent_pid: 4,
+            exe_path: exe.to_string(),
+            command_line: exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send barrier proc");
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 3).await);
+
+    // 1. Saving an unrelated domain rule (`good.example`) on the SAME exe MUST succeed despite
+    //    `remove_domain_policy_permit` failing for `evil.example`'s IP permit.
+    engine
+        .upsert_policy_rule(&AllowlistRuleRecord {
+            rule_id: "R-GOOD-ALLOW".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("good.example".to_string()),
+            created_at_ms: now_ms + 30,
+            created_by: "ui".to_string(),
+        })
+        .expect("saving unrelated good.example rule must succeed");
+    assert!(store.get_rule("R-GOOD-ALLOW").unwrap().is_some());
+
+    // 2. Re-upserting `R-BLK-EVIL` (`evil.example`) itself MUST fail with `FirewallSync` and roll back.
+    let mut updated_evil = evil_rule;
+    updated_evil.created_by = "ui-retry".to_string();
+    let evil_err = engine
+        .upsert_policy_rule(&updated_evil)
+        .expect_err("touching evil.example rule whose permit removal failed must fail");
+    assert!(matches!(evil_err, PolicyRuleError::FirewallSync(_)));
+    assert_eq!(
+        store.get_rule("R-BLK-EVIL").unwrap().unwrap().created_by,
+        "seed"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-41` (`SEC_..._0001` / `PRRT_..._W2BQ`): When an app-wide `NetworkBlock` fails to
+/// apply in WFP, adding a destination-specific literal-IP `NetworkBlock` subsumed under that app
+/// rule must not silently return success — it must roll back SQLite and report `FirewallSync`.
+#[tokio::test]
+async fn daemon_p3_41_unapplied_app_block_surfaces_failure_for_subsumed_ip_block() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let exe = r"C:\Tools\broken_app_block.exe";
+    let sha = "d".repeat(64);
+    inspector.register(exe, Some(&sha), None);
+    let now_ms = current_unix_ms();
+
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-APP-BLK".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: now_ms,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed app-wide block");
+    defense.add_fail_wfp_exe("broken_app_block.exe");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector,
+    );
+    assert!(
+        !engine.has_active_wfp_filter(exe, None, false),
+        "app-wide WFP block must be unapplied at startup due to injected exe failure"
+    );
+
+    let err = engine
+        .upsert_policy_rule(&AllowlistRuleRecord {
+            rule_id: "R-IP-BLK".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("203.0.113.44".to_string()),
+            created_at_ms: now_ms + 10,
+            created_by: "ui".to_string(),
+        })
+        .expect_err("saving literal-IP block hidden under failing app-wide block must fail");
+    assert!(
+        matches!(err, PolicyRuleError::FirewallSync(_)),
+        "expected FirewallSync, got {err:?}"
+    );
+    assert!(
+        store.get_rule("R-IP-BLK").unwrap().is_none(),
+        "R-IP-BLK must be rolled back from SQLite when neither app-wide nor IP block is live"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}

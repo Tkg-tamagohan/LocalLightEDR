@@ -346,6 +346,14 @@ impl TwoLaneReceiver {
         }
     }
 
+    pub(crate) fn try_recv_high_priority(&mut self) -> Option<SensorEvent> {
+        self.high_rx.try_recv().ok()
+    }
+
+    pub(crate) fn try_recv_telemetry(&mut self) -> Option<SensorEvent> {
+        self.telemetry.try_pop()
+    }
+
     /// Non-blocking drain of all currently buffered events (high-priority first, then telemetry).
     pub fn drain_ready(&mut self) -> Vec<SensorEvent> {
         self.drain_ready_with_lane()

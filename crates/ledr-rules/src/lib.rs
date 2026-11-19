@@ -1792,4 +1792,60 @@ brand-new.org
         assert!(status_err.contains("503"), "{status_err}");
         err_server.join().expect("join 503 server");
     }
+
+    #[test]
+    fn rules_p3_12_async_winhttp_concurrent_cancel_stress() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind cancel stress listener");
+        listener.set_nonblocking(true).expect("set_nonblocking");
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let srv = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stop_bg.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let mut buf = [0u8; 256];
+                        let _ = s.read(&mut buf);
+                        held.push(s);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stress.txt");
+        for iter in 0..20u64 {
+            let token = Arc::new(NrdCancelToken::new());
+            let worker_token = Arc::clone(&token);
+            let url_c = url.clone();
+            let handle = std::thread::spawn(move || {
+                fetch_nrd_feed_url_cancellable(&url_c, NRD_MAX_RESPONSE_BYTES, &worker_token)
+            });
+            // Vary cancel timing across 0..20 ms to hit handle registration, SendRequest,
+            // ReceiveResponse, and wait_for_outcome boundaries without cross-thread handle races.
+            std::thread::sleep(Duration::from_millis(iter % 15));
+            let started = Instant::now();
+            token.cancel();
+            let res = handle.join().expect("fetch thread must not panic");
+            let elapsed = started.elapsed();
+            assert!(res.is_err(), "iter {iter}: cancelled fetch must fail");
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "iter {iter}: cancel took too long ({elapsed:?})"
+            );
+        }
+
+        stop.store(true, Ordering::Release);
+        srv.join().expect("join stress server");
+    }
 }

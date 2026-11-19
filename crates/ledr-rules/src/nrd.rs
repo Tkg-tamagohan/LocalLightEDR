@@ -19,13 +19,7 @@ use crate::RulesError;
 struct NrdCancelState {
     cancelled: AtomicBool,
     #[cfg(windows)]
-    active_request: std::sync::Mutex<Option<ActiveWinHttpRequest>>,
-}
-
-#[cfg(windows)]
-struct ActiveWinHttpRequest {
-    raw_handle: usize,
-    ctx: Arc<AsyncWinHttpContext>,
+    active_ctx: std::sync::Mutex<Option<Arc<AsyncWinHttpContext>>>,
 }
 
 /// Cooperative cancellation token for [`fetch_nrd_feed_url_cancellable`] and
@@ -56,9 +50,9 @@ impl NrdCancelToken {
 
     /// Cancels any current or future NRD fetch associated with this token.
     ///
-    /// On Windows, wakes any waiting async WinHTTP operation immediately and atomically takes and
-    /// closes the active asynchronous WinHTTP request handle (whose `AsyncWinHttpContext` stays
-    /// alive via `Arc` until `WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING` fires).
+    /// On Windows, wakes any waiting async WinHTTP operation immediately via `AsyncWinHttpContext`
+    /// so the owning fetch thread unwinds and closes `HINTERNET` handles on its own thread with
+    /// zero cross-thread `WinHttpCloseHandle` vs `WinHttpSendRequest`/`WinHttpReadData` races.
     pub fn cancel(&self) {
         self.state.cancelled.store(true, Ordering::SeqCst);
         #[cfg(windows)]
@@ -66,20 +60,13 @@ impl NrdCancelToken {
             let active = {
                 let mut guard = self
                     .state
-                    .active_request
+                    .active_ctx
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 guard.take()
             };
-            if let Some(req) = active {
-                req.ctx.mark_cancelled();
-                // SAFETY: `req.raw_handle` was opened with `WINHTTP_FLAG_ASYNC` and `take()`
-                // guarantees `WinHttpCloseHandle` is invoked at most once across `cancel()` and
-                // `CancellableWinHttpHandle::drop()`. `req.ctx` stays alive until
-                // `WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING`.
-                unsafe {
-                    let _ = winhttp_ffi::WinHttpCloseHandle(req.raw_handle as *mut std::ffi::c_void);
-                }
+            if let Some(ctx) = active {
+                ctx.mark_cancelled();
             }
         }
     }
@@ -991,6 +978,7 @@ struct AsyncWinHttpState {
     outcome: AsyncWaitOutcome,
     last_secure_failure_flags: Option<u32>,
     cancelled: bool,
+    handle_closed: bool,
 }
 
 #[cfg(windows)]
@@ -1015,6 +1003,7 @@ impl AsyncWinHttpContext {
                 outcome: AsyncWaitOutcome::Pending,
                 last_secure_failure_flags: None,
                 cancelled: false,
+                handle_closed: false,
             }),
             cv: std::sync::Condvar::new(),
             io_buf: std::sync::Mutex::new(Vec::new()),
@@ -1086,6 +1075,7 @@ impl AsyncWinHttpContext {
 
     fn complete_handle_closing(&self) {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.handle_closed = true;
         if matches!(guard.outcome, AsyncWaitOutcome::Pending) {
             guard.outcome = if guard.cancelled {
                 AsyncWaitOutcome::Cancelled
@@ -1094,6 +1084,27 @@ impl AsyncWinHttpContext {
             };
         }
         self.cv.notify_all();
+    }
+
+    fn wait_for_handle_closing(&self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !guard.handle_closed {
+            let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            if rem.is_zero() {
+                break;
+            }
+            let (next_guard, wait_res) = self
+                .cv
+                .wait_timeout(guard, rem)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = next_guard;
+            if wait_res.timed_out() {
+                break;
+            }
+        }
     }
 }
 
@@ -1207,9 +1218,9 @@ fn fetch_http_winhttp_cancellable(
         }
     }
 
-    // RAII guard for the cancellable async request handle: `take()`s from `active_request`
-    // before closing so `NrdCancelToken::cancel()` and `Drop` NEVER double-close the same
-    // HINTERNET handle.
+    // RAII guard for the async request handle: registers `AsyncWinHttpContext` for cross-thread
+    // wakeups (`cancel()`) while ensuring `WinHttpCloseHandle(self.raw)` is invoked EXCLUSIVELY
+    // on this owning fetch thread after all `WinHttp*` calls have returned.
     struct CancellableWinHttpHandle<'a> {
         cancel: &'a NrdCancelToken,
         raw: *mut c_void,
@@ -1226,7 +1237,7 @@ fn fetch_http_winhttp_cancellable(
         ) -> Result<Self, String> {
             let mut guard = cancel
                 .state
-                .active_request
+                .active_ctx
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if cancel.state.cancelled.load(Ordering::SeqCst) {
@@ -1237,12 +1248,10 @@ fn fetch_http_winhttp_cancellable(
                 unsafe {
                     let _ = WinHttpCloseHandle(raw_request);
                 }
+                ctx.wait_for_handle_closing(std::time::Duration::from_millis(150));
                 return Err("NRD feed download cancelled".to_string());
             }
-            *guard = Some(ActiveWinHttpRequest {
-                raw_handle: raw_request as usize,
-                ctx: Arc::clone(&ctx),
-            });
+            *guard = Some(Arc::clone(&ctx));
             Ok(Self {
                 cancel,
                 raw: raw_request,
@@ -1266,21 +1275,26 @@ fn fetch_http_winhttp_cancellable(
 
     impl Drop for CancellableWinHttpHandle<'_> {
         fn drop(&mut self) {
-            let active = {
+            {
                 let mut guard = self
                     .cancel
                     .state
-                    .active_request
+                    .active_ctx
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                guard.take()
-            };
-            if let Some(req) = active {
-                // SAFETY: `take()` ensures `WinHttpCloseHandle` is called at most once
-                // between `NrdCancelToken::cancel()` and `CancellableWinHttpHandle::drop()`.
-                unsafe {
-                    let _ = WinHttpCloseHandle(req.raw_handle as *mut c_void);
+                if guard.as_ref().is_some_and(|c| Arc::ptr_eq(c, &self.ctx)) {
+                    *guard = None;
                 }
+            }
+            if !self.raw.is_null() {
+                // SAFETY: `self.raw` is closed exclusively on the fetch thread after all
+                // WinHTTP calls on `self.raw` have finished; `HANDLE_CLOSING` releases `cb_raw`.
+                unsafe {
+                    let _ = WinHttpCloseHandle(self.raw);
+                }
+                self.raw = ptr::null_mut();
+                self.ctx
+                    .wait_for_handle_closing(std::time::Duration::from_millis(150));
             }
         }
     }

@@ -70,9 +70,6 @@ pub struct WfpFailedOp {
     pub error: String,
 }
 
-/// Canonical key identifying a non-startup WFP operation failure (`(exe_key, remote_ip, is_remove)`).
-pub type WfpFailedOpKey = (String, Option<IpAddr>, bool);
-
 /// Snapshot of a filter origin promoted/demoted during reconciliation (plus any alert containment
 /// bindings cleared on promotion) so SQLite rollback can restore the exact pre-reconcile state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +99,6 @@ pub struct WfpReconcileReport {
     pub skipped_wildcard: usize,
     pub failed: usize,
     pub failed_ops: Vec<WfpFailedOp>,
-    pub prior_failed_keys: HashSet<WfpFailedOpKey>,
     pub promoted_backups: Vec<PromotedFilterSnapshot>,
     pub removed_domain_filters: Vec<RemovedDomainFilterSnapshot>,
 }
@@ -121,31 +117,16 @@ impl WfpReconcileReport {
         Self::format_ops(self.failed_ops.iter().filter(|op| !op.is_startup_preemptive))
     }
 
-    /// Returns the canonical keys of all non-startup failures observed in this report.
-    pub fn non_startup_failed_keys(&self) -> HashSet<WfpFailedOpKey> {
-        self.failed_ops
-            .iter()
-            .filter(|op| !op.is_startup_preemptive)
-            .map(|op| (op.exe_key.clone(), op.remote_ip, op.is_remove))
-            .collect()
-    }
-
-    /// Returns a formatted error summary ONLY if this reconciliation encountered a new
-    /// non-startup WFP failure affecting at least one rule in `affected_rules` (ignoring
-    /// pre-existing failures in `prior_failed_keys` and failures on unrelated executables/targets).
+    /// Returns a formatted error summary ONLY if this reconciliation encountered a non-startup
+    /// WFP failure affecting at least one rule in `affected_rules` (ignoring failures on unrelated
+    /// executables/targets while still surfacing repeated failures on any affected rule).
     pub fn failure_summary_for_rules(&self, affected_rules: &[&AllowlistRuleRecord]) -> Option<String> {
         let relevant: Vec<&WfpFailedOp> = self
             .failed_ops
             .iter()
             .filter(|op| {
-                if op.is_startup_preemptive {
-                    return false;
-                }
-                let op_key = (op.exe_key.clone(), op.remote_ip, op.is_remove);
-                if self.prior_failed_keys.contains(&op_key) {
-                    return false;
-                }
-                affected_rules.iter().any(|rule| Self::op_matches_rule(op, rule))
+                !op.is_startup_preemptive
+                    && affected_rules.iter().any(|rule| Self::op_matches_rule(op, rule))
             })
             .collect();
         if relevant.is_empty() {
@@ -182,9 +163,9 @@ impl WfpReconcileReport {
         if parse_literal_target_ip(target).is_some() || parse_cidr_target(target).is_ok() {
             return matches_network_target(target, ip, None);
         }
-        // Domain / wildcard target rules only touch IP-specific WFP entries when removing
-        // DomainPolicy filters or updating IP permissions for that exe.
-        true
+        // Domain / wildcard target rules only touch IP-specific WFP entries in reconciliation
+        // when removing stale `DomainPolicy` filters; live additions report directly.
+        op.is_remove
     }
 
     fn format_ops<'a>(ops: impl Iterator<Item = &'a WfpFailedOp>) -> String {
@@ -209,7 +190,6 @@ pub struct WfpRuleManager {
     bound_alerts: HashMap<String, WfpTargetKey>,
     once_allowed_processes: HashMap<String, String>,
     startup_preemptive_exes: HashMap<String, String>,
-    last_non_startup_failures: HashSet<WfpFailedOpKey>,
     has_wildcard_network_rules: bool,
     has_domain_network_rules: bool,
 }
@@ -977,10 +957,7 @@ impl WfpRuleManager {
         inspector: &dyn BinaryInspector,
         defense: &dyn ActiveDefenseController,
     ) -> WfpReconcileReport {
-        let mut report = WfpReconcileReport {
-            prior_failed_keys: self.last_non_startup_failures.clone(),
-            ..Default::default()
-        };
+        let mut report = WfpReconcileReport::default();
 
         // 1. Collect candidate concrete executable paths from persisted rules, running processes,
         //    and startup-pinned pre-restricted executables.
@@ -1373,7 +1350,6 @@ impl WfpRuleManager {
             }
         }
 
-        self.last_non_startup_failures = report.non_startup_failed_keys();
         report
     }
 
@@ -1660,6 +1636,10 @@ mod tests {
         assert!(
             r2.failure_summary_for_rules(&[&healthy_rule]).is_none(),
             "pre-existing unrelated failure must not fail healthy rule mutation"
+        );
+        assert!(
+            r2.failure_summary_for_rules(&[&broken_rule]).is_some(),
+            "repeated failure on affected rule must still surface via failure_summary_for_rules"
         );
         assert!(fw.has_active_filter(healthy_exe, None, false));
 

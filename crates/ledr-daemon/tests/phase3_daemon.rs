@@ -4703,11 +4703,14 @@ async fn daemon_p3_28_wfp_drop_waits_for_delayed_dns_allow_and_suspends_on_timeo
     engine.shutdown_and_flush().await.expect("shutdown");
 }
 
-/// `DAEMON-P3-29` (`Thread 9`): Multiple active instances of the same executable must NEVER guess
-/// `candidates[0]` or fabricate `network_events` when attributing `WfpDropEvent`:
+/// `DAEMON-P3-29` (`Thread 9`, `BUG_0004`): Multiple active instances of the same executable must
+/// NEVER guess `candidates[0]`, misattribute via prior `(exe, ip, port)` connects, or fabricate
+/// `network_events` when attributing `WfpDropEvent`:
 /// - Ambiguous multi-instance drops emit a deduplicated app-level alert (`process_instance_id = None`,
 ///   `process_suspended = false`, `"attribution": "app_level_ambiguous"`) with zero suspensions.
-/// - Unique recent PID-bearing `NetworkConnect` disambiguates the true connecting instance cleanly.
+/// - Sequential access by another instance to the same `(dst_ip, dst_port)` after an earlier
+///   instance was quarantined is NOT swallowed by the earlier instance's dedup and surfaces an
+///   `app_level_ambiguous` alert.
 #[tokio::test]
 async fn daemon_p3_29_wfp_drop_multi_instance_disambiguation_and_ambiguous_app_alert() {
     let store = LedrStore::open_in_memory().expect("open store");
@@ -4809,24 +4812,12 @@ async fn daemon_p3_29_wfp_drop_multi_instance_disambiguation_and_ambiguous_app_a
         .expect("AllowOnce on app-level ambiguous alert");
     assert!(!engine.has_active_wfp_filter(ps_exe, None, false));
 
-    // 2. Two instances of `tool.exe` where ONLY `q2` recently had a NetworkConnect to (203.0.113.99, 8443)
-    //    matching a NetworkBlock rule: WfpDropEvent disambiguates uniquely to `q2`, NOT `q1` and NOT
-    //    `app_level_ambiguous`.
+    // 2. Two concurrent instances of `tool.exe` (`q1`, `q2`): `q2` connects to (203.0.113.99, 8443)
+    //    first, triggering suspension + app-wide WFP containment + `q2_alert`. When `q1` hits the
+    //    same `(dst_ip, dst_port)` shortly after (`WfpDropEvent` with no PID), it MUST NOT be
+    //    falsely attributed to `q2` and silenced by `q2`'s dedup — it must emit an app-level alert.
     let q1 = ProcessIdentity::new(8201, unix_ms_to_filetime(now_ms - 800));
     let q2 = ProcessIdentity::new(8202, unix_ms_to_filetime(now_ms - 700));
-    engine
-        .upsert_policy_rule(&AllowlistRuleRecord {
-            rule_id: "R-TOOL-BLK".to_string(),
-            scope: RuleScope::NetworkBlock,
-            exe_path_pattern: tool_exe.to_string(),
-            sha256: None,
-            signer_subject: None,
-            root_thumbprint: None,
-            allowed_target: Some("203.0.113.99".to_string()),
-            created_at_ms: now_ms,
-            created_by: "test".to_string(),
-        })
-        .expect("upsert tool block");
     for proc_id in [q1, q2] {
         engine
             .sender()
@@ -4842,13 +4833,13 @@ async fn daemon_p3_29_wfp_drop_multi_instance_disambiguation_and_ambiguous_app_a
     }
     assert!(wait_until(1_000, || engine.active_process_table_len() == 4).await);
 
-    let disambig_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99));
+    let shared_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99));
     engine
         .sender()
         .send(SensorEvent::NetworkConnect {
             pid: q2.pid,
             protocol: 6,
-            dst_ip: disambig_ip,
+            dst_ip: shared_ip,
             dst_port: 8443,
             domain_hint: None,
             timestamp_ms: now_ms + 500,
@@ -4867,24 +4858,41 @@ async fn daemon_p3_29_wfp_drop_multi_instance_disambiguation_and_ambiguous_app_a
     );
     let q2_alert = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap()[0].clone();
     assert_eq!(q2_alert.process_instance_id, Some(q2.instance_id()));
+    assert!(q2_alert.process_suspended);
+    assert!(engine.has_active_wfp_filter(tool_exe, None, false));
 
-    // Now WfpDropEvent arrives: RecentConnectTracker matches `q2` uniquely -> `q2`'s dedup handles it
-    // cleanly without creating a false `q1` alert OR an `app_level_ambiguous` alert!
+    // Sibling `q1` connects to the same `(shared_ip, 8443)` and gets blocked by the app-wide WFP
+    // filter -> WfpDropEvent arrives shortly after -> MUST emit an `app_level_ambiguous` alert
+    // rather than being misattributed to `q2` and swallowed by `q2`'s dedup!
     assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
         os_filter_id: 20,
         rule_handle: 20,
         exe_path: tool_exe.to_string(),
         protocol: 6,
-        dst_ip: disambig_ip,
+        dst_ip: shared_ip,
         dst_port: 8443,
-        timestamp_ms: now_ms + 520,
+        timestamp_ms: now_ms + 700,
     }));
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert_eq!(
-        store.list_alerts(Some(AlertStatus::Pending), 10).unwrap().len(),
-        1,
-        "unique RecentConnect attribution to q2 must neither blame q1 nor emit ambiguous alert"
+    assert!(
+        wait_until(1_500, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|a| a.len() == 2)
+                .unwrap_or(false)
+        })
+        .await,
+        "subsequent sibling WfpDropEvent to same destination must surface as app_level_ambiguous alert"
     );
+    let alerts = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap();
+    let app_alert = alerts
+        .iter()
+        .find(|a| a.alert_id != q2_alert.alert_id)
+        .expect("app-level alert present");
+    assert_eq!(app_alert.process_instance_id, None);
+    assert!(!app_alert.process_suspended);
+    let app_ctx: serde_json::Value = serde_json::from_str(&app_alert.context_json).unwrap();
+    assert_eq!(app_ctx["attribution"], "app_level_ambiguous");
+    assert_eq!(defense.suspends(), vec![q2]);
 
     engine.shutdown_and_flush().await.expect("shutdown");
 }
@@ -5286,6 +5294,479 @@ async fn daemon_p3_31_cidr_network_allow_and_block_enforced_with_deny_precedence
         "198.51.100.200 in 198.51.100.128/25 must be blocked with deny-overrides-allow"
     );
     assert!(engine.has_active_wfp_filter(app_exe, Some(denied_ip), false));
+
+    drop(server);
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-32` (`PRRT_..._WNKR` & `WNMN`): Unrelated PID DNS queries do NOT prematurely
+/// wake a parked `WfpDropEvent` during `wfp_drop_dns_grace_ms`; real candidate DNS authorizes it;
+/// and ambiguous CIDR/wildcard `AllowedByRule` installs a concrete IP WFP Permit or alerts with
+/// `LEDR-NET-POLICY-PERMIT-FAILED` on BFE failure.
+#[tokio::test]
+async fn daemon_p3_32_wfp_drop_ignores_unrelated_pid_dns_and_allows_ambiguous_cidr() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+    let ps_hash = "d".repeat(64);
+    let chrome_hash = "e".repeat(64);
+    inspector.register(ps_exe, Some(&ps_hash), None);
+    inspector.register(chrome_exe, Some(&chrome_hash), None);
+
+    let now_ms = current_unix_ms();
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-PS-DOM-ALLOW".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: ps_exe.to_string(),
+            sha256: Some(ps_hash.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("api.realps.example".to_string()),
+            created_at_ms: now_ms,
+            created_by: "test".to_string(),
+        })
+        .expect("seed ps domain allow");
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-PS-CIDR-ALLOW".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: ps_exe.to_string(),
+            sha256: Some(ps_hash),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("198.51.100.0/24".to_string()),
+            created_at_ms: now_ms + 1,
+            created_by: "test".to_string(),
+        })
+        .expect("seed ps cidr allow");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            preemptive_startup_executables: vec![ps_exe.to_string()],
+            wfp_drop_dns_grace_ms: 400,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector,
+    );
+
+    let ps1 = ProcessIdentity::new(8501, unix_ms_to_filetime(now_ms - 500));
+    let ch1 = ProcessIdentity::new(8502, unix_ms_to_filetime(now_ms - 500));
+    for (proc_id, exe) in [(ps1, ps_exe), (ch1, chrome_exe)] {
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: proc_id,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("start proc");
+    }
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 2).await);
+
+    // Part A: Unrelated Chrome DNS for `api.realps.example` -> target_ip MUST NOT flush ps1's
+    // parked WfpDropEvent early. Only ps1's own DnsQuery authorizes it (0 alerts, 0 suspends).
+    let dom_ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 77));
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 1,
+        rule_handle: 1,
+        exe_path: ps_exe.to_string(),
+        protocol: 6,
+        dst_ip: dom_ip,
+        dst_port: 443,
+        timestamp_ms: now_ms + 10,
+    }));
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: ch1.pid,
+            query_name: "api.realps.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![dom_ip],
+            timestamp_ms: now_ms + 20,
+        })
+        .await
+        .expect("chrome dns");
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        !engine.has_active_wfp_filter(ps_exe, Some(dom_ip), true),
+        "unrelated chrome DnsQuery must not authorize powershell WfpDropEvent"
+    );
+    assert!(defense.suspends().is_empty());
+
+    // Now ps1 emits the real DnsQuery well inside the 400ms grace window.
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: ps1.pid,
+            query_name: "api.realps.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![dom_ip],
+            timestamp_ms: now_ms + 50,
+        })
+        .await
+        .expect("ps1 dns");
+    assert!(
+        wait_until(1_000, || {
+            engine.has_active_wfp_filter(ps_exe, Some(dom_ip), true)
+        })
+        .await,
+        "ps1 DnsQuery must flush parked WfpDropEvent and install DomainPolicy permit"
+    );
+    assert!(defense.suspends().is_empty());
+    assert!(store.list_alerts(None, 20).unwrap().is_empty());
+
+    // Part B: Start a second powershell instance so PID attribution is ambiguous (`candidates.len() == 2`).
+    let ps2 = ProcessIdentity::new(8503, unix_ms_to_filetime(now_ms - 400));
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: ps2,
+            parent_pid: 4,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start ps2");
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 3).await);
+
+    let cidr_ip_ok = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 2,
+        rule_handle: 2,
+        exe_path: ps_exe.to_string(),
+        protocol: 6,
+        dst_ip: cidr_ip_ok,
+        dst_port: 443,
+        timestamp_ms: now_ms + 100,
+    }));
+    assert!(
+        wait_until(1_500, || {
+            engine.has_active_wfp_filter(ps_exe, Some(cidr_ip_ok), true)
+        })
+        .await,
+        "ambiguous AllowedByRule CIDR must materialize concrete IP WFP permit"
+    );
+    assert!(store.list_alerts(None, 20).unwrap().is_empty());
+    assert!(defense.suspends().is_empty());
+
+    // Now simulate BFE permit installation failure on another CIDR IP -> must alert instead of silently dropping!
+    defense.set_fail_wfp_add_permits(true);
+    let cidr_ip_fail = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 3,
+        rule_handle: 3,
+        exe_path: ps_exe.to_string(),
+        protocol: 6,
+        dst_ip: cidr_ip_fail,
+        dst_port: 443,
+        timestamp_ms: now_ms + 150,
+    }));
+    assert!(
+        wait_until(1_500, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 20)
+                .map(|v| {
+                    v.iter()
+                        .any(|a| a.rule_id == "LEDR-NET-POLICY-PERMIT-FAILED")
+                })
+                .unwrap_or(false)
+        })
+        .await,
+        "failed permit installation under AllowedByRule must raise LEDR-NET-POLICY-PERMIT-FAILED alert"
+    );
+    let permit_alert = store
+        .list_alerts(Some(AlertStatus::Pending), 20)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.rule_id == "LEDR-NET-POLICY-PERMIT-FAILED")
+        .unwrap();
+    let ctx: serde_json::Value =
+        serde_json::from_str(&permit_alert.context_json).expect("context_json");
+    assert_eq!(ctx["attribution"], serde_json::json!("app_level_ambiguous"));
+    assert!(ctx["wfp_permit_error"].as_str().is_some());
+    assert!(defense.suspends().is_empty());
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-33` (`PRRT_..._WNNr`): Telemetry flood never starves `wfp_drop_rx`, and bursting past
+/// `wfp_drop_tx` capacity overflows losslessly into `wfp_drop_overflow` without dropping alerts.
+#[tokio::test]
+async fn daemon_p3_33_wfp_drop_not_starved_by_telemetry_burst_and_overflow() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let app_exe = r"C:\Temp\drop_burst.exe";
+    let now_ms = current_unix_ms();
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            high_priority_capacity: 4,
+            telemetry_capacity: 64,
+            preemptive_startup_executables: vec![app_exe.to_string()],
+            wfp_drop_dns_grace_ms: 0,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector,
+    );
+
+    // Start two instances of `app_exe` (multi-instance -> AppWfpAlertDedup per `(exe, dst_ip)`)
+    // plus one instance each of `drop_burst_9..12.exe` so every queued/coalesced drop has
+    // active process attribution in `ActiveProcessTable`.
+    for (idx, exe) in [
+        (8601, app_exe.to_string()),
+        (8602, app_exe.to_string()),
+        (8609, r"C:\Temp\drop_burst_9.exe".to_string()),
+        (8610, r"C:\Temp\drop_burst_10.exe".to_string()),
+        (8611, r"C:\Temp\drop_burst_11.exe".to_string()),
+        (8612, r"C:\Temp\drop_burst_12.exe".to_string()),
+    ] {
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(idx, unix_ms_to_filetime(now_ms - 500)),
+                parent_pid: 4,
+                exe_path: exe.clone(),
+                command_line: exe,
+                user_sid: None,
+            })
+            .await
+            .expect("start burst proc");
+    }
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 6).await);
+
+    let classified = engine.classified_sender();
+    classified.classifier().mark_steady(9999);
+
+    // Part A: Saturate Telemetry continuously while injecting a WfpDropEvent -> must not starve.
+    let stop_flood = Arc::new(AtomicBool::new(false));
+    let stop_c = Arc::clone(&stop_flood);
+    let sender_c = classified.clone();
+    let flood_task = tokio::spawn(async move {
+        let mut seq = 0i64;
+        while !stop_c.load(Ordering::Relaxed) {
+            let _ = sender_c
+                .send(SensorEvent::DnsQuery {
+                    pid: 9999,
+                    query_name: format!("flood-{seq}.example"),
+                    query_type: 1,
+                    resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))],
+                    timestamp_ms: now_ms + seq,
+                })
+                .await;
+            seq = seq.wrapping_add(1);
+            if seq % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    // Wait briefly so Telemetry queue stays full before injecting WfpDropEvent.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let first_drop_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200));
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 1,
+        rule_handle: 1,
+        exe_path: app_exe.to_string(),
+        protocol: 6,
+        dst_ip: first_drop_ip,
+        dst_port: 443,
+        timestamp_ms: now_ms + 1,
+    }));
+
+    assert!(
+        wait_until(1_500, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        })
+        .await,
+        "WfpDropEvent must be handled promptly even under continuous Telemetry saturation"
+    );
+    stop_flood.store(true, Ordering::Release);
+    flood_task.await.expect("join telemetry flood");
+
+    // Part B: Burst 12 distinct WfpDropEvents past `high_priority_capacity = 4` -> overflow path
+    // absorbs excess without dropping any event (8 on `app_exe` + 4 distinct exes exercise both
+    // `wfp_drop_overflow.queue` and `coalesced_by_exe` deterministically).
+    for i in 1u8..=12 {
+        let burst_exe = if i <= 8 {
+            app_exe.to_string()
+        } else {
+            format!(r"C:\Temp\drop_burst_{i}.exe")
+        };
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: u64::from(i) + 10,
+            rule_handle: u64::from(i) + 10,
+            exe_path: burst_exe,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, i)),
+            dst_port: 8443,
+            timestamp_ms: now_ms + 100 + i64::from(i),
+        }));
+    }
+    assert!(
+        engine.wfp_drop_overflow_pushed() > 0,
+        "burst >4 WfpDropEvents with capacity=4 must exercise bounded overflow queue"
+    );
+    assert!(
+        wait_until(2_500, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 50)
+                .map(|v| v.len() == 13)
+                .unwrap_or(false)
+        })
+        .await,
+        "all 1 + 12 distinct WfpDropEvents must materialize Pending alerts with 0 loss"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-34` (`PRRT_..._WNJE`): Repeated WFP failures on a rule that IS part of an IPC
+/// `UpsertRule` mutation must NOT be suppressed by prior startup failures; IPC returns
+/// `WFP_SYNC_ERROR` and rolls back the SQLite edit.
+#[tokio::test]
+async fn daemon_p3_34_prior_failed_rule_update_still_returns_firewall_sync_error() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let fail_exe = r"C:\Temp\repeat_fail_rule.exe";
+    defense.add_fail_wfp_exe("repeat_fail_rule.exe");
+
+    let now_ms = current_unix_ms();
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-FAIL-REPEAT".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: fail_exe.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("203.0.113.50".to_string()),
+            created_at_ms: now_ms,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed failing block rule");
+
+    let pipe_name = unique_test_pipe_name();
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_name.clone(),
+            dev_mode_bypass_ui_auth: true,
+            ..DaemonConfig::default()
+        },
+        defense,
+        notifier,
+        inspector,
+    );
+    let server = start_ipc_server(Arc::clone(&engine)).expect("start ipc");
+
+    // 1. Re-upserting the SAME failing target (`203.0.113.50`) with updated metadata must still
+    //    surface `WFP_SYNC_ERROR` and roll back `created_by` to `"seed"`.
+    let same_target_update = AllowlistRuleRecord {
+        rule_id: "R-FAIL-REPEAT".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: fail_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("203.0.113.50".to_string()),
+        created_at_ms: now_ms + 10,
+        created_by: "ui-retry".to_string(),
+    };
+    let pipe_c = pipe_name.clone();
+    let resp1 = tokio::task::spawn_blocking(move || {
+        send_pipe_request(
+            &pipe_c,
+            &IpcRequest::UpsertRule {
+                rule: same_target_update,
+            },
+        )
+    })
+    .await
+    .expect("join upsert same target");
+    assert!(
+        matches!(&resp1, IpcResponse::Error { code, .. } if code == "WFP_SYNC_ERROR"),
+        "re-upserting failing rule with same target must still return WFP_SYNC_ERROR, got {resp1:?}"
+    );
+    assert_eq!(
+        store
+            .get_rule("R-FAIL-REPEAT")
+            .unwrap()
+            .unwrap()
+            .created_by,
+        "seed"
+    );
+
+    // 2. Updating the rule to a different failing IP (`203.0.113.51`) must likewise fail and
+    //    preserve `"203.0.113.50"` in SQLite.
+    let new_target_update = AllowlistRuleRecord {
+        rule_id: "R-FAIL-REPEAT".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: fail_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("203.0.113.51".to_string()),
+        created_at_ms: now_ms + 20,
+        created_by: "ui-edit".to_string(),
+    };
+    let pipe_c = pipe_name.clone();
+    let resp2 = tokio::task::spawn_blocking(move || {
+        send_pipe_request(
+            &pipe_c,
+            &IpcRequest::UpsertRule {
+                rule: new_target_update,
+            },
+        )
+    })
+    .await
+    .expect("join upsert new target");
+    assert!(
+        matches!(&resp2, IpcResponse::Error { code, .. } if code == "WFP_SYNC_ERROR"),
+        "updating failing rule target must return WFP_SYNC_ERROR, got {resp2:?}"
+    );
+    assert_eq!(
+        store
+            .get_rule("R-FAIL-REPEAT")
+            .unwrap()
+            .unwrap()
+            .allowed_target
+            .as_deref(),
+        Some("203.0.113.50")
+    );
 
     drop(server);
     engine.shutdown_and_flush().await.expect("shutdown");

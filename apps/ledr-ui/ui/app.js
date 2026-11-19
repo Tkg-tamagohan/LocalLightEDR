@@ -1519,6 +1519,7 @@
       decision = "AllowOnce";
       previewStatus = "ApprovedOnce";
     } else {
+      const details = extractAlertDetails(alert, buildHierarchy(state.snapshot).byId);
       const allowDestRaw = el.optAllowDest.value.trim();
       if (details.isNetworkAlert && allowDestRaw.includes("/") && !isLiteralIpOrCidr(allowDestRaw)) {
         state.triageFeedback = {

@@ -47,6 +47,127 @@ fn merge_domain_hint(hints: &mut Vec<String>, raw: &str) {
     hints.push(norm);
 }
 
+/// Merges `authorizing_hints` (protected from eviction by co-hosted hints) and `cohosted_hints`
+/// into `target` while keeping `target.len() <= MAX_DOMAIN_HINTS_PER_FILTER`.
+///
+/// Within the 32-hint cap, preserves insertion order (`authorizing_hints` followed by
+/// `cohosted_hints` appended to existing hints without duplicates). On overflow, evicts the
+/// oldest unprotected slot first so `authorizing_hints` are never pushed out by co-hosted hints
+/// (`AUD-P3-02`).
+fn merge_domain_hints_prioritized(
+    target: &mut Vec<String>,
+    authorizing_hints: &[String],
+    cohosted_hints: &[String],
+) {
+    let protected: HashSet<&str> = authorizing_hints.iter().map(String::as_str).collect();
+
+    for hint in authorizing_hints {
+        if target.iter().any(|h| h == hint) {
+            continue;
+        }
+        while target.len() >= MAX_DOMAIN_HINTS_PER_FILTER {
+            if let Some(evict_idx) = target
+                .iter()
+                .position(|existing| !protected.contains(existing.as_str()))
+            {
+                target.remove(evict_idx);
+            } else {
+                target.remove(0);
+            }
+        }
+        target.push(hint.clone());
+    }
+
+    for hint in cohosted_hints {
+        if target.iter().any(|h| h == hint) {
+            continue;
+        }
+        if target.len() >= MAX_DOMAIN_HINTS_PER_FILTER {
+            let Some(evict_idx) = target
+                .iter()
+                .position(|existing| !protected.contains(existing.as_str()))
+            else {
+                // All slots are occupied by protected authorizing hints; do not evict them.
+                continue;
+            };
+            target.remove(evict_idx);
+        }
+        target.push(hint.clone());
+    }
+}
+
+/// Computes the pruned `domain_hints` for a [`WfpFilterOrigin::DomainPolicy`] IP Permit filter
+/// given a retirement predicate `is_retired` (DNS migration or `superseded_permit_hints`).
+///
+/// Shared between [`WfpRuleManager::prune_migrated_domain_permit_hints_for_query`] and
+/// [`WfpRuleManager::reconcile_persisted_rules_with_dns_context`] so both paths enforce identical
+/// semantics:
+/// - When surviving (non-retired) hints or `static_allowed` preserve `AllowedByRule`, prune all
+///   retired hints.
+/// - Otherwise prune retired unallowed co-hosted hints while retaining retired hints that still
+///   match a persisted `NetworkAllow` rule (preserving round-robin/cached-IP permits and rule
+///   attribution on subsequent block/delete).
+/// - Never corrupt a non-static Permit into untagged `domain_hints: []`.
+fn compute_pruned_permit_hints(
+    domain_hints: &[String],
+    identity: &BinaryIdentity,
+    ip: IpAddr,
+    rules: &[AllowlistRuleRecord],
+    static_allowed: bool,
+    mut is_retired: impl FnMut(&str) -> bool,
+) -> Vec<String> {
+    let mut normalized_all: Vec<String> = Vec::with_capacity(domain_hints.len());
+    let mut surviving_hints: Vec<String> = Vec::with_capacity(domain_hints.len());
+    let mut retired_flags: Vec<bool> = Vec::with_capacity(domain_hints.len());
+
+    for raw in domain_hints {
+        let Some(norm) = normalize_domain_hint(raw) else {
+            continue;
+        };
+        if normalized_all.iter().any(|h| h == &norm) {
+            continue;
+        }
+        let retired = is_retired(&norm);
+        if !retired {
+            surviving_hints.push(norm.clone());
+        }
+        normalized_all.push(norm);
+        retired_flags.push(retired);
+    }
+
+    if !retired_flags.iter().any(|&r| r) {
+        return normalized_all;
+    }
+
+    let surviving_preserves_allow = static_allowed
+        || surviving_hints.iter().any(|hint| {
+            matches!(
+                evaluate_outbound_policy(identity, ip, Some(hint.as_str()), rules),
+                OutboundDecision::AllowedByRule { .. }
+            )
+        });
+    if surviving_preserves_allow {
+        return surviving_hints;
+    }
+
+    let mut retained: Vec<String> = Vec::with_capacity(normalized_all.len());
+    for (norm, retired) in normalized_all.iter().zip(retired_flags.iter()) {
+        if !*retired
+            || rules.iter().any(|r| {
+                r.scope == RuleScope::NetworkAllow
+                    && matches_network_allow_rule(r, identity, ip, Some(norm.as_str()))
+            })
+        {
+            retained.push(norm.clone());
+        }
+    }
+
+    if retained.is_empty() && !static_allowed {
+        return normalized_all;
+    }
+    retained
+}
+
 /// Origin tracking why a dynamic WFP filter is currently installed in BFE.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WfpFilterOrigin {
@@ -796,11 +917,42 @@ impl WfpRuleManager {
         domain_hints: &[S],
         defense: &dyn ActiveDefenseController,
     ) -> Result<Option<u64>, String> {
+        self.ensure_ip_permit_for_domain_hints_prioritized(
+            exe_path,
+            dst_ip,
+            &[] as &[&str],
+            domain_hints,
+            defense,
+        )
+    }
+
+    /// Like [`WfpRuleManager::ensure_ip_permit_for_domain_hints`], protecting `authorizing_hints`
+    /// from FIFO eviction by `cohosted_hints` when [`MAX_DOMAIN_HINTS_PER_FILTER`] is reached
+    /// (`AUD-P3-02`). Within the 32-hint cap, preserves insertion order (`authorizing_hints`
+    /// followed by `cohosted_hints`).
+    pub fn ensure_ip_permit_for_domain_hints_prioritized<S1: AsRef<str>, S2: AsRef<str>>(
+        &mut self,
+        exe_path: &str,
+        dst_ip: IpAddr,
+        authorizing_hints: &[S1],
+        cohosted_hints: &[S2],
+        defense: &dyn ActiveDefenseController,
+    ) -> Result<Option<u64>, String> {
         let canon_ip = canonical_ip(dst_ip);
-        let mut normalized_hints = Vec::new();
-        for raw in domain_hints {
-            merge_domain_hint(&mut normalized_hints, raw.as_ref());
+        let mut norm_auth = Vec::new();
+        for raw in authorizing_hints {
+            merge_domain_hint(&mut norm_auth, raw.as_ref());
         }
+        let mut norm_cohost = Vec::new();
+        for raw in cohosted_hints {
+            let Some(norm) = normalize_domain_hint(raw.as_ref()) else {
+                continue;
+            };
+            if !norm_auth.iter().any(|h| h == &norm) && !norm_cohost.iter().any(|h| h == &norm) {
+                norm_cohost.push(norm);
+            }
+        }
+
         let ip_key = (Self::exe_key(exe_path), Some(canon_ip));
         if let Some(existing) = self.installed.get_mut(&ip_key) {
             if existing.allow {
@@ -808,23 +960,25 @@ impl WfpRuleManager {
                     domain_hints: ref mut cur_hints,
                 } = existing.origin
                 {
-                    for hint in &normalized_hints {
-                        merge_domain_hint(cur_hints, hint);
-                    }
+                    merge_domain_hints_prioritized(cur_hints, &norm_auth, &norm_cohost);
                 }
                 return Ok(Some(existing.handle));
             }
             // Do not override an explicit/domain IP-specific Block filter (deny-overrides-allow).
+            let mut log_hints = Vec::new();
+            merge_domain_hints_prioritized(&mut log_hints, &norm_auth, &norm_cohost);
             tracing::warn!(
                 exe_path = %exe_path,
                 dst_ip = %canon_ip,
-                allowed_domain_hints = ?normalized_hints,
+                allowed_domain_hints = ?log_hints,
                 existing_origin = ?existing.origin,
                 "suppressing IP-level WFP Permit for allowed domain because an existing IP Block shares this destination IP (deny-overrides-allow)"
             );
             return Ok(None);
         }
 
+        let mut normalized_hints = Vec::new();
+        merge_domain_hints_prioritized(&mut normalized_hints, &norm_auth, &norm_cohost);
         self.evict_domain_policy_if_full(defense);
         let handle = defense.add_wfp_app_rule(Path::new(exe_path), Some(canon_ip), true)?;
         self.installed.insert(
@@ -941,18 +1095,41 @@ impl WfpRuleManager {
         out
     }
 
+    /// Returns the `domain_hints` of a live [`WfpFilterOrigin::DomainPolicy`] IP Permit filter
+    /// for `(exe_path, remote_ip)` (canonicalizing `remote_ip`), or `None` when no live
+    /// `DomainPolicy` IP Permit exists for that target (`AUD-P3-01`).
+    pub fn domain_policy_permit_hints(
+        &self,
+        exe_path: &str,
+        remote_ip: IpAddr,
+    ) -> Option<Vec<String>> {
+        let key = (Self::exe_key(exe_path), Some(canonical_ip(remote_ip)));
+        let entry = self.installed.get(&key)?;
+        if !entry.allow {
+            return None;
+        }
+        match &entry.origin {
+            WfpFilterOrigin::DomainPolicy { domain_hints } => Some(domain_hints.clone()),
+            _ => None,
+        }
+    }
+
     /// Prunes migrated/superseded domains from [`WfpFilterOrigin::DomainPolicy`] IP Permit filters
-    /// for `exe_path` so a domain that has moved to a different IP cannot falsely revoke an active
-    /// shared-IP or CIDR Permit if that domain is later blocked (`#1`, `#4`).
-    ///
-    /// Never transitions a non-static single-domain Permit into an untagged `domain_hints: []`
-    /// Permit (preserving round-robin in-flight Permits and rule attribution).
+    /// for `exe_path` using [`compute_pruned_permit_hints`]:
+    /// - When surviving hints or static policy still satisfy `AllowedByRule`, prunes all migrated/
+    ///   superseded hints so later blocks on a migrated domain cannot falsely revoke an active
+    ///   shared-IP or CIDR Permit.
+    /// - Otherwise prunes migrated unallowed co-hosted hints while retaining migrated authorizing
+    ///   hints that match a persisted `NetworkAllow` rule so unrelated reconciliations do not
+    ///   drop a cached-IP Permit (`PRRT_kwDOVyjVyM65e5kL`).
+    /// - Never transitions a non-static Permit into an untagged `domain_hints: []` Permit.
     pub fn prune_migrated_domain_permit_hints_for_query(
         &mut self,
         exe_path: &str,
         query_name: &str,
         new_ips: &[IpAddr],
-        static_allowed_ips: &HashSet<IpAddr>,
+        identity: &BinaryIdentity,
+        rules: &[AllowlistRuleRecord],
         superseded_pairs: &HashSet<(IpAddr, String)>,
     ) -> usize {
         let exe_k = Self::exe_key(exe_path);
@@ -962,10 +1139,6 @@ impl WfpRuleManager {
         let new_canon: HashSet<IpAddr> = new_ips.iter().map(|ip| canonical_ip(*ip)).collect();
         let has_v4 = new_canon.iter().any(IpAddr::is_ipv4);
         let has_v6 = new_canon.iter().any(IpAddr::is_ipv6);
-        let static_allowed_canon: HashSet<IpAddr> = static_allowed_ips
-            .iter()
-            .map(|ip| canonical_ip(*ip))
-            .collect();
         let norm_superseded: HashSet<(IpAddr, String)> = superseded_pairs
             .iter()
             .filter_map(|(ip, dom)| {
@@ -988,27 +1161,30 @@ impl WfpRuleManager {
                 continue;
             }
             let same_family = (has_v4 && ip.is_ipv4()) || (has_v6 && ip.is_ipv6());
-            let mut next_hints: Vec<String> = Vec::with_capacity(domain_hints.len());
-            for raw_hint in domain_hints {
-                let Some(hint_norm) = normalize_domain_hint(raw_hint) else {
-                    continue;
-                };
-                let is_domain_hint =
-                    !hint_norm.contains('/') && parse_literal_target_ip(&hint_norm).is_none();
-                let matches_migrated_query = !new_canon.contains(&ip)
-                    && same_family
-                    && is_domain_hint
-                    && (hint_norm == norm_query
-                        || (hint_norm.contains('*')
-                            && matches_network_target(&hint_norm, ip, Some(&norm_query))));
-                let is_superseded = norm_superseded.contains(&(ip, hint_norm.clone()));
-                if !matches_migrated_query && !is_superseded {
-                    merge_domain_hint(&mut next_hints, &hint_norm);
-                }
-            }
-            if &next_hints != domain_hints
-                && (!next_hints.is_empty() || static_allowed_canon.contains(&ip))
-            {
+            let static_allowed = matches!(
+                evaluate_outbound_policy(identity, ip, None, rules),
+                OutboundDecision::AllowedByRule { .. }
+            );
+            let next_hints = compute_pruned_permit_hints(
+                domain_hints,
+                identity,
+                ip,
+                rules,
+                static_allowed,
+                |hint_norm| {
+                    let is_domain_hint =
+                        !hint_norm.contains('/') && parse_literal_target_ip(hint_norm).is_none();
+                    let matches_migrated_query = !new_canon.contains(&ip)
+                        && same_family
+                        && is_domain_hint
+                        && (hint_norm == norm_query
+                            || (hint_norm.contains('*')
+                                && matches_network_target(hint_norm, ip, Some(&norm_query))));
+                    matches_migrated_query
+                        || norm_superseded.contains(&(ip, hint_norm.to_string()))
+                },
+            );
+            if &next_hints != domain_hints {
                 updated_hints.push((k.clone(), next_hints));
             }
         }
@@ -1967,9 +2143,9 @@ impl WfpRuleManager {
                             keys_to_remove.push(key.clone());
                         }
                     } else {
-                        // DomainPolicy Permit: first prune any hint positively superseded in DNS
-                        // history (provided either another hint remains or the IP is statically
-                        // allowed, so a round-robin single-domain Permit is not turned untagged).
+                        // DomainPolicy Permit: prune hints superseded in DNS history using the
+                        // shared `compute_pruned_permit_hints` helper so DNS-time pruning and
+                        // reconciliation stay strictly aligned (`PRRT_kwDOVyjVyM65e5kL`).
                         // Then if ANY remaining hint matches `BlockedByRule`, deny-overrides-allow
                         // revokes the Permit immediately; otherwise keep while at least one hint
                         // (or static allow when pruned to empty) stays `AllowedByRule`.
@@ -1977,24 +2153,20 @@ impl WfpRuleManager {
                             evaluate_outbound_policy(identity, ip, None, rules),
                             OutboundDecision::AllowedByRule { .. }
                         );
-                        let mut active_hints: Vec<String> = Vec::with_capacity(domain_hints.len());
-                        for hint in domain_hints {
-                            let is_superseded = normalize_domain_hint(hint).is_some_and(|norm| {
-                                dns_ctx
-                                    .superseded_permit_hints
-                                    .contains(&(key.0.clone(), ip, norm))
-                            });
-                            if !is_superseded {
-                                active_hints.push(hint.clone());
-                            }
-                        }
-                        let effective_hints = if active_hints.len() < domain_hints.len()
-                            && (!active_hints.is_empty() || static_allowed)
-                        {
-                            active_hints
-                        } else {
-                            domain_hints.clone()
-                        };
+                        let effective_hints = compute_pruned_permit_hints(
+                            domain_hints,
+                            identity,
+                            ip,
+                            rules,
+                            static_allowed,
+                            |norm| {
+                                dns_ctx.superseded_permit_hints.contains(&(
+                                    key.0.clone(),
+                                    ip,
+                                    norm.to_string(),
+                                ))
+                            },
+                        );
 
                         if effective_hints.is_empty() {
                             // Reachable only when `static_allowed == true` (so `None` is
@@ -3241,11 +3413,37 @@ mod tests {
             .ensure_ip_permit_for_domain_rule(sync_exe, cidr_mig_ip, "cdn-moved.example", &defense)
             .expect("cidr-backed permit");
 
+        let sync_identity = inspector.inspect(sync_exe);
+        let allow_keep_mig = AllowlistRuleRecord {
+            rule_id: "R-ALLOW-KEEP-MIG".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: sync_exe.to_string(),
+            sha256: Some("d".repeat(64)),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("keep.example".to_string()),
+            created_at_ms: 10,
+            created_by: "test".to_string(),
+        };
+        let allow_solo_mig = AllowlistRuleRecord {
+            rule_id: "R-ALLOW-SOLO-MIG".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: sync_exe.to_string(),
+            sha256: Some("d".repeat(64)),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("solo.example".to_string()),
+            created_at_ms: 10,
+            created_by: "test".to_string(),
+        };
+        let mig_rules = [allow_keep_mig, allow_solo_mig];
+
         let pruned_multi = fw_perm.prune_migrated_domain_permit_hints_for_query(
             sync_exe,
             "moved.example",
             &[migrated_dest],
-            &HashSet::new(),
+            &sync_identity,
+            &mig_rules,
             &HashSet::new(),
         );
         assert_eq!(pruned_multi, 1);
@@ -3259,7 +3457,8 @@ mod tests {
             sync_exe,
             "solo.example",
             &[migrated_dest],
-            &HashSet::new(),
+            &sync_identity,
+            &mig_rules,
             &HashSet::new(),
         );
         assert_eq!(
@@ -3466,5 +3665,432 @@ mod tests {
                 .is_none(),
             "unrelated rule must remain unblocked"
         );
+    }
+
+    /// `FIREWALL-P3-48A` (`PRRT_kwDOVyjVyM65e5kL` + `AUD-P3-02`):
+    /// - Shared IP (`api.example` allowed + `other.example` unallowed) migrating `api.example`
+    ///   retains the authorizing hint across DNS-time pruning and unrelated reconciliation;
+    /// - Subsequent migration of unallowed `other.example` selectively prunes `other.example`
+    ///   while keeping `api.example` (with rollback fidelity);
+    /// - Multi-allow shared IP (`keep.example` + `api.example` + `other.example`) prunes the
+    ///   migrating `api.example` so blocking `api.example` preserves `keep.example`'s Permit;
+    /// - Post-migration blocks (`R-BLK-OTHER` and `R-BLK-API`) and allow-rule deletion
+    ///   (`R-ALLOW-API`) revoke the Permit with exact sole rule attribution and rollback fidelity;
+    /// - `ensure_ip_permit_for_domain_hints_prioritized` preserves insertion order within 32 hints
+    ///   and protects authorizing hints from FIFO eviction on `MAX_DOMAIN_HINTS_PER_FILTER` overflow.
+    #[test]
+    fn firewall_p3_48a_shared_ip_authorizing_hint_retention_and_prioritized_cap() {
+        let defense = StubDefense::new();
+        let sha = "e".repeat(64);
+        let inspector = StubInspector(sha.clone());
+        let exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let exe_k = WfpRuleManager::exe_key(exe);
+        let identity = inspector.inspect(exe);
+        let ip1 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 160));
+        let ip1_v6_mapped = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 160).to_ipv6_mapped());
+        let ip2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 161));
+        let ip3 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 162));
+
+        let mk_rule = |id: &str, scope: RuleScope, target: &str| AllowlistRuleRecord {
+            rule_id: id.to_string(),
+            scope,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some(target.to_string()),
+            created_at_ms: 100,
+            created_by: "test".to_string(),
+        };
+
+        let r_allow_api = mk_rule("R-ALLOW-API", RuleScope::NetworkAllow, "api.example");
+        let r_allow_keep = mk_rule("R-ALLOW-KEEP", RuleScope::NetworkAllow, "keep.example");
+        let r_blk_other = mk_rule("R-BLK-OTHER", RuleScope::NetworkBlock, "other.example");
+        let r_blk_api = mk_rule("R-BLK-API", RuleScope::NetworkBlock, "api.example");
+        let r_unrelated = AllowlistRuleRecord {
+            rule_id: "R-UNRELATED".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: r"C:\Tools\other_unrelated.exe".to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("unrelated.example".to_string()),
+            created_at_ms: 101,
+            created_by: "test".to_string(),
+        };
+
+        // 1. Shared IP (`api.example` allowed + `other.example` unallowed): `api.example` moves to
+        //    `ip2` -> authorizing hint `api.example` MUST be retained across DNS-time pruning and
+        //    unrelated rule reconciliation.
+        let mut fw = WfpRuleManager::new();
+        fw.ensure_ip_permit_for_domain_hints_prioritized(
+            exe,
+            ip1,
+            &["api.example"],
+            &["other.example"],
+            &defense,
+        )
+        .expect("install shared-ip permit");
+        assert_eq!(
+            fw.domain_policy_permit_hints(exe, ip1),
+            Some(vec!["api.example".to_string(), "other.example".to_string()])
+        );
+        assert_eq!(
+            fw.domain_policy_permit_hints(exe, ip1_v6_mapped),
+            Some(vec!["api.example".to_string(), "other.example".to_string()]),
+            "domain_policy_permit_hints must canonicalize IPv4-mapped IPv6 addresses"
+        );
+        assert_eq!(fw.domain_policy_permit_hints(exe, ip2), None);
+
+        let mut sup_api_only: HashSet<(IpAddr, String)> = HashSet::new();
+        sup_api_only.insert((ip1, "api.example".to_string()));
+        let pruned_on_api_move = fw.prune_migrated_domain_permit_hints_for_query(
+            exe,
+            "api.example",
+            &[ip2],
+            &identity,
+            std::slice::from_ref(&r_allow_api),
+            &sup_api_only,
+        );
+        assert_eq!(
+            pruned_on_api_move, 0,
+            "migrating the sole authorizing domain while unallowed co-hosted hint remains must keep authorizing hint"
+        );
+        assert_eq!(
+            fw.domain_policy_permit_hints(exe, ip1),
+            Some(vec!["api.example".to_string(), "other.example".to_string()])
+        );
+
+        let mut dns_ctx_api_sup = WfpReconcileDnsContext::default();
+        dns_ctx_api_sup
+            .superseded_permit_hints
+            .insert((exe_k.clone(), ip1, "api.example".to_string()));
+        let rep_unrel = fw.reconcile_persisted_rules_with_dns_context(
+            &[r_allow_api.clone(), r_unrelated.clone()],
+            Some(std::slice::from_ref(&r_allow_api)),
+            &[],
+            &dns_ctx_api_sup,
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_unrel.removed, 0);
+        assert!(
+            fw.has_active_filter(exe, Some(ip1), true),
+            "unrelated rule reconciliation must preserve cached-IP Permit after authorizing domain migration"
+        );
+        assert_eq!(
+            fw.domain_policy_permit_hints(exe, ip1),
+            Some(vec!["api.example".to_string(), "other.example".to_string()])
+        );
+
+        // 2. Subsequent migration of unallowed `other.example` to `ip3`:
+        //    2a. Via `reconcile_persisted_rules_with_dns_context` (selective pruning + rollback).
+        let mut dns_ctx_both_sup = WfpReconcileDnsContext::default();
+        dns_ctx_both_sup
+            .superseded_permit_hints
+            .insert((exe_k.clone(), ip1, "api.example".to_string()));
+        dns_ctx_both_sup
+            .superseded_permit_hints
+            .insert((exe_k.clone(), ip1, "other.example".to_string()));
+        let rep_other_sup = fw.reconcile_persisted_rules_with_dns_context(
+            &[r_allow_api.clone(), r_blk_other.clone()],
+            Some(std::slice::from_ref(&r_allow_api)),
+            &[],
+            &dns_ctx_both_sup,
+            &inspector,
+            &defense,
+        );
+        assert!(
+            fw.has_active_filter(exe, Some(ip1), true),
+            "blocking unallowed co-hosted domain after it also migrated must NOT revoke Permit"
+        );
+        assert_eq!(
+            fw.domain_policy_permit_hints(exe, ip1),
+            Some(vec!["api.example".to_string()]),
+            "reconcile must selectively prune retired unallowed co-hosted hint while retaining authorizing hint"
+        );
+        fw.restore_promoted_filter_states(&rep_other_sup.promoted_backups);
+        assert_eq!(
+            fw.domain_policy_permit_hints(exe, ip1),
+            Some(vec!["api.example".to_string(), "other.example".to_string()]),
+            "rollback must faithfully restore pre-reconcile Permit hints"
+        );
+
+        //    2b. Via `prune_migrated_domain_permit_hints_for_query` on `other.example -> ip3`.
+        let mut sup_both: HashSet<(IpAddr, String)> = HashSet::new();
+        sup_both.insert((ip1, "api.example".to_string()));
+        sup_both.insert((ip1, "other.example".to_string()));
+        let pruned_other = fw.prune_migrated_domain_permit_hints_for_query(
+            exe,
+            "other.example",
+            &[ip3],
+            &identity,
+            std::slice::from_ref(&r_allow_api),
+            &sup_both,
+        );
+        assert_eq!(pruned_other, 1);
+        assert_eq!(
+            fw.domain_policy_permit_hints(exe, ip1),
+            Some(vec!["api.example".to_string()]),
+            "DNS-time pruning must selectively drop migrated unallowed other.example while keeping api.example"
+        );
+
+        // Re-restore `other.example` onto `ip1` Permit to test post-migration block & delete attribution.
+        fw.ensure_ip_permit_for_domain_hints_prioritized(
+            exe,
+            ip1,
+            &["api.example"],
+            &["other.example"],
+            &defense,
+        )
+        .expect("re-merge other.example");
+        assert_eq!(
+            fw.domain_policy_permit_hints(exe, ip1),
+            Some(vec!["api.example".to_string(), "other.example".to_string()])
+        );
+
+        // 3. Post-migration `R-BLK-OTHER` sole attribution and rollback fidelity.
+        *defense.fail_removes.lock().expect("lock fail_removes") = true;
+        let rep_blk_other_fail = fw.reconcile_persisted_rules_with_dns_context(
+            &[r_allow_api.clone(), r_blk_other.clone()],
+            Some(std::slice::from_ref(&r_allow_api)),
+            &[],
+            &dns_ctx_api_sup,
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_blk_other_fail.failed_ops.len(), 1);
+        assert_eq!(
+            rep_blk_other_fail.failed_ops[0].source_rule_ids,
+            vec!["R-BLK-OTHER".to_string()],
+            "blocking still-cohosted other.example must attribute solely to R-BLK-OTHER"
+        );
+        assert_eq!(
+            rep_blk_other_fail.failed_ops[0].domain_hints,
+            vec!["other.example".to_string()]
+        );
+        assert!(rep_blk_other_fail
+            .failure_summary_for_rules(&[&r_blk_other])
+            .is_some());
+        assert!(rep_blk_other_fail
+            .failure_summary_for_rules(&[&r_allow_api])
+            .is_none());
+        assert!(rep_blk_other_fail
+            .failure_summary_for_rules(&[&r_unrelated])
+            .is_none());
+
+        // 4. Post-migration `R-BLK-API` sole attribution (even though `api.example` is superseded).
+        let rep_blk_api_fail = fw.reconcile_persisted_rules_with_dns_context(
+            &[r_allow_api.clone(), r_blk_api.clone()],
+            Some(std::slice::from_ref(&r_allow_api)),
+            &[],
+            &dns_ctx_api_sup,
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_blk_api_fail.failed_ops.len(), 1);
+        assert_eq!(
+            rep_blk_api_fail.failed_ops[0].source_rule_ids,
+            vec!["R-BLK-API".to_string()],
+            "blocking migrated authorizing api.example must attribute solely to R-BLK-API"
+        );
+        assert_eq!(
+            rep_blk_api_fail.failed_ops[0].domain_hints,
+            vec!["api.example".to_string()]
+        );
+        assert!(rep_blk_api_fail
+            .failure_summary_for_rules(&[&r_blk_api])
+            .is_some());
+        assert!(rep_blk_api_fail
+            .failure_summary_for_rules(&[&r_allow_api])
+            .is_none());
+        assert!(rep_blk_api_fail
+            .failure_summary_for_rules(&[&r_unrelated])
+            .is_none());
+
+        // 5. Post-migration deletion of `R-ALLOW-API` sole attribution + removal rollback fidelity.
+        let rep_del_fail = fw.reconcile_persisted_rules_with_dns_context(
+            &[],
+            Some(std::slice::from_ref(&r_allow_api)),
+            &[],
+            &dns_ctx_api_sup,
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_del_fail.failed_ops.len(), 1);
+        assert_eq!(
+            rep_del_fail.failed_ops[0].source_rule_ids,
+            vec!["R-ALLOW-API".to_string()],
+            "deleting R-ALLOW-API after migration must attribute solely to R-ALLOW-API"
+        );
+        assert!(rep_del_fail
+            .failure_summary_for_rules(&[&r_allow_api])
+            .is_some());
+        assert!(rep_del_fail
+            .failure_summary_for_rules(&[&r_unrelated])
+            .is_none());
+
+        *defense.fail_removes.lock().expect("lock fail_removes") = false;
+        let rep_del_ok = fw.reconcile_persisted_rules_with_dns_context(
+            &[],
+            Some(std::slice::from_ref(&r_allow_api)),
+            &[],
+            &dns_ctx_api_sup,
+            &inspector,
+            &defense,
+        );
+        assert!(!fw.has_active_filter(exe, Some(ip1), true));
+        assert_eq!(rep_del_ok.removed_domain_filters.len(), 1);
+        assert_eq!(
+            rep_del_ok.removed_domain_filters[0].domain_hints,
+            vec!["api.example".to_string(), "other.example".to_string()]
+        );
+        fw.restore_removed_domain_filters(&rep_del_ok.removed_domain_filters, &defense);
+        assert!(fw.has_active_filter(exe, Some(ip1), true));
+        assert_eq!(
+            fw.domain_policy_permit_hints(exe, ip1),
+            Some(vec!["api.example".to_string(), "other.example".to_string()]),
+            "restore_removed_domain_filters must restore exact pre-removal Permit hints"
+        );
+
+        // 6. Multiple allowed domains (`keep.example` + `api.example` + `other.example`) sharing
+        //    `ip1`: when `api.example` moves to `ip2`, `keep.example` preserves `AllowedByRule`,
+        //    so `api.example` IS pruned and later `R-BLK-API` preserves `ip1` Permit.
+        let mut fw_multi = WfpRuleManager::new();
+        fw_multi
+            .ensure_ip_permit_for_domain_hints_prioritized(
+                exe,
+                ip1,
+                &["keep.example", "api.example"],
+                &["other.example"],
+                &defense,
+            )
+            .expect("install multi-allow permit");
+        let pruned_multi_allow = fw_multi.prune_migrated_domain_permit_hints_for_query(
+            exe,
+            "api.example",
+            &[ip2],
+            &identity,
+            &[r_allow_keep.clone(), r_allow_api.clone()],
+            &sup_api_only,
+        );
+        assert_eq!(pruned_multi_allow, 1);
+        assert_eq!(
+            fw_multi.domain_policy_permit_hints(exe, ip1),
+            Some(vec!["keep.example".to_string(), "other.example".to_string()])
+        );
+        let rep_multi_blk_api = fw_multi.reconcile_persisted_rules_with_dns_context(
+            &[r_allow_keep, r_allow_api.clone(), r_blk_api],
+            None,
+            &[],
+            &dns_ctx_api_sup,
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_multi_blk_api.removed, 0);
+        assert!(
+            fw_multi.has_active_filter(exe, Some(ip1), true),
+            "blocking migrated api.example must preserve ip1 Permit when keep.example remains allowed"
+        );
+
+        // 7. `MAX_DOMAIN_HINTS_PER_FILTER` (32) overflow protection (`AUD-P3-02`):
+        let mut fw_cap = WfpRuleManager::new();
+        let cap_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 170));
+        let cap_full_auth_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 171));
+        let cap_blk_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 172));
+
+        // 7a. Within 32 hints: preserves insertion order.
+        fw_cap
+            .ensure_ip_permit_for_domain_hints_prioritized(
+                exe,
+                cap_ip,
+                &["api.example"],
+                &["c00.example", "c01.example"],
+                &defense,
+            )
+            .expect("install initial prioritized permit");
+        assert_eq!(
+            fw_cap.domain_policy_permit_hints(exe, cap_ip),
+            Some(vec![
+                "api.example".to_string(),
+                "c00.example".to_string(),
+                "c01.example".to_string(),
+            ])
+        );
+
+        // 7b. Overflow with 40 co-hosted hints: len bounded at 32 and `api.example` is NEVER evicted.
+        let many_cohosts: Vec<String> = (0..40).map(|i| format!("c{i:02}.example")).collect();
+        fw_cap
+            .ensure_ip_permit_for_domain_hints_prioritized(
+                exe,
+                cap_ip,
+                &["api.example"],
+                &many_cohosts,
+                &defense,
+            )
+            .expect("merge 40 cohosted hints");
+        let hints_after = fw_cap
+            .domain_policy_permit_hints(exe, cap_ip)
+            .expect("permit hints after overflow");
+        assert_eq!(hints_after.len(), MAX_DOMAIN_HINTS_PER_FILTER);
+        assert!(
+            hints_after.iter().any(|h| h == "api.example"),
+            "authorizing hint api.example must never be FIFO-evicted by co-hosted hints"
+        );
+        assert_eq!(hints_after[0], "api.example");
+        assert_eq!(hints_after[1], "c09.example");
+        assert_eq!(hints_after[MAX_DOMAIN_HINTS_PER_FILTER - 1], "c39.example");
+
+        // Re-merging additional co-hosted hints onto an already-full Permit still retains `api.example`.
+        fw_cap
+            .ensure_ip_permit_for_domain_hints_prioritized(
+                exe,
+                cap_ip,
+                &["api.example"],
+                &["c40.example", "c41.example"],
+                &defense,
+            )
+            .expect("merge extra cohosted hints");
+        let hints_after_extra = fw_cap
+            .domain_policy_permit_hints(exe, cap_ip)
+            .expect("permit hints after extra cohost merge");
+        assert_eq!(hints_after_extra.len(), MAX_DOMAIN_HINTS_PER_FILTER);
+        assert!(hints_after_extra.iter().any(|h| h == "api.example"));
+        assert!(hints_after_extra.iter().any(|h| h == "c41.example"));
+        assert!(!hints_after_extra.iter().any(|h| h == "c09.example"));
+
+        // 7c. All 32 slots occupied by authorizing hints: co-hosted hints never evict any of them.
+        let all_auth: Vec<String> = (0..MAX_DOMAIN_HINTS_PER_FILTER)
+            .map(|i| format!("auth{i:02}.example"))
+            .collect();
+        fw_cap
+            .ensure_ip_permit_for_domain_hints_prioritized(
+                exe,
+                cap_full_auth_ip,
+                &all_auth,
+                &["cohost-extra.example"],
+                &defense,
+            )
+            .expect("install 32 authorizing hints");
+        let full_auth_hints = fw_cap
+            .domain_policy_permit_hints(exe, cap_full_auth_ip)
+            .expect("32 auth permit hints");
+        assert_eq!(full_auth_hints, all_auth);
+
+        // 7d. Existing IP Block conflict still returns Ok(None) (deny-overrides-allow).
+        fw_cap
+            .ensure_domain_policy_block(exe, cap_blk_ip, "bad.example", &defense)
+            .expect("install block");
+        let suppressed = fw_cap
+            .ensure_ip_permit_for_domain_hints_prioritized(
+                exe,
+                cap_blk_ip,
+                &["api.example"],
+                &["other.example"],
+                &defense,
+            )
+            .expect("conflict returns Ok(None)");
+        assert_eq!(suppressed, None);
+        assert_eq!(fw_cap.domain_policy_permit_hints(exe, cap_blk_ip), None);
     }
 }

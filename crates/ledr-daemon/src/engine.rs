@@ -21,11 +21,12 @@ use ledr_proto::{
 use ledr_rules::{
     assess_domain_risk, canonical_ip, classify_outbound_risk, compute_file_sha256_hex,
     evaluate_outbound_policy, inspect_authenticode, is_allowed_by_rules, is_external_ip,
-    matches_app_wide_network_allow, matches_app_wide_network_block, matches_network_block_rule,
-    matches_network_target, matches_path_pattern, parse_cidr_target, refresh_nrd_cache_cancellable,
-    validate_policy_rule, BinaryIdentity, DomainRiskAssessment, EarlyPruner, EventContext,
-    NrdCache, NrdCancelToken, NrdRefreshStats, OutboundDecision, OutboundRiskClass, SigmaEngine,
-    DEFAULT_NRD_FEED_URLS, NRD_MAX_ENTRIES, NRD_MAX_RESPONSE_BYTES, NRD_REFRESH_INTERVAL_MS,
+    matches_app_wide_network_allow, matches_app_wide_network_block, matches_network_allow_rule,
+    matches_network_block_rule, matches_network_target, matches_path_pattern, parse_cidr_target,
+    refresh_nrd_cache_cancellable, validate_policy_rule, BinaryIdentity, DomainRiskAssessment,
+    EarlyPruner, EventContext, NrdCache, NrdCancelToken, NrdRefreshStats, OutboundDecision,
+    OutboundRiskClass, SigmaEngine, DEFAULT_NRD_FEED_URLS, NRD_MAX_ENTRIES,
+    NRD_MAX_RESPONSE_BYTES, NRD_REFRESH_INTERVAL_MS,
 };
 use ledr_sensor_win::{NoopDefenseController, WfpDropEvent, WfpDropSinkFn};
 use ledr_store::{LedrStore, PurgeStats, StoreError};
@@ -1789,6 +1790,13 @@ impl DaemonEngine {
                                                     known_domains.push(dom);
                                                 }
                                             }
+                                            let (authorizing_hints, cohosted_hints) =
+                                                partition_permit_hints(
+                                                    &bin_identity,
+                                                    dst_ip,
+                                                    &known_domains,
+                                                    &current_rules,
+                                                );
                                             let fallback_domain = (parse_cidr_target(target_pat)
                                                 .is_err()
                                                 && !matches_network_target(
@@ -1800,18 +1808,22 @@ impl DaemonEngine {
                                                 .lock()
                                                 .unwrap_or_else(|e| e.into_inner());
                                             if fw.active_app_block(&exe).is_some() {
-                                                let permit_res = if !known_domains.is_empty() {
-                                                    fw.ensure_ip_permit_for_domain_hints(
+                                                let permit_res = if !authorizing_hints.is_empty()
+                                                    || !cohosted_hints.is_empty()
+                                                {
+                                                    fw.ensure_ip_permit_for_domain_hints_prioritized(
                                                         &exe,
                                                         dst_ip,
-                                                        &known_domains,
+                                                        &authorizing_hints,
+                                                        &cohosted_hints,
                                                         &*self.defense,
                                                     )
                                                 } else {
-                                                    fw.ensure_ip_permit_for_domain_rule(
+                                                    fw.ensure_ip_permit_for_domain_hints_prioritized(
                                                         &exe,
                                                         dst_ip,
-                                                        fallback_domain.unwrap_or(""),
+                                                        &[fallback_domain.unwrap_or("")],
+                                                        &[] as &[&str],
                                                         &*self.defense,
                                                     )
                                                 };
@@ -3180,16 +3192,6 @@ impl DaemonEngine {
                 }
             }
 
-            let mut static_allowed_ips: HashSet<IpAddr> = HashSet::new();
-            for (perm_ip, _) in &candidate_permits {
-                if matches!(
-                    evaluate_outbound_policy(&bin_identity, *perm_ip, None, &rules),
-                    OutboundDecision::AllowedByRule { .. }
-                ) {
-                    static_allowed_ips.insert(*perm_ip);
-                }
-            }
-
             {
                 let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                 if !candidate_blocks.is_empty() {
@@ -3208,7 +3210,8 @@ impl DaemonEngine {
                         exe_path,
                         norm_query,
                         &all_canon_ips,
-                        &static_allowed_ips,
+                        &bin_identity,
+                        &rules,
                         &superseded_permit_pairs,
                     );
                 }
@@ -3365,16 +3368,19 @@ impl DaemonEngine {
                         );
                         continue;
                     }
-                    let permit_hints: Vec<&str> = shared_candidates
+                    let permit_candidates: Vec<&str> = shared_candidates
                         .iter()
                         .map(|(dom, _)| dom.as_str())
                         .collect();
+                    let (authorizing_hints, cohosted_hints) =
+                        partition_permit_hints(&bin_identity, ip, &permit_candidates, &rules);
                     let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                     if fw.active_app_block(exe_path).is_some() {
-                        if let Err(err) = fw.ensure_ip_permit_for_domain_hints(
+                        if let Err(err) = fw.ensure_ip_permit_for_domain_hints_prioritized(
                             exe_path,
                             ip,
-                            &permit_hints,
+                            &authorizing_hints,
+                            &cohosted_hints,
                             &*self.defense,
                         ) {
                             tracing::debug!(
@@ -3723,10 +3729,19 @@ impl DaemonEngine {
                         &domain_candidates,
                         &rules,
                     );
+                    let ambiguous_freshness = (candidates.len() > 1)
+                        .then_some((item.timestamp_ms, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS));
                     if matches!(
                         decision,
                         OutboundDecision::PreemptiveRestrict(_)
                             | OutboundDecision::UnknownFirstConnect
+                    ) && !self.has_valid_live_domain_policy_permit(
+                        &item.exe_path,
+                        &bin_identity,
+                        item.dst_ip,
+                        &domain_candidates,
+                        &rules,
+                        ambiguous_freshness,
                     ) {
                         while pending.len() >= MAX_PENDING_WFP_DROPS {
                             if let Some(oldest) = pending.pop_front() {
@@ -4010,15 +4025,12 @@ impl DaemonEngine {
                     .and_then(|r| r.allowed_target.as_deref())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                let distinct_cand_hints: Vec<&str> = {
-                    let mut list: Vec<&str> = Vec::new();
-                    for (dom, _) in &cand_domains {
-                        if !dom.is_empty() && !list.contains(&dom.as_str()) {
-                            list.push(dom.as_str());
-                        }
-                    }
-                    list
-                };
+                let cand_hint_strs: Vec<&str> = cand_domains
+                    .iter()
+                    .map(|(dom, _)| dom.as_str())
+                    .collect();
+                let (authorizing_hints, cohosted_hints) =
+                    partition_permit_hints(&bin_identity, item.dst_ip, &cand_hint_strs, &rules);
                 let fallback_domain = matched_target.filter(|t| {
                     parse_literal_target_ip(t).is_none()
                         && parse_cidr_target(t).is_err()
@@ -4027,18 +4039,20 @@ impl DaemonEngine {
                 let permit_res = {
                     let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                     if fw.active_app_block(canonical_exe).is_some() {
-                        if !distinct_cand_hints.is_empty() {
-                            fw.ensure_ip_permit_for_domain_hints(
+                        if !authorizing_hints.is_empty() || !cohosted_hints.is_empty() {
+                            fw.ensure_ip_permit_for_domain_hints_prioritized(
                                 canonical_exe,
                                 item.dst_ip,
-                                &distinct_cand_hints,
+                                &authorizing_hints,
+                                &cohosted_hints,
                                 &*self.defense,
                             )
                         } else {
-                            fw.ensure_ip_permit_for_domain_rule(
+                            fw.ensure_ip_permit_for_domain_hints_prioritized(
                                 canonical_exe,
                                 item.dst_ip,
-                                fallback_domain.unwrap_or(""),
+                                &[fallback_domain.unwrap_or("")],
+                                &[] as &[&str],
                                 &*self.defense,
                             )
                         }
@@ -4062,8 +4076,10 @@ impl DaemonEngine {
             }
             OutboundDecision::PreemptiveRestrict(_) | OutboundDecision::UnknownFirstConnect => {
                 // If an active candidate already resolved an allowed domain for `dst_ip` and
-                // materialized a live IP Permit (with no overriding block), do not emit a false
-                // ambiguous drop alert.
+                // materialized a live IP Permit (with no overriding block), OR a live
+                // `DomainPolicy` IP Permit still validates against the latest binary identity,
+                // current rules, and active exe-wide DNS history (e.g., cached old IP after
+                // domain migration), do not emit a false ambiguous drop alert (`AUD-P3-01`).
                 if matches!(cand_decision, OutboundDecision::AllowedByRule { .. }) {
                     let has_live_ip_permit = {
                         let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
@@ -4073,6 +4089,18 @@ impl DaemonEngine {
                     if has_live_ip_permit {
                         return;
                     }
+                }
+                if !matches!(cand_decision, OutboundDecision::BlockedByRule { .. })
+                    && self.has_valid_live_domain_policy_permit(
+                        canonical_exe,
+                        &bin_identity,
+                        item.dst_ip,
+                        &cand_domains,
+                        &rules,
+                        Some((item.timestamp_ms, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS)),
+                    )
+                {
+                    return;
                 }
             }
             OutboundDecision::BlockedByRule { .. } => {}
@@ -4371,6 +4399,112 @@ impl DaemonEngine {
         )
     }
 
+    /// Re-validates whether a live [`WfpFilterOrigin::DomainPolicy`] IP Permit for
+    /// `(exe_path, dst_ip)` remains authorized under the latest `bin_identity` and current `rules`
+    /// with zero conflicting `NetworkBlock` matches across static policy, stored Permit hints,
+    /// current `domain_candidates`, and active exe-wide DNS history (`AUD-P3-01`).
+    ///
+    /// When `ambiguous_freshness` is `Some((event_ts_ms, max_age_ms))` (multi-instance WFP drops
+    /// with `candidates.len() > 1`), requires static allow or at least one authorizing Permit hint
+    /// to have a fresh DNS record in `ProcessDnsHistory` within `[event_ts_ms - max_age_ms,
+    /// event_ts_ms + 60_000]`, keeping `AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS` symmetric across
+    /// `on_wfp_drop_dequeued`, `flush_ready_pending_wfp_drops`, and `handle_ambiguous_wfp_drop`.
+    ///
+    /// Releases `self.firewall` before locking `self.process_dns_history` (no nested locks).
+    fn has_valid_live_domain_policy_permit(
+        &self,
+        exe_path: &str,
+        bin_identity: &BinaryIdentity,
+        dst_ip: IpAddr,
+        domain_candidates: &[(String, i64)],
+        rules: &[AllowlistRuleRecord],
+        ambiguous_freshness: Option<(i64, i64)>,
+    ) -> bool {
+        let Some(permit_hints) = ({
+            let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+            fw.domain_policy_permit_hints(exe_path, dst_ip)
+        }) else {
+            return false;
+        };
+
+        let static_allowed = match evaluate_outbound_policy(bin_identity, dst_ip, None, rules) {
+            OutboundDecision::BlockedByRule { .. } => return false,
+            OutboundDecision::AllowedByRule { .. } => true,
+            _ => false,
+        };
+
+        let mut allowed_hints: Vec<&str> = Vec::new();
+        for hint in &permit_hints {
+            let norm = hint.trim().trim_end_matches('.');
+            if norm.is_empty() {
+                continue;
+            }
+            match evaluate_outbound_policy(bin_identity, dst_ip, Some(norm), rules) {
+                OutboundDecision::BlockedByRule { .. } => return false,
+                OutboundDecision::AllowedByRule { .. } => allowed_hints.push(norm),
+                _ => {}
+            }
+        }
+        if !static_allowed && allowed_hints.is_empty() {
+            return false;
+        }
+
+        for (dom, _) in domain_candidates {
+            let norm = dom.trim().trim_end_matches('.');
+            if norm.is_empty() {
+                continue;
+            }
+            if matches!(
+                evaluate_outbound_policy(bin_identity, dst_ip, Some(norm), rules),
+                OutboundDecision::BlockedByRule { .. }
+            ) {
+                return false;
+            }
+        }
+
+        let exe_k = WfpRuleManager::exe_key(exe_path);
+        let (exe_domains, freshness_ok) = {
+            let history = self
+                .process_dns_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let exe_domains = history.domains_for_exe_ip(&exe_k, dst_ip);
+            let freshness_ok = match ambiguous_freshness {
+                None => true,
+                Some((event_ts_ms, max_age_ms)) => {
+                    static_allowed
+                        || allowed_hints.iter().any(|hint| {
+                            history.has_fresh_domain_record_for_family(
+                                &exe_k,
+                                hint,
+                                dst_ip,
+                                event_ts_ms,
+                                max_age_ms,
+                            )
+                        })
+                }
+            };
+            (exe_domains, freshness_ok)
+        };
+        if !freshness_ok {
+            return false;
+        }
+        for dom in &exe_domains {
+            let norm = dom.trim().trim_end_matches('.');
+            if norm.is_empty() {
+                continue;
+            }
+            if matches!(
+                evaluate_outbound_policy(bin_identity, dst_ip, Some(norm), rules),
+                OutboundDecision::BlockedByRule { .. }
+            ) {
+                return false;
+            }
+        }
+
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn evaluate_and_handle_outbound_connect(
         &self,
@@ -4498,46 +4632,48 @@ impl DaemonEngine {
                             .map(str::trim)
                             .filter(|s| !s.is_empty());
                         // Propagate all active shared-IP domains (already verified free of
-                        // `BlockedByRule` above) onto the Permit so deny-overrides-allow
-                        // reconciliation still revokes the Permit if a co-hosted domain is blocked
-                        // after DNS history FIFO eviction (`#1`, `#2`, `#4`).
-                        let mut permit_hints: Vec<&str> = Vec::new();
-                        for (dom, _) in &shared_cands {
-                            let trimmed = dom.trim().trim_end_matches('.');
-                            if !trimmed.is_empty()
-                                && !permit_hints
-                                    .iter()
-                                    .any(|existing| existing.eq_ignore_ascii_case(trimmed))
-                            {
-                                permit_hints.push(trimmed);
-                            }
-                        }
-                        let permit_res = if !permit_hints.is_empty() {
-                            fw.ensure_ip_permit_for_domain_hints(
-                                exe_path,
-                                dst_ip,
-                                &permit_hints,
-                                &*self.defense,
-                            )
-                        } else {
-                            let fallback_domain = matched_target.filter(|t| {
-                                parse_literal_target_ip(t).is_none()
-                                    && parse_cidr_target(t).is_err()
-                                    && !matches_network_target(t, dst_ip, None)
-                            });
-                            let domain_label = effective_domain_hint
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .or(fallback_domain)
-                                .unwrap_or("");
-                            fw.ensure_ip_permit_for_domain_rule(
-                                exe_path,
-                                dst_ip,
-                                domain_label,
-                                &*self.defense,
-                            )
-                        };
+                        // `BlockedByRule` above) onto the Permit while protecting authorizing
+                        // hints from FIFO eviction at `MAX_DOMAIN_HINTS_PER_FILTER` (`#1`, `#2`,
+                        // `#4`, `AUD-P3-02`).
+                        let permit_candidates: Vec<&str> = shared_cands
+                            .iter()
+                            .map(|(dom, _)| dom.as_str())
+                            .collect();
+                        let (authorizing_hints, cohosted_hints) = partition_permit_hints(
+                            &bin_identity,
+                            dst_ip,
+                            &permit_candidates,
+                            &rules,
+                        );
+                        let permit_res =
+                            if !authorizing_hints.is_empty() || !cohosted_hints.is_empty() {
+                                fw.ensure_ip_permit_for_domain_hints_prioritized(
+                                    exe_path,
+                                    dst_ip,
+                                    &authorizing_hints,
+                                    &cohosted_hints,
+                                    &*self.defense,
+                                )
+                            } else {
+                                let fallback_domain = matched_target.filter(|t| {
+                                    parse_literal_target_ip(t).is_none()
+                                        && parse_cidr_target(t).is_err()
+                                        && !matches_network_target(t, dst_ip, None)
+                                });
+                                let domain_label = effective_domain_hint
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .or(fallback_domain)
+                                    .unwrap_or("");
+                                fw.ensure_ip_permit_for_domain_hints_prioritized(
+                                    exe_path,
+                                    dst_ip,
+                                    &[domain_label],
+                                    &[] as &[&str],
+                                    &*self.defense,
+                                )
+                            };
                         if let Err(err) = permit_res {
                             tracing::debug!(
                                 exe_path = %exe_path,
@@ -4727,6 +4863,22 @@ impl DaemonEngine {
                         }
                         return ("ALLOWED", false);
                     }
+                }
+                // Re-validate a live `DomainPolicy` IP Permit (e.g., an allowed domain that
+                // migrated to a new IP while clients connect to its cached old IP) against the
+                // latest binary identity, current rules, and active exe-wide DNS history before
+                // falling through to Permit revocation and containment (`AUD-P3-01`).
+                if self.has_valid_live_domain_policy_permit(
+                    exe_path,
+                    &bin_identity,
+                    dst_ip,
+                    domain_candidates,
+                    &rules,
+                    None,
+                ) {
+                    return ("ALLOWED", false);
+                }
+                if let Some(inst_id) = proc_ctx.proc_instance_id.as_deref() {
                     if already_outbound_alerted {
                         return ("DEDUP_SUPPRESSED", false);
                     }
@@ -5978,6 +6130,30 @@ impl ProcessDnsHistory {
         !latest_ips.contains(&canon)
     }
 
+    fn has_fresh_domain_record_for_family(
+        &self,
+        exe_key: &str,
+        domain_hint: &str,
+        ip: IpAddr,
+        event_ts_ms: i64,
+        max_age_ms: i64,
+    ) -> bool {
+        let exe_norm = exe_key.trim().to_ascii_lowercase();
+        let dom_norm = domain_hint.trim().trim_end_matches('.').to_ascii_lowercase();
+        if exe_norm.is_empty() || dom_norm.is_empty() {
+            return false;
+        }
+        let canon = canonical_ip(ip);
+        let Some(latest) = self.latest_domain_by_exe.get(&(exe_norm, dom_norm)) else {
+            return false;
+        };
+        let Some((_, latest_ts)) = latest.family(canon) else {
+            return false;
+        };
+        event_ts_ms.saturating_sub(*latest_ts) <= max_age_ms
+            && *latest_ts <= event_ts_ms.saturating_add(60_000)
+    }
+
     fn is_domain_ip_superseded_at_or_before(
         &self,
         exe_key: &str,
@@ -6318,6 +6494,46 @@ fn collect_domain_specific_blocked_hints(
         }
     }
     hints
+}
+
+/// Partitions normalized candidate domain hints for `(bin_identity, dst_ip)` into
+/// `(authorizing_hints, cohosted_hints)` so `MAX_DOMAIN_HINTS_PER_FILTER` overflow never evicts
+/// hints backed by a domain-specific `NetworkAllow` rule (`AUD-P3-02`).
+fn partition_permit_hints<S: AsRef<str>>(
+    bin_identity: &BinaryIdentity,
+    dst_ip: IpAddr,
+    candidates: &[S],
+    rules: &[AllowlistRuleRecord],
+) -> (Vec<String>, Vec<String>) {
+    let mut authorizing_hints: Vec<String> = Vec::new();
+    let mut cohosted_hints: Vec<String> = Vec::new();
+    for raw in candidates {
+        let norm = raw
+            .as_ref()
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if norm.is_empty()
+            || authorizing_hints.iter().any(|h| h == &norm)
+            || cohosted_hints.iter().any(|h| h == &norm)
+        {
+            continue;
+        }
+        let is_domain_authorizing = matches!(
+            evaluate_outbound_policy(bin_identity, dst_ip, Some(norm.as_str()), rules),
+            OutboundDecision::AllowedByRule { .. }
+        ) && rules.iter().any(|r| {
+            r.scope == RuleScope::NetworkAllow
+                && matches_network_allow_rule(r, bin_identity, dst_ip, Some(norm.as_str()))
+                && !matches_network_allow_rule(r, bin_identity, dst_ip, None)
+        });
+        if is_domain_authorizing {
+            authorizing_hints.push(norm);
+        } else {
+            cohosted_hints.push(norm);
+        }
+    }
+    (authorizing_hints, cohosted_hints)
 }
 
 fn network_allow_rule_identity_matches(
@@ -10246,6 +10462,619 @@ mod tests {
                 );
                 live_engine.shutdown_and_flush().await.expect("live shutdown");
             });
+        });
+    }
+
+    /// `DAEMON-P3-49A` (`PRRT_kwDOVyjVyM65e5kL` + `AUD-P3-01` + `AUD-P3-02`):
+    /// Unit-integration verification of:
+    /// 1. `prematerialize_domain_wfp_filters` + unrelated `upsert_policy_rule` preserving the
+    ///    authorizing hint on a shared-IP `DomainPolicy` Permit after `api.example` migrates;
+    /// 2. Cached old-IP `NetworkConnect` and `WfpDropEvent` (`on_wfp_drop_dequeued` single-PID
+    ///    without grace parking, plus multi-PID `handle_ambiguous_wfp_drop`) passing via
+    ///    `has_valid_live_domain_policy_permit` with 0 suspends and 0 alerts;
+    /// 3. Separate executable isolation (`SEC_0002`), unallowed co-hosted block vs post-migration
+    ///    selective pruning, binary SHA-256 swap (`SEC_0001`), and `delete_policy_rule` revocation;
+    /// 4. Over-32 co-hosted domains (`MAX_DOMAIN_HINTS_PER_FILTER` overflow) never evicting the
+    ///    authorizing hint via `partition_permit_hints` + `ensure_ip_permit_for_domain_hints_prioritized`.
+    #[test]
+    fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
+        use super::{current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, QueuedWfpDrop};
+        use crate::firewall::{WfpRuleManager, MAX_DOMAIN_HINTS_PER_FILTER};
+        use ledr_proto::{AllowlistRuleRecord, EventLane, ProcessIdentity, RuleScope, SensorEvent};
+        use ledr_rules::{BinaryIdentity, EarlyPruner, SigmaEngine};
+        use ledr_store::LedrStore;
+        use std::collections::{HashMap, VecDeque};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::{Arc, RwLock};
+
+        struct CountingDefense {
+            next_handle: AtomicU64,
+            suspends: AtomicUsize,
+        }
+        impl ledr_proto::ActiveDefenseController for CountingDefense {
+            fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+                self.suspends.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+                Ok(())
+            }
+            fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+                Ok(())
+            }
+            fn add_wfp_app_rule(
+                &self,
+                _: &std::path::Path,
+                _: Option<IpAddr>,
+                _: bool,
+            ) -> Result<u64, String> {
+                Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
+            }
+            fn remove_wfp_rule(&self, _: u64) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        struct StubNotifier;
+        impl super::NotificationDispatcher for StubNotifier {
+            fn notify_alert(&self, _: &ledr_proto::AlertRecord) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        struct MapShaInspector {
+            shas: RwLock<HashMap<String, String>>,
+        }
+        impl MapShaInspector {
+            fn new() -> Self {
+                Self {
+                    shas: RwLock::new(HashMap::new()),
+                }
+            }
+            fn set_sha(&self, exe: &str, sha: &str) {
+                self.shas
+                    .write()
+                    .unwrap()
+                    .insert(WfpRuleManager::exe_key(exe), sha.to_string());
+            }
+        }
+        impl super::BinaryInspector for MapShaInspector {
+            fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+                let sha = self
+                    .shas
+                    .read()
+                    .unwrap()
+                    .get(&WfpRuleManager::exe_key(exe_path))
+                    .cloned();
+                BinaryIdentity {
+                    exe_path: exe_path.to_string(),
+                    sha256: sha,
+                    authenticode: None,
+                }
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build rt");
+        rt.block_on(async {
+            let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+            let other_exe = r"C:\Users\alice\Downloads\other_app.exe";
+            let unrelated_exe = r"C:\Tools\unrelated_app.exe";
+            let sha_orig = "a".repeat(64);
+            let sha_swapped = "b".repeat(64);
+            let sha_other = "c".repeat(64);
+            let sha_unrel = "d".repeat(64);
+
+            let inspector = Arc::new(MapShaInspector::new());
+            inspector.set_sha(ps_exe, &sha_orig);
+            inspector.set_sha(other_exe, &sha_other);
+            inspector.set_sha(unrelated_exe, &sha_unrel);
+
+            let defense = Arc::new(CountingDefense {
+                next_handle: AtomicU64::new(1),
+                suspends: AtomicUsize::new(0),
+            });
+            let store = LedrStore::open_in_memory().expect("open store");
+            let engine = DaemonEngine::start_with_dependencies(
+                store.clone(),
+                SigmaEngine::default(),
+                EarlyPruner::default(),
+                DaemonConfig {
+                    outbound_firewall_enabled: true,
+                    wfp_drop_dns_grace_ms: 500,
+                    dns_history_capacity: 64,
+                    ..DaemonConfig::default()
+                },
+                defense.clone(),
+                Arc::new(StubNotifier),
+                inspector.clone(),
+            );
+
+            let now_ms = current_unix_ms();
+            let mk_rule = |id: &str, exe: &str, sha: &str, scope: RuleScope, target: &str, ts: i64| {
+                AllowlistRuleRecord {
+                    rule_id: id.to_string(),
+                    scope,
+                    exe_path_pattern: exe.to_string(),
+                    sha256: Some(sha.to_string()),
+                    signer_subject: None,
+                    root_thumbprint: None,
+                    allowed_target: Some(target.to_string()),
+                    created_at_ms: ts,
+                    created_by: "test".to_string(),
+                }
+            };
+
+            let r_allow_api = mk_rule(
+                "R-ALLOW-API",
+                ps_exe,
+                &sha_orig,
+                RuleScope::NetworkAllow,
+                "api.example",
+                now_ms + 10,
+            );
+            engine
+                .upsert_policy_rule(&r_allow_api)
+                .expect("upsert R-ALLOW-API");
+
+            let p1 = ProcessIdentity::new(9801, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: p1,
+                    parent_pid: 4,
+                    exe_path: ps_exe.to_string(),
+                    command_line: ps_exe.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(
+                engine.has_active_wfp_filter(ps_exe, None, false),
+                "pre-restricted PowerShell must have app-wide Preemptive WFP Block"
+            );
+
+            let ip1 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 180));
+            let ip2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 181));
+            let ip3 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 182));
+
+            // 1. Shared IP `ip1` (`other.example` unallowed + `api.example` allowed), then
+            //    `api.example` migrates to `ip2`, followed by unrelated rule `upsert_policy_rule`.
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p1.pid,
+                    query_name: "other.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ip1],
+                    timestamp_ms: now_ms + 20,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p1.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ip1],
+                    timestamp_ms: now_ms + 30,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(
+                engine
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .domain_policy_permit_hints(ps_exe, ip1),
+                Some(vec!["api.example".to_string(), "other.example".to_string()])
+            );
+
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p1.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ip2],
+                    timestamp_ms: now_ms + 40,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(engine.has_active_wfp_filter(ps_exe, Some(ip1), true));
+            assert!(engine.has_active_wfp_filter(ps_exe, Some(ip2), true));
+            assert_eq!(
+                engine
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .domain_policy_permit_hints(ps_exe, ip1),
+                Some(vec!["api.example".to_string(), "other.example".to_string()]),
+                "migrating api.example must keep authorizing hint on shared-IP ip1 Permit"
+            );
+
+            let r_unrelated = mk_rule(
+                "R-UNRELATED",
+                unrelated_exe,
+                &sha_unrel,
+                RuleScope::NetworkAllow,
+                "unrelated.example",
+                now_ms + 50,
+            );
+            engine
+                .upsert_policy_rule(&r_unrelated)
+                .expect("upsert unrelated rule");
+            assert!(
+                engine.has_active_wfp_filter(ps_exe, Some(ip1), true),
+                "unrelated rule save must preserve ip1 Permit after api.example migration"
+            );
+            assert!(engine.has_active_wfp_filter(ps_exe, Some(ip2), true));
+
+            // 2. Cached old-IP `NetworkConnect` and `WfpDropEvent` (`on_wfp_drop_dequeued` single-
+            //    PID and multi-PID ambiguous) must pass cleanly with 0 suspends and 0 alerts.
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: p1.pid,
+                    protocol: 6,
+                    dst_ip: ip1,
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: now_ms + 60,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(defense.suspends.load(Ordering::Relaxed), 0);
+            assert_eq!(engine.alerts_emitted(), 0);
+            assert!(engine.has_active_wfp_filter(ps_exe, Some(ip1), true));
+
+            let mk_drop = |exe: &str, ip: IpAddr, ts: i64| QueuedWfpDrop {
+                exe_path: exe.to_string(),
+                exe_key: WfpRuleManager::exe_key(exe),
+                dst_ip: ip,
+                dst_port: 443,
+                protocol: 6,
+                timestamp_ms: ts,
+                os_filter_id: 77,
+            };
+            let mut pending = VecDeque::new();
+            engine.on_wfp_drop_dequeued(mk_drop(ps_exe, ip1, now_ms + 70), &mut pending);
+            assert!(
+                pending.is_empty(),
+                "live valid DomainPolicy Permit must bypass grace parking in on_wfp_drop_dequeued"
+            );
+            assert_eq!(defense.suspends.load(Ordering::Relaxed), 0);
+            assert_eq!(engine.alerts_emitted(), 0);
+            assert!(engine.has_active_wfp_filter(ps_exe, Some(ip1), true));
+
+            // Multi-PID ambiguous drop for `ps_exe -> ip1` also stays silent.
+            let p2 = ProcessIdentity::new(9802, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: p2,
+                    parent_pid: 4,
+                    exe_path: ps_exe.to_string(),
+                    command_line: ps_exe.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+            engine.on_wfp_drop_dequeued(mk_drop(ps_exe, ip1, now_ms + 80), &mut pending);
+            assert!(pending.is_empty());
+            assert_eq!(defense.suspends.load(Ordering::Relaxed), 0);
+            assert_eq!(engine.alerts_emitted(), 0);
+
+            // Stale (> AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS) multi-PID drop must still park so
+            // multi-instance freshness symmetry is preserved across `on_wfp_drop_dequeued`,
+            // `flush_ready_pending_wfp_drops`, and `handle_ambiguous_wfp_drop`.
+            engine.on_wfp_drop_dequeued(
+                mk_drop(
+                    ps_exe,
+                    ip1,
+                    now_ms + super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS + 5_000,
+                ),
+                &mut pending,
+            );
+            assert_eq!(
+                pending.len(),
+                1,
+                "stale >60s multi-PID drop must still park in grace queue"
+            );
+            pending.clear();
+
+            // 3. Separate executable (`SEC_0002`) connecting to `ip1` must NOT inherit PowerShell's Permit.
+            let p_other = ProcessIdentity::new(9803, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: p_other,
+                    parent_pid: 4,
+                    exe_path: other_exe.to_string(),
+                    command_line: other_exe.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: p_other.pid,
+                    protocol: 6,
+                    dst_ip: ip1,
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: now_ms + 90,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(
+                defense.suspends.load(Ordering::Relaxed),
+                1,
+                "different executable must be suspended when connecting to ip1 (SEC_0002)"
+            );
+            assert_eq!(engine.alerts_emitted(), 1);
+
+            // 4. Blocking co-hosted `other.example` while still on `ip1` revokes `ip1` Permit
+            //    immediately (`deny-overrides-allow`), and `has_valid_live_domain_policy_permit`
+            //    rejects even a hypothetically stuck Permit.
+            let r_blk_other = mk_rule(
+                "R-BLK-OTHER",
+                ps_exe,
+                &sha_orig,
+                RuleScope::NetworkBlock,
+                "other.example",
+                now_ms + 100,
+            );
+            engine
+                .upsert_policy_rule(&r_blk_other)
+                .expect("upsert R-BLK-OTHER");
+            assert!(
+                !engine.has_active_wfp_filter(ps_exe, Some(ip1), true),
+                "blocking co-hosted other.example on ip1 must revoke ip1 Permit"
+            );
+            assert!(engine.has_active_wfp_filter(ps_exe, Some(ip2), true));
+
+            // Defense-in-depth: even if a DomainPolicy Permit tagged ONLY `["api.example"]` were
+            // stuck in `firewall` while `other.example` remains active in exe-wide DNS history and
+            // blocked by `R-BLK-OTHER`, `has_valid_live_domain_policy_permit` MUST return `false`.
+            {
+                let mut fw = engine.firewall.lock().unwrap();
+                fw.ensure_ip_permit_for_domain_hints_prioritized(
+                    ps_exe,
+                    ip1,
+                    &["api.example"],
+                    &[] as &[&str],
+                    &*defense,
+                )
+                .expect("inject stuck permit for defense-in-depth check");
+            }
+            let cur_rules_with_blk = store.list_network_rules().expect("list rules");
+            let ps_identity = inspector.inspect(ps_exe);
+            assert!(
+                !engine.has_valid_live_domain_policy_permit(
+                    ps_exe,
+                    &ps_identity,
+                    ip1,
+                    &[],
+                    &cur_rules_with_blk,
+                    None,
+                ),
+                "stuck api.example-only Permit must be rejected when exe-wide DNS history has blocked other.example"
+            );
+            {
+                let mut fw = engine.firewall.lock().unwrap();
+                let _ = fw.remove_domain_policy_permit(ps_exe, ip1, &*defense);
+            }
+
+            // Remove `R-BLK-OTHER`, re-establish shared `ip1`, then migrate `other.example -> ip3`
+            // before re-adding `R-BLK-OTHER`: `other.example` is selectively pruned so `ip1` survives!
+            engine
+                .delete_policy_rule("R-BLK-OTHER")
+                .expect("delete R-BLK-OTHER");
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p1.pid,
+                    query_name: "other.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ip1],
+                    timestamp_ms: now_ms + 110,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p1.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ip1],
+                    timestamp_ms: now_ms + 120,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p1.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ip2],
+                    timestamp_ms: now_ms + 130,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p1.pid,
+                    query_name: "other.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ip3],
+                    timestamp_ms: now_ms + 140,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(
+                engine
+                    .firewall
+                    .lock()
+                    .unwrap()
+                    .domain_policy_permit_hints(ps_exe, ip1),
+                Some(vec!["api.example".to_string()]),
+                "subsequent migration of other.example must selectively prune it from ip1 Permit"
+            );
+            engine
+                .upsert_policy_rule(&r_blk_other)
+                .expect("re-upsert R-BLK-OTHER after other.example migrated");
+            assert!(
+                engine.has_active_wfp_filter(ps_exe, Some(ip1), true),
+                "blocking migrated other.example must preserve ip1 Permit"
+            );
+            let susp_before_post_mig = defense.suspends.load(Ordering::Relaxed);
+            let alerts_before_post_mig = engine.alerts_emitted();
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: p1.pid,
+                    protocol: 6,
+                    dst_ip: ip1,
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: now_ms + 150,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(defense.suspends.load(Ordering::Relaxed), susp_before_post_mig);
+            assert_eq!(engine.alerts_emitted(), alerts_before_post_mig);
+            engine
+                .delete_policy_rule("R-BLK-OTHER")
+                .expect("cleanup R-BLK-OTHER");
+
+            // 5. Binary SHA-256 swap (`SEC_0001`): connecting to cached `ip1` must fail live
+            //    Permit re-validation, revoke stale Permits, suspend `p1`, and emit an alert.
+            inspector.set_sha(ps_exe, &sha_swapped);
+            let susp_before_swap = defense.suspends.load(Ordering::Relaxed);
+            let alerts_before_swap = engine.alerts_emitted();
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: p1.pid,
+                    protocol: 6,
+                    dst_ip: ip1,
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: now_ms + 160,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(
+                !engine.has_active_wfp_filter(ps_exe, Some(ip1), true),
+                "binary SHA-256 swap must revoke stale ip1 Permit (SEC_0001)"
+            );
+            assert_eq!(defense.suspends.load(Ordering::Relaxed), susp_before_swap + 1);
+            assert_eq!(engine.alerts_emitted(), alerts_before_swap + 1);
+
+            // Restore original SHA-256 and verify `delete_policy_rule` revokes Permits.
+            inspector.set_sha(ps_exe, &sha_orig);
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p2.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ip1],
+                    timestamp_ms: now_ms + 170,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p2.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ip2],
+                    timestamp_ms: now_ms + 180,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(engine.has_active_wfp_filter(ps_exe, Some(ip1), true));
+            assert!(engine.has_active_wfp_filter(ps_exe, Some(ip2), true));
+            engine
+                .delete_policy_rule("R-ALLOW-API")
+                .expect("delete R-ALLOW-API");
+            assert!(!engine.has_active_wfp_filter(ps_exe, Some(ip1), true));
+            assert!(!engine.has_active_wfp_filter(ps_exe, Some(ip2), true));
+
+            // 6. > 32 co-hosted unallowed domains (`AUD-P3-02`): authorizing hint `api.example`
+            //    must NEVER be FIFO-evicted during `prematerialize_domain_wfp_filters`, and
+            //    subsequent unrelated reconciliation must preserve the Permit.
+            engine
+                .upsert_policy_rule(&r_allow_api)
+                .expect("re-upsert R-ALLOW-API for cap32 test");
+            let cap_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 190));
+            let cap_ip2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 191));
+            let p3 = ProcessIdentity::new(9804, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: p3,
+                    parent_pid: 4,
+                    exe_path: ps_exe.to_string(),
+                    command_line: ps_exe.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+            let pids = [p1.pid, p2.pid, p3.pid];
+            for idx in 0..36usize {
+                let _ = engine.process_event_with_lane(
+                    &SensorEvent::DnsQuery {
+                        pid: pids[idx / 12],
+                        query_name: format!("cohost-{idx:02}.shared.example"),
+                        query_type: 1,
+                        resolved_ips: vec![cap_ip],
+                        timestamp_ms: now_ms + 200 + idx as i64,
+                    },
+                    EventLane::HighPriority,
+                );
+            }
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p1.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![cap_ip],
+                    timestamp_ms: now_ms + 300,
+                },
+                EventLane::HighPriority,
+            );
+            let cap_hints = engine
+                .firewall
+                .lock()
+                .unwrap()
+                .domain_policy_permit_hints(ps_exe, cap_ip)
+                .expect("cap_ip DomainPolicy Permit must exist");
+            assert_eq!(cap_hints.len(), MAX_DOMAIN_HINTS_PER_FILTER);
+            assert!(
+                cap_hints.iter().any(|h| h == "api.example"),
+                "authorizing hint api.example must never be evicted under > 32 co-hosted domains"
+            );
+            // Migrate `api.example` off `cap_ip` to `cap_ip2` and save another unrelated rule ->
+            // `cap_ip` Permit must survive!
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p1.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![cap_ip2],
+                    timestamp_ms: now_ms + 310,
+                },
+                EventLane::HighPriority,
+            );
+            let r_unrelated_2 = mk_rule(
+                "R-UNRELATED-2",
+                unrelated_exe,
+                &sha_unrel,
+                RuleScope::NetworkAllow,
+                "unrelated-2.example",
+                now_ms + 320,
+            );
+            engine
+                .upsert_policy_rule(&r_unrelated_2)
+                .expect("upsert second unrelated rule");
+            assert!(
+                engine.has_active_wfp_filter(ps_exe, Some(cap_ip), true),
+                "cap_ip Permit must survive unrelated reconciliation after api.example migration under > 32 co-hosted domains"
+            );
+
+            engine.shutdown_and_flush().await.expect("shutdown");
         });
     }
 }

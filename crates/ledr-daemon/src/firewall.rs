@@ -22,15 +22,41 @@ use crate::engine::BinaryInspector;
 /// usage strictly bounded.
 pub const MAX_DOMAIN_POLICY_FILTERS: usize = 512;
 
+/// Upper bound on normalized domain hints retained per [`WfpFilterOrigin::DomainPolicy`] filter
+/// to keep per-filter metadata strictly bounded (`L-10`).
+pub const MAX_DOMAIN_HINTS_PER_FILTER: usize = 32;
+
+/// Normalizes a domain hint (trim whitespace, strip trailing DNS dots, ASCII lowercase).
+fn normalize_domain_hint(raw: &str) -> Option<String> {
+    let norm = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!norm.is_empty()).then_some(norm)
+}
+
+/// Inserts a normalized domain hint into `hints` without duplicates while keeping the set bounded
+/// by [`MAX_DOMAIN_HINTS_PER_FILTER`] (evicting the oldest hint FIFO on overflow).
+fn merge_domain_hint(hints: &mut Vec<String>, raw: &str) {
+    let Some(norm) = normalize_domain_hint(raw) else {
+        return;
+    };
+    if hints.iter().any(|h| h == &norm) {
+        return;
+    }
+    while hints.len() >= MAX_DOMAIN_HINTS_PER_FILTER {
+        hints.remove(0);
+    }
+    hints.push(norm);
+}
+
 /// Origin tracking why a dynamic WFP filter is currently installed in BFE.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WfpFilterOrigin {
     /// Installed directly to enforce a persisted concrete/IP `NetworkBlock` or `NetworkAllow` rule.
     PersistedPolicy,
-    /// Installed for a concrete resolved IP matched by a persisted domain-scoped `NetworkBlock`
-    /// or `NetworkAllow` rule (`domain_hint` retained so reconciliation keeps the filter while
-    /// the backing rule stays active and removes it when deleted or overridden by deny).
-    DomainPolicy { domain_hint: String },
+    /// Installed for a concrete resolved IP matched by persisted domain-scoped `NetworkBlock`
+    /// or `NetworkAllow` rules (`domain_hints` retains the normalized, deduplicated, bounded set
+    /// of domains backing this IP filter so shared-IP reconciliation and DNS migration cleanup
+    /// stay accurate even across DNS history eviction).
+    DomainPolicy { domain_hints: Vec<String> },
     /// Installed proactively on `ProcessStart` for high-risk paths (`Downloads`/`Temp`) or
     /// script interpreters (`powershell`, `node`, `python`, etc.) (`L-03`).
     Preemptive,
@@ -69,7 +95,7 @@ pub struct WfpFailedOp {
     pub is_startup_preemptive: bool,
     pub newly_required: bool,
     pub source_rule_ids: Vec<String>,
-    pub domain_hint: Option<String>,
+    pub domain_hints: Vec<String>,
     pub error: String,
 }
 
@@ -90,7 +116,7 @@ pub struct RemovedDomainFilterSnapshot {
     pub exe_path: String,
     pub remote_ip: IpAddr,
     pub allow: bool,
-    pub domain_hint: String,
+    pub domain_hints: Vec<String>,
 }
 
 /// Summary of a persisted-rule reconciliation pass against [`ActiveDefenseController`].
@@ -174,7 +200,13 @@ impl WfpReconcileReport {
             return matches_network_target(target, ip, None);
         }
         if op.is_remove {
-            return matches_network_target(target, ip, op.domain_hint.as_deref());
+            if op.domain_hints.is_empty() {
+                return matches_network_target(target, ip, None);
+            }
+            return op
+                .domain_hints
+                .iter()
+                .any(|hint| matches_network_target(target, ip, Some(hint.as_str())));
         }
         false
     }
@@ -658,7 +690,8 @@ impl WfpRuleManager {
 
     /// Materializes a domain-scoped persisted `NetworkBlock` rule onto a resolved destination IP
     /// so reconciliation preserves it while the backing domain block rule exists and removes it
-    /// immediately once deleted.
+    /// immediately once deleted. When reusing an existing `DomainPolicy` Block filter on a shared
+    /// IP, merges `domain_hint` into its bounded `domain_hints` set (`#4`).
     pub fn ensure_domain_policy_block(
         &mut self,
         exe_path: &str,
@@ -674,8 +707,14 @@ impl WfpRuleManager {
         }
         let canon_ip = canonical_ip(dst_ip);
         let key = (Self::exe_key(exe_path), Some(canon_ip));
-        if let Some(existing) = self.installed.get(&key) {
+        if let Some(existing) = self.installed.get_mut(&key) {
             if !existing.allow {
+                if let WfpFilterOrigin::DomainPolicy {
+                    ref mut domain_hints,
+                } = existing.origin
+                {
+                    merge_domain_hint(domain_hints, domain_hint);
+                }
                 return Ok(existing.handle);
             }
             let old_handle = existing.handle;
@@ -685,15 +724,15 @@ impl WfpRuleManager {
 
         self.evict_domain_policy_if_full(defense);
         let handle = defense.add_wfp_app_rule(Path::new(exe_path), Some(canon_ip), false)?;
+        let mut domain_hints = Vec::new();
+        merge_domain_hint(&mut domain_hints, domain_hint);
         self.installed.insert(
             key,
             InstalledWfpFilter {
                 handle,
                 exe_path: exe_path.to_string(),
                 allow: false,
-                origin: WfpFilterOrigin::DomainPolicy {
-                    domain_hint: domain_hint.trim().trim_end_matches('.').to_ascii_lowercase(),
-                },
+                origin: WfpFilterOrigin::DomainPolicy { domain_hints },
             },
         );
         Ok(handle)
@@ -710,19 +749,33 @@ impl WfpRuleManager {
         domain_hint: &str,
         defense: &dyn ActiveDefenseController,
     ) -> Result<Option<u64>, String> {
+        self.ensure_ip_permit_for_domain_hints(exe_path, dst_ip, &[domain_hint], defense)
+    }
+
+    /// Like [`WfpRuleManager::ensure_ip_permit_for_domain_rule`], merging all non-empty
+    /// `domain_hints` into the `DomainPolicy` Permit metadata (deduplicated and bounded by
+    /// [`MAX_DOMAIN_HINTS_PER_FILTER`]).
+    pub fn ensure_ip_permit_for_domain_hints<S: AsRef<str>>(
+        &mut self,
+        exe_path: &str,
+        dst_ip: IpAddr,
+        domain_hints: &[S],
+        defense: &dyn ActiveDefenseController,
+    ) -> Result<Option<u64>, String> {
         let canon_ip = canonical_ip(dst_ip);
-        let norm_dom = domain_hint.trim().trim_end_matches('.').to_ascii_lowercase();
+        let mut normalized_hints = Vec::new();
+        for raw in domain_hints {
+            merge_domain_hint(&mut normalized_hints, raw.as_ref());
+        }
         let ip_key = (Self::exe_key(exe_path), Some(canon_ip));
         if let Some(existing) = self.installed.get_mut(&ip_key) {
             if existing.allow {
-                if !norm_dom.is_empty() {
-                    if let WfpFilterOrigin::DomainPolicy {
-                        domain_hint: ref mut cur_hint,
-                    } = existing.origin
-                    {
-                        if cur_hint.is_empty() {
-                            *cur_hint = norm_dom;
-                        }
+                if let WfpFilterOrigin::DomainPolicy {
+                    domain_hints: ref mut cur_hints,
+                } = existing.origin
+                {
+                    for hint in &normalized_hints {
+                        merge_domain_hint(cur_hints, hint);
                     }
                 }
                 return Ok(Some(existing.handle));
@@ -731,7 +784,7 @@ impl WfpRuleManager {
             tracing::warn!(
                 exe_path = %exe_path,
                 dst_ip = %canon_ip,
-                allowed_domain_hint = %domain_hint,
+                allowed_domain_hints = ?normalized_hints,
                 existing_origin = ?existing.origin,
                 "suppressing IP-level WFP Permit for allowed domain because an existing IP Block shares this destination IP (deny-overrides-allow)"
             );
@@ -747,14 +800,14 @@ impl WfpRuleManager {
                 exe_path: exe_path.to_string(),
                 allow: true,
                 origin: WfpFilterOrigin::DomainPolicy {
-                    domain_hint: norm_dom,
+                    domain_hints: normalized_hints,
                 },
             },
         );
         Ok(Some(handle))
     }
 
-    /// Lists active `DomainPolicy` Permit filters whose `domain_hint` was empty at installation
+    /// Lists active `DomainPolicy` Permit filters whose `domain_hints` was empty at installation
     /// time (e.g., CIDR permits created without inline DNS hints) so reconciliation can cross-check
     /// later DNS history against newly added domain block rules (`SEC_0001`).
     pub fn unnamed_domain_permits(&self) -> Vec<(String, String, IpAddr)> {
@@ -765,9 +818,26 @@ impl WfpRuleManager {
                 if entry.allow
                     && matches!(
                         &entry.origin,
-                        WfpFilterOrigin::DomainPolicy { domain_hint } if domain_hint.is_empty()
+                        WfpFilterOrigin::DomainPolicy { domain_hints } if domain_hints.is_empty()
                     )
                 {
+                    Some((exe_k.clone(), entry.exe_path.clone(), ip))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Lists all active `DomainPolicy` Permit filters `(exe_key, exe_path, remote_ip)` so
+    /// reconciliation can cross-check live DNS history against newly added domain block rules,
+    /// including shared-IP permits tagged with another domain name (`#1`, `#4`).
+    pub fn domain_policy_permits(&self) -> Vec<(String, String, IpAddr)> {
+        self.installed
+            .iter()
+            .filter_map(|((exe_k, ip_opt), entry)| {
+                let ip = (*ip_opt)?;
+                if entry.allow && matches!(&entry.origin, WfpFilterOrigin::DomainPolicy { .. }) {
                     Some((exe_k.clone(), entry.exe_path.clone(), ip))
                 } else {
                     None
@@ -788,7 +858,7 @@ impl WfpRuleManager {
         let Some(entry) = self.installed.get(&key).cloned() else {
             return Ok(None);
         };
-        let WfpFilterOrigin::DomainPolicy { domain_hint } = entry.origin else {
+        let WfpFilterOrigin::DomainPolicy { domain_hints } = entry.origin else {
             return Ok(None);
         };
         if !entry.allow {
@@ -801,60 +871,124 @@ impl WfpRuleManager {
             exe_path: entry.exe_path,
             remote_ip: key.1.unwrap_or(ip),
             allow: true,
-            domain_hint,
+            domain_hints,
         }))
     }
 
-    /// Removes stale [`WfpFilterOrigin::DomainPolicy`] IP Block filters for `exe_path` whose
-    /// recorded `domain_hint` matches `query_name` (in the same IP address family) or is listed in
-    /// `superseded_ips` when a newer DNS response resolves to different IPs (`new_ips`) and the old
-    /// IP is no longer independently blocked (`BUG_..._0003`).
+    /// Prunes migrated/superseded domains from [`WfpFilterOrigin::DomainPolicy`] IP Block filters
+    /// for `exe_path`, synchronizes active blocking reason domains from
+    /// `active_blocking_domains_by_ip`, and removes any non-static domain block whose remaining
+    /// `domain_hints` becomes empty (`BUG_..._0003`, `#4`).
+    #[allow(clippy::too_many_arguments)]
     pub fn invalidate_stale_domain_blocks_for_query(
         &mut self,
         exe_path: &str,
         query_name: &str,
         new_ips: &[IpAddr],
-        still_blocked_ips: &HashSet<IpAddr>,
-        superseded_ips: &HashSet<IpAddr>,
+        static_blocked_ips: &HashSet<IpAddr>,
+        active_blocking_domains_by_ip: &HashMap<IpAddr, Vec<String>>,
+        superseded_pairs: &HashSet<(IpAddr, String)>,
         defense: &dyn ActiveDefenseController,
     ) -> usize {
         let exe_k = Self::exe_key(exe_path);
-        let norm_query = query_name.trim().trim_end_matches('.').to_ascii_lowercase();
-        if norm_query.is_empty() {
+        let Some(norm_query) = normalize_domain_hint(query_name) else {
             return 0;
-        }
+        };
         let new_canon: HashSet<IpAddr> = new_ips.iter().map(|ip| canonical_ip(*ip)).collect();
         let has_v4 = new_canon.iter().any(IpAddr::is_ipv4);
         let has_v6 = new_canon.iter().any(IpAddr::is_ipv6);
-        let stale_keys: Vec<WfpTargetKey> = self
-            .installed
+        let static_blocked_canon: HashSet<IpAddr> = static_blocked_ips
             .iter()
-            .filter_map(|(k, entry)| {
-                if k.0 != exe_k || entry.allow {
-                    return None;
-                }
-                let ip = k.1?;
-                if new_canon.contains(&ip) || still_blocked_ips.contains(&ip) {
-                    return None;
-                }
-                let WfpFilterOrigin::DomainPolicy { domain_hint } = &entry.origin else {
-                    return None;
-                };
-                let hint_norm = domain_hint.trim().trim_end_matches('.').to_ascii_lowercase();
-                if hint_norm.is_empty() {
-                    return None;
-                }
-                let same_family = (has_v4 && ip.is_ipv4()) || (has_v6 && ip.is_ipv6());
-                let is_domain_hint =
-                    !hint_norm.contains('/') && parse_literal_target_ip(&hint_norm).is_none();
-                let matches_query = same_family
-                    && is_domain_hint
-                    && (hint_norm == norm_query
-                        || (hint_norm.contains('*')
-                            && matches_network_target(&hint_norm, ip, Some(&norm_query))));
-                (matches_query || superseded_ips.contains(&ip)).then(|| k.clone())
+            .map(|ip| canonical_ip(*ip))
+            .collect();
+        let mut active_by_ip_canon: HashMap<IpAddr, Vec<String>> =
+            HashMap::with_capacity(active_blocking_domains_by_ip.len());
+        for (ip, doms) in active_blocking_domains_by_ip {
+            let entry = active_by_ip_canon.entry(canonical_ip(*ip)).or_default();
+            for dom in doms {
+                merge_domain_hint(entry, dom);
+            }
+        }
+        let norm_superseded: HashSet<(IpAddr, String)> = superseded_pairs
+            .iter()
+            .filter_map(|(ip, dom)| {
+                normalize_domain_hint(dom).map(|norm| (canonical_ip(*ip), norm))
             })
             .collect();
+
+        let mut stale_keys: Vec<WfpTargetKey> = Vec::new();
+        let mut updated_hints: Vec<(WfpTargetKey, Vec<String>)> = Vec::new();
+
+        for (k, entry) in &self.installed {
+            if k.0 != exe_k || entry.allow {
+                continue;
+            }
+            let Some(ip) = k.1 else {
+                continue;
+            };
+            let WfpFilterOrigin::DomainPolicy { domain_hints } = &entry.origin else {
+                continue;
+            };
+
+            let had_non_empty_hints = !domain_hints.is_empty();
+            let same_family = (has_v4 && ip.is_ipv4()) || (has_v6 && ip.is_ipv6());
+            let mut next_hints: Vec<String> = Vec::with_capacity(domain_hints.len());
+
+            // 1. Prune hints that migrated away in this query or are superseded in DNS history.
+            if had_non_empty_hints {
+                for raw_hint in domain_hints {
+                    let Some(hint_norm) = normalize_domain_hint(raw_hint) else {
+                        continue;
+                    };
+                    let is_domain_hint =
+                        !hint_norm.contains('/') && parse_literal_target_ip(&hint_norm).is_none();
+                    let matches_migrated_query = !new_canon.contains(&ip)
+                        && same_family
+                        && is_domain_hint
+                        && (hint_norm == norm_query
+                            || (hint_norm.contains('*')
+                                && matches_network_target(&hint_norm, ip, Some(&norm_query))));
+                    let is_superseded = norm_superseded.contains(&(ip, hint_norm.clone()));
+                    if !matches_migrated_query && !is_superseded {
+                        merge_domain_hint(&mut next_hints, &hint_norm);
+                    }
+                }
+            }
+
+            // 2. Synchronize currently active blocking domains so filter metadata tracks live
+            //    blocking reasons even if the original domain later evicts from DNS history FIFO.
+            if let Some(active_doms) = active_by_ip_canon.get(&ip) {
+                for dom in active_doms {
+                    merge_domain_hint(&mut next_hints, dom);
+                }
+            }
+
+            // 3. Keep the filter if the IP is still in `new_canon`, statically blocked, or has
+            //    any active blocking domain; otherwise remove if a domain-tagged filter has zero
+            //    remaining hints.
+            let keep = new_canon.contains(&ip)
+                || static_blocked_canon.contains(&ip)
+                || active_by_ip_canon.contains_key(&ip)
+                || !had_non_empty_hints
+                || !next_hints.is_empty();
+
+            if keep {
+                if &next_hints != domain_hints {
+                    updated_hints.push((k.clone(), next_hints));
+                }
+            } else {
+                stale_keys.push(k.clone());
+            }
+        }
+
+        for (key, next_hints) in updated_hints {
+            if let Some(entry) = self.installed.get_mut(&key) {
+                entry.origin = WfpFilterOrigin::DomainPolicy {
+                    domain_hints: next_hints,
+                };
+            }
+        }
+
         let mut removed = 0usize;
         for key in stale_keys {
             if let Some(entry) = self.installed.get(&key).cloned() {
@@ -879,9 +1013,9 @@ impl WfpRuleManager {
         removed
     }
 
-    pub fn domain_policy_blocks(&self, exe_path: &str) -> Vec<(IpAddr, String)> {
+    pub fn domain_policy_blocks(&self, exe_path: &str) -> Vec<(IpAddr, Vec<String>)> {
         let exe_k = Self::exe_key(exe_path);
-        let mut out: Vec<(IpAddr, String)> = self
+        let mut out: Vec<(IpAddr, Vec<String>)> = self
             .installed
             .iter()
             .filter_map(|(k, entry)| {
@@ -889,14 +1023,13 @@ impl WfpRuleManager {
                     return None;
                 }
                 let ip = k.1?;
-                let WfpFilterOrigin::DomainPolicy { domain_hint } = &entry.origin else {
+                let WfpFilterOrigin::DomainPolicy { domain_hints } = &entry.origin else {
                     return None;
                 };
-                Some((ip, domain_hint.clone()))
+                Some((ip, domain_hints.clone()))
             })
             .collect();
-        out.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()).then(a.1.cmp(&b.1)));
-        out.dedup();
+        out.sort_by_key(|a| a.0.to_string());
         out
     }
 
@@ -1398,9 +1531,10 @@ impl WfpRuleManager {
         //    startup-pinned interpreters so deleting a NetworkBlock leaves zero unprotected gap.
         let mut keys_to_remove: Vec<WfpTargetKey> = Vec::new();
         let mut removal_sources: HashMap<WfpTargetKey, Vec<String>> = HashMap::new();
-        let mut removal_hints: HashMap<WfpTargetKey, String> = HashMap::new();
+        let mut removal_hints: HashMap<WfpTargetKey, Vec<String>> = HashMap::new();
         let mut keys_to_promote: Vec<WfpTargetKey> = Vec::new();
         let mut keys_to_demote_preemptive: Vec<WfpTargetKey> = Vec::new();
+        let mut domain_block_hint_updates: Vec<(WfpTargetKey, Vec<String>)> = Vec::new();
         for (key, entry) in &self.installed {
             match &entry.origin {
                 WfpFilterOrigin::PersistedPolicy => match plan.desired.get(key) {
@@ -1427,7 +1561,7 @@ impl WfpRuleManager {
                         keys_to_remove.push(key.clone());
                     }
                 },
-                WfpFilterOrigin::DomainPolicy { domain_hint } => {
+                WfpFilterOrigin::DomainPolicy { domain_hints } => {
                     if let Some((_, desired_allow)) = plan.desired.get(key) {
                         if *desired_allow == entry.allow {
                             keys_to_promote.push(key.clone());
@@ -1457,32 +1591,85 @@ impl WfpRuleManager {
                     let identity = identity_cache
                         .entry(key.0.clone())
                         .or_insert_with(|| inspector.inspect(&entry.exe_path));
-                    let hint_opt = (!domain_hint.is_empty()).then_some(domain_hint.as_str());
-                    let decision = evaluate_outbound_policy(identity, ip, hint_opt, rules);
-                    let still_valid = matches!(
-                        (entry.allow, &decision),
-                        (true, OutboundDecision::AllowedByRule { .. })
-                            | (false, OutboundDecision::BlockedByRule { .. })
-                    );
-                    if !still_valid {
-                        if entry.allow && matches!(decision, OutboundDecision::BlockedByRule { .. })
-                        {
-                            let block_srcs: Vec<String> = rules
-                                .iter()
-                                .filter(|r| {
-                                    r.scope == RuleScope::NetworkBlock
-                                        && matches_network_block_rule(r, identity, ip, hint_opt)
-                                })
-                                .map(|r| r.rule_id.clone())
-                                .collect();
-                            if !block_srcs.is_empty() {
-                                removal_sources.insert(key.clone(), block_srcs);
+                    if domain_hints.is_empty() {
+                        let decision = evaluate_outbound_policy(identity, ip, None, rules);
+                        let still_valid = matches!(
+                            (entry.allow, &decision),
+                            (true, OutboundDecision::AllowedByRule { .. })
+                                | (false, OutboundDecision::BlockedByRule { .. })
+                        );
+                        if !still_valid {
+                            if entry.allow
+                                && matches!(decision, OutboundDecision::BlockedByRule { .. })
+                            {
+                                let block_srcs: Vec<String> = rules
+                                    .iter()
+                                    .filter(|r| {
+                                        r.scope == RuleScope::NetworkBlock
+                                            && matches_network_block_rule(r, identity, ip, None)
+                                    })
+                                    .map(|r| r.rule_id.clone())
+                                    .collect();
+                                if !block_srcs.is_empty() {
+                                    removal_sources.insert(key.clone(), block_srcs);
+                                }
+                            }
+                            keys_to_remove.push(key.clone());
+                        }
+                    } else if !entry.allow {
+                        // DomainPolicy Block: keep only hints that remain `BlockedByRule`; remove
+                        // the filter when zero blocked hints remain (`#4`).
+                        let mut surviving_hints: Vec<String> = Vec::with_capacity(domain_hints.len());
+                        for hint in domain_hints {
+                            let hint_opt = (!hint.is_empty()).then_some(hint.as_str());
+                            if matches!(
+                                evaluate_outbound_policy(identity, ip, hint_opt, rules),
+                                OutboundDecision::BlockedByRule { .. }
+                            ) {
+                                merge_domain_hint(&mut surviving_hints, hint);
                             }
                         }
-                        if !domain_hint.is_empty() {
-                            removal_hints.insert(key.clone(), domain_hint.clone());
+                        if surviving_hints.is_empty() {
+                            removal_hints.insert(key.clone(), domain_hints.clone());
+                            keys_to_remove.push(key.clone());
+                        } else if &surviving_hints != domain_hints {
+                            domain_block_hint_updates.push((key.clone(), surviving_hints));
                         }
-                        keys_to_remove.push(key.clone());
+                    } else {
+                        // DomainPolicy Permit: if ANY hint matches `BlockedByRule`, deny-overrides-allow
+                        // revokes the Permit immediately and attributes failure to the blocking rule(s);
+                        // otherwise keep the Permit while at least one hint stays `AllowedByRule`.
+                        let mut block_srcs: Vec<String> = Vec::new();
+                        let mut blocked_hints: Vec<String> = Vec::new();
+                        let mut any_allowed = false;
+                        for hint in domain_hints {
+                            let hint_opt = (!hint.is_empty()).then_some(hint.as_str());
+                            match evaluate_outbound_policy(identity, ip, hint_opt, rules) {
+                                OutboundDecision::BlockedByRule { .. } => {
+                                    blocked_hints.push(hint.clone());
+                                    for r in rules {
+                                        if r.scope == RuleScope::NetworkBlock
+                                            && matches_network_block_rule(r, identity, ip, hint_opt)
+                                            && !block_srcs.contains(&r.rule_id)
+                                        {
+                                            block_srcs.push(r.rule_id.clone());
+                                        }
+                                    }
+                                }
+                                OutboundDecision::AllowedByRule { .. } => {
+                                    any_allowed = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !block_srcs.is_empty() {
+                            removal_sources.insert(key.clone(), block_srcs);
+                            removal_hints.insert(key.clone(), blocked_hints);
+                            keys_to_remove.push(key.clone());
+                        } else if !any_allowed {
+                            removal_hints.insert(key.clone(), domain_hints.clone());
+                            keys_to_remove.push(key.clone());
+                        }
                     }
                 }
                 WfpFilterOrigin::Preemptive | WfpFilterOrigin::TransientContainment => {
@@ -1506,13 +1693,13 @@ impl WfpRuleManager {
             if let Some(entry) = self.installed.get(&key).cloned() {
                 match defense.remove_wfp_rule(entry.handle) {
                     Ok(()) => {
-                        if let WfpFilterOrigin::DomainPolicy { domain_hint } = &entry.origin {
+                        if let WfpFilterOrigin::DomainPolicy { domain_hints } = &entry.origin {
                             if let Some(remote_ip) = key.1 {
                                 report.removed_domain_filters.push(RemovedDomainFilterSnapshot {
                                     exe_path: entry.exe_path.clone(),
                                     remote_ip,
                                     allow: entry.allow,
-                                    domain_hint: domain_hint.clone(),
+                                    domain_hints: domain_hints.clone(),
                                 });
                             }
                         }
@@ -1528,7 +1715,7 @@ impl WfpRuleManager {
                             "failed to remove obsolete WFP rule during reconciliation"
                         );
                         let source_rule_ids = removal_sources.remove(&key).unwrap_or_default();
-                        let domain_hint = removal_hints.remove(&key);
+                        let domain_hints = removal_hints.remove(&key).unwrap_or_default();
                         failed_exe_keys.insert(key.0.clone());
                         report.failed += 1;
                         report.failed_ops.push(WfpFailedOp {
@@ -1538,7 +1725,7 @@ impl WfpRuleManager {
                             is_startup_preemptive: false,
                             newly_required: false,
                             source_rule_ids,
-                            domain_hint,
+                            domain_hints,
                             error: err,
                         });
                     }
@@ -1599,15 +1786,16 @@ impl WfpRuleManager {
                         is_startup_preemptive: false,
                         newly_required,
                         source_rule_ids,
-                        domain_hint: None,
+                        domain_hints: Vec::new(),
                         error: err,
                     });
                 }
             }
         }
 
-        // 4b. Promote/demote matching existing filters ONLY AFTER remove & add succeed for `exe_k`,
-        //     capturing snapshots so any subsequent rollback restores pre-promote origins & bindings.
+        // 4b. Promote/demote matching existing filters and prune surviving `DomainPolicy` Block
+        //     hints ONLY AFTER remove & add succeed for `exe_k`, capturing snapshots so any
+        //     subsequent rollback restores pre-reconcile origins & bindings faithfully.
         for key in keys_to_promote {
             if failed_exe_keys.contains(&key.0) {
                 continue;
@@ -1641,6 +1829,22 @@ impl WfpRuleManager {
                     bound_alert_ids: Vec::new(),
                 });
                 entry.origin = WfpFilterOrigin::Preemptive;
+            }
+        }
+
+        for (key, surviving_hints) in domain_block_hint_updates {
+            if failed_exe_keys.contains(&key.0) {
+                continue;
+            }
+            if let Some(entry) = self.installed.get_mut(&key) {
+                report.promoted_backups.push(PromotedFilterSnapshot {
+                    key: key.clone(),
+                    prev_origin: entry.origin.clone(),
+                    bound_alert_ids: Vec::new(),
+                });
+                entry.origin = WfpFilterOrigin::DomainPolicy {
+                    domain_hints: surviving_hints,
+                };
             }
         }
 
@@ -1686,7 +1890,7 @@ impl WfpRuleManager {
                         is_startup_preemptive: true,
                         newly_required: false,
                         source_rule_ids: Vec::new(),
-                        domain_hint: None,
+                        domain_hints: Vec::new(),
                         error: err,
                     });
                 }
@@ -1731,7 +1935,7 @@ impl WfpRuleManager {
                             exe_path: snap.exe_path.clone(),
                             allow: snap.allow,
                             origin: WfpFilterOrigin::DomainPolicy {
-                                domain_hint: snap.domain_hint.clone(),
+                                domain_hints: snap.domain_hints.clone(),
                             },
                         },
                     );
@@ -2072,7 +2276,277 @@ mod tests {
         assert_eq!(
             fw.filter_origin(transient_app, Some(dom_ip)),
             Some(&WfpFilterOrigin::DomainPolicy {
-                domain_hint: "bad.example".to_string()
+                domain_hints: vec!["bad.example".to_string()]
+            })
+        );
+    }
+
+    /// `FIREWALL-P3-47A` (`#4`, `#1`): Shared-IP `DomainPolicy` filters retain a bounded,
+    /// normalized set of domain hints across reuse, prune migrated domains and sync active
+    /// blocking reasons on migration so final migration removes the block even after earlier
+    /// domains were evicted from DNS history FIFO, preserve dual-stack IPv6 blocks, enforce
+    /// multi-domain Permit deny-overrides-allow reconciliation, and restore multi-domain
+    /// `RemovedDomainFilterSnapshot` faithfully.
+    #[test]
+    fn firewall_p3_47a_domain_policy_hint_set_migration_cleanup_and_rollback_fidelity() {
+        use std::net::Ipv6Addr;
+
+        let mut fw = WfpRuleManager::new();
+        let defense = StubDefense::new();
+        let inspector = StubInspector("d".repeat(64));
+
+        let app = r"C:\Tools\shared_blk_app.exe";
+        let shared_v4 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88));
+        let new_a_v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let new_b_v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11));
+        let v6_a = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x88));
+
+        // 1. Reusing a shared-IP DomainPolicy Block merges distinct normalized hints without
+        //    creating duplicate BFE handles or duplicate hint entries.
+        let h1 = fw
+            .ensure_domain_policy_block(app, shared_v4, "A.Example.", &defense)
+            .expect("block a.example");
+        let h2 = fw
+            .ensure_domain_policy_block(app, shared_v4, "b.example", &defense)
+            .expect("block b.example");
+        let h3 = fw
+            .ensure_domain_policy_block(app, shared_v4, "a.example", &defense)
+            .expect("dedup a.example");
+        assert_eq!(h1, h2);
+        assert_eq!(h1, h3);
+        assert_eq!(
+            fw.filter_origin(app, Some(shared_v4)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: vec!["a.example".to_string(), "b.example".to_string()],
+            })
+        );
+
+        // Dual-stack IPv6 block for `a.example` on a separate address family.
+        fw.ensure_domain_policy_block(app, v6_a, "a.example", &defense)
+            .expect("block a.example v6");
+
+        // 2. `a.example` migrates off `shared_v4` while `b.example` still actively blocks it:
+        //    `shared_v4` stays blocked with `domain_hints` synced to `["b.example"]`, and `v6_a`
+        //    stays completely intact.
+        let mut active_blocking: HashMap<IpAddr, Vec<String>> = HashMap::new();
+        active_blocking.insert(shared_v4, vec!["b.example".to_string()]);
+        let mut superseded: HashSet<(IpAddr, String)> = HashSet::new();
+        superseded.insert((shared_v4, "a.example".to_string()));
+        let removed_step1 = fw.invalidate_stale_domain_blocks_for_query(
+            app,
+            "a.example",
+            &[new_a_v4],
+            &HashSet::new(),
+            &active_blocking,
+            &superseded,
+            &defense,
+        );
+        assert_eq!(removed_step1, 0);
+        assert!(fw.has_active_filter(app, Some(shared_v4), false));
+        assert_eq!(
+            fw.filter_origin(app, Some(shared_v4)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: vec!["b.example".to_string()],
+            })
+        );
+        assert_eq!(
+            fw.filter_origin(app, Some(v6_a)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: vec!["a.example".to_string()],
+            }),
+            "IPv4 migration must not disturb IPv6 DomainPolicy Block"
+        );
+
+        // 3. Even after `a.example` is evicted from `latest_domain_by_exe` FIFO (so
+        //    `superseded_pairs` is completely empty!), migrating `b.example` off `shared_v4`
+        //    deterministically removes the retired `shared_v4` block while keeping `v6_a`.
+        let removed_step2 = fw.invalidate_stale_domain_blocks_for_query(
+            app,
+            "b.example",
+            &[new_b_v4],
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &defense,
+        );
+        assert_eq!(removed_step2, 1);
+        assert!(
+            !fw.has_active_filter(app, Some(shared_v4), false),
+            "shared_v4 block must be removed once final domain b.example migrates away"
+        );
+        assert!(
+            fw.has_active_filter(app, Some(v6_a), false),
+            "IPv6 block for a.example must remain unaffected by IPv4 migrations"
+        );
+
+        // 4. Even if `b.example` was NOT originally recorded on the filter before `a.example`
+        //    migrated, syncing `active_blocking_domains_by_ip` during `a.example`'s migration
+        //    transitions `domain_hints` to `["b.example"]` so `b.example`'s later migration still
+        //    clears the filter with empty `superseded_pairs`.
+        fw.ensure_domain_policy_block(app, shared_v4, "a.example", &defense)
+            .expect("re-block a.example only");
+        assert_eq!(
+            fw.invalidate_stale_domain_blocks_for_query(
+                app,
+                "a.example",
+                &[new_a_v4],
+                &HashSet::new(),
+                &active_blocking,
+                &HashSet::new(),
+                &defense,
+            ),
+            0
+        );
+        assert_eq!(
+            fw.filter_origin(app, Some(shared_v4)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: vec!["b.example".to_string()],
+            })
+        );
+        assert_eq!(
+            fw.invalidate_stale_domain_blocks_for_query(
+                app,
+                "b.example",
+                &[new_b_v4],
+                &HashSet::new(),
+                &HashMap::new(),
+                &HashSet::new(),
+                &defense,
+            ),
+            1
+        );
+        assert!(!fw.has_active_filter(app, Some(shared_v4), false));
+
+        // 5. Hint set is strictly bounded by `MAX_DOMAIN_HINTS_PER_FILTER` (32).
+        let cap_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 99));
+        for idx in 0..(MAX_DOMAIN_HINTS_PER_FILTER + 8) {
+            fw.ensure_domain_policy_block(app, cap_ip, &format!("d{idx}.example"), &defense)
+                .expect("bounded hint merge");
+        }
+        let Some(WfpFilterOrigin::DomainPolicy { domain_hints }) =
+            fw.filter_origin(app, Some(cap_ip))
+        else {
+            panic!("expected DomainPolicy origin for cap_ip");
+        };
+        assert_eq!(domain_hints.len(), MAX_DOMAIN_HINTS_PER_FILTER);
+        assert_eq!(domain_hints.first().map(String::as_str), Some("d8.example"));
+        assert_eq!(
+            domain_hints.last().map(String::as_str),
+            Some("d39.example")
+        );
+
+        // 6. Multi-domain Permit accumulation, Block hint pruning, deny-overrides-allow removal,
+        //    and `RemovedDomainFilterSnapshot` restore fidelity.
+        let perm_app = r"C:\Tools\shared_perm_app.exe";
+        let perm_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55));
+        let blk_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 56));
+        let sha = "d".repeat(64);
+        let p_h1 = fw
+            .ensure_ip_permit_for_domain_rule(perm_app, perm_ip, "good1.example", &defense)
+            .expect("permit good1");
+        let p_h2 = fw
+            .ensure_ip_permit_for_domain_rule(perm_app, perm_ip, "good2.example", &defense)
+            .expect("permit good2");
+        assert_eq!(p_h1, p_h2);
+        assert_eq!(
+            fw.filter_origin(perm_app, Some(perm_ip)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: vec!["good1.example".to_string(), "good2.example".to_string()],
+            })
+        );
+        fw.ensure_domain_policy_block(perm_app, blk_ip, "blk1.example", &defense)
+            .expect("blk1");
+        fw.ensure_domain_policy_block(perm_app, blk_ip, "blk2.example", &defense)
+            .expect("blk2");
+
+        let allow_good1 = AllowlistRuleRecord {
+            rule_id: "R-ALLOW-1".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: perm_app.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("good1.example".to_string()),
+            created_at_ms: 1,
+            created_by: "test".to_string(),
+        };
+        let block_blk2 = AllowlistRuleRecord {
+            rule_id: "R-BLK-2".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: perm_app.to_string(),
+            sha256: Some(sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("blk2.example".to_string()),
+            created_at_ms: 2,
+            created_by: "test".to_string(),
+        };
+        // Reconcile with only `good1` allowed and only `blk2` blocked:
+        // - Permit stays alive because `good1` is still allowed and neither is blocked.
+        // - Block stays alive and prunes `blk1.example`, retaining only `["blk2.example"]`
+        //   (with rollback backup capturing `["blk1.example", "blk2.example"]`).
+        let rep_keep = fw.reconcile_persisted_rules(
+            &[allow_good1.clone(), block_blk2.clone()],
+            &[],
+            &inspector,
+            &defense,
+        );
+        assert!(fw.has_active_filter(perm_app, Some(perm_ip), true));
+        assert!(fw.has_active_filter(perm_app, Some(blk_ip), false));
+        assert_eq!(
+            fw.filter_origin(perm_app, Some(blk_ip)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: vec!["blk2.example".to_string()],
+            })
+        );
+        fw.restore_promoted_filter_states(&rep_keep.promoted_backups);
+        assert_eq!(
+            fw.filter_origin(perm_app, Some(blk_ip)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: vec!["blk1.example".to_string(), "blk2.example".to_string()],
+            }),
+            "rollback of reconciled Block hint pruning must restore original hint set"
+        );
+
+        // Adding a block for `good2.example` revokes the multi-domain Permit (deny-overrides-allow)
+        // and captures all `domain_hints` in `RemovedDomainFilterSnapshot`.
+        let block_good2 = AllowlistRuleRecord {
+            rule_id: "R-BLK-GOOD2".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: perm_app.to_string(),
+            sha256: Some(sha),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("good2.example".to_string()),
+            created_at_ms: 3,
+            created_by: "test".to_string(),
+        };
+        let rep_revoke = fw.reconcile_persisted_rules(
+            &[allow_good1, block_blk2, block_good2],
+            &[],
+            &inspector,
+            &defense,
+        );
+        assert!(
+            !fw.has_active_filter(perm_app, Some(perm_ip), true),
+            "blocking any domain in Permit hint set must revoke shared-IP Permit"
+        );
+        let perm_snap = rep_revoke
+            .removed_domain_filters
+            .iter()
+            .find(|s| s.remote_ip == perm_ip && s.allow)
+            .expect("removed Permit snapshot");
+        assert_eq!(
+            perm_snap.domain_hints,
+            vec!["good1.example".to_string(), "good2.example".to_string()]
+        );
+
+        // Restoring the snapshot reproduces the exact multi-domain hint vector.
+        fw.restore_removed_domain_filters(std::slice::from_ref(perm_snap), &defense);
+        assert_eq!(
+            fw.filter_origin(perm_app, Some(perm_ip)),
+            Some(&WfpFilterOrigin::DomainPolicy {
+                domain_hints: vec!["good1.example".to_string(), "good2.example".to_string()],
             })
         );
     }

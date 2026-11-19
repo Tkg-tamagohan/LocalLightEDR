@@ -8538,3 +8538,824 @@ async fn daemon_p3_47_shared_ip_block_cleanup_after_fifo_eviction_of_first_domai
 
     engine.shutdown_and_flush().await.expect("shutdown");
 }
+
+struct P348Harness {
+    store: LedrStore,
+    defense: Arc<MockWfpDefense>,
+    notifier: Arc<MockNotifier>,
+    inspector: Arc<MapBinaryInspector>,
+    engine: Arc<DaemonEngine>,
+    ps_exe: &'static str,
+    ps_sha: String,
+    unrelated_exe: &'static str,
+    unrelated_sha: String,
+    ps_proc: ProcessIdentity,
+}
+
+impl P348Harness {
+    async fn start(pid: u32, allow_rules: &[(&str, &str)], base_ts: i64) -> Self {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+
+        let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let ps_sha = "a".repeat(64);
+        let unrelated_exe = r"C:\Tools\unrelated_app_p3_48.exe";
+        let unrelated_sha = "b".repeat(64);
+        inspector.register(ps_exe, Some(&ps_sha), None);
+        inspector.register(unrelated_exe, Some(&unrelated_sha), None);
+
+        for (idx, (rule_id, domain)) in allow_rules.iter().enumerate() {
+            store
+                .upsert_rule(&AllowlistRuleRecord {
+                    rule_id: (*rule_id).to_string(),
+                    scope: RuleScope::NetworkAllow,
+                    exe_path_pattern: ps_exe.to_string(),
+                    sha256: Some(ps_sha.clone()),
+                    signer_subject: None,
+                    root_thumbprint: None,
+                    allowed_target: Some((*domain).to_string()),
+                    created_at_ms: base_ts - 10_000 + idx as i64,
+                    created_by: "seed".to_string(),
+                })
+                .expect("seed NetworkAllow rule");
+        }
+
+        let engine = DaemonEngine::start_with_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                preemptive_startup_executables: vec![ps_exe.to_string()],
+                wfp_drop_dns_grace_ms: 2_000,
+                ..DaemonConfig::default()
+            },
+            defense.clone(),
+            notifier.clone(),
+            inspector.clone(),
+        );
+        assert!(
+            engine.has_active_wfp_filter(ps_exe, None, false),
+            "pre-restricted powershell.exe must carry an app-wide preemptive WFP block at startup"
+        );
+
+        let ps_proc = ProcessIdentity::new(pid, unix_ms_to_filetime(base_ts - 5_000));
+        let hp_before = engine.metrics().high_priority_processed;
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: ps_proc,
+                parent_pid: 4,
+                exe_path: ps_exe.to_string(),
+                command_line: format!("{ps_exe} -NoProfile"),
+                user_sid: Some("S-1-5-21-1000".to_string()),
+            })
+            .await
+            .expect("send ProcessStart");
+        assert!(
+            wait_until(1_000, || engine.metrics().high_priority_processed > hp_before).await,
+            "ProcessStart must finish deterministically on the HighPriority lane"
+        );
+        assert!(
+            engine.has_active_wfp_filter(ps_exe, None, false),
+            "pre-restricted powershell.exe must keep its app-wide preemptive WFP block after ProcessStart"
+        );
+
+        Self {
+            store,
+            defense,
+            notifier,
+            inspector,
+            engine,
+            ps_exe,
+            ps_sha,
+            unrelated_exe,
+            unrelated_sha,
+            ps_proc,
+        }
+    }
+
+    async fn send_promoted_dns(
+        &self,
+        query_name: &str,
+        resolved_ips: Vec<IpAddr>,
+        timestamp_ms: i64,
+    ) {
+        let ev = SensorEvent::DnsQuery {
+            pid: self.ps_proc.pid,
+            query_name: query_name.to_string(),
+            query_type: 1,
+            resolved_ips,
+            timestamp_ms,
+        };
+        let classified = self.engine.classified_sender();
+        assert!(
+            classified.should_promote(&ev),
+            "external DnsQuery for {query_name} must promote to HighPriority while domain rules exist"
+        );
+        let hp_before = self.engine.metrics().high_priority_processed;
+        classified.send(ev).await.expect("send promoted DnsQuery");
+        assert!(
+            wait_until(1_000, || {
+                self.engine.metrics().high_priority_processed > hp_before
+            })
+            .await,
+            "promoted DnsQuery for {query_name} must finish HighPriority processing"
+        );
+    }
+
+    async fn send_promoted_connect(
+        &self,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        domain_hint: Option<&str>,
+        timestamp_ms: i64,
+    ) {
+        let ev = SensorEvent::NetworkConnect {
+            pid: self.ps_proc.pid,
+            protocol: 6,
+            dst_ip,
+            dst_port,
+            domain_hint: domain_hint.map(ToString::to_string),
+            timestamp_ms,
+        };
+        let classified = self.engine.classified_sender();
+        assert!(
+            classified.should_promote(&ev),
+            "external NetworkConnect to {dst_ip}:{dst_port} must promote to HighPriority"
+        );
+        let hp_before = self.engine.metrics().high_priority_processed;
+        classified
+            .send(ev)
+            .await
+            .expect("send promoted NetworkConnect");
+        assert!(
+            wait_until(1_000, || {
+                self.engine.metrics().high_priority_processed > hp_before
+            })
+            .await,
+            "promoted NetworkConnect to {dst_ip}:{dst_port} must finish HighPriority processing"
+        );
+    }
+
+    async fn send_wfp_drop_and_barrier(
+        &self,
+        filter_id: u64,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        timestamp_ms: i64,
+        barrier_label: &str,
+    ) {
+        assert!(self.engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: filter_id,
+            rule_handle: filter_id,
+            exe_path: self.ps_exe.to_string(),
+            protocol: 6,
+            dst_ip,
+            dst_port,
+            timestamp_ms,
+        }));
+        let tel_before = self.engine.metrics().telemetry_processed;
+        self.engine
+            .sender()
+            .send(SensorEvent::DnsQuery {
+                pid: 99_999,
+                query_name: format!("{barrier_label}.local"),
+                query_type: 1,
+                resolved_ips: Vec::new(),
+                timestamp_ms: timestamp_ms + 1,
+            })
+            .await
+            .expect("send Tier-3 telemetry barrier");
+        assert!(
+            wait_until(1_000, || {
+                self.engine.metrics().telemetry_processed > tel_before
+            })
+            .await,
+            "Tier-3 telemetry barrier `{barrier_label}` must confirm Tier-2b WfpDropEvent completed"
+        );
+    }
+
+    fn upsert_unrelated_rule(&self, rule_id: &str, target_ip: IpAddr, created_at_ms: i64) {
+        let report = self
+            .engine
+            .upsert_policy_rule(&AllowlistRuleRecord {
+                rule_id: rule_id.to_string(),
+                scope: RuleScope::NetworkAllow,
+                exe_path_pattern: self.unrelated_exe.to_string(),
+                sha256: Some(self.unrelated_sha.clone()),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some(target_ip.to_string()),
+                created_at_ms,
+                created_by: "test".to_string(),
+            })
+            .expect("upsert unrelated app rule");
+        assert_eq!(
+            report.failed, 0,
+            "unrelated rule `{rule_id}` reconciliation must succeed without WFP failures"
+        );
+        assert!(
+            self.engine
+                .has_active_wfp_filter(self.unrelated_exe, Some(target_ip), true),
+            "unrelated app rule `{rule_id}` must materialize its own WFP Permit"
+        );
+    }
+
+    fn upsert_ps_block_domain(&self, rule_id: &str, domain: &str, created_at_ms: i64) {
+        let report = self
+            .engine
+            .upsert_policy_rule(&AllowlistRuleRecord {
+                rule_id: rule_id.to_string(),
+                scope: RuleScope::NetworkBlock,
+                exe_path_pattern: self.ps_exe.to_string(),
+                sha256: Some(self.ps_sha.clone()),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some(domain.to_string()),
+                created_at_ms,
+                created_by: "test".to_string(),
+            })
+            .expect("upsert powershell NetworkBlock rule");
+        assert_eq!(
+            report.failed, 0,
+            "powershell NetworkBlock rule `{rule_id}` reconciliation must succeed without WFP failures"
+        );
+    }
+
+    async fn setup_shared_ip_and_migrate_api(
+        &self,
+        ip1: IpAddr,
+        ip2: IpAddr,
+        unrelated_ip: IpAddr,
+        base_ts: i64,
+        unrelated_rule_id: &str,
+    ) {
+        // 1. Unallowed `other.example` resolves to shared `ip1`.
+        self.send_promoted_dns("other.example", vec![ip1], base_ts + 100)
+            .await;
+        assert!(
+            !self.engine.has_active_wfp_filter(self.ps_exe, Some(ip1), true),
+            "unallowed other.example alone must not materialize an IP Permit on {ip1}"
+        );
+
+        // 2. Allowed `api.example` resolves to the same shared `ip1`.
+        self.send_promoted_dns("api.example", vec![ip1], base_ts + 200)
+            .await;
+        assert!(
+            self.engine.has_active_wfp_filter(self.ps_exe, Some(ip1), true),
+            "allowed api.example must materialize a DomainPolicy IP Permit on shared {ip1}"
+        );
+
+        // 3. `api.example` migrates to `ip2`.
+        self.send_promoted_dns("api.example", vec![ip2], base_ts + 300)
+            .await;
+        assert!(
+            self.engine.has_active_wfp_filter(self.ps_exe, Some(ip1), true),
+            "cached old IP {ip1} Permit must stay active after api.example migrates to {ip2}"
+        );
+        assert!(
+            self.engine.has_active_wfp_filter(self.ps_exe, Some(ip2), true),
+            "new IP {ip2} Permit must be materialized after api.example migrates"
+        );
+
+        // 4. Unrelated rule save triggers full reconciliation.
+        self.upsert_unrelated_rule(unrelated_rule_id, unrelated_ip, base_ts + 400);
+        assert!(
+            self.engine.has_active_wfp_filter(self.ps_exe, Some(ip1), true),
+            "cached old IP {ip1} Permit must survive unrelated rule reconciliation"
+        );
+        assert!(
+            self.engine.has_active_wfp_filter(self.ps_exe, Some(ip2), true),
+            "migrated IP {ip2} Permit must survive unrelated rule reconciliation"
+        );
+        assert!(
+            self.defense.removed_wfp().is_empty(),
+            "no WFP filter should be revoked during shared-IP migration and unrelated reconcile"
+        );
+    }
+
+    fn notified_alerts(&self) -> Vec<AlertRecord> {
+        self.notifier
+            .notified
+            .lock()
+            .expect("lock notified")
+            .clone()
+    }
+}
+
+/// `DAEMON-P3-48` (PR #5 Review #38 `PRRT_kwDOVyjVyM65e5kL` / `AUD-P3-01` E2E regression):
+/// - Part 1: When a pre-restricted `powershell.exe` has `NetworkAllow(api.example)`, both
+///   `other.example` and `api.example` resolve to shared `ip1`, `api.example` migrates to `ip2`,
+///   and an unrelated app rule is saved via `upsert_policy_rule`, both `ip1` and `ip2` WFP Permits
+///   remain active and subsequent `NetworkConnect(domain_hint: None)` plus a racing `WfpDropEvent`
+///   against cached `ip1` succeed with 0 suspends, 0 false alerts, and `ip1` Permit intact.
+/// - Part 2: Four isolated security boundaries from the exact same post-reconcile state:
+///   (a) Adding `NetworkBlock(other.example)` while cohosted on `ip1` revokes `ip1` Permit
+///       immediately (deny-overrides-allow) while keeping `ip2` Permit.
+///   (b) Migrating `other.example` to `ip3` before adding `NetworkBlock(other.example)` preserves
+///       `ip1` Permit and blocks `ip3`.
+///   (c) Replacing the binary SHA-256 on disk (`MapBinaryInspector`) causes `NetworkConnect` to
+///       cached `ip1` to revoke stale Permits, suspend the process, and emit a `Pending` alert
+///       (`SEC_0001`).
+///   (d) Deleting `NetworkAllow(api.example)` via `delete_policy_rule` revokes both `ip1` and `ip2`
+///       Permits.
+/// - Part 3: With two allowed domains (`keep.example` and `api.example`) plus unallowed
+///   `other.example` sharing `ip1`, migrating `api.example` to `ip2` and adding
+///   `NetworkBlock(api.example)` revokes `ip2` Permit while keeping `keep.example`'s `ip1` Permit.
+#[tokio::test]
+async fn daemon_p3_48_shared_ip_migrated_allow_permit_preservation_and_security_boundaries() {
+    let ip1 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 148));
+    let ip2 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 148));
+    let ip3 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 149));
+    let unrelated_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 148));
+    let now_ms = current_unix_ms();
+    let base_ts = now_ms - 4_000;
+
+    // -------------------------------------------------------------------------
+    // Part 1: Primary E2E regression (cached old IP connection + racing WfpDropEvent)
+    // -------------------------------------------------------------------------
+    {
+        let h = P348Harness::start(9811, &[("R-ALLOW-API-P3-48", "api.example")], base_ts).await;
+        h.setup_shared_ip_and_migrate_api(ip1, ip2, unrelated_ip, base_ts, "R-UNRELATED-P3-48-1")
+            .await;
+
+        // Cached old IP `ip1` NetworkConnect with `domain_hint: None` must pass cleanly.
+        h.send_promoted_connect(ip1, 443, None, base_ts + 500).await;
+        assert!(
+            h.defense.suspends().is_empty(),
+            "Part 1: cached old IP NetworkConnect must not suspend powershell.exe"
+        );
+        assert!(
+            h.store.list_alerts(None, 20).expect("list alerts").is_empty(),
+            "Part 1: cached old IP NetworkConnect must emit 0 alerts"
+        );
+        assert!(
+            h.notified_alerts().is_empty(),
+            "Part 1: cached old IP NetworkConnect must dispatch 0 notifications"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 1: ip1 Permit must remain active after NetworkConnect"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), true),
+            "Part 1: ip2 Permit must remain active after NetworkConnect"
+        );
+
+        // Racing WfpDropEvent against cached old IP `ip1` must also pass without suspend/alert.
+        h.send_wfp_drop_and_barrier(4801, ip1, 8443, base_ts + 550, "p3-48-part1-drop-barrier")
+            .await;
+        assert!(
+            h.defense.suspends().is_empty(),
+            "Part 1: racing WfpDropEvent on cached ip1 must produce 0 suspends"
+        );
+        assert!(
+            h.store.list_alerts(None, 20).expect("list alerts").is_empty(),
+            "Part 1: racing WfpDropEvent on cached ip1 must produce 0 false alerts"
+        );
+        assert!(
+            h.notified_alerts().is_empty(),
+            "Part 1: racing WfpDropEvent on cached ip1 must dispatch 0 notifications"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 1: ip1 Permit must remain intact after racing WfpDropEvent"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), true),
+            "Part 1: ip2 Permit must remain intact after racing WfpDropEvent"
+        );
+        assert!(
+            h.defense.removed_wfp().is_empty(),
+            "Part 1: ip1 Permit must never have been revoked"
+        );
+
+        // Shutdown flushes any parked pending drops, verifying the drop was not silently deferred.
+        h.engine
+            .shutdown_and_flush()
+            .await
+            .expect("shutdown part 1");
+        assert!(
+            h.defense.suspends().is_empty(),
+            "Part 1: 0 suspends must remain after shutdown_and_flush"
+        );
+        assert!(
+            h.store.list_alerts(None, 20).expect("list alerts").is_empty(),
+            "Part 1: 0 false alerts must remain after shutdown_and_flush"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Part 2(a): Security boundary — blocking cohosted `other.example` immediately
+    // revokes `ip1` Permit (deny-overrides-allow) while preserving `ip2` Permit.
+    // -------------------------------------------------------------------------
+    {
+        let h = P348Harness::start(9812, &[("R-ALLOW-API-P3-48", "api.example")], base_ts).await;
+        h.setup_shared_ip_and_migrate_api(ip1, ip2, unrelated_ip, base_ts, "R-UNRELATED-P3-48-2A")
+            .await;
+
+        h.upsert_ps_block_domain("R-BLK-OTHER-P3-48-2A", "other.example", base_ts + 500);
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 2(a): blocking cohosted other.example must immediately revoke ip1 Permit"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, None, false),
+            "Part 2(a): app-wide preemptive block must remain active so ip1 is blocked immediately"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), true),
+            "Part 2(a): migrated api.example ip2 Permit must remain intact"
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), false),
+            "Part 2(a): migrated api.example ip2 must not be blocked"
+        );
+
+        // Subsequent NetworkConnect to `ip1` must enforce the policy block (not live-permit allow).
+        h.send_promoted_connect(ip1, 443, None, base_ts + 550).await;
+        let alerts = h.store.list_alerts(None, 20).expect("list part 2a alerts");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "Part 2(a): connecting to blocked shared ip1 must emit 1 policy-block alert (got {alerts:?})"
+        );
+        assert_eq!(alerts[0].rule_id, "LEDR-NET-POLICY-BLOCK");
+        let ctx: serde_json::Value =
+            serde_json::from_str(&alerts[0].context_json).expect("parse part 2a context_json");
+        assert_eq!(
+            ctx.get("matched_rule_id").and_then(serde_json::Value::as_str),
+            Some("R-BLK-OTHER-P3-48-2A")
+        );
+        assert_eq!(
+            ctx.get("domain_hint").and_then(serde_json::Value::as_str),
+            Some("other.example")
+        );
+        assert_eq!(
+            ctx.get("wfp_blocked").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 2(a): ip1 Permit must stay revoked after connect"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), false),
+            "Part 2(a): connecting to blocked shared ip1 must materialize IP-level DomainPolicy Block"
+        );
+
+        h.engine
+            .shutdown_and_flush()
+            .await
+            .expect("shutdown part 2a");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part 2(b): Security boundary — after `other.example` also migrates to `ip3`,
+    // adding `NetworkBlock(other.example)` blocks `ip3` without revoking `ip1` Permit.
+    // -------------------------------------------------------------------------
+    {
+        let h = P348Harness::start(9813, &[("R-ALLOW-API-P3-48", "api.example")], base_ts).await;
+        h.setup_shared_ip_and_migrate_api(ip1, ip2, unrelated_ip, base_ts, "R-UNRELATED-P3-48-2B")
+            .await;
+
+        h.send_promoted_dns("other.example", vec![ip3], base_ts + 500)
+            .await;
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 2(b): ip1 Permit must remain active after other.example migrates to ip3"
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip3), true),
+            "Part 2(b): unallowed other.example migrating to ip3 must not create an ip3 Permit"
+        );
+
+        h.upsert_ps_block_domain("R-BLK-OTHER-P3-48-2B", "other.example", base_ts + 550);
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 2(b): ip1 Permit must remain active when migrated other.example is later blocked"
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), false),
+            "Part 2(b): ip1 must not receive a Block after other.example migrated away"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), true),
+            "Part 2(b): ip2 Permit must remain active"
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip3), true),
+            "Part 2(b): ip3 must not have a Permit"
+        );
+        assert!(
+            h.defense.removed_wfp().is_empty(),
+            "Part 2(b): ip1 Permit must not be removed during selective pruning or later block"
+        );
+
+        // Cached old IP `ip1` connection still passes with 0 suspends and 0 alerts.
+        h.send_promoted_connect(ip1, 443, None, base_ts + 600).await;
+        assert!(
+            h.defense.suspends().is_empty(),
+            "Part 2(b): cached ip1 connection must not suspend"
+        );
+        assert!(
+            h.store.list_alerts(None, 20).expect("list alerts").is_empty(),
+            "Part 2(b): cached ip1 connection must emit 0 alerts"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 2(b): ip1 Permit must stay active after cached ip1 connection"
+        );
+
+        // Connecting to `other.example`'s new IP `ip3` enforces the block rule without affecting `ip1`.
+        h.send_promoted_connect(ip3, 443, None, base_ts + 650).await;
+        let alerts = h.store.list_alerts(None, 20).expect("list part 2b alerts");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "Part 2(b): connecting to migrated other.example ip3 must emit 1 policy-block alert (got {alerts:?})"
+        );
+        assert_eq!(alerts[0].rule_id, "LEDR-NET-POLICY-BLOCK");
+        let ctx: serde_json::Value =
+            serde_json::from_str(&alerts[0].context_json).expect("parse part 2b context_json");
+        assert_eq!(
+            ctx.get("matched_rule_id").and_then(serde_json::Value::as_str),
+            Some("R-BLK-OTHER-P3-48-2B")
+        );
+        assert_eq!(
+            ctx.get("domain_hint").and_then(serde_json::Value::as_str),
+            Some("other.example")
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip3), false),
+            "Part 2(b): connecting to ip3 must materialize DomainPolicy Block on ip3"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 2(b): ip1 Permit must remain active after blocking ip3"
+        );
+
+        h.engine
+            .shutdown_and_flush()
+            .await
+            .expect("shutdown part 2b");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part 2(c): Security boundary (`SEC_0001`) — replacing binary SHA-256 on disk
+    // before connecting to cached `ip1` revokes stale Permits, suspends, and alerts.
+    // -------------------------------------------------------------------------
+    {
+        let h = P348Harness::start(9814, &[("R-ALLOW-API-P3-48", "api.example")], base_ts).await;
+        h.setup_shared_ip_and_migrate_api(ip1, ip2, unrelated_ip, base_ts, "R-UNRELATED-P3-48-2C")
+            .await;
+
+        let tampered_sha = "f".repeat(64);
+        h.inspector.register(h.ps_exe, Some(&tampered_sha), None);
+
+        h.send_promoted_connect(ip1, 443, None, base_ts + 500).await;
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 2(c): stale ip1 Permit must be revoked on binary SHA-256 mismatch (SEC_0001)"
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), true),
+            "Part 2(c): stale ip2 Permit must also be revoked on binary SHA-256 mismatch (SEC_0001)"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, None, false),
+            "Part 2(c): app-wide preemptive WFP block must remain enforced"
+        );
+        assert_eq!(
+            h.defense.suspends(),
+            vec![h.ps_proc],
+            "Part 2(c): tampered process connecting to cached ip1 must be suspended (SEC_0001)"
+        );
+        let alerts = h
+            .store
+            .list_alerts(Some(AlertStatus::Pending), 20)
+            .expect("list part 2c pending alerts");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "Part 2(c): tampered process connecting to cached ip1 must emit 1 Pending alert (got {alerts:?})"
+        );
+        assert_eq!(alerts[0].rule_id, "LEDR-NET-SCRIPT-INTERPRETER");
+        assert!(
+            alerts[0].process_suspended,
+            "Part 2(c): alert must record confirmed process suspension"
+        );
+        let ctx: serde_json::Value =
+            serde_json::from_str(&alerts[0].context_json).expect("parse part 2c context_json");
+        assert_eq!(
+            ctx.get("dst_ip").and_then(serde_json::Value::as_str),
+            Some(ip1.to_string().as_str())
+        );
+        assert_eq!(
+            ctx.get("sha256").and_then(serde_json::Value::as_str),
+            Some(tampered_sha.as_str())
+        );
+        assert_eq!(
+            ctx.get("wfp_blocked").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            h.notified_alerts().len(),
+            1,
+            "Part 2(c): containment alert must be dispatched to notifier"
+        );
+
+        h.engine
+            .shutdown_and_flush()
+            .await
+            .expect("shutdown part 2c");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part 2(d): Security boundary — deleting `NetworkAllow(api.example)` revokes
+    // both `ip1` and `ip2` Permits while leaving unrelated rules intact.
+    // -------------------------------------------------------------------------
+    {
+        let h = P348Harness::start(9815, &[("R-ALLOW-API-P3-48", "api.example")], base_ts).await;
+        h.setup_shared_ip_and_migrate_api(ip1, ip2, unrelated_ip, base_ts, "R-UNRELATED-P3-48-2D")
+            .await;
+
+        let (deleted, report) = h
+            .engine
+            .delete_policy_rule("R-ALLOW-API-P3-48")
+            .expect("delete NetworkAllow(api.example)");
+        assert!(deleted, "Part 2(d): delete_policy_rule must report deletion");
+        assert_eq!(
+            report.failed, 0,
+            "Part 2(d): delete_policy_rule reconciliation must succeed without WFP failures"
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 2(d): deleting api.example allow rule must revoke ip1 Permit"
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), true),
+            "Part 2(d): deleting api.example allow rule must revoke ip2 Permit"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, None, false),
+            "Part 2(d): app-wide preemptive block must remain active after allow deletion"
+        );
+        assert!(
+            h.engine
+                .has_active_wfp_filter(h.unrelated_exe, Some(unrelated_ip), true),
+            "Part 2(d): unrelated app rule Permit must remain untouched"
+        );
+
+        // Subsequent NetworkConnect to `ip1` must now suspend and alert.
+        h.send_promoted_connect(ip1, 443, None, base_ts + 500).await;
+        assert_eq!(
+            h.defense.suspends(),
+            vec![h.ps_proc],
+            "Part 2(d): connecting to ip1 after allow deletion must suspend powershell.exe"
+        );
+        let alerts = h
+            .store
+            .list_alerts(Some(AlertStatus::Pending), 20)
+            .expect("list part 2d pending alerts");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "Part 2(d): connecting to ip1 after allow deletion must emit 1 Pending alert"
+        );
+        assert_eq!(alerts[0].rule_id, "LEDR-NET-SCRIPT-INTERPRETER");
+        assert!(alerts[0].process_suspended);
+
+        h.engine
+            .shutdown_and_flush()
+            .await
+            .expect("shutdown part 2d");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part 3: Multi-allowed shared IP (`keep.example` + `api.example` + unallowed
+    // `other.example` on `ip1`): migrating `api.example` to `ip2` and then blocking
+    // `api.example` revokes `ip2` Permit while preserving `keep.example`'s `ip1` Permit.
+    // -------------------------------------------------------------------------
+    {
+        let h = P348Harness::start(
+            9816,
+            &[
+                ("R-ALLOW-KEEP-P3-48", "keep.example"),
+                ("R-ALLOW-API-P3-48", "api.example"),
+            ],
+            base_ts,
+        )
+        .await;
+
+        h.send_promoted_dns("other.example", vec![ip1], base_ts + 100)
+            .await;
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 3: unallowed other.example alone must not create an ip1 Permit"
+        );
+        h.send_promoted_dns("keep.example", vec![ip1], base_ts + 200)
+            .await;
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 3: keep.example must materialize ip1 Permit"
+        );
+        h.send_promoted_dns("api.example", vec![ip1], base_ts + 300)
+            .await;
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 3: api.example sharing ip1 must keep ip1 Permit active"
+        );
+
+        // Migrate `api.example` away to `ip2`: `keep.example` sustains `ip1` Permit so
+        // `api.example` is pruned from `ip1`'s Permit hints while `ip2` receives its Permit.
+        h.send_promoted_dns("api.example", vec![ip2], base_ts + 400)
+            .await;
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 3: ip1 Permit must stay active for keep.example after api.example migrates"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), true),
+            "Part 3: ip2 Permit must be materialized for migrated api.example"
+        );
+
+        // Block `api.example`: must revoke `ip2` Permit while leaving `keep.example`'s `ip1`
+        // Permit untouched.
+        h.upsert_ps_block_domain("R-BLK-API-P3-48-3", "api.example", base_ts + 500);
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 3: keep.example ip1 Permit must remain active after blocking migrated api.example"
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), false),
+            "Part 3: ip1 must not be blocked after api.example migrated away"
+        );
+        assert!(
+            !h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), true),
+            "Part 3: migrated api.example ip2 Permit must be revoked by NetworkBlock(api.example)"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, None, false),
+            "Part 3: app-wide preemptive block must remain active to cover revoked ip2"
+        );
+
+        // Verify E2E traffic and racing WfpDropEvent to `ip1` continue cleanly with 0 suspends / 0 alerts.
+        h.send_promoted_connect(ip1, 443, None, base_ts + 550).await;
+        h.send_wfp_drop_and_barrier(4802, ip1, 8443, base_ts + 600, "p3-48-part3-drop-barrier")
+            .await;
+        assert!(
+            h.defense.suspends().is_empty(),
+            "Part 3: keep.example traffic on ip1 must produce 0 suspends"
+        );
+        assert!(
+            h.store.list_alerts(None, 20).expect("list alerts").is_empty(),
+            "Part 3: keep.example traffic on ip1 must produce 0 false alerts"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 3: ip1 Permit must stay active after E2E traffic and drop triage"
+        );
+
+        // Verify connecting to migrated `api.example`'s `ip2` enforces `NetworkBlock(api.example)`
+        // without disturbing `keep.example`'s `ip1` Permit.
+        h.send_promoted_connect(ip2, 443, None, base_ts + 650).await;
+        let alerts = h.store.list_alerts(None, 20).expect("list part 3 alerts");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "Part 3: connecting to blocked migrated api.example ip2 must emit 1 policy-block alert (got {alerts:?})"
+        );
+        assert_eq!(alerts[0].rule_id, "LEDR-NET-POLICY-BLOCK");
+        let ctx: serde_json::Value =
+            serde_json::from_str(&alerts[0].context_json).expect("parse part 3 context_json");
+        assert_eq!(
+            ctx.get("matched_rule_id").and_then(serde_json::Value::as_str),
+            Some("R-BLK-API-P3-48-3")
+        );
+        assert_eq!(
+            ctx.get("domain_hint").and_then(serde_json::Value::as_str),
+            Some("api.example")
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip2), false),
+            "Part 3: connecting to blocked api.example ip2 must materialize DomainPolicy Block on ip2"
+        );
+        assert!(
+            h.engine.has_active_wfp_filter(h.ps_exe, Some(ip1), true),
+            "Part 3: keep.example ip1 Permit must stay active after blocking ip2"
+        );
+
+        h.engine
+            .shutdown_and_flush()
+            .await
+            .expect("shutdown part 3");
+        assert!(
+            h.defense.suspends().is_empty(),
+            "Part 3: 0 suspends must remain after shutdown_and_flush"
+        );
+    }
+}

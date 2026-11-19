@@ -158,6 +158,7 @@ LocalEDR/
 ├── Cargo.toml                  # ワークスペース共通定義 (Phase 0 で凍結)
 ├── docs/
 │   ├── decision-records.md     # 確定仕様決定記録 L-01 〜 L-16
+│   ├── follow-up-notes.md      # 副次申し送り事項と実機 E2E 検証記録
 │   └── implementation-plan.md  # 本実装計画書
 ├── crates/
 │   ├── ledr-proto/             # 共通型、IPC メッセージ、トレイト定義 (Phase 0 で凍結)
@@ -488,8 +489,9 @@ Background Service Worker は `chrome.downloads.onCreated` と完了遷移の `o
 
 ## 段階的実装計画とフェーズ別受け入れ条件
 
-本計画書におけるチェックリストの `[x]` は、該当フェーズの作業ブランチで実装および下記受け入れ条件の検証に合格し、`main` ブランチへマージ完了した状態を指す。
-未マージの作業ブランチに留まる実装や検証途上の成果は `[x]` にしない。
+本計画書におけるチェックリストの `[x]` は、該当項目に求められる実装および検証が完了し、`main` ブランチへマージされた状態を指す。
+実機依存の受け入れ検証を別 PR へ切り出したフェーズでは、実装および合成自動テストの `main` マージ完了項目と、実機 E2E による受け入れ検証項目をチェックリスト上で分けて表示する。
+未マージの作業ブランチに留まる実装や未実施の受け入れ検証は `[x]` にしない。
 
 ### Phase 0 基盤構築と共通型の凍結
 
@@ -511,22 +513,26 @@ Background Service Worker は `chrome.downloads.onCreated` と完了遷移の `o
 
 ### Phase 2 機密ファイル保護とおとり監視および通知連携
 
-- [ ] `crates/ledr-sensor-win` に `Kernel-File` の UTF-16 ゼロアロケーション一次フィルタ、`Kernel-Registry` 自動起動キー監視、Folder Canary パス判定、おとりファイル生成と削除ライフサイクル管理、`NtSuspendProcess`、および Never-Suspend 安全ガードを実装する
-- [ ] `crates/ledr-rules` と `crates/ledr-daemon` に Authenticode 署名と SHA-256 の 2 階層許可判定、60 秒タイムアウト遷移（`EXPIRED_SUSPENDED`）、Named Pipe 呼出元バイナリ検証、および `CreateProcessAsUser` による `--notify` ワンショット起動を実装する
-- [ ] `crates/ledr-store` に `file_canary_events`、`alerts`、`allowlist_rules` の永続化と状態更新クエリを実装する
-- [ ] `apps/ledr-ui` に `--notify <alert_id>` トースト通知発行モードと View 1（アラートトリアージビュー）での 3 段階解決操作（強制終了と遮断、今回のみ許可、永続ルール許可）を実装する
-- [ ] `crates/ledr-sim` にダミー `Cookies` Open およびおとりファイル 1 バイト書込シナリオを追加する
+- [x] `crates/ledr-sensor-win` に `Kernel-File` の UTF-16 ゼロアロケーション一次フィルタ、`Kernel-Registry` 自動起動キー監視、Folder Canary パス判定、おとりファイル生成と削除ライフサイクル管理、`NtSuspendProcess`、および Never-Suspend 安全ガードを実装する
+- [x] `crates/ledr-rules` と `crates/ledr-daemon` に Authenticode 署名と SHA-256 の 2 階層許可判定、60 秒タイムアウト遷移（`EXPIRED_SUSPENDED`）、Named Pipe 呼出元バイナリ検証、および `CreateProcessAsUser` による `--notify` ワンショット起動を実装する
+- [x] `crates/ledr-store` に `file_canary_events`、`alerts`、`allowlist_rules` の永続化と状態更新クエリを実装する
+- [x] `apps/ledr-ui` に `--notify <alert_id>` トースト通知発行モードと View 1（アラートトリアージビュー）での 3 段階解決操作（強制終了と遮断、今回のみ許可、永続ルール許可）を実装する
+- [x] `crates/ledr-sim` にダミー `Cookies` Open およびおとりファイル 1 バイト書込シナリオを追加する
+- [ ] 実機 E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` 参照）
 
 受け入れ条件として、非許可の `ledr-sim` によるダミー機密ファイル Open またはおとりファイル書込時に即座にサスペンドされ、1 秒以内にトースト通知が出て、クリック後 1,000 ms 以内に View 1 から 5 秒以内で強制終了または再開が完了すること、かつ `explorer.exe` 等の除外プロセスが一切停止しないことを確認する。
+Phase 2 の実装項目 5 件は合成自動テストに合格して `main` へマージ済み（PR #3、`a68bce5`）であり、実機依存の受け入れ検証項目のみ未完了（`[ ]`）として独立した実機 E2E 検証 PR で実施する予定である（[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` 参照）。
 
 ### Phase 3 未知プロセスのアウトバウンド通信制御
 
-- [ ] `crates/ledr-sensor-win` に `FWPM_SESSION_FLAG_DYNAMIC` を用いた WFP 動的セッション初期化と、アプリ別の Block および Permit フィルタの動的追加と削除を実装する
-- [ ] `crates/ledr-rules` と `crates/ledr-daemon` に高リスクパスおよびスクリプトインタプリタの事前制限、未知プロセスの初発外部通信時サスペンドと WFP ブロック連動、日次 NRD フィードキャッシュ、および起動時ルール再展開を実装する
-- [ ] `crates/ledr-store` にファイアウォール許可および遮断ルールの CRUD クエリを実装する
-- [ ] `apps/ledr-ui` に View 3（防御ポリシー、カナリア、ブラウザシールド管理ビュー）と View 1 からの通信許可ルール保存連携を実装する
+- [x] `crates/ledr-sensor-win` に `FWPM_SESSION_FLAG_DYNAMIC` を用いた WFP 動的セッション初期化と、アプリ別の Block および Permit フィルタの動的追加と削除を実装する
+- [x] `crates/ledr-rules` と `crates/ledr-daemon` に高リスクパスおよびスクリプトインタプリタの事前制限、未知プロセスの初発外部通信時サスペンドと WFP ブロック連動、日次 NRD フィードキャッシュ、および起動時ルール再展開を実装する
+- [x] `crates/ledr-store` にファイアウォール許可および遮断ルールの CRUD クエリを実装する
+- [x] `apps/ledr-ui` に View 3（防御ポリシー、カナリア、ブラウザシールド管理ビュー）と View 1 からの通信許可ルール保存連携を実装する
+- [ ] 実機 E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` 参照）
 
 受け入れ条件として、未許可の `ledr-sim` またはスクリプトインタプリタの外部通信が遮断および凍結され、View 1 で許可登録後に再開および通信が成立すること、View 3 でルールの参照と削除ができること、およびデーモン強制終了時に動的 WFP フィルタが自動消去されて通信不能にならないことを確認する。
+Phase 3 の実装項目 4 件は合成自動テストに合格して `main` へマージ済み（PR #5、`3fe1031`）であり、実機依存の受け入れ検証項目のみ未完了（`[ ]`）として独立した実機 E2E 検証 PR で実施する予定である（[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` および副次申し送り `FU-P3-01` 参照）。
 
 ### Phase 4 Chrome 拡張と Native Messaging の統合
 

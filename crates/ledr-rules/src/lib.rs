@@ -1797,7 +1797,7 @@ brand-new.org
     fn rules_p3_12_async_winhttp_concurrent_cancel_stress() {
         use std::io::Read;
         use std::net::TcpListener;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
@@ -1805,14 +1805,21 @@ brand-new.org
         listener.set_nonblocking(true).expect("set_nonblocking");
         let port = listener.local_addr().unwrap().port();
         let stop = Arc::new(AtomicBool::new(false));
+        let reqs_received = Arc::new(AtomicUsize::new(0));
         let stop_bg = Arc::clone(&stop);
+        let reqs_bg = Arc::clone(&reqs_received);
         let srv = std::thread::spawn(move || {
             let mut held = Vec::new();
             while !stop_bg.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut s, _)) => {
-                        let mut buf = [0u8; 256];
-                        let _ = s.read(&mut buf);
+                        let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+                        let mut buf = [0u8; 512];
+                        if let Ok(n) = s.read(&mut buf) {
+                            if buf[..n].starts_with(b"GET ") {
+                                reqs_bg.fetch_add(1, Ordering::AcqRel);
+                            }
+                        }
                         held.push(s);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1824,6 +1831,43 @@ brand-new.org
         });
 
         let url = format!("http://127.0.0.1:{port}/stress.txt");
+        // Deterministic mid-flight cancel checks: wait until the HTTP GET request reaches the
+        // hanging server before signalling cancellation and verifying a cancel error returns.
+        for iter in 0..3u64 {
+            let before = reqs_received.load(Ordering::Acquire);
+            let token = Arc::new(NrdCancelToken::new());
+            let worker_token = Arc::clone(&token);
+            let url_c = url.clone();
+            let handle = std::thread::spawn(move || {
+                fetch_nrd_feed_url_cancellable(&url_c, NRD_MAX_RESPONSE_BYTES, &worker_token)
+            });
+            let wait_deadline = Instant::now() + Duration::from_secs(2);
+            while reqs_received.load(Ordering::Acquire) == before && Instant::now() < wait_deadline
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                reqs_received.load(Ordering::Acquire) > before,
+                "midflight iter {iter}: server must receive HTTP GET before cancel"
+            );
+            let started = Instant::now();
+            token.cancel();
+            let err = handle
+                .join()
+                .expect("fetch thread must not panic")
+                .expect_err("midflight cancelled fetch must fail");
+            let elapsed = started.elapsed();
+            assert!(
+                err.to_ascii_lowercase().contains("cancel"),
+                "midflight iter {iter}: expected cancellation error, got {err}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "midflight iter {iter}: cancel took too long ({elapsed:?})"
+            );
+        }
+
+        // Tight timing sweep across 0..14 ms to stress handle registration and WinHTTP async races.
         for iter in 0..20u64 {
             let token = Arc::new(NrdCancelToken::new());
             let worker_token = Arc::clone(&token);
@@ -1831,14 +1875,18 @@ brand-new.org
             let handle = std::thread::spawn(move || {
                 fetch_nrd_feed_url_cancellable(&url_c, NRD_MAX_RESPONSE_BYTES, &worker_token)
             });
-            // Vary cancel timing across 0..20 ms to hit handle registration, SendRequest,
-            // ReceiveResponse, and wait_for_outcome boundaries without cross-thread handle races.
             std::thread::sleep(Duration::from_millis(iter % 15));
             let started = Instant::now();
             token.cancel();
-            let res = handle.join().expect("fetch thread must not panic");
+            let err = handle
+                .join()
+                .expect("fetch thread must not panic")
+                .expect_err("cancelled fetch must fail");
             let elapsed = started.elapsed();
-            assert!(res.is_err(), "iter {iter}: cancelled fetch must fail");
+            assert!(
+                err.to_ascii_lowercase().contains("cancel"),
+                "iter {iter}: expected cancellation error, got {err}"
+            );
             assert!(
                 elapsed < Duration::from_secs(1),
                 "iter {iter}: cancel took too long ({elapsed:?})"

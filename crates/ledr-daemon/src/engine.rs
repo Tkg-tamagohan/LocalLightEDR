@@ -786,6 +786,7 @@ impl DaemonEngine {
                         remote_ip: None,
                         is_remove: false,
                         is_startup_preemptive: false,
+                        source_rule_ids: Vec::new(),
                         error: format!("failed to load persisted network rules: {err}"),
                     }],
                     ..Default::default()
@@ -797,16 +798,57 @@ impl DaemonEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .active_exe_paths();
-        let (report, has_domain_rules) = {
+        let (mut report, has_domain_rules) = {
             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-            let rep = fw.reconcile_persisted_rules(
+            let mut rep = fw.reconcile_persisted_rules(
                 &rules,
                 &active_exes,
                 &*self.inspector,
                 &*self.defense,
             );
+            let unnamed = fw.unnamed_domain_permits();
+            if !unnamed.is_empty() {
+                let dns_hist = self
+                    .process_dns_history
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for (exe_k, exe_path, ip) in unnamed {
+                    let doms = dns_hist.domains_for_ip(&ip);
+                    if doms.is_empty() {
+                        continue;
+                    }
+                    let identity = self.inspector.inspect(&exe_path);
+                    let blocked = doms.iter().any(|dom| {
+                        matches!(
+                            evaluate_outbound_policy(&identity, ip, Some(dom), &rules),
+                            OutboundDecision::BlockedByRule { .. }
+                        )
+                    });
+                    if blocked {
+                        match fw.remove_domain_policy_permit(&exe_path, ip, &*self.defense) {
+                            Ok(Some(snap)) => {
+                                rep.removed += 1;
+                                rep.removed_domain_filters.push(snap);
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                rep.failed += 1;
+                                rep.failed_ops.push(WfpFailedOp {
+                                    exe_key: exe_k,
+                                    remote_ip: Some(ip),
+                                    is_remove: true,
+                                    is_startup_preemptive: false,
+                                    source_rule_ids: Vec::new(),
+                                    error: err,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             (rep, fw.has_domain_network_rules())
         };
+        let _ = &mut report;
         self.outbound_classifier
             .set_has_domain_rules(has_domain_rules);
         report
@@ -1405,11 +1447,27 @@ impl DaemonEngine {
                                         alert_domain_hint.as_deref(),
                                     )
                                 {
-                                    let domain_label = if parse_cidr_target(target_pat).is_ok() {
-                                        ""
-                                    } else {
-                                        alert_domain_hint.as_deref().unwrap_or(target_pat)
-                                    };
+                                    let known_domain = alert_domain_hint
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .or_else(|| {
+                                            alert.process_instance_id.as_deref().and_then(|inst_id| {
+                                                self.process_dns_history
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner())
+                                                    .lookup_for_process(inst_id, dst_ip)
+                                                    .map(|(dom, _)| dom)
+                                            })
+                                        });
+                                    let domain_label = known_domain
+                                        .as_deref()
+                                        .or_else(|| {
+                                            (parse_cidr_target(target_pat).is_err())
+                                                .then_some(target_pat)
+                                        })
+                                        .unwrap_or("");
                                     let mut fw =
                                         self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                                     if fw.active_app_block(&exe).is_some() {
@@ -1970,6 +2028,8 @@ impl DaemonEngine {
     pub async fn shutdown_and_flush(&self) -> Result<(), anyhow::Error> {
         let shutdown_started = Instant::now();
         let total_budget = Duration::from_millis(self.config.shutdown_flush_timeout_ms.max(1));
+        let checkpoint_reserve = Duration::from_millis(200).min(total_budget / 3);
+        let drain_budget = total_budget.saturating_sub(checkpoint_reserve);
         self.nrd_cancel.cancel();
         self.store.request_shutdown();
         self.sender.close();
@@ -1980,7 +2040,7 @@ impl DaemonEngine {
         };
 
         if let Some(h) = handle {
-            match tokio::time::timeout(total_budget, h).await {
+            match tokio::time::timeout(drain_budget, h).await {
                 Ok(join_res) => {
                     if let Err(err) = join_res {
                         tracing::error!(error = %err, "daemon worker task panicked during shutdown");
@@ -2008,24 +2068,29 @@ impl DaemonEngine {
                     tracing::warn!("background NRD refresh thread panicked during shutdown");
                 }
             } else {
-                let remaining = total_budget
-                    .saturating_sub(shutdown_started.elapsed())
-                    .max(Duration::from_millis(50));
-                let join_task = tokio::task::spawn_blocking(move || jh.join());
-                match tokio::time::timeout(remaining, join_task).await {
-                    Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(_panic_payload))) => {
-                        tracing::warn!("background NRD refresh thread panicked during shutdown");
+                let remaining = drain_budget.saturating_sub(shutdown_started.elapsed());
+                if !remaining.is_zero() {
+                    let join_task = tokio::task::spawn_blocking(move || jh.join());
+                    match tokio::time::timeout(remaining, join_task).await {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(_panic_payload))) => {
+                            tracing::warn!("background NRD refresh thread panicked during shutdown");
+                        }
+                        Ok(Err(join_err)) => {
+                            tracing::warn!(error = %join_err, "blocking join task for NRD refresh thread failed");
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_ms = self.config.shutdown_flush_timeout_ms,
+                                "timed out waiting for background NRD refresh thread join during shutdown"
+                            );
+                        }
                     }
-                    Ok(Err(join_err)) => {
-                        tracing::warn!(error = %join_err, "blocking join task for NRD refresh thread failed");
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            timeout_ms = self.config.shutdown_flush_timeout_ms,
-                            "timed out waiting for background NRD refresh thread join during shutdown"
-                        );
-                    }
+                } else {
+                    tracing::warn!(
+                        timeout_ms = self.config.shutdown_flush_timeout_ms,
+                        "shutdown budget exhausted prior to SQLite checkpoint; skipping NRD thread join wait"
+                    );
                 }
             }
         }
@@ -3176,13 +3241,37 @@ impl DaemonEngine {
         }
         let rules = self.store.list_network_rules().unwrap_or_default();
         let bin_identity = self.inspector.inspect(canonical_exe);
-        let decision = evaluate_outbound_policy(&bin_identity, item.dst_ip, None, &rules);
+        let cand_domains: Vec<String> = {
+            let history = self
+                .process_dns_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            candidates
+                .iter()
+                .filter_map(|c| history.lookup_for_process(&c.instance_id, item.dst_ip))
+                .map(|(dom, _)| dom)
+                .collect()
+        };
+        let mut decision = evaluate_outbound_policy(&bin_identity, item.dst_ip, None, &rules);
+        if matches!(decision, OutboundDecision::AllowedByRule { .. }) {
+            if let Some(blk_rule_id) = cand_domains.iter().find_map(|dom| {
+                match evaluate_outbound_policy(&bin_identity, item.dst_ip, Some(dom), &rules) {
+                    OutboundDecision::BlockedByRule { rule_id } => Some(rule_id),
+                    _ => None,
+                }
+            }) {
+                decision = OutboundDecision::BlockedByRule {
+                    rule_id: blk_rule_id,
+                };
+            }
+        }
         let mut permit_failure: Option<(String, String)> = None;
         match &decision {
             OutboundDecision::ProtectedOs => return,
             OutboundDecision::AllowedByRule { rule_id } => {
                 // App-scoped IP/CIDR/wildcard allow: materialize a concrete IP WFP Permit even
-                // when PID is ambiguous, respecting existing IP denies (`deny overrides allow`).
+                // when PID is ambiguous, respecting existing IP blocks (`deny overrides allow`)
+                // and preserving known candidate domain hints (`SEC_0001`).
                 // Never swallow a BFE failure silently without alerting.
                 let matched_target = rules
                     .iter()
@@ -3190,8 +3279,14 @@ impl DaemonEngine {
                     .and_then(|r| r.allowed_target.as_deref())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                let domain_label = matched_target
-                    .filter(|t| parse_literal_target_ip(t).is_none() && parse_cidr_target(t).is_err())
+                let domain_label = cand_domains
+                    .first()
+                    .map(String::as_str)
+                    .or_else(|| {
+                        matched_target.filter(|t| {
+                            parse_literal_target_ip(t).is_none() && parse_cidr_target(t).is_err()
+                        })
+                    })
                     .unwrap_or("");
                 let permit_res = {
                     let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
@@ -3224,17 +3319,6 @@ impl DaemonEngine {
                 // If an active candidate already resolved an allowed domain for `dst_ip` and
                 // materialized a live IP Permit (with no overriding block), do not emit a false
                 // ambiguous drop alert.
-                let cand_domains: Vec<String> = {
-                    let history = self
-                        .process_dns_history
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    candidates
-                        .iter()
-                        .filter_map(|c| history.lookup_for_process(&c.instance_id, item.dst_ip))
-                        .map(|(dom, _)| dom)
-                        .collect()
-                };
                 let any_blocked_dom = cand_domains.iter().any(|dom| {
                     matches!(
                         evaluate_outbound_policy(&bin_identity, item.dst_ip, Some(dom), &rules),
@@ -4726,6 +4810,19 @@ impl ProcessDnsHistory {
         self.entries
             .get(&(process_instance_id.to_string(), canonical_ip(ip)))
             .cloned()
+    }
+
+    fn domains_for_ip(&self, ip: &IpAddr) -> Vec<String> {
+        let canon = canonical_ip(*ip);
+        let mut out: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|((_, entry_ip), _)| *entry_ip == canon)
+            .map(|(_, (dom, _))| dom.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn another_process_resolved(

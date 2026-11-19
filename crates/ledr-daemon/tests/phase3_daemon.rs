@@ -5771,3 +5771,233 @@ async fn daemon_p3_34_prior_failed_rule_update_still_returns_firewall_sync_error
     drop(server);
     engine.shutdown_and_flush().await.expect("shutdown");
 }
+
+/// `DAEMON-P3-35` (`SEC_..._0001`): When a pre-emptively restricted binary connects to a domain
+/// and the operator applies `AllowPermanent` with a CIDR scope (`198.51.100.0/24`), the installed
+/// `DomainPolicy` IP Permit preserves the known domain so adding a `NetworkBlock` rule for that
+/// domain later immediately revokes the existing IP Permit.
+#[tokio::test]
+async fn daemon_p3_35_cidr_permanent_allow_revoked_when_domain_later_blocked() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let ps_hash = "e".repeat(64);
+    inspector.register(ps_exe, Some(&ps_hash), None);
+
+    let pipe_name = unique_test_pipe_name();
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_name.clone(),
+            dev_mode_bypass_ui_auth: true,
+            preemptive_startup_executables: vec![ps_exe.to_string()],
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector,
+    );
+    let server = start_ipc_server(Arc::clone(&engine)).expect("start ipc");
+
+    let now_ms = current_unix_ms();
+    let proc_id = ProcessIdentity::new(8701, unix_ms_to_filetime(now_ms - 500));
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: proc_id,
+            parent_pid: 4,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start ps");
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 1).await);
+
+    let target_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42));
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: proc_id.pid,
+            query_name: "evil-later.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![target_ip],
+            timestamp_ms: now_ms + 1,
+        })
+        .await
+        .expect("send dns");
+    engine
+        .sender()
+        .send(SensorEvent::NetworkConnect {
+            pid: proc_id.pid,
+            protocol: 6,
+            dst_ip: target_ip,
+            dst_port: 443,
+            domain_hint: Some("evil-later.example".to_string()),
+            timestamp_ms: now_ms + 2,
+        })
+        .await
+        .expect("send connect");
+
+    assert!(
+        wait_until(1_500, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 10)
+                .map(|a| a.len() == 1)
+                .unwrap_or(false)
+        })
+        .await,
+        "preemptive connect must emit pending alert"
+    );
+    let al = store.list_alerts(Some(AlertStatus::Pending), 10).unwrap()[0].clone();
+
+    engine
+        .resolve_alert(
+            &al.alert_id,
+            AlertDecision::AllowPermanent {
+                use_signer_if_available: false,
+                allow_dest: Some("198.51.100.0/24".to_string()),
+            },
+        )
+        .expect("AllowPermanent CIDR succeeds");
+    assert!(
+        engine.has_active_wfp_filter(ps_exe, Some(target_ip), true),
+        "CIDR AllowPermanent under preemptive app block must install IP permit for 198.51.100.42"
+    );
+
+    // Later operator blocks `evil-later.example` via IPC UpsertRule -> existing IP permit must
+    // be revoked immediately on WFP reconciliation.
+    let block_rule = AllowlistRuleRecord {
+        rule_id: "R-LATER-DOMAIN-BLOCK".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: ps_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("evil-later.example".to_string()),
+        created_at_ms: now_ms + 50,
+        created_by: "test".to_string(),
+    };
+    let pipe_c = pipe_name.clone();
+    let resp = tokio::task::spawn_blocking(move || {
+        send_pipe_request(&pipe_c, &IpcRequest::UpsertRule { rule: block_rule })
+    })
+    .await
+    .expect("join upsert domain block");
+    assert!(matches!(resp, IpcResponse::Ack { .. }));
+    assert!(
+        !engine.has_active_wfp_filter(ps_exe, Some(target_ip), true),
+        "existing CIDR-derived IP permit for 198.51.100.42 must be revoked when evil-later.example is blocked"
+    );
+
+    drop(server);
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-36` (`BUG_..._0001`): A persistent WFP failure on an existing app-wide `NetworkAllow`
+/// rule for `tool.exe` must NOT reject adding an independent domain `NetworkBlock` rule on the
+/// SAME `tool.exe`, while re-upserting the failing `NetworkAllow` rule itself still fails with
+/// `WFP_SYNC_ERROR`.
+#[tokio::test]
+async fn daemon_p3_36_same_exe_unrelated_app_allow_failure_allows_domain_block_save() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let tool_exe = r"C:\Tools\same_exe_tool.exe";
+    let tool_hash = "9".repeat(64);
+    inspector.register(tool_exe, Some(&tool_hash), None);
+    defense.add_fail_wfp_exe("same_exe_tool.exe");
+
+    let now_ms = current_unix_ms();
+    let failing_app_allow = AllowlistRuleRecord {
+        rule_id: "R-TOOL-APP-ALLOW".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: tool_exe.to_string(),
+        sha256: Some(tool_hash),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: now_ms,
+        created_by: "seed".to_string(),
+    };
+    store
+        .upsert_rule(&failing_app_allow)
+        .expect("seed failing app allow");
+
+    let pipe_name = unique_test_pipe_name();
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_name.clone(),
+            dev_mode_bypass_ui_auth: true,
+            ..DaemonConfig::default()
+        },
+        defense,
+        notifier,
+        inspector,
+    );
+    let server = start_ipc_server(Arc::clone(&engine)).expect("start ipc");
+
+    // 1. Adding an independent domain NetworkBlock on the SAME exe must succeed (`Ack`).
+    let ads_block = AllowlistRuleRecord {
+        rule_id: "R-TOOL-ADS-BLOCK".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: tool_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("ads.example.com".to_string()),
+        created_at_ms: now_ms + 10,
+        created_by: "ui".to_string(),
+    };
+    let pipe_c = pipe_name.clone();
+    let resp_dom = tokio::task::spawn_blocking(move || {
+        send_pipe_request(&pipe_c, &IpcRequest::UpsertRule { rule: ads_block })
+    })
+    .await
+    .expect("join upsert ads block");
+    assert!(
+        matches!(resp_dom, IpcResponse::Ack { .. }),
+        "independent domain block on same exe must succeed despite failing app-wide allow, got {resp_dom:?}"
+    );
+    assert!(store.get_rule("R-TOOL-ADS-BLOCK").unwrap().is_some());
+
+    // 2. Re-upserting the failing app-wide NetworkAllow itself must still return `WFP_SYNC_ERROR`.
+    let mut updated_app_allow = failing_app_allow;
+    updated_app_allow.created_by = "ui-retry".to_string();
+    let pipe_c = pipe_name.clone();
+    let resp_allow = tokio::task::spawn_blocking(move || {
+        send_pipe_request(
+            &pipe_c,
+            &IpcRequest::UpsertRule {
+                rule: updated_app_allow,
+            },
+        )
+    })
+    .await
+    .expect("join upsert app allow retry");
+    assert!(
+        matches!(&resp_allow, IpcResponse::Error { code, .. } if code == "WFP_SYNC_ERROR"),
+        "re-upserting failing app-wide allow itself must return WFP_SYNC_ERROR, got {resp_allow:?}"
+    );
+    assert_eq!(
+        store
+            .get_rule("R-TOOL-APP-ALLOW")
+            .unwrap()
+            .unwrap()
+            .created_by,
+        "seed"
+    );
+
+    drop(server);
+    engine.shutdown_and_flush().await.expect("shutdown");
+}

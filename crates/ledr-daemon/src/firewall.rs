@@ -67,6 +67,7 @@ pub struct WfpFailedOp {
     pub remote_ip: Option<IpAddr>,
     pub is_remove: bool,
     pub is_startup_preemptive: bool,
+    pub source_rule_ids: Vec<String>,
     pub error: String,
 }
 
@@ -137,6 +138,9 @@ impl WfpReconcileReport {
     }
 
     fn op_matches_rule(op: &WfpFailedOp, rule: &AllowlistRuleRecord) -> bool {
+        if !op.is_remove && !op.source_rule_ids.is_empty() {
+            return op.source_rule_ids.iter().any(|id| id == &rule.rule_id);
+        }
         let pat = rule.exe_path_pattern.trim();
         if pat.is_empty() {
             return false;
@@ -149,15 +153,15 @@ impl WfpReconcileReport {
         if !exe_matches {
             return false;
         }
-        let Some(ip) = op.remote_ip else {
-            return true;
-        };
-        let Some(target) = rule
+        let target_opt = rule
             .allowed_target
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
+            .filter(|s| !s.is_empty());
+        let Some(ip) = op.remote_ip else {
+            return target_opt.is_none();
+        };
+        let Some(target) = target_opt else {
             return true;
         };
         if parse_literal_target_ip(target).is_some() || parse_cidr_target(target).is_ok() {
@@ -692,9 +696,20 @@ impl WfpRuleManager {
         defense: &dyn ActiveDefenseController,
     ) -> Result<Option<u64>, String> {
         let canon_ip = canonical_ip(dst_ip);
+        let norm_dom = domain_hint.trim().trim_end_matches('.').to_ascii_lowercase();
         let ip_key = (Self::exe_key(exe_path), Some(canon_ip));
-        if let Some(existing) = self.installed.get(&ip_key) {
+        if let Some(existing) = self.installed.get_mut(&ip_key) {
             if existing.allow {
+                if !norm_dom.is_empty() {
+                    if let WfpFilterOrigin::DomainPolicy {
+                        domain_hint: ref mut cur_hint,
+                    } = existing.origin
+                    {
+                        if cur_hint.is_empty() {
+                            *cur_hint = norm_dom;
+                        }
+                    }
+                }
                 return Ok(Some(existing.handle));
             }
             // Do not override an explicit/domain IP-specific Block filter (deny-overrides-allow).
@@ -717,11 +732,62 @@ impl WfpRuleManager {
                 exe_path: exe_path.to_string(),
                 allow: true,
                 origin: WfpFilterOrigin::DomainPolicy {
-                    domain_hint: domain_hint.trim().trim_end_matches('.').to_ascii_lowercase(),
+                    domain_hint: norm_dom,
                 },
             },
         );
         Ok(Some(handle))
+    }
+
+    /// Lists active `DomainPolicy` Permit filters whose `domain_hint` was empty at installation
+    /// time (e.g., CIDR permits created without inline DNS hints) so reconciliation can cross-check
+    /// later DNS history against newly added domain block rules (`SEC_0001`).
+    pub fn unnamed_domain_permits(&self) -> Vec<(String, String, IpAddr)> {
+        self.installed
+            .iter()
+            .filter_map(|((exe_k, ip_opt), entry)| {
+                let ip = (*ip_opt)?;
+                if entry.allow
+                    && matches!(
+                        &entry.origin,
+                        WfpFilterOrigin::DomainPolicy { domain_hint } if domain_hint.is_empty()
+                    )
+                {
+                    Some((exe_k.clone(), entry.exe_path.clone(), ip))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Removes a specific `DomainPolicy` Permit filter from BFE and local tracking, returning a
+    /// rollback snapshot when removed.
+    pub fn remove_domain_policy_permit(
+        &mut self,
+        exe_path: &str,
+        ip: IpAddr,
+        defense: &dyn ActiveDefenseController,
+    ) -> Result<Option<RemovedDomainFilterSnapshot>, String> {
+        let key = (Self::exe_key(exe_path), Some(canonical_ip(ip)));
+        let Some(entry) = self.installed.get(&key).cloned() else {
+            return Ok(None);
+        };
+        let WfpFilterOrigin::DomainPolicy { domain_hint } = entry.origin else {
+            return Ok(None);
+        };
+        if !entry.allow {
+            return Ok(None);
+        }
+        defense.remove_wfp_rule(entry.handle)?;
+        self.installed.remove(&key);
+        self.bound_alerts.retain(|_, k| k != &key);
+        Ok(Some(RemovedDomainFilterSnapshot {
+            exe_path: entry.exe_path,
+            remote_ip: key.1.unwrap_or(ip),
+            allow: true,
+            domain_hint,
+        }))
     }
 
     fn evict_domain_policy_if_full(&mut self, defense: &dyn ActiveDefenseController) {
@@ -1014,6 +1080,7 @@ impl WfpRuleManager {
 
         // 2. Compute desired PersistedPolicy WFP filter set with strict deny-overrides-allow.
         let mut desired: HashMap<WfpTargetKey, (String, bool)> = HashMap::new();
+        let mut desired_sources: HashMap<WfpTargetKey, Vec<String>> = HashMap::new();
         let mut identity_cache: HashMap<String, BinaryIdentity> = HashMap::new();
         for (exe_k, exe_path) in candidate_exes {
             let matching_rules: Vec<&AllowlistRuleRecord> = rules
@@ -1052,12 +1119,22 @@ impl WfpRuleManager {
                 is_never_suspend_process(&exe_path) || is_never_suspend_process(clean_exe);
 
             // Check app-wide NetworkBlock first: if present, deny overrides ALL NetworkAllow rules.
-            let has_app_wide_block = !protected
-                && matching_rules
+            let app_block_ids: Vec<String> = if protected {
+                Vec::new()
+            } else {
+                matching_rules
                     .iter()
-                    .any(|r| matches_app_wide_network_block(r, &identity));
-            if has_app_wide_block {
-                desired.insert((exe_k, None), (exe_path, false));
+                    .filter(|r| matches_app_wide_network_block(r, &identity))
+                    .map(|r| r.rule_id.clone())
+                    .collect()
+            };
+            if !app_block_ids.is_empty() {
+                let target_key = (exe_k, None);
+                desired.insert(target_key.clone(), (exe_path, false));
+                desired_sources
+                    .entry(target_key)
+                    .or_default()
+                    .extend(app_block_ids);
                 continue;
             }
 
@@ -1075,18 +1152,30 @@ impl WfpRuleManager {
                     {
                         if matches_network_block_rule(rule, &identity, ip, None) {
                             blocked_ips.insert(ip);
-                            desired.insert((exe_k.clone(), Some(ip)), (exe_path.clone(), false));
+                            let target_key = (exe_k.clone(), Some(ip));
+                            desired.insert(target_key.clone(), (exe_path.clone(), false));
+                            desired_sources
+                                .entry(target_key)
+                                .or_default()
+                                .push(rule.rule_id.clone());
                         }
                     }
                 }
             }
 
             // Collect app-wide NetworkAllow rules (L-04 strict identity verification).
-            if matching_rules
+            let app_allow_ids: Vec<String> = matching_rules
                 .iter()
-                .any(|r| matches_app_wide_network_allow(r, &identity))
-            {
-                desired.insert((exe_k.clone(), None), (exe_path.clone(), true));
+                .filter(|r| matches_app_wide_network_allow(r, &identity))
+                .map(|r| r.rule_id.clone())
+                .collect();
+            if !app_allow_ids.is_empty() {
+                let target_key = (exe_k.clone(), None);
+                desired.insert(target_key.clone(), (exe_path.clone(), true));
+                desired_sources
+                    .entry(target_key)
+                    .or_default()
+                    .extend(app_allow_ids);
             }
 
             // Collect IP-specific NetworkAllow rules unless overridden by an IP-specific Block.
@@ -1103,7 +1192,12 @@ impl WfpRuleManager {
                         continue;
                     }
                     if matches_network_allow_rule(rule, &identity, ip, None) {
-                        desired.insert((exe_k.clone(), Some(ip)), (exe_path.clone(), true));
+                        let target_key = (exe_k.clone(), Some(ip));
+                        desired.insert(target_key.clone(), (exe_path.clone(), true));
+                        desired_sources
+                            .entry(target_key)
+                            .or_default()
+                            .push(rule.rule_id.clone());
                     }
                 }
             }
@@ -1209,6 +1303,7 @@ impl WfpRuleManager {
                             remote_ip: key.1,
                             is_remove: true,
                             is_startup_preemptive: false,
+                            source_rule_ids: Vec::new(),
                             error: err,
                         });
                     }
@@ -1253,6 +1348,7 @@ impl WfpRuleManager {
                         error = %err,
                         "failed to apply persisted WFP firewall rule"
                     );
+                    let source_rule_ids = desired_sources.remove(&key).unwrap_or_default();
                     failed_exe_keys.insert(key.0.clone());
                     report.failed += 1;
                     report.failed_ops.push(WfpFailedOp {
@@ -1260,6 +1356,7 @@ impl WfpRuleManager {
                         remote_ip: key.1,
                         is_remove: false,
                         is_startup_preemptive: false,
+                        source_rule_ids,
                         error: err,
                     });
                 }
@@ -1344,6 +1441,7 @@ impl WfpRuleManager {
                         remote_ip: None,
                         is_remove: false,
                         is_startup_preemptive: true,
+                        source_rule_ids: Vec::new(),
                         error: err,
                     });
                 }
@@ -1640,6 +1738,35 @@ mod tests {
         assert!(
             r2.failure_summary_for_rules(&[&broken_rule]).is_some(),
             "repeated failure on affected rule must still surface via failure_summary_for_rules"
+        );
+        // Same exe, unrelated domain block rule must NOT be blocked by `broken_rule`'s app-wide failure.
+        let same_exe_ads_block = AllowlistRuleRecord {
+            rule_id: "R-broken-ads-block".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: broken_exe.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("ads.example.com".to_string()),
+            created_at_ms: 4,
+            created_by: "test".to_string(),
+        };
+        let r2_dom = fw.reconcile_persisted_rules(
+            &[
+                broken_rule.clone(),
+                cidr_rule.clone(),
+                healthy_rule.clone(),
+                same_exe_ads_block.clone(),
+            ],
+            &[],
+            &inspector,
+            &defense,
+        );
+        assert!(
+            r2_dom
+                .failure_summary_for_rules(&[&same_exe_ads_block])
+                .is_none(),
+            "unrelated pre-existing failure on same exe must NOT block domain rule mutation"
         );
         assert!(fw.has_active_filter(healthy_exe, None, false));
 

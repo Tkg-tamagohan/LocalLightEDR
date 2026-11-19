@@ -1790,43 +1790,47 @@ impl DaemonEngine {
                                                     known_domains.push(dom);
                                                 }
                                             }
-                                            let (authorizing_hints, cohosted_hints) =
+                                            let (mut authorizing_hints, cohosted_hints) =
                                                 partition_permit_hints(
                                                     &bin_identity,
                                                     dst_ip,
                                                     &known_domains,
                                                     &current_rules,
                                                 );
-                                            let fallback_domain = (parse_cidr_target(target_pat)
-                                                .is_err()
-                                                && !matches_network_target(
-                                                    target_pat, dst_ip, None,
-                                                ))
-                                            .then_some(target_pat);
+                                            if authorizing_hints.is_empty()
+                                                && cohosted_hints.is_empty()
+                                            {
+                                                let fallback_domain = (parse_cidr_target(target_pat)
+                                                    .is_err()
+                                                    && !matches_network_target(
+                                                        target_pat, dst_ip, None,
+                                                    ))
+                                                .then_some(target_pat);
+                                                if let Some(dom) = fallback_domain {
+                                                    authorizing_hints.push(dom.to_string());
+                                                }
+                                            }
                                             let mut fw = self
                                                 .firewall
                                                 .lock()
                                                 .unwrap_or_else(|e| e.into_inner());
                                             if fw.active_app_block(&exe).is_some() {
-                                                let permit_res = if !authorizing_hints.is_empty()
-                                                    || !cohosted_hints.is_empty()
-                                                {
-                                                    fw.ensure_ip_permit_for_domain_hints_prioritized(
+                                                extend_authorizing_hints_from_existing_permit(
+                                                    &fw,
+                                                    &exe,
+                                                    dst_ip,
+                                                    &bin_identity,
+                                                    &current_rules,
+                                                    &mut authorizing_hints,
+                                                );
+                                                let permit_res = fw
+                                                    .ensure_ip_permit_for_domain_hints_prioritized(
                                                         &exe,
                                                         dst_ip,
                                                         &authorizing_hints,
                                                         &cohosted_hints,
                                                         &*self.defense,
-                                                    )
-                                                } else {
-                                                    fw.ensure_ip_permit_for_domain_hints_prioritized(
-                                                        &exe,
-                                                        dst_ip,
-                                                        &[fallback_domain.unwrap_or("")],
-                                                        &[] as &[&str],
-                                                        &*self.defense,
-                                                    )
-                                                };
+                                                    );
                                                 if let Err(err) = permit_res {
                                                     return Err(Box::new((
                                                         format!(
@@ -3372,10 +3376,18 @@ impl DaemonEngine {
                         .iter()
                         .map(|(dom, _)| dom.as_str())
                         .collect();
-                    let (authorizing_hints, cohosted_hints) =
+                    let (mut authorizing_hints, cohosted_hints) =
                         partition_permit_hints(&bin_identity, ip, &permit_candidates, &rules);
                     let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                     if fw.active_app_block(exe_path).is_some() {
+                        extend_authorizing_hints_from_existing_permit(
+                            &fw,
+                            exe_path,
+                            ip,
+                            &bin_identity,
+                            &rules,
+                            &mut authorizing_hints,
+                        );
                         if let Err(err) = fw.ensure_ip_permit_for_domain_hints_prioritized(
                             exe_path,
                             ip,
@@ -4029,33 +4041,36 @@ impl DaemonEngine {
                     .iter()
                     .map(|(dom, _)| dom.as_str())
                     .collect();
-                let (authorizing_hints, cohosted_hints) =
+                let (mut authorizing_hints, cohosted_hints) =
                     partition_permit_hints(&bin_identity, item.dst_ip, &cand_hint_strs, &rules);
-                let fallback_domain = matched_target.filter(|t| {
-                    parse_literal_target_ip(t).is_none()
-                        && parse_cidr_target(t).is_err()
-                        && !matches_network_target(t, item.dst_ip, None)
-                });
+                if authorizing_hints.is_empty() && cohosted_hints.is_empty() {
+                    let fallback_domain = matched_target.filter(|t| {
+                        parse_literal_target_ip(t).is_none()
+                            && parse_cidr_target(t).is_err()
+                            && !matches_network_target(t, item.dst_ip, None)
+                    });
+                    if let Some(dom) = fallback_domain {
+                        authorizing_hints.push(dom.to_string());
+                    }
+                }
                 let permit_res = {
                     let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                     if fw.active_app_block(canonical_exe).is_some() {
-                        if !authorizing_hints.is_empty() || !cohosted_hints.is_empty() {
-                            fw.ensure_ip_permit_for_domain_hints_prioritized(
-                                canonical_exe,
-                                item.dst_ip,
-                                &authorizing_hints,
-                                &cohosted_hints,
-                                &*self.defense,
-                            )
-                        } else {
-                            fw.ensure_ip_permit_for_domain_hints_prioritized(
-                                canonical_exe,
-                                item.dst_ip,
-                                &[fallback_domain.unwrap_or("")],
-                                &[] as &[&str],
-                                &*self.defense,
-                            )
-                        }
+                        extend_authorizing_hints_from_existing_permit(
+                            &fw,
+                            canonical_exe,
+                            item.dst_ip,
+                            &bin_identity,
+                            &rules,
+                            &mut authorizing_hints,
+                        );
+                        fw.ensure_ip_permit_for_domain_hints_prioritized(
+                            canonical_exe,
+                            item.dst_ip,
+                            &authorizing_hints,
+                            &cohosted_hints,
+                            &*self.defense,
+                        )
                     } else {
                         Ok(None)
                     }
@@ -4480,6 +4495,17 @@ impl DaemonEngine {
                                 dst_ip,
                                 event_ts_ms,
                                 max_age_ms,
+                                |k_dom| {
+                                    matches!(
+                                        evaluate_outbound_policy(
+                                            bin_identity,
+                                            dst_ip,
+                                            Some(k_dom),
+                                            rules,
+                                        ),
+                                        OutboundDecision::AllowedByRule { .. }
+                                    )
+                                },
                             )
                         })
                 }
@@ -4639,41 +4665,42 @@ impl DaemonEngine {
                             .iter()
                             .map(|(dom, _)| dom.as_str())
                             .collect();
-                        let (authorizing_hints, cohosted_hints) = partition_permit_hints(
+                        let (mut authorizing_hints, cohosted_hints) = partition_permit_hints(
                             &bin_identity,
                             dst_ip,
                             &permit_candidates,
                             &rules,
                         );
-                        let permit_res =
-                            if !authorizing_hints.is_empty() || !cohosted_hints.is_empty() {
-                                fw.ensure_ip_permit_for_domain_hints_prioritized(
-                                    exe_path,
-                                    dst_ip,
-                                    &authorizing_hints,
-                                    &cohosted_hints,
-                                    &*self.defense,
-                                )
-                            } else {
-                                let fallback_domain = matched_target.filter(|t| {
-                                    parse_literal_target_ip(t).is_none()
-                                        && parse_cidr_target(t).is_err()
-                                        && !matches_network_target(t, dst_ip, None)
-                                });
-                                let domain_label = effective_domain_hint
-                                    .as_deref()
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty())
-                                    .or(fallback_domain)
-                                    .unwrap_or("");
-                                fw.ensure_ip_permit_for_domain_hints_prioritized(
-                                    exe_path,
-                                    dst_ip,
-                                    &[domain_label],
-                                    &[] as &[&str],
-                                    &*self.defense,
-                                )
-                            };
+                        if authorizing_hints.is_empty() && cohosted_hints.is_empty() {
+                            let fallback_domain = matched_target.filter(|t| {
+                                parse_literal_target_ip(t).is_none()
+                                    && parse_cidr_target(t).is_err()
+                                    && !matches_network_target(t, dst_ip, None)
+                            });
+                            let domain_label = effective_domain_hint
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .or(fallback_domain);
+                            if let Some(label) = domain_label {
+                                authorizing_hints.push(label.to_string());
+                            }
+                        }
+                        extend_authorizing_hints_from_existing_permit(
+                            &fw,
+                            exe_path,
+                            dst_ip,
+                            &bin_identity,
+                            &rules,
+                            &mut authorizing_hints,
+                        );
+                        let permit_res = fw.ensure_ip_permit_for_domain_hints_prioritized(
+                            exe_path,
+                            dst_ip,
+                            &authorizing_hints,
+                            &cohosted_hints,
+                            &*self.defense,
+                        );
                         if let Err(err) = permit_res {
                             tracing::debug!(
                                 exe_path = %exe_path,
@@ -6137,6 +6164,7 @@ impl ProcessDnsHistory {
         ip: IpAddr,
         event_ts_ms: i64,
         max_age_ms: i64,
+        mut wildcard_domain_allowed: impl FnMut(&str) -> bool,
     ) -> bool {
         let exe_norm = exe_key.trim().to_ascii_lowercase();
         let dom_norm = domain_hint.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -6144,14 +6172,36 @@ impl ProcessDnsHistory {
             return false;
         }
         let canon = canonical_ip(ip);
-        let Some(latest) = self.latest_domain_by_exe.get(&(exe_norm, dom_norm)) else {
-            return false;
+        let is_fresh = |latest: &LatestDomainIps| {
+            latest.family(canon).is_some_and(|(_, latest_ts)| {
+                event_ts_ms.saturating_sub(*latest_ts) <= max_age_ms
+                    && *latest_ts <= event_ts_ms.saturating_add(60_000)
+            })
         };
-        let Some((_, latest_ts)) = latest.family(canon) else {
-            return false;
-        };
-        event_ts_ms.saturating_sub(*latest_ts) <= max_age_ms
-            && *latest_ts <= event_ts_ms.saturating_add(60_000)
+        if let Some(latest) = self
+            .latest_domain_by_exe
+            .get(&(exe_norm.clone(), dom_norm.clone()))
+        {
+            if is_fresh(latest) {
+                return true;
+            }
+        }
+        if dom_norm.contains('*')
+            && !dom_norm.contains('/')
+            && parse_literal_target_ip(&dom_norm).is_none()
+            && !matches_network_target(&dom_norm, canon, None)
+        {
+            return self
+                .latest_domain_by_exe
+                .iter()
+                .any(|((k_exe, k_dom), latest)| {
+                    k_exe == &exe_norm
+                        && matches_network_target(&dom_norm, canon, Some(k_dom))
+                        && is_fresh(latest)
+                        && wildcard_domain_allowed(k_dom)
+                });
+        }
+        false
     }
 
     fn is_domain_ip_superseded_at_or_before(
@@ -6534,6 +6584,35 @@ fn partition_permit_hints<S: AsRef<str>>(
         }
     }
     (authorizing_hints, cohosted_hints)
+}
+
+/// Prepends any already-stored domain-authorizing hints from an existing `DomainPolicy` IP Permit
+/// for `(exe_path, dst_ip)` into `authorizing_hints` (preserving chronological oldest-first order
+/// without duplicates) so subsequent merges after DNS-history eviction or under a co-existing
+/// CIDR/second allow rule never FIFO-evict an existing authorizing hint (`AUD-P3-02`).
+fn extend_authorizing_hints_from_existing_permit(
+    fw: &WfpRuleManager,
+    exe_path: &str,
+    dst_ip: IpAddr,
+    bin_identity: &BinaryIdentity,
+    rules: &[AllowlistRuleRecord],
+    authorizing_hints: &mut Vec<String>,
+) {
+    let Some(existing_hints) = fw.domain_policy_permit_hints(exe_path, dst_ip) else {
+        return;
+    };
+    let (existing_auth, _) =
+        partition_permit_hints(bin_identity, dst_ip, &existing_hints, rules);
+    if existing_auth.is_empty() {
+        return;
+    }
+    let mut merged = existing_auth;
+    for hint in authorizing_hints.drain(..) {
+        if !merged.iter().any(|h| h == &hint) {
+            merged.push(hint);
+        }
+    }
+    *authorizing_hints = merged;
 }
 
 fn network_allow_rule_identity_matches(
@@ -11073,6 +11152,365 @@ mod tests {
                 engine.has_active_wfp_filter(ps_exe, Some(cap_ip), true),
                 "cap_ip Permit must survive unrelated reconciliation after api.example migration under > 32 co-hosted domains"
             );
+
+            // 7. Existing authorizing hint preservation across DNS-history eviction + subsequent
+            //    merges under co-existing CIDR allow and second domain allow (`AUD-P3-02` deep):
+            //    Evict `api.example` from `ProcessDnsHistory` (capacity = 64) via unrelated DNS
+            //    churn, then merge new co-hosted domains via CIDR (`prematerialize`, `NetworkConnect`,
+            //    multi-PID `handle_ambiguous_wfp_drop`) and via a second allow rule `keep.example`.
+            let churn_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 250));
+            for idx in 0..80usize {
+                let _ = engine.process_event_with_lane(
+                    &SensorEvent::DnsQuery {
+                        pid: p3.pid,
+                        query_name: format!("churn-{idx:03}.noise.example"),
+                        query_type: 1,
+                        resolved_ips: vec![churn_ip],
+                        timestamp_ms: now_ms + 400 + idx as i64,
+                    },
+                    EventLane::HighPriority,
+                );
+            }
+            // 7a. Co-existing CIDR allow triggers `prematerialize`, `NetworkConnect`, and
+            //     multi-PID `handle_ambiguous_wfp_drop` with `authorizing_hints = []` from DNS
+            //     history alone; `extend_authorizing_hints_from_existing_permit` must protect
+            //     existing `api.example` so deleting the CIDR rule leaves `cap_ip` Permit intact!
+            let r_allow_cap_cidr = mk_rule(
+                "R-ALLOW-CAP-CIDR",
+                ps_exe,
+                &sha_orig,
+                RuleScope::NetworkAllow,
+                "198.51.100.190/32",
+                now_ms + 500,
+            );
+            engine
+                .upsert_policy_rule(&r_allow_cap_cidr)
+                .expect("upsert co-existing CIDR allow for cap_ip");
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p2.pid,
+                    query_name: "cohost-cidr-90.shared.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![cap_ip],
+                    timestamp_ms: now_ms + 510,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: p2.pid,
+                    protocol: 6,
+                    dst_ip: cap_ip,
+                    dst_port: 443,
+                    domain_hint: Some("cohost-cidr-91.shared.example".to_string()),
+                    timestamp_ms: now_ms + 520,
+                },
+                EventLane::HighPriority,
+            );
+            engine.on_wfp_drop_dequeued(mk_drop(ps_exe, cap_ip, now_ms + 530), &mut pending);
+            assert!(pending.is_empty());
+            let cap_hints_after_cidr = engine
+                .firewall
+                .lock()
+                .unwrap()
+                .domain_policy_permit_hints(ps_exe, cap_ip)
+                .expect("cap_ip Permit must still exist after CIDR merges");
+            assert_eq!(cap_hints_after_cidr.len(), MAX_DOMAIN_HINTS_PER_FILTER);
+            assert!(
+                cap_hints_after_cidr.iter().any(|h| h == "api.example"),
+                "existing authorizing hint api.example must never be evicted by CIDR co-hosted merges"
+            );
+            engine
+                .delete_policy_rule("R-ALLOW-CAP-CIDR")
+                .expect("delete co-existing CIDR allow");
+            assert!(
+                engine.has_active_wfp_filter(ps_exe, Some(cap_ip), true),
+                "deleting co-existing CIDR rule must preserve cap_ip Permit backed by retained api.example"
+            );
+
+            // 7b. Second domain allow (`keep.example`) arrives while `api.example` is absent from
+            //     `ProcessDnsHistory`; BOTH `api.example` and `keep.example` stay protected so
+            //     deleting `R-ALLOW-KEEP` preserves `cap_ip` Permit.
+            let r_allow_keep = mk_rule(
+                "R-ALLOW-KEEP",
+                ps_exe,
+                &sha_orig,
+                RuleScope::NetworkAllow,
+                "keep.example",
+                now_ms + 540,
+            );
+            engine
+                .upsert_policy_rule(&r_allow_keep)
+                .expect("upsert R-ALLOW-KEEP");
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p2.pid,
+                    query_name: "keep.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![cap_ip],
+                    timestamp_ms: now_ms + 550,
+                },
+                EventLane::HighPriority,
+            );
+            let cap_hints_after_keep = engine
+                .firewall
+                .lock()
+                .unwrap()
+                .domain_policy_permit_hints(ps_exe, cap_ip)
+                .expect("cap_ip Permit after keep.example");
+            assert_eq!(cap_hints_after_keep.len(), MAX_DOMAIN_HINTS_PER_FILTER);
+            assert!(
+                cap_hints_after_keep.iter().any(|h| h == "api.example")
+                    && cap_hints_after_keep.iter().any(|h| h == "keep.example"),
+                "both existing api.example and new keep.example must remain protected on cap_ip"
+            );
+            engine
+                .delete_policy_rule("R-ALLOW-KEEP")
+                .expect("delete R-ALLOW-KEEP");
+            assert!(
+                engine.has_active_wfp_filter(ps_exe, Some(cap_ip), true),
+                "deleting R-ALLOW-KEEP must preserve cap_ip Permit backed by retained api.example"
+            );
+
+            // 7c. `AllowPermanent` (`resolve_alert`) on a full 32-hint Permit while `api.example`
+            //     is absent from `ProcessDnsHistory`: CIDR allow with a new co-hosted hint must
+            //     preserve existing `api.example` via `extend_authorizing_hints_from_existing_permit`.
+            let allow_perm_alert = ledr_proto::AlertRecord {
+                alert_id: "AL-P3-49A-CAP-ALLOWPERM".to_string(),
+                timestamp_ms: now_ms + 560,
+                severity: ledr_proto::AlertSeverity::High,
+                source_layer: "LAYER_3_NETWORK".to_string(),
+                rule_id: "LEDR-NET-SCRIPT-INTERPRETER".to_string(),
+                title: "Full-32 AllowPermanent preservation check".to_string(),
+                process_instance_id: Some(p2.instance_id()),
+                process_suspended: false,
+                status: ledr_proto::AlertStatus::Pending,
+                context_json: serde_json::json!({
+                    "exe_path": ps_exe,
+                    "dst_ip": cap_ip.to_string(),
+                    "domain_hint": "cohost-allowperm-99.shared.example",
+                    "sha256": sha_orig,
+                })
+                .to_string(),
+                resolved_at_ms: None,
+            };
+            store
+                .record_alert(&allow_perm_alert)
+                .expect("record AllowPermanent test alert");
+            engine
+                .resolve_alert(
+                    &allow_perm_alert.alert_id,
+                    ledr_proto::AlertDecision::AllowPermanent {
+                        use_signer_if_available: false,
+                        allow_dest: Some("198.51.100.190/32".to_string()),
+                    },
+                )
+                .expect("AllowPermanent CIDR on full 32-hint Permit");
+            let cap_hints_after_ap = engine
+                .firewall
+                .lock()
+                .unwrap()
+                .domain_policy_permit_hints(ps_exe, cap_ip)
+                .expect("cap_ip Permit after AllowPermanent");
+            assert_eq!(cap_hints_after_ap.len(), MAX_DOMAIN_HINTS_PER_FILTER);
+            assert!(
+                cap_hints_after_ap.iter().any(|h| h == "api.example"),
+                "AllowPermanent merge on full 32-hint Permit must never evict existing api.example"
+            );
+            assert!(
+                cap_hints_after_ap
+                    .iter()
+                    .any(|h| h == "cohost-allowperm-99.shared.example"),
+                "AllowPermanent must still record the new co-hosted hint by evicting an unprotected slot"
+            );
+            let ap_rule_id = store
+                .list_network_rules()
+                .expect("list rules")
+                .into_iter()
+                .find(|r| r.allowed_target.as_deref() == Some("198.51.100.190/32"))
+                .expect("AllowPermanent CIDR rule persisted")
+                .rule_id;
+            engine
+                .delete_policy_rule(&ap_rule_id)
+                .expect("delete AllowPermanent CIDR rule");
+            assert!(
+                engine.has_active_wfp_filter(ps_exe, Some(cap_ip), true),
+                "deleting AllowPermanent CIDR rule must preserve cap_ip Permit backed by retained api.example"
+            );
+
+            // 8. Wildcard `DomainPolicy` Permit hint (`*.wild.example`) multi-instance freshness:
+            //    - Fresh allowed subdomain (`sub.wild.example`) migration passes `on_wfp_drop_dequeued`
+            //      without grace parking and emits 0 alerts.
+            //    - Stale allowed subdomain + fresh BLOCKED subdomain (`evil.wild.example`) must NOT
+            //      falsely refresh `*.wild.example`, so multi-instance drop still parks.
+            let wild_ip1 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 200));
+            let wild_ip2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 201));
+            let wild_ip3 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 202));
+            let r_allow_wild = mk_rule(
+                "R-ALLOW-WILD",
+                ps_exe,
+                &sha_orig,
+                RuleScope::NetworkAllow,
+                "*.wild.example",
+                now_ms + 600,
+            );
+            let r_blk_evil_wild = mk_rule(
+                "R-BLK-EVIL-WILD",
+                ps_exe,
+                &sha_orig,
+                RuleScope::NetworkBlock,
+                "evil.wild.example",
+                now_ms + 601,
+            );
+            engine
+                .upsert_policy_rule(&r_allow_wild)
+                .expect("upsert R-ALLOW-WILD");
+            engine
+                .upsert_policy_rule(&r_blk_evil_wild)
+                .expect("upsert R-BLK-EVIL-WILD");
+            {
+                let mut fw = engine.firewall.lock().unwrap();
+                fw.ensure_ip_permit_for_domain_hints_prioritized(
+                    ps_exe,
+                    wild_ip1,
+                    &["*.wild.example"],
+                    &[] as &[&str],
+                    &*defense,
+                )
+                .expect("install wildcard fallback DomainPolicy Permit");
+            }
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p2.pid,
+                    query_name: "sub.wild.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![wild_ip2],
+                    timestamp_ms: now_ms + 610,
+                },
+                EventLane::HighPriority,
+            );
+            let alerts_before_wild = engine.alerts_emitted();
+            engine.on_wfp_drop_dequeued(mk_drop(ps_exe, wild_ip1, now_ms + 620), &mut pending);
+            assert!(
+                pending.is_empty(),
+                "fresh allowed subdomain matching *.wild.example must satisfy multi-instance freshness"
+            );
+            assert_eq!(engine.alerts_emitted(), alerts_before_wild);
+
+            // Advance past `AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS` so `sub.wild.example` is stale, then
+            // record a fresh DNS query ONLY for blocked `evil.wild.example`: must STILL park!
+            let stale_wild_ts = now_ms + 610 + super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS + 5_000;
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p2.pid,
+                    query_name: "evil.wild.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![wild_ip3],
+                    timestamp_ms: stale_wild_ts - 10,
+                },
+                EventLane::HighPriority,
+            );
+            engine.on_wfp_drop_dequeued(mk_drop(ps_exe, wild_ip1, stale_wild_ts), &mut pending);
+            assert_eq!(
+                pending.len(),
+                1,
+                "fresh blocked subdomain evil.wild.example must never refresh stale *.wild.example Permit"
+            );
+            pending.clear();
+
+            // 9. Dual-stack (`A` + `AAAA`) and IPv4-mapped IPv6 (`::ffff:v4`) after IPv4-only
+            //    migration: `has_valid_live_domain_policy_permit` and `has_fresh_domain_record_for_family`
+            //    must canonicalize `::ffff:v4` and preserve independent v4/v6 freshness windows.
+            let ds_v4_old = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 210));
+            let ds_v4_old_mapped =
+                IpAddr::V6(Ipv4Addr::new(198, 51, 100, 210).to_ipv6_mapped());
+            let ds_v4_new = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 211));
+            let ds_v6_old = IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x210,
+            ));
+            let ds_t0 = now_ms + 700;
+            let ds_t_v4_mig = ds_t0 + super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS + 5_000;
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p2.pid,
+                    query_name: "other.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ds_v4_old, ds_v6_old],
+                    timestamp_ms: ds_t0,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p2.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ds_v4_old, ds_v6_old],
+                    timestamp_ms: ds_t0,
+                },
+                EventLane::HighPriority,
+            );
+            // Migrate ONLY IPv4 at `ds_t_v4_mig` (making `AAAA` at `ds_t0` stale > 60s while `A`
+            // is fresh!).
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: p2.pid,
+                    query_name: "api.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![ds_v4_new],
+                    timestamp_ms: ds_t_v4_mig,
+                },
+                EventLane::HighPriority,
+            );
+            let susp_before_ds = defense.suspends.load(Ordering::Relaxed);
+            let alerts_before_ds = engine.alerts_emitted();
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: p2.pid,
+                    protocol: 6,
+                    dst_ip: ds_v4_old_mapped,
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: ds_t_v4_mig + 10,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::NetworkConnect {
+                    pid: p2.pid,
+                    protocol: 6,
+                    dst_ip: ds_v6_old,
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: ds_t_v4_mig + 15,
+                },
+                EventLane::HighPriority,
+            );
+            assert_eq!(defense.suspends.load(Ordering::Relaxed), susp_before_ds);
+            assert_eq!(engine.alerts_emitted(), alerts_before_ds);
+
+            // Multi-instance drops at `ds_t_v4_mig + 20`: `::ffff:ds_v4_old` has fresh v4 migration
+            // -> bypasses parking; `ds_v6_old` has stale > 60s v6 -> MUST still park!
+            engine.on_wfp_drop_dequeued(
+                mk_drop(ps_exe, ds_v4_old_mapped, ds_t_v4_mig + 20),
+                &mut pending,
+            );
+            assert!(
+                pending.is_empty(),
+                "IPv4-mapped IPv6 drop with fresh IPv4 migration must bypass multi-instance parking"
+            );
+            assert_eq!(engine.alerts_emitted(), alerts_before_ds);
+
+            engine.on_wfp_drop_dequeued(
+                mk_drop(ps_exe, ds_v6_old, ds_t_v4_mig + 25),
+                &mut pending,
+            );
+            assert_eq!(
+                pending.len(),
+                1,
+                "IPv6 drop with stale >60s AAAA must still park even after fresh IPv4-only migration"
+            );
+            pending.clear();
 
             engine.shutdown_and_flush().await.expect("shutdown");
         });

@@ -156,6 +156,7 @@ fn compute_pruned_permit_hints(
             || rules.iter().any(|r| {
                 r.scope == RuleScope::NetworkAllow
                     && matches_network_allow_rule(r, identity, ip, Some(norm.as_str()))
+                    && !matches_network_allow_rule(r, identity, ip, None)
             })
         {
             retained.push(norm.clone());
@@ -4092,5 +4093,51 @@ mod tests {
             .expect("conflict returns Ok(None)");
         assert_eq!(suppressed, None);
         assert_eq!(fw_cap.domain_policy_permit_hints(exe, cap_blk_ip), None);
+
+        // 8. Static CIDR `NetworkAllow` overridden by static CIDR `NetworkBlock`: retired
+        //    unallowed co-hosted hint `other.example` must NOT be treated as domain-authorized
+        //    by the CIDR allow rule, so `R-BLK-OTHER` is never falsely attributed on `ip1`.
+        let mut fw_cidr_override = WfpRuleManager::new();
+        fw_cidr_override
+            .ensure_ip_permit_for_domain_hints_prioritized(
+                exe,
+                ip1,
+                &[] as &[&str],
+                &["api.example", "other.example"],
+                &defense,
+            )
+            .expect("install cidr shared-ip permit");
+        let r_allow_cidr = mk_rule("R-ALLOW-CIDR", RuleScope::NetworkAllow, "198.51.100.0/24");
+        let r_blk_cidr = mk_rule("R-BLK-CIDR", RuleScope::NetworkBlock, "198.51.100.0/24");
+        let mut dns_ctx_other_sup = WfpReconcileDnsContext::default();
+        dns_ctx_other_sup
+            .superseded_permit_hints
+            .insert((exe_k.clone(), ip1, "other.example".to_string()));
+        *defense.fail_removes.lock().expect("lock fail_removes") = true;
+        let rep_cidr_blk_fail = fw_cidr_override.reconcile_persisted_rules_with_dns_context(
+            &[r_allow_cidr.clone(), r_blk_cidr.clone(), r_blk_other.clone()],
+            Some(&[r_allow_cidr, r_blk_other.clone()]),
+            &[],
+            &dns_ctx_other_sup,
+            &inspector,
+            &defense,
+        );
+        *defense.fail_removes.lock().expect("lock fail_removes") = false;
+        assert_eq!(rep_cidr_blk_fail.failed_ops.len(), 1);
+        assert_eq!(
+            rep_cidr_blk_fail.failed_ops[0].source_rule_ids,
+            vec!["R-BLK-CIDR".to_string()],
+            "overridden static CIDR allow must not retain retired unallowed other.example or attribute R-BLK-OTHER"
+        );
+        assert_eq!(
+            rep_cidr_blk_fail.failed_ops[0].domain_hints,
+            vec!["api.example".to_string()]
+        );
+        assert!(rep_cidr_blk_fail
+            .failure_summary_for_rules(&[&r_blk_cidr])
+            .is_some());
+        assert!(rep_cidr_blk_fail
+            .failure_summary_for_rules(&[&r_blk_other])
+            .is_none());
     }
 }

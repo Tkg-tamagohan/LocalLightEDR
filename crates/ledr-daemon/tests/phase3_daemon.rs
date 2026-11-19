@@ -5612,9 +5612,11 @@ async fn daemon_p3_33_wfp_drop_not_starved_by_telemetry_burst_and_overflow() {
     stop_flood.store(true, Ordering::Release);
     flood_task.await.expect("join telemetry flood");
 
-    // Part B: Burst 12 distinct WfpDropEvents past `high_priority_capacity = 4` -> overflow path
-    // absorbs excess without dropping any event (8 on `app_exe` + 4 distinct exes exercise both
-    // `wfp_drop_overflow.queue` and `coalesced_by_exe` deterministically).
+    // Part B: Burst 12 distinct WfpDropEvents past `high_priority_capacity = 4` while the worker
+    // drains concurrently, verifying the bounded overflow fallback queue (`wfp_drop_overflow_pushed() > 0`)
+    // absorbs the burst without dropping any alert. Deterministic verification of same-app
+    // overwrite coalescing (`wfp_drop_overflow_coalesced() > 0`) and latest-destination payload
+    // retention is covered by `DAEMON-P3-44` and `DAEMON-P3-44A`.
     for i in 1u8..=12 {
         let burst_exe = if i <= 8 {
             app_exe.to_string()
@@ -7640,9 +7642,7 @@ fn daemon_p3_45_over_budget_nrd_shutdown_checkpoints_and_runtime_drop_does_not_h
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-    let blocked_in_read = Arc::new(AtomicBool::new(false));
     let server_released = Arc::new(AtomicBool::new(false));
-    let blocked_bg = Arc::clone(&blocked_in_read);
     let released_bg = Arc::clone(&server_released);
     let pipe_path_bg = pipe_path.clone();
 
@@ -7668,24 +7668,20 @@ fn daemon_p3_45_over_budget_nrd_shutdown_checkpoints_and_runtime_drop_does_not_h
                     _ = tokio::time::sleep(Duration::from_secs(10)) => false,
                 };
                 if connected {
-                    // Stream 256 KiB of `#` comment payload (> pipe buffer and > multiple 64 KiB
-                    // chunks) so `write_all` only completes once the NRD thread is actively inside
-                    // `read_bounded_reader_cancellable`'s read loop, then hold the pipe open so the
-                    // next synchronous `ReadFile` blocks past `shutdown_flush_timeout_ms`.
-                    let mut primer = vec![b'#'; 256 * 1024];
-                    if let Some(last) = primer.last_mut() {
-                        *last = b'\n';
-                    }
+                    // Write only a single byte `b"\n"` and flush, then hold the pipe open until
+                    // `release_rx` fires: the 1st `ReadFile` consumes that byte
+                    // (`blocking_read_entries() == 1`), guaranteeing the 2nd `ReadFile` blocks
+                    // in the kernel with 0 bytes remaining (`blocking_read_entries() >= 2 &&
+                    // is_blocking_read_active()`).
                     let wrote = tokio::select! {
-                        res = server.write_all(&primer) => res.is_ok(),
+                        res = async {
+                            server.write_all(b"\n").await?;
+                            server.flush().await
+                        } => res.is_ok(),
                         _ = &mut release_rx => false,
                         _ = tokio::time::sleep(Duration::from_secs(5)) => false,
                     };
                     if wrote {
-                        // Allow the NRD thread to advance from completing the primed chunk into
-                        // its next blocking kernel `ReadFile` call.
-                        tokio::time::sleep(Duration::from_millis(30)).await;
-                        blocked_bg.store(true, Ordering::Release);
                         let _ = tokio::time::timeout(Duration::from_secs(10), &mut release_rx).await;
                     }
                     let _ = server.disconnect();
@@ -7718,7 +7714,6 @@ fn daemon_p3_45_over_budget_nrd_shutdown_checkpoints_and_runtime_drop_does_not_h
 
     let marker_id_for_rt = marker_id.clone();
     let db_path_for_rt = db_path.clone();
-    let blocked_for_rt = Arc::clone(&blocked_in_read);
     subject_rt.block_on(async move {
         let store = LedrStore::open(&db_path_for_rt).expect("open file-backed LedrStore");
         let defense = Arc::new(MockWfpDefense::new());
@@ -7743,15 +7738,19 @@ fn daemon_p3_45_over_budget_nrd_shutdown_checkpoints_and_runtime_drop_does_not_h
             inspector,
         );
 
+        let nrd_token = engine.nrd_cancel_token();
         assert!(
             wait_until(3_000, || {
-                blocked_for_rt.load(Ordering::Acquire) && engine.is_nrd_refresh_in_flight()
+                nrd_token.blocking_read_entries() >= 2
+                    && nrd_token.is_blocking_read_active()
+                    && engine.is_nrd_refresh_in_flight()
             })
             .await,
-            "background NRD thread must enter blocking read on local Named Pipe"
+            "background NRD thread must enter its 2nd blocking ReadFile on local Named Pipe"
         );
 
-        // Sending and synchronizing a ProcessStart AFTER `blocked_in_read` simultaneously:
+        // Sending and synchronizing a ProcessStart AFTER observing `blocking_read_entries() >= 2`
+        // simultaneously:
         // 1. guarantees `run_pipeline` has finished storing `NrdThreadHandle` on the same task, and
         // 2. writes dirty state into SQLite WAL so we can verify `wal_checkpoint(TRUNCATE)`.
         engine
@@ -7846,4 +7845,696 @@ fn daemon_p3_45_over_budget_nrd_shutdown_checkpoints_and_runtime_drop_does_not_h
             assert_eq!(wal_len, 0, "reopened DB must have 0-byte WAL");
         }
     }
+}
+
+/// `DAEMON-P3-46` (PR #5 Issue #2 regression, `L-03` / `L-10` / `AUTO-05`):
+/// 1. Under a pre-emptively restricted single process with a `NetworkAllow` rule ONLY for
+///    `allowed.example`, when `other.example (t=2000)` resolves first to a shared IP
+///    (`198.51.100.77`), an earlier `WfpDropEvent` is parked/queued, and late-arriving
+///    `allowed.example (t=1500 < 2000)` arrives via the high-priority lane: `allowed.example`'s
+///    IP Permit is materialized and preserved through `handle_wfp_drop_event_now` with zero
+///    suspends and zero false alerts.
+/// 2. When `blocked.example` (`NetworkBlock` rule) also coexists on that same shared IP alongside
+///    `allowed.example`, deny-overrides-allow revokes/withholds the IP Permit, installs and keeps
+///    the `DomainPolicy` IP Block, and emits `LEDR-NET-POLICY-BLOCK` during WFP drop triage even
+///    when `allowed.example` has a newer DNS timestamp.
+#[tokio::test]
+async fn daemon_p3_46_shared_ip_late_allowed_dns_vs_earlier_wfp_drop_and_deny_overrides_allow() {
+    let shared_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+    let now_ms = current_unix_ms();
+    let base_ts = now_ms - 4_000;
+
+    // -------------------------------------------------------------------------
+    // Part 1: Shared IP late allowed DNS (t=1500) vs newer unallowed DNS (t=2000)
+    // and earlier WFP drop.
+    // -------------------------------------------------------------------------
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+
+        let exe = r"C:\Temp\shared_ip_allow_p3_46.exe";
+        let sha = "b".repeat(64);
+        inspector.register(exe, Some(&sha), None);
+
+        store
+            .upsert_rule(&AllowlistRuleRecord {
+                rule_id: "R-ALLOW-SHARED-P3-46".to_string(),
+                scope: RuleScope::NetworkAllow,
+                exe_path_pattern: exe.to_string(),
+                sha256: Some(sha),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some("allowed.example".to_string()),
+                created_at_ms: now_ms - 10_000,
+                created_by: "seed".to_string(),
+            })
+            .expect("seed allowed.example allow rule");
+
+        let engine = DaemonEngine::start_with_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                preemptive_startup_executables: vec![exe.to_string()],
+                wfp_drop_dns_grace_ms: 2_000,
+                ..DaemonConfig::default()
+            },
+            defense.clone(),
+            notifier,
+            inspector,
+        );
+
+        let p1 = ProcessIdentity::new(9701, unix_ms_to_filetime(now_ms - 10_000));
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: p1,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("start single pre-restricted process");
+        assert!(
+            wait_until(1_000, || {
+                engine.active_process_table_len() == 1
+                    && engine.metrics().high_priority_processed >= 1
+            })
+            .await,
+            "ProcessStart must complete before DNS sequence"
+        );
+        assert!(
+            engine.has_active_wfp_filter(exe, None, false),
+            "pre-restricted process must have an active app-wide WFP block"
+        );
+
+        let classified = engine.classified_sender();
+
+        // Step 1: Newer unallowed `other.example (t=2000)` resolves to `shared_ip`.
+        let dns_other = SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "other.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: base_ts + 2_000,
+        };
+        assert!(
+            classified.should_promote(&dns_other),
+            "external DnsQuery with active domain allow rule must promote to HighPriority"
+        );
+        let hp_before = engine.metrics().high_priority_processed;
+        classified
+            .send(dns_other)
+            .await
+            .expect("send other.example DNS");
+        assert!(
+            wait_until(1_000, || engine.metrics().high_priority_processed > hp_before).await,
+            "other.example (t=2000) DnsQuery must finish HighPriority processing"
+        );
+        assert!(
+            !engine.has_active_wfp_filter(exe, Some(shared_ip), true),
+            "unallowed other.example must not materialize an IP Permit"
+        );
+
+        // Step 2: Earlier WFP drop for `shared_ip` arrives while only `other.example` is known.
+        // Synchronize via a Tier-3 Telemetry barrier (`run_pipeline` drains Tier-2b `wfp_drop_rx`
+        // strictly before Tier-3 Telemetry) to confirm the drop is deterministically dequeued and
+        // parked inside `pending_wfp_drops` during the grace window.
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 4601,
+            rule_handle: 4601,
+            exe_path: exe.to_string(),
+            protocol: 6,
+            dst_ip: shared_ip,
+            dst_port: 443,
+            timestamp_ms: base_ts + 2_050,
+        }));
+        let tel_before = engine.metrics().telemetry_processed;
+        engine
+            .sender()
+            .send(SensorEvent::DnsQuery {
+                pid: 99_999,
+                query_name: "p3-46-park-barrier.local".to_string(),
+                query_type: 1,
+                resolved_ips: Vec::new(),
+                timestamp_ms: base_ts + 2_051,
+            })
+            .await
+            .expect("send Tier-3 park barrier");
+        assert!(
+            wait_until(1_000, || engine.metrics().telemetry_processed > tel_before).await,
+            "Tier-3 barrier must confirm earlier WfpDropEvent has been dequeued and parked"
+        );
+        assert!(
+            defense.suspends().is_empty(),
+            "parked WfpDropEvent must not suspend before late allowed DNS arrives"
+        );
+        assert!(
+            store.list_alerts(None, 20).expect("list alerts").is_empty(),
+            "parked WfpDropEvent must not emit an alert before late allowed DNS arrives"
+        );
+        assert!(
+            !engine.has_active_wfp_filter(exe, Some(shared_ip), true),
+            "no IP Permit must exist prior to late allowed.example DNS"
+        );
+
+        // Step 3: Late-arriving `allowed.example (t=1500 < 2000)` arrives on HighPriority lane:
+        // pre-materializes the IP Permit and immediately wakes the parked earlier WFP drop into
+        // `handle_wfp_drop_event_now` with both `other.example (t=2000)` and `allowed.example (t=1500)`
+        // in `ProcessDnsHistory`.
+        let dns_allowed = SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "allowed.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: base_ts + 1_500,
+        };
+        assert!(
+            classified.should_promote(&dns_allowed),
+            "late allowed.example DnsQuery must promote to HighPriority lane"
+        );
+        let hp_before = engine.metrics().high_priority_processed;
+        classified
+            .send(dns_allowed)
+            .await
+            .expect("send late allowed.example DNS");
+        assert!(
+            wait_until(1_000, || engine.metrics().high_priority_processed > hp_before).await,
+            "late allowed.example (t=1500) DnsQuery must complete HighPriority processing"
+        );
+        // Follow with a Tier-3 Telemetry barrier so `flush_ready_pending_wfp_drops` ->
+        // `handle_wfp_drop_event_now` (which runs right after `high_priority_processed` increments
+        // in the same worker loop iteration) is deterministically complete before assertions.
+        let tel_before = engine.metrics().telemetry_processed;
+        engine
+            .sender()
+            .send(SensorEvent::DnsQuery {
+                pid: 99_999,
+                query_name: "p3-46-flush-barrier.local".to_string(),
+                query_type: 1,
+                resolved_ips: Vec::new(),
+                timestamp_ms: base_ts + 2_060,
+            })
+            .await
+            .expect("send Tier-3 post-wakeup barrier");
+        assert!(
+            wait_until(1_000, || engine.metrics().telemetry_processed > tel_before).await,
+            "Tier-3 barrier must confirm parked WfpDropEvent completed handle_wfp_drop_event_now"
+        );
+
+        // Step 4: Also exercise direct post-DNS `handle_wfp_drop_event_now` on a distinct port
+        // while both `other.example (t=2000)` and `allowed.example (t=1500)` coexist in DNS history.
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 4602,
+            rule_handle: 4602,
+            exe_path: exe.to_string(),
+            protocol: 6,
+            dst_ip: shared_ip,
+            dst_port: 8443,
+            timestamp_ms: base_ts + 2_100,
+        }));
+        let tel_before = engine.metrics().telemetry_processed;
+        engine
+            .sender()
+            .send(SensorEvent::DnsQuery {
+                pid: 99_999,
+                query_name: "p3-46-direct-drop-barrier.local".to_string(),
+                query_type: 1,
+                resolved_ips: Vec::new(),
+                timestamp_ms: base_ts + 2_101,
+            })
+            .await
+            .expect("send Tier-3 post-direct-drop barrier");
+        assert!(
+            wait_until(1_000, || engine.metrics().telemetry_processed > tel_before).await,
+            "Tier-3 barrier must confirm direct WfpDropEvent completed handle_wfp_drop_event_now"
+        );
+
+        assert!(
+            engine.has_active_wfp_filter(exe, Some(shared_ip), true),
+            "IP Permit for allowed.example on shared IP must be preserved after WFP drop triage"
+        );
+        assert!(
+            defense.removed_wfp().is_empty(),
+            "allowed.example IP Permit must never be revoked during shared-IP WFP drop triage"
+        );
+        assert_eq!(
+            defense.suspends().len(),
+            0,
+            "process must NOT be suspended when allowed.example coexists with newer other.example"
+        );
+        assert!(
+            store.list_alerts(None, 20).expect("list alerts").is_empty(),
+            "zero false alerts must be emitted when allowed.example coexists on shared IP"
+        );
+
+        // Shutdown also flushes any remaining pending drops immediately, confirming zero late alerts/suspends.
+        engine.shutdown_and_flush().await.expect("shutdown part 1");
+        assert_eq!(
+            defense.suspends().len(),
+            0,
+            "zero suspends must remain after shutdown flush"
+        );
+        assert!(
+            store.list_alerts(None, 20).expect("list alerts").is_empty(),
+            "zero false alerts must remain after shutdown flush"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Part 2: `blocked.example` (`NetworkBlock`) coexisting on the same shared IP
+    // alongside `allowed.example` (`NetworkAllow`) enforces deny-overrides-allow.
+    // -------------------------------------------------------------------------
+    {
+        let store = LedrStore::open_in_memory().expect("open store part 2");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+
+        let exe2 = r"C:\Temp\shared_ip_coexist_p3_46.exe";
+        let sha2 = "c".repeat(64);
+        inspector.register(exe2, Some(&sha2), None);
+
+        store
+            .upsert_rule(&AllowlistRuleRecord {
+                rule_id: "R-ALLOW-COEXIST-P3-46".to_string(),
+                scope: RuleScope::NetworkAllow,
+                exe_path_pattern: exe2.to_string(),
+                sha256: Some(sha2.clone()),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some("allowed.example".to_string()),
+                created_at_ms: now_ms - 10_000,
+                created_by: "seed".to_string(),
+            })
+            .expect("seed allowed.example rule");
+        store
+            .upsert_rule(&AllowlistRuleRecord {
+                rule_id: "R-BLK-COEXIST-P3-46".to_string(),
+                scope: RuleScope::NetworkBlock,
+                exe_path_pattern: exe2.to_string(),
+                sha256: Some(sha2),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some("blocked.example".to_string()),
+                created_at_ms: now_ms - 9_999,
+                created_by: "seed".to_string(),
+            })
+            .expect("seed blocked.example rule");
+
+        let engine2 = DaemonEngine::start_with_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                preemptive_startup_executables: vec![exe2.to_string()],
+                wfp_drop_dns_grace_ms: 2_000,
+                ..DaemonConfig::default()
+            },
+            defense.clone(),
+            notifier,
+            inspector,
+        );
+
+        let p2 = ProcessIdentity::new(9702, unix_ms_to_filetime(now_ms - 10_000));
+        engine2
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: p2,
+                parent_pid: 4,
+                exe_path: exe2.to_string(),
+                command_line: exe2.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("start part 2 process");
+        assert!(
+            wait_until(1_000, || {
+                engine2.active_process_table_len() == 1
+                    && engine2.metrics().high_priority_processed >= 1
+            })
+            .await,
+            "part 2 ProcessStart must complete"
+        );
+
+        let classified = engine2.classified_sender();
+
+        // First resolve `allowed.example (t=2000)` -> IP Permit installed initially.
+        let dns_allow_init = SensorEvent::DnsQuery {
+            pid: p2.pid,
+            query_name: "allowed.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: base_ts + 2_000,
+        };
+        assert!(classified.should_promote(&dns_allow_init));
+        let hp_before = engine2.metrics().high_priority_processed;
+        classified
+            .send(dns_allow_init)
+            .await
+            .expect("send initial allowed.example DNS");
+        assert!(
+            wait_until(1_000, || engine2.metrics().high_priority_processed > hp_before).await,
+            "initial allowed.example DNS must complete"
+        );
+        assert!(
+            engine2.has_active_wfp_filter(exe2, Some(shared_ip), true),
+            "allowed.example should materialize IP Permit before blocked.example shares the IP"
+        );
+
+        // Next resolve `blocked.example (t=1500, older than allowed.example)` on the same shared IP:
+        // deny-overrides-allow must revoke the IP Permit and install a DomainPolicy IP Block.
+        let dns_blocked = SensorEvent::DnsQuery {
+            pid: p2.pid,
+            query_name: "blocked.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: base_ts + 1_500,
+        };
+        assert!(classified.should_promote(&dns_blocked));
+        let hp_before = engine2.metrics().high_priority_processed;
+        classified
+            .send(dns_blocked)
+            .await
+            .expect("send blocked.example DNS");
+        assert!(
+            wait_until(1_000, || engine2.metrics().high_priority_processed > hp_before).await,
+            "blocked.example DNS must complete"
+        );
+        assert!(
+            !engine2.has_active_wfp_filter(exe2, Some(shared_ip), true),
+            "coexisting blocked.example must revoke allowed.example IP Permit (deny-overrides-allow)"
+        );
+        assert!(
+            engine2.has_active_wfp_filter(exe2, Some(shared_ip), false),
+            "coexisting blocked.example must install IP-level DomainPolicy Block"
+        );
+
+        // Re-resolving newer `allowed.example (t=2500)` on `shared_ip` must keep Permit withheld
+        // while `blocked.example` remains active on the shared IP.
+        let dns_allow_newer = SensorEvent::DnsQuery {
+            pid: p2.pid,
+            query_name: "allowed.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: base_ts + 2_500,
+        };
+        let hp_before = engine2.metrics().high_priority_processed;
+        classified
+            .send(dns_allow_newer)
+            .await
+            .expect("send newer allowed.example DNS");
+        assert!(
+            wait_until(1_000, || engine2.metrics().high_priority_processed > hp_before).await,
+            "newer allowed.example DNS must complete"
+        );
+        assert!(
+            !engine2.has_active_wfp_filter(exe2, Some(shared_ip), true),
+            "Permit must remain withheld when blocked.example coexists on shared IP"
+        );
+        assert!(
+            engine2.has_active_wfp_filter(exe2, Some(shared_ip), false),
+            "IP Block must remain active when newer allowed.example queries shared IP"
+        );
+
+        // WFP drop on `shared_ip` must enforce `BlockedByRule` even though `allowed.example (t=2500)`
+        // is newer than `blocked.example (t=1500)`.
+        assert!(engine2.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 4603,
+            rule_handle: 4603,
+            exe_path: exe2.to_string(),
+            protocol: 6,
+            dst_ip: shared_ip,
+            dst_port: 443,
+            timestamp_ms: base_ts + 2_600,
+        }));
+        let tel_before = engine2.metrics().telemetry_processed;
+        engine2
+            .sender()
+            .send(SensorEvent::DnsQuery {
+                pid: 99_999,
+                query_name: "p3-46-coexist-drop-barrier.local".to_string(),
+                query_type: 1,
+                resolved_ips: Vec::new(),
+                timestamp_ms: base_ts + 2_601,
+            })
+            .await
+            .expect("send Tier-3 coexist barrier");
+        assert!(
+            wait_until(1_000, || engine2.metrics().telemetry_processed > tel_before).await,
+            "Tier-3 barrier must confirm blocked coexist WfpDropEvent completed"
+        );
+
+        let alerts = store.list_alerts(None, 20).expect("list part 2 alerts");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "coexisting blocked.example on shared IP must emit one policy-block alert (got {alerts:?})"
+        );
+        assert_eq!(alerts[0].rule_id, "LEDR-NET-POLICY-BLOCK");
+        let ctx: serde_json::Value =
+            serde_json::from_str(&alerts[0].context_json).expect("parse block alert context_json");
+        assert_eq!(
+            ctx.get("matched_rule_id").and_then(serde_json::Value::as_str),
+            Some("R-BLK-COEXIST-P3-46")
+        );
+        assert_eq!(
+            ctx.get("domain_hint").and_then(serde_json::Value::as_str),
+            Some("blocked.example")
+        );
+        assert_eq!(
+            ctx.get("wfp_blocked").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            !engine2.has_active_wfp_filter(exe2, Some(shared_ip), true),
+            "IP Permit must remain absent after deny-overrides-allow drop enforcement"
+        );
+        assert!(
+            engine2.has_active_wfp_filter(exe2, Some(shared_ip), false),
+            "IP Block must remain enforced after deny-overrides-allow drop enforcement"
+        );
+
+        engine2.shutdown_and_flush().await.expect("shutdown part 2");
+    }
+}
+
+/// `DAEMON-P3-47` (PR #5 Issue #4 regression, `L-03` / `L-10`):
+/// With `DaemonConfig::dns_history_capacity = 4` and `NetworkBlock` rules for `a.example` and
+/// `b.example`, resolving both to shared IP `198.51.100.88`, migrating `a.example` away (block
+/// kept for `b.example`), flooding 6+ unrelated DNS queries across multiple processes so
+/// `ProcessDnsHistory::latest_domain_by_exe` FIFO completely evicts `a.example`'s history, and
+/// finally migrating `b.example` away must deterministically remove the stale `DomainPolicy`
+/// block filter on `198.51.100.88`.
+#[tokio::test]
+async fn daemon_p3_47_shared_ip_block_cleanup_after_fifo_eviction_of_first_domain() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let exe = r"C:\Tools\shared_blk_evict_p3_47.exe";
+    let other_exe = r"C:\Tools\unrelated_dns_p3_47.exe";
+    let sha = "d".repeat(64);
+    inspector.register(exe, Some(&sha), None);
+
+    let now_ms = current_unix_ms();
+    let base_ts = now_ms - 4_000;
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            dns_history_capacity: 4,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector,
+    );
+
+    for (rid, dom) in [
+        ("R-BLK-P3-47-A", "a.example"),
+        ("R-BLK-P3-47-B", "b.example"),
+    ] {
+        engine
+            .upsert_policy_rule(&AllowlistRuleRecord {
+                rule_id: rid.to_string(),
+                scope: RuleScope::NetworkBlock,
+                exe_path_pattern: exe.to_string(),
+                sha256: Some(sha.clone()),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some(dom.to_string()),
+                created_at_ms: now_ms - 10_000,
+                created_by: "test".to_string(),
+            })
+            .expect("register NetworkBlock rule");
+    }
+
+    let p1 = ProcessIdentity::new(9801, unix_ms_to_filetime(now_ms - 10_000));
+    let p2 = ProcessIdentity::new(9802, unix_ms_to_filetime(now_ms - 9_500));
+    for (proc_id, path) in [(p1, exe), (p2, other_exe)] {
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: proc_id,
+                parent_pid: 4,
+                exe_path: path.to_string(),
+                command_line: path.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("send ProcessStart");
+    }
+    assert!(
+        wait_until(1_000, || {
+            engine.active_process_table_len() == 2 && engine.metrics().high_priority_processed >= 2
+        })
+        .await,
+        "both processes must be registered before DNS sequence"
+    );
+
+    let classified = engine.classified_sender();
+    let shared_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88));
+    let a_new_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11));
+    let b_new_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22));
+
+    // Step 1: Resolve `a.example` then `b.example` to shared IP `198.51.100.88`.
+    for (dom, ts_off) in [("a.example", 100), ("b.example", 200)] {
+        let ev = SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: dom.to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_ip],
+            timestamp_ms: base_ts + ts_off,
+        };
+        assert!(
+            classified.should_promote(&ev),
+            "domain block rule must promote external DnsQuery for {dom} to HighPriority"
+        );
+        let hp_before = engine.metrics().high_priority_processed;
+        classified.send(ev).await.expect("send shared-IP DNS");
+        assert!(
+            wait_until(1_000, || engine.metrics().high_priority_processed > hp_before).await,
+            "{dom} -> shared_ip DnsQuery must finish processing"
+        );
+    }
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(shared_ip), false),
+        "DomainPolicy Block filter must exist on shared IP 198.51.100.88"
+    );
+
+    // Step 2: Migrate `a.example` to `a_new_ip` -> shared IP block MUST remain active for `b.example`.
+    let dns_a_migrate = SensorEvent::DnsQuery {
+        pid: p1.pid,
+        query_name: "a.example".to_string(),
+        query_type: 1,
+        resolved_ips: vec![a_new_ip],
+        timestamp_ms: base_ts + 300,
+    };
+    assert!(classified.should_promote(&dns_a_migrate));
+    let hp_before = engine.metrics().high_priority_processed;
+    classified
+        .send(dns_a_migrate)
+        .await
+        .expect("send a.example migration DNS");
+    assert!(
+        wait_until(1_000, || engine.metrics().high_priority_processed > hp_before).await,
+        "a.example migration DnsQuery must finish processing"
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(a_new_ip), false),
+        "migrated a.example destination must receive a DomainPolicy Block"
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(shared_ip), false),
+        "shared IP 198.51.100.88 block must be maintained while b.example still points there"
+    );
+
+    // Step 3: Submit 7 unrelated DNS queries across `p2` (another process) and `p1` (unrelated
+    // domains) so `ProcessDnsHistory::latest_domain_by_exe` FIFO (capacity 4) completely evicts
+    // `a.example`'s history.
+    let noise_queries: [(u32, &str, u8); 7] = [
+        (p2.pid, "other-proc-0.example", 101),
+        (p2.pid, "other-proc-1.example", 102),
+        (p2.pid, "other-proc-2.example", 103),
+        (p2.pid, "other-proc-3.example", 104),
+        (p1.pid, "unrelated-0.example", 105),
+        (p1.pid, "unrelated-1.example", 106),
+        (p1.pid, "unrelated-2.example", 107),
+    ];
+    for (idx, (pid, domain, octet)) in noise_queries.into_iter().enumerate() {
+        let ev = SensorEvent::DnsQuery {
+            pid,
+            query_name: domain.to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, octet))],
+            timestamp_ms: base_ts + 350 + idx as i64,
+        };
+        let promoted = classified.should_promote(&ev);
+        let hp_before = engine.metrics().high_priority_processed;
+        let tel_before = engine.metrics().telemetry_processed;
+        classified.send(ev).await.expect("send FIFO noise DNS");
+        assert!(
+            wait_until(1_000, || {
+                if promoted {
+                    engine.metrics().high_priority_processed > hp_before
+                } else {
+                    engine.metrics().telemetry_processed > tel_before
+                }
+            })
+            .await,
+            "FIFO eviction DNS query {domain} must finish processing on its lane"
+        );
+    }
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(shared_ip), false),
+        "shared IP 198.51.100.88 block must remain active after DNS FIFO eviction while b.example has not migrated"
+    );
+
+    // Step 4: Migrate `b.example` to `b_new_ip` -> old shared IP `198.51.100.88` DomainPolicy
+    // Block filter MUST be deterministically removed despite `a.example` having been FIFO-evicted.
+    let dns_b_migrate = SensorEvent::DnsQuery {
+        pid: p1.pid,
+        query_name: "b.example".to_string(),
+        query_type: 1,
+        resolved_ips: vec![b_new_ip],
+        timestamp_ms: base_ts + 500,
+    };
+    assert!(classified.should_promote(&dns_b_migrate));
+    let hp_before = engine.metrics().high_priority_processed;
+    classified
+        .send(dns_b_migrate)
+        .await
+        .expect("send b.example migration DNS");
+    assert!(
+        wait_until(1_000, || engine.metrics().high_priority_processed > hp_before).await,
+        "b.example migration DnsQuery must finish processing"
+    );
+    assert!(
+        !engine.has_active_wfp_filter(exe, Some(shared_ip), false),
+        "stale DomainPolicy Block on 198.51.100.88 must be deterministically removed after b.example migrates"
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(b_new_ip), false),
+        "migrated b.example destination must receive a DomainPolicy Block"
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(a_new_ip), false),
+        "previously migrated a.example destination block must remain active"
+    );
+    assert!(
+        !defense.removed_wfp().is_empty(),
+        "WFP remove_wfp_rule must have been invoked to clean up retired shared IP block"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
 }

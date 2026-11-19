@@ -2182,4 +2182,195 @@ brand-new.org
         assert!(trunc);
         assert!(bytes.is_empty());
     }
+
+    /// `RULES-P3-15`（`決定記録 L-14` / PR #5 指摘 #10）:
+    /// `NrdCancelToken` のブロッキング読み取り観測 API（`is_blocking_read_active()` /
+    /// `blocking_read_entries()`）と `BlockingReadGuard` の RAII 動作を決定的に検証する。
+    /// チャネル同期のブロッキング `Read` モックを用い（`thread::sleep` 不使用）、
+    /// 1 回目 `read()` 通過後の 2 回目 `read()` ブロック中に `blocking_read_entries() == 2`
+    /// かつ `is_blocking_read_active() == true` をテストスレッドから観測できること、および
+    /// (a) 通常 EOF 完了、(b) ブロック中 `read()` からの I/O エラー終了、
+    /// (c) ブロック中 `cancel()` 後のアンブロック終了のいずれでも `is_blocking_read_active()`
+    /// が自動で `false` へ戻ることを確認する。
+    #[test]
+    fn rules_p3_15_nrd_cancel_token_blocking_read_observation_and_guard_reset() {
+        use std::io::{self, Read};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct ChannelBlockingReader {
+            token: NrdCancelToken,
+            first_chunk: Vec<u8>,
+            first_obs_tx: Option<mpsc::SyncSender<(u64, bool)>>,
+            second_entered_tx: Option<mpsc::SyncSender<()>>,
+            second_release_rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+            call_count: usize,
+        }
+
+        impl Read for ChannelBlockingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => {
+                        if let Some(tx) = self.first_obs_tx.take() {
+                            let _ = tx.send((
+                                self.token.blocking_read_entries(),
+                                self.token.is_blocking_read_active(),
+                            ));
+                        }
+                        let n = self.first_chunk.len().min(buf.len());
+                        buf[..n].copy_from_slice(&self.first_chunk[..n]);
+                        Ok(n)
+                    }
+                    2 => {
+                        if let Some(tx) = self.second_entered_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        match self.second_release_rx.recv_timeout(Duration::from_secs(5)) {
+                            Ok(Ok(bytes)) => {
+                                let n = bytes.len().min(buf.len());
+                                buf[..n].copy_from_slice(&bytes[..n]);
+                                Ok(n)
+                            }
+                            Ok(Err(err)) => Err(err),
+                            Err(err) => Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!("test channel did not release 2nd read: {err}"),
+                            )),
+                        }
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+
+        type ReaderJoinHandle = std::thread::JoinHandle<Result<(Vec<u8>, bool), String>>;
+
+        let spawn_blocked_on_second_read =
+            || -> (NrdCancelToken, mpsc::SyncSender<io::Result<Vec<u8>>>, ReaderJoinHandle) {
+                let token = NrdCancelToken::new();
+                assert!(!token.is_blocking_read_active());
+                assert_eq!(token.blocking_read_entries(), 0);
+
+                let (first_obs_tx, first_obs_rx) = mpsc::sync_channel(1);
+                let (second_entered_tx, second_entered_rx) = mpsc::sync_channel(1);
+                let (second_release_tx, second_release_rx) = mpsc::sync_channel(1);
+
+                let reader = ChannelBlockingReader {
+                    token: token.clone(),
+                    first_chunk: b"alpha-one.xyz\n".to_vec(),
+                    first_obs_tx: Some(first_obs_tx),
+                    second_entered_tx: Some(second_entered_tx),
+                    second_release_rx,
+                    call_count: 0,
+                };
+                let worker_token = token.clone();
+                let handle = std::thread::spawn(move || {
+                    crate::nrd::read_bounded_reader_cancellable(
+                        reader,
+                        NRD_MAX_RESPONSE_BYTES,
+                        &worker_token,
+                    )
+                });
+
+                let first_obs = first_obs_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("1st read() must report entry");
+                assert_eq!(
+                    first_obs,
+                    (1, true),
+                    "1st read() must observe blocking_read_entries() == 1 and active == true"
+                );
+
+                second_entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("2nd read() must enter blocking state");
+                assert_eq!(
+                    token.blocking_read_entries(),
+                    2,
+                    "test thread must observe blocking_read_entries() == 2 while blocked in 2nd read()"
+                );
+                assert!(
+                    token.is_blocking_read_active(),
+                    "test thread must observe is_blocking_read_active() == true while blocked in 2nd read()"
+                );
+
+                (token, second_release_tx, handle)
+            };
+
+        // (a) 通常 EOF 完了: 2 回目 read() が Ok(0) で抜けた後に active が false へ戻る。
+        {
+            let (token, release_tx, handle) = spawn_blocked_on_second_read();
+            release_tx
+                .send(Ok(Vec::new()))
+                .expect("release 2nd read with EOF");
+            let (bytes, truncated) = handle
+                .join()
+                .expect("EOF reader thread must not panic")
+                .expect("EOF completion must succeed");
+            assert!(!truncated);
+            assert_eq!(bytes, b"alpha-one.xyz\n");
+            assert!(
+                !token.is_blocking_read_active(),
+                "is_blocking_read_active() must reset to false after normal EOF completion"
+            );
+            assert_eq!(token.blocking_read_entries(), 2);
+        }
+
+        // (b) I/O エラー終了: ブロック中 2 回目 read() が Err で抜けた後に active が false へ戻る。
+        {
+            let (token, release_tx, handle) = spawn_blocked_on_second_read();
+            release_tx
+                .send(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "simulated broken pipe",
+                )))
+                .expect("release 2nd read with I/O error");
+            let err = handle
+                .join()
+                .expect("error reader thread must not panic")
+                .expect_err("I/O error must propagate");
+            assert!(
+                err.contains("simulated broken pipe"),
+                "unexpected I/O error message: {err}"
+            );
+            assert!(
+                !token.is_blocking_read_active(),
+                "is_blocking_read_active() must reset to false after I/O error exit"
+            );
+            assert_eq!(token.blocking_read_entries(), 2);
+        }
+
+        // (c) ブロック中 cancel() 後のアンブロック終了:
+        //     ブロック中は active == true を維持し、アンブロック後に cancelled エラーで終了して
+        //     active == false へ戻り、3 回目の read() へは進まない。
+        {
+            let (token, release_tx, handle) = spawn_blocked_on_second_read();
+            token.cancel();
+            assert!(token.is_cancelled());
+            assert!(
+                token.is_blocking_read_active(),
+                "guard must remain active until the blocked 2nd read() actually returns"
+            );
+            assert_eq!(token.blocking_read_entries(), 2);
+
+            release_tx
+                .send(Ok(b"late-chunk.xyz\n".to_vec()))
+                .expect("unblock cancelled 2nd read");
+            let err = handle
+                .join()
+                .expect("cancelled reader thread must not panic")
+                .expect_err("cancelled reader must fail with cancellation error");
+            assert_eq!(err, "NRD feed download cancelled");
+            assert!(
+                !token.is_blocking_read_active(),
+                "is_blocking_read_active() must reset to false after cancelled read unblocks"
+            );
+            assert_eq!(
+                token.blocking_read_entries(),
+                2,
+                "cancelled reader must not enter a 3rd read()"
+            );
+        }
+    }
 }

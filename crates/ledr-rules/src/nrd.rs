@@ -18,8 +18,24 @@ use crate::RulesError;
 #[derive(Default)]
 struct NrdCancelState {
     cancelled: AtomicBool,
+    blocking_read_active: AtomicBool,
+    blocking_read_entries: AtomicU64,
     #[cfg(windows)]
     active_ctx: std::sync::Mutex<Option<Arc<AsyncWinHttpContext>>>,
+}
+
+/// RAII guard marking an in-flight synchronous `Read::read()` call on [`NrdCancelToken`].
+pub(crate) struct BlockingReadGuard<'a> {
+    token: &'a NrdCancelToken,
+}
+
+impl Drop for BlockingReadGuard<'_> {
+    fn drop(&mut self) {
+        self.token
+            .state
+            .blocking_read_active
+            .store(false, Ordering::Release);
+    }
 }
 
 /// Cooperative cancellation token for [`fetch_nrd_feed_url_cancellable`] and
@@ -33,6 +49,8 @@ impl std::fmt::Debug for NrdCancelToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NrdCancelToken")
             .field("cancelled", &self.is_cancelled())
+            .field("blocking_read_active", &self.is_blocking_read_active())
+            .field("blocking_read_entries", &self.blocking_read_entries())
             .finish()
     }
 }
@@ -46,6 +64,34 @@ impl NrdCancelToken {
     /// Returns `true` if [`NrdCancelToken::cancel`] has been called.
     pub fn is_cancelled(&self) -> bool {
         self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Returns `true` while a cancellable bounded reader is currently inside a synchronous
+    /// `Read::read()` call associated with this token.
+    pub fn is_blocking_read_active(&self) -> bool {
+        self.state.blocking_read_active.load(Ordering::Acquire)
+    }
+
+    /// Returns the total number of synchronous `Read::read()` calls entered with this token.
+    pub fn blocking_read_entries(&self) -> u64 {
+        self.state.blocking_read_entries.load(Ordering::Acquire)
+    }
+
+    /// Marks entry into a synchronous `Read::read()` call and returns an RAII guard that resets
+    /// `blocking_read_active` to `false` on drop.
+    ///
+    /// Sets `blocking_read_active` to `true` (`Release`) before incrementing
+    /// `blocking_read_entries` (`AcqRel`) so any observer that sees `blocking_read_entries() >= N`
+    /// with `Acquire` immediately sees `is_blocking_read_active() == true` while the reader is
+    /// still inside `read()`.
+    pub(crate) fn enter_blocking_read(&self) -> BlockingReadGuard<'_> {
+        self.state
+            .blocking_read_active
+            .store(true, Ordering::Release);
+        self.state
+            .blocking_read_entries
+            .fetch_add(1, Ordering::AcqRel);
+        BlockingReadGuard { token: self }
     }
 
     /// Cancels any current or future NRD fetch associated with this token.
@@ -681,10 +727,6 @@ pub(crate) fn read_bounded_reader_cancellable<R: Read>(
     let mut truncated = false;
 
     loop {
-        if cancel.is_cancelled() {
-            return Err(NRD_DOWNLOAD_CANCELLED_ERR.to_string());
-        }
-
         let remaining_budget = cap.saturating_sub(body.len());
         let want = if remaining_budget == 0 {
             1
@@ -692,7 +734,16 @@ pub(crate) fn read_bounded_reader_cancellable<R: Read>(
             remaining_budget.saturating_add(1).min(chunk.len())
         };
 
-        let n = match reader.read(&mut chunk[..want]) {
+        if cancel.is_cancelled() {
+            return Err(NRD_DOWNLOAD_CANCELLED_ERR.to_string());
+        }
+
+        let read_result = {
+            let _read_guard = cancel.enter_blocking_read();
+            reader.read(&mut chunk[..want])
+        };
+
+        let n = match read_result {
             Ok(n) => n,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                 if cancel.is_cancelled() {

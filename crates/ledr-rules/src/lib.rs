@@ -3,6 +3,8 @@
 
 pub mod allowlist;
 pub mod domain;
+pub mod nrd;
+pub mod outbound;
 pub mod pruner;
 pub mod sigma;
 
@@ -18,6 +20,18 @@ pub use allowlist::{
     signer_subject_matches, BinaryIdentity,
 };
 pub use domain::{assess_domain_risk, DomainRiskAssessment};
+pub use nrd::{
+    fetch_nrd_feed_url, normalize_nrd_domain, parse_file_url, parse_http_url, parse_nrd_feed_bytes,
+    parse_nrd_line, refresh_nrd_cache, NrdCache, NrdRefreshStats, ParsedHttpUrl,
+    DEFAULT_NRD_FEED_URLS, NRD_MAX_ENTRIES, NRD_MAX_RESPONSE_BYTES, NRD_REFRESH_INTERVAL_MS,
+};
+pub use outbound::{
+    canonical_ip, classify_outbound_risk, discover_default_prerestricted_interpreters,
+    evaluate_outbound_policy, is_external_ip, is_high_risk_executable_path, is_script_interpreter,
+    matches_app_wide_network_allow, matches_app_wide_network_block, matches_network_allow_rule,
+    matches_network_block_rule, matches_network_target, validate_policy_rule, OutboundDecision,
+    OutboundRiskClass,
+};
 pub use pruner::{AllowlistConfig, EarlyPruner, EarlyPrunerConfig};
 pub use sigma::{
     EventContext, FieldCondition, MatchModifier, SigmaEngine, SigmaField, SigmaMatch, SigmaRule,
@@ -877,5 +891,560 @@ mod tests {
             ),
             "Brave signed identity must match ALLOW-BROWSER-BRAVE"
         );
+    }
+
+    #[test]
+    fn rules_p3_01_outbound_risk_classification_and_external_ip_checks() {
+        // Protected OS & LocalEDR binaries (AUTO-02).
+        assert_eq!(
+            classify_outbound_risk(r"C:\Windows\System32\svchost.exe"),
+            OutboundRiskClass::ProtectedOs
+        );
+        assert_eq!(
+            classify_outbound_risk(r"C:\Program Files\LocalEDR\ledr-daemon.exe"),
+            OutboundRiskClass::ProtectedOs
+        );
+
+        // High-risk paths: Downloads, Temp, Tmp (L-03).
+        assert_eq!(
+            classify_outbound_risk(r"C:\Users\alice\Downloads\setup.exe"),
+            OutboundRiskClass::HighRiskPath
+        );
+        assert_eq!(
+            classify_outbound_risk(r"C:\Users\alice\AppData\Local\Temp\sub\dropper.exe"),
+            OutboundRiskClass::HighRiskPath
+        );
+        assert_eq!(
+            classify_outbound_risk(r"\\?\D:/TMP/tool.exe"),
+            OutboundRiskClass::HighRiskPath
+        );
+        // Non-high-risk lookalikes must stay GeneralUnknown.
+        assert_eq!(
+            classify_outbound_risk(r"C:\Program Files\TemplateApp\downloader.exe"),
+            OutboundRiskClass::GeneralUnknown
+        );
+
+        // Script interpreters (L-03).
+        for script in [
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Python312\python.exe",
+            r"C:\Python312\python3.12.exe",
+            r"C:\Python312\pythonw.exe",
+            r"C:\Windows\System32\wscript.exe",
+            r"C:\Windows\System32\cscript.exe",
+            r"C:\Windows\System32\mshta.exe",
+        ] {
+            assert_eq!(
+                classify_outbound_risk(script),
+                OutboundRiskClass::ScriptInterpreter,
+                "expected ScriptInterpreter for {script}"
+            );
+        }
+
+        // External IP classification (IPv4, IPv6, IPv4-mapped IPv6).
+        assert!(is_external_ip(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
+        assert!(is_external_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2606, 0x2800, 0x0220, 0x0001, 0x0248, 0x1893, 0x25c8, 0x1946
+        ))));
+        for local in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 10, 2)),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6("fe80::1".parse().unwrap()),
+            IpAddr::V6("fc00::1".parse().unwrap()),
+            IpAddr::V6("ff02::1".parse().unwrap()),
+            IpAddr::V6("::ffff:127.0.0.1".parse().unwrap()),
+            IpAddr::V6("::ffff:192.168.1.5".parse().unwrap()),
+        ] {
+            assert!(!is_external_ip(local), "expected local/non-external: {local}");
+        }
+        assert!(is_external_ip(IpAddr::V6("::ffff:93.184.216.34".parse().unwrap())));
+    }
+
+    #[test]
+    fn rules_p3_02_outbound_policy_deny_overrides_allow_and_l04_tiers() {
+        use ledr_proto::{AuthenticodeInfo, RuleScope};
+
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let identity = BinaryIdentity {
+            exe_path: r"C:\Tools\client.exe".to_string(),
+            sha256: Some(sha.to_string()),
+            authenticode: Some(AuthenticodeInfo {
+                signer_subject: "CN=Example Corp".to_string(),
+                root_thumbprint: "3B1EFD3A66EA28B16697394703A72CA340A05BD5".to_string(),
+            }),
+        };
+
+        // Unsigned NetworkAllow WITHOUT sha256 fails closed (`L-04`).
+        let invalid_allow = AllowlistRuleRecord {
+            rule_id: "ALLOW-INVALID".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: r"C:\Tools\client.exe".to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 1,
+            created_by: "test".to_string(),
+        };
+        assert_eq!(
+            evaluate_outbound_policy(&identity, dst_ip, Some("api.example.com"), &[invalid_allow]),
+            OutboundDecision::UnknownFirstConnect
+        );
+
+        // Valid signed NetworkAllow scoped by wildcard domain allows matching connection.
+        let valid_allow = AllowlistRuleRecord {
+            rule_id: "ALLOW-CLIENT".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: r"C:\Tools\client.exe".to_string(),
+            sha256: None,
+            signer_subject: Some("CN=Example Corp".to_string()),
+            root_thumbprint: Some("3B1EFD3A66EA28B16697394703A72CA340A05BD5".to_string()),
+            allowed_target: Some("*.example.com".to_string()),
+            created_at_ms: 2,
+            created_by: "test".to_string(),
+        };
+        assert_eq!(
+            evaluate_outbound_policy(
+                &identity,
+                dst_ip,
+                Some("api.example.com."),
+                std::slice::from_ref(&valid_allow),
+            ),
+            OutboundDecision::AllowedByRule {
+                rule_id: "ALLOW-CLIENT".to_string()
+            }
+        );
+        assert_eq!(
+            evaluate_outbound_policy(
+                &identity,
+                dst_ip,
+                Some("evil.other.org"),
+                std::slice::from_ref(&valid_allow),
+            ),
+            OutboundDecision::UnknownFirstConnect
+        );
+
+        // Deny-overrides-allow: path-only NetworkBlock overrides even when placed AFTER NetworkAllow.
+        let path_block = AllowlistRuleRecord {
+            rule_id: "BLOCK-CLIENT".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: r"C:\Tools\client.exe".to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 3,
+            created_by: "user_quarantine".to_string(),
+        };
+        assert_eq!(
+            evaluate_outbound_policy(
+                &identity,
+                dst_ip,
+                Some("api.example.com"),
+                &[valid_allow, path_block],
+            ),
+            OutboundDecision::BlockedByRule {
+                rule_id: "BLOCK-CLIENT".to_string()
+            }
+        );
+
+        // Protected OS process is NEVER blocked even if a wildcard NetworkBlock matches its path.
+        let svchost = BinaryIdentity {
+            exe_path: r"C:\Windows\System32\svchost.exe".to_string(),
+            sha256: None,
+            authenticode: None,
+        };
+        let catch_all_block = AllowlistRuleRecord {
+            rule_id: "BLOCK-ALL".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: r"C:\Windows\System32\*.exe".to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 4,
+            created_by: "test".to_string(),
+        };
+        assert_eq!(
+            evaluate_outbound_policy(&svchost, dst_ip, None, &[catch_all_block]),
+            OutboundDecision::ProtectedOs
+        );
+    }
+
+    #[test]
+    fn rules_p3_03_nrd_feed_parser_caps_and_disk_cache_roundtrip() {
+        let tmp = TestTempDir::new("ledr-rules-p3-nrd");
+        let raw_feed = "\
+# HaGeZi NRD 7-day sample
+! comment
+; comment
+fresh-login.xyz
+0.0.0.0   Phish-Bank.TOP.  # inline comment
+||c2-drop.click^
+127.0.0.1 localhost
+203.0.113.5
+not a valid line
+-badlabel.com
+brand-new.org
+";
+        let mut set = std::collections::HashSet::new();
+        let (added, truncated) = parse_nrd_feed_bytes(raw_feed.as_bytes(), &mut set, 100);
+        assert_eq!(added, 4);
+        assert!(!truncated);
+        assert!(set.contains("fresh-login.xyz"));
+        assert!(set.contains("phish-bank.top"));
+        assert!(set.contains("c2-drop.click"));
+        assert!(set.contains("brand-new.org"));
+
+        // Entry cap enforcement.
+        let mut capped = std::collections::HashSet::new();
+        let (capped_added, capped_trunc) = parse_nrd_feed_bytes(raw_feed.as_bytes(), &mut capped, 2);
+        assert_eq!(capped_added, 2);
+        assert!(capped_trunc);
+        assert_eq!(capped.len(), 2);
+
+        // Save/load roundtrip + staleness + exact & subdomain lookup (bare TLD never matches).
+        let cache_path = tmp.path().join("nrd-cache.txt");
+        let cache = NrdCache::from_domains(set.iter(), Some(1_760_000_000_000), NRD_MAX_ENTRIES);
+        cache.save_to_file(&cache_path).expect("save NRD cache");
+
+        let loaded = NrdCache::load_from_file(&cache_path, NRD_MAX_ENTRIES).expect("load NRD cache");
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded.updated_at_ms(), Some(1_760_000_000_000));
+        assert!(!loaded.is_stale(1_760_000_000_000 + 1_000, NRD_REFRESH_INTERVAL_MS));
+        assert!(loaded.is_stale(
+            1_760_000_000_000 + i64::try_from(NRD_REFRESH_INTERVAL_MS).unwrap(),
+            NRD_REFRESH_INTERVAL_MS
+        ));
+        assert!(loaded.contains("fresh-login.xyz"));
+        assert!(loaded.contains("Sub.Fresh-Login.XYZ."));
+        assert!(!loaded.contains("xyz"));
+        assert!(!loaded.contains("not-fresh-login.xyz"));
+
+        // Verify assess_domain_risk integrates subdomain NRD + homograph detection.
+        let sub_risk = assess_domain_risk("login.phish-bank.top", Some(loaded.domains()));
+        assert!(sub_risk.is_nrd);
+        assert!(!sub_risk.is_homograph);
+
+        let typo_risk = assess_domain_risk("micros0ft.com", Some(loaded.domains()));
+        assert!(!typo_risk.is_nrd);
+        assert!(typo_risk.is_homograph);
+        assert_eq!(typo_risk.matched_brand.as_deref(), Some("microsoft"));
+    }
+
+    #[test]
+    fn rules_p3_04_nrd_url_parsing_file_refresh_and_byte_cap() {
+        // HTTP/HTTPS URL parser edge cases.
+        let https = parse_http_url(DEFAULT_NRD_FEED_URLS[0]).expect("parse default nrd7 URL");
+        assert!(https.is_https);
+        assert_eq!(https.host, "raw.githubusercontent.com");
+        assert_eq!(https.port, 443);
+        assert_eq!(
+            https.path_and_query,
+            "/hagezi/nrd/main/domains/nrd7.txt"
+        );
+        let https_14 = parse_http_url(DEFAULT_NRD_FEED_URLS[1]).expect("parse default nrd14-8 URL");
+        assert!(https_14.is_https);
+        assert_eq!(https_14.host, "raw.githubusercontent.com");
+        assert_eq!(
+            https_14.path_and_query,
+            "/hagezi/nrd/main/domains/nrd14-8.txt"
+        );
+
+        let v6_url = parse_http_url("http://[::1]:8080/feeds/nrd.txt?v=1").expect("parse v6 url");
+        assert!(!v6_url.is_https);
+        assert_eq!(v6_url.host, "::1");
+        assert_eq!(v6_url.port, 8080);
+        assert_eq!(v6_url.path_and_query, "/feeds/nrd.txt?v=1");
+
+        assert!(parse_http_url("ftp://example.com/list.txt").is_err());
+        assert!(parse_http_url("https://user:pass@example.com/list.txt").is_err());
+        assert!(parse_http_url("https://example.com/bad path").is_err());
+
+        // file:// refresh across two feeds + partial failure tolerance + response byte cap.
+        let tmp = TestTempDir::new("ledr-rules-p3-file-feed");
+        let feed1 = tmp.path().join("nrd7.txt");
+        let feed2 = tmp.path().join("nrd14-8.txt");
+        let missing = tmp.path().join("missing.txt");
+        std::fs::write(&feed1, "alpha-new.xyz\nbeta-new.xyz\n").expect("write feed1");
+        std::fs::write(&feed2, "gamma-new.top\ndelta-new.top\nepsilon-new.top\n")
+            .expect("write feed2");
+
+        let to_file_url = |p: &Path| -> String {
+            format!("file:///{}", p.to_string_lossy().replace('\\', "/"))
+        };
+        let urls = vec![
+            to_file_url(&feed1),
+            to_file_url(&missing),
+            to_file_url(&feed2),
+        ];
+        let (cache, stats) =
+            refresh_nrd_cache(&urls, NRD_MAX_ENTRIES, NRD_MAX_RESPONSE_BYTES, 1_760_000_123_000)
+                .expect("refresh succeeds when at least one feed succeeds");
+        assert_eq!(stats.feeds_succeeded, 2);
+        assert_eq!(stats.feeds_failed, 1);
+        assert_eq!(stats.total_entries, 5);
+        assert!(!stats.truncated);
+        assert!(cache.contains("alpha-new.xyz"));
+        assert!(cache.contains("epsilon-new.top"));
+
+        // Byte cap trims cleanly at newline boundary without emitting half a domain.
+        let (capped_cache, capped_stats) =
+            refresh_nrd_cache(&[to_file_url(&feed2)], NRD_MAX_ENTRIES, 20, 1_760_000_123_000)
+                .expect("byte-capped refresh");
+        assert!(capped_stats.truncated);
+        assert!(capped_cache.is_truncated());
+        assert!(capped_cache.contains("gamma-new.top"));
+        assert!(!capped_cache.contains("delta-new.top"));
+
+        // All feeds failing returns Err so callers preserve their prior cache.
+        assert!(
+            refresh_nrd_cache(
+                &[to_file_url(&missing)],
+                NRD_MAX_ENTRIES,
+                NRD_MAX_RESPONSE_BYTES,
+                1_760_000_123_000
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rules_p3_05_canonical_ip_matching_policy_validation_and_nrd_truncation_edge_cases() {
+        use ledr_proto::RuleScope;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        // IPv4-mapped IPv6 matches plain IPv4 target and wildcard IPv4 target (no bypass).
+        let mapped_v6 = IpAddr::V6(Ipv4Addr::new(93, 184, 216, 34).to_ipv6_mapped());
+        assert!(matches_network_target("93.184.216.34", mapped_v6, None));
+        assert!(matches_network_target("93.184.*", mapped_v6, None));
+        assert!(matches_network_target(
+            "::ffff:93.184.216.34",
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            None
+        ));
+
+        // Uncompressed IPv6 rule target matches compressed IPv6 destination address.
+        let v6_dst = IpAddr::V6(
+            "2606:2800:220:1:248:1893:25c8:1946"
+                .parse::<Ipv6Addr>()
+                .expect("valid v6"),
+        );
+        assert!(matches_network_target(
+            "2606:2800:0220:0001:0248:1893:25c8:1946",
+            v6_dst,
+            None
+        ));
+
+        // Server-side policy rule validator enforces L-04 & AUTO-02.
+        let valid_sha = "a".repeat(64);
+        let mk_rule = |scope: RuleScope| AllowlistRuleRecord {
+            rule_id: "R-1".to_string(),
+            scope,
+            exe_path_pattern: r"C:\Tools\app.exe".to_string(),
+            sha256: Some(valid_sha.clone()),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 1,
+            created_by: "test".to_string(),
+        };
+        assert!(validate_policy_rule(&mk_rule(RuleScope::NetworkAllow)).is_ok());
+
+        // Allow rule missing both sha256 and signer+thumbprint is rejected.
+        let mut no_id = mk_rule(RuleScope::NetworkAllow);
+        no_id.sha256 = None;
+        assert!(validate_policy_rule(&no_id).is_err());
+
+        // Signer without thumbprint (even if sha256 is set) is rejected.
+        let mut signer_no_tp = mk_rule(RuleScope::NetworkAllow);
+        signer_no_tp.signer_subject = Some("CN=Vendor".to_string());
+        assert!(validate_policy_rule(&signer_no_tp).is_err());
+
+        // All-zero root_thumbprint is rejected.
+        let mut zero_tp = signer_no_tp.clone();
+        zero_tp.root_thumbprint = Some("0".repeat(40));
+        assert!(validate_policy_rule(&zero_tp).is_err());
+
+        // Bad SHA-256 length/chars rejected.
+        let mut bad_sha = mk_rule(RuleScope::NetworkAllow);
+        bad_sha.sha256 = Some("not-a-valid-sha256".to_string());
+        assert!(validate_policy_rule(&bad_sha).is_err());
+
+        // Concrete NetworkBlock targeting AUTO-02 protected process (including trailing dot) rejected.
+        let mut block_lsass = mk_rule(RuleScope::NetworkBlock);
+        block_lsass.sha256 = None;
+        block_lsass.exe_path_pattern = r"C:\Windows\System32\lsass.exe.".to_string();
+        assert!(validate_policy_rule(&block_lsass).is_err());
+
+        // Path-only NetworkBlock for non-protected app is valid.
+        let mut block_app = mk_rule(RuleScope::NetworkBlock);
+        block_app.sha256 = None;
+        assert!(validate_policy_rule(&block_app).is_ok());
+
+        // Single-line feed truncated BEFORE first newline must NOT emit a corrupted half-domain!
+        let tmp = TestTempDir::new("ledr-rules-p3-single-line-trunc");
+        let long_feed = tmp.path().join("single.txt");
+        std::fs::write(&long_feed, "super-long-domain.example\n").expect("write single line");
+        let mixed_file_url = format!("File:///{}", long_feed.to_string_lossy().replace('\\', "/"));
+        let (bytes, truncated) =
+            fetch_nrd_feed_url(&mixed_file_url, 22).expect("fetch truncated single-line feed");
+        assert!(truncated);
+        assert!(
+            bytes.is_empty(),
+            "truncated single line without newline must be discarded, got: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        // Mixed-case HTTPS scheme + #fragment stripping + UNC file:// parsing.
+        let upper_https =
+            parse_http_url("HTTPS://example.com/nrd.txt?v=2#frag").expect("mixed-case https");
+        assert!(upper_https.is_https);
+        assert_eq!(upper_https.path_and_query, "/nrd.txt?v=2");
+        assert_eq!(
+            parse_file_url("file://fileserver/share/nrd7.txt").expect("UNC file url"),
+            Path::new(r"\\fileserver\share\nrd7.txt")
+        );
+    }
+
+    #[test]
+    fn rules_p3_06_bounded_chunk_reader_handles_exact_cap_and_midline_overflow() {
+        use std::collections::VecDeque;
+
+        // 1. Exact cap with clean EOF (no extra bytes) -> not truncated, full body preserved.
+        let mut exact_eof = VecDeque::from(vec![b"alpha.xyz\n".to_vec(), b"beta.xyz\n".to_vec()]);
+        let (body, trunc) = crate::nrd::read_bounded_chunks(19, |_| Ok(exact_eof.pop_front()))
+            .expect("exact EOF");
+        assert!(!trunc);
+        assert_eq!(String::from_utf8_lossy(&body), "alpha.xyz\nbeta.xyz\n");
+
+        // 2. Chunk 1 fills exact cap (22 bytes) ending mid-domain, chunk 2 has remaining bytes ->
+        //    MUST trim the partial second line even when hitting the `remaining_budget == 0` path!
+        let mut exact_then_more = VecDeque::from(vec![
+            b"first-ok.xyz\nsecond-ha".to_vec(),
+            b"lf.xyz\n".to_vec(),
+        ]);
+        let (body, trunc) =
+            crate::nrd::read_bounded_chunks(22, |_| Ok(exact_then_more.pop_front()))
+                .expect("exact cap then more");
+        assert!(trunc);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "first-ok.xyz\n",
+            "exact-cap boundary with trailing data must trim partial trailing domain"
+        );
+
+        // 3. Overflow mid-chunk with no newline anywhere -> buffer cleared cleanly.
+        let mut no_nl = VecDeque::from(vec![b"very-long-single-line-domain.example".to_vec()]);
+        let (body, trunc) =
+            crate::nrd::read_bounded_chunks(18, |_| Ok(no_nl.pop_front())).expect("no newline");
+        assert!(trunc);
+        assert!(body.is_empty());
+    }
+
+    /// `RULES-P3-07`: `DEFAULT_NRD_FEED_URLS` targets `hagezi/nrd` over HTTPS, and
+    /// `fetch_nrd_feed_url` rejects unencrypted remote `http://` URLs while recognizing
+    /// loopback-only HTTP hosts for local tests.
+    #[test]
+    fn rules_p3_07_default_nrd_repo_urls_and_plaintext_remote_http_rejected() {
+        assert_eq!(
+            DEFAULT_NRD_FEED_URLS,
+            &[
+                "https://raw.githubusercontent.com/hagezi/nrd/main/domains/nrd7.txt",
+                "https://raw.githubusercontent.com/hagezi/nrd/main/domains/nrd14-8.txt",
+            ]
+        );
+
+        for remote_http in [
+            "http://raw.githubusercontent.com/hagezi/nrd/main/domains/nrd7.txt",
+            "HTTP://example.com/nrd7.txt",
+            "http://192.168.1.10:8080/nrd7.txt",
+            "http://localhost.evil.example/nrd7.txt",
+            "http://[2001:db8::1]/nrd7.txt",
+        ] {
+            let err = fetch_nrd_feed_url(remote_http, 1024)
+                .expect_err("unencrypted remote http:// NRD URL must be rejected");
+            assert!(
+                err.contains("unencrypted remote HTTP"),
+                "unexpected error for `{remote_http}`: {err}"
+            );
+        }
+
+        // Loopback classification accepts localhost / 127.0.0.0/8 / ::1 and rejects remote hosts.
+        assert!(crate::nrd::is_loopback_http_host("localhost"));
+        assert!(crate::nrd::is_loopback_http_host("LOCALHOST."));
+        assert!(crate::nrd::is_loopback_http_host("127.0.0.1"));
+        assert!(crate::nrd::is_loopback_http_host("127.10.20.30"));
+        assert!(crate::nrd::is_loopback_http_host("::1"));
+        assert!(crate::nrd::is_loopback_http_host("::ffff:127.0.0.1"));
+        assert!(!crate::nrd::is_loopback_http_host("localhost.evil.example"));
+        assert!(!crate::nrd::is_loopback_http_host("192.168.1.1"));
+        assert!(!crate::nrd::is_loopback_http_host("93.184.216.34"));
+    }
+
+    /// `RULES-P3-08`: Startup script-interpreter discovery collects existing `%SystemRoot%`
+    /// interpreters and `PATH`-installed `pwsh`/`node`/`python`/`python3`, deduplicated
+    /// case-insensitively and excluding protected processes.
+    #[test]
+    fn rules_p3_08_discover_default_prerestricted_interpreters() {
+        let tmp = TestTempDir::new("ledr-rules-p3-interpreters");
+        let fake_sysroot = tmp.path().join("Windows");
+        let ps64 = fake_sysroot.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let ps32 = fake_sysroot.join(r"SysWOW64\WindowsPowerShell\v1.0\powershell.exe");
+        let wscript = fake_sysroot.join(r"System32\wscript.exe");
+        let mshta = fake_sysroot.join(r"System32\mshta.exe");
+        let bin_dir = tmp.path().join("Tools");
+        let bin_dir_alt_case = tmp.path().join("tools");
+        let node_exe = bin_dir.join("node.exe");
+        let python_exe = bin_dir.join("python.exe");
+        let pwsh_exe = bin_dir.join("pwsh.exe");
+
+        for p in [&ps64, &ps32, &wscript, &mshta, &node_exe, &python_exe, &pwsh_exe] {
+            std::fs::create_dir_all(p.parent().unwrap()).expect("create parent");
+            std::fs::write(p, b"MZ").expect("write stub exe");
+        }
+        // Duplicate directory entry with different casing in PATH to test case-insensitive dedup.
+        let joined_path = std::env::join_paths([bin_dir.as_path(), bin_dir_alt_case.as_path()])
+            .expect("join PATH");
+        let discovered = crate::outbound::discover_prerestricted_interpreters_from(
+            Some(fake_sysroot.as_path()),
+            Some(joined_path.as_os_str()),
+        );
+        assert_eq!(discovered.len(), 7, "discovered={discovered:?}");
+        for expected in [&ps64, &ps32, &wscript, &mshta, &node_exe, &python_exe, &pwsh_exe] {
+            let exp_str = expected.to_string_lossy().replace('/', "\\");
+            assert!(
+                discovered.iter().any(|p| p.eq_ignore_ascii_case(&exp_str)),
+                "missing expected interpreter `{exp_str}` in {discovered:?}"
+            );
+        }
+        // Non-existent cscript.exe and python3.exe must NOT be included.
+        assert!(!discovered
+            .iter()
+            .any(|p| p.to_ascii_lowercase().ends_with("cscript.exe")));
+        assert!(!discovered
+            .iter()
+            .any(|p| p.to_ascii_lowercase().ends_with("python3.exe")));
+
+        // Real host smoke check: every returned path exists and is never a protected OS binary.
+        let host_list = discover_default_prerestricted_interpreters();
+        for p in &host_list {
+            assert!(Path::new(p).is_file(), "discovered path must exist: {p}");
+            assert!(
+                !ledr_proto::is_never_suspend_process(p),
+                "protected OS binary must never be pre-restricted: {p}"
+            );
+        }
     }
 }

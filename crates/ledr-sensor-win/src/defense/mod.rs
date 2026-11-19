@@ -23,6 +23,7 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW, TerminateProcess,
 };
 
+use crate::wfp::{WfpDynamicEngine, validate_wfp_rule_request};
 use crate::{OwnedHandle, SensorError};
 
 const HONEYPOT_DECOY_CONTENT: &[u8] = b"LocalEDR Canary Decoy File - Do Not Modify or Delete.\r\n";
@@ -304,17 +305,41 @@ fn validate_process_metadata(
 }
 
 /// Windows active-defense actuator implementing [`ActiveDefenseController`] via `ntdll`
-/// `NtSuspendProcess`/`NtResumeProcess` and Win32 `TerminateProcess` (`AUTO-02`, `AUTO-03`, `L-07`).
+/// `NtSuspendProcess`/`NtResumeProcess`, Win32 `TerminateProcess`, and the dynamic WFP
+/// firewall engine (`AUTO-02`, `AUTO-03`, `AUTO-04`, `L-03`, `L-07`).
 #[derive(Debug, Default)]
 pub struct WindowsDefenseController {
     suspended_processes: Mutex<HashSet<ProcessIdentity>>,
     suspended_children: Mutex<HashMap<ProcessIdentity, Vec<ProcessIdentity>>>,
+    wfp_engine: Mutex<Option<WfpDynamicEngine>>,
 }
 
 impl WindowsDefenseController {
-    /// Creates a new [`WindowsDefenseController`].
+    /// Creates a new [`WindowsDefenseController`] with lazy dynamic WFP session initialization.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a [`WindowsDefenseController`] pre-configured with an explicit [`WfpDynamicEngine`].
+    pub fn with_wfp_engine(wfp_engine: WfpDynamicEngine) -> Self {
+        Self {
+            suspended_processes: Mutex::new(HashSet::new()),
+            suspended_children: Mutex::new(HashMap::new()),
+            wfp_engine: Mutex::new(Some(wfp_engine)),
+        }
+    }
+
+    /// Eagerly initializes the dynamic WFP session (`FWPM_SESSION_FLAG_DYNAMIC`) and custom
+    /// SubLayer (`AUTO-04`). Safe to call repeatedly (no-op once initialized).
+    pub fn init_wfp_session(&self) -> Result<(), String> {
+        let mut slot = self
+            .wfp_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(WfpDynamicEngine::open_dynamic()?);
+        }
+        Ok(())
     }
 
     /// Returns a snapshot of currently tracked suspended descendants for `target` (useful for
@@ -621,15 +646,33 @@ impl ActiveDefenseController for WindowsDefenseController {
 
     fn add_wfp_app_rule(
         &self,
-        _exe_path: &Path,
-        _remote_ip: Option<IpAddr>,
-        _allow: bool,
+        exe_path: &Path,
+        remote_ip: Option<IpAddr>,
+        allow: bool,
     ) -> Result<u64, String> {
-        Err("WFP dynamic firewall rules are not enabled until Phase 3".to_string())
+        validate_wfp_rule_request(exe_path, allow)?;
+        let mut slot = self
+            .wfp_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(WfpDynamicEngine::open_dynamic()?);
+        }
+        let engine = slot
+            .as_ref()
+            .ok_or_else(|| "WFP dynamic session failed to initialize".to_string())?;
+        engine.add_app_rule(exe_path, remote_ip, allow)
     }
 
-    fn remove_wfp_rule(&self, _filter_id: u64) -> Result<(), String> {
-        Err("WFP dynamic firewall rules are not enabled until Phase 3".to_string())
+    fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+        let slot = self
+            .wfp_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let engine = slot
+            .as_ref()
+            .ok_or_else(|| "WFP dynamic session is not initialized".to_string())?;
+        engine.remove_rule(filter_id)
     }
 }
 
@@ -1354,5 +1397,67 @@ mod tests {
             "orphan grandchild3 ({}) must be terminated even after parent3 exited",
             grandchild3
         );
+    }
+
+    #[test]
+    fn sens_p3_04_defense_controller_wfp_delegation_and_guards() {
+        use crate::wfp::{WfpBackend, WfpFilterSpec};
+        use std::net::Ipv4Addr;
+
+        struct StubDynamicBackend {
+            next_id: u64,
+            active: HashMap<u64, WfpFilterSpec>,
+        }
+        impl WfpBackend for StubDynamicBackend {
+            fn begin_transaction(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn commit_transaction(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn abort_transaction(&mut self) {}
+            fn add_filter(&mut self, spec: &WfpFilterSpec) -> Result<u64, String> {
+                self.next_id += 1;
+                self.active.insert(self.next_id, spec.clone());
+                Ok(self.next_id)
+            }
+            fn delete_filter(&mut self, os_filter_id: u64) -> Result<(), String> {
+                self.active.remove(&os_filter_id);
+                Ok(())
+            }
+            fn is_dynamic_session(&self) -> bool {
+                true
+            }
+        }
+
+        // Uninitialized controller still enforces Never-Block before opening WFP.
+        let uninit = WindowsDefenseController::new();
+        let err = uninit
+            .add_wfp_app_rule(Path::new(r"C:\Windows\System32\svchost.exe"), None, false)
+            .expect_err("protected process must be rejected before WFP open");
+        assert!(err.contains("protected process"), "{err}");
+        assert!(uninit.remove_wfp_rule(1).is_err());
+
+        // Configured controller delegates add/remove cleanly through ActiveDefenseController.
+        let wfp = WfpDynamicEngine::from_backend(Box::new(StubDynamicBackend {
+            next_id: 0,
+            active: HashMap::new(),
+        }))
+        .expect("dynamic engine");
+        let controller = WindowsDefenseController::with_wfp_engine(wfp);
+        let h1 = controller
+            .add_wfp_app_rule(Path::new(r"C:\Temp\sim.exe"), None, false)
+            .expect("add dual-stack block");
+        let h2 = controller
+            .add_wfp_app_rule(
+                Path::new(r"C:\Temp\sim.exe"),
+                Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+                true,
+            )
+            .expect("add single-stack permit");
+        assert_ne!(h1, h2);
+        controller.remove_wfp_rule(h1).expect("remove h1");
+        controller.remove_wfp_rule(h2).expect("remove h2");
+        assert!(controller.remove_wfp_rule(h1).is_err());
     }
 }

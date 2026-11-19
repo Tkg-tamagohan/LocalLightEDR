@@ -9,5 +9,5 @@ ledr-proto = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-windows = { workspace = true, features = ["Win32_System_Time"] }
+windows = { workspace = true, features = ["Win32_System_Time", "Win32_System_Rpc"] }
 windows-sys = { workspace = true }

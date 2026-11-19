@@ -25,7 +25,7 @@
         </button>
         <button type="button" class="nav-tab" data-view="policy">
           <span>View 3: 防御ポリシー・カナリア・ブラウザシールド</span>
-          <span class="phase-tag">Phase 3</span>
+          <span class="phase-tag is-live">Active</span>
         </button>
       </nav>
 
@@ -154,9 +154,9 @@
                   </button>
                   <div class="tier-option">
                     <input id="opt-add-block-rule" type="checkbox" checked />
-                    <label for="opt-add-block-rule">Save NetworkBlock policy rule (WFP in Phase 3)</label>
+                    <label for="opt-add-block-rule">Save NetworkBlock policy rule (WFP)</label>
                   </div>
-                  <span class="tier-constraint">Terminates process tree now; WFP network block applies in Phase 3</span>
+                  <span class="tier-constraint">Terminates process tree and applies dynamic WFP block</span>
                 </div>
 
                 <div class="tier-card tier-once">
@@ -269,12 +269,189 @@
         </section>
       </section>
 
-      <section id="view-policy" class="placeholder-view hidden" aria-label="Defense Policy and Browser Shield">
-        <div class="panel placeholder-card">
-          <h2>View 3: 防御ポリシー・カナリア・ブラウザシールド</h2>
-          <p class="empty-state-meta">Phase 3 target</p>
-          <button type="button" class="btn btn-primary back-to-view2">Return to View 2</button>
-        </div>
+      <section id="view-policy" class="workspace policy-workspace hidden" aria-label="Defense Policy and Browser Shield">
+        <section class="panel policy-rules-panel" aria-label="Firewall and Allowlist Rules">
+          <div class="panel-header">
+            <div class="panel-title-group">
+              <h2>ファイアウォール・防御ポリシー</h2>
+              <span id="policy-rules-summary" class="panel-meta">0 rules</span>
+            </div>
+            <div class="panel-actions policy-scope-tabs" role="group" aria-label="Rule Scopes">
+              <button type="button" class="btn btn-xs policy-scope-btn is-selected" data-scope="all" aria-pressed="true">
+                All <span id="scope-count-all" class="count-badge">0</span>
+              </button>
+              <button type="button" class="btn btn-xs policy-scope-btn" data-scope="NetworkBlock" aria-pressed="false">
+                Block <span id="scope-count-block" class="count-badge">0</span>
+              </button>
+              <button type="button" class="btn btn-xs policy-scope-btn" data-scope="NetworkAllow" aria-pressed="false">
+                Allow <span id="scope-count-allow" class="count-badge">0</span>
+              </button>
+              <button type="button" class="btn btn-xs policy-scope-btn" data-scope="FileCanaryAllow" aria-pressed="false">
+                Canary <span id="scope-count-canary" class="count-badge">0</span>
+              </button>
+              <button type="button" class="btn btn-xs policy-scope-btn" data-scope="ProcessAllow" aria-pressed="false">
+                Process <span id="scope-count-process" class="count-badge">0</span>
+              </button>
+            </div>
+          </div>
+
+          <search class="filter-bar policy-toolbar">
+            <label for="policy-filter" class="visually-hidden">Filter policy rules</label>
+            <input
+              id="policy-filter"
+              type="search"
+              placeholder="e.g. powershell.exe, 198.51.100.1, *.example.com"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="none"
+              spellcheck="false"
+            />
+            <button id="toggle-add-rule-btn" type="button" class="btn btn-primary btn-xs" aria-expanded="false">
+              + Add Rule
+            </button>
+          </search>
+
+          <form id="policy-add-form" class="policy-add-form hidden" novalidate>
+            <div class="policy-form-grid">
+              <div class="policy-field">
+                <label for="rule-scope-input">Scope</label>
+                <select id="rule-scope-input">
+                  <option value="NetworkBlock">NetworkBlock (WFP Deny)</option>
+                  <option value="NetworkAllow">NetworkAllow (WFP Permit)</option>
+                  <option value="FileCanaryAllow">FileCanaryAllow</option>
+                  <option value="ProcessAllow">ProcessAllow</option>
+                </select>
+              </div>
+              <div class="policy-field">
+                <label for="rule-exe-input">Executable Path *</label>
+                <input
+                  id="rule-exe-input"
+                  type="text"
+                  required
+                  placeholder="C:\Tools\app.exe"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+              <div class="policy-field">
+                <label for="rule-target-input">Target IP / Domain / Path</label>
+                <input
+                  id="rule-target-input"
+                  type="text"
+                  placeholder="e.g. 93.184.216.34 or *.example.com"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+              <div class="policy-field">
+                <label for="rule-sha256-input">SHA-256 (L-04 for unsigned Allow)</label>
+                <input
+                  id="rule-sha256-input"
+                  type="text"
+                  placeholder="64-char hex digest"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+              <div class="policy-field">
+                <label for="rule-signer-input">Signer Subject</label>
+                <input
+                  id="rule-signer-input"
+                  type="text"
+                  placeholder="CN=Vendor Corp"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+              <div class="policy-field">
+                <label for="rule-thumbprint-input">Root Thumbprint</label>
+                <input
+                  id="rule-thumbprint-input"
+                  type="text"
+                  placeholder="Root CA thumbprint"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+            </div>
+            <div class="policy-form-actions">
+              <span class="tier-constraint">NetworkBlock overrides NetworkAllow (WFP dynamic session)</span>
+              <div class="panel-actions">
+                <button id="cancel-add-rule-btn" type="button" class="btn btn-ghost btn-xs">Cancel</button>
+                <button id="submit-add-rule-btn" type="submit" class="btn btn-primary btn-xs">Save Rule</button>
+              </div>
+            </div>
+          </form>
+
+          <div
+            id="policy-feedback"
+            class="triage-feedback policy-feedback hidden"
+            role="status"
+            aria-live="polite"
+          ></div>
+
+          <div class="table-wrap">
+            <table class="telemetry-table policy-table">
+              <thead>
+                <tr>
+                  <th scope="col">Scope</th>
+                  <th scope="col">Executable</th>
+                  <th scope="col">Target Scope</th>
+                  <th scope="col">Identity</th>
+                  <th scope="col">Created</th>
+                  <th scope="col">Action</th>
+                </tr>
+              </thead>
+              <tbody id="policy-rules-body">
+                <tr>
+                  <td colspan="6" class="empty-row">No policy rules loaded.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="policy-side-column" aria-label="Canary and Browser Shield Status">
+          <section class="panel policy-side-panel" aria-label="Canary and Honeypot Status">
+            <div class="panel-header">
+              <div class="panel-title-group">
+                <h2>カナリア・おとり配置状態</h2>
+                <span id="honeypot-summary" class="panel-meta">0/3 deployed</span>
+              </div>
+            </div>
+            <div class="policy-card-scroll">
+              <div id="honeypot-status-list" class="status-list"></div>
+              <h3 class="policy-subhead">Tier 1 Protected Templates</h3>
+              <div id="protected-paths-list" class="status-list"></div>
+            </div>
+          </section>
+
+          <section class="panel policy-side-panel" aria-label="Browser Shield and Domain Risk Check">
+            <div class="panel-header">
+              <div class="panel-title-group">
+                <h2>ブラウザシールド・ドメイン診断</h2>
+              </div>
+            </div>
+            <div class="policy-card-scroll">
+              <dl id="browser-shield-dl" class="kv-list"></dl>
+              <h3 class="policy-subhead">NRD / Homograph Check</h3>
+              <form id="domain-check-form" class="domain-check-form">
+                <label for="domain-check-input" class="visually-hidden">Domain to check</label>
+                <input
+                  id="domain-check-input"
+                  type="text"
+                  placeholder="e.g. login-paypa1.example"
+                  autocomplete="off"
+                  autocorrect="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                />
+                <button id="domain-check-btn" type="submit" class="btn btn-secondary btn-xs">Check</button>
+              </form>
+              <div id="domain-check-result" class="domain-check-result hidden" aria-live="polite"></div>
+            </div>
+          </section>
+        </aside>
       </section>
     </main>
 

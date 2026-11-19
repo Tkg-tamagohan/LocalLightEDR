@@ -11,7 +11,7 @@ use ledr_proto::{
     AlertStatus, DownloadOriginRecord, IpcRequest, IpcResponse, AUTHORIZED_BRIDGE_EXE_PATH,
     AUTHORIZED_UI_EXE_PATH, IPC_MAX_FRAME_BYTES,
 };
-use ledr_rules::{assess_domain_risk, signer_subject_matches, BinaryIdentity};
+use ledr_rules::{signer_subject_matches, BinaryIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{watch, Semaphore};
@@ -26,7 +26,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::engine::DaemonEngine;
+use crate::engine::{DaemonEngine, PolicyRuleError};
 
 const IPC_READ_CHUNK_BYTES: usize = 8_192;
 const SDDL_REVISION_1: u32 = 1;
@@ -807,7 +807,7 @@ fn dispatch_request(
         },
         IpcRequest::GetPipelineMetrics => IpcResponse::Metrics(engine.metrics()),
         IpcRequest::CheckDomainRisk { domain } => {
-            let assessment = assess_domain_risk(&domain, None);
+            let assessment = engine.assess_domain(&domain);
             IpcResponse::DomainRisk {
                 domain: assessment.domain,
                 is_nrd: assessment.is_nrd,
@@ -847,17 +847,21 @@ fn dispatch_request(
                 }
             }
         }
-        IpcRequest::UpsertRule { rule } => match store.upsert_rule(&rule) {
-            Ok(()) => IpcResponse::Ack {
+        IpcRequest::UpsertRule { rule } => match engine.upsert_policy_rule(&rule) {
+            Ok(_report) => IpcResponse::Ack {
                 message: format!("upserted rule {}", rule.rule_id),
             },
-            Err(err) => store_error_response(err),
+            Err(PolicyRuleError::Invalid(msg)) => IpcResponse::Error {
+                code: "INVALID_RULE".to_string(),
+                message: msg,
+            },
+            Err(PolicyRuleError::Store(err)) => store_error_response(err),
         },
-        IpcRequest::DeleteRule { rule_id } => match store.delete_rule(&rule_id) {
-            Ok(true) => IpcResponse::Ack {
+        IpcRequest::DeleteRule { rule_id } => match engine.delete_policy_rule(&rule_id) {
+            Ok((true, _report)) => IpcResponse::Ack {
                 message: format!("deleted rule {rule_id}"),
             },
-            Ok(false) => IpcResponse::Error {
+            Ok((false, _)) => IpcResponse::Error {
                 code: "NOT_FOUND".to_string(),
                 message: format!("rule {rule_id} not found"),
             },

@@ -5,6 +5,7 @@
 
 pub mod channel;
 pub mod engine;
+pub mod firewall;
 pub mod ipc;
 pub mod notify;
 pub mod process_table;
@@ -12,7 +13,12 @@ pub mod process_table;
 pub use channel::{
     ChannelClosedError, HighPrioritySendError, TwoLaneChannel, TwoLaneReceiver, TwoLaneSender,
 };
-pub use engine::{BinaryInspector, DaemonConfig, DaemonEngine, WindowsBinaryInspector};
+pub use engine::{
+    BinaryInspector, DaemonConfig, DaemonEngine, PolicyRuleError, WindowsBinaryInspector,
+};
+pub use firewall::{
+    InstalledWfpFilter, WfpFilterOrigin, WfpReconcileReport, WfpRuleManager,
+};
 pub use ipc::{
     build_service_pipe_security_descriptor, inspect_pipe_client_exe, is_authorized_bridge_caller,
     is_authorized_ui_caller, start_ipc_server, verify_authorized_caller_binary,

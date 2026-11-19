@@ -1823,4 +1823,69 @@ mod tests {
         assert!(decide_registry_event(&delete_key, &cache, || panic!("unreachable")).is_some());
         assert!(lookup_registry_key(&cache, 0x3000).is_none());
     }
+
+    #[test]
+    fn sens_p2_08_registry_missing_status_continues_processing() {
+        let cache = Mutex::new(HashMap::new());
+        let facts_no_status = |event_id: u16, key_object: u64, key_name: RegistryKeyName| {
+            RegistryEventFacts {
+                pid: 4242,
+                event_id,
+                key_object: Some(key_object),
+                status: None,
+                key_name,
+                disposition: None,
+                access_type: None,
+                timestamp_ms: 1_700_000_000_000,
+            }
+        };
+
+        // OpenKey with status: None still caches the monitored autorun KeyObject.
+        let open = facts_no_status(2, 0x5000, autorun_run_key());
+        assert!(decide_registry_event(&open, &cache, || panic!("unreachable")).is_none());
+        assert!(
+            lookup_registry_key(&cache, 0x5000).is_some(),
+            "status: None OpenKey must populate KeyObject cache"
+        );
+
+        // SetValueKey with status: None and empty KeyName still resolves from cache and alerts.
+        let set_val = facts_no_status(5, 0x5000, RegistryKeyName::Missing);
+        let ev = decide_registry_event(&set_val, &cache, || Some("AutoStart".to_string()))
+            .expect("status: None SetValueKey on cached autorun key must alert");
+        match ev {
+            SensorEvent::CanaryFileAccess {
+                category,
+                target_path,
+                is_write_or_delete,
+                ..
+            } => {
+                assert_eq!(category, CanaryCategory::AutorunRegistry);
+                assert!(target_path.ends_with(r"\AutoStart"), "{target_path}");
+                assert!(is_write_or_delete);
+            }
+            other => panic!("expected CanaryFileAccess, got {other:?}"),
+        }
+
+        // DeleteKey with status: None alerts and evicts the cached KeyObject.
+        let del_key = facts_no_status(3, 0x5000, RegistryKeyName::Missing);
+        assert!(
+            decide_registry_event(&del_key, &cache, || panic!("unreachable")).is_some(),
+            "status: None DeleteKey must alert"
+        );
+        assert!(
+            lookup_registry_key(&cache, 0x5000).is_none(),
+            "status: None DeleteKey must evict KeyObject"
+        );
+
+        // CloseKey with status: None invalidates a cached KeyObject cleanly.
+        let open2 = facts_no_status(2, 0x6000, autorun_run_key());
+        assert!(decide_registry_event(&open2, &cache, || panic!("unreachable")).is_none());
+        assert!(lookup_registry_key(&cache, 0x6000).is_some());
+        let close = facts_no_status(13, 0x6000, RegistryKeyName::Missing);
+        assert!(decide_registry_event(&close, &cache, || panic!("unreachable")).is_none());
+        assert!(
+            lookup_registry_key(&cache, 0x6000).is_none(),
+            "status: None CloseKey must evict KeyObject"
+        );
+    }
 }

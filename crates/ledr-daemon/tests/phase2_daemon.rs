@@ -94,6 +94,7 @@ struct MockDefenseController {
     suspends: Mutex<Vec<SuspendCall>>,
     resumes: Mutex<Vec<ProcessIdentity>>,
     terminates: Mutex<Vec<TerminateCall>>,
+    terminate_attempts: Mutex<Vec<TerminateCall>>,
     fail_suspend: Mutex<bool>,
     terminate_error: Mutex<Option<String>>,
     failing_suspend_pids: Mutex<Vec<u32>>,
@@ -112,6 +113,13 @@ impl MockDefenseController {
 
     fn terminates(&self) -> Vec<TerminateCall> {
         self.terminates.lock().expect("lock terminates").clone()
+    }
+
+    fn terminate_attempts(&self) -> Vec<TerminateCall> {
+        self.terminate_attempts
+            .lock()
+            .expect("lock terminate_attempts")
+            .clone()
     }
 
     fn set_terminate_error(&self, err: Option<String>) {
@@ -195,6 +203,13 @@ impl ActiveDefenseController for MockDefenseController {
         target: &ProcessIdentity,
         include_children: bool,
     ) -> Result<(), String> {
+        self.terminate_attempts
+            .lock()
+            .expect("lock terminate_attempts")
+            .push(TerminateCall {
+                target: *target,
+                include_children,
+            });
         if let Some(err) = self
             .terminate_error
             .lock()
@@ -3248,6 +3263,120 @@ async fn daemon_p2_29_bug_0001_live_suspended_child_terminate_failure_keeps_unre
             .expect("list block rules")
             .is_empty(),
         "no block rule must persist while a suspended child cannot be terminated"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P2-30` (Phase 2 invariant regression): when a frozen parent fails `terminate_process`
+/// for a non-protected reason while still running and `suspended_children` is non-empty, the
+/// daemon must still attempt every recorded suspended child and return the parent's terminate
+/// error with precedence (regardless of individual child outcomes), leaving the alert unresolved
+/// and persisting no block rule.
+#[tokio::test]
+async fn daemon_p2_30_frozen_parent_terminate_failure_attempts_all_children_and_returns_parent_err() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+    );
+
+    let now_ms = current_unix_ms();
+    // Use the current test process PID as a confirmed-live frozen parent so
+    // `is_process_gone_or_replaced` returns false and enters the parent-error branch.
+    let live_parent = ProcessIdentity::new(std::process::id(), unix_ms_to_filetime(now_ms - 1_000));
+    let failing_child = ProcessIdentity::new(0x7FFF_FFD1, unix_ms_to_filetime(now_ms - 1_000));
+    let succeeding_child = ProcessIdentity::new(0x7FFF_FFD2, unix_ms_to_filetime(now_ms - 1_000));
+
+    let alert = AlertRecord {
+        alert_id: "alert-frozen-parent-terminate-fail".to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::Critical,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+        title: "frozen parent terminate failure".to_string(),
+        process_instance_id: Some(live_parent.instance_id()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": r"C:\Temp\live_parent.exe",
+            "suspended_children": [failing_child.instance_id(), succeeding_child.instance_id()],
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    store.record_alert(&alert).expect("record alert");
+
+    defense.add_failing_terminate_pid(live_parent.pid);
+    defense.add_failing_terminate_pid(failing_child.pid);
+
+    let err = engine
+        .resolve_alert_with_outcome(
+            &alert.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+        )
+        .expect_err("frozen parent terminate failure must return parent error");
+
+    assert!(
+        err.contains(&format!("PID {})", live_parent.pid)),
+        "returned error must prioritize the parent PID over child errors: {err}"
+    );
+    assert!(
+        !err.contains(&format!("PID {})", failing_child.pid)),
+        "returned error must not be replaced by a child terminate error: {err}"
+    );
+    assert_eq!(
+        defense.terminate_attempts(),
+        vec![
+            TerminateCall {
+                target: live_parent,
+                include_children: true,
+            },
+            TerminateCall {
+                target: failing_child,
+                include_children: true,
+            },
+            TerminateCall {
+                target: succeeding_child,
+                include_children: true,
+            },
+        ],
+        "parent and every recorded suspended child must be attempted in order"
+    );
+    assert_eq!(
+        defense.terminates(),
+        vec![TerminateCall {
+            target: succeeding_child,
+            include_children: true,
+        }],
+        "succeeding child must complete termination even when parent and earlier child failed"
+    );
+    assert!(
+        store
+            .get_alert(&alert.alert_id)
+            .expect("get alert")
+            .expect("alert exists")
+            .status
+            .is_unresolved(),
+        "alert must remain unresolved after parent terminate failure"
+    );
+    assert!(
+        store
+            .list_rules(Some(RuleScope::NetworkBlock))
+            .expect("list block rules")
+            .is_empty(),
+        "no block rule must be persisted after parent terminate failure"
     );
 
     engine.shutdown_and_flush().await.expect("shutdown");

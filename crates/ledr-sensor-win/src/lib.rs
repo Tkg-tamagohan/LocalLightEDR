@@ -14,6 +14,13 @@ pub use etw::file_canary::{
     CanaryMatcher, is_autorun_registry_key, is_autorun_registry_key_u16,
     prefilter_and_classify_canary, prefilter_and_classify_canary_u16,
 };
+pub use wfp::{
+    LEDR_WFP_PROVIDER_GUID, LEDR_WFP_SUBLAYER_GUID, WFP_WEIGHT_BLOCK_APP,
+    WFP_WEIGHT_BLOCK_SPECIFIC, WFP_WEIGHT_LOOPBACK_PERMIT, WFP_WEIGHT_PERMIT_APP,
+    WFP_WEIGHT_PERMIT_SPECIFIC, WfpBackend, WfpDynamicEngine, WfpFilterAction, WfpFilterSpec,
+    WfpLayer, WfpLoopbackCondition, WfpLoopbackFilterSpec, WfpRemoteAddress,
+    build_loopback_permit_filter_specs, build_wfp_filter_specs, validate_wfp_rule_request,
+};
 
 use std::net::IpAddr;
 use std::path::Path;

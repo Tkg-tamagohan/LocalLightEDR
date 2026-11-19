@@ -339,11 +339,26 @@ async fn burst_02_lotl_cmd_powershell_end_to_end() {
     let alerts = store
         .list_alerts(Some(AlertStatus::Pending), 20)
         .expect("list alerts");
-    assert_eq!(alerts.len(), 1);
-    assert_eq!(alerts[0].rule_id, "LEDR-LOTL-001");
-    assert_eq!(alerts[0].severity, AlertSeverity::High);
+    assert_eq!(alerts.len(), 2);
+    let lotl = alerts
+        .iter()
+        .find(|a| a.rule_id == "LEDR-LOTL-001")
+        .expect("LEDR-LOTL-001 alert present");
+    assert_eq!(lotl.source_layer, "LAYER_2_RULES");
+    assert_eq!(lotl.severity, AlertSeverity::High);
     assert_eq!(
-        alerts[0].process_instance_id.as_deref(),
+        lotl.process_instance_id.as_deref(),
+        Some(ps_ident.instance_id().as_str())
+    );
+    let net_alert = alerts
+        .iter()
+        .find(|a| a.rule_id == "LEDR-NET-SCRIPT-INTERPRETER")
+        .expect("Phase 3 script interpreter outbound alert present");
+    assert_eq!(net_alert.source_layer, "LAYER_3_NETWORK");
+    assert_eq!(net_alert.severity, AlertSeverity::High);
+    assert!(net_alert.process_suspended);
+    assert_eq!(
+        net_alert.process_instance_id.as_deref(),
         Some(ps_ident.instance_id().as_str())
     );
 

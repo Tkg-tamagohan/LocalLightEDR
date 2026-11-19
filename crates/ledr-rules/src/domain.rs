@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use crate::label_edit_distance;
+use crate::nrd::matches_domain_or_parent_in_set;
 
 const PROTECTED_BRANDS: &[&str] = &[
     "google",
@@ -33,7 +34,7 @@ pub fn assess_domain_risk(
     nrd_domains: Option<&HashSet<String>>,
 ) -> DomainRiskAssessment {
     let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    let is_nrd = nrd_domains.is_some_and(|set| set.contains(&normalized));
+    let is_nrd = nrd_domains.is_some_and(|set| matches_domain_or_parent_in_set(&normalized, set));
 
     let has_punycode = normalized
         .split('.')

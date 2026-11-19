@@ -316,6 +316,31 @@ impl ActiveProcessTable {
             .collect()
     }
 
+    /// Returns deduplicated executable paths for all currently unexited processes in the table.
+    pub fn active_exe_paths(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for entry in self.entries.values() {
+            if entry.exited_at_ms.is_none() && !entry.exe_path.trim().is_empty() {
+                let key = entry.exe_path.to_ascii_lowercase();
+                if seen.insert(key) {
+                    out.push(entry.exe_path.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Zero-allocation check returning `true` if any currently unexited process matches
+    /// `target_exe_key` (as normalized by `WfpRuleManager::exe_key`).
+    pub fn has_active_exe_key(&self, target_exe_key: &str) -> bool {
+        self.entries.values().any(|entry| {
+            entry.exited_at_ms.is_none()
+                && !entry.exe_path.trim().is_empty()
+                && normalized_exe_key_eq(&entry.exe_path, target_exe_key)
+        })
+    }
+
     /// O(1) lookup by composite `instance_id` (`"{pid}:{create_time_100ns}"`).
     pub fn get_by_instance_id(&self, instance_id: &str) -> Option<&ActiveProcessEntry> {
         self.entries.get(instance_id)
@@ -455,6 +480,36 @@ impl ActiveProcessTable {
             }
         }
     }
+}
+
+fn normalized_exe_key_eq(raw_exe: &str, canonical_lower_key: &str) -> bool {
+    let trimmed = raw_exe.trim();
+    let (prefix_slash_prefix, rest) = if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\") || p.eq_ignore_ascii_case("//?/UNC/"))
+    {
+        (r"\\", &trimmed[8..])
+    } else if trimmed
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\") || p.eq_ignore_ascii_case("//?/"))
+    {
+        ("", &trimmed[4..])
+    } else {
+        ("", trimmed)
+    };
+
+    let mut key_bytes = canonical_lower_key.bytes();
+    for b in prefix_slash_prefix.bytes().chain(rest.bytes()) {
+        let norm = if b == b'/' {
+            b'\\'
+        } else {
+            b.to_ascii_lowercase()
+        };
+        if key_bytes.next() != Some(norm) {
+            return false;
+        }
+    }
+    key_bytes.next().is_none()
 }
 
 #[cfg(test)]

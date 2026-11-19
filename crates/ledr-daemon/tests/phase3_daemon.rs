@@ -6789,3 +6789,208 @@ async fn daemon_p3_41_unapplied_app_block_surfaces_failure_for_subsumed_ip_block
 
     engine.shutdown_and_flush().await.expect("shutdown");
 }
+
+/// `DAEMON-P3-42` (`BUG_..._0003` edge cases):
+/// 1. Two blocked domains sharing one IP keep it blocked while either still resolves there, and
+///    release the stale `DomainPolicy` Block filter once both domains have migrated away.
+/// 2. IPv4-only DNS rotation preserves an existing IPv6 `DomainPolicy` Block filter even after the
+///    original querying process exited.
+/// 3. An out-of-order older-timestamp `DnsQuery` does not re-materialize a retired IP Block.
+#[tokio::test]
+async fn daemon_p3_42_shared_ip_dual_stack_and_out_of_order_dns_block_invalidation() {
+    use std::net::Ipv6Addr;
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let exe = r"C:\Tools\dns_edge.exe";
+    let sha = "e".repeat(64);
+    inspector.register(exe, Some(&sha), None);
+    let now_ms = current_unix_ms();
+
+    for (rid, dom) in [("R-BLK-1", "one.example"), ("R-BLK-2", "two.example")] {
+        store
+            .upsert_rule(&AllowlistRuleRecord {
+                rule_id: rid.to_string(),
+                scope: RuleScope::NetworkBlock,
+                exe_path_pattern: exe.to_string(),
+                sha256: Some(sha.clone()),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some(dom.to_string()),
+                created_at_ms: now_ms,
+                created_by: "seed".to_string(),
+            })
+            .expect("seed domain block");
+    }
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            preemptive_startup_executables: vec![exe.to_string()],
+            ..DaemonConfig::default()
+        },
+        defense,
+        notifier,
+        inspector,
+    );
+
+    let p1 = ProcessIdentity::new(9301, unix_ms_to_filetime(now_ms - 500));
+    let p2 = ProcessIdentity::new(9302, unix_ms_to_filetime(now_ms - 400));
+    for proc_id in [p1, p2] {
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: proc_id,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("start proc");
+    }
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 2).await);
+
+    let shared_v4 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 120));
+    let v4_one_new = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 121));
+    let v4_two_new = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 122));
+    let v6_one = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x55));
+
+    // Both `one.example` and `two.example` resolve to `shared_v4`, and `one.example` also has `v6_one`.
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "one.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_v4],
+            timestamp_ms: now_ms + 10,
+        })
+        .await
+        .expect("one v4");
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "one.example".to_string(),
+            query_type: 28,
+            resolved_ips: vec![v6_one],
+            timestamp_ms: now_ms + 15,
+        })
+        .await
+        .expect("one v6");
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p2.pid,
+            query_name: "two.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_v4],
+            timestamp_ms: now_ms + 20,
+        })
+        .await
+        .expect("two v4");
+    assert!(
+        wait_until(1_000, || {
+            engine.has_active_wfp_filter(exe, Some(shared_v4), false)
+                && engine.has_active_wfp_filter(exe, Some(v6_one), false)
+        })
+        .await
+    );
+
+    // `p1` exits (evicting `p1`'s `v6_one` entry from ProcessDnsHistory), then `p2` moves
+    // `one.example` IPv4 to `v4_one_new`: `shared_v4` stays blocked for `two.example` and
+    // `v6_one` stays blocked for IPv6!
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStop {
+            pid: p1.pid,
+            exit_time_100ns: unix_ms_to_filetime(now_ms + 25),
+            exit_code: 0,
+        })
+        .await
+        .expect("stop p1");
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p2.pid,
+            query_name: "one.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![v4_one_new],
+            timestamp_ms: now_ms + 30,
+        })
+        .await
+        .expect("one v4 move");
+    assert!(
+        wait_until(1_000, || engine.has_active_wfp_filter(exe, Some(v4_one_new), false)).await
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(shared_v4), false),
+        "shared_v4 must stay blocked while two.example still points there"
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(v6_one), false),
+        "IPv4-only move of one.example must preserve IPv6 DomainPolicy Block"
+    );
+
+    // Now `two.example` also moves off `shared_v4` -> `shared_v4` Block (originally tagged with
+    // `domain_hint: "one.example"`) MUST be invalidated!
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p2.pid,
+            query_name: "two.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![v4_two_new],
+            timestamp_ms: now_ms + 40,
+        })
+        .await
+        .expect("two v4 move");
+    assert!(
+        wait_until(1_000, || {
+            engine.has_active_wfp_filter(exe, Some(v4_two_new), false)
+                && !engine.has_active_wfp_filter(exe, Some(shared_v4), false)
+        })
+        .await,
+        "shared_v4 block must be removed once both domains migrated away"
+    );
+
+    // Delayed out-of-order query for `two.example` -> `shared_v4` with an older timestamp (`now_ms + 5`)
+    // must NOT re-install the retired Block filter.
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: p2.pid,
+            query_name: "two.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![shared_v4],
+            timestamp_ms: now_ms + 5,
+        })
+        .await
+        .expect("stale out-of-order dns");
+    let p3 = ProcessIdentity::new(9303, unix_ms_to_filetime(now_ms - 300));
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: p3,
+            parent_pid: 4,
+            exe_path: exe.to_string(),
+            command_line: exe.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("barrier proc");
+    assert!(wait_until(1_000, || engine.active_process_table_len() == 2).await);
+    assert!(
+        !engine.has_active_wfp_filter(exe, Some(shared_v4), false),
+        "out-of-order older DnsQuery must not re-materialize retired shared_v4 Block"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}

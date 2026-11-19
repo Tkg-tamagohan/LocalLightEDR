@@ -806,14 +806,16 @@ impl WfpRuleManager {
     }
 
     /// Removes stale [`WfpFilterOrigin::DomainPolicy`] IP Block filters for `exe_path` whose
-    /// recorded `domain_hint` matches `query_name` when a newer DNS response resolves `query_name`
-    /// to different IPs (`new_ips`) and the old IP is no longer independently blocked (`BUG_..._0003`).
+    /// recorded `domain_hint` matches `query_name` (in the same IP address family) or is listed in
+    /// `superseded_ips` when a newer DNS response resolves to different IPs (`new_ips`) and the old
+    /// IP is no longer independently blocked (`BUG_..._0003`).
     pub fn invalidate_stale_domain_blocks_for_query(
         &mut self,
         exe_path: &str,
         query_name: &str,
         new_ips: &[IpAddr],
         still_blocked_ips: &HashSet<IpAddr>,
+        superseded_ips: &HashSet<IpAddr>,
         defense: &dyn ActiveDefenseController,
     ) -> usize {
         let exe_k = Self::exe_key(exe_path);
@@ -822,6 +824,8 @@ impl WfpRuleManager {
             return 0;
         }
         let new_canon: HashSet<IpAddr> = new_ips.iter().map(|ip| canonical_ip(*ip)).collect();
+        let has_v4 = new_canon.iter().any(IpAddr::is_ipv4);
+        let has_v6 = new_canon.iter().any(IpAddr::is_ipv6);
         let stale_keys: Vec<WfpTargetKey> = self
             .installed
             .iter()
@@ -840,9 +844,15 @@ impl WfpRuleManager {
                 if hint_norm.is_empty() {
                     return None;
                 }
-                let matches_query = hint_norm == norm_query
-                    || matches_network_target(&hint_norm, ip, Some(&norm_query));
-                matches_query.then(|| k.clone())
+                let same_family = (has_v4 && ip.is_ipv4()) || (has_v6 && ip.is_ipv6());
+                let is_domain_hint =
+                    !hint_norm.contains('/') && parse_literal_target_ip(&hint_norm).is_none();
+                let matches_query = same_family
+                    && is_domain_hint
+                    && (hint_norm == norm_query
+                        || (hint_norm.contains('*')
+                            && matches_network_target(&hint_norm, ip, Some(&norm_query))));
+                (matches_query || superseded_ips.contains(&ip)).then(|| k.clone())
             })
             .collect();
         let mut removed = 0usize;
@@ -869,20 +879,33 @@ impl WfpRuleManager {
         removed
     }
 
-    pub fn domain_policy_block_ips(&self, exe_path: &str) -> Vec<IpAddr> {
+    pub fn domain_policy_blocks(&self, exe_path: &str) -> Vec<(IpAddr, String)> {
         let exe_k = Self::exe_key(exe_path);
-        let mut out: Vec<IpAddr> = self
+        let mut out: Vec<(IpAddr, String)> = self
             .installed
             .iter()
             .filter_map(|(k, entry)| {
-                (k.0 == exe_k
-                    && !entry.allow
-                    && matches!(entry.origin, WfpFilterOrigin::DomainPolicy { .. }))
-                .then_some(k.1)
-                .flatten()
+                if k.0 != exe_k || entry.allow {
+                    return None;
+                }
+                let ip = k.1?;
+                let WfpFilterOrigin::DomainPolicy { domain_hint } = &entry.origin else {
+                    return None;
+                };
+                Some((ip, domain_hint.clone()))
             })
             .collect();
-        out.sort_by_key(|ip| ip.to_string());
+        out.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()).then(a.1.cmp(&b.1)));
+        out.dedup();
+        out
+    }
+
+    pub fn domain_policy_block_ips(&self, exe_path: &str) -> Vec<IpAddr> {
+        let mut out: Vec<IpAddr> = self
+            .domain_policy_blocks(exe_path)
+            .into_iter()
+            .map(|(ip, _)| ip)
+            .collect();
         out.dedup();
         out
     }

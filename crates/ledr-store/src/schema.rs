@@ -47,8 +47,9 @@ CREATE TABLE IF NOT EXISTS dns_queries (
     resolved_ips        TEXT,
     is_nrd              INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_dns_ts_proc ON dns_queries(timestamp_ms, process_instance_id);
-CREATE INDEX IF NOT EXISTS idx_dns_name    ON dns_queries(query_name);
+CREATE INDEX IF NOT EXISTS idx_dns_ts_proc     ON dns_queries(timestamp_ms, process_instance_id);
+CREATE INDEX IF NOT EXISTS idx_dns_name        ON dns_queries(query_name);
+CREATE INDEX IF NOT EXISTS idx_dns_name_nocase ON dns_queries(query_name COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS network_events (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +101,7 @@ CREATE TABLE IF NOT EXISTS allowlist_rules (
     created_at_ms       INTEGER NOT NULL,
     created_by          TEXT NOT NULL
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_rules_scope_created ON allowlist_rules(scope, created_at_ms DESC, rule_id ASC);
 
 CREATE TABLE IF NOT EXISTS download_origins (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,

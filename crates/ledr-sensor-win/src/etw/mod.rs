@@ -3,10 +3,11 @@
 //! snapshots (`AUTO-03`, `AUTO-06`, `AUTO-08`).
 
 pub mod file_canary;
-mod tdh;
+pub(crate) mod tdh;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
@@ -341,6 +342,35 @@ impl EtwCallbackContext {
             .unwrap_or_else(|e| e.into_inner());
         let non_empty = tracker.close_handle(file_object);
         self.has_honeypot_handles.store(non_empty, Ordering::Release);
+    }
+
+    fn evict_dns_pid(&self, pid: u32) {
+        self.dns_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_pid(pid);
+    }
+
+    fn record_dns_resolution(
+        &self,
+        pid: u32,
+        query_name: &str,
+        resolved_ips: &[IpAddr],
+        timestamp_ms: i64,
+    ) {
+        if !resolved_ips.is_empty() {
+            self.dns_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert_resolution_for_pid(pid, query_name, resolved_ips, timestamp_ms);
+        }
+    }
+
+    fn resolve_network_domain_hint(&self, pid: u32, dst_ip: &IpAddr) -> Option<String> {
+        self.dns_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookup_domain_for_pid(pid, dst_ip)
     }
 }
 
@@ -841,7 +871,7 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
     let emitted = if provider == KERNEL_PROCESS_GUID {
         match event_id {
             1 => handle_process_start(record, ctx),
-            2 => handle_process_stop(record),
+            2 => handle_process_stop(record, ctx),
             _ => None,
         }
     } else if provider == KERNEL_FILE_GUID {
@@ -875,6 +905,7 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
 fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Option<SensorEvent> {
     let info = TdhEventInfo::from_record(record)?;
     let pid = info.get_u32("ProcessID")?;
+    ctx.evict_dns_pid(pid);
     let parent_pid = info
         .get_u32("ParentProcessID")
         .unwrap_or(record.EventHeader.ProcessId);
@@ -918,11 +949,12 @@ fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Opti
     })
 }
 
-fn handle_process_stop(record: &EVENT_RECORD) -> Option<SensorEvent> {
+fn handle_process_stop(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Option<SensorEvent> {
     let info = TdhEventInfo::from_record(record)?;
     let pid = info
         .get_u32("ProcessID")
         .unwrap_or(record.EventHeader.ProcessId);
+    ctx.evict_dns_pid(pid);
     let exit_time_100ns = info
         .get_u64("ExitTime")
         .filter(|&t| t > 0)
@@ -959,13 +991,11 @@ fn handle_dns_client(
         .unwrap_or(0);
     let timestamp_ms = filetime_100ns_to_unix_ms(record.EventHeader.TimeStamp.max(0) as u64);
 
-    if !resolved_ips.is_empty() {
-        let mut cache = ctx.dns_cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert_resolution(&query_name, &resolved_ips, timestamp_ms);
-    }
+    let pid = record.EventHeader.ProcessId;
+    ctx.record_dns_resolution(pid, &query_name, &resolved_ips, timestamp_ms);
 
     Some(SensorEvent::DnsQuery {
-        pid: record.EventHeader.ProcessId,
+        pid,
         query_name,
         query_type,
         resolved_ips,
@@ -988,10 +1018,7 @@ fn handle_kernel_network(
     let protocol = if event_id == 12 || event_id == 28 { 6 } else { 17 };
     let timestamp_ms = filetime_100ns_to_unix_ms(record.EventHeader.TimeStamp.max(0) as u64);
 
-    let domain_hint = {
-        let mut cache = ctx.dns_cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.lookup_domain(&dst_ip)
-    };
+    let domain_hint = ctx.resolve_network_domain_hint(pid, &dst_ip);
 
     Some(SensorEvent::NetworkConnect {
         pid,
@@ -1822,5 +1849,124 @@ mod tests {
         let delete_key = registry_facts(3, 0x3000, RegistryKeyName::Missing, 0);
         assert!(decide_registry_event(&delete_key, &cache, || panic!("unreachable")).is_some());
         assert!(lookup_registry_key(&cache, 0x3000).is_none());
+    }
+
+    #[test]
+    fn sens_p2_08_registry_missing_status_continues_processing() {
+        let cache = Mutex::new(HashMap::new());
+        let facts_no_status = |event_id: u16, key_object: u64, key_name: RegistryKeyName| {
+            RegistryEventFacts {
+                pid: 4242,
+                event_id,
+                key_object: Some(key_object),
+                status: None,
+                key_name,
+                disposition: None,
+                access_type: None,
+                timestamp_ms: 1_700_000_000_000,
+            }
+        };
+
+        // OpenKey with status: None still caches the monitored autorun KeyObject.
+        let open = facts_no_status(2, 0x5000, autorun_run_key());
+        assert!(decide_registry_event(&open, &cache, || panic!("unreachable")).is_none());
+        assert!(
+            lookup_registry_key(&cache, 0x5000).is_some(),
+            "status: None OpenKey must populate KeyObject cache"
+        );
+
+        // SetValueKey with status: None and empty KeyName still resolves from cache and alerts.
+        let set_val = facts_no_status(5, 0x5000, RegistryKeyName::Missing);
+        let ev = decide_registry_event(&set_val, &cache, || Some("AutoStart".to_string()))
+            .expect("status: None SetValueKey on cached autorun key must alert");
+        match ev {
+            SensorEvent::CanaryFileAccess {
+                category,
+                target_path,
+                is_write_or_delete,
+                ..
+            } => {
+                assert_eq!(category, CanaryCategory::AutorunRegistry);
+                assert!(target_path.ends_with(r"\AutoStart"), "{target_path}");
+                assert!(is_write_or_delete);
+            }
+            other => panic!("expected CanaryFileAccess, got {other:?}"),
+        }
+
+        // DeleteKey with status: None alerts and evicts the cached KeyObject.
+        let del_key = facts_no_status(3, 0x5000, RegistryKeyName::Missing);
+        assert!(
+            decide_registry_event(&del_key, &cache, || panic!("unreachable")).is_some(),
+            "status: None DeleteKey must alert"
+        );
+        assert!(
+            lookup_registry_key(&cache, 0x5000).is_none(),
+            "status: None DeleteKey must evict KeyObject"
+        );
+
+        // CloseKey with status: None invalidates a cached KeyObject cleanly.
+        let open2 = facts_no_status(2, 0x6000, autorun_run_key());
+        assert!(decide_registry_event(&open2, &cache, || panic!("unreachable")).is_none());
+        assert!(lookup_registry_key(&cache, 0x6000).is_some());
+        let close = facts_no_status(13, 0x6000, RegistryKeyName::Missing);
+        assert!(decide_registry_event(&close, &cache, || panic!("unreachable")).is_none());
+        assert!(
+            lookup_registry_key(&cache, 0x6000).is_none(),
+            "status: None CloseKey must evict KeyObject"
+        );
+    }
+
+    #[test]
+    fn sens_p3_08_etw_per_pid_dns_isolation_and_pid_reuse_eviction() {
+        let sink: EventSinkFn = Arc::new(|_| true);
+        let ctx = EtwCallbackContext {
+            sink,
+            dns_cache: Mutex::new(DnsResolutionCache::default()),
+            volume_map: DosVolumeMap::with_mappings(Vec::new()),
+            canary_matcher: Arc::new(RwLock::new(CanaryMatcher::default())),
+            honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
+            has_honeypot_handles: AtomicBool::new(false),
+            registry_kcb_names: Mutex::new(HashMap::new()),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            session_name_nul: vec![0],
+        };
+
+        let cdn_ip = IpAddr::V4(Ipv4Addr::new(104, 16, 132, 229));
+        let v6_ip = IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0x6810, 0x84e5));
+
+        // Process 1001 resolves `allowed.example` to `cdn_ip` and `v6_ip`.
+        ctx.record_dns_resolution(1001, "allowed.example", &[cdn_ip, v6_ip], 1_700_000_000_000);
+        assert_eq!(
+            ctx.resolve_network_domain_hint(1001, &cdn_ip),
+            Some("allowed.example".to_string())
+        );
+
+        // Process 2002 connecting to the same shared CDN IP MUST NOT inherit 1001's domain hint.
+        assert_eq!(
+            ctx.resolve_network_domain_hint(2002, &cdn_ip),
+            None,
+            "cross-PID DNS hint leakage must not occur"
+        );
+
+        // Process 2002 resolving `blocked.example` to the same IP stays scoped to 2002 only.
+        ctx.record_dns_resolution(2002, "blocked.example", &[cdn_ip], 1_700_000_000_500);
+        assert_eq!(
+            ctx.resolve_network_domain_hint(2002, &cdn_ip),
+            Some("blocked.example".to_string())
+        );
+        assert_eq!(
+            ctx.resolve_network_domain_hint(1001, &cdn_ip),
+            Some("allowed.example".to_string())
+        );
+
+        // ProcessStop / ProcessStart evicts stale DNS history before PID reuse.
+        ctx.evict_dns_pid(1001);
+        assert_eq!(ctx.resolve_network_domain_hint(1001, &cdn_ip), None);
+        assert_eq!(ctx.resolve_network_domain_hint(1001, &v6_ip), None);
+        // PID 2002's entries remain untouched.
+        assert_eq!(
+            ctx.resolve_network_domain_hint(2002, &cdn_ip),
+            Some("blocked.example".to_string())
+        );
     }
 }

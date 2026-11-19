@@ -3,12 +3,13 @@
 mod ipc;
 mod tree;
 
-use ipc::IpcClient;
+use ipc::{DomainRiskView, IpcClient};
 use ledr_proto::{
-    AlertDecision, AlertRecord, AlertStatus, AllowlistRuleRecord, FlightRecorderSnapshot,
-    PipelineMetrics, RuleScope,
+    AUTHORIZED_BRIDGE_EXE_PATH, AlertDecision, AlertRecord, AlertStatus, AllowlistRuleRecord,
+    FlightRecorderSnapshot, PipelineMetrics, RuleScope,
 };
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 /// Environment variable disabling OS WinRT toast emission during headless/CI tests.
@@ -232,6 +233,44 @@ async fn fetch_rules(
 }
 
 #[tauri::command]
+async fn upsert_rule_action(
+    client: tauri::State<'_, IpcClient>,
+    rule: AllowlistRuleRecord,
+) -> Result<String, String> {
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.upsert_rule(rule))
+        .await
+        .map_err(|err| format!("IPC background task failed: {err}"))?
+}
+
+#[tauri::command]
+async fn delete_rule_action(
+    client: tauri::State<'_, IpcClient>,
+    rule_id: String,
+) -> Result<String, String> {
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.delete_rule(rule_id))
+        .await
+        .map_err(|err| format!("IPC background task failed: {err}"))?
+}
+
+#[tauri::command]
+async fn check_domain_risk_action(
+    client: tauri::State<'_, IpcClient>,
+    domain: String,
+) -> Result<DomainRiskView, String> {
+    let client = client.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || client.check_domain_risk(domain))
+        .await
+        .map_err(|err| format!("IPC background task failed: {err}"))?
+}
+
+#[tauri::command]
+fn fetch_local_defense_status() -> LocalDefenseStatus {
+    collect_local_defense_status()
+}
+
+#[tauri::command]
 async fn ping_daemon(client: tauri::State<'_, IpcClient>) -> Result<String, String> {
     let client = client.inner().clone();
     tauri::async_runtime::spawn_blocking(move || client.ping())
@@ -307,6 +346,34 @@ fn extract_context_paths(context_json: &str) -> (Option<String>, Option<String>)
             val.get("event")
                 .and_then(|e| e.get("CanaryFileAccess"))
                 .and_then(|c| non_empty_str_field(c, "target_path"))
+        })
+        .or_else(|| {
+            let dst_ip = non_empty_str_field(&val, "dst_ip").or_else(|| {
+                val.get("event")
+                    .and_then(|e| e.get("NetworkConnect"))
+                    .and_then(|n| non_empty_str_field(n, "dst_ip"))
+            })?;
+            let dst_port = val
+                .get("dst_port")
+                .or_else(|| {
+                    val.get("event")
+                        .and_then(|e| e.get("NetworkConnect"))
+                        .and_then(|n| n.get("dst_port"))
+                })
+                .and_then(serde_json::Value::as_u64);
+            let domain = non_empty_str_field(&val, "domain_hint").or_else(|| {
+                val.get("event")
+                    .and_then(|e| e.get("NetworkConnect"))
+                    .and_then(|n| non_empty_str_field(n, "domain_hint"))
+            });
+            let endpoint = match dst_port {
+                Some(port) => format!("{dst_ip}:{port}"),
+                None => dst_ip,
+            };
+            Some(match domain {
+                Some(d) => format!("{d} ({endpoint})"),
+                None => endpoint,
+            })
         })
         .or_else(|| {
             val.get("event")
@@ -845,6 +912,152 @@ fn dispatch_notify_oneshot(alert_id: &str, ipc_client: &IpcClient) -> Result<(),
     Ok(())
 }
 
+const HONEYPOT_FILENAME: &str = "!00_LocalEDR_Canary_DoNotEdit.docx";
+const HONEYPOT_FOLDERS: [&str; 3] = ["Documents", "Desktop", "Pictures"];
+#[cfg_attr(not(windows), allow(dead_code))]
+const CHROME_NMH_REG_SUBKEY: &str = r"Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge";
+#[cfg_attr(not(windows), allow(dead_code))]
+const EDGE_NMH_REG_SUBKEY: &str = r"Software\Microsoft\Edge\NativeMessagingHosts\com.localedr.bridge";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HoneypotStatusItem {
+    pub(crate) folder: String,
+    pub(crate) path: String,
+    pub(crate) deployed: bool,
+    pub(crate) size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProtectedPathTemplate {
+    pub(crate) category: String,
+    pub(crate) label: String,
+    pub(crate) path_template: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BrowserShieldStatus {
+    pub(crate) bridge_binary_path: String,
+    pub(crate) bridge_binary_present: bool,
+    pub(crate) native_host_registered: bool,
+    pub(crate) uri_scheme_registered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LocalDefenseStatus {
+    pub(crate) honeypots: Vec<HoneypotStatusItem>,
+    pub(crate) protected_paths: Vec<ProtectedPathTemplate>,
+    pub(crate) browser_shield: BrowserShieldStatus,
+}
+
+pub(crate) fn static_protected_path_templates() -> Vec<ProtectedPathTemplate> {
+    vec![
+        ProtectedPathTemplate {
+            category: "CookieDb".to_string(),
+            label: "Browser Cookies, Login Data & Local State".to_string(),
+            path_template: r"%LOCALAPPDATA%\{Google\Chrome,Microsoft\Edge,BraveSoftware\Brave-Browser}\User Data\*\(Cookies|Login Data|Local State), %APPDATA%\Mozilla\Firefox\Profiles\*\(cookies.sqlite|logins.json|key4.db)".to_string(),
+        },
+        ProtectedPathTemplate {
+            category: "SshKey".to_string(),
+            label: "SSH Private Keys".to_string(),
+            path_template: r"%USERPROFILE%\.ssh\*".to_string(),
+        },
+        ProtectedPathTemplate {
+            category: "CloudCreds".to_string(),
+            label: "AWS / GCP Credentials".to_string(),
+            path_template: r"%USERPROFILE%\.aws\{credentials,config}, %USERPROFILE%\.config\gcloud\*".to_string(),
+        },
+        ProtectedPathTemplate {
+            category: "EnvFile".to_string(),
+            label: "Project .env Secrets (Registered Dev Roots)".to_string(),
+            path_template: r"<DevRoots>\**\.env*".to_string(),
+        },
+        ProtectedPathTemplate {
+            category: "Honeypot".to_string(),
+            label: "Ransomware Decoy Files (Write/Delete)".to_string(),
+            path_template: format!(r"%USERPROFILE%\{{Documents,Desktop,Pictures}}\{HONEYPOT_FILENAME}"),
+        },
+        ProtectedPathTemplate {
+            category: "AutorunRegistry".to_string(),
+            label: "Windows Autorun Registry Keys".to_string(),
+            path_template: r"{HKCU,HKLM}\Software\Microsoft\Windows\CurrentVersion\{Run,RunOnce}".to_string(),
+        },
+    ]
+}
+
+/// Collects View 3 local defense status strictly without touching any real sensitive user files
+/// (`Cookies`, `.ssh`, `.aws`, `gcloud`): only `std::fs::metadata` on decoy honeypot paths and
+/// `ledr-bridge-nm.exe`, plus read-only registry readiness flags (Decision #4).
+pub(crate) fn collect_local_defense_status_with(
+    user_profile: Option<&Path>,
+    bridge_path: &Path,
+    native_host_registered: bool,
+    uri_scheme_registered: bool,
+) -> LocalDefenseStatus {
+    let honeypots = HONEYPOT_FOLDERS
+        .iter()
+        .map(|folder| {
+            let full_path = match user_profile {
+                Some(profile) => profile.join(folder).join(HONEYPOT_FILENAME),
+                None => PathBuf::from(format!(r"%USERPROFILE%\{folder}\{HONEYPOT_FILENAME}")),
+            };
+            let meta = if user_profile.is_some() {
+                std::fs::metadata(&full_path).ok().filter(|m| m.is_file())
+            } else {
+                None
+            };
+            HoneypotStatusItem {
+                folder: (*folder).to_string(),
+                path: full_path.to_string_lossy().into_owned(),
+                deployed: meta.is_some(),
+                size_bytes: meta.map(|m| m.len()),
+            }
+        })
+        .collect();
+
+    let bridge_binary_present = std::fs::metadata(bridge_path)
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+
+    LocalDefenseStatus {
+        honeypots,
+        protected_paths: static_protected_path_templates(),
+        browser_shield: BrowserShieldStatus {
+            bridge_binary_path: bridge_path.to_string_lossy().into_owned(),
+            bridge_binary_present,
+            native_host_registered,
+            uri_scheme_registered,
+        },
+    }
+}
+
+#[cfg(windows)]
+fn is_hkcu_subkey_present(subkey: &str) -> bool {
+    // `0x0001` = `KEY_QUERY_VALUE` (read-only probe).
+    matches!(win_uri_reg::reg_open_hkcu(subkey, 0x0001), Ok(Some(_)))
+}
+
+#[cfg(not(windows))]
+fn is_hkcu_subkey_present(_subkey: &str) -> bool {
+    false
+}
+
+pub(crate) fn collect_local_defense_status() -> LocalDefenseStatus {
+    let user_profile = std::env::var_os("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let uri_cmd_key = format!(r"{LEDR_URI_REG_SUBKEY}\shell\open\command");
+    let uri_scheme_registered = is_hkcu_subkey_present(&uri_cmd_key);
+    let native_host_registered =
+        is_hkcu_subkey_present(CHROME_NMH_REG_SUBKEY) || is_hkcu_subkey_present(EDGE_NMH_REG_SUBKEY);
+
+    collect_local_defense_status_with(
+        user_profile.as_deref(),
+        Path::new(AUTHORIZED_BRIDGE_EXE_PATH),
+        native_host_registered,
+        uri_scheme_registered,
+    )
+}
+
 fn run_gui(launch_mode: LaunchMode, ipc_client: IpcClient) -> Result<(), String> {
     let app = tauri::Builder::default()
         .manage(launch_mode)
@@ -855,6 +1068,10 @@ fn run_gui(launch_mode: LaunchMode, ipc_client: IpcClient) -> Result<(), String>
             fetch_alerts,
             resolve_alert_action,
             fetch_rules,
+            upsert_rule_action,
+            delete_rule_action,
+            check_domain_risk_action,
+            fetch_local_defense_status,
             ping_daemon,
             get_launch_mode,
             build_process_tree_view,
@@ -1697,5 +1914,167 @@ mod tests {
                 r#""C:\Program Files\LocalEDR\ledr-ui.exe" "%1""#
             );
         }
+    }
+
+    #[test]
+    fn ui_p3_01_ipc_upsert_delete_rule_and_domain_risk_roundtrip() {
+        let rule = AllowlistRuleRecord {
+            rule_id: "RULE-UI-P3-01".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: r"C:\Tools\bad.exe".to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("198.51.100.5".to_string()),
+            created_at_ms: 1_732_070_000_000,
+            created_by: "user_policy".to_string(),
+        };
+
+        let mut stream = MockIpcStream::new(|req| match req {
+            IpcRequest::UpsertRule { rule: r } => IpcResponse::Ack {
+                message: format!("rule {} saved", r.rule_id),
+            },
+            IpcRequest::DeleteRule { rule_id } => IpcResponse::Ack {
+                message: format!("rule {rule_id} deleted"),
+            },
+            IpcRequest::CheckDomainRisk { domain } => IpcResponse::DomainRisk {
+                domain: domain.clone(),
+                is_nrd: domain.ends_with(".fresh-c2.example"),
+                is_homograph: domain.contains("xn--"),
+                matched_brand: if domain.contains("xn--") {
+                    Some("paypal.com".to_string())
+                } else {
+                    None
+                },
+            },
+            other => IpcResponse::Error {
+                code: "UNEXPECTED".to_string(),
+                message: format!("{other:?}"),
+            },
+        });
+
+        let upsert_resp =
+            IpcClient::send_request_over_stream(&mut stream, &IpcRequest::UpsertRule { rule })
+                .expect("upsert roundtrip");
+        let upsert_msg = parse_ack_response(upsert_resp).expect("parse upsert ack");
+        assert!(upsert_msg.contains("RULE-UI-P3-01"));
+
+        let del_resp = IpcClient::send_request_over_stream(
+            &mut stream,
+            &IpcRequest::DeleteRule {
+                rule_id: "RULE-UI-P3-01".to_string(),
+            },
+        )
+        .expect("delete roundtrip");
+        let del_msg = parse_ack_response(del_resp).expect("parse delete ack");
+        assert!(del_msg.contains("RULE-UI-P3-01"));
+
+        let risk_resp = IpcClient::send_request_over_stream(
+            &mut stream,
+            &IpcRequest::CheckDomainRisk {
+                domain: "api.fresh-c2.example".to_string(),
+            },
+        )
+        .expect("domain risk roundtrip");
+        let risk = ipc::parse_domain_risk_response(risk_resp).expect("parse domain risk");
+        assert_eq!(risk.domain, "api.fresh-c2.example");
+        assert!(risk.is_nrd);
+        assert!(!risk.is_homograph);
+        assert!(risk.matched_brand.is_none());
+    }
+
+    #[test]
+    fn ui_p3_02_local_defense_status_honeypot_detection_and_static_templates() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "ledr-ui-p3-status-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_root);
+        let docs = tmp_root.join("Documents");
+        let desk = tmp_root.join("Desktop");
+        std::fs::create_dir_all(&docs).expect("create Documents");
+        std::fs::create_dir_all(&desk).expect("create Desktop");
+        std::fs::write(docs.join(HONEYPOT_FILENAME), b"decoy-docx-bytes-1")
+            .expect("write Documents honeypot");
+        std::fs::write(desk.join(HONEYPOT_FILENAME), b"decoy-docx-2")
+            .expect("write Desktop honeypot");
+        let fake_bridge = tmp_root.join("ledr-bridge-nm.exe");
+        std::fs::write(&fake_bridge, b"stub-bridge").expect("write bridge stub");
+
+        let status = collect_local_defense_status_with(
+            Some(&tmp_root),
+            &fake_bridge,
+            true,
+            false,
+        );
+        assert_eq!(status.honeypots.len(), 3);
+        let doc_item = status
+            .honeypots
+            .iter()
+            .find(|h| h.folder == "Documents")
+            .expect("Documents item");
+        assert!(doc_item.deployed);
+        assert_eq!(doc_item.size_bytes, Some(18));
+
+        let desk_item = status
+            .honeypots
+            .iter()
+            .find(|h| h.folder == "Desktop")
+            .expect("Desktop item");
+        assert!(desk_item.deployed);
+        assert_eq!(desk_item.size_bytes, Some(12));
+
+        let pic_item = status
+            .honeypots
+            .iter()
+            .find(|h| h.folder == "Pictures")
+            .expect("Pictures item");
+        assert!(!pic_item.deployed);
+        assert_eq!(pic_item.size_bytes, None);
+
+        assert_eq!(status.protected_paths.len(), 6);
+        assert!(status.protected_paths.iter().any(|p| p.category == "CookieDb"));
+        assert!(status.protected_paths.iter().any(|p| p.category == "SshKey"));
+        assert!(status.protected_paths.iter().any(|p| p.category == "CloudCreds"));
+        assert!(status.protected_paths.iter().any(|p| p.category == "EnvFile"));
+        assert!(status.protected_paths.iter().any(|p| p.category == "Honeypot"));
+        assert!(status.protected_paths.iter().any(|p| p.category == "AutorunRegistry"));
+
+        assert!(status.browser_shield.bridge_binary_present);
+        assert!(status.browser_shield.native_host_registered);
+        assert!(!status.browser_shield.uri_scheme_registered);
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn ui_p3_03_network_alert_toast_extracts_dst_and_domain() {
+        let net_alert = AlertRecord {
+            alert_id: "net-alert-p3".to_string(),
+            timestamp_ms: 1_732_070_000_000,
+            severity: AlertSeverity::High,
+            source_layer: "LAYER_3_NETWORK".to_string(),
+            rule_id: "LEDR-NET-UNKNOWN-OUTBOUND".to_string(),
+            title: "Unknown Process Outbound Connection".to_string(),
+            process_instance_id: Some("6000:133765432100000000".to_string()),
+            process_suspended: true,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "dst_ip": "198.51.100.42",
+                "dst_port": 443,
+                "domain_hint": "c2.fresh-nrd.example",
+                "exe_path": r"C:\Tools\probe.exe",
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        };
+        let summary = summarize_alert_for_toast(&net_alert.alert_id, Some(&net_alert));
+        assert_eq!(
+            summary.target_path.as_deref(),
+            Some("c2.fresh-nrd.example (198.51.100.42:443)")
+        );
+        assert_eq!(summary.exe_path.as_deref(), Some(r"C:\Tools\probe.exe"));
+        let xml = build_winrt_toast_xml(&summary);
+        assert!(xml.contains("c2.fresh-nrd.example (198.51.100.42:443)"));
     }
 }

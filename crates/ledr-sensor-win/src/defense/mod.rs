@@ -7,7 +7,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ledr_proto::{
     ActiveDefenseController, HONEYPOT_DEFAULT_FILENAME, ProcessIdentity, is_never_suspend_process,
@@ -23,6 +23,7 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW, TerminateProcess,
 };
 
+use crate::wfp::{WfpDropSinkFn, WfpDynamicEngine, validate_wfp_rule_request};
 use crate::{OwnedHandle, SensorError};
 
 const HONEYPOT_DECOY_CONTENT: &[u8] = b"LocalEDR Canary Decoy File - Do Not Modify or Delete.\r\n";
@@ -304,17 +305,111 @@ fn validate_process_metadata(
 }
 
 /// Windows active-defense actuator implementing [`ActiveDefenseController`] via `ntdll`
-/// `NtSuspendProcess`/`NtResumeProcess` and Win32 `TerminateProcess` (`AUTO-02`, `AUTO-03`, `L-07`).
-#[derive(Debug, Default)]
+/// `NtSuspendProcess`/`NtResumeProcess`, Win32 `TerminateProcess`, and the dynamic WFP
+/// firewall engine (`AUTO-02`, `AUTO-03`, `AUTO-04`, `L-03`, `L-07`).
+#[derive(Default)]
 pub struct WindowsDefenseController {
     suspended_processes: Mutex<HashSet<ProcessIdentity>>,
     suspended_children: Mutex<HashMap<ProcessIdentity, Vec<ProcessIdentity>>>,
+    wfp_engine: Mutex<Option<WfpDynamicEngine>>,
+    wfp_drop_sink: Mutex<Option<WfpDropSinkFn>>,
+}
+
+impl std::fmt::Debug for WindowsDefenseController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_wfp = self.wfp_engine.lock().is_ok_and(|g| g.is_some());
+        let has_drop_sink = self.wfp_drop_sink.lock().is_ok_and(|g| g.is_some());
+        f.debug_struct("WindowsDefenseController")
+            .field("has_wfp_engine", &has_wfp)
+            .field("has_wfp_drop_sink", &has_drop_sink)
+            .finish()
+    }
+}
+
+fn ensure_wfp_engine_locked<'a>(
+    slot: &'a mut Option<WfpDynamicEngine>,
+    pending_sink: &Mutex<Option<WfpDropSinkFn>>,
+) -> Result<&'a WfpDynamicEngine, String> {
+    if slot.is_none() {
+        let engine = WfpDynamicEngine::open_dynamic()?;
+        let sink_opt = pending_sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(sink) = sink_opt {
+            if let Err(err) = engine.set_drop_sink(sink) {
+                tracing::warn!(
+                    error = %err,
+                    "failed attaching pending WFP drop sink during lazy session initialization"
+                );
+            }
+        }
+        *slot = Some(engine);
+    }
+    slot.as_ref()
+        .ok_or_else(|| "WFP dynamic session failed to initialize".to_string())
 }
 
 impl WindowsDefenseController {
-    /// Creates a new [`WindowsDefenseController`].
+    /// Creates a new [`WindowsDefenseController`] with lazy dynamic WFP session initialization.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a [`WindowsDefenseController`] pre-configured with an explicit [`WfpDynamicEngine`].
+    pub fn with_wfp_engine(wfp_engine: WfpDynamicEngine) -> Self {
+        Self {
+            suspended_processes: Mutex::new(HashSet::new()),
+            suspended_children: Mutex::new(HashMap::new()),
+            wfp_engine: Mutex::new(Some(wfp_engine)),
+            wfp_drop_sink: Mutex::new(None),
+        }
+    }
+
+    /// Eagerly initializes the dynamic WFP session (`FWPM_SESSION_FLAG_DYNAMIC`) and custom
+    /// SubLayer (`AUTO-04`). Safe to call repeatedly (no-op once initialized).
+    pub fn init_wfp_session(&self) -> Result<(), String> {
+        let mut slot = self
+            .wfp_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = ensure_wfp_engine_locked(&mut slot, &self.wfp_drop_sink)?;
+        Ok(())
+    }
+
+    /// Registers a callback sink receiving WFP net-event drops for LocalEDR block filters
+    /// (`BUG_0001`). Works both before and after lazy WFP session creation.
+    pub fn set_wfp_drop_sink(&self, sink: WfpDropSinkFn) -> Result<(), String> {
+        let slot = self
+            .wfp_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(engine) = slot.as_ref() {
+            engine.set_drop_sink(Arc::clone(&sink))?;
+        }
+        let mut sink_slot = self
+            .wfp_drop_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *sink_slot = Some(sink);
+        Ok(())
+    }
+
+    /// Unregisters any active WFP net-event drop sink and clears any pending lazy registration.
+    pub fn clear_wfp_drop_sink(&self) {
+        let slot = self
+            .wfp_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        {
+            let mut sink_slot = self
+                .wfp_drop_sink
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *sink_slot = None;
+        }
+        if let Some(engine) = slot.as_ref() {
+            if let Err(err) = engine.clear_drop_sink() {
+                tracing::warn!(error = %err, "failed clearing WFP drop sink");
+            }
+        }
     }
 
     /// Returns a snapshot of currently tracked suspended descendants for `target` (useful for
@@ -621,15 +716,28 @@ impl ActiveDefenseController for WindowsDefenseController {
 
     fn add_wfp_app_rule(
         &self,
-        _exe_path: &Path,
-        _remote_ip: Option<IpAddr>,
-        _allow: bool,
+        exe_path: &Path,
+        remote_ip: Option<IpAddr>,
+        allow: bool,
     ) -> Result<u64, String> {
-        Err("WFP dynamic firewall rules are not enabled until Phase 3".to_string())
+        validate_wfp_rule_request(exe_path, allow)?;
+        let mut slot = self
+            .wfp_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let engine = ensure_wfp_engine_locked(&mut slot, &self.wfp_drop_sink)?;
+        engine.add_app_rule(exe_path, remote_ip, allow)
     }
 
-    fn remove_wfp_rule(&self, _filter_id: u64) -> Result<(), String> {
-        Err("WFP dynamic firewall rules are not enabled until Phase 3".to_string())
+    fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+        let slot = self
+            .wfp_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let engine = slot
+            .as_ref()
+            .ok_or_else(|| "WFP dynamic session is not initialized".to_string())?;
+        engine.remove_rule(filter_id)
     }
 }
 
@@ -1354,5 +1462,157 @@ mod tests {
             "orphan grandchild3 ({}) must be terminated even after parent3 exited",
             grandchild3
         );
+    }
+
+    #[test]
+    fn sens_p3_04_defense_controller_wfp_delegation_and_guards() {
+        use crate::wfp::{WfpBackend, WfpFilterSpec};
+        use std::net::Ipv4Addr;
+
+        struct StubDynamicBackend {
+            next_id: u64,
+            active: HashMap<u64, WfpFilterSpec>,
+        }
+        impl WfpBackend for StubDynamicBackend {
+            fn begin_transaction(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn commit_transaction(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn abort_transaction(&mut self) {}
+            fn add_filter(&mut self, spec: &WfpFilterSpec) -> Result<u64, String> {
+                self.next_id += 1;
+                self.active.insert(self.next_id, spec.clone());
+                Ok(self.next_id)
+            }
+            fn delete_filter(&mut self, os_filter_id: u64) -> Result<(), String> {
+                self.active.remove(&os_filter_id);
+                Ok(())
+            }
+            fn is_dynamic_session(&self) -> bool {
+                true
+            }
+        }
+
+        // Uninitialized controller still enforces Never-Block before opening WFP.
+        let uninit = WindowsDefenseController::new();
+        let err = uninit
+            .add_wfp_app_rule(Path::new(r"C:\Windows\System32\svchost.exe"), None, false)
+            .expect_err("protected process must be rejected before WFP open");
+        assert!(err.contains("protected process"), "{err}");
+        assert!(uninit.remove_wfp_rule(1).is_err());
+
+        // Configured controller delegates add/remove cleanly through ActiveDefenseController.
+        let wfp = WfpDynamicEngine::from_backend(Box::new(StubDynamicBackend {
+            next_id: 0,
+            active: HashMap::new(),
+        }))
+        .expect("dynamic engine");
+        let controller = WindowsDefenseController::with_wfp_engine(wfp);
+        let h1 = controller
+            .add_wfp_app_rule(Path::new(r"C:\Temp\sim.exe"), None, false)
+            .expect("add dual-stack block");
+        let h2 = controller
+            .add_wfp_app_rule(
+                Path::new(r"C:\Temp\sim.exe"),
+                Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+                true,
+            )
+            .expect("add single-stack permit");
+        assert_ne!(h1, h2);
+        controller.remove_wfp_rule(h1).expect("remove h1");
+        controller.remove_wfp_rule(h2).expect("remove h2");
+        assert!(controller.remove_wfp_rule(h1).is_err());
+    }
+
+    #[test]
+    fn sens_p3_11_defense_controller_wfp_drop_sink_before_and_after_init() {
+        use crate::wfp::{WfpBackend, WfpDropEvent, WfpDropSinkFn, WfpFilterMeta, WfpFilterSpec};
+        use std::sync::RwLock;
+
+        // 1. Pre-init registration succeeds before lazy WFP open and can be cleared cleanly.
+        let lazy_controller = WindowsDefenseController::new();
+        let sink: WfpDropSinkFn = Arc::new(|_| {});
+        lazy_controller
+            .set_wfp_drop_sink(Arc::clone(&sink))
+            .expect("pre-init set_wfp_drop_sink");
+        assert!(lazy_controller.wfp_drop_sink.lock().unwrap().is_some());
+        lazy_controller.clear_wfp_drop_sink();
+        assert!(lazy_controller.wfp_drop_sink.lock().unwrap().is_none());
+
+        // 2. Post-init registration forwards `filter_index` and `Some/None` sink to backend.
+        #[derive(Default)]
+        struct SinkStubBackend {
+            next_id: u64,
+            sink_set_count: usize,
+            sink_clear_count: usize,
+            has_sink: bool,
+            captured_index: Option<Arc<RwLock<HashMap<u64, WfpFilterMeta>>>>,
+        }
+        struct SharedStub(Arc<Mutex<SinkStubBackend>>);
+        impl WfpBackend for SharedStub {
+            fn begin_transaction(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn commit_transaction(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn abort_transaction(&mut self) {}
+            fn add_filter(&mut self, _spec: &WfpFilterSpec) -> Result<u64, String> {
+                let mut s = self.0.lock().unwrap();
+                s.next_id += 1;
+                Ok(s.next_id)
+            }
+            fn delete_filter(&mut self, _os_filter_id: u64) -> Result<(), String> {
+                Ok(())
+            }
+            fn is_dynamic_session(&self) -> bool {
+                true
+            }
+            fn set_drop_sink(
+                &mut self,
+                filter_index: Arc<RwLock<HashMap<u64, WfpFilterMeta>>>,
+                sink: Option<WfpDropSinkFn>,
+            ) -> Result<(), String> {
+                let mut s = self.0.lock().unwrap();
+                s.captured_index = Some(filter_index);
+                if sink.is_some() {
+                    s.sink_set_count += 1;
+                    s.has_sink = true;
+                } else {
+                    s.sink_clear_count += 1;
+                    s.has_sink = false;
+                }
+                Ok(())
+            }
+        }
+
+        let shared = Arc::new(Mutex::new(SinkStubBackend::default()));
+        let wfp = WfpDynamicEngine::from_backend(Box::new(SharedStub(Arc::clone(&shared))))
+            .expect("dynamic engine");
+        let controller = WindowsDefenseController::with_wfp_engine(wfp);
+
+        let events = Arc::new(Mutex::new(Vec::<WfpDropEvent>::new()));
+        let events_clone = Arc::clone(&events);
+        let recording_sink: WfpDropSinkFn = Arc::new(move |ev| {
+            events_clone.lock().unwrap().push(ev);
+        });
+        controller
+            .set_wfp_drop_sink(recording_sink)
+            .expect("set_wfp_drop_sink on active engine");
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.sink_set_count, 1);
+            assert!(s.has_sink);
+            assert!(s.captured_index.is_some());
+        }
+
+        controller.clear_wfp_drop_sink();
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.sink_clear_count, 1);
+            assert!(!s.has_sink);
+        }
     }
 }

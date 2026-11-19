@@ -16,6 +16,8 @@
       download_origins: [],
     },
     alerts: [],
+    rules: [],
+    localDefenseStatus: null,
     metrics: null,
     selectedProcessId: null,
     selectedAlertId: null,
@@ -24,12 +26,20 @@
     alertQueueFilter: "unresolved",
     alertFilterText: "",
     filterText: "",
+    policyScopeFilter: "all",
+    policyFilterText: "",
+    policyFeedback: null,
+    isMutatingRule: false,
+    domainRiskResult: null,
+    domainRiskError: null,
+    isCheckingDomain: false,
     activeTab: "all",
     activeView: "lineage",
     collapsedIds: new Set(),
     isSamplePreview: false,
     isDaemonOnline: false,
     isResolvingAlert: false,
+    selectedAlertIsNetwork: false,
     triageFeedback: null,
   };
 
@@ -60,6 +70,7 @@
     alertQueue: document.getElementById("alert-queue"),
     triageEmpty: document.getElementById("triage-empty"),
     triageEmptyLabel: document.getElementById("triage-empty-label"),
+    triageEmptyFeedback: document.getElementById("triage-empty-feedback"),
     triageShowAllBtn: document.getElementById("triage-show-all-btn"),
     triageSampleBtn: document.getElementById("triage-sample-btn"),
     triageDetail: document.getElementById("triage-detail"),
@@ -77,6 +88,7 @@
     optUseSigner: document.getElementById("opt-use-signer"),
     signerConstraintNote: document.getElementById("signer-constraint-note"),
     optAllowDest: document.getElementById("opt-allow-dest"),
+    targetScopeNote: document.getElementById("target-scope-note"),
     // View 2 elements
     treeSummary: document.getElementById("tree-summary"),
     processFilter: document.getElementById("process-filter"),
@@ -92,6 +104,36 @@
     countCanary: document.getElementById("count-canary"),
     scopeIndicator: document.getElementById("scope-indicator"),
     telemetryBody: document.getElementById("telemetry-body"),
+    // View 3 elements
+    policyRulesSummary: document.getElementById("policy-rules-summary"),
+    policyScopeBtns: Array.from(document.querySelectorAll(".policy-scope-btn")),
+    scopeCountAll: document.getElementById("scope-count-all"),
+    scopeCountBlock: document.getElementById("scope-count-block"),
+    scopeCountAllow: document.getElementById("scope-count-allow"),
+    scopeCountCanary: document.getElementById("scope-count-canary"),
+    scopeCountProcess: document.getElementById("scope-count-process"),
+    policyFilter: document.getElementById("policy-filter"),
+    toggleAddRuleBtn: document.getElementById("toggle-add-rule-btn"),
+    policyAddForm: document.getElementById("policy-add-form"),
+    ruleScopeInput: document.getElementById("rule-scope-input"),
+    ruleExeInput: document.getElementById("rule-exe-input"),
+    ruleTargetInput: document.getElementById("rule-target-input"),
+    ruleSha256Input: document.getElementById("rule-sha256-input"),
+    ruleSignerInput: document.getElementById("rule-signer-input"),
+    ruleThumbprintInput: document.getElementById("rule-thumbprint-input"),
+    policyScopeNote: document.getElementById("policy-scope-note"),
+    cancelAddRuleBtn: document.getElementById("cancel-add-rule-btn"),
+    submitAddRuleBtn: document.getElementById("submit-add-rule-btn"),
+    policyFeedback: document.getElementById("policy-feedback"),
+    policyRulesBody: document.getElementById("policy-rules-body"),
+    honeypotSummary: document.getElementById("honeypot-summary"),
+    honeypotStatusList: document.getElementById("honeypot-status-list"),
+    protectedPathsList: document.getElementById("protected-paths-list"),
+    browserShieldDl: document.getElementById("browser-shield-dl"),
+    domainCheckForm: document.getElementById("domain-check-form"),
+    domainCheckInput: document.getElementById("domain-check-input"),
+    domainCheckBtn: document.getElementById("domain-check-btn"),
+    domainCheckResult: document.getElementById("domain-check-result"),
   };
 
   function getInvoke() {
@@ -161,6 +203,60 @@
 
   function isUnresolvedAlert(alert) {
     return alert && (alert.status === "Pending" || alert.status === "ExpiredSuspended");
+  }
+
+  function isValidIpv4(ip) {
+    if (!/^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/.test(ip)) {
+      return false;
+    }
+    return ip.split(".").every((octet) => Number(octet) <= 255);
+  }
+
+  function isValidIpv6(ip) {
+    if (!ip || !ip.includes(":") || /[^0-9a-fA-F:.]/.test(ip)) {
+      return false;
+    }
+    try {
+      const url = new URL(`http://[${ip}]/`);
+      return url.hostname.startsWith("[") && url.hostname.endsWith("]");
+    } catch {
+      return false;
+    }
+  }
+
+  function isLiteralIpOrCidr(raw) {
+    const trimmed = String(raw || "").trim();
+    if (!trimmed) return false;
+    const slashIdx = trimmed.indexOf("/");
+    if (slashIdx === -1) {
+      return isValidIpv4(trimmed) || isValidIpv6(trimmed);
+    }
+    if (trimmed.indexOf("/", slashIdx + 1) !== -1) {
+      return false;
+    }
+    const addr = trimmed.slice(0, slashIdx);
+    const prefixStr = trimmed.slice(slashIdx + 1);
+    if (!/^(?:0|[1-9]\d{0,2})$/.test(prefixStr)) {
+      return false;
+    }
+    const prefix = Number(prefixStr);
+    if (isValidIpv4(addr)) return prefix <= 32;
+    if (isValidIpv6(addr)) return prefix <= 128;
+    return false;
+  }
+
+  function isNetworkDomainTarget(scope, allowedTarget) {
+    if (scope !== "NetworkBlock" && scope !== "NetworkAllow") return false;
+    const trimmed = String(allowedTarget || "").trim();
+    if (!trimmed) return false;
+    return !isLiteralIpOrCidr(trimmed);
+  }
+
+  function formatBackendError(err) {
+    if (err && typeof err === "object" && typeof err.message === "string") {
+      return err.message;
+    }
+    return String(err ?? "Unknown error");
   }
 
   function buildSampleData() {
@@ -302,7 +398,7 @@
           dst_ip: "203.0.113.77",
           dst_port: 443,
           domain_hint: "exfil-gate.nrd-sample.invalid",
-          action: "LOG",
+          action: "SUSPENDED_BLOCKED",
         },
         {
           id: 2,
@@ -312,7 +408,7 @@
           dst_ip: "203.0.113.42",
           dst_port: 443,
           domain_hint: "telemetry-check.nrd-sample.invalid",
-          action: "LOG",
+          action: "BLOCKED",
         },
         {
           id: 3,
@@ -322,7 +418,7 @@
           dst_ip: "13.107.42.14",
           dst_port: 443,
           domain_hint: "settings-win.data.microsoft.com",
-          action: "ALLOW",
+          action: "ALLOWED",
         },
       ],
       file_canary_events: [
@@ -423,6 +519,40 @@
         resolved_at_ms: null,
       },
       {
+        alert_id: "sample-net-004",
+        timestamp_ms: now - 15_000,
+        severity: "High",
+        source_layer: "LAYER_3_NETWORK",
+        rule_id: "LEDR-NET-HIGH-RISK-PATH",
+        title: "High-Risk Path Outbound Connection: cred-audit.exe -> exfil-gate.nrd-sample.invalid (203.0.113.77:443)",
+        process_instance_id: stealerId,
+        process_suspended: true,
+        status: "Pending",
+        context_json: JSON.stringify({
+          dst_ip: "203.0.113.77",
+          dst_port: 443,
+          protocol: 6,
+          domain_hint: "exfil-gate.nrd-sample.invalid",
+          risk_class: "HighRiskPath",
+          wfp_blocked: true,
+          wfp_filter_id: 1042,
+          is_nrd: true,
+          is_homograph: false,
+          is_first_seen_domain: true,
+          matched_brand: null,
+          exe_path: stealerExe,
+          command_line: `"${stealerExe}" --export-browser --silent`,
+          parent_exe_path:
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+          parent_command_line:
+            "powershell.exe -NoProfile -NonInteractive -EncodedCommand VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIAAiAEwAbwBjAGEAbABFAEQAUgAiAA==",
+          sha256: stealerSha,
+          signer_subject: null,
+          root_thumbprint: null,
+        }),
+        resolved_at_ms: null,
+      },
+      {
         alert_id: "sample-lotl-003",
         timestamp_ms: now - 35_000,
         severity: "Medium",
@@ -445,7 +575,108 @@
       },
     ];
 
-    return { snapshot, alerts };
+    const rules = [
+      {
+        rule_id: "SAMPLE-BLOCK-001",
+        scope: "NetworkBlock",
+        exe_path_pattern: stealerExe,
+        sha256: stealerSha,
+        signer_subject: null,
+        root_thumbprint: null,
+        allowed_target: null,
+        created_at_ms: now - 10_000,
+        created_by: "user_quarantine",
+      },
+      {
+        rule_id: "SAMPLE-ALLOW-001",
+        scope: "NetworkAllow",
+        exe_path_pattern: syncExe,
+        sha256: null,
+        signer_subject: syncSigner,
+        root_thumbprint: syncThumbprint,
+        allowed_target: "*.examplesync.invalid",
+        created_at_ms: now - 50_000,
+        created_by: "user_triage",
+      },
+      {
+        rule_id: "SAMPLE-CANARY-001",
+        scope: "FileCanaryAllow",
+        exe_path_pattern: syncExe,
+        sha256: null,
+        signer_subject: syncSigner,
+        root_thumbprint: syncThumbprint,
+        allowed_target: "C:\\Users\\user\\Documents\\*",
+        created_at_ms: now - 60_000,
+        created_by: "user_triage",
+      },
+    ];
+
+    const localDefenseStatus = {
+      honeypots: [
+        {
+          folder: "Documents",
+          path: honeypotTarget,
+          deployed: true,
+          size_bytes: 14336,
+        },
+        {
+          folder: "Desktop",
+          path: "C:\\Users\\user\\Desktop\\!00_LocalEDR_Canary_DoNotEdit.docx",
+          deployed: true,
+          size_bytes: 14336,
+        },
+        {
+          folder: "Pictures",
+          path: "C:\\Users\\user\\Pictures\\!00_LocalEDR_Canary_DoNotEdit.docx",
+          deployed: false,
+          size_bytes: null,
+        },
+      ],
+      protected_paths: [
+        {
+          category: "CookieDb",
+          label: "Browser Cookies, Login Data & Local State",
+          path_template:
+            "%LOCALAPPDATA%\\{Google\\Chrome,Microsoft\\Edge,BraveSoftware\\Brave-Browser}\\User Data\\*\\(Cookies|Login Data|Local State), %APPDATA%\\Mozilla\\Firefox\\Profiles\\*\\(cookies.sqlite|logins.json|key4.db)",
+        },
+        {
+          category: "SshKey",
+          label: "SSH Private Keys",
+          path_template: "%USERPROFILE%\\.ssh\\*",
+        },
+        {
+          category: "CloudCreds",
+          label: "AWS / GCP Credentials",
+          path_template:
+            "%USERPROFILE%\\.aws\\{credentials,config}, %USERPROFILE%\\.config\\gcloud\\*",
+        },
+        {
+          category: "EnvFile",
+          label: "Project .env Secrets (Registered Dev Roots)",
+          path_template: "<DevRoots>\\**\\.env*",
+        },
+        {
+          category: "Honeypot",
+          label: "Ransomware Decoy Files (Write/Delete)",
+          path_template:
+            "%USERPROFILE%\\{Documents,Desktop,Pictures}\\!00_LocalEDR_Canary_DoNotEdit.docx",
+        },
+        {
+          category: "AutorunRegistry",
+          label: "Windows Autorun Registry Keys",
+          path_template:
+            "{HKCU,HKLM}\\Software\\Microsoft\\Windows\\CurrentVersion\\{Run,RunOnce}",
+        },
+      ],
+      browser_shield: {
+        bridge_binary_path: "C:\\Program Files\\LocalEDR\\ledr-bridge-nm.exe",
+        bridge_binary_present: true,
+        native_host_registered: true,
+        uri_scheme_registered: true,
+      },
+    };
+
+    return { snapshot, alerts, rules, localDefenseStatus };
   }
 
   function buildHierarchy(snapshot) {
@@ -579,9 +810,39 @@
       (c) => procId && c.process_instance_id === procId,
     );
 
+    const netEvt = ctx.event?.NetworkConnect || null;
+    const isNetworkAlert =
+      alert.source_layer === "LAYER_3_NETWORK" || Boolean(netEvt) || Boolean(ctx.dst_ip);
+    const dstIp = ctx.dst_ip || netEvt?.dst_ip || null;
+    const dstPort = ctx.dst_port ?? netEvt?.dst_port ?? null;
+    const protocol = ctx.protocol ?? netEvt?.protocol ?? null;
+    const domainHint = ctx.domain_hint || netEvt?.domain_hint || null;
+    const riskClass = ctx.risk_class || null;
+    const wfpBlocked = Boolean(ctx.wfp_blocked);
+    const wfpFilterId = ctx.wfp_filter_id ?? null;
+    const attribution = ctx.attribution || null;
+    const candidatePids = Array.isArray(ctx.candidate_pids)
+      ? ctx.candidate_pids
+      : [];
+    const candidateInstanceIds = Array.isArray(ctx.candidate_instance_ids)
+      ? ctx.candidate_instance_ids
+      : [];
+    const isNrd = Boolean(ctx.is_nrd);
+    const isHomograph = Boolean(ctx.is_homograph);
+    const isFirstSeenDomain = Boolean(ctx.is_first_seen_domain);
+    const matchedBrand = ctx.matched_brand || null;
+    const matchedRuleId = ctx.matched_rule_id || null;
+
+    const networkTarget = dstIp
+      ? domainHint
+        ? `${domainHint} (${dstIp}${dstPort !== null ? `:${dstPort}` : ""})`
+        : `${dstIp}${dstPort !== null ? `:${dstPort}` : ""}`
+      : null;
+
     const targetPath =
       ctx.target_path ||
       ctx.event?.CanaryFileAccess?.target_path ||
+      networkTarget ||
       ctx.event?.DnsQuery?.query_name ||
       ctx.url ||
       matchingCanary?.target_path ||
@@ -590,6 +851,8 @@
     const category =
       ctx.category ||
       ctx.event?.CanaryFileAccess?.category ||
+      riskClass ||
+      (isNetworkAlert ? "OutboundNetwork" : null) ||
       ctx.event_type ||
       matchingCanary?.category ||
       null;
@@ -659,6 +922,22 @@
     ];
 
     return {
+      isNetworkAlert,
+      dstIp,
+      dstPort,
+      protocol,
+      domainHint,
+      riskClass,
+      wfpBlocked,
+      wfpFilterId,
+      attribution,
+      candidatePids,
+      candidateInstanceIds,
+      isNrd,
+      isHomograph,
+      isFirstSeenDomain,
+      matchedBrand,
+      matchedRuleId,
       targetPath,
       category,
       accessMask,
@@ -840,17 +1119,27 @@
     const selected =
       allAlerts.find((a) => a.alert_id === state.selectedAlertId) || null;
     if (!selected) {
+      state.selectedAlertIsNetwork = false;
       el.triageDetail.classList.add("hidden");
       el.triageEmpty.classList.remove("hidden");
 
-      if (state.triageFeedback && state.triageFeedback.message) {
-        el.triageEmptyLabel.textContent = state.triageFeedback.message;
-      } else if (state.alertQueueFilter === "unresolved" && allAlerts.length > 0) {
+      if (state.alertQueueFilter === "unresolved" && allAlerts.length > 0) {
         el.triageEmptyLabel.textContent = "No unresolved alerts";
       } else {
         el.triageEmptyLabel.textContent = state.isDaemonOnline
           ? "No alerts recorded"
           : "Daemon offline — no alerts loaded";
+      }
+
+      if (state.triageFeedback && state.triageFeedback.message) {
+        el.triageEmptyFeedback.textContent = state.triageFeedback.message;
+        el.triageEmptyFeedback.className = `triage-feedback ${
+          state.triageFeedback.ok ? "is-ok" : "is-error"
+        }`;
+        el.triageEmptyFeedback.setAttribute("role", state.triageFeedback.ok ? "status" : "alert");
+        el.triageEmptyFeedback.classList.remove("hidden");
+      } else {
+        el.triageEmptyFeedback.classList.add("hidden");
       }
 
       el.triageShowAllBtn.classList.toggle(
@@ -864,6 +1153,7 @@
       return;
     }
 
+    el.triageEmptyFeedback.classList.add("hidden");
     el.triageEmpty.classList.add("hidden");
     el.triageDetail.classList.remove("hidden");
 
@@ -876,6 +1166,23 @@
     syncResolutionControls(selected, details);
   }
 
+  function networkActionBadgeClass(actionUpper) {
+    if (
+      actionUpper === "BLOCK" ||
+      actionUpper === "BLOCKED" ||
+      actionUpper === "SUSPENDED_BLOCKED"
+    ) {
+      return "badge-action-block";
+    }
+    if (actionUpper === "ALLOW" || actionUpper === "ALLOWED") {
+      return "badge-action-allow";
+    }
+    if (actionUpper === "SUSPENDED" || actionUpper === "ALERTED") {
+      return "badge-nrd";
+    }
+    return "badge-action-log";
+  }
+
   function renderSuspendBanner(alert, details) {
     let bannerClass = "suspend-banner";
     let headline = alert.title;
@@ -883,16 +1190,25 @@
 
     if (alert.status === "ExpiredSuspended") {
       bannerClass += " is-expired";
-      subline = details.includeChildren
-        ? "60s timeout elapsed — process tree remains frozen without data loss"
-        : "60s timeout elapsed — process remains frozen without data loss";
+      subline = details.wfpBlocked
+        ? "60s timeout elapsed — process frozen and dynamic WFP block retained"
+        : details.includeChildren
+          ? "60s timeout elapsed — process tree remains frozen without data loss"
+          : "60s timeout elapsed — process remains frozen without data loss";
     } else if (alert.status === "Pending" && alert.process_suspended) {
       bannerClass += " is-frozen";
-      subline = details.includeChildren
-        ? "Process tree frozen (NtSuspendProcess) — awaiting decision"
-        : "Process frozen (NtSuspendProcess) — awaiting decision";
+      subline = details.wfpBlocked
+        ? "Process frozen + dynamic WFP outbound block active — awaiting decision"
+        : details.includeChildren
+          ? "Process tree frozen (NtSuspendProcess) — awaiting decision"
+          : "Process frozen (NtSuspendProcess) — awaiting decision";
     } else if (alert.status === "Pending") {
-      subline = "Active alert — process not suspended";
+      subline =
+        details.attribution === "app_level_ambiguous"
+          ? "Dynamic WFP block active (multi-instance PID ambiguous — no process suspended)"
+          : details.wfpBlocked
+            ? "Dynamic WFP outbound block active — awaiting decision"
+            : "Active alert — process not suspended";
     } else if (alert.status === "TerminatedBlocked") {
       bannerClass += " is-terminated";
       subline = alert.resolved_at_ms
@@ -926,6 +1242,56 @@
   }
 
   function renderDetectionCard(alert, details) {
+    if (details.isNetworkAlert) {
+      const endpoint = details.dstIp
+        ? `${details.dstIp}${details.dstPort !== null ? `:${details.dstPort}` : ""}`
+        : "-";
+      const protoBadge =
+        details.protocol !== null && details.protocol !== undefined
+          ? `<span class="badge badge-metric">${escapeHtml(formatProtocol(details.protocol))}</span>`
+          : "";
+      const riskBadges = [];
+      if (details.isNrd) riskBadges.push(`<span class="badge badge-nrd">NRD</span>`);
+      if (details.isFirstSeenDomain) {
+        riskBadges.push(`<span class="badge badge-unsigned">First-Seen</span>`);
+      }
+      if (details.isHomograph) {
+        riskBadges.push(
+          `<span class="badge badge-nrd">Homograph${
+            details.matchedBrand ? `: ${escapeHtml(details.matchedBrand)}` : ""
+          }</span>`,
+        );
+      }
+      const wfpBadge = details.wfpBlocked
+        ? `<span class="badge badge-action-block">WFP Blocked${
+            details.wfpFilterId !== null ? ` (#${escapeHtml(details.wfpFilterId)})` : ""
+          }</span>`
+        : `<span class="badge badge-orphan">WFP Inactive</span>`;
+      const riskClassBadge = details.riskClass
+        ? `<span class="badge badge-metric">${escapeHtml(details.riskClass)}</span>`
+        : "";
+      const attributionBadge =
+        details.attribution === "app_level_ambiguous"
+          ? `<span class="badge badge-unsigned" title="Multiple concurrent instances matched WFP executable path; no individual PID was suspended">App-Level (Ambiguous PID)</span>`
+          : "";
+
+      el.triageDetectionDl.innerHTML = `
+        <dt>Destination</dt>
+        <dd class="mono-wrap">${protoBadge} ${escapeHtml(endpoint)}</dd>
+        <dt>Domain / Risk</dt>
+        <dd class="mono-wrap">${escapeHtml(details.domainHint || "-")} ${riskBadges.join(" ")}</dd>
+        <dt>Containment</dt>
+        <dd>${wfpBadge} ${riskClassBadge} ${attributionBadge}</dd>
+        <dt>Rule ID</dt>
+        <dd class="mono-wrap">${escapeHtml(alert.rule_id)}${
+          details.matchedRuleId
+            ? ` (policy: ${escapeHtml(details.matchedRuleId)})`
+            : ""
+        }</dd>
+      `;
+      return;
+    }
+
     const opBadge =
       details.isWriteOrDelete === true
         ? `<span class="badge badge-nrd">Write / Delete</span>`
@@ -963,13 +1329,20 @@
         }`
       : `<span class="badge badge-unsigned">Unsigned</span>`;
 
+    const pidInstanceLabel =
+      details.attribution === "app_level_ambiguous"
+        ? `Ambiguous (candidates: ${
+            details.candidatePids.length > 0 ? details.candidatePids.join(", ") : "none"
+          }) | app-level`
+        : `${
+            details.pid !== null && details.pid !== undefined ? String(details.pid) : "-"
+          } | ${details.processInstanceId || "-"}`;
+
     el.triageLineageDl.innerHTML = `
       <dt>Executable</dt>
       <dd class="mono-wrap">${escapeHtml(details.exePath || "-")}</dd>
       <dt>PID / Instance</dt>
-      <dd class="mono-wrap">${escapeHtml(
-        details.pid !== null && details.pid !== undefined ? String(details.pid) : "-",
-      )} | ${escapeHtml(details.processInstanceId || "-")}</dd>
+      <dd class="mono-wrap">${escapeHtml(pidInstanceLabel)}</dd>
       <dt>Signer</dt>
       <dd>${signerHtml}</dd>
       <dt>SHA-256</dt>
@@ -1045,12 +1418,7 @@
     }
     for (const n of net.slice(0, 8)) {
       const actionUpper = String(n.action || "LOG").toUpperCase();
-      const actionClass =
-        actionUpper === "BLOCK"
-          ? "badge-action-block"
-          : actionUpper === "ALLOW"
-            ? "badge-action-allow"
-            : "badge-action-log";
+      const actionClass = networkActionBadgeClass(actionUpper);
       rows.push(`
         <li class="mini-event-row">
           <span class="badge badge-metric">${escapeHtml(formatProtocol(n.protocol))}</span>
@@ -1068,9 +1436,25 @@
     el.triageNetBody.innerHTML = `<ul class="mini-events-list">${rows.join("")}</ul>`;
   }
 
+  function syncTriageTargetScopeNote(isNetworkAlert) {
+    if (!isNetworkAlert) {
+      el.targetScopeNote.textContent = "";
+      el.targetScopeNote.className = "tier-constraint hidden";
+      return;
+    }
+    const domainEntered = isNetworkDomainTarget("NetworkAllow", el.optAllowDest.value);
+    el.targetScopeNote.textContent =
+      "Accepts literal IP, CIDR (e.g. 198.51.100.0/24), or domain/wildcard (WFP enforces matched IPs; Deny wins).";
+    el.targetScopeNote.className = domainEntered
+      ? "tier-constraint is-warn"
+      : "tier-constraint";
+    el.targetScopeNote.classList.remove("hidden");
+  }
+
   function syncResolutionControls(alert, details) {
     const unresolved = isUnresolvedAlert(alert);
     const hasSigner = Boolean(details.signerSubject);
+    state.selectedAlertIsNetwork = Boolean(details.isNetworkAlert);
 
     if (state.lastSyncedAlertId !== alert.alert_id) {
       state.lastSyncedAlertId = alert.alert_id;
@@ -1083,12 +1467,22 @@
     if (!hasSigner) {
       el.optUseSigner.checked = false;
       el.signerConstraintNote.textContent = "Unsigned binary: SHA-256 required";
+    } else if (!details.rootThumbprint) {
+      el.signerConstraintNote.textContent =
+        "Root thumbprint verified on save (fallback: SHA-256)";
     } else {
       el.signerConstraintNote.textContent = "";
     }
 
     el.optAddBlockRule.disabled = !unresolved || state.isResolvingAlert;
     el.optAllowDest.disabled = !unresolved || state.isResolvingAlert;
+    el.optAllowDest.placeholder = details.isNetworkAlert
+      ? "e.g. 93.184.216.34, 198.51.100.0/24, or *.example.com"
+      : "e.g. C:\\Users\\*\\Cookies";
+    el.optAllowDest.title = details.isNetworkAlert
+      ? "Literal IP, CIDR prefix, or domain/wildcard (WFP enforces matched IPs; shared CDN IPs inherit rule; Deny wins)"
+      : "Optional file path pattern (e.g. C:\\Users\\*\\Cookies)";
+    syncTriageTargetScopeNote(details.isNetworkAlert);
     el.btnTerminateBlock.disabled = !unresolved || state.isResolvingAlert;
     el.btnAllowOnce.disabled = !unresolved || state.isResolvingAlert;
     el.btnAllowPermanent.disabled = !unresolved || state.isResolvingAlert;
@@ -1098,6 +1492,7 @@
       el.triageActionStatus.className = `triage-feedback ${
         state.triageFeedback.ok ? "is-ok" : "is-error"
       }`;
+      el.triageActionStatus.setAttribute("role", state.triageFeedback.ok ? "status" : "alert");
       el.triageActionStatus.classList.remove("hidden");
     } else {
       el.triageActionStatus.classList.add("hidden");
@@ -1124,7 +1519,16 @@
       decision = "AllowOnce";
       previewStatus = "ApprovedOnce";
     } else {
+      const details = extractAlertDetails(alert, buildHierarchy(state.snapshot).byId);
       const allowDestRaw = el.optAllowDest.value.trim();
+      if (details.isNetworkAlert && allowDestRaw.includes("/") && !isLiteralIpOrCidr(allowDestRaw)) {
+        state.triageFeedback = {
+          ok: false,
+          message: "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
+        };
+        renderTriageView();
+        return;
+      }
       decision = {
         AllowPermanent: {
           use_signer_if_available:
@@ -1143,7 +1547,7 @@
         kind === "terminate"
           ? `Preview: ${alert.alert_id} → ${previewStatus} — process tree terminated; ${
               addBlockRule
-                ? "NetworkBlock rule saved, WFP applies in Phase 3"
+                ? "NetworkBlock rule saved & WFP dynamic block active"
                 : "no NetworkBlock rule saved"
             }`
           : `Preview: ${alert.alert_id} → ${previewStatus}`;
@@ -1179,8 +1583,8 @@
       state.triageFeedback = { ok: true, message: ackMessage };
       await refreshAll();
     } catch (err) {
-      state.triageFeedback = { ok: false, message: String(err) };
-      renderTriageView();
+      state.triageFeedback = { ok: false, message: formatBackendError(err) };
+      await refreshAll();
     } finally {
       state.isResolvingAlert = false;
       renderTriageView();
@@ -1394,12 +1798,7 @@
         const proc = byId.get(n.process_instance_id);
         const procLabel = proc ? `${baseName(proc.exe_path)} (${proc.pid})` : n.process_instance_id;
         const actionUpper = String(n.action || "LOG").toUpperCase();
-        const actionClass =
-          actionUpper === "BLOCK"
-            ? "badge-action-block"
-            : actionUpper === "ALLOW"
-              ? "badge-action-allow"
-              : "badge-action-log";
+        const actionClass = networkActionBadgeClass(actionUpper);
         rows.push({
           ts: n.timestamp_ms,
           html: `
@@ -1496,9 +1895,490 @@
     }
   }
 
+  function scopeBadgeHtml(scope) {
+    if (scope === "NetworkBlock") {
+      return `<span class="badge badge-action-block">NetworkBlock</span>`;
+    }
+    if (scope === "NetworkAllow") {
+      return `<span class="badge badge-action-allow">NetworkAllow</span>`;
+    }
+    if (scope === "FileCanaryAllow") {
+      return `<span class="badge badge-signed">FileCanaryAllow</span>`;
+    }
+    if (scope === "ProcessAllow") {
+      return `<span class="badge badge-metric">ProcessAllow</span>`;
+    }
+    return `<span class="badge badge-orphan">${escapeHtml(scope)}</span>`;
+  }
+
+  function renderPolicyView() {
+    const allRules = Array.isArray(state.rules) ? state.rules : [];
+    const blockCount = allRules.filter((r) => r.scope === "NetworkBlock").length;
+    const allowCount = allRules.filter((r) => r.scope === "NetworkAllow").length;
+    const canaryCount = allRules.filter((r) => r.scope === "FileCanaryAllow").length;
+    const processCount = allRules.filter((r) => r.scope === "ProcessAllow").length;
+
+    el.policyRulesSummary.textContent = `${allRules.length} rules`;
+    el.scopeCountAll.textContent = String(allRules.length);
+    el.scopeCountBlock.textContent = String(blockCount);
+    el.scopeCountAllow.textContent = String(allowCount);
+    el.scopeCountCanary.textContent = String(canaryCount);
+    el.scopeCountProcess.textContent = String(processCount);
+
+    for (const btn of el.policyScopeBtns) {
+      const selected = btn.dataset.scope === state.policyScopeFilter;
+      btn.classList.toggle("is-selected", selected);
+      btn.setAttribute("aria-pressed", selected ? "true" : "false");
+    }
+
+    if (state.policyFeedback && state.policyFeedback.message) {
+      el.policyFeedback.textContent = state.policyFeedback.message;
+      el.policyFeedback.className = `triage-feedback policy-feedback ${
+        state.policyFeedback.ok ? "is-ok" : "is-error"
+      }`;
+      el.policyFeedback.setAttribute("role", state.policyFeedback.ok ? "status" : "alert");
+      el.policyFeedback.classList.remove("hidden");
+    } else {
+      el.policyFeedback.classList.add("hidden");
+    }
+
+    const query = state.policyFilterText.trim().toLowerCase();
+    const visibleRules = allRules.filter((rule) => {
+      if (state.policyScopeFilter !== "all" && rule.scope !== state.policyScopeFilter) {
+        return false;
+      }
+      if (!query) return true;
+      return [
+        rule.rule_id,
+        rule.scope,
+        rule.exe_path_pattern,
+        rule.allowed_target || "",
+        rule.sha256 || "",
+        rule.signer_subject || "",
+        rule.created_by || "",
+      ].some((v) => String(v).toLowerCase().includes(query));
+    });
+
+    if (visibleRules.length === 0) {
+      el.policyRulesBody.innerHTML = `<tr><td colspan="6" class="empty-row">${
+        query
+          ? "No rules match filter."
+          : state.isDaemonOnline || state.isSamplePreview
+            ? "No policy rules in this scope."
+            : "Daemon offline — no rules loaded."
+      }</td></tr>`;
+    } else {
+      el.policyRulesBody.innerHTML = visibleRules
+        .map((rule) => {
+          const identityParts = [];
+          if (rule.signer_subject) {
+            identityParts.push(
+              `<span class="badge badge-signed">${escapeHtml(rule.signer_subject)}</span>`,
+            );
+          }
+          if (rule.sha256) {
+            const shortSha =
+              rule.sha256.length > 16 ? `${rule.sha256.slice(0, 16)}…` : rule.sha256;
+            identityParts.push(
+              `<span class="mono" title="${escapeHtml(rule.sha256)}">sha256:${escapeHtml(shortSha)}</span>`,
+            );
+          }
+          if (identityParts.length === 0) {
+            identityParts.push(`<span class="panel-meta">Path only</span>`);
+          }
+          const targetText = rule.allowed_target || "All targets";
+          const domainIpBadge = isNetworkDomainTarget(rule.scope, rule.allowed_target)
+            ? `<span class="badge badge-domain-ip" title="WFP enforces resolved IPs; shared CDN/proxy IPs are also affected (deny overrides allow)">IP-resolved</span>`
+            : "";
+          return `
+            <tr>
+              <td>${scopeBadgeHtml(rule.scope)}</td>
+              <td class="mono-wrap" title="${escapeHtml(rule.rule_id)}">${escapeHtml(
+                rule.exe_path_pattern,
+              )}</td>
+              <td>
+                <div class="policy-target-cell">
+                  <span class="mono-wrap">${escapeHtml(targetText)}</span>
+                  ${domainIpBadge}
+                </div>
+              </td>
+              <td>${identityParts.join(" ")}</td>
+              <td class="mono">${escapeHtml(formatTime(rule.created_at_ms))}</td>
+              <td>
+                <button
+                  type="button"
+                  class="btn btn-danger-xs"
+                  data-delete-rule-id="${escapeHtml(rule.rule_id)}"
+                  ${state.isMutatingRule ? "disabled" : ""}
+                >Delete</button>
+              </td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
+
+    el.submitAddRuleBtn.disabled = state.isMutatingRule;
+
+    // Right column 1: Canary & Honeypot Status
+    const localStatus = state.localDefenseStatus;
+    const honeypots = localStatus?.honeypots || [];
+    const deployedCount = honeypots.filter((h) => h.deployed).length;
+    el.honeypotSummary.textContent = `${deployedCount}/${honeypots.length || 3} deployed`;
+
+    if (honeypots.length === 0) {
+      el.honeypotStatusList.innerHTML = `<div class="panel-meta">Local honeypot probe unavailable outside Tauri runtime.</div>`;
+    } else {
+      el.honeypotStatusList.innerHTML = honeypots
+        .map((h) => {
+          const badge = h.deployed
+            ? `<span class="badge badge-action-allow">Deployed (${escapeHtml(
+                h.size_bytes ?? 0,
+              )} B)</span>`
+            : `<span class="badge badge-unsigned">Not Deployed</span>`;
+          return `
+            <div class="status-item">
+              <div class="status-item-top">
+                <span class="status-item-title">${escapeHtml(h.folder)}</span>
+                ${badge}
+              </div>
+              <div class="status-item-path">${escapeHtml(h.path)}</div>
+            </div>
+          `;
+        })
+        .join("");
+    }
+
+    const templates = localStatus?.protected_paths || [];
+    if (templates.length === 0) {
+      el.protectedPathsList.innerHTML = `<div class="panel-meta">No templates loaded.</div>`;
+    } else {
+      el.protectedPathsList.innerHTML = templates
+        .map(
+          (t) => `
+            <div class="status-item">
+              <div class="status-item-top">
+                <span class="status-item-title">${escapeHtml(t.label)}</span>
+                <span class="badge badge-metric">${escapeHtml(t.category)}</span>
+              </div>
+              <div class="status-item-path">${escapeHtml(t.path_template)}</div>
+            </div>
+          `,
+        )
+        .join("");
+    }
+
+    // Right column 2: Browser Shield & Domain Risk Check
+    const shield = localStatus?.browser_shield || null;
+    const statusPill = (ok, yesText, noText) =>
+      ok
+        ? `<span class="badge badge-action-allow">${escapeHtml(yesText)}</span>`
+        : `<span class="badge badge-unsigned">${escapeHtml(noText)}</span>`;
+
+    el.browserShieldDl.innerHTML = `
+      <dt>Daemon IPC</dt>
+      <dd>${
+        state.isDaemonOnline
+          ? statusPill(true, "Connected", "Offline")
+          : state.isSamplePreview
+            ? `<span class="badge badge-orphan">Sample Preview</span>`
+            : statusPill(false, "Connected", "Offline")
+      }</dd>
+      <dt>Bridge Binary</dt>
+      <dd>${
+        shield
+          ? `${statusPill(shield.bridge_binary_present, "Installed", "Not Found")} <span class="mono-wrap">${escapeHtml(
+              shield.bridge_binary_path,
+            )}</span>`
+          : `<span class="panel-meta">Unknown</span>`
+      }</dd>
+      <dt>Native Messaging</dt>
+      <dd>${
+        shield
+          ? statusPill(shield.native_host_registered, "Registered (HKCU)", "Not Registered")
+          : `<span class="panel-meta">Unknown</span>`
+      }</dd>
+      <dt>URI Protocol</dt>
+      <dd>${
+        shield
+          ? statusPill(shield.uri_scheme_registered, "ledr:// Registered", "Not Registered")
+          : `<span class="panel-meta">Unknown</span>`
+      }</dd>
+    `;
+
+    el.domainCheckBtn.disabled = state.isCheckingDomain;
+    if (state.domainRiskError) {
+      el.domainCheckResult.innerHTML = `<span class="badge badge-action-block">Error</span> <span class="mono-wrap">${escapeHtml(
+        state.domainRiskError,
+      )}</span>`;
+      el.domainCheckResult.classList.remove("hidden");
+    } else if (state.domainRiskResult) {
+      const r = state.domainRiskResult;
+      const badges = [];
+      badges.push(
+        r.is_nrd
+          ? `<span class="badge badge-nrd">NRD (&lt;=14d)</span>`
+          : `<span class="badge badge-action-allow">Not in NRD</span>`,
+      );
+      badges.push(
+        r.is_homograph
+          ? `<span class="badge badge-action-block">Homograph${
+              r.matched_brand ? `: ${escapeHtml(r.matched_brand)}` : ""
+            }</span>`
+          : `<span class="badge badge-action-allow">No Homograph</span>`,
+      );
+      el.domainCheckResult.innerHTML = `
+        <div class="mono-wrap">${escapeHtml(r.domain)}</div>
+        <div class="domain-check-badges">${badges.join("")}</div>
+      `;
+      el.domainCheckResult.classList.remove("hidden");
+    } else {
+      el.domainCheckResult.classList.add("hidden");
+    }
+  }
+
+  function syncPolicyFormHints() {
+    const scope = el.ruleScopeInput.value;
+    if (scope === "NetworkBlock" || scope === "NetworkAllow") {
+      el.ruleTargetInput.placeholder = "e.g. 93.184.216.34, 198.51.100.0/24, or *.example.com";
+      el.ruleTargetInput.title =
+        "Literal IP, CIDR prefix, or domain/wildcard (WFP enforces matched/resolved IPs; shared CDN IPs affected)";
+      const domainEntered = isNetworkDomainTarget(scope, el.ruleTargetInput.value);
+      el.policyScopeNote.textContent =
+        "Accepts literal IP, CIDR (e.g. 198.51.100.0/24), or domain/wildcard (WFP enforces matched IPs; Deny overrides Allow).";
+      el.policyScopeNote.className = domainEntered
+        ? "tier-constraint is-warn"
+        : "tier-constraint";
+    } else if (scope === "FileCanaryAllow") {
+      el.ruleTargetInput.placeholder = "e.g. C:\\Users\\*\\Documents\\*";
+      el.ruleTargetInput.title = "Optional canary file path glob pattern";
+      el.policyScopeNote.textContent =
+        "Canary rule: file path glob pattern scoped to protected files.";
+      el.policyScopeNote.className = "tier-constraint";
+    } else {
+      el.ruleTargetInput.placeholder = "(unused for ProcessAllow)";
+      el.ruleTargetInput.title = "Leave blank for ProcessAllow rules";
+      el.policyScopeNote.textContent =
+        "Process rule: requires SHA-256 or Signer + Root Thumbprint (L-04).";
+      el.policyScopeNote.className = "tier-constraint";
+    }
+  }
+
+  function setAddRuleFormVisible(visible) {
+    el.policyAddForm.classList.toggle("hidden", !visible);
+    el.toggleAddRuleBtn.setAttribute("aria-expanded", visible ? "true" : "false");
+    if (visible) {
+      syncPolicyFormHints();
+      el.ruleExeInput.focus();
+    }
+  }
+
+  async function handleUpsertRule(event) {
+    event.preventDefault();
+    if (state.isMutatingRule) return;
+
+    const scope = el.ruleScopeInput.value;
+    const exePath = el.ruleExeInput.value.trim();
+    const target = el.ruleTargetInput.value.trim();
+    const sha256 = el.ruleSha256Input.value.trim();
+    const signer = el.ruleSignerInput.value.trim();
+    const thumbprint = el.ruleThumbprintInput.value.trim();
+
+    if (!exePath) {
+      state.policyFeedback = { ok: false, message: "Executable Path is required." };
+      renderPolicyView();
+      return;
+    }
+
+    if (sha256 && !/^[0-9a-fA-F]{64}$/.test(sha256)) {
+      state.policyFeedback = {
+        ok: false,
+        message: "SHA-256 must be a 64-character hexadecimal digest.",
+      };
+      renderPolicyView();
+      return;
+    }
+
+    if (thumbprint && /^0+$/.test(thumbprint)) {
+      state.policyFeedback = {
+        ok: false,
+        message: "Root Thumbprint cannot be all zeros (L-04).",
+      };
+      renderPolicyView();
+      return;
+    }
+
+    if ((signer && !thumbprint) || (!signer && thumbprint)) {
+      state.policyFeedback = {
+        ok: false,
+        message: "Signer Subject and Root Thumbprint must be provided together (L-04).",
+      };
+      renderPolicyView();
+      return;
+    }
+
+    const isAllowScope = scope !== "NetworkBlock";
+    if (isAllowScope && !sha256 && !(signer && thumbprint)) {
+      state.policyFeedback = {
+        ok: false,
+        message: "Allow rules require SHA-256 or Signer Subject + Root Thumbprint (L-04).",
+      };
+      renderPolicyView();
+      return;
+    }
+
+    if (
+      (scope === "NetworkBlock" || scope === "NetworkAllow") &&
+      target.includes("/") &&
+      !isLiteralIpOrCidr(target)
+    ) {
+      state.policyFeedback = {
+        ok: false,
+        message: "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
+      };
+      renderPolicyView();
+      return;
+    }
+
+    const rule = {
+      rule_id: `RULE-UI-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+      scope,
+      exe_path_pattern: exePath,
+      sha256: sha256 || null,
+      signer_subject: signer || null,
+      root_thumbprint: thumbprint || null,
+      allowed_target: target || null,
+      created_at_ms: Date.now(),
+      created_by: "user_policy",
+    };
+
+    if (state.isSamplePreview) {
+      state.rules = [rule, ...state.rules];
+      state.policyFeedback = {
+        ok: true,
+        message: `Preview: saved ${rule.scope} rule (${rule.exe_path_pattern})`,
+      };
+      el.policyAddForm.reset();
+      syncPolicyFormHints();
+      setAddRuleFormVisible(false);
+      renderPolicyView();
+      return;
+    }
+
+    const invoke = getInvoke();
+    if (!invoke) {
+      state.policyFeedback = {
+        ok: false,
+        message: "Tauri IPC bridge unavailable outside Tauri runtime.",
+      };
+      renderPolicyView();
+      return;
+    }
+
+    state.isMutatingRule = true;
+    state.policyFeedback = null;
+    renderPolicyView();
+    try {
+      const ack = await invoke("upsert_rule_action", { rule });
+      state.policyFeedback = { ok: true, message: ack };
+      el.policyAddForm.reset();
+      syncPolicyFormHints();
+      setAddRuleFormVisible(false);
+      await refreshAll();
+    } catch (err) {
+      state.policyFeedback = { ok: false, message: formatBackendError(err) };
+      await refreshAll();
+    } finally {
+      state.isMutatingRule = false;
+      renderPolicyView();
+    }
+  }
+
+  async function handleDeleteRule(ruleId) {
+    if (!ruleId || state.isMutatingRule) return;
+
+    if (state.isSamplePreview) {
+      state.rules = state.rules.filter((r) => r.rule_id !== ruleId);
+      state.policyFeedback = {
+        ok: true,
+        message: `Preview: deleted rule ${ruleId}`,
+      };
+      renderPolicyView();
+      return;
+    }
+
+    const invoke = getInvoke();
+    if (!invoke) {
+      state.policyFeedback = {
+        ok: false,
+        message: "Tauri IPC bridge unavailable outside Tauri runtime.",
+      };
+      renderPolicyView();
+      return;
+    }
+
+    state.isMutatingRule = true;
+    state.policyFeedback = null;
+    renderPolicyView();
+    try {
+      const ack = await invoke("delete_rule_action", { ruleId });
+      state.policyFeedback = { ok: true, message: ack };
+      await refreshAll();
+    } catch (err) {
+      state.policyFeedback = { ok: false, message: formatBackendError(err) };
+      await refreshAll();
+    } finally {
+      state.isMutatingRule = false;
+      renderPolicyView();
+    }
+  }
+
+  async function handleCheckDomainRisk(event) {
+    event.preventDefault();
+    const domain = el.domainCheckInput.value.trim();
+    if (!domain || state.isCheckingDomain) return;
+
+    if (state.isSamplePreview) {
+      const lower = domain.toLowerCase();
+      const isNrd = lower.endsWith(".nrd-sample.invalid") || lower.includes("nrd");
+      const isHomograph = lower.includes("xn--") || lower.includes("paypa1");
+      state.domainRiskError = null;
+      state.domainRiskResult = {
+        domain,
+        is_nrd: isNrd,
+        is_homograph: isHomograph,
+        matched_brand: isHomograph ? "paypal.com" : null,
+      };
+      renderPolicyView();
+      return;
+    }
+
+    const invoke = getInvoke();
+    if (!invoke) {
+      state.domainRiskError = "Tauri IPC bridge unavailable outside Tauri runtime.";
+      state.domainRiskResult = null;
+      renderPolicyView();
+      return;
+    }
+
+    state.isCheckingDomain = true;
+    state.domainRiskError = null;
+    renderPolicyView();
+    try {
+      state.domainRiskResult = await invoke("check_domain_risk_action", { domain });
+    } catch (err) {
+      state.domainRiskResult = null;
+      state.domainRiskError = String(err);
+    } finally {
+      state.isCheckingDomain = false;
+      renderPolicyView();
+    }
+  }
+
   function renderAllViews() {
     renderTriageView();
     renderTree();
+    renderPolicyView();
   }
 
   async function refreshAll() {
@@ -1513,7 +2393,11 @@
 
     el.refreshBtn.disabled = true;
     try {
-      const [pingSummary, snapshot, metrics, alerts] = await Promise.all([
+      // Local defense status (honeypot metadata & HKCU readiness) works even when daemon is offline.
+      const localStatusPromise = invoke("fetch_local_defense_status").catch(() => null);
+
+      const [localStatus, pingSummary, snapshot, metrics, alertsRes, rulesRes] = await Promise.all([
+        localStatusPromise,
         invoke("ping_daemon"),
         invoke("fetch_flight_recorder", {
           limit: 250,
@@ -1523,18 +2407,44 @@
         invoke("fetch_alerts", {
           status: null,
           limit: 200,
-        }).catch(() => []),
+        })
+          .then((data) => ({ ok: true, data }))
+          .catch((err) => ({ ok: false, error: String(err) })),
+        invoke("fetch_rules", {
+          scope: null,
+        })
+          .then((data) => ({ ok: true, data }))
+          .catch((err) => ({ ok: false, error: String(err) })),
       ]);
 
+      state.localDefenseStatus = localStatus;
       state.isDaemonOnline = true;
       state.isSamplePreview = false;
       state.snapshot = snapshot;
       state.metrics = metrics;
-      state.alerts = Array.isArray(alerts) ? alerts : [];
+      if (alertsRes.ok) {
+        state.alerts = Array.isArray(alertsRes.data) ? alertsRes.data : [];
+      } else if (!(state.triageFeedback && !state.triageFeedback.ok)) {
+        state.triageFeedback = {
+          ok: false,
+          message: `Failed to refresh alerts: ${alertsRes.error}`,
+        };
+      }
+      if (rulesRes.ok) {
+        state.rules = Array.isArray(rulesRes.data) ? rulesRes.data : [];
+      } else if (!(state.policyFeedback && !state.policyFeedback.ok)) {
+        state.policyFeedback = {
+          ok: false,
+          message: `Failed to refresh policy rules: ${rulesRes.error}`,
+        };
+      }
       hideBanner();
       updateDaemonHeader(`Connected: ${pingSummary}`, metrics);
       renderAllViews();
     } catch (err) {
+      state.localDefenseStatus = await invoke("fetch_local_defense_status").catch(
+        () => state.localDefenseStatus,
+      );
       state.isDaemonOnline = false;
       updateDaemonHeader(null, null);
       showOfflineBanner(String(err));
@@ -1578,6 +2488,8 @@
     }
     if (viewName === "triage") {
       renderTriageView();
+    } else if (viewName === "policy") {
+      renderPolicyView();
     }
   }
 
@@ -1587,8 +2499,13 @@
     state.isDaemonOnline = false;
     state.selectedProcessId = null;
     state.triageFeedback = null;
+    state.policyFeedback = null;
+    state.domainRiskResult = null;
+    state.domainRiskError = null;
     state.snapshot = sample.snapshot;
     state.alerts = sample.alerts;
+    state.rules = sample.rules;
+    state.localDefenseStatus = sample.localDefenseStatus;
     if (!state.selectedAlertId || !sample.alerts.some((a) => a.alert_id === state.selectedAlertId)) {
       state.selectedAlertId = sample.alerts[0]?.alert_id || null;
     }
@@ -1599,14 +2516,47 @@
   el.navTabs.forEach((tab) => {
     tab.addEventListener("click", () => switchView(tab.dataset.view));
   });
-  document.querySelectorAll(".back-to-view2").forEach((btn) => {
-    btn.addEventListener("click", () => switchView("lineage"));
-  });
 
   el.refreshBtn.addEventListener("click", refreshAll);
   el.retryBtn.addEventListener("click", refreshAll);
   el.sampleBtn.addEventListener("click", loadSamplePreview);
   el.triageSampleBtn.addEventListener("click", loadSamplePreview);
+
+  el.policyScopeBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.policyScopeFilter = btn.dataset.scope;
+      renderPolicyView();
+    });
+  });
+
+  el.policyFilter.addEventListener("input", (event) => {
+    state.policyFilterText = event.target.value || "";
+    renderPolicyView();
+  });
+
+  el.toggleAddRuleBtn.addEventListener("click", () => {
+    const currentlyHidden = el.policyAddForm.classList.contains("hidden");
+    setAddRuleFormVisible(currentlyHidden);
+  });
+
+  el.cancelAddRuleBtn.addEventListener("click", () => {
+    el.policyAddForm.reset();
+    syncPolicyFormHints();
+    setAddRuleFormVisible(false);
+  });
+
+  el.ruleScopeInput.addEventListener("change", syncPolicyFormHints);
+  el.ruleTargetInput.addEventListener("input", syncPolicyFormHints);
+
+  el.policyAddForm.addEventListener("submit", handleUpsertRule);
+
+  el.policyRulesBody.addEventListener("click", (event) => {
+    const delBtn = event.target.closest("[data-delete-rule-id]");
+    if (!delBtn) return;
+    handleDeleteRule(delBtn.dataset.deleteRuleId);
+  });
+
+  el.domainCheckForm.addEventListener("submit", handleCheckDomainRisk);
 
   el.filterUnresolvedBtn.addEventListener("click", () => {
     state.alertQueueFilter = "unresolved";
@@ -1632,10 +2582,17 @@
   el.alertQueue.addEventListener("click", (event) => {
     const btn = event.target.closest("[data-alert-id]");
     if (!btn) return;
+    const nextAlertId = btn.dataset.alertId;
     state.launchFocusAlertId = null;
-    state.selectedAlertId = btn.dataset.alertId;
-    state.triageFeedback = null;
+    if (state.selectedAlertId !== nextAlertId) {
+      state.triageFeedback = null;
+    }
+    state.selectedAlertId = nextAlertId;
     renderTriageView();
+  });
+
+  el.optAllowDest.addEventListener("input", () => {
+    syncTriageTargetScopeNote(state.selectedAlertIsNetwork);
   });
 
   el.inspectInView2Btn.addEventListener("click", () => {
@@ -1706,6 +2663,7 @@
   });
 
   document.addEventListener("DOMContentLoaded", async () => {
+    syncPolicyFormHints();
     await loadLaunchMode();
     await refreshAll();
   });

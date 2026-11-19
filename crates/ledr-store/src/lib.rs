@@ -713,6 +713,60 @@ impl LedrStore {
         Ok(rules)
     }
 
+    /// Lists persisted firewall policy rules (`NetworkBlock` followed by `NetworkAllow`) for
+    /// startup WFP redeployment and deny-overrides-allow evaluation (`L-03`, `L-04`).
+    pub fn list_network_rules(&self) -> Result<Vec<AllowlistRuleRecord>, StoreError> {
+        self.list_rules_by_scopes(&[RuleScope::NetworkBlock, RuleScope::NetworkAllow])
+    }
+
+    /// Lists persisted rules matching any scope in `scopes`, preserving the caller's scope
+    /// priority order and ordering within each scope by `created_at_ms DESC, rule_id ASC`
+    /// via `idx_rules_scope_created`.
+    pub fn list_rules_by_scopes(
+        &self,
+        scopes: &[RuleScope],
+    ) -> Result<Vec<AllowlistRuleRecord>, StoreError> {
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reader = self.lock_reader()?;
+        let sql = format!(
+            "SELECT {RULE_COLS} FROM allowlist_rules WHERE scope = ?1 ORDER BY created_at_ms DESC, rule_id ASC"
+        );
+        let mut stmt = reader.prepare(&sql)?;
+        let mut seen = HashSet::with_capacity(scopes.len());
+        let mut rules = Vec::new();
+        for &scope in scopes {
+            if !seen.insert(scope) {
+                continue;
+            }
+            let mut rows = stmt.query(params![scope.as_db_str()])?;
+            while let Some(row) = rows.next()? {
+                rules.push(row_to_rule(row)?);
+            }
+        }
+        Ok(rules)
+    }
+
+    /// Returns `true` if `query_name` (case-insensitive, with or without a trailing DNS root dot)
+    /// already exists in local `dns_queries` history (`L-14` first-seen domain check).
+    pub fn has_seen_dns_domain(&self, query_name: &str) -> Result<bool, StoreError> {
+        let normalized = query_name.trim().trim_end_matches('.');
+        if normalized.is_empty() {
+            return Ok(false);
+        }
+        let with_dot = format!("{normalized}.");
+        let reader = self.lock_reader()?;
+        let found: Option<i64> = reader
+            .query_row(
+                "SELECT 1 FROM dns_queries WHERE query_name COLLATE NOCASE IN (?1, ?2) LIMIT 1",
+                params![normalized, with_dot],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Fetches a single [`AllowlistRuleRecord`] by `rule_id` via the read-only query connection.
     pub fn get_rule(&self, rule_id: &str) -> Result<Option<AllowlistRuleRecord>, StoreError> {
         let reader = self.lock_reader()?;
@@ -1042,6 +1096,42 @@ impl LedrStore {
         let sql = format!("EXPLAIN QUERY PLAN\n{PID_TIME_WINDOW_LOOKUP_SQL}");
         let mut stmt = reader.prepare(&sql)?;
         let mut rows = stmt.query(params![4i64, 1_750_000_000_000i64])?;
+        let mut details = Vec::new();
+        while let Some(row) = rows.next()? {
+            details.push(row.get::<_, String>(3)?);
+        }
+        Ok(details)
+    }
+
+    /// Returns SQLite `EXPLAIN QUERY PLAN` detail lines for scope-filtered `allowlist_rules`
+    /// queries used during startup firewall redeployment and policy lookups.
+    pub fn explain_rules_scope_plan(&self) -> Result<Vec<String>, StoreError> {
+        let reader = self.lock_reader()?;
+        let sql = format!(
+            "EXPLAIN QUERY PLAN
+             SELECT {RULE_COLS} FROM allowlist_rules
+             WHERE scope = ?1
+             ORDER BY created_at_ms DESC, rule_id ASC"
+        );
+        let mut stmt = reader.prepare(&sql)?;
+        let mut rows = stmt.query(params![RuleScope::NetworkBlock.as_db_str()])?;
+        let mut details = Vec::new();
+        while let Some(row) = rows.next()? {
+            details.push(row.get::<_, String>(3)?);
+        }
+        Ok(details)
+    }
+
+    /// Returns SQLite `EXPLAIN QUERY PLAN` detail lines for the case-insensitive local DNS
+    /// history lookup used by [`LedrStore::has_seen_dns_domain`] (`L-14`).
+    pub fn explain_dns_name_nocase_plan(&self) -> Result<Vec<String>, StoreError> {
+        let reader = self.lock_reader()?;
+        let sql = "EXPLAIN QUERY PLAN
+             SELECT 1 FROM dns_queries
+             WHERE query_name COLLATE NOCASE IN (?1, ?2)
+             LIMIT 1";
+        let mut stmt = reader.prepare(sql)?;
+        let mut rows = stmt.query(params!["example.com", "example.com."])?;
         let mut details = Vec::new();
         while let Some(row) = rows.next()? {
             details.push(row.get::<_, String>(3)?);
@@ -1583,12 +1673,14 @@ mod tests {
             "idx_dl_path",
             "idx_dl_sha256",
             "idx_dns_name",
+            "idx_dns_name_nocase",
             "idx_dns_ts_proc",
             "idx_net_ts_proc",
             "idx_processes_created",
             "idx_processes_parent",
             "idx_processes_pid_created",
             "idx_processes_sha256",
+            "idx_rules_scope_created",
         ];
 
         let writer = store.lock_writer().expect("lock writer");

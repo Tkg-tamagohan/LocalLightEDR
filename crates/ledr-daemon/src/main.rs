@@ -10,7 +10,8 @@ use ledr_proto::{
     SensorBackend,
 };
 use ledr_rules::{
-    compute_file_sha256_hex, load_rules_and_pruner_from_dir, EarlyPruner, SigmaEngine,
+    compute_file_sha256_hex, discover_default_prerestricted_interpreters,
+    load_rules_and_pruner_from_dir, EarlyPruner, SigmaEngine, DEFAULT_NRD_FEED_URLS,
 };
 use ledr_sensor_win::defense::{HoneypotManager, WindowsDefenseController};
 use ledr_sensor_win::etw::{
@@ -25,8 +26,11 @@ use tracing_subscriber::EnvFilter;
 struct CliArgs {
     foreground: bool,
     dev_bypass_auth: bool,
+    disable_nrd_refresh: bool,
     db_path: Option<PathBuf>,
     rules_dir: Option<PathBuf>,
+    nrd_cache_path: Option<PathBuf>,
+    nrd_feed_urls: Vec<String>,
     pipe_name: String,
     ui_sha256: Option<String>,
     ui_signer: Option<String>,
@@ -39,8 +43,11 @@ impl Default for CliArgs {
         Self {
             foreground: true,
             dev_bypass_auth: false,
+            disable_nrd_refresh: false,
             db_path: None,
             rules_dir: None,
+            nrd_cache_path: None,
+            nrd_feed_urls: Vec::new(),
             pipe_name: IPC_PIPE_NAME.to_string(),
             ui_sha256: None,
             ui_signer: None,
@@ -65,6 +72,27 @@ where
             "--foreground" => parsed.foreground = true,
             "--service-strict" => parsed.foreground = false,
             "--dev-bypass-auth" => parsed.dev_bypass_auth = true,
+            "--disable-nrd-refresh" => parsed.disable_nrd_refresh = true,
+            "--nrd-feed-url" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--nrd-feed-url requires a URL argument"))?;
+                let trimmed = val.to_string_lossy().trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--nrd-feed-url cannot be empty");
+                }
+                parsed.nrd_feed_urls.push(trimmed);
+            }
+            "--nrd-cache" => {
+                let val = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--nrd-cache requires a file path argument"))?;
+                let trimmed = val.to_string_lossy().trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--nrd-cache cannot be empty");
+                }
+                parsed.nrd_cache_path = Some(PathBuf::from(val));
+            }
             "--db" => {
                 let val = iter
                     .next()
@@ -224,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = parse_cli_args(std::env::args_os())?;
     if cli.show_help {
         println!(
-            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>]"
+            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>]"
         );
         return Ok(());
     }
@@ -262,6 +290,30 @@ async fn main() -> anyhow::Result<()> {
     let authorized_bridge_sha256 =
         resolve_existing_sha256(&[Path::new(AUTHORIZED_BRIDGE_EXE_PATH)]);
 
+    let nrd_cache_path = cli.nrd_cache_path.clone().or_else(|| {
+        db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|dir| dir.join("nrd-cache.txt"))
+    });
+    let nrd_feed_urls = if cli.nrd_feed_urls.is_empty() {
+        DEFAULT_NRD_FEED_URLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        cli.nrd_feed_urls.clone()
+    };
+
+    let defense_controller = Arc::new(WindowsDefenseController::new());
+    if let Err(err) = defense_controller.init_wfp_session() {
+        tracing::warn!(
+            error = %err,
+            "WFP dynamic session could not be initialized (non-elevated session?); outbound WFP filtering will retry on demand"
+        );
+    }
+
+    let preemptive_startup_executables = discover_default_prerestricted_interpreters();
     let config = DaemonConfig {
         pipe_name: cli.pipe_name.clone(),
         dev_mode_bypass_ui_auth: cli.dev_bypass_auth,
@@ -270,19 +322,33 @@ async fn main() -> anyhow::Result<()> {
         authorized_ui_signer: cli.ui_signer.clone(),
         authorized_ui_root_thumbprint: cli.ui_root_thumbprint.clone(),
         authorized_bridge_sha256,
+        preemptive_startup_executables,
+        nrd_refresh_enabled: !cli.disable_nrd_refresh,
+        nrd_cache_path,
+        nrd_feed_urls,
         ..DaemonConfig::default()
     };
+    let wfp_defense = Arc::clone(&defense_controller);
+    let outbound_firewall_enabled = config.outbound_firewall_enabled;
     let engine = DaemonEngine::start_with_controllers(
         store,
         sigma,
         pruner,
         config,
-        Arc::new(WindowsDefenseController::new()),
+        defense_controller,
         Arc::new(Session0ToastLauncher::with_foreground_fallback(
             ui_exe,
             cli.foreground,
         )),
     );
+    if outbound_firewall_enabled {
+        if let Err(err) = wfp_defense.set_wfp_drop_sink(engine.wfp_drop_sink()) {
+            tracing::warn!(
+                error = %err,
+                "WFP net-event drop sink could not be attached (non-elevated session?); continuing without WFP drop capture"
+            );
+        }
+    }
 
     let mut honeypot_mgr = HoneypotManager::new();
     let honeypot_paths = match honeypot_mgr.deploy_honeypots() {
@@ -299,9 +365,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start ETW capture directly into TwoLaneSender BEFORE Toolhelp32 snapshot capture so
-    // processes spawned or exiting during snapshot enumeration are not missed (BUG_0001, BUG_0006).
-    let bridge_sender = engine.sender();
+    // Start ETW capture directly into ClassifiedEventSender BEFORE Toolhelp32 snapshot capture so
+    // processes spawned or exiting during snapshot enumeration are not missed (BUG_0001, BUG_0006, L-10).
+    let bridge_sender = engine.classified_sender();
     let etw_sink: EventSinkFn = Arc::new(move |ev| bridge_sender.blocking_send(ev).is_ok());
     let mut etw_sensor = WindowsEtwSensor::with_sink(etw_sink, DEFAULT_ETW_SESSION_NAME);
     etw_sensor.set_honeypot_paths(honeypot_paths);
@@ -332,11 +398,15 @@ async fn main() -> anyhow::Result<()> {
             0
         }
     };
+    let wfp_report = engine.deploy_persisted_network_rules();
     tracing::info!(
         seeded_processes = seeded_count,
         sigma_rules = rule_count,
+        wfp_applied = wfp_report.applied,
+        wfp_failed = wfp_report.failed,
+        nrd_entries = engine.nrd_entry_count(),
         db = %db_path.display(),
-        "initialized ActiveProcessTable and SQLite WAL store"
+        "initialized ActiveProcessTable, WFP firewall rules, and SQLite WAL store"
     );
 
     let ipc_handle = start_ipc_server(Arc::clone(&engine))?;
@@ -362,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(Ok(())) => {}
     }
 
+    wfp_defense.clear_wfp_drop_sink();
     ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await?;
     tracing::info!("ledr-daemon shutdown complete");
@@ -378,8 +449,11 @@ mod tests {
         let def = parse_cli_args(["ledr-daemon"]).expect("default args");
         assert!(def.foreground);
         assert!(!def.dev_bypass_auth);
+        assert!(!def.disable_nrd_refresh);
         assert_eq!(def.db_path, None);
         assert_eq!(def.rules_dir, None);
+        assert_eq!(def.nrd_cache_path, None);
+        assert!(def.nrd_feed_urls.is_empty());
         assert_eq!(def.pipe_name, IPC_PIPE_NAME);
         assert_eq!(def.ui_sha256, None);
         assert_eq!(def.ui_signer, None);
@@ -389,6 +463,13 @@ mod tests {
             "ledr-daemon",
             "--foreground",
             "--dev-bypass-auth",
+            "--disable-nrd-refresh",
+            "--nrd-feed-url",
+            "file:///C:/Temp/nrd7.txt",
+            "--nrd-feed-url",
+            "file:///C:/Temp/nrd14-8.txt",
+            "--nrd-cache",
+            r"C:\Temp\nrd-cache.txt",
             "--db",
             r"C:\Temp\test.db",
             "--rules",
@@ -405,6 +486,18 @@ mod tests {
         .expect("custom args");
         assert!(custom.foreground);
         assert!(custom.dev_bypass_auth);
+        assert!(custom.disable_nrd_refresh);
+        assert_eq!(
+            custom.nrd_feed_urls,
+            vec![
+                "file:///C:/Temp/nrd7.txt".to_string(),
+                "file:///C:/Temp/nrd14-8.txt".to_string(),
+            ]
+        );
+        assert_eq!(
+            custom.nrd_cache_path,
+            Some(PathBuf::from(r"C:\Temp\nrd-cache.txt"))
+        );
         assert_eq!(custom.db_path, Some(PathBuf::from(r"C:\Temp\test.db")));
         assert_eq!(custom.rules_dir, Some(PathBuf::from(r"C:\Temp\rules")));
         assert_eq!(custom.pipe_name, r"\\.\pipe\custom-pipe");
@@ -454,6 +547,10 @@ mod tests {
             "signer + root thumbprint pair must be accepted"
         );
         assert!(parse_cli_args(["ledr-daemon", "--ui-root-thumbprint"]).is_err());
+        assert!(parse_cli_args(["ledr-daemon", "--nrd-feed-url"]).is_err());
+        assert!(parse_cli_args(["ledr-daemon", "--nrd-feed-url", "   "]).is_err());
+        assert!(parse_cli_args(["ledr-daemon", "--nrd-cache"]).is_err());
+        assert!(parse_cli_args(["ledr-daemon", "--nrd-cache", ""]).is_err());
         assert!(parse_cli_args(["ledr-daemon", "--unknown"]).is_err());
     }
 }

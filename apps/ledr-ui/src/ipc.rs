@@ -5,6 +5,7 @@ use ledr_proto::{
     IPC_PIPE_NAME, IpcRequest, IpcResponse, PipelineMetrics, RuleScope, read_ipc_frame,
     write_ipc_frame,
 };
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
@@ -368,6 +369,15 @@ pub(crate) fn verify_named_pipe_server_process(pipe: &File) -> Result<(), String
     )
 }
 
+/// Domain risk lookup result returned by `IpcRequest::CheckDomainRisk` (`L-13`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainRiskView {
+    pub domain: String,
+    pub is_nrd: bool,
+    pub is_homograph: bool,
+    pub matched_brand: Option<String>,
+}
+
 /// Client for exchanging 4-byte little-endian length-prefixed JSON frames with `ledr-daemon`.
 #[derive(Debug, Clone)]
 pub struct IpcClient {
@@ -507,6 +517,24 @@ impl IpcClient {
         let req = IpcRequest::ListRules { scope };
         parse_rules_response(self.send_request(&req)?)
     }
+
+    /// Creates or updates a policy rule via `ledr-daemon` and reconciles live WFP filters.
+    pub fn upsert_rule(&self, rule: AllowlistRuleRecord) -> Result<String, String> {
+        let req = IpcRequest::UpsertRule { rule };
+        parse_ack_response(self.send_request(&req)?)
+    }
+
+    /// Deletes a persisted policy rule by `rule_id` and reconciles live WFP filters.
+    pub fn delete_rule(&self, rule_id: String) -> Result<String, String> {
+        let req = IpcRequest::DeleteRule { rule_id };
+        parse_ack_response(self.send_request(&req)?)
+    }
+
+    /// Queries the live NRD + homograph domain risk engine in `ledr-daemon` (`L-13`).
+    pub fn check_domain_risk(&self, domain: String) -> Result<DomainRiskView, String> {
+        let req = IpcRequest::CheckDomainRisk { domain };
+        parse_domain_risk_response(self.send_request(&req)?)
+    }
 }
 
 pub(crate) fn parse_ping_response(response: IpcResponse) -> Result<String, String> {
@@ -557,6 +585,23 @@ pub(crate) fn parse_rules_response(
     match response {
         IpcResponse::Rules(rules) => Ok(rules),
         other => Err(unexpected_or_daemon_error(other, "Rules")),
+    }
+}
+
+pub(crate) fn parse_domain_risk_response(response: IpcResponse) -> Result<DomainRiskView, String> {
+    match response {
+        IpcResponse::DomainRisk {
+            domain,
+            is_nrd,
+            is_homograph,
+            matched_brand,
+        } => Ok(DomainRiskView {
+            domain,
+            is_nrd,
+            is_homograph,
+            matched_brand,
+        }),
+        other => Err(unexpected_or_daemon_error(other, "DomainRisk")),
     }
 }
 

@@ -31,6 +31,21 @@
 - `dev_bypass_auth` は実行時呼び出し元認証の迂回であり、使用しない署名設定の要求をスキップする。
 - 実機依存の挙動（ツリー終了の非同期性など）は合成ユニットテストでは検証済みと扱わず、Windows 10/11 クライアント SKU の実機 E2E 対象として残す。
 
+## Phase 3 で確立した不変条件
+
+- デュアルスタック DNS 履歴（`ProcessDnsHistory`）は `LatestDomainIps` で IPv4 と IPv6 の最新 IP 集合と時刻を独立管理し、`canonical_ip` により IPv4 射影 IPv6 を参照時に正規化し、遅延応答で既存エントリのより新しい時刻を後退させない。
+  各 `(process_instance_id, IpAddr)` エントリは複数ドメイン候補（上限 `MAX_DOMAINS_PER_PROCESS_IP = 16`）を保持し、複数候補の評価は `select_outbound_decision_for_domains` の優先順位（`ProtectedOs`、`BlockedByRule`、`AllowedByRule`、最新候補の順）へ統一する。
+  プロセス終了後や容量退避後でも `domains_for_exe_ip` と `current_domains_by_ip_for_exe` で全ドメイン横断の最新履歴を照合し、共有 IP の遮断優先（deny-overrides-allow）を維持する。
+- WFP のドメイン由来フィルタ（`WfpFilterOrigin::DomainPolicy { domain_hints }`）は複数ドメイン集合（上限 `MAX_DOMAIN_HINTS_PER_FILTER = 32`）を保持し、アプリ全体、リテラル IP、CIDR、ワイルドカード IP のように `domain_hint` なしで静的に一致するルールではヒントを空のまま保ち、ドメイン固有ルールのみ `collect_domain_specific_blocked_hints` と `ensure_domain_policy_block_hints` で付与する。
+  ポリシー変更時の `reconcile_persisted_rules_with_baseline` は、変更前後比較で新規に必要となったフィルタ追加失敗へ `newly_required = true` を付与し、削除、縮小、上書きされたドメインルールの失敗も `removal_sources` で元ルール ID へ帰属させて補償ロールバックを漏らさない。
+- BFE コールバック経路の `ingest_wfp_drop_event` は非ブロッキングかつ同期 `tracing` 出力を持たず、チャネル満杯時は一次 FIFO と満杯時 `coalesced_by_exe` の二段有界キュー `WfpDropOverflowQueue`（一次キュー部分ドレイン時も両層横断で重複判定）へ退避する。
+  同一実行ファイルの別宛先上書き回数は `wfp_drop_overflow_coalesced` で計測し、非同期ワーカー側の `maybe_log_wfp_drop_overflow_coalesced` からべき乗間引きで警告ログを出す。
+- `on_wfp_drop_dequeued`、`flush_ready_pending_wfp_drops`、`handle_ambiguous_wfp_drop` では、単一候補時は `lookup_domains_for_process`、複数候補時は 60 秒鮮度窓付きの `lookup_fresh_domains_for_process`（`AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS = 60_000`）を用い、猶予保留、早期解除、最終評価の鮮度条件を対称に保つ。
+- NRD 更新スレッドの停止は `spawn_blocking` を使わず `NrdThreadHandle`（`oneshot` と `InFlightGuard::drop`）で非ブロッキング待機し、ワーカー未チェックポイント時は待機前に `checkpoint_truncate` を優先実行し、予算超過時はデタッチして Tokio `Runtime::drop` のハングを防ぐ。
+  ファイル形式 NRD は `read_bounded_reader_cancellable`（`NRD_FILE_READ_CHUNK_BYTES = 64 * 1024`）で各チャンク前後および `ErrorKind::Interrupted` 再試行前にキャンセルを確認し、`NrdCancelToken::enter_blocking_read()` によりブロッキング読み取り突入を壁時計スリープなしで観測可能に保つ。
+- 統合テストでは優先度レーン分離をまたぐ異レーン完了バリアおよび終了済み込み `active_process_table_len()` による同期を禁止し、`GateBinaryInspector` のようなマルチスレッド Tokio 上の同期ブロッキングモックには `RuntimeFlavor::MultiThread` ガード付き `block_in_place` を使う。
+- 実 BFE カーネル WFP フィルタ登録、`FwpmNetEventSubscribe1` 実イベント捕捉、実 ETW `DNS-Client`、および応答しない実 UNC/SMB 共有での NRD 挙動は合成テストでは検証済みと扱わず、Windows 10/11 クライアント SKU の実機 E2E 対象として残す。
+
 ## 標準検証コマンド
 
 - 静的検査：`cargo clippy --workspace --all-targets --locked -- -D warnings`

@@ -6012,10 +6012,21 @@ struct GateBinaryInspector {
 impl BinaryInspector for GateBinaryInspector {
     fn inspect(&self, exe_path: &str) -> BinaryIdentity {
         if exe_path.to_ascii_lowercase().contains(&self.target_substr) {
-            self.entered.store(true, Ordering::Release);
-            let deadline = Instant::now() + self.wait_cap;
-            while !self.release.load(Ordering::Acquire) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
+            let wait_loop = || {
+                self.entered.store(true, Ordering::Release);
+                let deadline = Instant::now() + self.wait_cap;
+                while !self.release.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            // Hand off the Tokio worker core before blocking in `std::thread::sleep` so the
+            // multi-threaded runtime's timer driver is never starved by this test gate.
+            if tokio::runtime::Handle::try_current()
+                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            {
+                tokio::task::block_in_place(wait_loop);
+            } else {
+                wait_loop();
             }
         }
         BinaryIdentity {
@@ -6481,6 +6492,11 @@ async fn daemon_p3_39_rotated_or_stale_dns_history_stops_blocking_cidr_allowed_i
     // Part B: Ambiguous drop with fresh (<60s) DNS for a blocked domain alerts under the app
     // block WITHOUT minting a sticky `DomainPolicy` Block filter; once >60s old, CIDR allow wins.
     let shared_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 60));
+    assert!(
+        wait_until(1_000, || engine.metrics().telemetry_processed >= 2).await,
+        "Part A telemetry DNS queries must finish before Part B barrier baseline"
+    );
+    let before_telemetry = engine.metrics().telemetry_processed;
     engine
         .sender()
         .send(SensorEvent::DnsQuery {
@@ -6492,19 +6508,13 @@ async fn daemon_p3_39_rotated_or_stale_dns_history_stops_blocking_cidr_allowed_i
         })
         .await
         .expect("dns before block rule");
-    let p3 = ProcessIdentity::new(9103, unix_ms_to_filetime(now_ms - 300));
-    engine
-        .sender()
-        .send(SensorEvent::ProcessStart {
-            identity: p3,
-            parent_pid: 4,
-            exe_path: exe.to_string(),
-            command_line: exe.to_string(),
-            user_sid: None,
+    assert!(
+        wait_until(1_000, || {
+            engine.metrics().telemetry_processed > before_telemetry
         })
-        .await
-        .expect("marker proc");
-    assert!(wait_until(1_000, || engine.active_process_table_len() == 3).await);
+        .await,
+        "stale-trap.example DnsQuery on Telemetry lane must finish before adding block rule"
+    );
 
     engine
         .upsert_policy_rule(&AllowlistRuleRecord {
@@ -6660,7 +6670,9 @@ async fn daemon_p3_40_unrelated_domain_permit_removal_failure_scoped_away_from_g
         .handle;
     defense.add_fail_wfp_remove_handle(permit_handle);
 
-    // Associate `shared_ip` with blocked `evil.example` in DNS history (`p3` acts as barrier).
+    // Associate `shared_ip` with blocked `evil.example` in DNS history and synchronize on the
+    // Telemetry lane completion counter rather than a cross-lane HighPriority `ProcessStart`.
+    let before_telemetry = engine.metrics().telemetry_processed;
     engine
         .sender()
         .send(SensorEvent::DnsQuery {
@@ -6672,19 +6684,13 @@ async fn daemon_p3_40_unrelated_domain_permit_removal_failure_scoped_away_from_g
         })
         .await
         .expect("send evil dns");
-    let p3 = ProcessIdentity::new(9203, unix_ms_to_filetime(now_ms - 300));
-    engine
-        .sender()
-        .send(SensorEvent::ProcessStart {
-            identity: p3,
-            parent_pid: 4,
-            exe_path: exe.to_string(),
-            command_line: exe.to_string(),
-            user_sid: None,
+    assert!(
+        wait_until(1_000, || {
+            engine.metrics().telemetry_processed > before_telemetry
         })
-        .await
-        .expect("send barrier proc");
-    assert!(wait_until(1_000, || engine.active_process_table_len() == 3).await);
+        .await,
+        "evil.example DnsQuery on Telemetry lane must finish before policy rule mutations"
+    );
 
     // 1. Saving an unrelated domain rule (`good.example`) on the SAME exe MUST succeed despite
     //    `remove_domain_policy_permit` failing for `evil.example`'s IP permit.
@@ -6795,7 +6801,8 @@ async fn daemon_p3_41_unapplied_app_block_surfaces_failure_for_subsumed_ip_block
 ///    release the stale `DomainPolicy` Block filter once both domains have migrated away.
 /// 2. IPv4-only DNS rotation preserves an existing IPv6 `DomainPolicy` Block filter even after the
 ///    original querying process exited.
-/// 3. An out-of-order older-timestamp `DnsQuery` does not re-materialize a retired IP Block.
+/// 3. An out-of-order older-timestamp `DnsQuery` (both direct Telemetry lane and domain-rule
+///    promoted HighPriority lane via `classified_sender()`) does not re-materialize a retired IP Block.
 #[tokio::test]
 async fn daemon_p3_42_shared_ip_dual_stack_and_out_of_order_dns_block_invalidation() {
     use std::net::Ipv6Addr;
@@ -6961,8 +6968,17 @@ async fn daemon_p3_42_shared_ip_dual_stack_and_out_of_order_dns_block_invalidati
         "shared_v4 block must be removed once both domains migrated away"
     );
 
+    // Synchronize all 5 prior Telemetry `DnsQuery` events (`one v4`, `one v6`, `two v4`,
+    // `one v4 move`, `two v4 move`) so `telemetry_processed` reflects a clean baseline before
+    // sending the delayed out-of-order query.
+    assert!(
+        wait_until(1_000, || engine.metrics().telemetry_processed >= 5).await,
+        "all 5 prior Telemetry DnsQuery events must complete before baseline snapshot"
+    );
+
     // Delayed out-of-order query for `two.example` -> `shared_v4` with an older timestamp (`now_ms + 5`)
-    // must NOT re-install the retired Block filter.
+    // on the Telemetry lane must NOT re-install the retired Block filter.
+    let before_telemetry = engine.metrics().telemetry_processed;
     engine
         .sender()
         .send(SensorEvent::DnsQuery {
@@ -6973,24 +6989,861 @@ async fn daemon_p3_42_shared_ip_dual_stack_and_out_of_order_dns_block_invalidati
             timestamp_ms: now_ms + 5,
         })
         .await
-        .expect("stale out-of-order dns");
-    let p3 = ProcessIdentity::new(9303, unix_ms_to_filetime(now_ms - 300));
+        .expect("stale out-of-order dns (telemetry lane)");
+    assert!(
+        wait_until(1_000, || {
+            engine.metrics().telemetry_processed > before_telemetry
+        })
+        .await,
+        "delayed out-of-order DnsQuery on Telemetry lane must be processed"
+    );
+    assert!(
+        !engine.has_active_wfp_filter(exe, Some(shared_v4), false),
+        "out-of-order older DnsQuery (Telemetry lane) must not re-materialize retired shared_v4 Block"
+    );
+
+    // Production-equivalent path: with domain rules active, `classified_sender()` promotes
+    // external `DnsQuery` onto the HighPriority lane (`L-10`). Synchronize prior HighPriority
+    // events (`p1 start`, `p2 start`, `p1 stop`), verify promotion, wait for
+    // `high_priority_processed` to increment, and confirm the retired Block filter is not re-created.
+    assert!(
+        wait_until(1_000, || engine.metrics().high_priority_processed >= 3).await,
+        "prior HighPriority events (p1 start, p2 start, p1 stop) must complete before baseline"
+    );
+    let classified = engine.classified_sender();
+    let promoted_stale_dns = SensorEvent::DnsQuery {
+        pid: p2.pid,
+        query_name: "two.example".to_string(),
+        query_type: 1,
+        resolved_ips: vec![shared_v4],
+        timestamp_ms: now_ms + 6,
+    };
+    assert!(
+        classified.should_promote(&promoted_stale_dns),
+        "with domain rules active, external DnsQuery via classified_sender() must promote to HighPriority"
+    );
+    let before_hp = engine.metrics().high_priority_processed;
+    classified
+        .send(promoted_stale_dns)
+        .await
+        .expect("stale out-of-order dns (classified HighPriority lane)");
+    assert!(
+        wait_until(1_000, || {
+            engine.metrics().high_priority_processed > before_hp
+        })
+        .await,
+        "delayed out-of-order DnsQuery promoted via classified_sender() must be processed on HighPriority lane"
+    );
+    assert!(
+        !engine.has_active_wfp_filter(exe, Some(shared_v4), false),
+        "out-of-order older DnsQuery (HighPriority lane) must not re-materialize retired shared_v4 Block"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-43` (`R-07` / `R-03`, `L-03` / `L-10` / `AUTO-05`):
+/// 1. Under a pre-emptively restricted single process with a domain-scoped `NetworkAllow` rule for
+///    `good.example`, processing `A 198.51.100.10 (t=1000)` -> `AAAA 2001:db8::1 (t=3000)` ->
+///    late-arriving `A 198.51.100.20 (t=2000)` tracks IPv4 and IPv6 independently so the newer
+///    IPv4 `.20` materializes a WFP Permit (connecting produces zero suspends/alerts) while
+///    preserving the IPv6 `2001:db8::1` Permit.
+/// 2. A genuinely stale `A` response (`t=500`, older than the latest IPv4 `t=2000`) is rejected
+///    and must neither materialize a Permit nor wake a parked `WfpDropEvent` early into a false
+///    suspend/alert before the real fresh `A` response arrives within the grace window.
+#[tokio::test]
+async fn daemon_p3_43_dual_stack_out_of_order_dns_permit_and_stale_drop_rejection() {
+    use std::net::Ipv6Addr;
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let exe = r"C:\Temp\dual_stack_allow.exe";
+    let sha = "a".repeat(64);
+    inspector.register(exe, Some(&sha), None);
+
+    let now_ms = current_unix_ms();
+    let base_ts = now_ms - 4_000;
+
+    store
+        .upsert_rule(&AllowlistRuleRecord {
+            rule_id: "R-ALLOW-GOOD-DUALSTACK".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some(sha),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("good.example".to_string()),
+            created_at_ms: now_ms - 10_000,
+            created_by: "seed".to_string(),
+        })
+        .expect("seed good.example allow rule");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            preemptive_startup_executables: vec![exe.to_string()],
+            wfp_drop_dns_grace_ms: 600,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        inspector,
+    );
+
+    let p1 = ProcessIdentity::new(9401, unix_ms_to_filetime(now_ms - 10_000));
     engine
         .sender()
         .send(SensorEvent::ProcessStart {
-            identity: p3,
+            identity: p1,
             parent_pid: 4,
             exe_path: exe.to_string(),
             command_line: exe.to_string(),
             user_sid: None,
         })
         .await
-        .expect("barrier proc");
-    assert!(wait_until(1_000, || engine.active_process_table_len() == 2).await);
+        .expect("start single pre-restricted process");
     assert!(
-        !engine.has_active_wfp_filter(exe, Some(shared_v4), false),
-        "out-of-order older DnsQuery must not re-materialize retired shared_v4 Block"
+        wait_until(1_000, || {
+            engine.active_process_table_len() == 1 && engine.metrics().high_priority_processed >= 1
+        })
+        .await,
+        "ProcessStart must complete before DNS sequence"
     );
 
+    let classified = engine.classified_sender();
+    let v4_t1000 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+    let v4_t2000 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
+    let v6_t3000 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1));
+
+    // Step 1: A 198.51.100.10 (t=1000)
+    let dns_v4_10 = SensorEvent::DnsQuery {
+        pid: p1.pid,
+        query_name: "good.example".to_string(),
+        query_type: 1,
+        resolved_ips: vec![v4_t1000],
+        timestamp_ms: base_ts + 1_000,
+    };
+    assert!(
+        classified.should_promote(&dns_v4_10),
+        "external DnsQuery with active domain rule must promote via classified_sender()"
+    );
+    let hp_before = engine.metrics().high_priority_processed;
+    classified.send(dns_v4_10).await.expect("send A .10 t=1000");
+    assert!(
+        wait_until(1_000, || {
+            engine.metrics().high_priority_processed > hp_before
+                && engine.has_active_wfp_filter(exe, Some(v4_t1000), true)
+        })
+        .await,
+        "A 198.51.100.10 (t=1000) must materialize WFP Permit"
+    );
+
+    // Step 2: AAAA 2001:db8::1 (t=3000)
+    let hp_before = engine.metrics().high_priority_processed;
+    classified
+        .send(SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "good.example".to_string(),
+            query_type: 28,
+            resolved_ips: vec![v6_t3000],
+            timestamp_ms: base_ts + 3_000,
+        })
+        .await
+        .expect("send AAAA 2001:db8::1 t=3000");
+    assert!(
+        wait_until(1_000, || {
+            engine.metrics().high_priority_processed > hp_before
+                && engine.has_active_wfp_filter(exe, Some(v6_t3000), true)
+        })
+        .await,
+        "AAAA 2001:db8::1 (t=3000) must materialize IPv6 WFP Permit"
+    );
+
+    // Step 3: Late-arriving A 198.51.100.20 (t=2000) — older than AAAA (t=3000) but newer than
+    // previous A (t=1000). Must be accepted per-family, materialize IPv4 `.20` Permit, and retain
+    // IPv6 `2001:db8::1` Permit.
+    let hp_before = engine.metrics().high_priority_processed;
+    classified
+        .send(SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "good.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![v4_t2000],
+            timestamp_ms: base_ts + 2_000,
+        })
+        .await
+        .expect("send late A .20 t=2000");
+    assert!(
+        wait_until(1_000, || engine.metrics().high_priority_processed > hp_before).await,
+        "late A 198.51.100.20 (t=2000) must be processed"
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(v4_t2000), true),
+        "late-arriving A 198.51.100.20 (t=2000) must materialize WFP Permit despite newer AAAA (t=3000)"
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(v6_t3000), true),
+        "IPv4 A update must preserve existing IPv6 2001:db8::1 WFP Permit"
+    );
+
+    // Connecting to both `.20` and `2001:db8::1` with `domain_hint: None` (resolved solely from
+    // ProcessDnsHistory) must be allowed with zero suspends and zero alerts.
+    for (dst_ip, ts_off) in [(v4_t2000, 3_100), (v6_t3000, 3_200)] {
+        let conn = SensorEvent::NetworkConnect {
+            pid: p1.pid,
+            protocol: 6,
+            dst_ip,
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: base_ts + ts_off,
+        };
+        let promoted = classified.should_promote(&conn);
+        let before_hp = engine.metrics().high_priority_processed;
+        let before_tel = engine.metrics().telemetry_processed;
+        classified.send(conn).await.expect("send allowed connect");
+        assert!(
+            wait_until(1_000, || {
+                if promoted {
+                    engine.metrics().high_priority_processed > before_hp
+                } else {
+                    engine.metrics().telemetry_processed > before_tel
+                }
+            })
+            .await,
+            "NetworkConnect to {dst_ip} must be processed"
+        );
+    }
+    assert!(
+        defense.suspends().is_empty(),
+        "allowed connections to .20 and 2001:db8::1 must never suspend the process"
+    );
+    assert!(
+        store.list_alerts(None, 20).expect("list alerts").is_empty(),
+        "allowed connections to .20 and 2001:db8::1 must emit zero alerts"
+    );
+
+    // Part 2 (`R-03`): Park a `WfpDropEvent` for a rotated target IP `198.51.100.30` during the
+    // grace window, then inject a genuinely stale `A` response (`t=500 < latest IPv4 t=2000`).
+    // The stale response must be rejected without minting a Permit and without prematurely waking
+    // the parked drop into a false suspend/alert.
+    let v4_next = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30));
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 43,
+        rule_handle: 43,
+        exe_path: exe.to_string(),
+        protocol: 6,
+        dst_ip: v4_next,
+        dst_port: 443,
+        timestamp_ms: base_ts + 3_300,
+    }));
+
+    // Synchronize via a Tier-3 Telemetry event: `run_pipeline` drains Tier-2b (`wfp_drop_rx`)
+    // strictly before Tier-3 Telemetry, so once this Telemetry event completes, `v4_next` is
+    // deterministically parked inside `pending_wfp_drops`.
+    let before_tel = engine.metrics().telemetry_processed;
+    engine
+        .sender()
+        .send(SensorEvent::DnsQuery {
+            pid: 99_999,
+            query_name: "tier3-barrier.local".to_string(),
+            query_type: 1,
+            resolved_ips: Vec::new(),
+            timestamp_ms: base_ts + 3_301,
+        })
+        .await
+        .expect("send tier3 telemetry barrier");
+    assert!(
+        wait_until(1_000, || engine.metrics().telemetry_processed > before_tel).await,
+        "Tier-3 barrier must confirm WfpDropEvent has been dequeued and parked"
+    );
+
+    // Send stale `A 198.51.100.30 (t=500)` for `good.example`.
+    let hp_before = engine.metrics().high_priority_processed;
+    classified
+        .send(SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "good.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![v4_next],
+            timestamp_ms: base_ts + 500,
+        })
+        .await
+        .expect("send stale A .30 t=500");
+    assert!(
+        wait_until(1_000, || engine.metrics().high_priority_processed > hp_before).await,
+        "stale A (t=500) must finish pipeline processing"
+    );
+    assert!(
+        !engine.has_active_wfp_filter(exe, Some(v4_next), true),
+        "stale A (t=500 < latest IPv4 t=2000) must be rejected and must not materialize Permit"
+    );
+    assert!(
+        defense.suspends().is_empty(),
+        "rejected stale A (t=500) must NOT prematurely flush parked WfpDropEvent into false suspend"
+    );
+    assert!(
+        store.list_alerts(None, 20).expect("list alerts").is_empty(),
+        "rejected stale A (t=500) must NOT trigger a false alert"
+    );
+
+    // Now deliver the real fresh `A 198.51.100.30 (t=3500)` within the grace window: this must
+    // authorize the parked `WfpDropEvent`, install `.30`'s Permit, and keep IPv6 Permit intact.
+    let hp_before = engine.metrics().high_priority_processed;
+    classified
+        .send(SensorEvent::DnsQuery {
+            pid: p1.pid,
+            query_name: "good.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![v4_next],
+            timestamp_ms: base_ts + 3_500,
+        })
+        .await
+        .expect("send fresh A .30 t=3500");
+    assert!(
+        wait_until(1_000, || {
+            engine.metrics().high_priority_processed > hp_before
+                && engine.has_active_wfp_filter(exe, Some(v4_next), true)
+        })
+        .await,
+        "fresh A (t=3500) within grace window must authorize parked drop and materialize .30 Permit"
+    );
+    assert!(
+        engine.has_active_wfp_filter(exe, Some(v6_t3000), true),
+        "IPv6 2001:db8::1 Permit must remain active after fresh IPv4 rotation"
+    );
+
+    // Shutdown flushes any remaining pending drops immediately, confirming the parked drop was
+    // resolved cleanly without suspending or alerting.
     engine.shutdown_and_flush().await.expect("shutdown");
+    assert!(
+        defense.suspends().is_empty(),
+        "no suspend must occur across full dual-stack + stale/fresh grace sequence"
+    );
+    assert!(
+        store.list_alerts(None, 20).expect("list alerts").is_empty(),
+        "no alert must occur across full dual-stack + stale/fresh grace sequence"
+    );
+}
+
+/// `DAEMON-P3-44` (`R-13`, `L-10`): Deterministically pause the pipeline worker via
+/// `GateBinaryInspector` so `wfp_drop_tx` (capacity 4) and `wfp_drop_overflow.queue` (capacity 4)
+/// fill completely, then inject multiple distinct destination IPs for the same `app_exe` plus
+/// distinct other executables into `coalesced_by_exe`. Before releasing the gate, verify both
+/// `wfp_drop_overflow_pushed() > 0` and `wfp_drop_overflow_coalesced() > 0`; after releasing,
+/// verify the latest coalesced destination IP for `app_exe` alerts and all other apps alert with
+/// zero loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p3_44_deterministic_wfp_drop_overflow_coalescing_preserves_latest_and_other_apps() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let inspector = Arc::new(GateBinaryInspector {
+        target_substr: "wfp_overflow_gate.exe".to_string(),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        wait_cap: Duration::from_secs(5),
+    });
+
+    let gate_exe = r"C:\Tools\wfp_overflow_gate.exe";
+    let app_exe = r"C:\Temp\coalesce_app.exe";
+    let other_1 = r"C:\Temp\coalesce_other_1.exe";
+    let other_2 = r"C:\Temp\coalesce_other_2.exe";
+    let other_3 = r"C:\Temp\coalesce_other_3.exe";
+    let now_ms = current_unix_ms();
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            high_priority_capacity: 4,
+            telemetry_capacity: 64,
+            preemptive_startup_executables: vec![
+                app_exe.to_string(),
+                other_1.to_string(),
+                other_2.to_string(),
+                other_3.to_string(),
+            ],
+            wfp_drop_dns_grace_ms: 0,
+            ..DaemonConfig::default()
+        },
+        defense,
+        notifier,
+        inspector,
+    );
+
+    // Start gate process, 2 instances of `app_exe` (multi-instance -> AppWfpAlertDedup per
+    // `(exe, dst_ip)`), and 1 instance each of 3 distinct other apps (`coalesced_by_exe` cap = 4).
+    let gate_proc = ProcessIdentity::new(9500, unix_ms_to_filetime(now_ms - 1_000));
+    for (proc_id, exe) in [
+        (gate_proc, gate_exe),
+        (
+            ProcessIdentity::new(9501, unix_ms_to_filetime(now_ms - 900)),
+            app_exe,
+        ),
+        (
+            ProcessIdentity::new(9502, unix_ms_to_filetime(now_ms - 800)),
+            app_exe,
+        ),
+        (
+            ProcessIdentity::new(9511, unix_ms_to_filetime(now_ms - 700)),
+            other_1,
+        ),
+        (
+            ProcessIdentity::new(9512, unix_ms_to_filetime(now_ms - 600)),
+            other_2,
+        ),
+        (
+            ProcessIdentity::new(9513, unix_ms_to_filetime(now_ms - 500)),
+            other_3,
+        ),
+    ] {
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: proc_id,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("start test process");
+    }
+    assert!(
+        wait_until(1_000, || {
+            engine.active_process_table_len() == 6 && engine.metrics().high_priority_processed >= 6
+        })
+        .await,
+        "all 6 test processes must be registered before pausing worker"
+    );
+
+    // Pause the worker deterministically inside `GateBinaryInspector::inspect`.
+    let gate_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 250));
+    engine
+        .classified_sender()
+        .send(SensorEvent::NetworkConnect {
+            pid: gate_proc.pid,
+            protocol: 6,
+            dst_ip: gate_ip,
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send gate NetworkConnect");
+    assert!(
+        wait_until(2_000, || entered.load(Ordering::Acquire)).await,
+        "worker must deterministically pause inside GateBinaryInspector"
+    );
+
+    // While the worker is paused:
+    // - 1..=4 fill `wfp_drop_tx` (capacity 4)
+    // - 5..=8 fill `wfp_drop_overflow.queue` (capacity 4 -> pushed = 4)
+    // - 9 inserts `app_exe` into `coalesced_by_exe` (pushed = 5, coalesced = 0)
+    // - 10 & 11 overwrite `app_exe` in `coalesced_by_exe` with newer dst IPs (coalesced = 2)
+    for i in 1u8..=11 {
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: u64::from(i),
+            rule_handle: u64::from(i),
+            exe_path: app_exe.to_string(),
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, i)),
+            dst_port: 8443,
+            timestamp_ms: now_ms + i64::from(i),
+        }));
+    }
+    // Distinct other apps fill the remaining 3 slots of `coalesced_by_exe` (total 4 == cap 4,
+    // zero evictions; pushed = 8, coalesced = 2).
+    let other_drops = [
+        (other_1, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 101)), 101u64),
+        (other_2, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 102)), 102u64),
+        (other_3, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 103)), 103u64),
+    ];
+    for (exe, dst_ip, id) in other_drops {
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: id,
+            rule_handle: id,
+            exe_path: exe.to_string(),
+            protocol: 6,
+            dst_ip,
+            dst_port: 8443,
+            timestamp_ms: now_ms + id as i64,
+        }));
+    }
+
+    // Deterministic pre-release verification of overflow & coalescing counters.
+    assert!(
+        engine.wfp_drop_overflow_pushed() > 0,
+        "overflow fallback queue must be exercised while worker is paused"
+    );
+    assert_eq!(
+        engine.wfp_drop_overflow_pushed(),
+        8,
+        "expected 4 queued + 4 distinct coalesced_by_exe entries pushed to overflow"
+    );
+    assert!(
+        engine.wfp_drop_overflow_coalesced() > 0,
+        "same-exe distinct destinations past overflow capacity must coalesce deterministically"
+    );
+    assert_eq!(
+        engine.wfp_drop_overflow_coalesced(),
+        2,
+        "expected exactly 2 same-exe overwrites (.9 -> .10 -> .11) in coalesced_by_exe"
+    );
+
+    // Release the gate and wait for all 13 surviving alerts:
+    // 1 (gate_proc) + 4 (wfp_drop_tx) + 4 (overflow.queue) + 1 (app_exe latest .11) + 3 (other_1..3).
+    release.store(true, Ordering::Release);
+    assert!(
+        wait_until(3_000, || {
+            store
+                .list_alerts(Some(AlertStatus::Pending), 50)
+                .map(|v| v.len() == 13)
+                .unwrap_or(false)
+        })
+        .await,
+        "expected 13 Pending alerts after gate release (got {:?})",
+        store
+            .list_alerts(Some(AlertStatus::Pending), 50)
+            .map(|v| v.len())
+    );
+
+    let alerts = store
+        .list_alerts(Some(AlertStatus::Pending), 50)
+        .expect("list pending alerts");
+    let observed_pairs: Vec<(String, String)> = alerts
+        .iter()
+        .map(|a| {
+            let v: serde_json::Value =
+                serde_json::from_str(&a.context_json).expect("parse alert context_json");
+            let exe = v
+                .get("exe_path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let ip = v
+                .get("dst_ip")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            (exe, ip)
+        })
+        .collect();
+
+    let app_lower = app_exe.to_ascii_lowercase();
+    for i in 1u8..=8 {
+        let expected_ip = format!("203.0.113.{i}");
+        assert!(
+            observed_pairs
+                .iter()
+                .any(|(e, ip)| e == &app_lower && ip == &expected_ip),
+            "queued app_exe drop {expected_ip} must reach triage: {observed_pairs:?}"
+        );
+    }
+    assert!(
+        observed_pairs
+            .iter()
+            .any(|(e, ip)| e == &app_lower && ip == "203.0.113.11"),
+        "latest coalesced destination IP (203.0.113.11) for app_exe must reach triage: {observed_pairs:?}"
+    );
+    for overwritten_ip in ["203.0.113.9", "203.0.113.10"] {
+        assert!(
+            !observed_pairs
+                .iter()
+                .any(|(e, ip)| e == &app_lower && ip == overwritten_ip),
+            "superseded coalesced destination {overwritten_ip} should have been overwritten by .11"
+        );
+    }
+    for (other_exe, other_ip, _) in other_drops {
+        let other_lower = other_exe.to_ascii_lowercase();
+        let ip_str = other_ip.to_string();
+        assert!(
+            observed_pairs
+                .iter()
+                .any(|(e, ip)| e == &other_lower && ip == &ip_str),
+            "distinct app {other_exe} -> {ip_str} must alert with zero loss: {observed_pairs:?}"
+        );
+    }
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+/// `DAEMON-P3-45` (`R-11` / `AUTO-10`): When the background NRD refresh OS thread remains blocked
+/// past `shutdown_flush_timeout_ms` (simulated deterministically without external network via an
+/// open local Windows Named Pipe `file://./pipe/...` held by an independent server thread),
+/// `shutdown_and_flush` still completes SQLite `wal_checkpoint(TRUNCATE)` within budget and
+/// detaches the NRD OS thread without spawning a Tokio blocking join task, so dropping the
+/// independently constructed Tokio `Runtime` completes promptly without hanging.
+#[test]
+fn daemon_p3_45_over_budget_nrd_shutdown_checkpoints_and_runtime_drop_does_not_hang() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct PipeServerGuard {
+        release_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl PipeServerGuard {
+        fn stop_and_join(&mut self) {
+            if let Some(tx) = self.release_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(jh) = self.thread.take() {
+                let _ = jh.join();
+            }
+        }
+    }
+    impl Drop for PipeServerGuard {
+        fn drop(&mut self) {
+            self.stop_and_join();
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ledr-p3-45-nrd-shutdown-{}-{}",
+        std::process::id(),
+        PIPE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir for DAEMON-P3-45");
+    let _tmp_guard = TempDirGuard(tmp_dir.clone());
+    let db_path = tmp_dir.join("nrd_overbudget.db");
+
+    let pipe_leaf = format!(
+        "localedr-p3-45-nrd-hang-{}-{}",
+        std::process::id(),
+        PIPE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let pipe_path = format!(r"\\.\pipe\{pipe_leaf}");
+    let feed_url = format!("file://./pipe/{pipe_leaf}");
+    assert_eq!(
+        ledr_rules::parse_file_url(&feed_url).expect("parse pipe file:// URL"),
+        std::path::PathBuf::from(&pipe_path),
+        "file://./pipe/... URL must resolve to the local Windows Named Pipe path"
+    );
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let blocked_in_read = Arc::new(AtomicBool::new(false));
+    let server_released = Arc::new(AtomicBool::new(false));
+    let blocked_bg = Arc::clone(&blocked_in_read);
+    let released_bg = Arc::clone(&server_released);
+    let pipe_path_bg = pipe_path.clone();
+
+    let server_thread = std::thread::Builder::new()
+        .name("test-nrd-pipe-server".to_string())
+        .spawn(move || {
+            let pipe_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build helper pipe runtime");
+            pipe_rt.block_on(async move {
+                let mut server = ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .out_buffer_size(1024)
+                    .create(&pipe_path_bg)
+                    .expect("create local Named Pipe for NRD hang simulation");
+                let _ = ready_tx.send(());
+
+                let mut release_rx = release_rx;
+                let connected = tokio::select! {
+                    res = server.connect() => res.is_ok(),
+                    _ = &mut release_rx => false,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => false,
+                };
+                if connected {
+                    // Stream 256 KiB of `#` comment payload (> pipe buffer and > multiple 64 KiB
+                    // chunks) so `write_all` only completes once the NRD thread is actively inside
+                    // `read_bounded_reader_cancellable`'s read loop, then hold the pipe open so the
+                    // next synchronous `ReadFile` blocks past `shutdown_flush_timeout_ms`.
+                    let mut primer = vec![b'#'; 256 * 1024];
+                    if let Some(last) = primer.last_mut() {
+                        *last = b'\n';
+                    }
+                    let wrote = tokio::select! {
+                        res = server.write_all(&primer) => res.is_ok(),
+                        _ = &mut release_rx => false,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => false,
+                    };
+                    if wrote {
+                        // Allow the NRD thread to advance from completing the primed chunk into
+                        // its next blocking kernel `ReadFile` call.
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        blocked_bg.store(true, Ordering::Release);
+                        let _ = tokio::time::timeout(Duration::from_secs(10), &mut release_rx).await;
+                    }
+                    let _ = server.disconnect();
+                }
+                released_bg.store(true, Ordering::Release);
+                drop(server);
+            });
+        })
+        .expect("spawn helper Named Pipe server thread");
+
+    let mut pipe_guard = PipeServerGuard {
+        release_tx: Some(release_tx),
+        thread: Some(server_thread),
+    };
+    ready_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Named Pipe server must become ready");
+
+    // Build an independent Tokio Runtime so we can explicitly time `Runtime::drop` right after
+    // `shutdown_and_flush` returns while the detached NRD thread is still blocked in `ReadFile`.
+    let subject_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build independent Tokio runtime");
+
+    let now_ms = current_unix_ms();
+    let marker_proc = ProcessIdentity::new(9601, unix_ms_to_filetime(now_ms - 1_000));
+    let marker_id = marker_proc.instance_id();
+
+    let marker_id_for_rt = marker_id.clone();
+    let db_path_for_rt = db_path.clone();
+    let blocked_for_rt = Arc::clone(&blocked_in_read);
+    subject_rt.block_on(async move {
+        let store = LedrStore::open(&db_path_for_rt).expect("open file-backed LedrStore");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+
+        let engine = DaemonEngine::start_with_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                nrd_refresh_enabled: true,
+                nrd_refresh_interval_ms: 200,
+                nrd_feed_urls: vec![feed_url],
+                shutdown_flush_timeout_ms: 200,
+                batch_flush_interval_ms: 500,
+                ..DaemonConfig::default()
+            },
+            defense,
+            notifier,
+            inspector,
+        );
+
+        assert!(
+            wait_until(3_000, || {
+                blocked_for_rt.load(Ordering::Acquire) && engine.is_nrd_refresh_in_flight()
+            })
+            .await,
+            "background NRD thread must enter blocking read on local Named Pipe"
+        );
+
+        // Sending and synchronizing a ProcessStart AFTER `blocked_in_read` simultaneously:
+        // 1. guarantees `run_pipeline` has finished storing `NrdThreadHandle` on the same task, and
+        // 2. writes dirty state into SQLite WAL so we can verify `wal_checkpoint(TRUNCATE)`.
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: marker_proc,
+                parent_pid: 4,
+                exe_path: r"C:\Tools\nrd_shutdown_marker.exe".to_string(),
+                command_line: r"C:\Tools\nrd_shutdown_marker.exe".to_string(),
+                user_sid: None,
+            })
+            .await
+            .expect("send marker ProcessStart");
+        assert!(
+            wait_until(1_000, || {
+                engine.active_process_table_len() == 1
+                    && engine.metrics().high_priority_processed >= 1
+            })
+            .await,
+            "marker ProcessStart must be processed before shutdown"
+        );
+
+        let shutdown_started = Instant::now();
+        engine
+            .shutdown_and_flush()
+            .await
+            .expect("shutdown_and_flush must checkpoint and return Ok despite over-budget NRD");
+        let shutdown_elapsed = shutdown_started.elapsed();
+
+        assert!(
+            shutdown_elapsed < Duration::from_millis(1_500),
+            "shutdown_and_flush must return within budget without hanging (took {shutdown_elapsed:?})"
+        );
+        assert!(
+            engine.is_nrd_refresh_in_flight(),
+            "NRD refresh thread must still be blocked past budget so the detach path was genuinely exercised"
+        );
+        assert_eq!(
+            Arc::strong_count(&engine),
+            1,
+            "detached NRD thread must hold zero Arc<DaemonEngine> references"
+        );
+
+        let persisted = store
+            .list_running_process_instance_ids()
+            .expect("list persisted running processes");
+        assert!(
+            persisted.contains(&marker_id_for_rt),
+            "marker process {marker_id_for_rt} must be flushed before shutdown returns"
+        );
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path_for_rt.display()));
+        if wal_path.exists() {
+            let wal_len = std::fs::metadata(&wal_path).expect("stat wal").len();
+            assert_eq!(
+                wal_len, 0,
+                "SQLite WAL must be truncated to 0 bytes before shutdown_and_flush returns"
+            );
+        }
+
+        drop(engine);
+        drop(store);
+    });
+
+    assert!(
+        !server_released.load(Ordering::Acquire),
+        "Named Pipe server must still be holding the NRD thread blocked when Runtime::drop starts"
+    );
+    let drop_started = Instant::now();
+    drop(subject_rt);
+    let drop_elapsed = drop_started.elapsed();
+    assert!(
+        drop_elapsed < Duration::from_millis(500),
+        "independent Tokio Runtime::drop must complete promptly without hanging on detached NRD thread (took {drop_elapsed:?})"
+    );
+
+    // Release and join the helper Named Pipe server so the detached NRD OS thread unblocks cleanly.
+    pipe_guard.stop_and_join();
+
+    // Verify durability on reopen after Runtime::drop.
+    {
+        let reopened = LedrStore::open(&db_path).expect("reopen checkpointed LedrStore");
+        let persisted = reopened
+            .list_running_process_instance_ids()
+            .expect("query reopened processes");
+        assert!(
+            persisted.contains(&marker_id),
+            "checkpointed marker process {marker_id} must survive runtime teardown"
+        );
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+        if wal_path.exists() {
+            let wal_len = std::fs::metadata(&wal_path).expect("stat reopened wal").len();
+            assert_eq!(wal_len, 0, "reopened DB must have 0-byte WAL");
+        }
+    }
 }

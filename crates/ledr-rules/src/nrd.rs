@@ -604,7 +604,7 @@ pub fn fetch_nrd_feed_url_cancellable(
         .is_some_and(|p| p.eq_ignore_ascii_case("file://"))
     {
         let path = parse_file_url(trimmed)?;
-        let res = read_bounded_file(&path, max_bytes)?;
+        let res = read_bounded_file(&path, max_bytes, cancel)?;
         if cancel.is_cancelled() {
             return Err("NRD feed download cancelled".to_string());
         }
@@ -630,22 +630,106 @@ pub fn fetch_nrd_feed_url_cancellable(
     ))
 }
 
-fn read_bounded_file(path: &Path, max_bytes: usize) -> Result<(Vec<u8>, bool), String> {
+pub(crate) const NRD_FILE_READ_CHUNK_BYTES: usize = 64 * 1024;
+const NRD_DOWNLOAD_CANCELLED_ERR: &str = "NRD feed download cancelled";
+const NRD_FEED_READ_ERR_PREFIX: &str = "failed to read NRD feed: ";
+
+/// Reads a bounded local NRD feed file in 64 KiB chunks while cooperatively checking `cancel`
+/// before and after every chunk read.
+pub(crate) fn read_bounded_file(
+    path: &Path,
+    max_bytes: usize,
+    cancel: &NrdCancelToken,
+) -> Result<(Vec<u8>, bool), String> {
+    if cancel.is_cancelled() {
+        return Err(NRD_DOWNLOAD_CANCELLED_ERR.to_string());
+    }
+    let file = File::open(path).map_err(|err| {
+        if cancel.is_cancelled() {
+            NRD_DOWNLOAD_CANCELLED_ERR.to_string()
+        } else {
+            format!("failed to open NRD feed file `{}`: {err}", path.display())
+        }
+    })?;
+    read_bounded_reader_cancellable(file, max_bytes, cancel).map_err(|err| {
+        if err == NRD_DOWNLOAD_CANCELLED_ERR {
+            err
+        } else if let Some(detail) = err.strip_prefix(NRD_FEED_READ_ERR_PREFIX) {
+            format!("failed to read NRD feed file `{}`: {detail}", path.display())
+        } else {
+            format!("failed to read NRD feed file `{}`: {err}", path.display())
+        }
+    })
+}
+
+/// Reads from `reader` in bounded 64 KiB chunks up to `max_bytes`, checking `cancel` before and
+/// after each `read()` call (and before retrying `ErrorKind::Interrupted`). When input exceeds
+/// `max_bytes`, trims any partial trailing line via [`trim_partial_trailing_line`].
+pub(crate) fn read_bounded_reader_cancellable<R: Read>(
+    mut reader: R,
+    max_bytes: usize,
+    cancel: &NrdCancelToken,
+) -> Result<(Vec<u8>, bool), String> {
+    if cancel.is_cancelled() {
+        return Err(NRD_DOWNLOAD_CANCELLED_ERR.to_string());
+    }
+
     let cap = max_bytes.max(1);
-    let file = File::open(path)
-        .map_err(|err| format!("failed to open NRD feed file `{}`: {err}", path.display()))?;
-    let mut buf = Vec::new();
-    file.take(cap as u64 + 1)
-        .read_to_end(&mut buf)
-        .map_err(|err| format!("failed to read NRD feed file `{}`: {err}", path.display()))?;
-    let truncated = if buf.len() > cap {
-        buf.truncate(cap);
-        trim_partial_trailing_line(&mut buf);
-        true
-    } else {
-        false
-    };
-    Ok((buf, truncated))
+    let chunk_cap = NRD_FILE_READ_CHUNK_BYTES.min(cap.saturating_add(1));
+    let mut chunk = vec![0u8; chunk_cap];
+    let mut body = Vec::new();
+    let mut truncated = false;
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(NRD_DOWNLOAD_CANCELLED_ERR.to_string());
+        }
+
+        let remaining_budget = cap.saturating_sub(body.len());
+        let want = if remaining_budget == 0 {
+            1
+        } else {
+            remaining_budget.saturating_add(1).min(chunk.len())
+        };
+
+        let n = match reader.read(&mut chunk[..want]) {
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                if cancel.is_cancelled() {
+                    return Err(NRD_DOWNLOAD_CANCELLED_ERR.to_string());
+                }
+                continue;
+            }
+            Err(err) => {
+                if cancel.is_cancelled() {
+                    return Err(NRD_DOWNLOAD_CANCELLED_ERR.to_string());
+                }
+                return Err(format!("{NRD_FEED_READ_ERR_PREFIX}{err}"));
+            }
+        };
+
+        if cancel.is_cancelled() {
+            return Err(NRD_DOWNLOAD_CANCELLED_ERR.to_string());
+        }
+
+        if n == 0 {
+            break;
+        }
+        if remaining_budget == 0 {
+            trim_partial_trailing_line(&mut body);
+            truncated = true;
+            break;
+        }
+        if n > remaining_budget {
+            body.extend_from_slice(&chunk[..remaining_budget]);
+            trim_partial_trailing_line(&mut body);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+
+    Ok((body, truncated))
 }
 
 fn trim_partial_trailing_line(buf: &mut Vec<u8>) {

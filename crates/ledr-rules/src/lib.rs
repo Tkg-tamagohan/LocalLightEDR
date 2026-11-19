@@ -1948,4 +1948,238 @@ brand-new.org
 
         assert!(srv.join().expect("join split server"));
     }
+
+    /// `RULES-P3-14`（`決定記録 L-14` / `AUTO-10` / 指摘 R-11）:
+    /// ファイル形式 NRD フィードの 64 KiB チャンク単位読み取り（`read_bounded_reader_cancellable` /
+    /// `read_bounded_file`）について、1 チャンク読み込み後のキャンセルで 2 チャンク目の `read()` を
+    /// 呼ばず `"NRD feed download cancelled"` で即終了すること、事前キャンセル済みトークンで
+    /// 0 回読み取り即終了すること、`ErrorKind::Interrupted` 再試行時のキャンセル検知、通常の
+    /// マルチチャンクファイル読み込み、および `max_bytes` 上限切り詰めと末尾不完全行トリムを
+    /// 決定的に検証する。
+    #[test]
+    fn rules_p3_14_file_nrd_feed_chunked_reader_cancellation_and_truncation() {
+        use std::collections::VecDeque;
+        use std::io::{self, Cursor, Read};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct ScriptedChunkReader {
+            steps: VecDeque<io::Result<Vec<u8>>>,
+            read_calls: Arc<AtomicUsize>,
+            observed_buf_lens: Arc<Mutex<Vec<usize>>>,
+            cancel_on_call: Option<(usize, NrdCancelToken)>,
+        }
+
+        impl Read for ScriptedChunkReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let call_idx = self.read_calls.fetch_add(1, Ordering::AcqRel) + 1;
+                self.observed_buf_lens
+                    .lock()
+                    .expect("lock observed_buf_lens")
+                    .push(buf.len());
+                let res = match self.steps.pop_front() {
+                    Some(Ok(chunk)) => {
+                        let n = chunk.len().min(buf.len());
+                        buf[..n].copy_from_slice(&chunk[..n]);
+                        Ok(n)
+                    }
+                    Some(Err(err)) => Err(err),
+                    None => Ok(0),
+                };
+                if let Some((target_call, ref token)) = self.cancel_on_call {
+                    if call_idx == target_call {
+                        token.cancel();
+                    }
+                }
+                res
+            }
+        }
+
+        let chunk_size = crate::nrd::NRD_FILE_READ_CHUNK_BYTES;
+        assert_eq!(chunk_size, 64 * 1024);
+
+        // 1. 1 チャンク（64 KiB）読み込み後に cancel() が実行されると、2 チャンク目の read() を
+        //    呼ばず即座に "NRD feed download cancelled" で終了する（read 呼び出し回数 == 1）。
+        let mid_token = NrdCancelToken::new();
+        let mid_calls = Arc::new(AtomicUsize::new(0));
+        let mid_buf_lens = Arc::new(Mutex::new(Vec::new()));
+        let mid_reader = ScriptedChunkReader {
+            steps: VecDeque::from([
+                Ok(vec![b'a'; chunk_size]),
+                Ok(vec![b'b'; chunk_size]),
+            ]),
+            read_calls: Arc::clone(&mid_calls),
+            observed_buf_lens: Arc::clone(&mid_buf_lens),
+            cancel_on_call: Some((1, mid_token.clone())),
+        };
+        let err = crate::nrd::read_bounded_reader_cancellable(
+            mid_reader,
+            NRD_MAX_RESPONSE_BYTES,
+            &mid_token,
+        )
+        .expect_err("cancel after first chunk must abort immediately");
+        assert_eq!(err, "NRD feed download cancelled");
+        assert_eq!(
+            mid_calls.load(Ordering::Acquire),
+            1,
+            "second chunk read() must not be invoked after cancellation"
+        );
+        assert_eq!(
+            *mid_buf_lens.lock().expect("lock mid_buf_lens"),
+            vec![chunk_size],
+            "file chunk reader must request 64 KiB chunks"
+        );
+
+        // 2. 事前キャンセル済みトークンでは read() を 0 回で即終了する。
+        let pre_token = NrdCancelToken::new();
+        pre_token.cancel();
+        let pre_calls = Arc::new(AtomicUsize::new(0));
+        let pre_reader = ScriptedChunkReader {
+            steps: VecDeque::from([Ok(b"alpha.xyz\n".to_vec())]),
+            read_calls: Arc::clone(&pre_calls),
+            observed_buf_lens: Arc::new(Mutex::new(Vec::new())),
+            cancel_on_call: None,
+        };
+        let err = crate::nrd::read_bounded_reader_cancellable(
+            pre_reader,
+            NRD_MAX_RESPONSE_BYTES,
+            &pre_token,
+        )
+        .expect_err("pre-cancelled reader must abort before first read");
+        assert_eq!(err, "NRD feed download cancelled");
+        assert_eq!(
+            pre_calls.load(Ordering::Acquire),
+            0,
+            "pre-cancelled reader must perform zero read() calls"
+        );
+
+        // 3. ErrorKind::Interrupted 再試行時のキャンセル検知と、非キャンセル時の正常リトライ。
+        let eintr_cancel_token = NrdCancelToken::new();
+        let eintr_cancel_calls = Arc::new(AtomicUsize::new(0));
+        let eintr_cancel_reader = ScriptedChunkReader {
+            steps: VecDeque::from([
+                Err(io::Error::new(io::ErrorKind::Interrupted, "simulated eintr")),
+                Ok(b"never-read.xyz\n".to_vec()),
+            ]),
+            read_calls: Arc::clone(&eintr_cancel_calls),
+            observed_buf_lens: Arc::new(Mutex::new(Vec::new())),
+            cancel_on_call: Some((1, eintr_cancel_token.clone())),
+        };
+        let err = crate::nrd::read_bounded_reader_cancellable(
+            eintr_cancel_reader,
+            1024,
+            &eintr_cancel_token,
+        )
+        .expect_err("cancel during Interrupted must abort without retrying");
+        assert_eq!(err, "NRD feed download cancelled");
+        assert_eq!(eintr_cancel_calls.load(Ordering::Acquire), 1);
+
+        let eintr_retry_calls = Arc::new(AtomicUsize::new(0));
+        let eintr_retry_reader = ScriptedChunkReader {
+            steps: VecDeque::from([
+                Err(io::Error::new(io::ErrorKind::Interrupted, "transient eintr")),
+                Ok(b"after-eintr.xyz\n".to_vec()),
+            ]),
+            read_calls: Arc::clone(&eintr_retry_calls),
+            observed_buf_lens: Arc::new(Mutex::new(Vec::new())),
+            cancel_on_call: None,
+        };
+        let (retried_bytes, retried_trunc) = crate::nrd::read_bounded_reader_cancellable(
+            eintr_retry_reader,
+            1024,
+            &NrdCancelToken::new(),
+        )
+        .expect("uncancelled Interrupted should retry and succeed");
+        assert!(!retried_trunc);
+        assert_eq!(retried_bytes, b"after-eintr.xyz\n");
+        assert_eq!(eintr_retry_calls.load(Ordering::Acquire), 3);
+
+        // 4. 通常のファイル読み込み（64 KiB 超マルチチャンク）および事前キャンセル時の read_bounded_file。
+        let tmp = TestTempDir::new("ledr-rules-p3-14");
+        let large_file = tmp.path().join("large-nrd.txt");
+        let mut expected_large = String::new();
+        for idx in 0..8_000usize {
+            // 19 bytes per line ("d00000.example.xyz\n") -> 152,000 bytes (> 2 * 64 KiB).
+            expected_large.push_str(&format!("d{idx:05}.example.xyz\n"));
+        }
+        assert!(expected_large.len() > chunk_size * 2);
+        std::fs::write(&large_file, expected_large.as_bytes()).expect("write large NRD feed");
+
+        let uncancelled = NrdCancelToken::new();
+        let (read_all, trunc_all) =
+            crate::nrd::read_bounded_file(&large_file, NRD_MAX_RESPONSE_BYTES, &uncancelled)
+                .expect("read_bounded_file must read multi-chunk file cleanly");
+        assert!(!trunc_all);
+        assert_eq!(read_all, expected_large.as_bytes());
+
+        let file_url = format!("file:///{}", large_file.to_string_lossy().replace('\\', "/"));
+        let (fetched_all, fetched_trunc) =
+            fetch_nrd_feed_url_cancellable(&file_url, NRD_MAX_RESPONSE_BYTES, &uncancelled)
+                .expect("fetch_nrd_feed_url_cancellable file:// must succeed");
+        assert!(!fetched_trunc);
+        assert_eq!(fetched_all, expected_large.as_bytes());
+
+        let missing_path = tmp.path().join("missing-not-opened.txt");
+        let pre_file_err = crate::nrd::read_bounded_file(&missing_path, 1024, &pre_token)
+            .expect_err("pre-cancelled read_bounded_file must abort before opening file");
+        assert_eq!(pre_file_err, "NRD feed download cancelled");
+
+        // 5. max_bytes 境界条件（ちょうど上限での EOF / 上限超過時の末尾不完全行トリム / 改行なし全破棄）。
+        // 5a. 小サイズでちょうど max_bytes 一致かつ末尾改行なし -> truncated == false で全量保持。
+        let exact_small_file = tmp.path().join("exact-small.txt");
+        let exact_small = b"exact-one.xyz\nexact-two.top";
+        std::fs::write(&exact_small_file, exact_small).expect("write exact small");
+        let (bytes, trunc) =
+            crate::nrd::read_bounded_file(&exact_small_file, exact_small.len(), &uncancelled)
+                .expect("exact max_bytes EOF");
+        assert!(!trunc);
+        assert_eq!(bytes, exact_small);
+
+        // 5b. ちょうど 64 KiB チャンク境界で EOF -> truncated == false で全量保持。
+        let exact_chunk_buf = vec![b'x'; chunk_size];
+        let (bytes, trunc) = crate::nrd::read_bounded_reader_cancellable(
+            Cursor::new(exact_chunk_buf.clone()),
+            chunk_size,
+            &uncancelled,
+        )
+        .expect("exact 64 KiB EOF");
+        assert!(!trunc);
+        assert_eq!(bytes, exact_chunk_buf);
+
+        // 5c. ちょうど 64 KiB 上限で後続データが存在し 65536 バイト目がドメイン途中 ->
+        //     remaining_budget == 0 経路でも truncated == true かつ末尾不完全行を改行までトリム。
+        assert_ne!(chunk_size % 19, 0, "64 KiB boundary must land mid-line");
+        let (capped_64k, trunc_64k) =
+            crate::nrd::read_bounded_file(&large_file, chunk_size, &uncancelled)
+                .expect("64 KiB capped read");
+        assert!(trunc_64k);
+        let expected_64k_len = (chunk_size / 19) * 19;
+        assert_eq!(capped_64k.len(), expected_64k_len);
+        assert_eq!(capped_64k, &expected_large.as_bytes()[..expected_64k_len]);
+        assert!(capped_64k.ends_with(b"\n"));
+
+        // 5d. 小サイズ上限超過時の末尾不完全行トリム。
+        let small_trunc_file = tmp.path().join("small-trunc.txt");
+        std::fs::write(
+            &small_trunc_file,
+            b"first-domain.xyz\nsecond-domain.top\nthird-domain.org\n",
+        )
+        .expect("write small trunc");
+        let (bytes, trunc) = crate::nrd::read_bounded_file(&small_trunc_file, 25, &uncancelled)
+            .expect("small mid-line truncation");
+        assert!(trunc);
+        assert_eq!(bytes, b"first-domain.xyz\n");
+
+        // 5e. 最初の改行より前に max_bytes 超過 -> 不完全な単一行は空バッファとして破棄。
+        let single_line_file = tmp.path().join("single-line.txt");
+        std::fs::write(
+            &single_line_file,
+            b"single-very-long-domain-without-early-newline.example\n",
+        )
+        .expect("write single line");
+        let (bytes, trunc) = crate::nrd::read_bounded_file(&single_line_file, 20, &uncancelled)
+            .expect("single-line truncation");
+        assert!(trunc);
+        assert!(bytes.is_empty());
+    }
 }

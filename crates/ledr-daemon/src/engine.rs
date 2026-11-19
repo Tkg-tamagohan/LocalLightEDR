@@ -305,6 +305,14 @@ struct WfpCandidate {
     parent_command_line: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverflowPushOutcome {
+    Queued,
+    Deduplicated,
+    CoalescedNewExe,
+    CoalescedOverwritten,
+}
+
 /// Bounded overflow fallback queue for [`QueuedWfpDrop`] events when `wfp_drop_tx` is temporarily
 /// full inside a non-blocking BFE net-event callback (`L-10`, `BUG_0006` overflow guarantee).
 /// Deduplicates identical `(exe_key, dst_ip)` tuples and coalesces per `exe_key` if even the
@@ -329,22 +337,29 @@ impl WfpDropOverflowQueue {
         }
     }
 
-    fn push(&mut self, item: QueuedWfpDrop) -> bool {
-        let dedup_key = (item.exe_key.clone(), canonical_ip(item.dst_ip));
+    fn push(&mut self, item: QueuedWfpDrop) -> OverflowPushOutcome {
+        let canon_dst = canonical_ip(item.dst_ip);
+        let dedup_key = (item.exe_key.clone(), canon_dst);
         if self.active_keys.contains(&dedup_key) {
-            return false;
+            return OverflowPushOutcome::Deduplicated;
+        }
+        if let Some(existing) = self.coalesced_by_exe.get_mut(&item.exe_key) {
+            if canonical_ip(existing.dst_ip) == canon_dst {
+                *existing = item;
+                return OverflowPushOutcome::Deduplicated;
+            }
         }
         if self.queue.len() < self.capacity {
             self.active_keys.insert(dedup_key);
             self.queue.push_back(item);
-            return true;
+            return OverflowPushOutcome::Queued;
         }
         let exe_k = item.exe_key.clone();
         if let std::collections::hash_map::Entry::Occupied(mut entry) =
             self.coalesced_by_exe.entry(exe_k.clone())
         {
             entry.insert(item);
-            return false;
+            return OverflowPushOutcome::CoalescedOverwritten;
         }
         while self.coalesced_by_exe.len() >= self.capacity {
             let Some(evicted) = self.coalesced_order.pop_front() else {
@@ -355,7 +370,7 @@ impl WfpDropOverflowQueue {
         }
         self.coalesced_order.push_back(exe_k.clone());
         self.coalesced_by_exe.insert(exe_k, item);
-        true
+        OverflowPushOutcome::CoalescedNewExe
     }
 
     fn pop(&mut self) -> Option<QueuedWfpDrop> {
@@ -371,6 +386,17 @@ impl WfpDropOverflowQueue {
         }
         None
     }
+}
+
+struct NrdThreadHandle {
+    join_handle: std::thread::JoinHandle<()>,
+    done_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+struct DnsCorrelationUpdate {
+    instance_id: String,
+    exe_key: String,
+    accepted_ips: Vec<IpAddr>,
 }
 
 /// Bounded deduplication set for unresolved app-level ambiguous WFP drop alerts keyed by
@@ -433,11 +459,12 @@ pub struct DaemonEngine {
     wfp_drop_overflow: Mutex<WfpDropOverflowQueue>,
     wfp_drop_overflow_notify: tokio::sync::Notify,
     wfp_drop_overflow_pushed: AtomicU64,
+    wfp_drop_overflow_coalesced: AtomicU64,
     app_wfp_alert_dedup: Mutex<AppWfpAlertDedup>,
     nrd_cache: Arc<RwLock<NrdCache>>,
     nrd_cancel: NrdCancelToken,
     nrd_in_flight: Arc<AtomicBool>,
-    nrd_thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    nrd_thread_handle: Mutex<Option<NrdThreadHandle>>,
     /// Serializes `resolve_alert` so concurrent resolves of sibling alerts cannot both
     /// observe "another unresolved suspended alert exists" and leave the process
     /// suspended forever (`BUG_0002`).
@@ -572,6 +599,7 @@ impl DaemonEngine {
             wfp_drop_overflow,
             wfp_drop_overflow_notify: tokio::sync::Notify::new(),
             wfp_drop_overflow_pushed: AtomicU64::new(0),
+            wfp_drop_overflow_coalesced: AtomicU64::new(0),
             app_wfp_alert_dedup: Mutex::new(AppWfpAlertDedup::new(APP_WFP_ALERT_DEDUP_CAPACITY)),
             nrd_cache: Arc::new(RwLock::new(initial_nrd)),
             nrd_cancel: NrdCancelToken::new(),
@@ -688,13 +716,30 @@ impl DaemonEngine {
         match self.wfp_drop_tx.try_send(queued) {
             Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(queued)) => {
-                let pushed = self
+                let outcome = self
                     .wfp_drop_overflow
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(queued);
-                if pushed {
-                    self.wfp_drop_overflow_pushed.fetch_add(1, Ordering::Relaxed);
+                match outcome {
+                    OverflowPushOutcome::Queued | OverflowPushOutcome::CoalescedNewExe => {
+                        self.wfp_drop_overflow_pushed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    OverflowPushOutcome::CoalescedOverwritten => {
+                        let count = self
+                            .wfp_drop_overflow_coalesced
+                            .fetch_add(1, Ordering::Relaxed)
+                            + 1;
+                        if count == 1 || count.is_power_of_two() {
+                            tracing::warn!(
+                                exe_path = %trimmed_exe,
+                                dst_ip = %canon_ip,
+                                coalesced_count = count,
+                                "WFP drop overflow queue full; coalesced earlier destination for same executable into latest drop"
+                            );
+                        }
+                    }
+                    OverflowPushOutcome::Deduplicated => {}
                 }
                 self.wfp_drop_overflow_notify.notify_one();
                 true
@@ -721,6 +766,12 @@ impl DaemonEngine {
     /// Number of WFP drop events routed through the bounded overflow fallback (`L-10`).
     pub fn wfp_drop_overflow_pushed(&self) -> u64 {
         self.wfp_drop_overflow_pushed.load(Ordering::Relaxed)
+    }
+
+    /// Number of WFP drop events overwritten in `coalesced_by_exe` when the same executable
+    /// overflowed both `wfp_drop_tx` and `wfp_drop_overflow.queue` with distinct destinations (`L-10`).
+    pub fn wfp_drop_overflow_coalesced(&self) -> u64 {
+        self.wfp_drop_overflow_coalesced.load(Ordering::Relaxed)
     }
 
     fn invalidate_non_protected_steady_pids(&self) {
@@ -2096,26 +2147,6 @@ impl DaemonEngine {
         self.store.request_shutdown();
         self.sender.close();
 
-        // Join any in-flight NRD thread concurrently with the worker drain so it consumes no
-        // serial tail budget after pipeline draining completes.
-        let nrd_handle = {
-            let mut guard = self
-                .nrd_thread_handle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            guard.take()
-        };
-        let nrd_join_task = nrd_handle.and_then(|jh| {
-            if jh.is_finished() {
-                if jh.join().is_err() {
-                    tracing::warn!("background NRD refresh thread panicked during shutdown");
-                }
-                None
-            } else {
-                Some(tokio::task::spawn_blocking(move || jh.join()))
-            }
-        });
-
         let handle = {
             let mut guard = self.worker_handle.lock().await;
             guard.take()
@@ -2150,47 +2181,52 @@ impl DaemonEngine {
             }
         }
 
-        if let Some(join_task) = nrd_join_task {
-            if join_task.is_finished() {
-                match join_task.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_panic_payload)) => {
-                        tracing::warn!("background NRD refresh thread panicked during shutdown");
-                    }
-                    Err(join_err) => {
-                        tracing::warn!(error = %join_err, "blocking join task for NRD refresh thread failed");
-                    }
-                }
-            } else {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if !remaining.is_zero() {
-                    match tokio::time::timeout(remaining, join_task).await {
-                        Ok(Ok(Ok(()))) => {}
-                        Ok(Ok(Err(_panic_payload))) => {
-                            tracing::warn!("background NRD refresh thread panicked during shutdown");
-                        }
-                        Ok(Err(join_err)) => {
-                            tracing::warn!(error = %join_err, "blocking join task for NRD refresh thread failed");
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                timeout_ms = self.config.shutdown_flush_timeout_ms,
-                                "timed out waiting for background NRD refresh thread join during shutdown"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        timeout_ms = self.config.shutdown_flush_timeout_ms,
-                        "shutdown budget exhausted; skipping remaining NRD thread join wait"
-                    );
-                }
-            }
-        }
-
+        // Prioritize WAL truncation BEFORE waiting on any remaining NRD refresh thread so a slow
+        // or wedged NRD thread can never delay or starve SQLite checkpointing (`AUTO-10`, `R-11`).
         if !worker_checkpointed {
             self.store.checkpoint_truncate()?;
         }
+
+        let nrd_handle = {
+            let mut guard = self
+                .nrd_thread_handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(mut nrd) = nrd_handle {
+            let mut completed = nrd.join_handle.is_finished()
+                || !matches!(
+                    nrd.done_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                );
+            if !completed {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !remaining.is_zero() {
+                    match tokio::time::timeout(remaining, &mut nrd.done_rx).await {
+                        Ok(Ok(())) | Ok(Err(_)) => {
+                            completed = true;
+                        }
+                        Err(_) => {
+                            completed = nrd.join_handle.is_finished();
+                        }
+                    }
+                }
+            }
+            if completed {
+                if nrd.join_handle.join().is_err() {
+                    tracing::warn!("background NRD refresh thread panicked during shutdown");
+                }
+            } else {
+                // Detach the raw OS thread without touching Tokio's blocking pool so subsequent
+                // `Runtime::drop` cannot hang on an unresponsive NRD I/O thread (`R-11`).
+                tracing::warn!(
+                    timeout_ms = self.config.shutdown_flush_timeout_ms,
+                    "shutdown budget exhausted waiting for background NRD refresh thread; detaching thread"
+                );
+            }
+        }
+
         if let Some(err) = drain_err {
             return Err(err);
         }
@@ -2233,20 +2269,15 @@ impl DaemonEngine {
             // are always up to date for attribution (`L-10`).
             if let Some(event) = receiver.try_recv_high_priority() {
                 sync_telemetry_streak = 0;
-                if let Some((dns_inst_id, dns_exe_key)) =
+                if let Some(dns_update) =
                     self.process_event_with_lane(&event, EventLane::HighPriority)
                 {
-                    if let SensorEvent::DnsQuery {
-                        query_name,
-                        resolved_ips,
-                        ..
-                    } = &event
-                    {
+                    if let SensorEvent::DnsQuery { query_name, .. } = &event {
                         self.flush_ready_pending_wfp_drops(
-                            &dns_inst_id,
-                            &dns_exe_key,
+                            &dns_update.instance_id,
+                            &dns_update.exe_key,
                             query_name,
-                            resolved_ips,
+                            &dns_update.accepted_ips,
                             &mut pending_wfp_drops,
                         );
                     }
@@ -2286,20 +2317,14 @@ impl DaemonEngine {
             // Tier 3: Steady telemetry lane, yielding periodically so single-threaded runtimes and
             // grace timers remain responsive during bursts.
             if let Some(event) = receiver.try_recv_telemetry() {
-                if let Some((dns_inst_id, dns_exe_key)) =
-                    self.process_event_with_lane(&event, EventLane::Telemetry)
+                if let Some(dns_update) = self.process_event_with_lane(&event, EventLane::Telemetry)
                 {
-                    if let SensorEvent::DnsQuery {
-                        query_name,
-                        resolved_ips,
-                        ..
-                    } = &event
-                    {
+                    if let SensorEvent::DnsQuery { query_name, .. } = &event {
                         self.flush_ready_pending_wfp_drops(
-                            &dns_inst_id,
-                            &dns_exe_key,
+                            &dns_update.instance_id,
+                            &dns_update.exe_key,
                             query_name,
-                            resolved_ips,
+                            &dns_update.accepted_ips,
                             &mut pending_wfp_drops,
                         );
                     }
@@ -2326,20 +2351,13 @@ impl DaemonEngine {
                 maybe_event = receiver.recv_with_lane() => {
                     match maybe_event {
                         Some((event, lane)) => {
-                            if let Some((dns_inst_id, dns_exe_key)) =
-                                self.process_event_with_lane(&event, lane)
-                            {
-                                if let SensorEvent::DnsQuery {
-                                    query_name,
-                                    resolved_ips,
-                                    ..
-                                } = &event
-                                {
+                            if let Some(dns_update) = self.process_event_with_lane(&event, lane) {
+                                if let SensorEvent::DnsQuery { query_name, .. } = &event {
                                     self.flush_ready_pending_wfp_drops(
-                                        &dns_inst_id,
-                                        &dns_exe_key,
+                                        &dns_update.instance_id,
+                                        &dns_update.exe_key,
                                         query_name,
-                                        resolved_ips,
+                                        &dns_update.accepted_ips,
                                         &mut pending_wfp_drops,
                                     );
                                 }
@@ -2396,21 +2414,40 @@ impl DaemonEngine {
                                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                                 .is_ok()
                         {
+                            if self.nrd_cancel.is_cancelled() {
+                                self.nrd_in_flight.store(false, Ordering::Release);
+                                continue;
+                            }
                             let feed_urls = self.config.nrd_feed_urls.clone();
                             let cache_path = self.config.nrd_cache_path.clone();
                             let nrd_cache = Arc::clone(&self.nrd_cache);
                             let nrd_cancel = self.nrd_cancel.clone();
                             let in_flight = Arc::clone(&self.nrd_in_flight);
+                            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
                             match std::thread::Builder::new()
                                 .name("ledr-nrd-refresh".to_string())
                                 .spawn(move || {
-                                    struct InFlightGuard(Arc<AtomicBool>);
+                                    struct InFlightGuard {
+                                        in_flight: Arc<AtomicBool>,
+                                        done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+                                    }
                                     impl Drop for InFlightGuard {
                                         fn drop(&mut self) {
-                                            self.0.store(false, Ordering::Release);
+                                            self.in_flight.store(false, Ordering::Release);
+                                            if let Some(tx) = self.done_tx.take() {
+                                                let _ = tx.send(());
+                                            }
                                         }
                                     }
-                                    let _guard = InFlightGuard(in_flight);
+                                    // Declare `_guard` before rebinding all captured inputs so
+                                    // every thread-owned value drops BEFORE `done_tx.send(())`
+                                    // wakes `shutdown_and_flush` (`R-11`).
+                                    let _guard = InFlightGuard {
+                                        in_flight,
+                                        done_tx: Some(done_tx),
+                                    };
+                                    let (feed_urls, cache_path, nrd_cache, nrd_cancel) =
+                                        (feed_urls, cache_path, nrd_cache, nrd_cancel);
                                     match execute_nrd_refresh(
                                         &feed_urls,
                                         cache_path.as_deref(),
@@ -2430,17 +2467,20 @@ impl DaemonEngine {
                                         ),
                                     }
                                 }) {
-                                Ok(jh) => {
+                                Ok(join_handle) => {
                                     let prev = {
                                         let mut guard = self
                                             .nrd_thread_handle
                                             .lock()
                                             .unwrap_or_else(|e| e.into_inner());
-                                        guard.replace(jh)
+                                        guard.replace(NrdThreadHandle {
+                                            join_handle,
+                                            done_rx,
+                                        })
                                     };
-                                    if let Some(old_jh) = prev {
-                                        if old_jh.is_finished() {
-                                            let _ = old_jh.join();
+                                    if let Some(old_nrd) = prev {
+                                        if old_nrd.join_handle.is_finished() {
+                                            let _ = old_nrd.join_handle.join();
                                         }
                                     }
                                 }
@@ -2495,7 +2535,7 @@ impl DaemonEngine {
         &self,
         event: &SensorEvent,
         lane: EventLane,
-    ) -> Option<(String, String)> {
+    ) -> Option<DnsCorrelationUpdate> {
         if let SensorEvent::CanaryFileAccess {
             category: CanaryCategory::Honeypot,
             is_write_or_delete: false,
@@ -2594,7 +2634,7 @@ impl DaemonEngine {
         };
 
         let mut flush_now = false;
-        let mut dns_correlation_key: Option<(String, String)> = None;
+        let mut dns_correlation: Option<DnsCorrelationUpdate> = None;
         let action = match event {
             SensorEvent::ProcessStart {
                 identity, exe_path, ..
@@ -2685,7 +2725,13 @@ impl DaemonEngine {
                                     event_ts_ms,
                                 );
                             if let Some(exe_k) = exe_k_opt {
-                                dns_correlation_key = Some((inst_id.clone(), exe_k));
+                                if !accepted.is_empty() {
+                                    dns_correlation = Some(DnsCorrelationUpdate {
+                                        instance_id: inst_id.clone(),
+                                        exe_key: exe_k,
+                                        accepted_ips: accepted.clone(),
+                                    });
+                                }
                             }
                             Some(accepted)
                         } else {
@@ -2741,7 +2787,7 @@ impl DaemonEngine {
             }
         }
 
-        dns_correlation_key
+        dns_correlation
     }
 
     fn prematerialize_domain_wfp_filters(
@@ -2805,21 +2851,26 @@ impl DaemonEngine {
             let rules = self.store.list_network_rules().unwrap_or_default();
             let bin_identity = self.inspector.inspect(exe_path);
             let exe_k = WfpRuleManager::exe_key(exe_path);
-            let (active_dns_entries, superseded_ips) = {
+            let (active_dns_entries, superseded_ips, current_domain_entries) = {
                 let history = self
                     .process_dns_history
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 let active = history.active_domains_by_ip_for_exe(&exe_k);
                 let mut superseded: HashSet<IpAddr> = HashSet::new();
+                let mut cand_ips: Vec<IpAddr> = Vec::with_capacity(candidate_blocks.len());
                 for (cand_ip, cand_hint) in &candidate_blocks {
                     if !cand_hint.trim().is_empty()
                         && history.is_domain_ip_superseded(&exe_k, cand_hint, *cand_ip)
                     {
                         superseded.insert(*cand_ip);
                     }
+                    if !cand_ips.contains(cand_ip) {
+                        cand_ips.push(*cand_ip);
+                    }
                 }
-                (active, superseded)
+                let current = history.current_domains_by_ip_for_exe(&exe_k, &cand_ips);
+                (active, superseded, current)
             };
             let mut still_blocked_ips: HashSet<IpAddr> = HashSet::new();
             for (cand_ip, _) in &candidate_blocks {
@@ -2828,6 +2879,14 @@ impl DaemonEngine {
                     OutboundDecision::BlockedByRule { .. }
                 ) {
                     still_blocked_ips.insert(*cand_ip);
+                }
+            }
+            for (cand_ip, cand_dom) in current_domain_entries {
+                if matches!(
+                    evaluate_outbound_policy(&bin_identity, cand_ip, Some(&cand_dom), &rules),
+                    OutboundDecision::BlockedByRule { .. }
+                ) {
+                    still_blocked_ips.insert(cand_ip);
                 }
             }
             for (entry_ip, entry_dom) in active_dns_entries {
@@ -3243,11 +3302,22 @@ impl DaemonEngine {
                             .process_dns_history
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        candidates.iter().any(|c| {
+                        if candidates.len() == 1 {
                             history
-                                .lookup_for_process(&c.instance_id, item.dst_ip)
+                                .lookup_for_process(&candidates[0].instance_id, item.dst_ip)
                                 .is_some()
-                        })
+                        } else {
+                            candidates.iter().any(|c| {
+                                history
+                                    .lookup_fresh_for_process(
+                                        &c.instance_id,
+                                        item.dst_ip,
+                                        item.timestamp_ms,
+                                        AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS,
+                                    )
+                                    .is_some()
+                            })
+                        }
                     };
                     if !any_cand_has_dns {
                         let bin_identity = self.inspector.inspect(&item.exe_path);
@@ -3284,19 +3354,20 @@ impl DaemonEngine {
         dns_inst_id: &str,
         dns_exe_key: &str,
         query_name: &str,
-        resolved_ips: &[IpAddr],
+        accepted_ips: &[IpAddr],
         pending: &mut VecDeque<PendingWfpDrop>,
     ) {
-        if pending.is_empty() || resolved_ips.is_empty() {
+        if pending.is_empty() || accepted_ips.is_empty() {
             return;
         }
-        let canon_resolved: Vec<IpAddr> = resolved_ips.iter().map(|ip| canonical_ip(*ip)).collect();
+        let canon_accepted: Vec<IpAddr> = accepted_ips.iter().map(|ip| canonical_ip(*ip)).collect();
         let norm_query = query_name.trim().trim_end_matches('.');
         let mut cached_rules: Option<Vec<AllowlistRuleRecord>> = None;
         let mut remaining = VecDeque::with_capacity(pending.len());
         let mut ready = Vec::new();
         while let Some(entry) = pending.pop_front() {
-            if dns_exe_key != entry.item.exe_key || !canon_resolved.contains(&entry.item.dst_ip) {
+            let canon_dst = canonical_ip(entry.item.dst_ip);
+            if dns_exe_key != entry.item.exe_key || !canon_accepted.contains(&canon_dst) {
                 remaining.push_back(entry);
                 continue;
             }
@@ -3308,20 +3379,54 @@ impl DaemonEngine {
                 continue;
             }
             if candidates.len() == 1 {
-                ready.push(entry.item);
+                let has_history = {
+                    let history = self
+                        .process_dns_history
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    history.lookup_for_process(dns_inst_id, canon_dst).is_some()
+                };
+                if has_history {
+                    ready.push(entry.item);
+                } else {
+                    remaining.push_back(entry);
+                }
             } else {
-                // Multi-instance case: only wake early if this candidate's DNS actually matches an
-                // allowed target for the executable so a sibling's unrelated DNS does not cut
-                // another instance's grace window short.
+                // Multi-instance case: only wake early if this candidate's fresh DNS history is
+                // available and actually matches an allowed target for the executable so a
+                // sibling's unrelated or stale DNS does not cut another instance's grace window short.
+                let fresh_domain = {
+                    let history = self
+                        .process_dns_history
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    history
+                        .lookup_fresh_for_process(
+                            dns_inst_id,
+                            canon_dst,
+                            entry.item.timestamp_ms,
+                            AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS,
+                        )
+                        .map(|(dom, _)| dom)
+                };
+                let Some(fresh_domain) = fresh_domain else {
+                    remaining.push_back(entry);
+                    continue;
+                };
+                let effective_query = if !fresh_domain.is_empty() {
+                    fresh_domain.as_str()
+                } else {
+                    norm_query
+                };
                 let rules = cached_rules
                     .get_or_insert_with(|| self.store.list_network_rules().unwrap_or_default());
                 let bin_identity = self.inspector.inspect(&entry.item.exe_path);
-                let allowed = !norm_query.is_empty()
+                let allowed = !effective_query.is_empty()
                     && matches!(
                         evaluate_outbound_policy(
                             &bin_identity,
                             entry.item.dst_ip,
-                            Some(norm_query),
+                            Some(effective_query),
                             rules,
                         ),
                         OutboundDecision::AllowedByRule { .. }
@@ -4982,12 +5087,28 @@ struct DnsHistoryEntry {
     timestamp_ms: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct LatestDomainIps {
+    ipv4: Option<(Vec<IpAddr>, i64)>,
+    ipv6: Option<(Vec<IpAddr>, i64)>,
+}
+
+impl LatestDomainIps {
+    fn family(&self, ip: IpAddr) -> Option<&(Vec<IpAddr>, i64)> {
+        if canonical_ip(ip).is_ipv4() {
+            self.ipv4.as_ref()
+        } else {
+            self.ipv6.as_ref()
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ProcessDnsHistory {
     capacity: usize,
     entries: HashMap<(String, IpAddr), DnsHistoryEntry>,
     insertion_order: VecDeque<(String, IpAddr)>,
-    latest_domain_by_exe: HashMap<(String, String), (Vec<IpAddr>, i64)>,
+    latest_domain_by_exe: HashMap<(String, String), LatestDomainIps>,
     latest_domain_order: VecDeque<(String, String)>,
 }
 
@@ -5027,42 +5148,58 @@ impl ProcessDnsHistory {
         }
         let exe_norm = exe_key.trim().to_ascii_lowercase();
         let mut canon_ips: Vec<IpAddr> = Vec::with_capacity(resolved_ips.len());
+        let mut v4_ips: Vec<IpAddr> = Vec::new();
+        let mut v6_ips: Vec<IpAddr> = Vec::new();
         for &ip in resolved_ips {
             let c = canonical_ip(ip);
             if !canon_ips.contains(&c) {
                 canon_ips.push(c);
+                if c.is_ipv4() {
+                    v4_ips.push(c);
+                } else {
+                    v6_ips.push(c);
+                }
             }
         }
-        let has_v4 = canon_ips.iter().any(IpAddr::is_ipv4);
-        let has_v6 = canon_ips.iter().any(IpAddr::is_ipv6);
+
+        let mut updated_v4 = false;
+        let mut updated_v6 = false;
+        let accepted_v4: Vec<IpAddr>;
+        let accepted_v6: Vec<IpAddr>;
 
         if !exe_norm.is_empty() {
             let domain_key = (exe_norm.clone(), norm_domain.clone());
-            if let Some((prev_ips, prev_ts)) = self.latest_domain_by_exe.get(&domain_key).cloned() {
-                if timestamp_ms < prev_ts {
-                    let prev_has_v4 = prev_ips.iter().any(IpAddr::is_ipv4);
-                    let prev_has_v6 = prev_ips.iter().any(IpAddr::is_ipv6);
-                    canon_ips.retain(|ip| {
-                        let same_family_updated =
-                            (ip.is_ipv4() && prev_has_v4) || (ip.is_ipv6() && prev_has_v6);
-                        !same_family_updated || prev_ips.contains(ip)
-                    });
-                    if canon_ips.is_empty() {
-                        return Vec::new();
-                    }
+            if let Some(latest) = self.latest_domain_by_exe.get_mut(&domain_key) {
+                accepted_v4 = if v4_ips.is_empty() {
+                    Vec::new()
                 } else {
-                    let mut merged: Vec<IpAddr> = prev_ips
-                        .into_iter()
-                        .filter(|ip| (!has_v4 && ip.is_ipv4()) || (!has_v6 && ip.is_ipv6()))
-                        .collect();
-                    for &ip in &canon_ips {
-                        if !merged.contains(&ip) {
-                            merged.push(ip);
+                    match &latest.ipv4 {
+                        Some((prev_ips, prev_ts)) if timestamp_ms < *prev_ts => v4_ips
+                            .into_iter()
+                            .filter(|ip| prev_ips.contains(ip))
+                            .collect(),
+                        _ => {
+                            latest.ipv4 = Some((v4_ips.clone(), timestamp_ms));
+                            updated_v4 = true;
+                            v4_ips
                         }
                     }
-                    self.latest_domain_by_exe
-                        .insert(domain_key, (merged, timestamp_ms));
-                }
+                };
+                accepted_v6 = if v6_ips.is_empty() {
+                    Vec::new()
+                } else {
+                    match &latest.ipv6 {
+                        Some((prev_ips, prev_ts)) if timestamp_ms < *prev_ts => v6_ips
+                            .into_iter()
+                            .filter(|ip| prev_ips.contains(ip))
+                            .collect(),
+                        _ => {
+                            latest.ipv6 = Some((v6_ips.clone(), timestamp_ms));
+                            updated_v6 = true;
+                            v6_ips
+                        }
+                    }
+                };
             } else {
                 let domain_cap = self.capacity.max(1);
                 while self.latest_domain_by_exe.len() >= domain_cap {
@@ -5071,39 +5208,82 @@ impl ProcessDnsHistory {
                     };
                     self.latest_domain_by_exe.remove(&oldest);
                 }
+                let mut latest = LatestDomainIps::default();
+                if !v4_ips.is_empty() {
+                    latest.ipv4 = Some((v4_ips.clone(), timestamp_ms));
+                    updated_v4 = true;
+                }
+                if !v6_ips.is_empty() {
+                    latest.ipv6 = Some((v6_ips.clone(), timestamp_ms));
+                    updated_v6 = true;
+                }
                 self.latest_domain_order.push_back(domain_key.clone());
-                self.latest_domain_by_exe
-                    .insert(domain_key, (canon_ips.clone(), timestamp_ms));
+                self.latest_domain_by_exe.insert(domain_key, latest);
+                accepted_v4 = v4_ips;
+                accepted_v6 = v6_ips;
+            }
+        } else {
+            updated_v4 = !v4_ips.is_empty();
+            updated_v6 = !v6_ips.is_empty();
+            accepted_v4 = v4_ips;
+            accepted_v6 = v6_ips;
+        }
+
+        let accepted_ips: Vec<IpAddr> = canon_ips
+            .into_iter()
+            .filter(|ip| {
+                if ip.is_ipv4() {
+                    accepted_v4.contains(ip)
+                } else {
+                    accepted_v6.contains(ip)
+                }
+            })
+            .collect();
+        if accepted_ips.is_empty() {
+            return Vec::new();
+        }
+
+        if updated_v4 || updated_v6 {
+            let mut removed_keys: Vec<(String, IpAddr)> = Vec::new();
+            self.entries.retain(|(inst_id, entry_ip), entry| {
+                let same_scope = inst_id == process_instance_id
+                    || (!exe_norm.is_empty() && entry.exe_key == exe_norm);
+                let family_updated =
+                    (updated_v4 && entry_ip.is_ipv4()) || (updated_v6 && entry_ip.is_ipv6());
+                let should_evict = same_scope
+                    && family_updated
+                    && entry.domain == norm_domain
+                    && entry.timestamp_ms <= timestamp_ms
+                    && !accepted_ips.contains(entry_ip);
+                if should_evict {
+                    removed_keys.push((inst_id.clone(), *entry_ip));
+                }
+                !should_evict
+            });
+            if !removed_keys.is_empty() {
+                self.insertion_order.retain(|k| !removed_keys.contains(k));
             }
         }
 
-        let mut removed_keys: Vec<(String, IpAddr)> = Vec::new();
-        self.entries.retain(|(inst_id, entry_ip), entry| {
-            let same_scope = inst_id == process_instance_id
-                || (!exe_norm.is_empty() && entry.exe_key == exe_norm);
-            let same_family = (has_v4 && entry_ip.is_ipv4()) || (has_v6 && entry_ip.is_ipv6());
-            let should_evict = same_scope
-                && same_family
-                && entry.domain == norm_domain
-                && entry.timestamp_ms <= timestamp_ms
-                && !canon_ips.contains(entry_ip);
-            if should_evict {
-                removed_keys.push((inst_id.clone(), *entry_ip));
-            }
-            !should_evict
-        });
-        if !removed_keys.is_empty() {
-            self.insertion_order.retain(|k| !removed_keys.contains(k));
-        }
-
-        for &canon in &canon_ips {
+        for &canon in &accepted_ips {
             let key = (process_instance_id.to_string(), canon);
+            let existing_superseded = self
+                .entries
+                .get(&key)
+                .is_some_and(|existing| self.is_entry_superseded(existing, canon));
             if let Some(existing) = self.entries.get_mut(&key) {
-                *existing = DnsHistoryEntry {
-                    exe_key: exe_norm.clone(),
-                    domain: norm_domain.clone(),
-                    timestamp_ms,
-                };
+                if existing.domain == norm_domain {
+                    if existing.exe_key.is_empty() && !exe_norm.is_empty() {
+                        existing.exe_key = exe_norm.clone();
+                    }
+                    existing.timestamp_ms = existing.timestamp_ms.max(timestamp_ms);
+                } else if existing_superseded || timestamp_ms >= existing.timestamp_ms {
+                    *existing = DnsHistoryEntry {
+                        exe_key: exe_norm.clone(),
+                        domain: norm_domain.clone(),
+                        timestamp_ms,
+                    };
+                }
             } else {
                 while self.entries.len() >= self.capacity {
                     let Some(oldest) = self.insertion_order.pop_front() else {
@@ -5122,7 +5302,34 @@ impl ProcessDnsHistory {
                 );
             }
         }
-        canon_ips
+        accepted_ips
+    }
+
+    fn current_domains_by_ip_for_exe(
+        &self,
+        exe_key: &str,
+        candidate_ips: &[IpAddr],
+    ) -> Vec<(IpAddr, String)> {
+        let exe_norm = exe_key.trim().to_ascii_lowercase();
+        if exe_norm.is_empty() || candidate_ips.is_empty() {
+            return Vec::new();
+        }
+        let canon_cands: Vec<IpAddr> = candidate_ips.iter().map(|ip| canonical_ip(*ip)).collect();
+        let mut out: Vec<(IpAddr, String)> = Vec::new();
+        for ((k_exe, dom), latest) in &self.latest_domain_by_exe {
+            if k_exe != &exe_norm {
+                continue;
+            }
+            for &cand in &canon_cands {
+                if latest
+                    .family(cand)
+                    .is_some_and(|(latest_ips, _)| latest_ips.contains(&cand))
+                {
+                    out.push((cand, dom.clone()));
+                }
+            }
+        }
+        out
     }
 
     fn is_domain_ip_superseded(&self, exe_key: &str, domain_hint: &str, ip: IpAddr) -> bool {
@@ -5132,31 +5339,30 @@ impl ProcessDnsHistory {
             return false;
         }
         let canon = canonical_ip(ip);
-        let Some((latest_ips, _)) = self.latest_domain_by_exe.get(&(exe_norm, dom_norm)) else {
+        let Some(latest) = self.latest_domain_by_exe.get(&(exe_norm, dom_norm)) else {
             return false;
         };
-        if latest_ips.contains(&canon) {
+        let Some((latest_ips, _)) = latest.family(canon) else {
             return false;
-        }
-        (canon.is_ipv4() && latest_ips.iter().any(IpAddr::is_ipv4))
-            || (canon.is_ipv6() && latest_ips.iter().any(IpAddr::is_ipv6))
+        };
+        !latest_ips.contains(&canon)
     }
 
     fn is_entry_superseded(&self, entry: &DnsHistoryEntry, ip: IpAddr) -> bool {
         if entry.exe_key.is_empty() {
             return false;
         }
-        let Some((latest_ips, latest_ts)) = self
+        let canon = canonical_ip(ip);
+        let Some(latest) = self
             .latest_domain_by_exe
             .get(&(entry.exe_key.clone(), entry.domain.clone()))
         else {
             return false;
         };
-        if *latest_ts < entry.timestamp_ms || latest_ips.contains(&ip) {
+        let Some((latest_ips, latest_ts)) = latest.family(canon) else {
             return false;
-        }
-        (ip.is_ipv4() && latest_ips.iter().any(IpAddr::is_ipv4))
-            || (ip.is_ipv6() && latest_ips.iter().any(IpAddr::is_ipv6))
+        };
+        *latest_ts >= entry.timestamp_ms && !latest_ips.contains(&canon)
     }
 
     fn remove_process(&mut self, process_instance_id: &str) {
@@ -5359,5 +5565,1103 @@ mod tests {
         assert!(hist
             .domains_for_exe_ip(r"c:\tools\other.exe", v4_new)
             .is_empty());
+    }
+
+    /// `DAEMON-P3-43A` (`R-07`): Dual-stack DNS history tracks latest IP sets and timestamps
+    /// independently per address family (IPv4 vs IPv6), handles mixed queries without cross-family
+    /// interference, and never regresses existing `entries` timestamps on delayed responses.
+    #[test]
+    fn daemon_p3_43a_dual_stack_dns_family_independent_timestamps_and_non_regression() {
+        use std::net::Ipv6Addr;
+
+        let mut hist = ProcessDnsHistory::new(32);
+        let exe = r"c:\tools\dualstack.exe";
+        let v4_1 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+        let v4_2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
+        let v4_3 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30));
+        let v4_stale = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 99));
+        let v6_1 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let v6_2 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2));
+        let v6_stale = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 99));
+
+        // 1. A(1000) -> AAAA(3000) -> A(2000): IPv4 is newer than prior IPv4 (2000 >= 1000)
+        //    so it must be accepted even though AAAA has a newer timestamp (3000).
+        assert_eq!(
+            hist.record_for_exe("10:1", exe, "api.example.", &[v4_1], 1_000),
+            vec![v4_1]
+        );
+        assert_eq!(
+            hist.record_for_exe("10:1", exe, "api.example.", &[v6_1], 3_000),
+            vec![v6_1]
+        );
+        assert_eq!(
+            hist.record_for_exe("10:1", exe, "api.example.", &[v4_2], 2_000),
+            vec![v4_2],
+            "newer IPv4 response at t=2000 must not be rejected by AAAA at t=3000"
+        );
+        assert!(hist.lookup_for_process("10:1", v4_1).is_none());
+        assert_eq!(
+            hist.lookup_for_process("10:1", v4_2),
+            Some(("api.example".to_string(), 2_000))
+        );
+        assert_eq!(
+            hist.lookup_for_process("10:1", v6_1),
+            Some(("api.example".to_string(), 3_000))
+        );
+        assert!(hist.is_domain_ip_superseded(exe, "api.example", v4_1));
+        assert!(!hist.is_domain_ip_superseded(exe, "api.example", v4_2));
+        assert!(!hist.is_domain_ip_superseded(exe, "api.example", v6_1));
+        // IPv4-mapped IPv6 address must map to the IPv4 family for superseding checks.
+        let v4_1_mapped = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 10).to_ipv6_mapped());
+        let v4_2_mapped = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 20).to_ipv6_mapped());
+        assert!(hist.is_domain_ip_superseded(exe, "api.example", v4_1_mapped));
+        assert!(!hist.is_domain_ip_superseded(exe, "api.example", v4_2_mapped));
+
+        // 2. Reverse order: AAAA(1000) -> A(3000) -> AAAA(2000).
+        assert_eq!(
+            hist.record_for_exe("20:1", exe, "rev.example", &[v6_1], 1_000),
+            vec![v6_1]
+        );
+        assert_eq!(
+            hist.record_for_exe("20:1", exe, "rev.example", &[v4_1], 3_000),
+            vec![v4_1]
+        );
+        assert_eq!(
+            hist.record_for_exe("20:1", exe, "rev.example", &[v6_2], 2_000),
+            vec![v6_2],
+            "newer IPv6 response at t=2000 must not be rejected by A at t=3000"
+        );
+        assert!(hist.lookup_for_process("20:1", v6_1).is_none());
+        assert_eq!(
+            hist.lookup_for_process("20:1", v6_2),
+            Some(("rev.example".to_string(), 2_000))
+        );
+        assert_eq!(
+            hist.lookup_for_process("20:1", v4_1),
+            Some(("rev.example".to_string(), 3_000))
+        );
+        assert!(hist.is_domain_ip_superseded(exe, "rev.example", v6_1));
+        assert!(!hist.is_domain_ip_superseded(exe, "rev.example", v6_2));
+        assert!(!hist.is_domain_ip_superseded(exe, "rev.example", v4_1));
+
+        // 3. Mixed IPv4/IPv6 query where one family is fresh and the other is delayed.
+        assert_eq!(
+            hist.record_for_exe("30:1", exe, "mix.example", &[v4_1], 1_000),
+            vec![v4_1]
+        );
+        assert_eq!(
+            hist.record_for_exe("30:1", exe, "mix.example", &[v6_1, v6_2], 3_000),
+            vec![v6_1, v6_2]
+        );
+        // Sibling instance holds a delayed record for `v6_2` at t=2100 (still in latest IPv6 set).
+        assert_eq!(
+            hist.record_for_exe("31:1", exe, "mix.example", &[v6_2], 2_100),
+            vec![v6_2]
+        );
+        // Mixed query at t=2000: `v4_2` updates IPv4, `v6_stale` is rejected for IPv6.
+        assert_eq!(
+            hist.record_for_exe("30:1", exe, "mix.example", &[v4_2, v6_stale], 2_000),
+            vec![v4_2]
+        );
+        assert!(hist.lookup_for_process("30:1", v4_1).is_none());
+        assert_eq!(
+            hist.lookup_for_process("30:1", v4_2),
+            Some(("mix.example".to_string(), 2_000))
+        );
+        assert!(hist.lookup_for_process("30:1", v6_stale).is_none());
+        assert_eq!(
+            hist.lookup_for_process("30:1", v6_1),
+            Some(("mix.example".to_string(), 3_000))
+        );
+        assert_eq!(
+            hist.lookup_for_process("30:1", v6_2),
+            Some(("mix.example".to_string(), 3_000))
+        );
+
+        // Mixed query at t=2500: `v4_3` updates IPv4, while delayed `v6_1` is in current IPv6 set.
+        // IPv6 latest timestamp was NOT updated, so `v6_2` (even sibling at t=2100 <= 2500) must
+        // NOT be evicted, and `30:1`'s `v6_1` timestamp must NOT regress from 3000 to 2500.
+        assert_eq!(
+            hist.record_for_exe("30:1", exe, "mix.example", &[v4_3, v6_1], 2_500),
+            vec![v4_3, v6_1]
+        );
+        assert!(hist.lookup_for_process("30:1", v4_2).is_none());
+        assert_eq!(
+            hist.lookup_for_process("30:1", v4_3),
+            Some(("mix.example".to_string(), 2_500))
+        );
+        assert_eq!(
+            hist.lookup_for_process("30:1", v6_1),
+            Some(("mix.example".to_string(), 3_000)),
+            "delayed query returning current latest IP must not regress existing timestamp_ms"
+        );
+        assert_eq!(
+            hist.lookup_for_process("30:1", v6_2),
+            Some(("mix.example".to_string(), 3_000)),
+            "non-updated family must not evict sibling IPs in latest set"
+        );
+        assert_eq!(
+            hist.lookup_for_process("31:1", v6_2),
+            Some(("mix.example".to_string(), 2_100)),
+            "delayed query must not evict older sibling entry for a still-current IP"
+        );
+
+        // 4. Delayed single-family responses: stale IP rejected, current IP does not regress ts,
+        //    and cross-domain delayed responses do not clobber newer non-superseded entries.
+        assert!(hist
+            .record_for_exe("30:1", exe, "mix.example", &[v4_stale], 2_400)
+            .is_empty());
+        assert_eq!(
+            hist.record_for_exe("30:1", exe, "mix.example", &[v4_3], 2_200),
+            vec![v4_3]
+        );
+        assert_eq!(
+            hist.lookup_for_process("30:1", v4_3),
+            Some(("mix.example".to_string(), 2_500))
+        );
+        // `is_entry_superseded` must consult only the entry IP's own address family.
+        let v4_entry_old = super::DnsHistoryEntry {
+            exe_key: exe.to_string(),
+            domain: "api.example".to_string(),
+            timestamp_ms: 1_000,
+        };
+        let v4_entry_cur = super::DnsHistoryEntry {
+            exe_key: exe.to_string(),
+            domain: "api.example".to_string(),
+            timestamp_ms: 2_000,
+        };
+        let v6_entry_cur = super::DnsHistoryEntry {
+            exe_key: exe.to_string(),
+            domain: "api.example".to_string(),
+            timestamp_ms: 3_000,
+        };
+        assert!(hist.is_entry_superseded(&v4_entry_old, v4_1));
+        assert!(!hist.is_entry_superseded(&v4_entry_cur, v4_2));
+        assert!(!hist.is_entry_superseded(&v6_entry_cur, v6_1));
+
+        // Cross-domain delayed response sharing the same IP must not clobber a newer mapping.
+        assert_eq!(
+            hist.record_for_exe("40:1", exe, "newer.example", &[v4_3], 6_000),
+            vec![v4_3]
+        );
+        assert_eq!(
+            hist.record_for_exe("40:1", exe, "older.example", &[v4_3], 4_000),
+            vec![v4_3]
+        );
+        assert_eq!(
+            hist.lookup_for_process("40:1", v4_3),
+            Some(("newer.example".to_string(), 6_000)),
+            "delayed cross-domain DNS on shared IP must not regress or clobber newer entry"
+        );
+    }
+
+    /// `DAEMON-P3-43B` (`R-03` + `R-07` boundary): `process_event_with_lane` returns only accepted
+    /// DNS IPs, and `flush_ready_pending_wfp_drops` keeps single-candidate pending entries parked
+    /// whenever `ProcessDnsHistory::lookup_for_process` has no usable record for that instance.
+    #[test]
+    fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
+        use super::{
+            current_unix_ms, DaemonConfig, DaemonEngine, EventLane, PendingWfpDrop, QueuedWfpDrop,
+            WfpRuleManager,
+        };
+        use ledr_proto::{ProcessIdentity, SensorEvent};
+        use ledr_rules::{EarlyPruner, SigmaEngine};
+        use ledr_store::LedrStore;
+        use std::collections::VecDeque;
+        use std::net::Ipv6Addr;
+        use std::time::Duration;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build rt");
+
+        rt.block_on(async {
+            let store = LedrStore::open_in_memory().expect("open store");
+            let engine = DaemonEngine::start(
+                store,
+                SigmaEngine::default(),
+                EarlyPruner::default(),
+                DaemonConfig {
+                    outbound_firewall_enabled: false,
+                    ..DaemonConfig::default()
+                },
+            );
+            // Stop background worker so we exercise `process_event_with_lane` and
+            // `flush_ready_pending_wfp_drops` deterministically on the current task.
+            if let Some(h) = engine.worker_handle.lock().await.take() {
+                h.abort();
+                let _ = h.await;
+            }
+
+            let now_ms = current_unix_ms();
+            let exe = r"C:\Tools\r03_boundary.exe";
+            let exe_key = WfpRuleManager::exe_key(exe);
+            let proc_id = ProcessIdentity::new(9401, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let inst_id = format!("{}:{}", proc_id.pid, proc_id.create_time_100ns);
+
+            let _ = engine.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: proc_id,
+                    parent_pid: 4,
+                    exe_path: exe.to_string(),
+                    command_line: exe.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+
+            let v4_new = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
+            let v4_stale = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+            let v6_new = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x42));
+
+            let upd1 = engine
+                .process_event_with_lane(
+                    &SensorEvent::DnsQuery {
+                        pid: proc_id.pid,
+                        query_name: "svc.example".to_string(),
+                        query_type: 1,
+                        resolved_ips: vec![v4_new],
+                        timestamp_ms: now_ms + 200,
+                    },
+                    EventLane::HighPriority,
+                )
+                .expect("fresh v4 dns accepted");
+            assert_eq!(upd1.instance_id, inst_id);
+            assert_eq!(upd1.exe_key, exe_key);
+            assert_eq!(upd1.accepted_ips, vec![v4_new]);
+
+            // Stale v4-only DNS response must yield `None` (no accepted IPs).
+            assert!(
+                engine
+                    .process_event_with_lane(
+                        &SensorEvent::DnsQuery {
+                            pid: proc_id.pid,
+                            query_name: "svc.example".to_string(),
+                            query_type: 1,
+                            resolved_ips: vec![v4_stale],
+                            timestamp_ms: now_ms + 100,
+                        },
+                        EventLane::HighPriority,
+                    )
+                    .is_none(),
+                "stale DNS response must return None and never wake pending WFP drops"
+            );
+
+            // Mixed query: stale v4 is dropped, fresh v6 is returned in `accepted_ips`.
+            let upd_mixed = engine
+                .process_event_with_lane(
+                    &SensorEvent::DnsQuery {
+                        pid: proc_id.pid,
+                        query_name: "svc.example".to_string(),
+                        query_type: 28,
+                        resolved_ips: vec![v4_stale, v6_new],
+                        timestamp_ms: now_ms + 150,
+                    },
+                    EventLane::HighPriority,
+                )
+                .expect("mixed query must accept v6");
+            assert_eq!(upd_mixed.accepted_ips, vec![v6_new]);
+
+            // Even with `candidates.len() == 1`, `flush_ready_pending_wfp_drops` must keep a
+            // pending entry parked when `lookup_for_process(dns_inst_id, dst_ip)` is `None`.
+            let mut pending = VecDeque::new();
+            let future_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            pending.push_back(PendingWfpDrop {
+                item: QueuedWfpDrop {
+                    exe_path: exe.to_string(),
+                    exe_key: exe_key.clone(),
+                    dst_ip: v4_stale,
+                    dst_port: 443,
+                    protocol: 6,
+                    timestamp_ms: now_ms + 250,
+                    os_filter_id: 1,
+                },
+                deadline: future_deadline,
+            });
+            engine.flush_ready_pending_wfp_drops(
+                &inst_id,
+                &exe_key,
+                "svc.example",
+                &[v4_stale],
+                &mut pending,
+            );
+            assert_eq!(
+                pending.len(),
+                1,
+                "single-candidate drop without usable DNS history must remain parked until deadline"
+            );
+
+            // Once the pending drop matches an IP present in `lookup_for_process`, it flushes.
+            pending.clear();
+            pending.push_back(PendingWfpDrop {
+                item: QueuedWfpDrop {
+                    exe_path: exe.to_string(),
+                    exe_key: exe_key.clone(),
+                    dst_ip: v6_new,
+                    dst_port: 443,
+                    protocol: 6,
+                    timestamp_ms: now_ms + 250,
+                    os_filter_id: 2,
+                },
+                deadline: future_deadline,
+            });
+            engine.flush_ready_pending_wfp_drops(
+                &inst_id,
+                &exe_key,
+                "svc.example",
+                &upd_mixed.accepted_ips,
+                &mut pending,
+            );
+            assert!(
+                pending.is_empty(),
+                "single-candidate drop with usable DNS history must flush immediately"
+            );
+
+            // Multi-instance (`candidates.len() > 1`) symmetry: when an existing sibling only has
+            // DNS older than `AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS`, `on_wfp_drop_dequeued` must still
+            // park the drop during the grace window, and `flush_ready_pending_wfp_drops` must keep
+            // it parked on stale-age DNS until a fresh allowed DNS arrives.
+            struct StubDefense(std::sync::atomic::AtomicU64);
+            impl ledr_proto::ActiveDefenseController for StubDefense {
+                fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+                    Ok(())
+                }
+                fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+                    Ok(())
+                }
+                fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+                    Ok(())
+                }
+                fn add_wfp_app_rule(
+                    &self,
+                    _: &std::path::Path,
+                    _: Option<IpAddr>,
+                    _: bool,
+                ) -> Result<u64, String> {
+                    Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                }
+                fn remove_wfp_rule(&self, _: u64) -> Result<(), String> {
+                    Ok(())
+                }
+            }
+            struct StubNotifier;
+            impl super::NotificationDispatcher for StubNotifier {
+                fn notify_alert(&self, _: &ledr_proto::AlertRecord) -> Result<(), String> {
+                    Ok(())
+                }
+            }
+            struct FixedShaInspector(String);
+            impl super::BinaryInspector for FixedShaInspector {
+                fn inspect(&self, exe_path: &str) -> ledr_rules::BinaryIdentity {
+                    ledr_rules::BinaryIdentity {
+                        exe_path: exe_path.to_string(),
+                        sha256: Some(self.0.clone()),
+                        authenticode: None,
+                    }
+                }
+            }
+
+            let test_sha = "a".repeat(64);
+            let allow_exe = r"C:\Temp\multi_r03.exe";
+            let allow_exe_key = WfpRuleManager::exe_key(allow_exe);
+            let allow_store = LedrStore::open_in_memory().expect("open allow store");
+            allow_store
+                .upsert_rule(&ledr_proto::AllowlistRuleRecord {
+                    rule_id: "R-MULTI-ALLOW".to_string(),
+                    scope: ledr_proto::RuleScope::NetworkAllow,
+                    exe_path_pattern: allow_exe.to_string(),
+                    sha256: Some(test_sha.clone()),
+                    signer_subject: None,
+                    root_thumbprint: None,
+                    allowed_target: Some("good.example".to_string()),
+                    created_at_ms: now_ms - 10_000,
+                    created_by: "test".to_string(),
+                })
+                .expect("seed allow rule");
+            let multi_engine = DaemonEngine::start_with_dependencies(
+                allow_store,
+                SigmaEngine::default(),
+                EarlyPruner::default(),
+                DaemonConfig {
+                    outbound_firewall_enabled: true,
+                    wfp_drop_dns_grace_ms: 500,
+                    ..DaemonConfig::default()
+                },
+                std::sync::Arc::new(StubDefense(std::sync::atomic::AtomicU64::new(1))),
+                std::sync::Arc::new(StubNotifier),
+                std::sync::Arc::new(FixedShaInspector(test_sha.clone())),
+            );
+            if let Some(h) = multi_engine.worker_handle.lock().await.take() {
+                h.abort();
+                let _ = h.await;
+            }
+            let proc_start_ms = now_ms - super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS - 20_000;
+            let p_a =
+                ProcessIdentity::new(9411, (proc_start_ms as u64 + 11_644_473_600_000) * 10_000);
+            let p_b =
+                ProcessIdentity::new(9412, (proc_start_ms as u64 + 11_644_473_600_000) * 10_000);
+            for pid_id in [p_a, p_b] {
+                let _ = multi_engine.process_event_with_lane(
+                    &SensorEvent::ProcessStart {
+                        identity: pid_id,
+                        parent_pid: 4,
+                        exe_path: allow_exe.to_string(),
+                        command_line: allow_exe.to_string(),
+                        user_sid: None,
+                    },
+                    EventLane::HighPriority,
+                );
+            }
+            let shared_dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+            // Seed stale DNS (> AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS old) on sibling `p_a`.
+            let stale_upd = multi_engine
+                .process_event_with_lane(
+                    &SensorEvent::DnsQuery {
+                        pid: p_a.pid,
+                        query_name: "good.example".to_string(),
+                        query_type: 1,
+                        resolved_ips: vec![shared_dst],
+                        timestamp_ms: now_ms - super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS - 5_000,
+                    },
+                    EventLane::HighPriority,
+                )
+                .expect("stale-age dns accepted as initial");
+            let mut multi_pending = VecDeque::new();
+            multi_engine.on_wfp_drop_dequeued(
+                QueuedWfpDrop {
+                    exe_path: allow_exe.to_string(),
+                    exe_key: allow_exe_key.clone(),
+                    dst_ip: shared_dst,
+                    dst_port: 443,
+                    protocol: 6,
+                    timestamp_ms: now_ms + 1_000,
+                    os_filter_id: 3,
+                },
+                &mut multi_pending,
+            );
+            assert_eq!(
+                multi_pending.len(),
+                1,
+                "multi-instance drop must still park when sibling only holds stale >60s DNS"
+            );
+            multi_engine.flush_ready_pending_wfp_drops(
+                &stale_upd.instance_id,
+                &allow_exe_key,
+                "good.example",
+                &stale_upd.accepted_ips,
+                &mut multi_pending,
+            );
+            assert_eq!(
+                multi_pending.len(),
+                1,
+                "stale-age sibling DNS must not prematurely wake parked multi-instance drop"
+            );
+            let fresh_upd = multi_engine
+                .process_event_with_lane(
+                    &SensorEvent::DnsQuery {
+                        pid: p_b.pid,
+                        query_name: "good.example".to_string(),
+                        query_type: 1,
+                        resolved_ips: vec![shared_dst],
+                        timestamp_ms: now_ms + 900,
+                    },
+                    EventLane::HighPriority,
+                )
+                .expect("fresh dns accepted");
+            multi_engine.flush_ready_pending_wfp_drops(
+                &fresh_upd.instance_id,
+                &allow_exe_key,
+                "good.example",
+                &fresh_upd.accepted_ips,
+                &mut multi_pending,
+            );
+            assert!(
+                multi_pending.is_empty(),
+                "fresh allowed sibling DNS must wake parked multi-instance drop"
+            );
+
+            // Post-exit shared-IP DomainPolicy Block preservation: if two blocked domains resolve
+            // to `shared_ip`, the original process exits (clearing `entries`), and one domain
+            // rotates away, `current_domains_by_ip_for_exe` must keep `shared_ip` blocked until
+            // the second blocked domain also rotates away.
+            let blk_exe = r"C:\Tools\shared_blk_post_exit.exe";
+            let blk_store = LedrStore::open_in_memory().expect("open blk store");
+            for (rid, dom) in [("R-BLK-A", "a.bad.example"), ("R-BLK-B", "b.bad.example")] {
+                blk_store
+                    .upsert_rule(&ledr_proto::AllowlistRuleRecord {
+                        rule_id: rid.to_string(),
+                        scope: ledr_proto::RuleScope::NetworkBlock,
+                        exe_path_pattern: blk_exe.to_string(),
+                        sha256: Some(test_sha.clone()),
+                        signer_subject: None,
+                        root_thumbprint: None,
+                        allowed_target: Some(dom.to_string()),
+                        created_at_ms: now_ms - 10_000,
+                        created_by: "test".to_string(),
+                    })
+                    .expect("seed block rule");
+            }
+            let blk_engine = DaemonEngine::start_with_dependencies(
+                blk_store,
+                SigmaEngine::default(),
+                EarlyPruner::default(),
+                DaemonConfig {
+                    outbound_firewall_enabled: true,
+                    ..DaemonConfig::default()
+                },
+                std::sync::Arc::new(StubDefense(std::sync::atomic::AtomicU64::new(100))),
+                std::sync::Arc::new(StubNotifier),
+                std::sync::Arc::new(FixedShaInspector(test_sha)),
+            );
+            if let Some(h) = blk_engine.worker_handle.lock().await.take() {
+                h.abort();
+                let _ = h.await;
+            }
+            let shared_blk_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88));
+            let moved_a_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88));
+            let moved_b_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 89));
+            let bp1 = ProcessIdentity::new(9421, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let bp2 = ProcessIdentity::new(9422, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+            let _ = blk_engine.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: bp1,
+                    parent_pid: 4,
+                    exe_path: blk_exe.to_string(),
+                    command_line: blk_exe.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = blk_engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: bp1.pid,
+                    query_name: "a.bad.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![shared_blk_ip],
+                    timestamp_ms: now_ms + 100,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = blk_engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: bp1.pid,
+                    query_name: "b.bad.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![shared_blk_ip],
+                    timestamp_ms: now_ms + 110,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(blk_engine.has_active_wfp_filter(blk_exe, Some(shared_blk_ip), false));
+            // `bp1` exits, clearing `ProcessDnsHistory::entries` completely.
+            let _ = blk_engine.process_event_with_lane(
+                &SensorEvent::ProcessStop {
+                    pid: bp1.pid,
+                    exit_time_100ns: (now_ms as u64 + 11_644_473_600_200) * 10_000,
+                    exit_code: 0,
+                },
+                EventLane::HighPriority,
+            );
+            let _ = blk_engine.process_event_with_lane(
+                &SensorEvent::ProcessStart {
+                    identity: bp2,
+                    parent_pid: 4,
+                    exe_path: blk_exe.to_string(),
+                    command_line: blk_exe.to_string(),
+                    user_sid: None,
+                },
+                EventLane::HighPriority,
+            );
+            // `a.bad.example` moves off `shared_blk_ip`, but `b.bad.example` still maps to it.
+            let _ = blk_engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: bp2.pid,
+                    query_name: "a.bad.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![moved_a_ip],
+                    timestamp_ms: now_ms + 300,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(
+                blk_engine.has_active_wfp_filter(blk_exe, Some(shared_blk_ip), false),
+                "shared_blk_ip must stay blocked while b.bad.example still points there in latest_domain_by_exe after bp1 exit"
+            );
+            // Once `b.bad.example` also moves off `shared_blk_ip`, the retired block is removed.
+            let _ = blk_engine.process_event_with_lane(
+                &SensorEvent::DnsQuery {
+                    pid: bp2.pid,
+                    query_name: "b.bad.example".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![moved_b_ip],
+                    timestamp_ms: now_ms + 400,
+                },
+                EventLane::HighPriority,
+            );
+            assert!(
+                !blk_engine.has_active_wfp_filter(blk_exe, Some(shared_blk_ip), false),
+                "shared_blk_ip block must be removed once both blocked domains rotated away"
+            );
+        });
+    }
+
+    /// `DAEMON-P3-44A` (`R-13`): `WfpDropOverflowQueue` reports `CoalescedOverwritten` when a
+    /// full secondary queue overwrites a distinct destination for the same executable, retains the
+    /// latest destination without disturbing other executables, evicts excess coalesced apps in
+    /// FIFO order, and exposes the counter via `DaemonEngine::wfp_drop_overflow_coalesced`.
+    #[test]
+    fn daemon_p3_44a_wfp_drop_overflow_queue_coalescing_and_fifo_eviction() {
+        use super::{
+            current_unix_ms, DaemonConfig, DaemonEngine, OverflowPushOutcome, QueuedWfpDrop,
+            WfpDropOverflowQueue,
+        };
+        use ledr_rules::{EarlyPruner, SigmaEngine};
+        use ledr_sensor_win::WfpDropEvent;
+        use ledr_store::LedrStore;
+
+        let make_item = |exe_key: &str, ip: IpAddr, port: u16| QueuedWfpDrop {
+            exe_path: exe_key.to_string(),
+            exe_key: exe_key.to_string(),
+            dst_ip: ip,
+            dst_port: port,
+            protocol: 6,
+            timestamp_ms: 1_000,
+            os_filter_id: 1,
+        };
+
+        let ip1 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+        let ip3 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 3));
+        let ip4 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4));
+        let ip1_mapped = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 1).to_ipv6_mapped());
+
+        // Part A: Same-app distinct-destination overwrite retains latest destination and leaves
+        // other executables untouched.
+        let mut q = WfpDropOverflowQueue::new(2);
+        assert_eq!(
+            q.push(make_item("app_a", ip1, 443)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q.push(make_item("app_a", ip1_mapped, 443)),
+            OverflowPushOutcome::Deduplicated
+        );
+        assert_eq!(
+            q.push(make_item("app_b", ip1, 443)),
+            OverflowPushOutcome::Queued
+        );
+        // Primary `queue` is now full (2/2). Subsequent events enter `coalesced_by_exe`.
+        assert_eq!(
+            q.push(make_item("app_a", ip2, 443)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q.push(make_item("app_a", ip2, 8443)),
+            OverflowPushOutcome::Deduplicated
+        );
+        assert_eq!(
+            q.push(make_item("app_a", ip3, 443)),
+            OverflowPushOutcome::CoalescedOverwritten
+        );
+        assert_eq!(
+            q.push(make_item("app_b", ip4, 443)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+
+        let drained: Vec<(String, IpAddr)> =
+            std::iter::from_fn(|| q.pop().map(|i| (i.exe_key, i.dst_ip))).collect();
+        assert_eq!(
+            drained,
+            vec![
+                ("app_a".to_string(), ip1),
+                ("app_b".to_string(), ip1),
+                ("app_a".to_string(), ip3),
+                ("app_b".to_string(), ip4),
+            ],
+            "coalesced overwrite must keep latest destination (ip3) for app_a without affecting app_b"
+        );
+
+        // Part B: Exceeding `coalesced_by_exe` capacity evicts the oldest coalesced executable FIFO.
+        let mut q_fifo = WfpDropOverflowQueue::new(2);
+        assert_eq!(
+            q_fifo.push(make_item("q1", ip1, 443)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q_fifo.push(make_item("q2", ip1, 443)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q_fifo.push(make_item("app_a", ip2, 443)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q_fifo.push(make_item("app_a", ip3, 443)),
+            OverflowPushOutcome::CoalescedOverwritten
+        );
+        assert_eq!(
+            q_fifo.push(make_item("app_b", ip2, 443)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        // `coalesced_by_exe` is now full (2/2: [app_a, app_b]); adding `app_c` evicts `app_a`.
+        assert_eq!(
+            q_fifo.push(make_item("app_c", ip4, 443)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        let drained_fifo: Vec<(String, IpAddr)> =
+            std::iter::from_fn(|| q_fifo.pop().map(|i| (i.exe_key, i.dst_ip))).collect();
+        assert_eq!(
+            drained_fifo,
+            vec![
+                ("q1".to_string(), ip1),
+                ("q2".to_string(), ip1),
+                ("app_b".to_string(), ip2),
+                ("app_c".to_string(), ip4),
+            ],
+            "coalesced_by_exe overflow must evict oldest executable (app_a) in FIFO order"
+        );
+
+        // Part B2: Partial drain of `queue` while `coalesced_by_exe` is non-empty must still
+        // deduplicate an identical `(exe_key, canonical_dst_ip)` instead of double-queuing it,
+        // while allowing a distinct destination IP to use the freed `queue` slot without losing
+        // the pending coalesced destination.
+        let mut q_partial = WfpDropOverflowQueue::new(2);
+        assert_eq!(
+            q_partial.push(make_item("app_a", ip1, 443)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q_partial.push(make_item("app_b", ip1, 443)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q_partial.push(make_item("app_a", ip2, 443)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        // Pop one item from `queue` (`queue.len() == 1 < capacity`), leaving `app_a -> ip2` in
+        // `coalesced_by_exe`.
+        let popped = q_partial.pop().expect("pop first queued item");
+        assert_eq!((popped.exe_key.as_str(), popped.dst_ip), ("app_a", ip1));
+        assert_eq!(
+            q_partial.push(make_item("app_a", ip2, 8443)),
+            OverflowPushOutcome::Deduplicated,
+            "duplicate (exe_key, dst_ip) already in coalesced_by_exe must deduplicate even when queue has free space"
+        );
+        assert_eq!(
+            q_partial.push(make_item("app_a", ip3, 443)),
+            OverflowPushOutcome::Queued,
+            "distinct dst_ip should use freed queue slot without overwriting coalesced ip2"
+        );
+        let drained_partial: Vec<(String, IpAddr, u16)> =
+            std::iter::from_fn(|| q_partial.pop().map(|i| (i.exe_key, i.dst_ip, i.dst_port)))
+                .collect();
+        assert_eq!(
+            drained_partial,
+            vec![
+                ("app_b".to_string(), ip1, 443),
+                ("app_a".to_string(), ip3, 443),
+                ("app_a".to_string(), ip2, 8443),
+            ],
+            "partial-drain dedup must emit ip2 exactly once (with updated port) and preserve ip3"
+        );
+
+        // Part C: Engine-level metric `wfp_drop_overflow_coalesced()` increments deterministically
+        // when `wfp_drop_tx` and `wfp_drop_overflow.queue` are both saturated.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build rt");
+        rt.block_on(async {
+            let store = LedrStore::open_in_memory().expect("open store");
+            let engine = DaemonEngine::start(
+                store,
+                SigmaEngine::default(),
+                EarlyPruner::default(),
+                DaemonConfig {
+                    high_priority_capacity: 1,
+                    outbound_firewall_enabled: true,
+                    ..DaemonConfig::default()
+                },
+            );
+            // Current-thread worker has not yielded yet, so `wfp_drop_tx` (cap 1) and
+            // `wfp_drop_overflow.queue` (cap 1) saturate deterministically before any `.await`.
+            let exe = r"C:\Tools\burst_app.exe";
+            let ts = current_unix_ms();
+            let mk = |ip: IpAddr, port: u16| WfpDropEvent {
+                os_filter_id: 1,
+                rule_handle: 1,
+                exe_path: exe.to_string(),
+                protocol: 6,
+                dst_ip: ip,
+                dst_port: port,
+                timestamp_ms: ts,
+            };
+            assert!(engine.ingest_wfp_drop_event(mk(ip1, 443))); // fills wfp_drop_tx
+            assert_eq!(engine.wfp_drop_overflow_pushed(), 0);
+            assert_eq!(engine.wfp_drop_overflow_coalesced(), 0);
+
+            assert!(engine.ingest_wfp_drop_event(mk(ip2, 443))); // Queued in overflow.queue
+            assert_eq!(engine.wfp_drop_overflow_pushed(), 1);
+            assert_eq!(engine.wfp_drop_overflow_coalesced(), 0);
+
+            assert!(engine.ingest_wfp_drop_event(mk(ip3, 443))); // CoalescedNewExe
+            assert_eq!(engine.wfp_drop_overflow_pushed(), 2);
+            assert_eq!(engine.wfp_drop_overflow_coalesced(), 0);
+
+            assert!(engine.ingest_wfp_drop_event(mk(ip4, 443))); // CoalescedOverwritten (#1)
+            assert_eq!(engine.wfp_drop_overflow_pushed(), 2);
+            assert_eq!(engine.wfp_drop_overflow_coalesced(), 1);
+
+            // Same dst_ip with different port passes WfpDropDedupCache, hits Deduplicated in
+            // coalesced_by_exe -> must NOT increment `wfp_drop_overflow_coalesced`.
+            assert!(engine.ingest_wfp_drop_event(mk(ip4, 8443)));
+            assert_eq!(engine.wfp_drop_overflow_coalesced(), 1);
+
+            // Another distinct IP -> CoalescedOverwritten (#2).
+            let ip5 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5));
+            assert!(engine.ingest_wfp_drop_event(mk(ip5, 443)));
+            assert_eq!(engine.wfp_drop_overflow_coalesced(), 2);
+
+            engine.shutdown_and_flush().await.expect("shutdown");
+        });
+    }
+
+    /// `DAEMON-P3-45A` (`R-11`): `shutdown_and_flush` runs `checkpoint_truncate` before waiting on
+    /// an in-flight NRD thread when `!worker_checkpointed`, wakes via `oneshot` on both normal
+    /// completion and panic without Lost Wakeup, and detaches a wedged NRD OS thread on budget
+    /// expiry so subsequent Tokio `Runtime::drop` never hangs.
+    #[test]
+    fn daemon_p3_45a_r11_shutdown_checkpoints_first_and_detaches_wedged_nrd_without_runtime_hang() {
+        use super::{current_unix_ms, DaemonConfig, DaemonEngine, NrdThreadHandle};
+        use ledr_proto::{ProcessIdentity, SensorEvent};
+        use ledr_rules::{EarlyPruner, SigmaEngine};
+        use ledr_store::LedrStore;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        // Part A: Wedged NRD thread exceeds budget -> checkpoint runs BEFORE NRD wait, shutdown
+        // detaches cleanly, and `drop(rt)` returns immediately without hanging.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-r11-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+        let db_path = tmp_dir.join("ledr.db");
+        let wal_path = tmp_dir.join("ledr.db-wal");
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build rt");
+
+            rt.block_on(async {
+                let store = LedrStore::open(&db_path).expect("open file store");
+                let engine = DaemonEngine::start(
+                    store.clone(),
+                    SigmaEngine::default(),
+                    EarlyPruner::default(),
+                    DaemonConfig {
+                        shutdown_flush_timeout_ms: 300,
+                        outbound_firewall_enabled: false,
+                        ..DaemonConfig::default()
+                    },
+                );
+                // Take and stop the worker task so `worker_checkpointed == false` during shutdown.
+                if let Some(h) = engine.worker_handle.lock().await.take() {
+                    h.abort();
+                    let _ = h.await;
+                }
+
+                // Write a committed batch into the WAL file without checkpointing yet.
+                let now_ms = current_unix_ms();
+                let proc_id =
+                    ProcessIdentity::new(9501, (now_ms as u64 + 11_644_473_600_000) * 10_000);
+                store
+                    .ingest_event(
+                        &SensorEvent::ProcessStart {
+                            identity: proc_id,
+                            parent_pid: 4,
+                            exe_path: r"C:\Tools\wal_probe.exe".to_string(),
+                            command_line: r"C:\Tools\wal_probe.exe".to_string(),
+                            user_sid: None,
+                        },
+                        None,
+                        false,
+                        "OBSERVED",
+                    )
+                    .expect("ingest");
+                store.flush_batch().expect("flush batch to WAL");
+                let wal_len_before = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+                assert!(wal_len_before > 0, "WAL must be non-empty before shutdown");
+
+                // Install a wedged NRD thread that will stay blocked past the 300ms shutdown budget.
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+                let join_handle = std::thread::Builder::new()
+                    .name("ledr-r11-wedged-nrd".to_string())
+                    .spawn(move || {
+                        let _ = release_rx.recv();
+                        let _ = done_tx.send(());
+                    })
+                    .expect("spawn wedged nrd thread");
+                *engine.nrd_thread_handle.lock().unwrap() = Some(NrdThreadHandle {
+                    join_handle,
+                    done_rx,
+                });
+
+                let engine_c = std::sync::Arc::clone(&engine);
+                let wal_check_path = wal_path.clone();
+                let shutdown_task = tokio::spawn(async move { engine_c.shutdown_and_flush().await });
+
+                // Deterministically wait until `shutdown_and_flush` has already executed
+                // `checkpoint_truncate`, taken `nrd_thread_handle`, and parked in `Poll::Pending`
+                // on `timeout(remaining, &mut nrd.done_rx)`.
+                let sync_deadline = Instant::now() + Duration::from_secs(2);
+                while engine.nrd_thread_handle.lock().unwrap().is_some() {
+                    assert!(
+                        Instant::now() < sync_deadline,
+                        "shutdown_and_flush did not take nrd_thread_handle in time"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    !shutdown_task.is_finished(),
+                    "shutdown_and_flush must be parked awaiting remaining NRD budget on done_rx"
+                );
+                let wal_len_mid = std::fs::metadata(&wal_check_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                assert_eq!(
+                    wal_len_mid, 0,
+                    "checkpoint_truncate must complete BEFORE waiting on NRD thread"
+                );
+
+                let started = Instant::now();
+                shutdown_task
+                    .await
+                    .expect("join shutdown task")
+                    .expect("shutdown_and_flush should succeed after detaching wedged NRD thread");
+                assert!(
+                    started.elapsed() < Duration::from_millis(1_500),
+                    "shutdown_and_flush must return promptly when NRD budget expires"
+                );
+            });
+
+            // Drop Tokio runtime while the OS thread is STILL blocked -> must NOT hang!
+            let drop_started = Instant::now();
+            drop(rt);
+            assert!(
+                drop_started.elapsed() < Duration::from_millis(300),
+                "Tokio Runtime::drop must not block on detached NRD OS thread (took {:?})",
+                drop_started.elapsed()
+            );
+        }
+        // Release the detached OS thread so the test process exits cleanly.
+        let _ = release_tx.send(());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // Part B: Normal completion (already done before shutdown) and panic completion (unwinds
+        // during shutdown while parked in `Poll::Pending`) both wake `done_rx` cleanly.
+        let rt2 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build rt2");
+        rt2.block_on(async {
+            // B1: Finished before `shutdown_and_flush` (no Lost Wakeup).
+            let store = LedrStore::open_in_memory().expect("open store");
+            let engine = DaemonEngine::start(
+                store,
+                SigmaEngine::default(),
+                EarlyPruner::default(),
+                DaemonConfig {
+                    shutdown_flush_timeout_ms: 2_000,
+                    outbound_firewall_enabled: false,
+                    ..DaemonConfig::default()
+                },
+            );
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let join_handle = std::thread::spawn(move || {
+                let _ = done_tx.send(());
+            });
+            // Ensure the thread finishes before shutdown starts.
+            while !join_handle.is_finished() {
+                std::thread::yield_now();
+            }
+            *engine.nrd_thread_handle.lock().unwrap() = Some(NrdThreadHandle {
+                join_handle,
+                done_rx,
+            });
+            let t0 = Instant::now();
+            engine.shutdown_and_flush().await.expect("shutdown B1");
+            assert!(t0.elapsed() < Duration::from_millis(500));
+
+            // B2: Panicking NRD thread sends via Drop guard while shutdown is parked on `done_rx`.
+            let store2 = LedrStore::open_in_memory().expect("open store2");
+            let engine2 = DaemonEngine::start(
+                store2,
+                SigmaEngine::default(),
+                EarlyPruner::default(),
+                DaemonConfig {
+                    shutdown_flush_timeout_ms: 2_000,
+                    outbound_firewall_enabled: false,
+                    ..DaemonConfig::default()
+                },
+            );
+            let (done_tx2, done_rx2) = tokio::sync::oneshot::channel::<()>();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            let join_handle2 = std::thread::spawn(move || {
+                struct DropNotify(Option<tokio::sync::oneshot::Sender<()>>);
+                impl Drop for DropNotify {
+                    fn drop(&mut self) {
+                        if let Some(tx) = self.0.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+                let _guard = DropNotify(Some(done_tx2));
+                let _ = go_rx.recv();
+                panic!("simulated NRD refresh panic");
+            });
+            *engine2.nrd_thread_handle.lock().unwrap() = Some(NrdThreadHandle {
+                join_handle: join_handle2,
+                done_rx: done_rx2,
+            });
+            let engine2_c = std::sync::Arc::clone(&engine2);
+            let shutdown_b2 = tokio::spawn(async move { engine2_c.shutdown_and_flush().await });
+            // Deterministically synchronize until `shutdown_and_flush` has taken `nrd_thread_handle`
+            // and parked in `Poll::Pending` on `done_rx2` before triggering the panic.
+            let sync_b2_deadline = Instant::now() + Duration::from_secs(2);
+            while engine2.nrd_thread_handle.lock().unwrap().is_some() {
+                assert!(
+                    Instant::now() < sync_b2_deadline,
+                    "shutdown B2 did not take nrd_thread_handle in time"
+                );
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !shutdown_b2.is_finished(),
+                "shutdown B2 must be parked awaiting done_rx2 before panic trigger"
+            );
+            let t1 = Instant::now();
+            let _ = go_tx.send(());
+            shutdown_b2
+                .await
+                .expect("join shutdown B2")
+                .expect("shutdown B2 should tolerate NRD panic cleanly");
+            assert!(
+                t1.elapsed() < Duration::from_millis(500),
+                "panicking NRD thread must wake shutdown immediately via Drop guard (took {:?})",
+                t1.elapsed()
+            );
+        });
     }
 }

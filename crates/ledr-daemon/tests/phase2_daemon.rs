@@ -1,7 +1,7 @@
 //! Phase 2 integration tests for `ledr-daemon`: Canary containment (`L-02`, `L-06`, `L-07`),
 //! 60s `EXPIRED_SUSPENDED` timeout, `ResolveAlert` 3 decisions (`L-04`, `L-07`), Session 0 toast
 //! launcher fallback (`L-08`), and Named Pipe SDDL / caller verification (`L-09`)
-//! (`DAEMON-P2-01`..`DAEMON-P2-06`).
+//! (`DAEMON-P2-01`..`DAEMON-P2-30`; `DAEMON-P2-28` lives in unit tests).
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -95,7 +95,6 @@ struct MockDefenseController {
     resumes: Mutex<Vec<ProcessIdentity>>,
     terminates: Mutex<Vec<TerminateCall>>,
     terminate_attempts: Mutex<Vec<TerminateCall>>,
-    fail_suspend: Mutex<bool>,
     terminate_error: Mutex<Option<String>>,
     failing_suspend_pids: Mutex<Vec<u32>>,
     failing_terminate_pids: Mutex<Vec<u32>>,
@@ -161,9 +160,6 @@ impl ActiveDefenseController for MockDefenseController {
         target: &ProcessIdentity,
         include_children: bool,
     ) -> Result<(), String> {
-        if *self.fail_suspend.lock().expect("lock fail_suspend") {
-            return Err("mock suspend failure".to_string());
-        }
         if self
             .failing_suspend_pids
             .lock()
@@ -321,11 +317,134 @@ async fn wait_for_hp_processed(engine: &DaemonEngine, expected: u64) {
     }
 }
 
-#[tokio::test]
-async fn daemon_p2_01_honeypot_read_ignored_and_write_tree_suspends() {
+struct Phase2Harness {
+    store: LedrStore,
+    defense: Arc<MockDefenseController>,
+    notifier: Arc<MockNotifier>,
+    engine: Arc<DaemonEngine>,
+}
+
+fn default_test_config() -> DaemonConfig {
+    DaemonConfig {
+        pipe_name: unique_test_pipe_name(),
+        ..DaemonConfig::default()
+    }
+}
+
+fn start_harness() -> Phase2Harness {
+    start_harness_with_config(default_test_config())
+}
+
+fn start_harness_with_config(config: DaemonConfig) -> Phase2Harness {
     let store = LedrStore::open_in_memory().expect("open in-memory store");
     let defense = Arc::new(MockDefenseController::default());
     let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_controllers(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        config,
+        defense.clone(),
+        notifier.clone(),
+    );
+    Phase2Harness {
+        store,
+        defense,
+        notifier,
+        engine,
+    }
+}
+
+fn start_harness_with_inspector(
+    store: LedrStore,
+    pruner: EarlyPruner,
+    config: DaemonConfig,
+    inspector: Arc<MockBinaryInspector>,
+) -> Phase2Harness {
+    let defense = Arc::new(MockDefenseController::default());
+    let notifier = Arc::new(MockNotifier::default());
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        pruner,
+        config,
+        defense.clone(),
+        notifier.clone(),
+        inspector,
+    );
+    Phase2Harness {
+        store,
+        defense,
+        notifier,
+        engine,
+    }
+}
+
+async fn send_process_start(
+    engine: &DaemonEngine,
+    identity: ProcessIdentity,
+    parent_pid: u32,
+    exe_path: &str,
+    command_line: &str,
+) {
+    engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity,
+            parent_pid,
+            exe_path: exe_path.to_string(),
+            command_line: command_line.to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send ProcessStart");
+}
+
+async fn send_canary_access(
+    engine: &DaemonEngine,
+    pid: u32,
+    target_path: &str,
+    category: CanaryCategory,
+    access_mask: u32,
+    is_write_or_delete: bool,
+    timestamp_ms: i64,
+) {
+    engine
+        .sender()
+        .send(SensorEvent::CanaryFileAccess {
+            pid,
+            target_path: target_path.to_string(),
+            category,
+            access_mask,
+            is_write_or_delete,
+            timestamp_ms,
+        })
+        .await
+        .expect("send CanaryFileAccess");
+}
+
+fn make_alert_record(
+    alert_id: &str,
+    process_instance_id: Option<String>,
+    context_json: String,
+) -> AlertRecord {
+    AlertRecord {
+        alert_id: alert_id.to_string(),
+        timestamp_ms: current_unix_ms(),
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
+        title: "canary".to_string(),
+        process_instance_id,
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json,
+        resolved_at_ms: None,
+    }
+}
+
+#[tokio::test]
+async fn daemon_p2_01_honeypot_read_ignored_and_write_tree_suspends() {
     let inspector = Arc::new(MockBinaryInspector::default());
 
     let parent_exe = r"C:\Windows\explorer.exe".to_string();
@@ -337,16 +456,15 @@ async fn daemon_p2_01_honeypot_read_ignored_and_write_tree_suspends() {
         authenticode: None,
     });
 
-    let engine = DaemonEngine::start_with_dependencies(
-        store.clone(),
-        SigmaEngine::default(),
+    let Phase2Harness {
+        store,
+        defense,
+        notifier,
+        engine,
+    } = start_harness_with_inspector(
+        LedrStore::open_in_memory().expect("open in-memory store"),
         EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier.clone(),
+        default_test_config(),
         inspector,
     );
 
@@ -354,41 +472,28 @@ async fn daemon_p2_01_honeypot_read_ignored_and_write_tree_suspends() {
     let parent_ident = ProcessIdentity::new(1100, unix_ms_to_filetime(t_base));
     let locker_ident = ProcessIdentity::new(1200, unix_ms_to_filetime(t_base + 500));
 
-    let sender = engine.sender();
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: parent_ident,
-            parent_pid: 4,
-            exe_path: parent_exe.clone(),
-            command_line: "explorer.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send parent");
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: locker_ident,
-            parent_pid: parent_ident.pid,
-            exe_path: locker_exe.clone(),
-            command_line: format!("{locker_exe} --encrypt"),
-            user_sid: None,
-        })
-        .await
-        .expect("send locker");
+    send_process_start(&engine, parent_ident, 4, &parent_exe, "explorer.exe").await;
+    send_process_start(
+        &engine,
+        locker_ident,
+        parent_ident.pid,
+        &locker_exe,
+        &format!("{locker_exe} --encrypt"),
+    )
+    .await;
 
     let honeypot_path = r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx".to_string();
     // 1. Read-only honeypot open MUST be ignored (L-06).
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: locker_ident.pid,
-            target_path: honeypot_path.clone(),
-            category: CanaryCategory::Honeypot,
-            access_mask: 0x0012_0089,
-            is_write_or_delete: false,
-            timestamp_ms: t_base + 1_000,
-        })
-        .await
-        .expect("send read-only honeypot");
+    send_canary_access(
+        &engine,
+        locker_ident.pid,
+        &honeypot_path,
+        CanaryCategory::Honeypot,
+        0x0012_0089,
+        false,
+        t_base + 1_000,
+    )
+    .await;
     wait_for_hp_processed(&engine, 3).await;
 
     assert!(defense.suspends().is_empty());
@@ -404,17 +509,16 @@ async fn daemon_p2_01_honeypot_read_ignored_and_write_tree_suspends() {
         .is_empty());
 
     // 2. Write/delete honeypot event MUST suspend tree (`include_children: true`, L-07).
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: locker_ident.pid,
-            target_path: honeypot_path.clone(),
-            category: CanaryCategory::Honeypot,
-            access_mask: 0x0012_0116,
-            is_write_or_delete: true,
-            timestamp_ms: t_base + 1_500,
-        })
-        .await
-        .expect("send honeypot write");
+    send_canary_access(
+        &engine,
+        locker_ident.pid,
+        &honeypot_path,
+        CanaryCategory::Honeypot,
+        0x0012_0116,
+        true,
+        t_base + 1_500,
+    )
+    .await;
     wait_for_hp_processed(&engine, 4).await;
 
     assert_eq!(
@@ -463,8 +567,6 @@ async fn daemon_p2_01_honeypot_read_ignored_and_write_tree_suspends() {
 #[tokio::test]
 async fn daemon_p2_02_cookie_single_suspend_never_suspend_and_allowlist_bypass() {
     let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
     let inspector = Arc::new(MockBinaryInspector::default());
 
     let browser_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string();
@@ -500,16 +602,15 @@ async fn daemon_p2_02_cookie_single_suspend_never_suspend_and_allowlist_bypass()
         })
         .expect("seed chrome rule");
 
-    let engine = DaemonEngine::start_with_dependencies(
-        store.clone(),
-        SigmaEngine::default(),
+    let Phase2Harness {
+        store,
+        defense,
+        notifier,
+        engine,
+    } = start_harness_with_inspector(
+        store,
         EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier.clone(),
+        default_test_config(),
         inspector,
     );
 
@@ -518,63 +619,50 @@ async fn daemon_p2_02_cookie_single_suspend_never_suspend_and_allowlist_bypass()
     let explorer_ident = ProcessIdentity::new(2200, unix_ms_to_filetime(t_base + 100));
     let stealer_ident = ProcessIdentity::new(2300, unix_ms_to_filetime(t_base + 200));
 
-    let sender = engine.sender();
     for (ident, exe) in [
         (chrome_ident, browser_exe.as_str()),
         (explorer_ident, r"C:\Windows\explorer.exe"),
         (stealer_ident, stealer_exe.as_str()),
     ] {
-        sender
-            .send(SensorEvent::ProcessStart {
-                identity: ident,
-                parent_pid: 4,
-                exe_path: exe.to_string(),
-                command_line: exe.to_string(),
-                user_sid: None,
-            })
-            .await
-            .expect("send start");
+        send_process_start(&engine, ident, 4, exe, exe).await;
     }
 
     let cookie_path = r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies";
     // 1. Allowlisted signed Chrome -> ALLOWED, no suspend, no alert.
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: chrome_ident.pid,
-            target_path: cookie_path.to_string(),
-            category: CanaryCategory::CookieDb,
-            access_mask: 0x0012_0089,
-            is_write_or_delete: false,
-            timestamp_ms: t_base + 500,
-        })
-        .await
-        .expect("send chrome cookie");
+    send_canary_access(
+        &engine,
+        chrome_ident.pid,
+        cookie_path,
+        CanaryCategory::CookieDb,
+        0x0012_0089,
+        false,
+        t_base + 500,
+    )
+    .await;
 
     // 2. Protected OS process `explorer.exe` -> NEVER suspended (`AUTO-02`), still recorded as ALERTED.
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: explorer_ident.pid,
-            target_path: cookie_path.to_string(),
-            category: CanaryCategory::CookieDb,
-            access_mask: 0x0012_0089,
-            is_write_or_delete: false,
-            timestamp_ms: t_base + 600,
-        })
-        .await
-        .expect("send explorer cookie");
+    send_canary_access(
+        &engine,
+        explorer_ident.pid,
+        cookie_path,
+        CanaryCategory::CookieDb,
+        0x0012_0089,
+        false,
+        t_base + 600,
+    )
+    .await;
 
     // 3. Unallowed stealer -> single-process suspend (`include_children: false`, L-07).
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: stealer_ident.pid,
-            target_path: cookie_path.to_string(),
-            category: CanaryCategory::CookieDb,
-            access_mask: 0x0012_0089,
-            is_write_or_delete: false,
-            timestamp_ms: t_base + 700,
-        })
-        .await
-        .expect("send stealer cookie");
+    send_canary_access(
+        &engine,
+        stealer_ident.pid,
+        cookie_path,
+        CanaryCategory::CookieDb,
+        0x0012_0089,
+        false,
+        t_base + 700,
+    )
+    .await;
 
     wait_for_hp_processed(&engine, 6).await;
 
@@ -629,35 +717,26 @@ async fn daemon_p2_03_alert_timeout_transitions_to_expired_suspended_without_res
     );
 
     // Part A: Explicit 60s cutoff verification via `expire_overdue_alerts`.
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            alert_timeout_ms: 60_000,
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness_with_config(DaemonConfig {
+        alert_timeout_ms: 60_000,
+        ..default_test_config()
+    });
 
     let base_ms = current_unix_ms();
     let overdue_alert = AlertRecord {
-        alert_id: "alert-overdue".to_string(),
         timestamp_ms: base_ms - 65_000,
-        severity: AlertSeverity::High,
-        source_layer: "LAYER_1_CANARY".to_string(),
         rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
         title: "Overdue Alert".to_string(),
-        process_instance_id: Some("3100:1000".to_string()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: "{}".to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(
+            "alert-overdue",
+            Some("3100:1000".to_string()),
+            "{}".to_string(),
+        )
     };
     let fresh_alert = AlertRecord {
         alert_id: "alert-fresh".to_string(),
@@ -694,46 +773,35 @@ async fn daemon_p2_03_alert_timeout_transitions_to_expired_suspended_without_res
     engine.shutdown_and_flush().await.expect("shutdown part A");
 
     // Part B: Periodic `run_pipeline` background timer automatically expires overdue alerts.
-    let store2 = LedrStore::open_in_memory().expect("open store 2");
-    let defense2 = Arc::new(MockDefenseController::default());
-    let notifier2 = Arc::new(MockNotifier::default());
-    let engine2 = DaemonEngine::start_with_controllers(
-        store2.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            alert_timeout_ms: 80,
-            ..DaemonConfig::default()
-        },
-        defense2.clone(),
-        notifier2,
-    );
+    let Phase2Harness {
+        store: store2,
+        defense: defense2,
+        engine: engine2,
+        ..
+    } = start_harness_with_config(DaemonConfig {
+        alert_timeout_ms: 80,
+        ..default_test_config()
+    });
 
     let ident = ProcessIdentity::new(3200, unix_ms_to_filetime(current_unix_ms() - 500));
-    engine2
-        .sender()
-        .send(SensorEvent::ProcessStart {
-            identity: ident,
-            parent_pid: 4,
-            exe_path: r"C:\Temp\slow_stealer.exe".to_string(),
-            command_line: "slow_stealer.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send start");
-    engine2
-        .sender()
-        .send(SensorEvent::CanaryFileAccess {
-            pid: ident.pid,
-            target_path: r"C:\Users\alice\.ssh\id_ed25519".to_string(),
-            category: CanaryCategory::SshKey,
-            access_mask: 1,
-            is_write_or_delete: false,
-            timestamp_ms: current_unix_ms() - 500,
-        })
-        .await
-        .expect("send ssh canary");
+    send_process_start(
+        &engine2,
+        ident,
+        4,
+        r"C:\Temp\slow_stealer.exe",
+        "slow_stealer.exe",
+    )
+    .await;
+    send_canary_access(
+        &engine2,
+        ident.pid,
+        r"C:\Users\alice\.ssh\id_ed25519",
+        CanaryCategory::SshKey,
+        1,
+        false,
+        current_unix_ms() - 500,
+    )
+    .await;
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -760,9 +828,6 @@ async fn daemon_p2_03_alert_timeout_transitions_to_expired_suspended_without_res
 #[tokio::test]
 async fn daemon_p2_04_resolve_alert_three_decisions_and_ipc_roundtrip() {
     let pipe_name = unique_test_pipe_name();
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
     let inspector = Arc::new(MockBinaryInspector::default());
 
     let signed_exe = r"C:\Program Files\TrustedBackup\backup.exe";
@@ -794,17 +859,19 @@ async fn daemon_p2_04_resolve_alert_three_decisions_and_ipc_roundtrip() {
         authenticode: None,
     });
 
-    let engine = DaemonEngine::start_with_dependencies(
-        store.clone(),
-        SigmaEngine::default(),
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness_with_inspector(
+        LedrStore::open_in_memory().expect("open in-memory store"),
         EarlyPruner::default(),
         DaemonConfig {
             pipe_name: pipe_name.clone(),
             dev_mode_bypass_ui_auth: true,
             ..DaemonConfig::default()
         },
-        defense.clone(),
-        notifier.clone(),
         inspector,
     );
     let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("start IPC");
@@ -816,7 +883,6 @@ async fn daemon_p2_04_resolve_alert_three_decisions_and_ipc_roundtrip() {
     let id_evil = ProcessIdentity::new(4004, unix_ms_to_filetime(t0 + 30));
     let id_no_hash = ProcessIdentity::new(4005, unix_ms_to_filetime(t0 + 40));
 
-    let sender = engine.sender();
     for (ident, exe, target) in [
         (id_once, unsigned_exe, r"E:\dev\.env"),
         (id_signed, signed_exe, r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx"),
@@ -824,31 +890,21 @@ async fn daemon_p2_04_resolve_alert_three_decisions_and_ipc_roundtrip() {
         (id_evil, evil_exe, r"C:\Users\alice\.aws\credentials"),
         (id_no_hash, r"C:\NonExistent\no_hash.exe", r"C:\Users\alice\.ssh\id_rsa"),
     ] {
-        sender
-            .send(SensorEvent::ProcessStart {
-                identity: ident,
-                parent_pid: 4,
-                exe_path: exe.to_string(),
-                command_line: exe.to_string(),
-                user_sid: None,
-            })
-            .await
-            .expect("send start");
-        sender
-            .send(SensorEvent::CanaryFileAccess {
-                pid: ident.pid,
-                target_path: target.to_string(),
-                category: if target.contains("Canary") {
-                    CanaryCategory::Honeypot
-                } else {
-                    CanaryCategory::EnvFile
-                },
-                access_mask: 2,
-                is_write_or_delete: true,
-                timestamp_ms: t0 + 100,
-            })
-            .await
-            .expect("send canary");
+        send_process_start(&engine, ident, 4, exe, exe).await;
+        send_canary_access(
+            &engine,
+            ident.pid,
+            target,
+            if target.contains("Canary") {
+                CanaryCategory::Honeypot
+            } else {
+                CanaryCategory::EnvFile
+            },
+            2,
+            true,
+            t0 + 100,
+        )
+        .await;
     }
 
     wait_for_hp_processed(&engine, 10).await;
@@ -1000,17 +1056,14 @@ async fn daemon_p2_04_resolve_alert_three_decisions_and_ipc_roundtrip() {
 #[test]
 fn daemon_p2_05_session0_toast_launcher_fallback_and_validation() {
     let sample_alert = AlertRecord {
-        alert_id: "toast-alert-001".to_string(),
         timestamp_ms: 1_750_000_000_000,
-        severity: AlertSeverity::High,
-        source_layer: "LAYER_1_CANARY".to_string(),
         rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
         title: "Test Alert".to_string(),
-        process_instance_id: Some("100:100".to_string()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: "{}".to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(
+            "toast-alert-001",
+            Some("100:100".to_string()),
+            "{}".to_string(),
+        )
     };
 
     // 1. Missing binary logs warning and returns Ok(()) gracefully.
@@ -1125,61 +1178,71 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
     let fake_ui_str = fake_ui.to_string_lossy().into_owned();
     let fake_ui_sha = compute_file_sha256_hex(&fake_ui).expect("hash fake ui");
 
-    // SEC_0002: unpinned + unsigned binary MUST be rejected even on exact path match.
-    assert!(!verify_authorized_caller_binary(
-        Some(&fake_ui_str),
-        &fake_ui_str,
-        None,
-        None,
-        None,
-        false
-    ));
-    // Pinned SHA-256 matches and succeeds.
-    assert!(verify_authorized_caller_binary(
-        Some(&fake_ui_str),
-        &fake_ui_str,
-        Some(&fake_ui_sha),
-        None,
-        None,
-        false
-    ));
-    // Real Authenticode-signed Windows binary succeeds even without explicit hash/signer pins.
+    let wrong_sha = "f".repeat(64);
     let signed_os_exe = Path::new(r"C:\Windows\System32\SearchIndexer.exe");
+    let signed_os_str = signed_os_exe.to_string_lossy().into_owned();
+    let mut binary_cases = vec![
+        // SEC_0002: unpinned + unsigned binary MUST be rejected even on exact path match.
+        (
+            "unpinned unsigned exact path rejected",
+            Some(fake_ui_str.as_str()),
+            fake_ui_str.as_str(),
+            None,
+            false,
+            false,
+        ),
+        // Pinned SHA-256 matches and succeeds.
+        (
+            "pinned sha256 matches",
+            Some(fake_ui_str.as_str()),
+            fake_ui_str.as_str(),
+            Some(fake_ui_sha.as_str()),
+            false,
+            true,
+        ),
+        (
+            "mismatched sha256 pin rejected",
+            Some(fake_ui_str.as_str()),
+            fake_ui_str.as_str(),
+            Some(wrong_sha.as_str()),
+            false,
+            false,
+        ),
+        (
+            "mismatched path rejected",
+            Some(r"C:\Temp\evil-ui.exe"),
+            AUTHORIZED_UI_EXE_PATH,
+            None,
+            false,
+            false,
+        ),
+        (
+            "dev bypass allows mismatched path",
+            Some(r"C:\Temp\evil-ui.exe"),
+            AUTHORIZED_UI_EXE_PATH,
+            None,
+            true,
+            true,
+        ),
+    ];
+    // Real Authenticode-signed Windows binary succeeds even without explicit hash/signer pins.
     if signed_os_exe.is_file() {
-        let signed_os_str = signed_os_exe.to_string_lossy().into_owned();
-        assert!(verify_authorized_caller_binary(
-            Some(&signed_os_str),
-            &signed_os_str,
+        binary_cases.push((
+            "authenticode signed OS binary accepted without pins",
+            Some(signed_os_str.as_str()),
+            signed_os_str.as_str(),
             None,
-            None,
-            None,
-            false
+            false,
+            true,
         ));
     }
-    assert!(!verify_authorized_caller_binary(
-        Some(&fake_ui_str),
-        &fake_ui_str,
-        Some(&"f".repeat(64)),
-        None,
-        None,
-        false
-    ));
-    assert!(!verify_authorized_caller_binary(
-        Some(r"C:\Temp\evil-ui.exe"),
-        AUTHORIZED_UI_EXE_PATH,
-        None,
-        None,
-        None,
-        false
-    ));
-    assert!(verify_authorized_caller_binary(
-        Some(r"C:\Temp\evil-ui.exe"),
-        AUTHORIZED_UI_EXE_PATH,
-        None,
-        None,
-        None,
-        true
-    ));
+    for (case, caller, expected_path, sha_pin, dev_bypass, expected) in binary_cases {
+        assert_eq!(
+            verify_authorized_caller_binary(caller, expected_path, sha_pin, None, None, dev_bypass),
+            expected,
+            "{case}"
+        );
+    }
 
     let signed_caller = BinaryIdentity {
         exe_path: AUTHORIZED_UI_EXE_PATH.to_string(),
@@ -1189,48 +1252,65 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
             root_thumbprint: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
         }),
     };
-    assert!(verify_caller_identity(
-        Some(&signed_caller),
-        &AUTHORIZED_UI_EXE_PATH.replace('\\', "/"),
-        Some(&fake_ui_sha),
-        Some("CN=LocalEDR"),
-        Some("0123456789ABCDEF0123456789ABCDEF01234567"),
-        false
-    ));
-    // Signed identity accepted without explicit pins (SEC_0002).
-    assert!(verify_caller_identity(
-        Some(&signed_caller),
-        AUTHORIZED_UI_EXE_PATH,
-        None,
-        None,
-        None,
-        false
-    ));
-    // SEC_0006: all-zero or missing root thumbprint MUST be rejected when signer pin is used.
-    assert!(!verify_caller_identity(
-        Some(&signed_caller),
-        AUTHORIZED_UI_EXE_PATH,
-        Some(&fake_ui_sha),
-        Some("CN=LocalEDR"),
-        Some("0000000000000000000000000000000000000000"),
-        false
-    ));
-    assert!(!verify_caller_identity(
-        Some(&signed_caller),
-        AUTHORIZED_UI_EXE_PATH,
-        Some(&fake_ui_sha),
-        Some("CN=LocalEDR"),
-        None,
-        false
-    ));
-    assert!(!verify_caller_identity(
-        Some(&signed_caller),
-        AUTHORIZED_UI_EXE_PATH,
-        Some(&fake_ui_sha),
-        Some("CN=LocalEDR"),
-        Some("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
-        false
-    ));
+    let forward_slash_path = AUTHORIZED_UI_EXE_PATH.replace('\\', "/");
+    let identity_cases = [
+        (
+            "signed caller with matching pins and forward slashes",
+            forward_slash_path.as_str(),
+            Some(fake_ui_sha.as_str()),
+            Some("CN=LocalEDR"),
+            Some("0123456789ABCDEF0123456789ABCDEF01234567"),
+            true,
+        ),
+        // Signed identity accepted without explicit pins (SEC_0002).
+        (
+            "signed identity accepted without explicit pins",
+            AUTHORIZED_UI_EXE_PATH,
+            None,
+            None,
+            None,
+            true,
+        ),
+        // SEC_0006: all-zero or missing root thumbprint MUST be rejected when signer pin is used.
+        (
+            "all-zero root thumbprint rejected",
+            AUTHORIZED_UI_EXE_PATH,
+            Some(fake_ui_sha.as_str()),
+            Some("CN=LocalEDR"),
+            Some("0000000000000000000000000000000000000000"),
+            false,
+        ),
+        (
+            "missing root thumbprint with signer pin rejected",
+            AUTHORIZED_UI_EXE_PATH,
+            Some(fake_ui_sha.as_str()),
+            Some("CN=LocalEDR"),
+            None,
+            false,
+        ),
+        (
+            "mismatched root thumbprint rejected",
+            AUTHORIZED_UI_EXE_PATH,
+            Some(fake_ui_sha.as_str()),
+            Some("CN=LocalEDR"),
+            Some("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
+            false,
+        ),
+    ];
+    for (case, expected_path, sha_pin, signer_pin, root_tp_pin, expected) in identity_cases {
+        assert_eq!(
+            verify_caller_identity(
+                Some(&signed_caller),
+                expected_path,
+                sha_pin,
+                signer_pin,
+                root_tp_pin,
+                false,
+            ),
+            expected,
+            "{case}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
@@ -1278,18 +1358,15 @@ async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolb
         authenticode: Some(chrome_auth),
     });
 
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_dependencies(
-        store.clone(),
-        SigmaEngine::default(),
+    let Phase2Harness {
+        store,
+        defense,
+        notifier,
+        engine,
+    } = start_harness_with_inspector(
+        store,
         EarlyPruner::new(cfg.early_pruner),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier.clone(),
+        default_test_config(),
         inspector,
     );
 
@@ -1298,90 +1375,65 @@ async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolb
     let search_ident = ProcessIdentity::new(5200, unix_ms_to_filetime(t0 + 50));
     let chrome_ident = ProcessIdentity::new(5300, unix_ms_to_filetime(t0 + 100));
 
-    let sender = engine.sender();
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: ps_ident,
-            parent_pid: 4,
-            exe_path: ps_exe,
-            command_line: "powershell.exe -c Get-Content Cookies".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send ps start");
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: search_ident,
-            parent_pid: 4,
-            exe_path: search_exe,
-            command_line: "SearchIndexer.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send search start");
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: chrome_ident,
-            parent_pid: 4,
-            exe_path: chrome_exe,
-            command_line: "chrome.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send chrome start");
+    send_process_start(
+        &engine,
+        ps_ident,
+        4,
+        &ps_exe,
+        "powershell.exe -c Get-Content Cookies",
+    )
+    .await;
+    send_process_start(&engine, search_ident, 4, &search_exe, "SearchIndexer.exe").await;
+    send_process_start(&engine, chrome_ident, 4, &chrome_exe, "chrome.exe").await;
 
     let cookie_path = r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies";
     let honeypot_path = r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx";
 
     // Chrome accessing its own Cookies has explicit `ALLOW-BROWSER-CHROME` -> ALLOWED (BUG_0002).
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: chrome_ident.pid,
-            target_path: cookie_path.to_string(),
-            category: CanaryCategory::CookieDb,
-            access_mask: 0x0012_0089,
-            is_write_or_delete: false,
-            timestamp_ms: t0 + 150,
-        })
-        .await
-        .expect("send chrome canary");
+    send_canary_access(
+        &engine,
+        chrome_ident.pid,
+        cookie_path,
+        CanaryCategory::CookieDb,
+        0x0012_0089,
+        false,
+        t0 + 150,
+    )
+    .await;
 
     // SearchIndexer.exe has explicit `FileCanaryAllow` -> ALLOWED.
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: search_ident.pid,
-            target_path: cookie_path.to_string(),
-            category: CanaryCategory::CookieDb,
-            access_mask: 0x0012_0089,
-            is_write_or_delete: false,
-            timestamp_ms: t0 + 200,
-        })
-        .await
-        .expect("send search canary");
+    send_canary_access(
+        &engine,
+        search_ident.pid,
+        cookie_path,
+        CanaryCategory::CookieDb,
+        0x0012_0089,
+        false,
+        t0 + 200,
+    )
+    .await;
 
     // powershell.exe only matches `ALLOW-OS-WIN-SYS32` (`ProcessAllow`) -> MUST NOT bypass canary!
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: ps_ident.pid,
-            target_path: cookie_path.to_string(),
-            category: CanaryCategory::CookieDb,
-            access_mask: 0x0012_0089,
-            is_write_or_delete: false,
-            timestamp_ms: t0 + 300,
-        })
-        .await
-        .expect("send ps cookie");
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: ps_ident.pid,
-            target_path: honeypot_path.to_string(),
-            category: CanaryCategory::Honeypot,
-            access_mask: 0x0012_0116,
-            is_write_or_delete: true,
-            timestamp_ms: t0 + 400,
-        })
-        .await
-        .expect("send ps honeypot write");
+    send_canary_access(
+        &engine,
+        ps_ident.pid,
+        cookie_path,
+        CanaryCategory::CookieDb,
+        0x0012_0089,
+        false,
+        t0 + 300,
+    )
+    .await;
+    send_canary_access(
+        &engine,
+        ps_ident.pid,
+        honeypot_path,
+        CanaryCategory::Honeypot,
+        0x0012_0116,
+        true,
+        t0 + 400,
+    )
+    .await;
 
     wait_for_hp_processed(&engine, 7).await;
 
@@ -1428,39 +1480,30 @@ async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolb
 
 #[tokio::test]
 async fn daemon_p2_08_terminate_and_block_exited_non_suspended_and_refusals() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
     let now_ms = current_unix_ms();
     // 1. Non-suspended alert whose short-lived process already exited (`OpenProcess` fails).
     let exited_alert = AlertRecord {
-        alert_id: "alert-exited-lotl".to_string(),
         timestamp_ms: now_ms - 5_000,
-        severity: AlertSeverity::High,
         source_layer: "LAYER_2_RULES".to_string(),
         rule_id: "LEDR-LOTL-001".to_string(),
         title: "Cmd Spawning Encoded PowerShell".to_string(),
-        process_instance_id: Some("5500:133765432100000000".to_string()),
         process_suspended: false,
-        status: AlertStatus::Pending,
-        context_json: serde_json::json!({
-            "exe_path": r"C:\Temp\short_lived.exe",
-            "sha256": "abababababababababababababababababababababababababababababababab",
-        })
-        .to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(
+            "alert-exited-lotl",
+            Some("5500:133765432100000000".to_string()),
+            serde_json::json!({
+                "exe_path": r"C:\Temp\short_lived.exe",
+                "sha256": "abababababababababababababababababababababababababababababababab",
+            })
+            .to_string(),
+        )
     };
     store.record_alert(&exited_alert).expect("record exited");
 
@@ -1551,9 +1594,6 @@ async fn daemon_p2_08_terminate_and_block_exited_non_suspended_and_refusals() {
 
 #[tokio::test]
 async fn daemon_p2_09_canary_burst_deduplicates_alerts_and_suspends() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
     let inspector = Arc::new(MockBinaryInspector::default());
 
     let dropper_exe = r"C:\Temp\burst_locker.exe";
@@ -1563,33 +1603,22 @@ async fn daemon_p2_09_canary_burst_deduplicates_alerts_and_suspends() {
         authenticode: None,
     });
 
-    let engine = DaemonEngine::start_with_dependencies(
-        store.clone(),
-        SigmaEngine::default(),
+    let Phase2Harness {
+        store,
+        defense,
+        notifier,
+        engine,
+    } = start_harness_with_inspector(
+        LedrStore::open_in_memory().expect("open in-memory store"),
         EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier.clone(),
+        default_test_config(),
         inspector,
     );
 
     let t0 = current_unix_ms() - 2_000;
     let ident = ProcessIdentity::new(6600, unix_ms_to_filetime(t0));
-    let sender = engine.sender();
 
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: ident,
-            parent_pid: 4,
-            exe_path: dropper_exe.to_string(),
-            command_line: "burst_locker.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send start");
+    send_process_start(&engine, ident, 4, dropper_exe, "burst_locker.exe").await;
 
     // Simulate a Kernel-File burst (Create, CreateNewFile, Write) on the same honeypot path
     // with mixed slashes/casing.
@@ -1610,17 +1639,16 @@ async fn daemon_p2_09_canary_burst_deduplicates_alerts_and_suspends() {
             16,
         ),
     ] {
-        sender
-            .send(SensorEvent::CanaryFileAccess {
-                pid: ident.pid,
-                target_path: path.to_string(),
-                category: CanaryCategory::Honeypot,
-                access_mask: mask,
-                is_write_or_delete: true,
-                timestamp_ms: t0 + offset,
-            })
-            .await
-            .expect("send burst canary");
+        send_canary_access(
+            &engine,
+            ident.pid,
+            path,
+            CanaryCategory::Honeypot,
+            mask,
+            true,
+            t0 + offset,
+        )
+        .await;
     }
 
     wait_for_hp_processed(&engine, 4).await;
@@ -1659,61 +1687,41 @@ async fn daemon_p2_09_canary_burst_deduplicates_alerts_and_suspends() {
 
 #[tokio::test]
 async fn daemon_p2_10_bug_0001_zero_or_missing_create_time_never_suspends() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier.clone(),
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        notifier,
+        engine,
+    } = start_harness();
 
     let now_ms = current_unix_ms();
-    let sender = engine.sender();
 
     // 1. Unknown PID (not in ActiveProcessTable -> proc_identity = None): must alert without suspending.
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: 7701,
-            target_path: r"C:\Users\alice\.ssh\id_rsa".to_string(),
-            category: CanaryCategory::SshKey,
-            access_mask: 1,
-            is_write_or_delete: false,
-            timestamp_ms: now_ms - 200,
-        })
-        .await
-        .expect("send unknown-pid canary");
+    send_canary_access(
+        &engine,
+        7701,
+        r"C:\Users\alice\.ssh\id_rsa",
+        CanaryCategory::SshKey,
+        1,
+        false,
+        now_ms - 200,
+    )
+    .await;
 
     // 2. Process with create_time_100ns == 0: must NEVER suspend (BUG_0001).
     let zero_ident = ProcessIdentity::new(7702, 0);
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: zero_ident,
-            parent_pid: 4,
-            exe_path: r"C:\Temp\zero_ts.exe".to_string(),
-            command_line: "zero_ts.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send zero create_time start");
+    send_process_start(&engine, zero_ident, 4, r"C:\Temp\zero_ts.exe", "zero_ts.exe").await;
     wait_for_hp_processed(&engine, 2).await;
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: zero_ident.pid,
-            target_path: r"C:\Users\alice\.aws\credentials".to_string(),
-            category: CanaryCategory::CloudCredential,
-            access_mask: 1,
-            is_write_or_delete: false,
-            timestamp_ms: current_unix_ms() + 100,
-        })
-        .await
-        .expect("send zero-ts canary");
+    send_canary_access(
+        &engine,
+        zero_ident.pid,
+        r"C:\Users\alice\.aws\credentials",
+        CanaryCategory::CloudCredential,
+        1,
+        false,
+        current_unix_ms() + 100,
+    )
+    .await;
 
     wait_for_hp_processed(&engine, 3).await;
 
@@ -1746,17 +1754,13 @@ async fn daemon_p2_10_bug_0001_zero_or_missing_create_time_never_suspends() {
 
     // Manually forged suspended alert with pid:0 + context pid fallback must be rejected in resolve_alert.
     let forged_suspended = AlertRecord {
-        alert_id: "forged-zero-suspended".to_string(),
         timestamp_ms: now_ms,
-        severity: AlertSeverity::High,
-        source_layer: "LAYER_1_CANARY".to_string(),
-        rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
         title: "Forged Zero Identity".to_string(),
-        process_instance_id: Some("7703:0".to_string()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: serde_json::json!({ "pid": 7703 }).to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(
+            "forged-zero-suspended",
+            Some("7703:0".to_string()),
+            serde_json::json!({ "pid": 7703 }).to_string(),
+        )
     };
     store.record_alert(&forged_suspended).expect("record forged");
     assert!(engine
@@ -1775,9 +1779,6 @@ async fn daemon_p2_10_bug_0001_zero_or_missing_create_time_never_suspends() {
 #[tokio::test]
 async fn daemon_p2_11_bug_0003_sibling_alerts_keep_suspended_until_last_allowed_and_cascade_terminate()
 {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
     let inspector = Arc::new(MockBinaryInspector::default());
 
     let proc_a_exe = r"C:\Temp\multi_stealer_a.exe".to_string();
@@ -1790,58 +1791,44 @@ async fn daemon_p2_11_bug_0003_sibling_alerts_keep_suspended_until_last_allowed_
         });
     }
 
-    let engine = DaemonEngine::start_with_dependencies(
-        store.clone(),
-        SigmaEngine::default(),
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness_with_inspector(
+        LedrStore::open_in_memory().expect("open in-memory store"),
         EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
+        default_test_config(),
         inspector,
     );
 
     let t0 = current_unix_ms() - 5_000;
     let ident_a = ProcessIdentity::new(7801, unix_ms_to_filetime(t0));
     let ident_b = ProcessIdentity::new(7802, unix_ms_to_filetime(t0 + 10));
-    let sender = engine.sender();
 
     for (ident, exe) in [(ident_a, &proc_a_exe), (ident_b, &proc_b_exe)] {
-        sender
-            .send(SensorEvent::ProcessStart {
-                identity: ident,
-                parent_pid: 4,
-                exe_path: exe.clone(),
-                command_line: exe.clone(),
-                user_sid: None,
-            })
-            .await
-            .expect("send start");
-        sender
-            .send(SensorEvent::CanaryFileAccess {
-                pid: ident.pid,
-                target_path: r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies"
-                    .to_string(),
-                category: CanaryCategory::CookieDb,
-                access_mask: 1,
-                is_write_or_delete: false,
-                timestamp_ms: t0 + 100,
-            })
-            .await
-            .expect("send cookie canary");
-        sender
-            .send(SensorEvent::CanaryFileAccess {
-                pid: ident.pid,
-                target_path: r"C:\Users\alice\.ssh\id_rsa".to_string(),
-                category: CanaryCategory::SshKey,
-                access_mask: 1,
-                is_write_or_delete: false,
-                timestamp_ms: t0 + 110,
-            })
-            .await
-            .expect("send ssh canary");
+        send_process_start(&engine, ident, 4, exe, exe).await;
+        send_canary_access(
+            &engine,
+            ident.pid,
+            r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies",
+            CanaryCategory::CookieDb,
+            1,
+            false,
+            t0 + 100,
+        )
+        .await;
+        send_canary_access(
+            &engine,
+            ident.pid,
+            r"C:\Users\alice\.ssh\id_rsa",
+            CanaryCategory::SshKey,
+            1,
+            false,
+            t0 + 110,
+        )
+        .await;
     }
 
     wait_for_hp_processed(&engine, 6).await;
@@ -1902,62 +1889,48 @@ async fn daemon_p2_11_bug_0003_sibling_alerts_keep_suspended_until_last_allowed_
 
 #[tokio::test]
 async fn daemon_p2_12_bug_0004_record_alert_error_compensates_suspension_dedup_and_skips_notify() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier.clone(),
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        notifier,
+        engine,
+    } = start_harness();
 
     let t0 = current_unix_ms() - 5_000;
     let parent_ident = ProcessIdentity::new(7901, unix_ms_to_filetime(t0));
     let child_ident = ProcessIdentity::new(7902, unix_ms_to_filetime(t0 + 50));
     let honeypot_path = r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx".to_string();
 
-    let sender = engine.sender();
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: parent_ident,
-            parent_pid: 4,
-            exe_path: r"C:\Temp\comp_parent.exe".to_string(),
-            command_line: "comp_parent.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send parent");
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: child_ident,
-            parent_pid: parent_ident.pid,
-            exe_path: r"C:\Temp\comp_child.exe".to_string(),
-            command_line: "comp_child.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send child");
+    send_process_start(
+        &engine,
+        parent_ident,
+        4,
+        r"C:\Temp\comp_parent.exe",
+        "comp_parent.exe",
+    )
+    .await;
+    send_process_start(
+        &engine,
+        child_ident,
+        parent_ident.pid,
+        r"C:\Temp\comp_child.exe",
+        "comp_child.exe",
+    )
+    .await;
     wait_for_hp_processed(&engine, 2).await;
 
     // Force record_alert to fail on the next canary alert.
     engine.set_fail_record_alert_for_test(true);
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: parent_ident.pid,
-            target_path: honeypot_path.clone(),
-            category: CanaryCategory::Honeypot,
-            access_mask: 0x0012_0116,
-            is_write_or_delete: true,
-            timestamp_ms: t0 + 200,
-        })
-        .await
-        .expect("send failing canary");
+    send_canary_access(
+        &engine,
+        parent_ident.pid,
+        &honeypot_path,
+        CanaryCategory::Honeypot,
+        0x0012_0116,
+        true,
+        t0 + 200,
+    )
+    .await;
     wait_for_hp_processed(&engine, 3).await;
 
     // Suspension was triggered then compensated (parent + child resumed), no toast sent, no alert persisted.
@@ -1986,17 +1959,16 @@ async fn daemon_p2_12_bug_0004_record_alert_error_compensates_suspension_dedup_a
 
     // Re-enabling alert recording must NOT be suppressed by stale dedup state.
     engine.set_fail_record_alert_for_test(false);
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: parent_ident.pid,
-            target_path: honeypot_path,
-            category: CanaryCategory::Honeypot,
-            access_mask: 0x0012_0116,
-            is_write_or_delete: true,
-            timestamp_ms: t0 + 300,
-        })
-        .await
-        .expect("send recovered canary");
+    send_canary_access(
+        &engine,
+        parent_ident.pid,
+        &honeypot_path,
+        CanaryCategory::Honeypot,
+        0x0012_0116,
+        true,
+        t0 + 300,
+    )
+    .await;
     wait_for_hp_processed(&engine, 4).await;
 
     assert_eq!(defense.suspends().len(), 4);
@@ -2008,54 +1980,35 @@ async fn daemon_p2_12_bug_0004_record_alert_error_compensates_suspension_dedup_a
 
 #[tokio::test]
 async fn daemon_p2_13_bug_0005_honeypot_tracks_suspended_children_and_resolves_tree() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
     let t0 = current_unix_ms() - 5_000;
     let parent_ident = ProcessIdentity::new(8001, unix_ms_to_filetime(t0));
     let child_ident = ProcessIdentity::new(8002, unix_ms_to_filetime(t0 + 20));
     let grandchild_ident = ProcessIdentity::new(8003, unix_ms_to_filetime(t0 + 40));
 
-    let sender = engine.sender();
     for (ident, ppid, exe) in [
         (parent_ident, 4, r"C:\Temp\tree_root.exe"),
         (child_ident, parent_ident.pid, r"C:\Temp\tree_child.exe"),
         (grandchild_ident, child_ident.pid, r"C:\Temp\tree_grand.exe"),
     ] {
-        sender
-            .send(SensorEvent::ProcessStart {
-                identity: ident,
-                parent_pid: ppid,
-                exe_path: exe.to_string(),
-                command_line: exe.to_string(),
-                user_sid: None,
-            })
-            .await
-            .expect("send tree process start");
+        send_process_start(&engine, ident, ppid, exe, exe).await;
     }
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: parent_ident.pid,
-            target_path: r"C:\Users\alice\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx".to_string(),
-            category: CanaryCategory::Honeypot,
-            access_mask: 0x0012_0116,
-            is_write_or_delete: true,
-            timestamp_ms: t0 + 100,
-        })
-        .await
-        .expect("send honeypot write");
+    send_canary_access(
+        &engine,
+        parent_ident.pid,
+        r"C:\Users\alice\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx",
+        CanaryCategory::Honeypot,
+        0x0012_0116,
+        true,
+        t0 + 100,
+    )
+    .await;
     wait_for_hp_processed(&engine, 4).await;
 
     let alerts = store.list_alerts(None, 20).expect("list alerts");
@@ -2082,21 +2035,19 @@ async fn daemon_p2_13_bug_0005_honeypot_tracks_suspended_children_and_resolves_t
     // Also test TerminateAndBlock terminating parent + tracked children while ignoring already-exited child.
     defense.add_failing_terminate_pid(child_ident.pid);
     let term_alert = AlertRecord {
-        alert_id: "tree-terminate-alert".to_string(),
         timestamp_ms: t0 + 200,
         severity: AlertSeverity::Critical,
-        source_layer: "LAYER_1_CANARY".to_string(),
         rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
         title: "Honeypot Tree Terminate".to_string(),
-        process_instance_id: Some(parent_ident.instance_id()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: serde_json::json!({
-            "exe_path": r"C:\Temp\tree_root.exe",
-            "suspended_children": [child_ident.instance_id(), grandchild_ident.instance_id(), "9999:0"],
-        })
-        .to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(
+            "tree-terminate-alert",
+            Some(parent_ident.instance_id()),
+            serde_json::json!({
+                "exe_path": r"C:\Temp\tree_root.exe",
+                "suspended_children": [child_ident.instance_id(), grandchild_ident.instance_id(), "9999:0"],
+            })
+            .to_string(),
+        )
     };
     store.record_alert(&term_alert).expect("record term alert");
     let terminated = engine
@@ -2127,50 +2078,38 @@ async fn daemon_p2_13_bug_0005_honeypot_tracks_suspended_children_and_resolves_t
 
 #[tokio::test]
 async fn daemon_p2_14_bug_0006_allow_once_clears_canary_dedup_for_reevaluation() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier.clone(),
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        notifier,
+        engine,
+    } = start_harness();
 
     let t0 = current_unix_ms() - 5_000;
     let ident = ProcessIdentity::new(8101, unix_ms_to_filetime(t0));
-    let target = r"C:\Users\alice\.ssh\id_ed25519".to_string();
-    let sender = engine.sender();
+    let target = r"C:\Users\alice\.ssh\id_ed25519";
 
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: ident,
-            parent_pid: 4,
-            exe_path: r"C:\Temp\retry_stealer.exe".to_string(),
-            command_line: "retry_stealer.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send start");
+    send_process_start(
+        &engine,
+        ident,
+        4,
+        r"C:\Temp\retry_stealer.exe",
+        "retry_stealer.exe",
+    )
+    .await;
 
     // 1. First access triggers alert #1 + suspension; immediate duplicate is suppressed.
     for offset in [100i64, 110] {
-        sender
-            .send(SensorEvent::CanaryFileAccess {
-                pid: ident.pid,
-                target_path: target.clone(),
-                category: CanaryCategory::SshKey,
-                access_mask: 1,
-                is_write_or_delete: false,
-                timestamp_ms: t0 + offset,
-            })
-            .await
-            .expect("send canary");
+        send_canary_access(
+            &engine,
+            ident.pid,
+            target,
+            CanaryCategory::SshKey,
+            1,
+            false,
+            t0 + offset,
+        )
+        .await;
     }
     wait_for_hp_processed(&engine, 3).await;
     let initial_alerts = store.list_alerts(None, 20).expect("list alerts");
@@ -2183,17 +2122,16 @@ async fn daemon_p2_14_bug_0006_allow_once_clears_canary_dedup_for_reevaluation()
         .expect("resolve AllowOnce");
     assert_eq!(defense.resumes(), vec![ident]);
 
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: ident.pid,
-            target_path: target,
-            category: CanaryCategory::SshKey,
-            access_mask: 1,
-            is_write_or_delete: false,
-            timestamp_ms: t0 + 500,
-        })
-        .await
-        .expect("send post-AllowOnce canary");
+    send_canary_access(
+        &engine,
+        ident.pid,
+        target,
+        CanaryCategory::SshKey,
+        1,
+        false,
+        t0 + 500,
+    )
+    .await;
     wait_for_hp_processed(&engine, 4).await;
 
     let final_alerts = store.list_alerts(None, 20).expect("list final alerts");
@@ -2214,17 +2152,14 @@ fn daemon_p2_15_sec_0004_session0_blocks_foreground_fallback() {
     std::fs::write(&invalid_pe, b"not-a-valid-pe-executable").expect("write marker file");
 
     let alert = AlertRecord {
-        alert_id: "sec-0004-toast".to_string(),
         timestamp_ms: 1_750_000_000_000,
-        severity: AlertSeverity::High,
-        source_layer: "LAYER_1_CANARY".to_string(),
         rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
         title: "Session 0 Guard Test".to_string(),
-        process_instance_id: Some("100:100".to_string()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: "{}".to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(
+            "sec-0004-toast",
+            Some("100:100".to_string()),
+            "{}".to_string(),
+        )
     };
 
     // 1. When allow_foreground_fallback is false, Session 1 also skips fallback safely.
@@ -2356,65 +2291,44 @@ async fn daemon_p2_17_sec_0003_strict_pipe_isolates_malformed_and_timed_out_clie
 
 #[tokio::test]
 async fn daemon_p2_18_bug_0003_bug_0005_honeypot_sibling_resumes_children_on_last_resolve() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
     let t0 = current_unix_ms() - 5_000;
     let parent_ident = ProcessIdentity::new(8201, unix_ms_to_filetime(t0));
     let child_ident = ProcessIdentity::new(8202, unix_ms_to_filetime(t0 + 20));
-    let sender = engine.sender();
 
     for (ident, ppid, exe) in [
         (parent_ident, 4, r"C:\Temp\combo_root.exe"),
         (child_ident, parent_ident.pid, r"C:\Temp\combo_child.exe"),
     ] {
-        sender
-            .send(SensorEvent::ProcessStart {
-                identity: ident,
-                parent_pid: ppid,
-                exe_path: exe.to_string(),
-                command_line: exe.to_string(),
-                user_sid: None,
-            })
-            .await
-            .expect("send start");
+        send_process_start(&engine, ident, ppid, exe, exe).await;
     }
 
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: parent_ident.pid,
-            target_path: r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx".to_string(),
-            category: CanaryCategory::Honeypot,
-            access_mask: 0x0012_0116,
-            is_write_or_delete: true,
-            timestamp_ms: t0 + 100,
-        })
-        .await
-        .expect("send honeypot write");
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: parent_ident.pid,
-            target_path: r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies"
-                .to_string(),
-            category: CanaryCategory::CookieDb,
-            access_mask: 0x0012_0089,
-            is_write_or_delete: false,
-            timestamp_ms: t0 + 110,
-        })
-        .await
-        .expect("send cookie read");
+    send_canary_access(
+        &engine,
+        parent_ident.pid,
+        r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx",
+        CanaryCategory::Honeypot,
+        0x0012_0116,
+        true,
+        t0 + 100,
+    )
+    .await;
+    send_canary_access(
+        &engine,
+        parent_ident.pid,
+        r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies",
+        CanaryCategory::CookieDb,
+        0x0012_0089,
+        false,
+        t0 + 110,
+    )
+    .await;
 
     wait_for_hp_processed(&engine, 4).await;
     let alerts = store.list_alerts(None, 20).expect("list alerts");
@@ -2461,17 +2375,10 @@ async fn daemon_p2_19_analysis_0001_resolve_outcome_reports_block_rule_saved() {
     );
 
     let make_pending = |alert_id: &str, ctx: serde_json::Value| AlertRecord {
-        alert_id: alert_id.to_string(),
-        timestamp_ms: current_unix_ms(),
         severity: AlertSeverity::Critical,
-        source_layer: "LAYER_1_CANARY".to_string(),
         rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
-        title: "canary".to_string(),
-        process_instance_id: None,
         process_suspended: false,
-        status: AlertStatus::Pending,
-        context_json: ctx.to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(alert_id, None, ctx.to_string())
     };
 
     // Case A: no resolvable exe_path -> alert resolves but no block rule is saved.
@@ -2518,9 +2425,6 @@ async fn daemon_p2_19_analysis_0001_resolve_outcome_reports_block_rule_saved() {
 /// a burst does not re-read the executable on the high-priority lane.
 #[tokio::test]
 async fn daemon_p2_20_analysis_0002_dedup_suppresses_before_binary_inspection() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
     let inspector = Arc::new(MockBinaryInspector::default());
 
     let dropper_exe = r"C:\Temp\burst_dedup.exe";
@@ -2530,45 +2434,27 @@ async fn daemon_p2_20_analysis_0002_dedup_suppresses_before_binary_inspection() 
         authenticode: None,
     });
 
-    let engine = DaemonEngine::start_with_dependencies(
-        store.clone(),
-        SigmaEngine::default(),
+    let Phase2Harness { store, engine, .. } = start_harness_with_inspector(
+        LedrStore::open_in_memory().expect("open in-memory store"),
         EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense,
-        notifier,
+        default_test_config(),
         inspector.clone(),
     );
 
     let t0 = current_unix_ms() - 2_000;
     let ident = ProcessIdentity::new(6700, unix_ms_to_filetime(t0));
-    let sender = engine.sender();
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: ident,
-            parent_pid: 4,
-            exe_path: dropper_exe.to_string(),
-            command_line: "burst_dedup.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send start");
+    send_process_start(&engine, ident, 4, dropper_exe, "burst_dedup.exe").await;
     for offset in 0..3i64 {
-        sender
-            .send(SensorEvent::CanaryFileAccess {
-                pid: ident.pid,
-                target_path: r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx"
-                    .to_string(),
-                category: CanaryCategory::Honeypot,
-                access_mask: 0x0012_0116,
-                is_write_or_delete: true,
-                timestamp_ms: t0 + 10 + offset,
-            })
-            .await
-            .expect("send canary burst");
+        send_canary_access(
+            &engine,
+            ident.pid,
+            r"C:\Users\alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx",
+            CanaryCategory::Honeypot,
+            0x0012_0116,
+            true,
+            t0 + 10 + offset,
+        )
+        .await;
     }
 
     wait_for_hp_processed(&engine, 4).await;
@@ -2597,46 +2483,27 @@ async fn daemon_p2_20_analysis_0002_dedup_suppresses_before_binary_inspection() 
 /// process once — never both skipping resume and freezing it forever.
 #[tokio::test]
 async fn daemon_p2_21_bug_0002_concurrent_sibling_resolves_resume_exactly_once() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
     let t0 = current_unix_ms() - 5_000;
     let ident = ProcessIdentity::new(8301, unix_ms_to_filetime(t0));
-    let sender = engine.sender();
-    sender
-        .send(SensorEvent::ProcessStart {
-            identity: ident,
-            parent_pid: 4,
-            exe_path: r"C:\Temp\race_root.exe".to_string(),
-            command_line: "race_root.exe".to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("send start");
+    send_process_start(&engine, ident, 4, r"C:\Temp\race_root.exe", "race_root.exe").await;
     for (idx, target) in [r"C:\t\a.env", r"C:\t\b.env"].iter().enumerate() {
-        sender
-            .send(SensorEvent::CanaryFileAccess {
-                pid: ident.pid,
-                target_path: (*target).to_string(),
-                category: CanaryCategory::EnvFile,
-                access_mask: 0x0012_0089,
-                is_write_or_delete: false,
-                timestamp_ms: t0 + 100 + idx as i64,
-            })
-            .await
-            .expect("send canary");
+        send_canary_access(
+            &engine,
+            ident.pid,
+            target,
+            CanaryCategory::EnvFile,
+            0x0012_0089,
+            false,
+            t0 + 100 + idx as i64,
+        )
+        .await;
     }
     wait_for_hp_processed(&engine, 3).await;
 
@@ -2660,8 +2527,7 @@ async fn daemon_p2_21_bug_0002_concurrent_sibling_resolves_resume_exactly_once()
         e2.resolve_alert(&id_b, AlertDecision::AllowOnce)
     });
     h1.join().expect("join resolve 1").expect("resolve 1 ok");
-    h2.join().expect("join resolve 2")
-.expect("resolve 2 ok");
+    h2.join().expect("join resolve 2").expect("resolve 2 ok");
 
     assert_eq!(
         defense.resumes(),
@@ -2675,33 +2541,15 @@ async fn daemon_p2_21_bug_0002_concurrent_sibling_resolves_resume_exactly_once()
 /// alert unresolved (operator can retry); only a genuinely gone process may be swallowed.
 #[tokio::test]
 async fn daemon_p2_22_bug_0004_resume_failure_on_live_process_keeps_alert_unresolved() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
-    let mk_alert = |alert_id: &str, ident: &ProcessIdentity| AlertRecord {
-        alert_id: alert_id.to_string(),
-        timestamp_ms: current_unix_ms(),
-        severity: AlertSeverity::High,
-        source_layer: "LAYER_1_CANARY".to_string(),
-        rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
-        title: "canary".to_string(),
-        process_instance_id: Some(ident.instance_id()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: "{}".to_string(),
-        resolved_at_ms: None,
+    let mk_alert = |alert_id: &str, ident: &ProcessIdentity| {
+        make_alert_record(alert_id, Some(ident.instance_id()), "{}".to_string())
     };
 
     // Live process (this test binary) whose resume fails: alert must stay unresolved.
@@ -2809,20 +2657,12 @@ async fn daemon_p2_23_sec_0001_ipc_session_lifetime_cap() {
 /// duplicate rules.
 #[tokio::test]
 async fn daemon_p2_24_bug_0001_permanent_rule_rolled_back_on_resume_failure() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
     // Suspended alert on a live process (this test binary) whose resume keeps failing.
     let live_ident = ProcessIdentity::new(
@@ -2830,23 +2670,15 @@ async fn daemon_p2_24_bug_0001_permanent_rule_rolled_back_on_resume_failure() {
         unix_ms_to_filetime(current_unix_ms() - 1_000),
     );
     defense.add_failing_resume_pid(live_ident.pid);
-    let alert = AlertRecord {
-        alert_id: "perm-rollback".to_string(),
-        timestamp_ms: current_unix_ms(),
-        severity: AlertSeverity::High,
-        source_layer: "LAYER_1_CANARY".to_string(),
-        rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
-        title: "canary".to_string(),
-        process_instance_id: Some(live_ident.instance_id()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: serde_json::json!({
+    let alert = make_alert_record(
+        "perm-rollback",
+        Some(live_ident.instance_id()),
+        serde_json::json!({
             "exe_path": r"C:\Temp\backup.exe",
             "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         })
         .to_string(),
-        resolved_at_ms: None,
-    };
+    );
     store.record_alert(&alert).expect("record alert");
 
     assert!(
@@ -2907,57 +2739,38 @@ async fn daemon_p2_24_bug_0001_permanent_rule_rolled_back_on_resume_failure() {
 /// recorded in `suspended_children`, so its resume failure cannot block resolution.
 #[tokio::test]
 async fn daemon_p2_25_bug_0002_unsuspendable_child_not_recorded_for_resume() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
     let t0 = current_unix_ms() - 5_000;
     let root_ident = ProcessIdentity::new(0x7FFF_0101, unix_ms_to_filetime(t0));
     let stuck_child = ProcessIdentity::new(0x7FFF_0102, unix_ms_to_filetime(t0 + 50));
     let ok_child = ProcessIdentity::new(0x7FFF_0103, unix_ms_to_filetime(t0 + 60));
-    let sender = engine.sender();
     for (ident, parent_pid, exe) in [
         (root_ident, 4u32, r"C:\Temp\root.exe"),
         (stuck_child, root_ident.pid, r"C:\Temp\stuck.exe"),
         (ok_child, root_ident.pid, r"C:\Temp\ok.exe"),
     ] {
-        sender
-            .send(SensorEvent::ProcessStart {
-                identity: ident,
-                parent_pid,
-                exe_path: exe.to_string(),
-                command_line: exe.to_string(),
-                user_sid: None,
-            })
-            .await
-            .expect("send start");
+        send_process_start(&engine, ident, parent_pid, exe, exe).await;
     }
     // The child the actuator cannot suspend would also fail resume; it must be
     // excluded from the recorded list so it cannot block resolution.
     defense.add_failing_suspend_pid(stuck_child.pid);
     defense.add_failing_resume_pid(stuck_child.pid);
-    sender
-        .send(SensorEvent::CanaryFileAccess {
-            pid: root_ident.pid,
-            target_path: r"C:\t\!00_LocalEDR_Canary_DoNotEdit.docx".to_string(),
-            category: CanaryCategory::Honeypot,
-            access_mask: 0x0012_0089,
-            is_write_or_delete: true,
-            timestamp_ms: t0 + 100,
-        })
-        .await
-        .expect("send canary");
+    send_canary_access(
+        &engine,
+        root_ident.pid,
+        r"C:\t\!00_LocalEDR_Canary_DoNotEdit.docx",
+        CanaryCategory::Honeypot,
+        0x0012_0089,
+        true,
+        t0 + 100,
+    )
+    .await;
     wait_for_hp_processed(&engine, 4).await;
 
     let alerts = store.list_alerts(None, 20).expect("list alerts");
@@ -2998,20 +2811,12 @@ async fn daemon_p2_25_bug_0002_unsuspendable_child_not_recorded_for_resume() {
 /// cannot be resumed must keep the alert unresolved so the operator can retry.
 #[tokio::test]
 async fn daemon_p2_26_bug_0002_suspended_child_resume_failure_keeps_unresolved() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
     let t0 = current_unix_ms() - 5_000;
     let root_ident = ProcessIdentity::new(0x7FFF_0110, unix_ms_to_filetime(t0));
@@ -3021,20 +2826,16 @@ async fn daemon_p2_26_bug_0002_suspended_child_resume_failure_keeps_unresolved()
         unix_ms_to_filetime(t0 + 50),
     );
     let alert = AlertRecord {
-        alert_id: "child-resume-fail".to_string(),
-        timestamp_ms: current_unix_ms(),
         severity: AlertSeverity::Critical,
-        source_layer: "LAYER_1_CANARY".to_string(),
         rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
-        title: "canary".to_string(),
-        process_instance_id: Some(root_ident.instance_id()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: serde_json::json!({
-            "suspended_children": [live_child.instance_id()],
-        })
-        .to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(
+            "child-resume-fail",
+            Some(root_ident.instance_id()),
+            serde_json::json!({
+                "suspended_children": [live_child.instance_id()],
+            })
+            .to_string(),
+        )
     };
     store.record_alert(&alert).expect("record alert");
 
@@ -3071,33 +2872,19 @@ async fn daemon_p2_26_bug_0002_suspended_child_resume_failure_keeps_unresolved()
 /// alert; a failure on a still-running target stays fatal.
 #[tokio::test]
 async fn daemon_p2_27_bug_0001_terminate_retry_on_gone_suspended_target_saves_block_rule() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
-    let mk_alert = |alert_id: &str, ident: &ProcessIdentity| AlertRecord {
-        alert_id: alert_id.to_string(),
-        timestamp_ms: current_unix_ms(),
-        severity: AlertSeverity::High,
-        source_layer: "LAYER_1_CANARY".to_string(),
-        rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
-        title: "canary".to_string(),
-        process_instance_id: Some(ident.instance_id()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: serde_json::json!({ "exe_path": r"C:\Temp\terminated_once.exe" }).to_string(),
-        resolved_at_ms: None,
+    let mk_alert = |alert_id: &str, ident: &ProcessIdentity| {
+        make_alert_record(
+            alert_id,
+            Some(ident.instance_id()),
+            serde_json::json!({ "exe_path": r"C:\Temp\terminated_once.exe" }).to_string(),
+        )
     };
 
     // First attempt: termination succeeded, then the alert status update failed and the
@@ -3180,20 +2967,12 @@ async fn daemon_p2_27_bug_0001_terminate_retry_on_gone_suspended_target_saves_bl
 /// no longer terminate or resume, and must not persist the block rule.
 #[tokio::test]
 async fn daemon_p2_29_bug_0001_live_suspended_child_terminate_failure_keeps_unresolved() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
     let now_ms = current_unix_ms();
     let gone_parent = ProcessIdentity::new(0x7FFF_FFC1, unix_ms_to_filetime(now_ms - 1_000));
@@ -3204,21 +2983,19 @@ async fn daemon_p2_29_bug_0001_live_suspended_child_terminate_failure_keeps_unre
     let extra_child = ProcessIdentity::new(0x7FFF_FFC2, unix_ms_to_filetime(now_ms - 1_000));
 
     let alert = AlertRecord {
-        alert_id: "alert-child-terminate-fail".to_string(),
         timestamp_ms: now_ms,
         severity: AlertSeverity::Critical,
-        source_layer: "LAYER_1_CANARY".to_string(),
         rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
         title: "child terminate failure".to_string(),
-        process_instance_id: Some(gone_parent.instance_id()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: serde_json::json!({
-            "exe_path": r"C:\Temp\gone_parent.exe",
-            "suspended_children": [live_child.instance_id(), extra_child.instance_id()],
-        })
-        .to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(
+            "alert-child-terminate-fail",
+            Some(gone_parent.instance_id()),
+            serde_json::json!({
+                "exe_path": r"C:\Temp\gone_parent.exe",
+                "suspended_children": [live_child.instance_id(), extra_child.instance_id()],
+            })
+            .to_string(),
+        )
     };
     store.record_alert(&alert).expect("record alert");
 
@@ -3275,20 +3052,12 @@ async fn daemon_p2_29_bug_0001_live_suspended_child_terminate_failure_keeps_unre
 /// and persisting no block rule.
 #[tokio::test]
 async fn daemon_p2_30_frozen_parent_terminate_failure_attempts_all_children_and_returns_parent_err() {
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let defense = Arc::new(MockDefenseController::default());
-    let notifier = Arc::new(MockNotifier::default());
-    let engine = DaemonEngine::start_with_controllers(
-        store.clone(),
-        SigmaEngine::default(),
-        EarlyPruner::default(),
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-        defense.clone(),
-        notifier,
-    );
+    let Phase2Harness {
+        store,
+        defense,
+        engine,
+        ..
+    } = start_harness();
 
     let now_ms = current_unix_ms();
     // Use the current test process PID as a confirmed-live frozen parent so
@@ -3298,21 +3067,19 @@ async fn daemon_p2_30_frozen_parent_terminate_failure_attempts_all_children_and_
     let succeeding_child = ProcessIdentity::new(0x7FFF_FFD2, unix_ms_to_filetime(now_ms - 1_000));
 
     let alert = AlertRecord {
-        alert_id: "alert-frozen-parent-terminate-fail".to_string(),
         timestamp_ms: now_ms,
         severity: AlertSeverity::Critical,
-        source_layer: "LAYER_1_CANARY".to_string(),
         rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
         title: "frozen parent terminate failure".to_string(),
-        process_instance_id: Some(live_parent.instance_id()),
-        process_suspended: true,
-        status: AlertStatus::Pending,
-        context_json: serde_json::json!({
-            "exe_path": r"C:\Temp\live_parent.exe",
-            "suspended_children": [failing_child.instance_id(), succeeding_child.instance_id()],
-        })
-        .to_string(),
-        resolved_at_ms: None,
+        ..make_alert_record(
+            "alert-frozen-parent-terminate-fail",
+            Some(live_parent.instance_id()),
+            serde_json::json!({
+                "exe_path": r"C:\Temp\live_parent.exe",
+                "suspended_children": [failing_child.instance_id(), succeeding_child.instance_id()],
+            })
+            .to_string(),
+        )
     };
     store.record_alert(&alert).expect("record alert");
 

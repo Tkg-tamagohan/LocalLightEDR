@@ -199,6 +199,9 @@ jobs:
           )
           tracked_files = [p for p in ls_res.stdout.decode("utf-8", errors="strict").split("\0") if p]
 
+          def reject_nonstandard_json_constant(token: str) -> None:
+              raise ValueError(f"Non-standard JSON constant {token!r} is not allowed")
+
           json_files = sorted(
               {rel for rel in tracked_files if pathlib.Path(rel).suffix.lower() == ".json"}
               | {rel for rel in required_json_files if pathlib.Path(rel).is_file()}
@@ -208,7 +211,10 @@ jobs:
               if not p.is_file():
                   continue
               try:
-                  json.loads(p.read_text(encoding="utf-8"))
+                  json.loads(
+                      p.read_text(encoding="utf-8"),
+                      parse_constant=reject_nonstandard_json_constant,
+                  )
               except Exception as exc:
                   errors.append(f"Invalid JSON in {rel}: {exc}")
 

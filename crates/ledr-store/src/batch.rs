@@ -1,5 +1,6 @@
 //! Write batch buffering, transactional flush, and PID time-window attribution.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_proto::{
@@ -55,6 +56,23 @@ impl LedrStore {
         is_nrd: bool,
         action: &str,
     ) -> Result<bool, StoreError> {
+        self.ingest_event_with_lifecycle(event, parent_instance_id, exited_at_ms, None, is_nrd, action)
+    }
+
+    /// Same as [`Self::ingest_event_with_exit`] and additionally closes a superseded active
+    /// process row (such as a `pid:0` snapshot placeholder) inside the same SQLite transaction
+    /// as the superseding `ProcessStart`, clamping `exited_at_ms` to at least `created_at_ms`.
+    ///
+    /// Both `exited_at_ms` and `superseded_process_exit` are ignored for non-`ProcessStart` events.
+    pub fn ingest_event_with_lifecycle(
+        &self,
+        event: &SensorEvent,
+        parent_instance_id: Option<&str>,
+        exited_at_ms: Option<i64>,
+        superseded_process_exit: Option<(&str, i64)>,
+        is_nrd: bool,
+        action: &str,
+    ) -> Result<bool, StoreError> {
         if matches!(event, SensorEvent::ScriptEvaluated { .. }) {
             // Evaluated in-memory by Layer 2 SigmaEngine and stored in alerts.context_json on match.
             tracing::trace!("skipping direct telemetry table buffering for ScriptEvaluated");
@@ -62,13 +80,19 @@ impl LedrStore {
         }
 
         let is_canary = matches!(event, SensorEvent::CanaryFileAccess { .. });
+        let is_process_start = matches!(event, SensorEvent::ProcessStart { .. });
         let buffered = BufferedEvent {
             event: event.clone(),
             parent_instance_id: parent_instance_id.map(str::to_owned),
             is_nrd,
             action: action.to_owned(),
             received_at_ms: current_unix_ms(),
-            exited_at_ms,
+            exited_at_ms: if is_process_start { exited_at_ms } else { None },
+            superseded_process_exit: if is_process_start {
+                superseded_process_exit.map(|(id, exit_ms)| (id.to_owned(), exit_ms))
+            } else {
+                None
+            },
         };
 
         let should_flush = {
@@ -100,6 +124,7 @@ impl LedrStore {
             return Ok(0);
         }
 
+        let initial_pending = self.lock_pending_superseded_exits()?.snapshot();
         let tx = writer.transaction()?;
         let events = match self.drain_batch() {
             Ok(events) => events,
@@ -114,9 +139,15 @@ impl LedrStore {
         }
 
         let count = events.len();
-        if let Err(err) = execute_batch_tx(tx, &events, None) {
+        let mut tracker = SupersededExitTracker::new(initial_pending);
+        if let Err(err) = execute_batch_tx(tx, &events, None, &mut tracker) {
             let _ = self.prepend_batch(events);
             return Err(err);
+        }
+        let (consumed, inserted) = tracker.into_delta();
+        if !consumed.is_empty() || !inserted.is_empty() {
+            self.lock_pending_superseded_exits()?
+                .apply_delta(&consumed, inserted);
         }
 
         Ok(count)
@@ -148,17 +179,40 @@ impl LedrStore {
     }
 
     /// Upserts a full [`ProcessRecord`] immediately in a transaction (useful for hash/signer/origin enrichment).
+    ///
+    /// Unlike partial `SensorEvent::ProcessStart` batch ingestion, explicit `ppid` and `exe_path`
+    /// values on the full record (including `0` and `""`) overwrite existing columns while still
+    /// preserving any already-recorded `exited_at_ms` and `Option`-typed fields when `None`.
     pub fn upsert_process_record(&self, process: &ProcessRecord) -> Result<(), StoreError> {
         let mut writer = self.lock_writer()?;
+        let pending_exit_ms = self
+            .lock_pending_superseded_exits()?
+            .get(&process.process_instance_id);
         let tx = writer.transaction()?;
-        upsert_process_row(&tx, process)?;
+        if let Some(exit_ms) = pending_exit_ms {
+            let mut adjusted = process.clone();
+            adjusted.exited_at_ms = Some(
+                adjusted
+                    .exited_at_ms
+                    .unwrap_or(exit_ms)
+                    .max(adjusted.created_at_ms),
+            );
+            upsert_process_row(&tx, &adjusted, false)?;
+        } else {
+            upsert_process_row(&tx, process, false)?;
+        }
         tx.commit()?;
+        if pending_exit_ms.is_some() {
+            self.lock_pending_superseded_exits()?
+                .remove(&process.process_instance_id);
+        }
         Ok(())
     }
 
     /// Records or updates an alert immediately in a transaction (flushing any pending batch first).
     pub fn record_alert(&self, alert: &AlertRecord) -> Result<(), StoreError> {
         let mut writer = self.lock_writer()?;
+        let initial_pending = self.lock_pending_superseded_exits()?.snapshot();
         let tx = writer.transaction()?;
         let events = match self.drain_batch() {
             Ok(events) => events,
@@ -168,9 +222,15 @@ impl LedrStore {
             }
         };
 
-        if let Err(err) = execute_batch_tx(tx, &events, Some(alert)) {
+        let mut tracker = SupersededExitTracker::new(initial_pending);
+        if let Err(err) = execute_batch_tx(tx, &events, Some(alert), &mut tracker) {
             let _ = self.prepend_batch(events);
             return Err(err);
+        }
+        let (consumed, inserted) = tracker.into_delta();
+        if !consumed.is_empty() || !inserted.is_empty() {
+            self.lock_pending_superseded_exits()?
+                .apply_delta(&consumed, inserted);
         }
 
         Ok(())
@@ -211,13 +271,63 @@ fn filetime_100ns_to_unix_ms(ticks: u64, fallback_now_ms: i64) -> i64 {
     }
 }
 
+/// Transaction-local tracker for superseded process exits whose target row has not yet reached
+/// SQLite. Deltas are committed to [`LedrStore`] only after `tx.commit()` succeeds.
+struct SupersededExitTracker {
+    initial: HashMap<String, i64>,
+    initial_consumed: Vec<String>,
+    newly_pending: HashMap<String, i64>,
+    newly_pending_order: Vec<String>,
+}
+
+impl SupersededExitTracker {
+    fn new(initial: HashMap<String, i64>) -> Self {
+        Self {
+            initial,
+            initial_consumed: Vec::new(),
+            newly_pending: HashMap::new(),
+            newly_pending_order: Vec::new(),
+        }
+    }
+
+    fn take(&mut self, instance_id: &str) -> Option<i64> {
+        if let Some(exit_ms) = self.newly_pending.remove(instance_id) {
+            return Some(exit_ms);
+        }
+        if let Some(exit_ms) = self.initial.remove(instance_id) {
+            self.initial_consumed.push(instance_id.to_owned());
+            return Some(exit_ms);
+        }
+        None
+    }
+
+    fn record_missing(&mut self, instance_id: String, exit_ms: i64) {
+        if self.initial.contains_key(&instance_id) || self.newly_pending.contains_key(&instance_id)
+        {
+            return;
+        }
+        self.newly_pending.insert(instance_id.clone(), exit_ms);
+        self.newly_pending_order.push(instance_id);
+    }
+
+    fn into_delta(mut self) -> (Vec<String>, Vec<(String, i64)>) {
+        let inserted = self
+            .newly_pending_order
+            .into_iter()
+            .filter_map(|id| self.newly_pending.remove(&id).map(|ms| (id, ms)))
+            .collect();
+        (self.initial_consumed, inserted)
+    }
+}
+
 fn execute_batch_tx(
     tx: Transaction<'_>,
     events: &[BufferedEvent],
     alert: Option<&AlertRecord>,
+    tracker: &mut SupersededExitTracker,
 ) -> Result<(), StoreError> {
     if !events.is_empty() {
-        write_buffered_events(&tx, events)?;
+        write_buffered_events(&tx, events, tracker)?;
     }
     if let Some(alert) = alert {
         insert_alert_row(&tx, alert)?;
@@ -226,8 +336,38 @@ fn execute_batch_tx(
     Ok(())
 }
 
-fn upsert_process_row(tx: &Transaction<'_>, process: &ProcessRecord) -> Result<(), StoreError> {
-    tx.execute(
+fn upsert_process_row(
+    tx: &Transaction<'_>,
+    process: &ProcessRecord,
+    preserve_existing_identity_fields: bool,
+) -> Result<(), StoreError> {
+    let sql = if preserve_existing_identity_fields {
+        "INSERT INTO processes (
+            process_instance_id, pid, parent_instance_id, ppid, exe_path, command_line,
+            sha256, signer_subject, is_trusted_os, user_sid, origin_url, created_at_ms, exited_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(process_instance_id) DO UPDATE SET
+            pid = excluded.pid,
+            parent_instance_id = COALESCE(excluded.parent_instance_id, processes.parent_instance_id),
+            ppid = CASE
+                WHEN excluded.ppid != 0 THEN excluded.ppid
+                ELSE processes.ppid
+            END,
+            exe_path = CASE
+                WHEN excluded.exe_path != '' THEN excluded.exe_path
+                ELSE processes.exe_path
+            END,
+            command_line = COALESCE(excluded.command_line, processes.command_line),
+            sha256 = COALESCE(excluded.sha256, processes.sha256),
+            signer_subject = COALESCE(excluded.signer_subject, processes.signer_subject),
+            is_trusted_os = CASE
+                WHEN excluded.is_trusted_os != 0 THEN 1
+                ELSE processes.is_trusted_os
+            END,
+            user_sid = COALESCE(excluded.user_sid, processes.user_sid),
+            origin_url = COALESCE(excluded.origin_url, processes.origin_url),
+            exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)"
+    } else {
         "INSERT INTO processes (
             process_instance_id, pid, parent_instance_id, ppid, exe_path, command_line,
             sha256, signer_subject, is_trusted_os, user_sid, origin_url, created_at_ms, exited_at_ms
@@ -246,7 +386,10 @@ fn upsert_process_row(tx: &Transaction<'_>, process: &ProcessRecord) -> Result<(
             END,
             user_sid = COALESCE(excluded.user_sid, processes.user_sid),
             origin_url = COALESCE(excluded.origin_url, processes.origin_url),
-            exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)",
+            exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)"
+    };
+    tx.execute(
+        sql,
         params![
             process.process_instance_id,
             i64::from(process.pid),
@@ -313,7 +456,11 @@ pub(crate) fn resolve_process_instance_id(
     Ok(format!("{pid}:0"))
 }
 
-fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Result<(), StoreError> {
+fn write_buffered_events(
+    tx: &Transaction<'_>,
+    events: &[BufferedEvent],
+    tracker: &mut SupersededExitTracker,
+) -> Result<(), StoreError> {
     for item in events {
         let hint = item.parent_instance_id.as_deref();
         match &item.event {
@@ -326,7 +473,7 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
             } => {
                 let instance_id = identity.instance_id();
                 let cmd = (!command_line.is_empty()).then(|| command_line.clone());
-                let record = ProcessRecord {
+                let mut record = ProcessRecord {
                     process_instance_id: instance_id,
                     pid: identity.pid,
                     parent_instance_id: item.parent_instance_id.clone(),
@@ -344,7 +491,38 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                     ),
                     exited_at_ms: item.exited_at_ms,
                 };
-                upsert_process_row(tx, &record)?;
+                if let Some(pending_exit_ms) = tracker.take(&record.process_instance_id) {
+                    record.exited_at_ms = Some(
+                        record
+                            .exited_at_ms
+                            .unwrap_or(pending_exit_ms)
+                            .max(record.created_at_ms),
+                    );
+                }
+                upsert_process_row(tx, &record, true)?;
+                if let Some((superseded_id, superseded_exit_ms)) = &item.superseded_process_exit {
+                    if superseded_id != &record.process_instance_id {
+                        let updated = tx.execute(
+                            "UPDATE processes
+                             SET exited_at_ms = MAX(created_at_ms, ?1)
+                             WHERE process_instance_id = ?2
+                               AND exited_at_ms IS NULL",
+                            params![superseded_exit_ms, superseded_id],
+                        )?;
+                        if updated == 0 {
+                            let exists: Option<i64> = tx
+                                .query_row(
+                                    "SELECT 1 FROM processes WHERE process_instance_id = ?1",
+                                    params![superseded_id],
+                                    |row| row.get(0),
+                                )
+                                .optional()?;
+                            if exists.is_none() {
+                                tracker.record_missing(superseded_id.clone(), *superseded_exit_ms);
+                            }
+                        }
+                    }
+                }
             }
             SensorEvent::ProcessStop {
                 pid,

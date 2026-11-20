@@ -87,3 +87,25 @@ impl BinaryInspector for WindowsBinaryInspector {
         }
     }
 }
+
+/// Abstraction for on-demand live OS process inspection used when `Kernel-File` delivers a
+/// `CanaryFileAccess` event before `Kernel-Process` delivers `ProcessStart`.
+pub trait LiveProcessInspector: Send + Sync {
+    fn inspect_live_process(&self, pid: u32) -> Option<ledr_sensor_win::etw::LiveProcessInfo>;
+}
+
+/// Default Windows live-process inspector backed by [`ledr_sensor_win::etw::inspect_live_process`].
+#[derive(Debug, Default)]
+pub struct WindowsLiveProcessInspector;
+
+impl WindowsLiveProcessInspector {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl LiveProcessInspector for WindowsLiveProcessInspector {
+    fn inspect_live_process(&self, pid: u32) -> Option<ledr_sensor_win::etw::LiveProcessInfo> {
+        ledr_sensor_win::etw::inspect_live_process(pid)
+    }
+}

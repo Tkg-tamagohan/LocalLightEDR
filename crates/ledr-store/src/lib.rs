@@ -8,6 +8,7 @@ mod queries;
 mod rules;
 mod schema;
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -78,7 +79,13 @@ struct BufferedEvent {
     /// Inferred exit time supplied by the daemon when a `ProcessStart` describes an older
     /// incarnation already superseded in memory; `None` for every other event.
     exited_at_ms: Option<i64>,
+    /// Previous `(process_instance_id, exit_ms)` closed in memory when a `ProcessStart`
+    /// supersedes an earlier active row (such as a `pid:0` snapshot placeholder); `None` for
+    /// every other event.
+    superseded_process_exit: Option<(String, i64)>,
 }
+
+const MAX_PENDING_SUPERSEDED_EXITS: usize = 1_024;
 
 #[derive(Default)]
 struct BatchBuffer {
@@ -86,10 +93,66 @@ struct BatchBuffer {
     first_buffered_at: Option<Instant>,
 }
 
+/// Bounded map of superseded process exit timestamps whose target row has not yet been inserted
+/// into SQLite due to concurrent startup snapshot / ETW persistence reordering.
+#[derive(Default)]
+struct PendingSupersededExits {
+    by_id: HashMap<String, i64>,
+    fifo: VecDeque<String>,
+}
+
+impl PendingSupersededExits {
+    fn snapshot(&self) -> HashMap<String, i64> {
+        self.by_id.clone()
+    }
+
+    fn get(&self, instance_id: &str) -> Option<i64> {
+        self.by_id.get(instance_id).copied()
+    }
+
+    fn remove(&mut self, instance_id: &str) {
+        self.by_id.remove(instance_id);
+        self.compact_fifo_if_needed();
+    }
+
+    fn insert_bounded(&mut self, instance_id: String, exit_ms: i64) {
+        if self.by_id.contains_key(&instance_id) {
+            return;
+        }
+        self.by_id.insert(instance_id.clone(), exit_ms);
+        self.fifo.push_back(instance_id);
+        while self.by_id.len() > MAX_PENDING_SUPERSEDED_EXITS {
+            let Some(oldest) = self.fifo.pop_front() else {
+                break;
+            };
+            self.by_id.remove(&oldest);
+        }
+        self.compact_fifo_if_needed();
+    }
+
+    fn apply_delta(&mut self, consumed: &[String], inserted: Vec<(String, i64)>) {
+        for id in consumed {
+            self.by_id.remove(id);
+        }
+        for (id, exit_ms) in inserted {
+            self.insert_bounded(id, exit_ms);
+        }
+        self.compact_fifo_if_needed();
+    }
+
+    fn compact_fifo_if_needed(&mut self) {
+        if self.fifo.len() > MAX_PENDING_SUPERSEDED_EXITS * 2 {
+            let by_id = &self.by_id;
+            self.fifo.retain(|id| by_id.contains_key(id));
+        }
+    }
+}
+
 struct StoreInner {
     writer: Arc<Mutex<Connection>>,
     reader: Arc<Mutex<Connection>>,
     batch: Mutex<BatchBuffer>,
+    pending_superseded_exits: Mutex<PendingSupersededExits>,
     shutdown_requested: AtomicBool,
     purge_batches_completed: AtomicUsize,
     purge_batch_delay_ms: AtomicU64,
@@ -123,6 +186,7 @@ impl LedrStore {
                 writer: Arc::new(Mutex::new(writer)),
                 reader: Arc::new(Mutex::new(reader)),
                 batch: Mutex::new(BatchBuffer::default()),
+                pending_superseded_exits: Mutex::new(PendingSupersededExits::default()),
                 shutdown_requested: AtomicBool::new(false),
                 purge_batches_completed: AtomicUsize::new(0),
                 purge_batch_delay_ms: AtomicU64::new(0),
@@ -142,6 +206,7 @@ impl LedrStore {
                 writer: Arc::clone(&shared),
                 reader: shared,
                 batch: Mutex::new(BatchBuffer::default()),
+                pending_superseded_exits: Mutex::new(PendingSupersededExits::default()),
                 shutdown_requested: AtomicBool::new(false),
                 purge_batches_completed: AtomicUsize::new(0),
                 purge_batch_delay_ms: AtomicU64::new(0),
@@ -190,6 +255,15 @@ impl LedrStore {
             .batch
             .lock()
             .map_err(|_| StoreError::LockPoisoned("batch"))
+    }
+
+    fn lock_pending_superseded_exits(
+        &self,
+    ) -> Result<MutexGuard<'_, PendingSupersededExits>, StoreError> {
+        self.inner
+            .pending_superseded_exits
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned("pending_superseded_exits"))
     }
 
     /// Records a browser download origin entry into `download_origins`.

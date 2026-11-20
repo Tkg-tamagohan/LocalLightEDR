@@ -1,6 +1,9 @@
 use super::*;
 use crate::batch::resolve_process_instance_id;
-use ledr_proto::{AlertRecord, AlertSeverity, ProcessIdentity, ProcessRecord, ScriptSource};
+use ledr_proto::{
+    AlertRecord, AlertSeverity, AllowlistRuleRecord, ProcessIdentity, ProcessRecord, RuleScope,
+    ScriptSource,
+};
 use std::net::{IpAddr, Ipv4Addr};
 use tempfile::TempDir;
 
@@ -17,6 +20,7 @@ fn unit_schema_tables_indexes_and_all_seven_pragmas() {
     let expected_tables = [
         "alerts",
         "allowlist_rules",
+        "default_rule_seeds",
         "dns_queries",
         "download_origins",
         "file_canary_events",
@@ -397,4 +401,502 @@ fn unit_purge_in_batches_stops_between_batches_on_shutdown() {
         .query_row("SELECT COUNT(*) FROM processes", [], |row| row.get(0))
         .expect("count remaining rows");
     assert_eq!(remaining, 700);
+}
+
+#[test]
+fn store_p2_bug_0002_update_alert_suspension_state_updates_flag_and_context() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "susp-1".to_string(),
+            timestamp_ms: 1_732_000_000_000,
+            severity: AlertSeverity::High,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
+            title: "Suspended".to_string(),
+            process_instance_id: Some("100:1000".to_string()),
+            process_suspended: true,
+            status: AlertStatus::Pending,
+            context_json: r#"{"suspended_children":["101:1001"]}"#.to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("record alert");
+
+    assert!(store
+        .update_alert_suspension_state(
+            "susp-1",
+            false,
+            r#"{"suspended_children":[],"shutdown_resumed_identities":["100:1000","101:1001"]}"#
+        )
+        .expect("update existing"));
+    assert!(!store
+        .update_alert_suspension_state("does-not-exist", false, "{}")
+        .expect("update missing"));
+
+    let updated = store
+        .get_alert("susp-1")
+        .expect("get")
+        .expect("row exists");
+    assert!(!updated.process_suspended);
+    assert!(updated.context_json.contains("shutdown_resumed_identities"));
+    assert_eq!(updated.status, AlertStatus::Pending);
+    assert!(
+        store
+            .list_unresolved_suspended_alerts()
+            .expect("list after clearing suspension")
+            .is_empty(),
+        "alert with process_suspended=false and empty suspended_children must not be re-listed"
+    );
+}
+
+#[test]
+fn store_p2_bug_0003_list_unresolved_suspended_alerts_paginates_past_500_and_1000() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+
+    // Insert 550 unresolved suspended alerts (exceeding the 500-row keyset page size)
+    // plus 1,050 newer non-suspended alerts and 1 resolved suspended alert.
+    for i in 0..550 {
+        let is_child_only = i % 10 == 0;
+        let status = if i % 2 == 0 {
+            AlertStatus::Pending
+        } else {
+            AlertStatus::ExpiredSuspended
+        };
+        store
+            .record_alert(&AlertRecord {
+                alert_id: format!("susp-{i:04}"),
+                timestamp_ms: 1_732_000_000_000 + (i / 5) as i64,
+                severity: AlertSeverity::High,
+                source_layer: "LAYER_1_CANARY".to_string(),
+                rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+                title: "Suspended".to_string(),
+                process_instance_id: Some(format!("{}:{}", 1000 + i, 2000 + i)),
+                process_suspended: !is_child_only,
+                status,
+                context_json: if is_child_only {
+                    format!(r#"{{"suspended_children":["{}:{}"]}}"#, 5000 + i, 6000 + i)
+                } else {
+                    "{}".to_string()
+                },
+                resolved_at_ms: None,
+            })
+            .expect("record suspended alert");
+    }
+
+    for i in 0..1050 {
+        store
+            .record_alert(&AlertRecord {
+                alert_id: format!("noise-{i:04}"),
+                timestamp_ms: 1_732_000_100_000 + i as i64,
+                severity: AlertSeverity::Low,
+                source_layer: "LAYER_2_SIGMA".to_string(),
+                rule_id: "LEDR-NOISE".to_string(),
+                title: "Not suspended".to_string(),
+                process_instance_id: Some(format!("{}:{}", 8000 + i, 9000 + i)),
+                process_suspended: false,
+                status: AlertStatus::Pending,
+                context_json: "{}".to_string(),
+                resolved_at_ms: None,
+            })
+            .expect("record noise alert");
+    }
+
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "resolved-susp".to_string(),
+            timestamp_ms: 1_732_000_200_000,
+            severity: AlertSeverity::High,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
+            title: "Resolved".to_string(),
+            process_instance_id: Some("9999:9999".to_string()),
+            process_suspended: true,
+            status: AlertStatus::ApprovedOnce,
+            context_json: "{}".to_string(),
+            resolved_at_ms: Some(1_732_000_201_000),
+        })
+        .expect("record resolved alert");
+
+    let found = store
+        .list_unresolved_suspended_alerts()
+        .expect("list unresolved suspended alerts");
+    assert_eq!(found.len(), 550);
+    assert!(found.iter().all(|a| a.alert_id.starts_with("susp-")));
+}
+
+#[test]
+fn store_p2_bug_0004_seed_default_rules_once_does_not_resurrect_deleted_or_overwrite_edited() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let mk_rule = |id: &str, target: Option<&str>| AllowlistRuleRecord {
+        rule_id: id.to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: format!(r"*\app_{id}.exe"),
+        sha256: None,
+        signer_subject: Some("Test Signer".to_string()),
+        root_thumbprint: None,
+        allowed_target: target.map(str::to_string),
+        created_at_ms: 1_732_000_000_000,
+        created_by: "system-default".to_string(),
+    };
+
+    let initial = vec![mk_rule("DEF-1", None), mk_rule("DEF-2", None)];
+    assert_eq!(
+        store.seed_default_rules_once(&initial).expect("first seed"),
+        2
+    );
+
+    // Operator deletes DEF-1 and customizes DEF-2.
+    assert!(store.delete_rule("DEF-1").expect("delete DEF-1"));
+    let mut edited = mk_rule("DEF-2", Some("example.com"));
+    edited.created_by = "operator".to_string();
+    store.upsert_rule(&edited).expect("edit DEF-2");
+
+    // Re-seeding on next daemon startup must NOT resurrect DEF-1 or overwrite DEF-2,
+    // while still seeding a brand-new default rule DEF-3.
+    let next_boot = vec![
+        mk_rule("DEF-1", None),
+        mk_rule("DEF-2", None),
+        mk_rule("DEF-3", None),
+    ];
+    assert_eq!(
+        store
+            .seed_default_rules_once(&next_boot)
+            .expect("second seed"),
+        1
+    );
+
+    assert!(
+        store.get_rule("DEF-1").expect("get DEF-1").is_none(),
+        "BUG_0004: deleted default rule must not be resurrected on restart"
+    );
+    let r2 = store
+        .get_rule("DEF-2")
+        .expect("get DEF-2")
+        .expect("DEF-2 exists");
+    assert_eq!(r2.allowed_target.as_deref(), Some("example.com"));
+    assert_eq!(r2.created_by, "operator");
+    assert!(store.get_rule("DEF-3").expect("get DEF-3").is_some());
+}
+
+#[test]
+fn store_p2_analysis_list_unresolved_suspended_alerts_uses_top_level_json_array() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let mk_alert = |id: &str, ts: i64, suspended: bool, ctx: &str| AlertRecord {
+        alert_id: id.to_string(),
+        timestamp_ms: ts,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+        title: format!("Alert {id}"),
+        process_instance_id: Some(format!("4000:{ts}")),
+        process_suspended: suspended,
+        status: AlertStatus::Pending,
+        context_json: ctx.to_string(),
+        resolved_at_ms: None,
+    };
+
+    // Must be INCLUDED:
+    // 1. Top-level non-empty array even when a nested object carries an empty same-named array.
+    store
+        .record_alert(&mk_alert(
+            "inc-nested-empty",
+            1,
+            false,
+            r#"{"suspended_children":["101:1001"],"meta":{"suspended_children":[]}}"#,
+        ))
+        .expect("record inc-nested-empty");
+    // 2. Pretty-printed / whitespace-formatted top-level non-empty array.
+    store
+        .record_alert(&mk_alert(
+            "inc-whitespace",
+            2,
+            false,
+            "{ \"suspended_children\" : [ \"102:1002\" ] }",
+        ))
+        .expect("record inc-whitespace");
+    // 3. Parent suspended with malformed JSON must still be included without error.
+    store
+        .record_alert(&mk_alert("inc-malformed-parent", 3, true, "{bad json"))
+        .expect("record inc-malformed-parent");
+    // 3b. EXPIRED_SUSPENDED alert with process_suspended=false and non-empty top-level array.
+    let mut expired_child_only = mk_alert(
+        "inc-expired-child",
+        35,
+        false,
+        r#"{"suspended_children":["106:1006"]}"#,
+    );
+    expired_child_only.status = AlertStatus::ExpiredSuspended;
+    store
+        .record_alert(&expired_child_only)
+        .expect("record inc-expired-child");
+
+    // Must be EXCLUDED:
+    // 4. Pretty-printed empty array with spaces (would fool LIKE/NOT LIKE).
+    store
+        .record_alert(&mk_alert(
+            "exc-whitespace-empty",
+            4,
+            false,
+            "{ \"suspended_children\" : [ ] }",
+        ))
+        .expect("record exc-whitespace-empty");
+    // 5. Nested non-empty array when top-level has no suspended_children.
+    store
+        .record_alert(&mk_alert(
+            "exc-nested-only",
+            5,
+            false,
+            r#"{"meta":{"suspended_children":["103:1003"]}}"#,
+        ))
+        .expect("record exc-nested-only");
+    // 6. Top-level non-array value (string / null / object).
+    store
+        .record_alert(&mk_alert(
+            "exc-string",
+            6,
+            false,
+            r#"{"suspended_children":"104:1004"}"#,
+        ))
+        .expect("record exc-string");
+    store
+        .record_alert(&mk_alert(
+            "exc-null",
+            7,
+            false,
+            r#"{"suspended_children":null}"#,
+        ))
+        .expect("record exc-null");
+    // 7. Malformed JSON / empty string with process_suspended=false must be excluded without SQLite error.
+    store
+        .record_alert(&mk_alert("exc-malformed", 8, false, "{not valid json"))
+        .expect("record exc-malformed");
+    store
+        .record_alert(&mk_alert("exc-empty-str", 81, false, ""))
+        .expect("record exc-empty-str");
+    // 8. Top-level JSON array / scalar instead of object.
+    store
+        .record_alert(&mk_alert("exc-top-array", 9, false, r#"["105:1005"]"#))
+        .expect("record exc-top-array");
+    store
+        .record_alert(&mk_alert("exc-top-scalar", 91, false, "null"))
+        .expect("record exc-top-scalar");
+
+    let found = store
+        .list_unresolved_suspended_alerts()
+        .expect("list unresolved suspended alerts with SQLite JSON functions");
+    let found_ids: Vec<&str> = found.iter().map(|a| a.alert_id.as_str()).collect();
+    assert_eq!(
+        found_ids,
+        vec![
+            "inc-nested-empty",
+            "inc-whitespace",
+            "inc-malformed-parent",
+            "inc-expired-child",
+        ]
+    );
+}
+
+#[test]
+fn store_p2_upsert_process_preserves_existing_ppid_and_exe_path() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let ident = ProcessIdentity::new(4200, 133_800_000_000_000_000);
+    let inst_id = ident.instance_id();
+
+    // Initial ProcessStart with known ppid and empty exe_path.
+    let initial = SensorEvent::ProcessStart {
+        identity: ident,
+        parent_pid: 1234,
+        exe_path: String::new(),
+        command_line: "tool.exe --run".to_string(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_exit(&initial, None, None, false, "OBSERVED")
+        .expect("ingest initial");
+    store.flush_batch().expect("flush initial");
+
+    // Partial backfill carrying exe_path but parent_pid == 0 must preserve ppid=1234.
+    let backfill_exe = SensorEvent::ProcessStart {
+        identity: ident,
+        parent_pid: 0,
+        exe_path: r"C:\Temp\tool.exe".to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_exit(&backfill_exe, None, None, false, "OBSERVED")
+        .expect("ingest backfill");
+    store.flush_batch().expect("flush backfill");
+
+    // Subsequent partial upsert with empty exe_path and parent_pid == 0 must preserve both.
+    let empty_partial = SensorEvent::ProcessStart {
+        identity: ident,
+        parent_pid: 0,
+        exe_path: String::new(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_exit(&empty_partial, None, None, false, "OBSERVED")
+        .expect("ingest empty partial");
+    store.flush_batch().expect("flush empty partial");
+
+    let snap = store
+        .query_flight_recorder(10, Some(&inst_id))
+        .expect("query flight recorder");
+    let row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == inst_id)
+        .expect("process row exists");
+    assert_eq!(row.ppid, 1234, "partial upsert with ppid=0 must not clobber existing ppid");
+    assert_eq!(
+        row.exe_path, r"C:\Temp\tool.exe",
+        "partial upsert with empty exe_path must not clobber existing exe_path"
+    );
+}
+
+#[test]
+fn store_p2_upsert_process_record_allows_explicit_zero_ppid_and_empty_exe_path() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let inst_id = "4201:133800000000000000".to_string();
+    store
+        .upsert_process_record(&ProcessRecord {
+            process_instance_id: inst_id.clone(),
+            pid: 4201,
+            parent_instance_id: None,
+            ppid: 1234,
+            exe_path: r"C:\Temp\tool.exe".to_string(),
+            command_line: Some("tool.exe --run".to_string()),
+            sha256: None,
+            signer_subject: None,
+            is_trusted_os: false,
+            user_sid: None,
+            origin_url: None,
+            created_at_ms: 1_700_000_000_000,
+            exited_at_ms: Some(1_700_000_005_000),
+        })
+        .expect("seed full process record");
+
+    // Full-record upsert must allow explicitly clearing ppid and exe_path while keeping
+    // existing exited_at_ms and Option fields untouched when None.
+    store
+        .upsert_process_record(&ProcessRecord {
+            process_instance_id: inst_id.clone(),
+            pid: 4201,
+            parent_instance_id: None,
+            ppid: 0,
+            exe_path: String::new(),
+            command_line: None,
+            sha256: None,
+            signer_subject: None,
+            is_trusted_os: false,
+            user_sid: None,
+            origin_url: None,
+            created_at_ms: 1_700_000_000_000,
+            exited_at_ms: None,
+        })
+        .expect("overwrite full process record");
+
+    let snap = store
+        .query_flight_recorder(10, Some(&inst_id))
+        .expect("query flight recorder");
+    let row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == inst_id)
+        .expect("process row exists");
+    assert_eq!(row.ppid, 0, "full-record upsert must allow explicit ppid=0");
+    assert_eq!(row.exe_path, "", "full-record upsert must allow explicit empty exe_path");
+    assert_eq!(
+        row.command_line.as_deref(),
+        Some("tool.exe --run"),
+        "None Option fields remain preserved via COALESCE"
+    );
+    assert_eq!(
+        row.exited_at_ms,
+        Some(1_700_000_005_000),
+        "already-set exited_at_ms must remain preserved"
+    );
+}
+
+#[test]
+fn store_p2_ingest_process_start_closes_superseded_placeholder_atomically_without_time_inversion() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let placeholder_id = ProcessIdentity::new(4202, 0);
+    let placeholder_key = placeholder_id.instance_id();
+
+    // Seed placeholder row (create_time_100ns = 0 -> created_at_ms = received_at_ms).
+    store
+        .ingest_event_with_lifecycle(
+            &SensorEvent::ProcessStart {
+                identity: placeholder_id,
+                parent_pid: 4,
+                exe_path: r"C:\Temp\svc.exe".to_string(),
+                command_line: String::new(),
+                user_sid: None,
+            },
+            None,
+            None,
+            None,
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest placeholder");
+    store.flush_batch().expect("flush placeholder");
+
+    let placeholder_created = store
+        .query_flight_recorder(10, Some(&placeholder_key))
+        .expect("query placeholder")
+        .processes
+        .into_iter()
+        .find(|p| p.process_instance_id == placeholder_key)
+        .expect("placeholder exists")
+        .created_at_ms;
+
+    // Superseding real ProcessStart carries an earlier real start timestamp (< placeholder_created).
+    let real_created_ms = placeholder_created - 2_000;
+    let real_ticks =
+        (u64::try_from(real_created_ms).expect("positive ms") * 10_000) + 116_444_736_000_000_000;
+    let real_id = ProcessIdentity::new(4202, real_ticks);
+    let real_key = real_id.instance_id();
+
+    store
+        .ingest_event_with_lifecycle(
+            &SensorEvent::ProcessStart {
+                identity: real_id,
+                parent_pid: 4,
+                exe_path: r"C:\Temp\svc.exe".to_string(),
+                command_line: "svc.exe --run".to_string(),
+                user_sid: None,
+            },
+            None,
+            None,
+            Some((placeholder_key.as_str(), real_created_ms)),
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest superseding start");
+    store.flush_batch().expect("flush superseding start");
+
+    let snap = store
+        .query_flight_recorder(20, None)
+        .expect("query flight recorder");
+    let placeholder_row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == placeholder_key)
+        .expect("placeholder row remains for lineage/alert references");
+    let real_row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == real_key)
+        .expect("real row exists");
+
+    assert_eq!(
+        placeholder_row.exited_at_ms,
+        Some(placeholder_created),
+        "superseded placeholder must be closed with exited_at_ms clamped to >= created_at_ms"
+    );
+    assert_eq!(real_row.exited_at_ms, None, "real process row remains active");
 }

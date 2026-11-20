@@ -972,12 +972,85 @@
     return `<span class="sev-pill ${cls}">${escapeHtml(label)}</span>`;
   }
 
+  function getAlertSuspensionState(alert) {
+    const ctx = safeJsonParse(alert?.context_json) || {};
+    const suspendedChildren = Array.isArray(ctx.suspended_children)
+      ? ctx.suspended_children
+      : [];
+    const shutdownResumedIds = Array.isArray(ctx.shutdown_resumed_identities)
+      ? ctx.shutdown_resumed_identities.filter((id) => typeof id === "string")
+      : [];
+    const shutdownGoneIds = Array.isArray(ctx.shutdown_gone_identities)
+      ? ctx.shutdown_gone_identities.filter((id) => typeof id === "string")
+      : [];
+    const shutdownResumedAtMs =
+      typeof ctx.shutdown_resumed_at_ms === "number"
+        ? ctx.shutdown_resumed_at_ms
+        : null;
+    const shutdownClearedAtMs =
+      typeof ctx.shutdown_cleared_at_ms === "number"
+        ? ctx.shutdown_cleared_at_ms
+        : null;
+    const parentSuspended = Boolean(alert?.process_suspended);
+    const parentId =
+      typeof alert?.process_instance_id === "string" &&
+      alert.process_instance_id.length > 0
+        ? alert.process_instance_id
+        : null;
+
+    let parentShutdownOutcome = null;
+    if (!parentSuspended) {
+      if (parentId && shutdownGoneIds.includes(parentId)) {
+        parentShutdownOutcome = "gone";
+      } else if (parentId && shutdownResumedIds.includes(parentId)) {
+        parentShutdownOutcome = "resumed";
+      } else if (
+        shutdownGoneIds.length === 0 &&
+        shutdownResumedIds.length === 0
+      ) {
+        if (shutdownClearedAtMs !== null && shutdownResumedAtMs === null) {
+          parentShutdownOutcome = "gone";
+        } else if (
+          shutdownResumedAtMs !== null &&
+          shutdownClearedAtMs === null
+        ) {
+          parentShutdownOutcome = "resumed";
+        }
+      }
+    }
+
+    const remainingChildren = suspendedChildren.length;
+    const stillFrozen = parentSuspended || remainingChildren > 0;
+    return {
+      parentSuspended,
+      parentShutdownOutcome,
+      remainingChildren,
+      stillFrozen,
+      shutdownResumedAtMs,
+      shutdownClearedAtMs,
+    };
+  }
+
   function renderAlertStatePills(alert) {
     if (alert.status === "ExpiredSuspended") {
-      return `<span class="state-pill state-expired">EXPIRED_SUSPENDED (60s)</span>`;
+      const susp = getAlertSuspensionState(alert);
+      if (susp.stillFrozen && susp.parentSuspended) {
+        return `<span class="state-pill state-expired">EXPIRED_SUSPENDED (60s)</span>`;
+      }
+      if (susp.stillFrozen) {
+        return `<span class="state-pill state-expired">EXPIRED_SUSPENDED (${susp.remainingChildren} CHILD FROZEN)</span>`;
+      }
+      if (susp.shutdownClearedAtMs !== null) {
+        return `<span class="state-pill state-pending">EXPIRED (CLEARED)</span>`;
+      }
+      if (susp.shutdownResumedAtMs !== null) {
+        return `<span class="state-pill state-pending">EXPIRED (RESUMED)</span>`;
+      }
+      return `<span class="state-pill state-pending">EXPIRED (60s)</span>`;
     }
     if (alert.status === "Pending") {
-      if (alert.process_suspended) {
+      const susp = getAlertSuspensionState(alert);
+      if (susp.stillFrozen) {
         return `<span class="state-pill state-frozen">FROZEN</span>`;
       }
       return `<span class="state-pill state-pending">PENDING</span>`;
@@ -1189,26 +1262,67 @@
     let subline = "";
 
     if (alert.status === "ExpiredSuspended") {
-      bannerClass += " is-expired";
-      subline = details.wfpBlocked
-        ? "60s timeout elapsed — process frozen and dynamic WFP block retained"
-        : details.includeChildren
-          ? "60s timeout elapsed — process tree remains frozen without data loss"
-          : "60s timeout elapsed — process remains frozen without data loss";
-    } else if (alert.status === "Pending" && alert.process_suspended) {
-      bannerClass += " is-frozen";
-      subline = details.wfpBlocked
-        ? "Process frozen + dynamic WFP outbound block active — awaiting decision"
-        : details.includeChildren
-          ? "Process tree frozen (NtSuspendProcess) — awaiting decision"
-          : "Process frozen (NtSuspendProcess) — awaiting decision";
+      const susp = getAlertSuspensionState(alert);
+      if (susp.stillFrozen) {
+        bannerClass += " is-expired";
+        if (!susp.parentSuspended && susp.remainingChildren > 0) {
+          if (susp.parentShutdownOutcome === "gone") {
+            subline = `60s timeout elapsed — parent already exited or PID reused before daemon shutdown, ${susp.remainingChildren} child process(es) still frozen`;
+          } else if (susp.parentShutdownOutcome === "resumed") {
+            subline = `60s timeout elapsed — parent resumed on daemon shutdown, ${susp.remainingChildren} child process(es) still frozen`;
+          } else {
+            subline = `60s timeout elapsed — parent not currently suspended, ${susp.remainingChildren} child process(es) still frozen`;
+          }
+        } else {
+          subline = details.wfpBlocked
+            ? "60s timeout elapsed — process frozen and dynamic WFP block retained"
+            : details.includeChildren
+              ? "60s timeout elapsed — process tree remains frozen without data loss"
+              : "60s timeout elapsed — process remains frozen without data loss";
+        }
+      } else if (
+        susp.shutdownResumedAtMs !== null &&
+        susp.shutdownClearedAtMs !== null
+      ) {
+        const clearedTs = Math.max(
+          susp.shutdownResumedAtMs,
+          susp.shutdownClearedAtMs,
+        );
+        subline = `60s timeout elapsed — suspension cleared on daemon shutdown at ${formatTime(clearedTs)} (active target resumed; others already exited or PID reused; awaiting triage)`;
+      } else if (susp.shutdownClearedAtMs !== null) {
+        subline = `60s timeout elapsed — suspended process already exited or PID reused before daemon shutdown at ${formatTime(susp.shutdownClearedAtMs)} (awaiting triage)`;
+      } else if (susp.shutdownResumedAtMs !== null) {
+        subline = `60s timeout elapsed — process resumed on daemon shutdown at ${formatTime(susp.shutdownResumedAtMs)} (awaiting triage)`;
+      } else {
+        subline = "60s timeout elapsed — process not currently suspended (awaiting triage)";
+      }
     } else if (alert.status === "Pending") {
-      subline =
-        details.attribution === "app_level_ambiguous"
-          ? "Dynamic WFP block active (multi-instance PID ambiguous — no process suspended)"
-          : details.wfpBlocked
-            ? "Dynamic WFP outbound block active — awaiting decision"
-            : "Active alert — process not suspended";
+      const susp = getAlertSuspensionState(alert);
+      if (susp.stillFrozen) {
+        bannerClass += " is-frozen";
+        if (!susp.parentSuspended && susp.remainingChildren > 0) {
+          if (susp.parentShutdownOutcome === "gone") {
+            subline = `Parent already exited or PID reused before daemon shutdown; ${susp.remainingChildren} child process(es) still frozen — awaiting decision`;
+          } else if (susp.parentShutdownOutcome === "resumed") {
+            subline = `Parent resumed on daemon shutdown; ${susp.remainingChildren} child process(es) still frozen — awaiting decision`;
+          } else {
+            subline = `${susp.remainingChildren} child process(es) still frozen (NtSuspendProcess) — awaiting decision`;
+          }
+        } else {
+          subline = details.wfpBlocked
+            ? "Process frozen + dynamic WFP outbound block active — awaiting decision"
+            : details.includeChildren
+              ? "Process tree frozen (NtSuspendProcess) — awaiting decision"
+              : "Process frozen (NtSuspendProcess) — awaiting decision";
+        }
+      } else {
+        subline =
+          details.attribution === "app_level_ambiguous"
+            ? "Dynamic WFP block active (multi-instance PID ambiguous — no process suspended)"
+            : details.wfpBlocked
+              ? "Dynamic WFP outbound block active — awaiting decision"
+              : "Active alert — process not suspended";
+      }
     } else if (alert.status === "TerminatedBlocked") {
       bannerClass += " is-terminated";
       subline = alert.resolved_at_ms

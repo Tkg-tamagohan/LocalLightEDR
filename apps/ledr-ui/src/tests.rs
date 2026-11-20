@@ -13,12 +13,12 @@ use ledr_proto::{
 };
 use notify::{
     ToastAlertSummary, base64_encode, build_notify_oneshot_event, build_winrt_toast_xml,
-    is_os_toast_disabled_value, summarize_alert_for_toast,
+    is_os_toast_disabled_value, is_os_toast_suppressed_by_setting, summarize_alert_for_toast,
 };
 use std::io::{self, Read, Write};
 use tree::build_process_tree;
 #[cfg(windows)]
-use uri_reg::{LEDR_URI_DESCRIPTION, win_uri_reg};
+use uri_reg::{LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, win_uri_reg};
 use uri_reg::{
     LEDR_URI_REG_SUBKEY, UriRegistrationOutcome, build_register_uri_event, format_ledr_uri_command,
 };
@@ -410,6 +410,9 @@ fn ui_p2_02_winrt_toast_xml_escaping_and_launch_uri() {
         severity: Some("CRITICAL".to_string()),
         process_suspended: true,
         is_expired_suspended: false,
+        has_suspended_children: false,
+        shutdown_resumed: false,
+        shutdown_cleared: false,
     };
 
     let xml = build_winrt_toast_xml(&summary);
@@ -433,10 +436,91 @@ fn ui_p2_02_winrt_toast_xml_escaping_and_launch_uri() {
         severity: Some("CRITICAL".to_string()),
         process_suspended: true,
         is_expired_suspended: true,
+        has_suspended_children: false,
+        shutdown_resumed: false,
+        shutdown_cleared: false,
     };
     let expired_xml = build_winrt_toast_xml(&expired_summary);
     assert!(expired_xml.contains("[EXPIRED_SUSPENDED · FROZEN]"));
     assert!(expired_xml.contains("launch=\"ledr://alert/alert-exp-1\""));
+
+    // Verify EXPIRED_SUSPENDED resumed on daemon shutdown distinguishes resumed vs still-frozen.
+    let shutdown_resumed_record = AlertRecord {
+        alert_id: "alert-exp-resumed".to_string(),
+        timestamp_ms: 1_700_000_000_000,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
+        title: "Cookies Access".to_string(),
+        process_instance_id: Some("4200:133800000000000000".to_string()),
+        process_suspended: false,
+        status: AlertStatus::ExpiredSuspended,
+        context_json: r#"{"suspended_children":[],"shutdown_resumed_at_ms":1700000099000}"#
+            .to_string(),
+        resolved_at_ms: None,
+    };
+    let resumed_summary =
+        summarize_alert_for_toast(&shutdown_resumed_record.alert_id, Some(&shutdown_resumed_record));
+    assert!(!resumed_summary.process_suspended);
+    assert!(!resumed_summary.has_suspended_children);
+    assert!(resumed_summary.shutdown_resumed);
+    let resumed_xml = build_winrt_toast_xml(&resumed_summary);
+    assert!(
+        resumed_xml.contains("[EXPIRED · RESUMED]"),
+        "shutdown-resumed expired alert must not claim FROZEN: {resumed_xml}"
+    );
+    assert!(!resumed_xml.contains("FROZEN"));
+
+    // Partial resume where parent resumed but a child remains suspended must still show FROZEN.
+    let partial_child_record = AlertRecord {
+        alert_id: "alert-exp-child-frozen".to_string(),
+        context_json: r#"{"suspended_children":["4204:133800000000000000"],"shutdown_resumed_at_ms":1700000099000}"#
+            .to_string(),
+        ..shutdown_resumed_record
+    };
+    let partial_summary =
+        summarize_alert_for_toast(&partial_child_record.alert_id, Some(&partial_child_record));
+    assert!(partial_summary.has_suspended_children);
+    let partial_xml = build_winrt_toast_xml(&partial_summary);
+    assert!(partial_xml.contains("[EXPIRED_SUSPENDED · FROZEN]"));
+
+    // PR23-U3-02: Shutdown clear of an already-exited / PID-reused process must NOT claim RESUMED.
+    let shutdown_gone_record = AlertRecord {
+        alert_id: "alert-exp-gone".to_string(),
+        context_json: r#"{"suspended_children":[],"shutdown_gone_identities":["4200:133800000000000000"],"shutdown_cleared_at_ms":1700000099500}"#
+            .to_string(),
+        ..partial_child_record.clone()
+    };
+    let gone_summary =
+        summarize_alert_for_toast(&shutdown_gone_record.alert_id, Some(&shutdown_gone_record));
+    assert!(!gone_summary.shutdown_resumed);
+    assert!(gone_summary.shutdown_cleared);
+    let gone_xml = build_winrt_toast_xml(&gone_summary);
+    assert!(
+        gone_xml.contains("[EXPIRED · CLEARED]"),
+        "shutdown-cleared gone process must show CLEARED badge: {gone_xml}"
+    );
+    assert!(!gone_xml.contains("RESUMED"));
+    assert!(!gone_xml.contains("FROZEN"));
+
+    // PR23-U3-02 (mixed): When both a resumed target and a gone/reused target were cleared on
+    // shutdown, badge must use CLEARED instead of claiming all targets resumed.
+    let shutdown_mixed_record = AlertRecord {
+        alert_id: "alert-exp-mixed".to_string(),
+        context_json: r#"{"suspended_children":[],"shutdown_resumed_identities":["4200:133800000000000000"],"shutdown_resumed_at_ms":1700000099000,"shutdown_gone_identities":["4204:133800000000000000"],"shutdown_cleared_at_ms":1700000099000}"#
+            .to_string(),
+        ..shutdown_gone_record
+    };
+    let mixed_summary =
+        summarize_alert_for_toast(&shutdown_mixed_record.alert_id, Some(&shutdown_mixed_record));
+    assert!(mixed_summary.shutdown_resumed);
+    assert!(mixed_summary.shutdown_cleared);
+    let mixed_xml = build_winrt_toast_xml(&mixed_summary);
+    assert!(
+        mixed_xml.contains("[EXPIRED · CLEARED]"),
+        "mixed shutdown resume/gone clear must show CLEARED badge: {mixed_xml}"
+    );
+    assert!(!mixed_xml.contains("RESUMED"));
 
     // RFC 4648 base64 sanity check for PowerShell -EncodedCommand encoding.
     assert_eq!(base64_encode(b""), "");
@@ -947,4 +1031,59 @@ fn ui_p3_03_network_alert_toast_extracts_dst_and_domain() {
     assert_eq!(summary.exe_path.as_deref(), Some(r"C:\Tools\probe.exe"));
     let xml = build_winrt_toast_xml(&summary);
     assert!(xml.contains("c2.fresh-nrd.example (198.51.100.42:443)"));
+}
+
+#[test]
+fn ui_p3_04_toast_os_setting_suppression_and_aumid_registration() {
+    assert!(is_os_toast_suppressed_by_setting(Some(0)));
+    assert!(!is_os_toast_suppressed_by_setting(Some(1)));
+    assert!(!is_os_toast_suppressed_by_setting(None));
+
+    // Ensure notify.rs no longer spawns PowerShell with -EncodedCommand / FromBase64String
+    // (which self-triggered LEDR-SCRIPT-001 and LEDR-LOTL-001).
+    let notify_src = include_str!("notify.rs");
+    assert!(
+        !notify_src.contains("powershell.exe"),
+        "notify.rs must use native WinRT instead of spawning powershell.exe"
+    );
+    assert!(
+        !notify_src.contains("FromBase64String"),
+        "notify.rs must not emit FromBase64String scripts"
+    );
+    assert!(
+        !notify_src.contains("-EncodedCommand"),
+        "notify.rs must not emit -EncodedCommand arguments"
+    );
+
+    #[cfg(windows)]
+    {
+        struct TestKeyCleanup(String);
+        impl Drop for TestKeyCleanup {
+            fn drop(&mut self) {
+                win_uri_reg::reg_delete_hkcu_tree(&self.0);
+            }
+        }
+
+        let root_cleanup = format!(r"Software\LocalEDRTest\ui-p3-04-{}", std::process::id());
+        let aumid_subkey = format!(r"{root_cleanup}\AppUserModelId\LocalEDR.AlertUI");
+        let _guard = TestKeyCleanup(root_cleanup);
+
+        let first =
+            win_uri_reg::ensure_hkcu_aumid_registered_at(&aumid_subkey, LEDR_AUMID_DISPLAY_NAME)
+                .expect("initial AUMID registration");
+        assert!(first, "initial AUMID registration must report updated=true");
+
+        let key = win_uri_reg::reg_open_hkcu(&aumid_subkey, 0x0001)
+            .expect("open AUMID key")
+            .expect("AUMID key exists");
+        assert_eq!(
+            win_uri_reg::reg_query_sz(&key, Some("DisplayName")).expect("query DisplayName"),
+            Some(LEDR_AUMID_DISPLAY_NAME.to_string())
+        );
+
+        let second =
+            win_uri_reg::ensure_hkcu_aumid_registered_at(&aumid_subkey, LEDR_AUMID_DISPLAY_NAME)
+                .expect("idempotent AUMID check");
+        assert!(!second, "second AUMID registration must be idempotent");
+    }
 }

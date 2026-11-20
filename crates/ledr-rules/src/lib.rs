@@ -11,7 +11,7 @@ pub mod sigma;
 use std::fs;
 use std::path::Path;
 
-use ledr_proto::{AllowlistRuleRecord, SensorEvent};
+use ledr_proto::{AllowlistRuleRecord, RuleScope, SensorEvent};
 use sha2::Digest as _;
 use thiserror::Error;
 
@@ -57,36 +57,91 @@ pub enum RulesError {
     InvalidRule { rule_id: String, reason: String },
 }
 
-/// Loads all Sigma rules (`lotl_core.json`, etc.) and allowlist / pruner configuration
-/// (`default_allowlist.json`) from `dir`.
-pub fn load_rules_and_pruner_from_dir(
-    dir: impl AsRef<Path>,
-) -> Result<(SigmaEngine, EarlyPruner, Vec<AllowlistRuleRecord>), RulesError> {
+/// Structured output of [`load_rules_dir`], distinguishing shipped default allowlist rules
+/// from operator-managed policy rules.
+#[derive(Debug, Default)]
+pub struct LoadedRulesDir {
+    pub sigma: SigmaEngine,
+    pub pruner: EarlyPruner,
+    /// Shipped default allowlist rules from `default_allowlist.json` (`created_by == "default_allowlist"`,
+    /// non-`NetworkBlock`) intended for one-time seeding via `seed_default_rules_once`.
+    pub default_allowlists: Vec<AllowlistRuleRecord>,
+    /// Operator-managed rules (separate JSON policy files, `NetworkBlock` entries, or rules with
+    /// non-default `created_by`) whose file edits must be upserted on startup.
+    pub managed_rules: Vec<AllowlistRuleRecord>,
+}
+
+fn is_shipped_default_rule(path: &Path, rule: &AllowlistRuleRecord) -> bool {
+    let is_default_file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("default_allowlist.json"));
+    if !is_default_file {
+        return false;
+    }
+    rule.scope != RuleScope::NetworkBlock
+        && rule.created_by.trim().eq_ignore_ascii_case("default_allowlist")
+}
+
+/// Loads all Sigma rules (`lotl_core.json`, etc.), early pruner configuration, shipped default
+/// allowlists (`default_allowlist.json`), and operator-managed rule files from `dir`.
+pub fn load_rules_dir(dir: impl AsRef<Path>) -> Result<LoadedRulesDir, RulesError> {
     let mut paths: Vec<_> = fs::read_dir(dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
         .collect();
     paths.sort();
 
     let mut rules = Vec::new();
     let mut pruner = EarlyPruner::default();
-    let mut allowlists = Vec::new();
+    let mut default_allowlists = Vec::new();
+    let mut managed_rules = Vec::new();
 
     for path in paths {
-        let raw = fs::read_to_string(&path)?;
-        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        let raw_file = fs::read_to_string(&path)?;
+        let raw = raw_file.strip_prefix('\u{feff}').unwrap_or(&raw_file);
+        let value: serde_json::Value = serde_json::from_str(raw)?;
         if value.is_array() || value.get("rules").is_some() {
-            rules.extend(sigma::parse_sigma_rules_json(&raw)?);
+            rules.extend(sigma::parse_sigma_rules_json(raw)?);
         } else if value.get("early_pruner").is_some() || value.get("allowlist_rules").is_some() {
-            let cfg = AllowlistConfig::from_json_str(&raw)?;
-            pruner = EarlyPruner::new(cfg.early_pruner);
-            allowlists.extend(cfg.allowlist_rules);
+            let cfg = AllowlistConfig::from_json_str(raw)?;
+            if value.get("early_pruner").is_some() {
+                pruner = EarlyPruner::new(cfg.early_pruner);
+            }
+            for rule in cfg.allowlist_rules {
+                if is_shipped_default_rule(&path, &rule) {
+                    default_allowlists.push(rule);
+                } else {
+                    managed_rules.push(rule);
+                }
+            }
         }
     }
 
-    let engine = SigmaEngine::from_rules(rules)?;
-    Ok((engine, pruner, allowlists))
+    let sigma = SigmaEngine::from_rules(rules)?;
+    Ok(LoadedRulesDir {
+        sigma,
+        pruner,
+        default_allowlists,
+        managed_rules,
+    })
+}
+
+/// Loads all Sigma rules (`lotl_core.json`, etc.) and allowlist / pruner configuration
+/// (`default_allowlist.json`) from `dir`, combining shipped default allowlists and
+/// operator-managed rules into a single list.
+pub fn load_rules_and_pruner_from_dir(
+    dir: impl AsRef<Path>,
+) -> Result<(SigmaEngine, EarlyPruner, Vec<AllowlistRuleRecord>), RulesError> {
+    let loaded = load_rules_dir(dir)?;
+    let mut allowlists = loaded.default_allowlists;
+    allowlists.extend(loaded.managed_rules);
+    Ok((loaded.sigma, loaded.pruner, allowlists))
 }
 
 /// Returns the rule engine implementation version string.

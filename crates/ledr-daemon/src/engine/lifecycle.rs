@@ -16,8 +16,9 @@ use crate::process_table::ActiveProcessTable;
 use super::dns_history::ProcessDnsHistory;
 use super::wfp_drops::{AppWfpAlertDedup, WfpDropDedupCache, WfpDropOverflowQueue};
 use super::{
-    current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, WindowsBinaryInspector,
-    APP_WFP_ALERT_DEDUP_CAPACITY, WFP_DROP_DEDUP_CAPACITY, WFP_DROP_DEDUP_WINDOW_MS,
+    current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, LiveProcessInspector,
+    WindowsBinaryInspector, WindowsLiveProcessInspector, APP_WFP_ALERT_DEDUP_CAPACITY,
+    WFP_DROP_DEDUP_CAPACITY, WFP_DROP_DEDUP_WINDOW_MS,
 };
 
 impl DaemonEngine {
@@ -70,6 +71,32 @@ impl DaemonEngine {
         notifier: Arc<dyn NotificationDispatcher>,
         inspector: Arc<dyn BinaryInspector>,
     ) -> Arc<Self> {
+        Self::start_with_all_dependencies(
+            store,
+            sigma,
+            pruner,
+            config,
+            defense,
+            notifier,
+            inspector,
+            Arc::new(WindowsLiveProcessInspector::new()),
+        )
+    }
+
+    /// Starts a new [`DaemonEngine`] with custom [`ActiveDefenseController`],
+    /// [`NotificationDispatcher`], [`BinaryInspector`], and [`LiveProcessInspector`]
+    /// implementations (enabling deterministic test isolation from host OS PIDs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_all_dependencies(
+        store: LedrStore,
+        sigma: SigmaEngine,
+        pruner: EarlyPruner,
+        config: DaemonConfig,
+        defense: Arc<dyn ActiveDefenseController>,
+        notifier: Arc<dyn NotificationDispatcher>,
+        inspector: Arc<dyn BinaryInspector>,
+        live_process_inspector: Arc<dyn LiveProcessInspector>,
+    ) -> Arc<Self> {
         let prior_running_candidates = store.list_running_process_instance_ids().unwrap_or_default();
         let (sender, receiver) = TwoLaneChannel::with_capacities(
             config.high_priority_capacity,
@@ -102,7 +129,11 @@ impl DaemonEngine {
             .unwrap_or_default();
 
         let mut wfp_manager = WfpRuleManager::new();
-        wfp_manager.set_startup_preemptive_executables(&config.preemptive_startup_executables);
+        if config.outbound_firewall_enabled
+            && config.outbound_enforcement_mode != super::OutboundEnforcementMode::Audit
+        {
+            wfp_manager.set_startup_preemptive_executables(&config.preemptive_startup_executables);
+        }
         let outbound_classifier = Arc::new(OutboundLaneClassifier::new(
             config.outbound_firewall_enabled,
         ));
@@ -126,6 +157,7 @@ impl DaemonEngine {
             defense,
             notifier,
             inspector,
+            live_process_inspector,
             process_table,
             firewall: Mutex::new(wfp_manager),
             outbound_classifier,
@@ -185,9 +217,10 @@ impl DaemonEngine {
         let mut count = 0usize;
         let mut active_id_set = HashSet::with_capacity(snapshots.len());
         for ev in snapshots {
-            if let SensorEvent::ProcessStart { identity, .. } = &ev {
-                active_id_set.insert(identity.instance_id());
-                self.process_event(&ev);
+            if matches!(&ev, SensorEvent::ProcessStart { .. }) {
+                if let Some(resolved_id) = self.process_seed_process_start(&ev) {
+                    active_id_set.insert(resolved_id);
+                }
                 count += 1;
             }
         }
@@ -313,9 +346,16 @@ impl DaemonEngine {
             }
         }
 
+        let mut needs_checkpoint = !worker_checkpointed;
+        if self.config.resume_suspended_on_shutdown
+            && self.resume_unresolved_suspended_processes_on_shutdown(deadline)
+        {
+            needs_checkpoint = true;
+        }
+
         // Prioritize WAL truncation BEFORE waiting on any remaining NRD refresh thread so a slow
-        // or wedged NRD thread can never delay or starve SQLite checkpointing (`AUTO-10`, `R-11`).
-        if !worker_checkpointed {
+        // or wedged NRD thread can never delay or starve SQLite checkpointing (`AUTO-10`, `R-11`, `ANALYSIS_0003`).
+        if needs_checkpoint {
             self.store.checkpoint_truncate()?;
         }
 
@@ -363,5 +403,282 @@ impl DaemonEngine {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Best-effort resumes all unresolved (`Pending` / `ExpiredSuspended`) parent and child
+    /// processes recorded as suspended in SQLite within the shared shutdown `deadline` when
+    /// `resume_suspended_on_shutdown` is enabled (`--foreground` or `--resume-suspended-on-shutdown`).
+    ///
+    /// Confirmed resumed identities are recorded under `context_json.shutdown_resumed_identities` /
+    /// `context_json.shutdown_resumed_at_ms`, while already-exited or PID-reused identities are
+    /// separated into `context_json.shutdown_gone_identities` / `context_json.shutdown_cleared_at_ms`
+    /// so UI and toast surfaces never claim a vanished process was resumed (`BUG_0002`, `BUG_0003`,
+    /// `ANALYSIS_0003`, `PR23-U3`).
+    /// Returns `true` if any SQLite alert row was updated and requires WAL checkpointing.
+    pub(super) fn resume_unresolved_suspended_processes_on_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "shutdown budget already exhausted before resuming unresolved suspended processes"
+            );
+            return false;
+        }
+        let alerts = match self.store.list_unresolved_suspended_alerts() {
+            Ok(alerts) => alerts,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to query unresolved suspended alerts during shutdown"
+                );
+                return false;
+            }
+        };
+
+        let mut seen: HashSet<ProcessIdentity> = HashSet::new();
+        let mut to_resume: Vec<ProcessIdentity> = Vec::new();
+
+        for alert in &alerts {
+            let parent_ident = alert
+                .process_instance_id
+                .as_deref()
+                .and_then(ProcessIdentity::from_instance_id)
+                .filter(|id| id.create_time_100ns != 0);
+            if alert.process_suspended {
+                if let Some(id) = parent_ident {
+                    if seen.insert(id) {
+                        to_resume.push(id);
+                    }
+                }
+            }
+            if let Ok(ctx_val) = serde_json::from_str::<serde_json::Value>(&alert.context_json) {
+                super::alerts::collect_suspended_children_from_ctx(
+                    &ctx_val,
+                    if alert.process_suspended {
+                        parent_ident
+                    } else {
+                        None
+                    },
+                    &mut seen,
+                    &mut to_resume,
+                );
+            }
+        }
+
+        if to_resume.is_empty() {
+            return false;
+        }
+
+        let mut resumed = 0usize;
+        let mut gone_or_replaced = 0usize;
+        let mut failed = 0usize;
+        let mut skipped_budget = 0usize;
+        let mut resumed_identities: HashSet<ProcessIdentity> = HashSet::new();
+        let mut gone_identities: HashSet<ProcessIdentity> = HashSet::new();
+
+        for (idx, ident) in to_resume.iter().enumerate() {
+            if tokio::time::Instant::now() >= deadline {
+                skipped_budget = to_resume.len().saturating_sub(idx);
+                tracing::warn!(
+                    attempted = idx,
+                    skipped_budget,
+                    total = to_resume.len(),
+                    "shutdown budget exhausted while resuming unresolved suspended processes"
+                );
+                break;
+            }
+            match self.defense.resume_process(ident) {
+                Ok(()) => {
+                    resumed += 1;
+                    resumed_identities.insert(*ident);
+                }
+                Err(err) => {
+                    if !super::alerts::is_protected_process_refusal(&err)
+                        && super::alerts::is_process_gone_or_replaced(&err, ident.pid)
+                    {
+                        gone_or_replaced += 1;
+                        gone_identities.insert(*ident);
+                        tracing::info!(
+                            pid = ident.pid,
+                            create_time_100ns = ident.create_time_100ns,
+                            error = %err,
+                            "suspended process already exited or PID reused during shutdown resume; clearing suspension state"
+                        );
+                    } else {
+                        failed += 1;
+                        tracing::warn!(
+                            pid = ident.pid,
+                            create_time_100ns = ident.create_time_100ns,
+                            error = %err,
+                            "best-effort resume_process failed during shutdown; keeping suspension state"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut updated_alerts = 0usize;
+        if !resumed_identities.is_empty() || !gone_identities.is_empty() {
+            let cleared_at_ms = current_unix_ms();
+            for alert in &alerts {
+                let parent_ident = alert
+                    .process_instance_id
+                    .as_deref()
+                    .and_then(ProcessIdentity::from_instance_id)
+                    .filter(|id| id.create_time_100ns != 0);
+                let parent_resumed = alert.process_suspended
+                    && parent_ident.is_some_and(|id| resumed_identities.contains(&id));
+                let parent_gone = alert.process_suspended
+                    && parent_ident.is_some_and(|id| gone_identities.contains(&id));
+                let parent_cleared = parent_resumed || parent_gone;
+                let new_process_suspended = if parent_cleared {
+                    false
+                } else {
+                    alert.process_suspended
+                };
+
+                let mut newly_resumed_ids: Vec<String> = Vec::new();
+                let mut newly_gone_ids: Vec<String> = Vec::new();
+                if let Some(id) = parent_ident {
+                    if parent_resumed {
+                        newly_resumed_ids.push(id.instance_id());
+                    } else if parent_gone {
+                        newly_gone_ids.push(id.instance_id());
+                    }
+                }
+
+                let mut children_changed = false;
+                let updated_context_json = match serde_json::from_str::<serde_json::Value>(
+                    &alert.context_json,
+                ) {
+                    Ok(mut ctx_val) => {
+                        if let Some(obj) = ctx_val.as_object_mut() {
+                            if let Some(arr) =
+                                obj.get("suspended_children").and_then(|v| v.as_array())
+                            {
+                                let mut remaining = Vec::with_capacity(arr.len());
+                                for item in arr {
+                                    let child_ident = item
+                                        .as_str()
+                                        .and_then(ProcessIdentity::from_instance_id)
+                                        .filter(|id| id.create_time_100ns != 0);
+                                    if let Some(child_id) =
+                                        child_ident.filter(|id| resumed_identities.contains(id))
+                                    {
+                                        children_changed = true;
+                                        let id_str = child_id.instance_id();
+                                        if !newly_resumed_ids.contains(&id_str) {
+                                            newly_resumed_ids.push(id_str);
+                                        }
+                                    } else if let Some(child_id) =
+                                        child_ident.filter(|id| gone_identities.contains(id))
+                                    {
+                                        children_changed = true;
+                                        let id_str = child_id.instance_id();
+                                        if !newly_gone_ids.contains(&id_str) {
+                                            newly_gone_ids.push(id_str);
+                                        }
+                                    } else {
+                                        remaining.push(item.clone());
+                                    }
+                                }
+                                if children_changed {
+                                    obj.insert(
+                                        "suspended_children".to_string(),
+                                        serde_json::Value::Array(remaining),
+                                    );
+                                }
+                            }
+                            if parent_cleared || children_changed {
+                                if !newly_resumed_ids.is_empty() {
+                                    let existing_audit = obj
+                                        .entry("shutdown_resumed_identities".to_string())
+                                        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                                    if let Some(audit_arr) = existing_audit.as_array_mut() {
+                                        for id_str in &newly_resumed_ids {
+                                            let exists = audit_arr
+                                                .iter()
+                                                .any(|v| v.as_str() == Some(id_str.as_str()));
+                                            if !exists {
+                                                audit_arr.push(serde_json::Value::String(
+                                                    id_str.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    obj.insert(
+                                        "shutdown_resumed_at_ms".to_string(),
+                                        serde_json::Value::from(cleared_at_ms),
+                                    );
+                                }
+                                if !newly_gone_ids.is_empty() {
+                                    let existing_gone = obj
+                                        .entry("shutdown_gone_identities".to_string())
+                                        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                                    if let Some(gone_arr) = existing_gone.as_array_mut() {
+                                        for id_str in &newly_gone_ids {
+                                            let exists = gone_arr
+                                                .iter()
+                                                .any(|v| v.as_str() == Some(id_str.as_str()));
+                                            if !exists {
+                                                gone_arr.push(serde_json::Value::String(
+                                                    id_str.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    obj.insert(
+                                        "shutdown_cleared_at_ms".to_string(),
+                                        serde_json::Value::from(cleared_at_ms),
+                                    );
+                                }
+                            }
+                        }
+                        if parent_cleared || children_changed {
+                            Some(ctx_val.to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => {
+                        if parent_cleared {
+                            Some(alert.context_json.clone())
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                if let Some(new_ctx_json) = updated_context_json {
+                    match self.store.update_alert_suspension_state(
+                        &alert.alert_id,
+                        new_process_suspended,
+                        &new_ctx_json,
+                    ) {
+                        Ok(true) => updated_alerts += 1,
+                        Ok(false) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                alert_id = %alert.alert_id,
+                                error = %err,
+                                "failed to update alert suspension state after shutdown resume"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            total = to_resume.len(),
+            resumed,
+            gone_or_replaced,
+            failed,
+            skipped_budget,
+            updated_alerts,
+            "completed best-effort resume of unresolved suspended processes on shutdown"
+        );
+        updated_alerts > 0
     }
 }

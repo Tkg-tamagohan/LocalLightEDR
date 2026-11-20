@@ -72,14 +72,25 @@ impl DaemonEngine {
             .and_then(ProcessIdentity::from_instance_id)
             .filter(|id| id.create_time_100ns != 0);
 
-        let mut seen_children = HashSet::new();
-        let mut suspended_children = Vec::new();
-        collect_suspended_children_from_ctx(&ctx_val, identity, &mut seen_children, &mut suspended_children);
+        let mut seen_own_children = HashSet::new();
+        let mut own_suspended_children = Vec::new();
+        collect_suspended_children_from_ctx(
+            &ctx_val,
+            if alert.process_suspended {
+                identity
+            } else {
+                None
+            },
+            &mut seen_own_children,
+            &mut own_suspended_children,
+        );
+
+        let mut seen_children = seen_own_children;
+        let mut suspended_children = own_suspended_children.clone();
         if let Some(ref proc_inst_id) = alert.process_instance_id {
             if let Ok(all_alerts) = self.store.list_alerts_for_process(proc_inst_id, false, 1000) {
                 for other in all_alerts {
-                    if other.alert_id != alert_id
-                    {
+                    if other.alert_id != alert_id {
                         if let Ok(other_ctx) =
                             serde_json::from_str::<serde_json::Value>(&other.context_json)
                         {
@@ -271,35 +282,20 @@ impl DaemonEngine {
                     }
                 }
 
-                if alert.process_suspended {
-                    let resume_result = (|| -> Result<(), String> {
-                        let ident = identity.ok_or_else(|| {
-                            format!(
-                                "missing process identity to resume suspended alert {alert_id}"
-                            )
-                        })?;
-                        if !self.has_other_unresolved_suspended_alert(
-                            alert_id,
-                            alert.process_instance_id.as_deref(),
-                        )? {
-                            self.resume_process_and_children(
-                                alert_id,
-                                &ident,
-                                &suspended_children,
-                            )?;
-                        }
-                        Ok(())
-                    })();
-                    if let Err(err) = resume_result {
-                        self.rollback_allow_once_wfp(
-                            alert_id,
-                            lifted_wfp_block.take(),
-                            rebind_alert_exe.take(),
-                            Vec::new(),
-                            std::mem::take(&mut marked_once_allowed_procs),
-                        );
-                        return Err(err);
-                    }
+                if let Err(err) = self.resume_alert_targets_if_unblocked(
+                    &alert,
+                    identity,
+                    &own_suspended_children,
+                    &suspended_children,
+                ) {
+                    self.rollback_allow_once_wfp(
+                        alert_id,
+                        lifted_wfp_block.take(),
+                        rebind_alert_exe.take(),
+                        Vec::new(),
+                        std::mem::take(&mut marked_once_allowed_procs),
+                    );
+                    return Err(err);
                 }
             }
             AlertDecision::AllowPermanent {
@@ -595,53 +591,37 @@ impl DaemonEngine {
                 }
                 drop(_policy_guard);
 
-                if alert.process_suspended {
-                    let resume_result = (|| -> Result<(), String> {
-                        let ident = identity.ok_or_else(|| {
-                            format!(
-                                "missing process identity to resume suspended alert {alert_id}"
-                            )
-                        })?;
-                        if !self.has_other_unresolved_suspended_alert(
-                            alert_id,
-                            alert.process_instance_id.as_deref(),
-                        )? {
-                            self.resume_process_and_children(
-                                alert_id,
-                                &ident,
-                                &suspended_children,
-                            )?;
-                        }
-                        Ok(())
-                    })();
-                    if let Err(err) = resume_result {
+                if let Err(err) = self.resume_alert_targets_if_unblocked(
+                    &alert,
+                    identity,
+                    &own_suspended_children,
+                    &suspended_children,
+                ) {
+                    {
+                        let _policy_guard =
+                            self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        self.rollback_saved_rule(&rule.rule_id);
+                        if scope == RuleScope::NetworkAllow && self.config.outbound_firewall_enabled
                         {
-                            let _policy_guard =
-                                self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
-                            self.rollback_saved_rule(&rule.rule_id);
-                            if scope == RuleScope::NetworkAllow
-                                && self.config.outbound_firewall_enabled
-                            {
-                                // Reconcile first so any newly added PersistedPolicy/DomainPolicy
-                                // Permit is removed, then restore any promoted/removed filter state and
-                                // re-arm any Preemptive Block BEFORE rebinding `alert_id`.
-                                if let Some(rep) = applied_wfp_report.take() {
-                                    self.compensate_failed_wfp_report(&rep);
-                                } else {
-                                    let _ = self.deploy_persisted_network_rules();
-                                }
-                                self.maybe_apply_preemptive_wfp_block(&exe);
+                            // Reconcile first so any newly added PersistedPolicy/DomainPolicy
+                            // Permit is removed, then restore any promoted/removed filter state and
+                            // re-arm any Preemptive Block BEFORE rebinding `alert_id`.
+                            if let Some(rep) = applied_wfp_report.take() {
+                                self.compensate_failed_wfp_report(&rep);
+                            } else {
+                                let _ = self.deploy_persisted_network_rules();
                             }
+                            self.maybe_apply_preemptive_wfp_block(&exe);
                         }
-                        self.rollback_allow_once_wfp(
-                            alert_id,
-                            lifted_wfp_block.take(),
-                            rebind_alert_exe.take(),
-                            std::mem::take(&mut displaced_bound_alerts),
-                            Vec::new(),
-                        );
-                        return Err(err);
                     }
+                    self.rollback_allow_once_wfp(
+                        alert_id,
+                        lifted_wfp_block.take(),
+                        rebind_alert_exe.take(),
+                        std::mem::take(&mut displaced_bound_alerts),
+                        Vec::new(),
+                    );
+                    return Err(err);
                 }
             }
             AlertDecision::TerminateAndBlock { add_block_rule } => {
@@ -836,29 +816,260 @@ impl DaemonEngine {
         })
     }
 
-    fn has_other_unresolved_suspended_alert(
+    /// Inspects all other unresolved suspended alerts to collect unresolved sibling alerts still
+    /// holding `process_instance_id` suspended as a parent, along with every specific
+    /// [`ProcessIdentity`] still held suspended (as parent or in `suspended_children`) by another
+    /// unresolved alert.
+    fn other_unresolved_containment(
         &self,
         alert_id: &str,
         process_instance_id: Option<&str>,
-    ) -> Result<bool, String> {
-        let Some(proc_inst_id) = process_instance_id else {
-            return Ok(false);
-        };
+    ) -> Result<(Vec<AlertRecord>, HashSet<ProcessIdentity>), String> {
         let unresolved = self
             .store
-            .list_alerts_for_process(proc_inst_id, true, 1000)
+            .list_unresolved_suspended_alerts()
             .map_err(|err| format!("failed to query unresolved alerts: {err}"))?;
-        let exists = unresolved.into_iter().any(|other| {
-            other.alert_id != alert_id && other.process_suspended
-        });
-        if exists {
+
+        let mut parent_holding_siblings = Vec::new();
+        let mut other_held_identities = HashSet::new();
+
+        for other in unresolved {
+            if other.alert_id == alert_id {
+                continue;
+            }
+            let other_parent = other
+                .process_instance_id
+                .as_deref()
+                .and_then(ProcessIdentity::from_instance_id)
+                .filter(|id| id.create_time_100ns != 0);
+
+            let holds_target_parent = other.process_suspended
+                && matches!(
+                    (process_instance_id, other.process_instance_id.as_deref()),
+                    (Some(target_proc), Some(other_proc)) if target_proc == other_proc
+                );
+
+            if other.process_suspended {
+                if let Some(id) = other_parent {
+                    other_held_identities.insert(id);
+                }
+            }
+
+            if let Ok(other_ctx) = serde_json::from_str::<serde_json::Value>(&other.context_json) {
+                let mut other_children = Vec::new();
+                collect_suspended_children_from_ctx(
+                    &other_ctx,
+                    if other.process_suspended {
+                        other_parent
+                    } else {
+                        None
+                    },
+                    &mut other_held_identities,
+                    &mut other_children,
+                );
+            }
+
+            if holds_target_parent {
+                parent_holding_siblings.push(other);
+            }
+        }
+
+        if !parent_holding_siblings.is_empty() {
             tracing::info!(
                 alert_id = %alert_id,
-                process_instance_id = %proc_inst_id,
+                process_instance_id = process_instance_id.unwrap_or("<none>"),
+                sibling_count = parent_holding_siblings.len(),
                 "keeping process suspended because another unresolved suspended alert exists"
             );
         }
-        Ok(exists)
+
+        Ok((parent_holding_siblings, other_held_identities))
+    }
+
+    /// Transfers deferred `suspended_children` from an alert being allowed onto unresolved sibling
+    /// alert(s) that still hold the same parent suspended, so neither a subsequent shutdown
+    /// (`list_unresolved_suspended_alerts`) nor a post-partial-shutdown allow on the surviving
+    /// sibling can orphan frozen children.
+    fn transfer_deferred_suspended_children(
+        &self,
+        source_alert_id: &str,
+        parent_holding_siblings: &[AlertRecord],
+        deferred_children: &[ProcessIdentity],
+    ) -> Result<(), String> {
+        if deferred_children.is_empty() {
+            return Ok(());
+        }
+
+        let mut adopted_count = 0usize;
+        let mut last_err: Option<String> = None;
+
+        for sibling in parent_holding_siblings {
+            let mut ctx_val = match serde_json::from_str::<serde_json::Value>(&sibling.context_json)
+            {
+                Ok(val) => val,
+                Err(err) => {
+                    last_err = Some(format!(
+                        "sibling alert {} has invalid context_json: {err}",
+                        sibling.alert_id
+                    ));
+                    continue;
+                }
+            };
+            let Some(obj) = ctx_val.as_object_mut() else {
+                last_err = Some(format!(
+                    "sibling alert {} context_json is not a JSON object",
+                    sibling.alert_id
+                ));
+                continue;
+            };
+
+            let mut merged_entries: Vec<serde_json::Value> = match obj.get("suspended_children") {
+                Some(serde_json::Value::Array(arr)) => arr.clone(),
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(_) => {
+                    last_err = Some(format!(
+                        "sibling alert {} has non-array suspended_children field",
+                        sibling.alert_id
+                    ));
+                    continue;
+                }
+            };
+
+            let mut existing_ids: HashSet<ProcessIdentity> = merged_entries
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(ProcessIdentity::from_instance_id)
+                .filter(|id| id.create_time_100ns != 0)
+                .collect();
+
+            let mut changed = false;
+            for child in deferred_children {
+                if existing_ids.insert(*child) {
+                    merged_entries.push(serde_json::Value::String(child.instance_id()));
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                adopted_count += 1;
+                continue;
+            }
+
+            obj.insert(
+                "suspended_children".to_string(),
+                serde_json::Value::Array(merged_entries),
+            );
+            match self.store.update_alert_suspension_state(
+                &sibling.alert_id,
+                sibling.process_suspended,
+                &ctx_val.to_string(),
+            ) {
+                Ok(true) => {
+                    adopted_count += 1;
+                }
+                Ok(false) => {
+                    last_err = Some(format!(
+                        "sibling alert {} disappeared while transferring suspended_children",
+                        sibling.alert_id
+                    ));
+                }
+                Err(err) => {
+                    last_err = Some(format!(
+                        "failed updating sibling alert {} suspended_children: {err}",
+                        sibling.alert_id
+                    ));
+                }
+            }
+        }
+
+        if adopted_count == 0 {
+            return Err(format!(
+                "failed to preserve {} deferred suspended child(ren) from alert {source_alert_id} onto unresolved sibling alert(s): {}",
+                deferred_children.len(),
+                last_err.unwrap_or_else(|| "no eligible unresolved sibling alert".to_string())
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Resumes the parent and/or recorded `suspended_children` for `alert` on an allow decision
+    /// (`AllowOnce` / `AllowPermanent`), handling parent and child suspension states
+    /// independently so children left suspended after a partial shutdown resume are still
+    /// resumed when `alert.process_suspended` is already `false`, while preserving containment
+    /// required by any other unresolved suspended alert (including transferring deferred
+    /// `suspended_children` onto surviving parent-holding sibling alerts).
+    fn resume_alert_targets_if_unblocked(
+        &self,
+        alert: &AlertRecord,
+        identity: Option<ProcessIdentity>,
+        own_suspended_children: &[ProcessIdentity],
+        all_suspended_children: &[ProcessIdentity],
+    ) -> Result<(), String> {
+        let alert_id = &alert.alert_id;
+        let resume_parent = alert.process_suspended;
+        let children_to_check: &[ProcessIdentity] = if resume_parent {
+            all_suspended_children
+        } else {
+            own_suspended_children
+        };
+
+        if !resume_parent && children_to_check.is_empty() {
+            return Ok(());
+        }
+
+        let parent_ident = if resume_parent {
+            Some(identity.ok_or_else(|| {
+                format!("missing process identity to resume suspended alert {alert_id}")
+            })?)
+        } else {
+            None
+        };
+
+        let (parent_holding_siblings, other_held_identities) =
+            self.other_unresolved_containment(alert_id, alert.process_instance_id.as_deref())?;
+
+        if !parent_holding_siblings.is_empty() {
+            let deferred_children: Vec<ProcessIdentity> = own_suspended_children
+                .iter()
+                .copied()
+                .filter(|child| !other_held_identities.contains(child))
+                .collect();
+            self.transfer_deferred_suspended_children(
+                alert_id,
+                &parent_holding_siblings,
+                &deferred_children,
+            )?;
+            return Ok(());
+        }
+
+        if let Some(ident) = parent_ident {
+            if other_held_identities.contains(&ident) {
+                tracing::info!(
+                    alert_id = %alert_id,
+                    pid = ident.pid,
+                    create_time_100ns = ident.create_time_100ns,
+                    "keeping parent suspended because another unresolved alert still holds its identity"
+                );
+            } else {
+                self.resume_single_process(alert_id, &ident, false)?;
+            }
+        }
+
+        for child in children_to_check {
+            if other_held_identities.contains(child) {
+                tracing::info!(
+                    alert_id = %alert_id,
+                    child_pid = child.pid,
+                    child_create_time_100ns = child.create_time_100ns,
+                    "keeping suspended child frozen because another unresolved alert still holds it"
+                );
+                continue;
+            }
+            self.resume_single_process(alert_id, child, true)?;
+        }
+
+        Ok(())
     }
 
     /// Best-effort rollback of a rule stored by a failed
@@ -874,11 +1085,11 @@ impl DaemonEngine {
         }
     }
 
-    fn resume_process_and_children(
+    fn resume_single_process(
         &self,
         alert_id: &str,
         ident: &ProcessIdentity,
-        suspended_children: &[ProcessIdentity],
+        is_child: bool,
     ) -> Result<(), String> {
         if let Err(err) = self.defense.resume_process(ident) {
             if is_protected_process_refusal(&err) {
@@ -888,34 +1099,31 @@ impl DaemonEngine {
             // (exited or PID reused). A live process that failed to resume must keep
             // the alert unresolved so the operator can retry.
             if !is_process_gone_or_replaced(&err, ident.pid) {
-                return Err(format!(
-                    "resume_process failed for alert {alert_id} (PID {} still running): {err}",
-                    ident.pid
-                ));
-            }
-            tracing::warn!(
-                alert_id = %alert_id,
-                pid = ident.pid,
-                error = %err,
-                "resume_process failed for parent (process already exited or PID reused); continuing child resume and alert resolution"
-            );
-        }
-        for child in suspended_children {
-            if let Err(err) = self.defense.resume_process(child) {
-                if is_protected_process_refusal(&err) {
-                    return Err(err);
-                }
-                if !is_process_gone_or_replaced(&err, child.pid) {
-                    return Err(format!(
+                return if is_child {
+                    Err(format!(
                         "resume_process failed for suspended child PID {} of alert {alert_id}: {err}",
-                        child.pid
-                    ));
-                }
+                        ident.pid
+                    ))
+                } else {
+                    Err(format!(
+                        "resume_process failed for alert {alert_id} (PID {} still running): {err}",
+                        ident.pid
+                    ))
+                };
+            }
+            if is_child {
                 tracing::warn!(
                     alert_id = %alert_id,
-                    child_pid = child.pid,
+                    child_pid = ident.pid,
                     error = %err,
                     "resume_process failed for suspended child (already exited); continuing"
+                );
+            } else {
+                tracing::warn!(
+                    alert_id = %alert_id,
+                    pid = ident.pid,
+                    error = %err,
+                    "resume_process failed for parent (process already exited or PID reused); continuing child resume and alert resolution"
                 );
             }
         }
@@ -1078,7 +1286,7 @@ impl DaemonEngine {
     }
 }
 
-fn collect_suspended_children_from_ctx(
+pub(super) fn collect_suspended_children_from_ctx(
     ctx_val: &serde_json::Value,
     parent_identity: Option<ProcessIdentity>,
     seen: &mut HashSet<ProcessIdentity>,
@@ -1099,7 +1307,7 @@ fn collect_suspended_children_from_ctx(
     }
 }
 
-fn is_protected_process_refusal(err: &str) -> bool {
+pub(super) fn is_protected_process_refusal(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("refusing to act on") || lower.contains("never-suspend")
 }
@@ -1108,7 +1316,7 @@ fn is_protected_process_refusal(err: &str) -> bool {
 /// the snapshot positively reports the PID absent or its PID was reused (CreationTime
 /// mismatch). Live processes and unverifiable states are genuine failures the caller
 /// must surface (`BUG_0004`, `BUG_0002`).
-fn is_process_gone_or_replaced(err: &str, pid: u32) -> bool {
+pub(super) fn is_process_gone_or_replaced(err: &str, pid: u32) -> bool {
     tolerate_missing_target(err, ledr_sensor_win::defense::process_liveness(pid))
 }
 

@@ -6,14 +6,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    GetProcessId, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 
 use crate::OwnedHandle;
 use crate::path_norm::DosVolumeMap;
 
 const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
 const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023_u32 as i32;
@@ -30,6 +31,16 @@ extern "system" {
 }
 
 #[repr(C)]
+struct ProcessBasicInformation {
+    exit_status: i32,
+    peb_base_address: *mut c_void,
+    affinity_mask: usize,
+    base_priority: i32,
+    unique_process_id: usize,
+    inherited_from_unique_process_id: usize,
+}
+
+#[repr(C)]
 struct NtUnicodeString {
     length: u16,
     maximum_length: u16,
@@ -38,6 +49,7 @@ struct NtUnicodeString {
 
 /// Process attributes inspected via Win32 / `ntdll` process handle queries.
 pub(crate) struct ProcessInspectInfo {
+    pub(crate) parent_pid: Option<u32>,
     pub(crate) create_time_100ns: u64,
     pub(crate) exe_path: Option<String>,
     pub(crate) command_line: Option<String>,
@@ -78,6 +90,16 @@ pub(crate) fn inspect_process_by_pid(
     // SAFETY: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` is read-only metadata access.
     let raw_handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
     let handle = OwnedHandle::new(raw_handle)?;
+
+    // Windows `OpenProcess` -> `PsLookupProcessByProcessId` ignores the low 2 bits of `pid`
+    // (`pid & !3`), so non-multiple-of-4 PIDs such as `pid + 1..=3` silently open `pid & !3`.
+    // Reject handles whose actual kernel PID does not match the requested `pid` (also fails
+    // closed if `GetProcessId` returns `0`).
+    // SAFETY: `handle` is an open process handle with `PROCESS_QUERY_LIMITED_INFORMATION`.
+    let actual_pid = unsafe { GetProcessId(handle.as_raw()) };
+    if actual_pid != pid {
+        return None;
+    }
 
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
@@ -123,13 +145,52 @@ pub(crate) fn inspect_process_by_pid(
         None
     };
 
+    let parent_pid = query_handle_parent_pid(handle.as_raw(), pid);
     let command_line = query_handle_command_line(handle.as_raw());
 
     Some(ProcessInspectInfo {
+        parent_pid,
         create_time_100ns,
         exe_path,
         command_line,
     })
+}
+
+fn query_handle_parent_pid(
+    handle: windows::Win32::Foundation::HANDLE,
+    expected_pid: u32,
+) -> Option<u32> {
+    let mut info = ProcessBasicInformation {
+        exit_status: 0,
+        peb_base_address: std::ptr::null_mut(),
+        affinity_mask: 0,
+        base_priority: 0,
+        unique_process_id: 0,
+        inherited_from_unique_process_id: 0,
+    };
+    let mut ret_len: u32 = 0;
+
+    // SAFETY: `handle` is an open process handle with `PROCESS_QUERY_LIMITED_INFORMATION`
+    // and `info` is a writable stack-allocated `ProcessBasicInformation` buffer.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            PROCESS_BASIC_INFORMATION_CLASS,
+            (&mut info as *mut ProcessBasicInformation).cast::<c_void>(),
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut ret_len,
+        )
+    };
+    if status != 0
+        || (ret_len != 0 && (ret_len as usize) < std::mem::size_of::<ProcessBasicInformation>())
+        || info.unique_process_id != expected_pid as usize
+    {
+        return None;
+    }
+
+    u32::try_from(info.inherited_from_unique_process_id)
+        .ok()
+        .filter(|&ppid| ppid != 0 && ppid != expected_pid)
 }
 
 fn query_handle_command_line(handle: windows::Win32::Foundation::HANDLE) -> Option<String> {

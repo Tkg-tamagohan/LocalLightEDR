@@ -4,14 +4,16 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ledr_daemon::{start_ipc_server, DaemonConfig, DaemonEngine, Session0ToastLauncher};
+use ledr_daemon::{
+    start_ipc_server, DaemonConfig, DaemonEngine, OutboundEnforcementMode, Session0ToastLauncher,
+};
 use ledr_proto::{
     AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, IPC_PIPE_NAME, PROGRAM_DATA_DIR,
     SensorBackend,
 };
 use ledr_rules::{
-    compute_file_sha256_hex, discover_default_prerestricted_interpreters,
-    load_rules_and_pruner_from_dir, EarlyPruner, SigmaEngine, DEFAULT_NRD_FEED_URLS,
+    compute_file_sha256_hex, discover_default_prerestricted_interpreters, load_rules_dir,
+    LoadedRulesDir, DEFAULT_NRD_FEED_URLS,
 };
 use ledr_sensor_win::defense::{HoneypotManager, WindowsDefenseController};
 use ledr_sensor_win::etw::{
@@ -27,6 +29,9 @@ struct CliArgs {
     foreground: bool,
     dev_bypass_auth: bool,
     disable_nrd_refresh: bool,
+    disable_outbound_firewall: bool,
+    outbound_mode: OutboundEnforcementMode,
+    resume_suspended_on_shutdown: bool,
     db_path: Option<PathBuf>,
     rules_dir: Option<PathBuf>,
     nrd_cache_path: Option<PathBuf>,
@@ -44,6 +49,9 @@ impl Default for CliArgs {
             foreground: true,
             dev_bypass_auth: false,
             disable_nrd_refresh: false,
+            disable_outbound_firewall: false,
+            outbound_mode: OutboundEnforcementMode::Enforce,
+            resume_suspended_on_shutdown: false,
             db_path: None,
             rules_dir: None,
             nrd_cache_path: None,
@@ -73,6 +81,24 @@ where
             "--service-strict" => parsed.foreground = false,
             "--dev-bypass-auth" => parsed.dev_bypass_auth = true,
             "--disable-nrd-refresh" => parsed.disable_nrd_refresh = true,
+            "--disable-outbound-firewall" => parsed.disable_outbound_firewall = true,
+            "--resume-suspended-on-shutdown" => parsed.resume_suspended_on_shutdown = true,
+            "--outbound-mode" => {
+                let val = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--outbound-mode requires one of: enforce, preemptive-only, audit"
+                    )
+                })?;
+                let raw = val.to_string_lossy().trim().to_ascii_lowercase();
+                parsed.outbound_mode = match raw.as_str() {
+                    "enforce" => OutboundEnforcementMode::Enforce,
+                    "preemptive-only" => OutboundEnforcementMode::PreemptiveOnly,
+                    "audit" => OutboundEnforcementMode::Audit,
+                    other => anyhow::bail!(
+                        "invalid --outbound-mode '{other}' (expected enforce, preemptive-only, or audit)"
+                    ),
+                };
+            }
             "--nrd-feed-url" => {
                 let val = iter
                     .next()
@@ -202,11 +228,9 @@ fn open_store_with_fallback(explicit_db: Option<&Path>) -> anyhow::Result<(LedrS
     }
 }
 
-fn load_rules_or_default(
-    explicit_dir: Option<&Path>,
-) -> anyhow::Result<(SigmaEngine, EarlyPruner, Vec<ledr_proto::AllowlistRuleRecord>)> {
+fn load_rules_or_default(explicit_dir: Option<&Path>) -> anyhow::Result<LoadedRulesDir> {
     if let Some(dir) = explicit_dir {
-        let loaded = load_rules_and_pruner_from_dir(dir)?;
+        let loaded = load_rules_dir(dir)?;
         return Ok(loaded);
     }
 
@@ -216,7 +240,7 @@ fn load_rules_or_default(
     ];
     for dir in candidates {
         if dir.is_dir() {
-            match load_rules_and_pruner_from_dir(&dir) {
+            match load_rules_dir(&dir) {
                 Ok(loaded) => {
                     tracing::info!(rules_dir = %dir.display(), "loaded Sigma rules and allowlists");
                     return Ok(loaded);
@@ -229,7 +253,45 @@ fn load_rules_or_default(
     }
 
     tracing::warn!("no rules directory found; running with empty Sigma rules and default EarlyPruner");
-    Ok((SigmaEngine::default(), EarlyPruner::default(), Vec::new()))
+    Ok(LoadedRulesDir::default())
+}
+
+fn apply_startup_rules(store: &LedrStore, loaded: &LoadedRulesDir) {
+    match store.seed_default_rules_once(&loaded.default_allowlists) {
+        Ok(seeded) => {
+            if seeded > 0 {
+                tracing::info!(
+                    seeded,
+                    total = loaded.default_allowlists.len(),
+                    "seeded default allowlist rules"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed seeding default allowlist rules");
+        }
+    }
+
+    let mut upserted = 0usize;
+    for rule in &loaded.managed_rules {
+        match store.upsert_rule(rule) {
+            Ok(()) => upserted += 1,
+            Err(err) => {
+                tracing::warn!(
+                    rule_id = %rule.rule_id,
+                    error = %err,
+                    "failed applying operator-managed rule"
+                );
+            }
+        }
+    }
+    if upserted > 0 {
+        tracing::info!(
+            upserted,
+            total = loaded.managed_rules.len(),
+            "applied operator-managed policy rules"
+        );
+    }
 }
 
 fn resolve_ui_exe_path(foreground: bool) -> PathBuf {
@@ -252,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = parse_cli_args(std::env::args_os())?;
     if cli.show_help {
         println!(
-            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>]"
+            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>]"
         );
         return Ok(());
     }
@@ -270,14 +332,14 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (store, db_path) = open_store_with_fallback(cli.db_path.as_deref())?;
-    let (sigma, pruner, default_allowlists) = load_rules_or_default(cli.rules_dir.as_deref())?;
+    let loaded_rules = load_rules_or_default(cli.rules_dir.as_deref())?;
+    apply_startup_rules(&store, &loaded_rules);
+    let LoadedRulesDir {
+        sigma,
+        pruner,
+        ..
+    } = loaded_rules;
     let rule_count = sigma.rule_count();
-
-    for rule in &default_allowlists {
-        if let Err(err) = store.upsert_rule(rule) {
-            tracing::warn!(rule_id = %rule.rule_id, error = %err, "failed seeding default allowlist rule");
-        }
-    }
 
     let ui_exe = resolve_ui_exe_path(cli.foreground);
     let authorized_ui_sha256 = cli.ui_sha256.clone().or_else(|| {
@@ -305,15 +367,24 @@ async fn main() -> anyhow::Result<()> {
         cli.nrd_feed_urls.clone()
     };
 
+    let outbound_firewall_enabled = !cli.disable_outbound_firewall;
+    let resume_suspended_on_shutdown = cli.resume_suspended_on_shutdown || cli.foreground;
     let defense_controller = Arc::new(WindowsDefenseController::new());
-    if let Err(err) = defense_controller.init_wfp_session() {
-        tracing::warn!(
-            error = %err,
-            "WFP dynamic session could not be initialized (non-elevated session?); outbound WFP filtering will retry on demand"
-        );
+    if outbound_firewall_enabled && cli.outbound_mode != OutboundEnforcementMode::Audit {
+        if let Err(err) = defense_controller.init_wfp_session() {
+            tracing::warn!(
+                error = %err,
+                "WFP dynamic session could not be initialized (non-elevated session?); outbound WFP filtering will retry on demand"
+            );
+        }
     }
 
-    let preemptive_startup_executables = discover_default_prerestricted_interpreters();
+    let preemptive_startup_executables =
+        if outbound_firewall_enabled && cli.outbound_mode != OutboundEnforcementMode::Audit {
+            discover_default_prerestricted_interpreters()
+        } else {
+            Vec::new()
+        };
     let config = DaemonConfig {
         pipe_name: cli.pipe_name.clone(),
         dev_mode_bypass_ui_auth: cli.dev_bypass_auth,
@@ -322,6 +393,9 @@ async fn main() -> anyhow::Result<()> {
         authorized_ui_signer: cli.ui_signer.clone(),
         authorized_ui_root_thumbprint: cli.ui_root_thumbprint.clone(),
         authorized_bridge_sha256,
+        outbound_firewall_enabled,
+        outbound_enforcement_mode: cli.outbound_mode,
+        resume_suspended_on_shutdown,
         preemptive_startup_executables,
         nrd_refresh_enabled: !cli.disable_nrd_refresh,
         nrd_cache_path,
@@ -329,7 +403,8 @@ async fn main() -> anyhow::Result<()> {
         ..DaemonConfig::default()
     };
     let wfp_defense = Arc::clone(&defense_controller);
-    let outbound_firewall_enabled = config.outbound_firewall_enabled;
+    let attach_wfp_drop_sink =
+        config.outbound_firewall_enabled && config.outbound_enforcement_mode != OutboundEnforcementMode::Audit;
     let engine = DaemonEngine::start_with_controllers(
         store,
         sigma,
@@ -341,7 +416,7 @@ async fn main() -> anyhow::Result<()> {
             cli.foreground,
         )),
     );
-    if outbound_firewall_enabled {
+    if attach_wfp_drop_sink {
         if let Err(err) = wfp_defense.set_wfp_drop_sink(engine.wfp_drop_sink()) {
             tracing::warn!(
                 error = %err,
@@ -514,11 +589,33 @@ mod tests {
         let service_strict = parse_cli_args(["ledr-daemon", "--service-strict"]).expect("service strict");
         assert!(!service_strict.foreground);
         assert!(!service_strict.dev_bypass_auth);
+        assert_eq!(service_strict.outbound_mode, OutboundEnforcementMode::Enforce);
+        assert!(!service_strict.disable_outbound_firewall);
+        assert!(!service_strict.resume_suspended_on_shutdown);
+
+        let safe_host = parse_cli_args([
+            "ledr-daemon",
+            "--service-strict",
+            "--outbound-mode",
+            "preemptive-only",
+            "--disable-outbound-firewall",
+            "--resume-suspended-on-shutdown",
+        ])
+        .expect("safe host flags");
+        assert_eq!(safe_host.outbound_mode, OutboundEnforcementMode::PreemptiveOnly);
+        assert!(safe_host.disable_outbound_firewall);
+        assert!(safe_host.resume_suspended_on_shutdown);
+
+        let audit_mode = parse_cli_args(["ledr-daemon", "--outbound-mode", "audit"])
+            .expect("audit mode");
+        assert_eq!(audit_mode.outbound_mode, OutboundEnforcementMode::Audit);
 
         // BUG_0007: --ui-signer without --ui-root-thumbprint must be rejected at startup.
         // BUG_0004: under --dev-bypass-auth no authorization runs, so the signer/thumbprint
         // pair is not required.
         let cases: &[(&str, &[&str], bool)] = &[
+            ("--outbound-mode missing value", &["ledr-daemon", "--outbound-mode"], false),
+            ("--outbound-mode invalid value", &["ledr-daemon", "--outbound-mode", "bogus"], false),
             ("--db missing value", &["ledr-daemon", "--db"], false),
             ("--ui-sha256 missing value", &["ledr-daemon", "--ui-sha256"], false),
             ("--ui-signer missing value", &["ledr-daemon", "--ui-signer"], false),
@@ -553,5 +650,141 @@ mod tests {
         for (label, args, expect_ok) in cases {
             assert_eq!(parse_cli_args(args.iter().copied()).is_ok(), *expect_ok, "{label}");
         }
+    }
+
+    #[test]
+    fn startup_rules_seed_defaults_once_and_upsert_edited_managed_rules_across_restarts() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-main-rules-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp rules dir");
+
+        let default_path = tmp_dir.join("default_allowlist.json");
+        let ops_path = tmp_dir.join("ops_network_policy.json");
+
+        std::fs::write(
+            &default_path,
+            serde_json::json!({
+                "allowlist_rules": [
+                    {
+                        "rule_id": "DEF-ALLOW-DELETE-ME",
+                        "scope": "NetworkAllow",
+                        "exe_path_pattern": r"C:\Apps\browser.exe",
+                        "sha256": null,
+                        "signer_subject": "CN=Example",
+                        "root_thumbprint": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "allowed_target": null,
+                        "created_at_ms": 0,
+                        "created_by": "default_allowlist"
+                    },
+                    {
+                        "rule_id": "DEF-ALLOW-KEEP-EDIT",
+                        "scope": "NetworkAllow",
+                        "exe_path_pattern": r"C:\Apps\edge.exe",
+                        "sha256": null,
+                        "signer_subject": "CN=Example",
+                        "root_thumbprint": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "allowed_target": null,
+                        "created_at_ms": 0,
+                        "created_by": "default_allowlist"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write default_allowlist.json");
+
+        // Boot 1: operator sets an app-wide NetworkBlock rule via --rules.
+        std::fs::write(
+            &ops_path,
+            serde_json::json!({
+                "allowlist_rules": [
+                    {
+                        "rule_id": "OPS-NET-BLOCK-1",
+                        "scope": "NetworkBlock",
+                        "exe_path_pattern": r"C:\Apps\tool.exe",
+                        "sha256": null,
+                        "signer_subject": null,
+                        "root_thumbprint": null,
+                        "allowed_target": null,
+                        "created_at_ms": 1000,
+                        "created_by": "operator"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write initial ops_network_policy.json");
+
+        let store = LedrStore::open_in_memory().expect("in-memory store");
+        let loaded_boot1 = load_rules_or_default(Some(&tmp_dir)).expect("boot1 load rules");
+        apply_startup_rules(&store, &loaded_boot1);
+
+        assert!(store.get_rule("DEF-ALLOW-DELETE-ME").unwrap().is_some());
+        let block_boot1 = store
+            .get_rule("OPS-NET-BLOCK-1")
+            .unwrap()
+            .expect("OPS-NET-BLOCK-1 exists after boot 1");
+        assert_eq!(block_boot1.allowed_target, None);
+
+        // Between boots: operator deletes one default rule, customizes another in SQLite,
+        // and narrows OPS-NET-BLOCK-1 in the --rules file to a specific IP.
+        assert!(store.delete_rule("DEF-ALLOW-DELETE-ME").unwrap());
+        let mut edited_default = store.get_rule("DEF-ALLOW-KEEP-EDIT").unwrap().unwrap();
+        edited_default.allowed_target = Some("allowed.example.com".to_string());
+        edited_default.created_by = "user_triage".to_string();
+        store.upsert_rule(&edited_default).unwrap();
+
+        std::fs::write(
+            &ops_path,
+            serde_json::json!({
+                "allowlist_rules": [
+                    {
+                        "rule_id": "OPS-NET-BLOCK-1",
+                        "scope": "NetworkBlock",
+                        "exe_path_pattern": r"C:\Apps\tool.exe",
+                        "sha256": null,
+                        "signer_subject": null,
+                        "root_thumbprint": null,
+                        "allowed_target": "203.0.113.10",
+                        "created_at_ms": 2000,
+                        "created_by": "operator"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("update ops_network_policy.json");
+
+        // Boot 2: reload from --rules and apply startup rules.
+        let loaded_boot2 = load_rules_or_default(Some(&tmp_dir)).expect("boot2 load rules");
+        apply_startup_rules(&store, &loaded_boot2);
+
+        assert!(
+            store.get_rule("DEF-ALLOW-DELETE-ME").unwrap().is_none(),
+            "deleted shipped default rule must NOT be resurrected on restart"
+        );
+        let kept = store
+            .get_rule("DEF-ALLOW-KEEP-EDIT")
+            .unwrap()
+            .expect("DEF-ALLOW-KEEP-EDIT exists");
+        assert_eq!(
+            kept.allowed_target.as_deref(),
+            Some("allowed.example.com"),
+            "SQLite edit to shipped default rule must NOT be overwritten on restart"
+        );
+        let block_boot2 = store
+            .get_rule("OPS-NET-BLOCK-1")
+            .unwrap()
+            .expect("OPS-NET-BLOCK-1 exists after boot 2");
+        assert_eq!(
+            block_boot2.allowed_target.as_deref(),
+            Some("203.0.113.10"),
+            "edited operator-managed rule in --rules must update SQLite on restart"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

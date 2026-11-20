@@ -26,8 +26,21 @@ pub(super) struct DnsCorrelationUpdate {
 }
 
 impl DaemonEngine {
-    pub(super) fn process_event(&self, event: &SensorEvent) {
+    pub(super) fn process_seed_process_start(&self, event: &SensorEvent) -> Option<String> {
         let _ = self.process_event_with_lane(event, event.default_lane());
+        if let SensorEvent::ProcessStart { identity, .. } = event {
+            let table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = table.lookup_by_pid(identity.pid) {
+                if entry.exited_at_ms.is_none() {
+                    return Some(entry.instance_id.clone());
+                }
+            }
+            return Some(identity.instance_id());
+        }
+        None
     }
 
     pub(super) fn process_event_with_lane(
@@ -52,13 +65,16 @@ impl DaemonEngine {
         let proc_ctx = self.resolve_process_context(event, event_ts_ms);
 
         if matches!(event, SensorEvent::CanaryFileAccess { .. }) {
+            let mut proc_ctx = proc_ctx;
+            self.backfill_canary_process_context_if_missing(event, &mut proc_ctx, event_ts_ms);
             self.handle_canary_file_access(event, &proc_ctx, event_ts_ms);
             self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
+        let effective_event = proc_ctx.effective_process_start.as_ref().unwrap_or(event);
         let ctx = EventContext::with_parent(
-            event,
+            effective_event,
             proc_ctx.parent_exe_path.as_deref(),
             proc_ctx.parent_command_line.as_deref(),
         );
@@ -89,7 +105,7 @@ impl DaemonEngine {
                     }
                 }
                 let context_json = serde_json::json!({
-                    "event": event,
+                    "event": effective_event,
                     "parent_exe_path": proc_ctx.parent_exe_path,
                     "parent_command_line": proc_ctx.parent_command_line,
                     "matched_fields": m.matched_fields,
@@ -138,14 +154,18 @@ impl DaemonEngine {
             SensorEvent::ProcessStart {
                 identity, exe_path, ..
             } => {
-                if proc_ctx.exited_at_ms.is_none() {
-                    if classify_outbound_risk(exe_path) == OutboundRiskClass::ProtectedOs {
+                if proc_ctx.exited_at_ms.is_none() && !proc_ctx.skip_store_ingest {
+                    let effective_exe = proc_ctx
+                        .proc_exe_path
+                        .as_deref()
+                        .unwrap_or(exe_path.as_str());
+                    if classify_outbound_risk(effective_exe) == OutboundRiskClass::ProtectedOs {
                         self.outbound_classifier.mark_protected_os(identity.pid);
                     } else {
                         self.outbound_classifier.remove_pid(identity.pid);
                     }
                     if self.config.outbound_firewall_enabled {
-                        self.maybe_apply_preemptive_wfp_block(exe_path);
+                        self.maybe_apply_preemptive_wfp_block(effective_exe);
                     }
                 }
                 "OBSERVED"
@@ -263,17 +283,23 @@ impl DaemonEngine {
             _ => "OBSERVED",
         };
 
-        if let Err(err) = self.store.ingest_event_with_exit(
-            event,
-            proc_ctx.store_hint.as_deref(),
-            proc_ctx.exited_at_ms,
-            is_nrd,
-            action,
-        ) {
-            tracing::warn!(error = %err, "failed to ingest event into SQLite store");
-        } else if flush_now {
-            if let Err(err) = self.store.flush_batch() {
-                tracing::warn!(error = %err, "failed to flush network alert telemetry batch");
+        if !proc_ctx.skip_store_ingest {
+            if let Err(err) = self.store.ingest_event_with_lifecycle(
+                effective_event,
+                proc_ctx.store_hint.as_deref(),
+                proc_ctx.exited_at_ms,
+                proc_ctx
+                    .superseded_exit
+                    .as_ref()
+                    .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
+                is_nrd,
+                action,
+            ) {
+                tracing::warn!(error = %err, "failed to ingest event into SQLite store");
+            } else if flush_now {
+                if let Err(err) = self.store.flush_batch() {
+                    tracing::warn!(error = %err, "failed to flush network alert telemetry batch");
+                }
             }
         }
 
@@ -298,6 +324,199 @@ impl DaemonEngine {
         } else {
             self.store.record_alert(alert)
         }
+    }
+
+    /// On-demand PID lookup fallback for ETW cross-provider ordering races (`Kernel-File`
+    /// delivering a canary access milliseconds before `Kernel-Process` delivers `ProcessStart`).
+    fn backfill_canary_process_context_if_missing(
+        &self,
+        event: &SensorEvent,
+        proc_ctx: &mut ResolvedProcessContext,
+        event_ts_ms: i64,
+    ) {
+        let SensorEvent::CanaryFileAccess { pid, .. } = event else {
+            return;
+        };
+        let needs_create_time = proc_ctx
+            .proc_identity
+            .is_none_or(|id| id.create_time_100ns == 0);
+        let needs_exe_path = proc_ctx
+            .proc_exe_path
+            .as_deref()
+            .is_none_or(|p| p.trim().is_empty());
+        if !needs_create_time && !needs_exe_path {
+            return;
+        }
+
+        let Some(live) = self.live_process_inspector.inspect_live_process(*pid) else {
+            return;
+        };
+        self.apply_canary_live_process_backfill(*pid, proc_ctx, event_ts_ms, live);
+    }
+
+    fn apply_canary_live_process_backfill(
+        &self,
+        pid: u32,
+        proc_ctx: &mut ResolvedProcessContext,
+        event_ts_ms: i64,
+        live: ledr_sensor_win::etw::LiveProcessInfo,
+    ) {
+        if live.create_time_100ns == 0 {
+            return;
+        }
+        // Guard against PID reuse (`BUG_0001`): if the live OS process at `pid` was created
+        // strictly after the canary event timestamp, it cannot be the original accessor.
+        let live_created_ms = super::filetime_100ns_to_unix_ms(live.create_time_100ns, i64::MAX);
+        if live_created_ms > event_ts_ms {
+            tracing::debug!(
+                pid,
+                live_created_ms,
+                event_ts_ms,
+                "skipping canary process backfill because live process started after event timestamp (possible PID reuse)"
+            );
+            return;
+        }
+
+        // Guard against PID reuse: if we already have a non-zero creation timestamp for this
+        // process context, never overwrite it with a different live process that reused the PID.
+        if let Some(existing_id) = proc_ctx.proc_identity {
+            if existing_id.create_time_100ns != 0
+                && existing_id.create_time_100ns != live.create_time_100ns
+            {
+                return;
+            }
+        }
+
+        let existing_exe_opt = proc_ctx
+            .proc_exe_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let live_exe_opt = live
+            .exe_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        // If the table already had a non-empty exe_path (e.g., synthetic PID with zero timestamp),
+        // only backfill when the live OS process reports a matching executable path (fail closed
+        // if the live image path cannot be queried).
+        if let Some(existing_exe) = existing_exe_opt {
+            let Some(live_exe) = live_exe_opt else {
+                return;
+            };
+            if !existing_exe
+                .replace('/', "\\")
+                .eq_ignore_ascii_case(&live_exe.replace('/', "\\"))
+            {
+                return;
+            }
+        }
+
+        let existing_cmd_opt = proc_ctx
+            .proc_command_line
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let live_cmd_opt = live
+            .command_line
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let gained_create_time = proc_ctx
+            .proc_identity
+            .is_none_or(|id| id.create_time_100ns == 0);
+        let gained_exe_path = existing_exe_opt.is_none() && live_exe_opt.is_some();
+        let gained_command_line = existing_cmd_opt.is_none() && live_cmd_opt.is_some();
+        if !gained_create_time && !gained_exe_path && !gained_command_line {
+            return;
+        }
+
+        let exe_path = existing_exe_opt
+            .or(live_exe_opt)
+            .map(str::to_string)
+            .unwrap_or_default();
+        let command_line = existing_cmd_opt
+            .or(live_cmd_opt)
+            .map(str::to_string)
+            .unwrap_or_default();
+
+        // Record the live process's actual creation timestamp (`live_created_ms <= event_ts_ms`)
+        // so `ActiveProcessTable::lookup_by_pid_at` matches events and child ProcessStarts
+        // occurring between process creation and this canary event.
+        let backfilled_created_ms =
+            super::filetime_100ns_to_unix_ms(live.create_time_100ns, event_ts_ms);
+        let ident = ProcessIdentity::new(pid, live.create_time_100ns);
+        let ident_instance_id = ident.instance_id();
+        let (existing_ppid, res) = {
+            let mut table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let existing_ppid = table
+                .get_by_instance_id(&ident_instance_id)
+                .or_else(|| {
+                    proc_ctx
+                        .proc_instance_id
+                        .as_deref()
+                        .and_then(|id| table.get_by_instance_id(id))
+                })
+                .map(|entry| entry.ppid)
+                .unwrap_or(0);
+            let res = table.on_process_start(
+                ident,
+                existing_ppid,
+                exe_path.clone(),
+                command_line.clone(),
+                None,
+                backfilled_created_ms,
+            );
+            (existing_ppid, res)
+        };
+
+        let synthetic_start = SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: existing_ppid,
+            exe_path: exe_path.clone(),
+            command_line: command_line.clone(),
+            user_sid: None,
+        };
+        if let Err(err) = self.store.ingest_event_with_lifecycle(
+            &synthetic_start,
+            res.parent_instance_id.as_deref(),
+            res.exited_at_ms,
+            res.superseded_exit
+                .as_ref()
+                .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
+            false,
+            "OBSERVED",
+        ) {
+            tracing::warn!(
+                pid,
+                error = %err,
+                "failed to persist on-demand backfilled ProcessStart into SQLite store"
+            );
+        }
+
+        proc_ctx.proc_identity = Some(ident);
+        proc_ctx.proc_instance_id = Some(res.instance_id.clone());
+        proc_ctx.proc_exe_path = (!exe_path.is_empty()).then_some(exe_path.clone());
+        proc_ctx.proc_command_line = (!command_line.is_empty()).then_some(command_line);
+        proc_ctx.store_hint = Some(res.instance_id);
+        if proc_ctx.parent_exe_path.is_none() {
+            proc_ctx.parent_exe_path = res.parent_exe_path;
+        }
+        if proc_ctx.parent_command_line.is_none() {
+            proc_ctx.parent_command_line = res.parent_command_line;
+        }
+
+        tracing::debug!(
+            pid,
+            create_time_100ns = live.create_time_100ns,
+            exe_path = %exe_path,
+            "backfilled missing process context on canary file access via on-demand PID lookup"
+        );
     }
 
     fn handle_canary_file_access(
@@ -595,7 +814,7 @@ impl DaemonEngine {
         table.clear_rule_alert_emitted(instance_id, rule_id)
     }
 
-    fn resolve_process_context(
+    pub(super) fn resolve_process_context(
         &self,
         event: &SensorEvent,
         event_ts_ms: i64,
@@ -621,16 +840,37 @@ impl DaemonEngine {
                     user_sid.clone(),
                     event_ts_ms,
                 );
+                let (resolved_exe, resolved_cmd, effective_process_start) =
+                    if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
+                        let differs = entry.identity != *identity
+                            || entry.ppid != *parent_pid
+                            || entry.exe_path != *exe_path
+                            || entry.command_line != *command_line
+                            || entry.user_sid != *user_sid;
+                        let merged_ev = differs.then(|| SensorEvent::ProcessStart {
+                            identity: entry.identity,
+                            parent_pid: entry.ppid,
+                            exe_path: entry.exe_path.clone(),
+                            command_line: entry.command_line.clone(),
+                            user_sid: entry.user_sid.clone(),
+                        });
+                        (entry.exe_path.clone(), entry.command_line.clone(), merged_ev)
+                    } else {
+                        (exe_path.clone(), command_line.clone(), None)
+                    };
                 ResolvedProcessContext {
-                    proc_identity: Some(*identity),
+                    proc_identity: Some(res.resolved_identity),
                     proc_instance_id: Some(res.instance_id),
-                    proc_exe_path: Some(exe_path.clone()),
-                    proc_command_line: (!command_line.is_empty()).then(|| command_line.clone()),
+                    proc_exe_path: Some(resolved_exe),
+                    proc_command_line: (!resolved_cmd.is_empty()).then_some(resolved_cmd),
                     store_hint: res.parent_instance_id,
                     parent_exe_path: res.parent_exe_path,
                     parent_command_line: res.parent_command_line,
                     should_evaluate_sigma: res.should_evaluate_sigma,
                     exited_at_ms: res.exited_at_ms,
+                    superseded_exit: res.superseded_exit,
+                    skip_store_ingest: res.skip_store_ingest,
+                    effective_process_start,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
@@ -649,6 +889,9 @@ impl DaemonEngine {
                     parent_command_line: None,
                     should_evaluate_sigma: true,
                     exited_at_ms: None,
+                    superseded_exit: None,
+                    skip_store_ingest: false,
+                    effective_process_start: None,
                 }
             }
             SensorEvent::DnsQuery { pid, .. }
@@ -690,6 +933,9 @@ impl DaemonEngine {
                     parent_command_line: parent_cmd,
                     should_evaluate_sigma: true,
                     exited_at_ms: None,
+                    superseded_exit: None,
+                    skip_store_ingest: false,
+                    effective_process_start: None,
                 }
             }
         }
@@ -708,6 +954,17 @@ pub(super) struct ResolvedProcessContext {
     /// Inferred exit time carried from [`ProcessStartResolution`] for older snapshot
     /// incarnations so the store row does not stay "running" forever.
     pub(super) exited_at_ms: Option<i64>,
+    /// Previous `(process_instance_id, exit_ms)` superseded in memory by this `ProcessStart`
+    /// so the store closes the replaced row atomically in the same transaction.
+    pub(super) superseded_exit: Option<(String, i64)>,
+    /// `true` when an unverified `create_time_100ns == 0` snapshot was absorbed into an active
+    /// verified process without adding any new metadata and must not write a `pid:0` row.
+    pub(super) skip_store_ingest: bool,
+    /// Merged `ProcessStart` carrying the table's consolidated identity and non-clobbering
+    /// metadata whenever the normalized in-memory entry differs from the incoming `ProcessStart`
+    /// event, so `EarlyPruner`, `SigmaEngine`, alert context, and SQLite ingestion evaluate the
+    /// same launch metadata.
+    pub(super) effective_process_start: Option<SensorEvent>,
 }
 
 impl Default for ResolvedProcessContext {
@@ -722,6 +979,9 @@ impl Default for ResolvedProcessContext {
             parent_command_line: None,
             should_evaluate_sigma: true,
             exited_at_ms: None,
+            superseded_exit: None,
+            skip_store_ingest: false,
+            effective_process_start: None,
         }
     }
 }

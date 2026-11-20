@@ -573,3 +573,33 @@ fn sens_p3_08_etw_per_pid_dns_isolation_and_pid_reuse_eviction() {
         Some("blocked.example".to_string())
     );
 }
+
+#[test]
+fn sens_p3_13_inspect_live_process_rejects_low_bit_pid_aliases() {
+    let self_pid = std::process::id();
+    let self_info = inspect_live_process(self_pid)
+        .expect("inspect_live_process must resolve the current live process");
+    assert!(self_info.create_time_100ns > 0);
+    assert!(
+        self_info
+            .exe_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty()),
+        "current live process must report a non-empty exe_path"
+    );
+
+    assert!(
+        inspect_live_process(0).is_none(),
+        "PID 0 must never resolve via inspect_live_process"
+    );
+
+    // Windows OpenProcess masks off the low 2 bits (`pid & !3`), so `self_pid + 1..=3`
+    // would otherwise silently open `self_pid` and return its metadata under a forged PID.
+    for offset in 1..=3u32 {
+        let alias_pid = self_pid.saturating_add(offset);
+        assert!(
+            inspect_live_process(alias_pid).is_none(),
+            "inspect_live_process must reject low-bit PID alias {alias_pid} for live PID {self_pid}"
+        );
+    }
+}

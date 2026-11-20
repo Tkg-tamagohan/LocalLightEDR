@@ -24,6 +24,9 @@ pub struct ActiveProcessEntry {
 /// Resolution result returned when recording a new `ProcessStart` into [`ActiveProcessTable`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessStartResolution {
+    /// Effective [`ProcessIdentity`] resolved in memory (equals the already-running verified
+    /// identity when a `create_time_100ns == 0` snapshot is absorbed into it).
+    pub resolved_identity: ProcessIdentity,
     pub instance_id: String,
     pub parent_instance_id: Option<String>,
     pub parent_exe_path: Option<String>,
@@ -32,6 +35,14 @@ pub struct ProcessStartResolution {
     /// Inferred exit time set when this `ProcessStart` describes an older incarnation already
     /// superseded in memory; the engine propagates it to the store row.
     pub exited_at_ms: Option<i64>,
+    /// Previous `(process_instance_id, exit_ms)` marked exited in memory when this `ProcessStart`
+    /// supersedes an earlier active entry for the same PID (such as a `pid:0` snapshot
+    /// placeholder); the engine propagates it to the store in the same transaction.
+    pub superseded_exit: Option<(String, i64)>,
+    /// `true` when an unverified `create_time_100ns == 0` snapshot was absorbed into an already
+    /// running verified process without enriching any missing metadata, so persisting a synthetic
+    /// `pid:0` row into SQLite must be skipped.
+    pub skip_store_ingest: bool,
 }
 
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
@@ -78,45 +89,149 @@ impl ActiveProcessTable {
     ) -> ProcessStartResolution {
         let instance_id = identity.instance_id();
 
-        let (mut parent_instance_id, mut parent_exe_path, mut parent_command_line) =
-            if parent_pid != 0 && parent_pid != identity.pid {
-                let parent_opt = self
-                    .lookup_by_pid_at(parent_pid, created_at_ms)
-                    .or_else(|| {
-                        self.lookup_by_pid(parent_pid)
-                            .filter(|entry| entry.identity.create_time_100ns == 0)
-                    });
-                if let Some(parent_entry) = parent_opt {
-                    (
-                        Some(parent_entry.instance_id.clone()),
-                        Some(parent_entry.exe_path.clone()),
-                        (!parent_entry.command_line.is_empty())
-                            .then(|| parent_entry.command_line.clone()),
-                    )
-                } else {
-                    (None, None, None)
-                }
-            } else {
-                (None, None, None)
-            };
-
-        if self.entries.contains_key(&instance_id) {
-            // Before mutating `existing`, populate parent metadata from `existing.parent_instance_id`
-            // if `parent_pid` lookup returned `None`.
-            if parent_instance_id.is_none() {
-                let existing_parent_id = self
+        if identity.create_time_100ns == 0 {
+            if let Some(active_verified_id) = self
+                .pid_to_identity
+                .get(&identity.pid)
+                .copied()
+                .filter(|prev| prev.create_time_100ns != 0)
+                .map(|prev| prev.instance_id())
+            {
+                if let Some((
+                    prev_identity,
+                    prev_created_at_ms,
+                    prev_ppid,
+                    prev_parent_id,
+                    prev_sigma_evaluated,
+                )) = self
                     .entries
-                    .get(&instance_id)
-                    .and_then(|e| e.parent_instance_id.clone());
-                if let Some(ref existing_pid) = existing_parent_id {
-                    if let Some(parent_entry) = self.entries.get(existing_pid) {
-                        parent_instance_id = Some(parent_entry.instance_id.clone());
-                        parent_exe_path = Some(parent_entry.exe_path.clone());
-                        parent_command_line = (!parent_entry.command_line.is_empty())
-                            .then(|| parent_entry.command_line.clone());
+                    .get(&active_verified_id)
+                    .filter(|e| e.exited_at_ms.is_none())
+                    .map(|e| {
+                        (
+                            e.identity,
+                            e.created_at_ms,
+                            e.ppid,
+                            e.parent_instance_id.clone(),
+                            e.sigma_evaluated,
+                        )
+                    })
+                {
+                    if prev_ppid != 0 && parent_pid != 0 && prev_ppid != parent_pid {
+                        let (
+                            existing_parent_id,
+                            existing_parent_exe,
+                            existing_parent_cmd,
+                        ) = prev_parent_id
+                            .as_deref()
+                            .map_or((None, None, None), |id| self.parent_metadata_by_id(id));
+                        return ProcessStartResolution {
+                            resolved_identity: prev_identity,
+                            instance_id: prev_identity.instance_id(),
+                            parent_instance_id: existing_parent_id,
+                            parent_exe_path: existing_parent_exe,
+                            parent_command_line: existing_parent_cmd,
+                            should_evaluate_sigma: !prev_sigma_evaluated,
+                            exited_at_ms: None,
+                            superseded_exit: None,
+                            skip_store_ingest: true,
+                        };
                     }
+
+                    let (parent_instance_id, parent_exe_path, parent_command_line) =
+                        if let Some(ref existing_pid) = prev_parent_id {
+                            self.parent_metadata_by_id(existing_pid)
+                        } else {
+                            let effective_parent_pid =
+                                if prev_ppid != 0 { prev_ppid } else { parent_pid };
+                            self.lookup_parent_for(
+                                effective_parent_pid,
+                                prev_identity,
+                                prev_created_at_ms,
+                                false,
+                            )
+                        };
+
+                    let prev_entry = self
+                        .entries
+                        .get_mut(&active_verified_id)
+                        .expect("verified active entry presence verified");
+                    let upgraded_parent =
+                        prev_entry.parent_instance_id.is_none() && parent_instance_id.is_some();
+                    let upgraded_ppid = prev_entry.ppid == 0
+                        && parent_pid != 0
+                        && parent_pid != prev_entry.pid;
+                    let upgraded_exe = prev_entry.exe_path.is_empty() && !exe_path.is_empty();
+                    let upgraded_cmd =
+                        prev_entry.command_line.is_empty() && !command_line.is_empty();
+                    let upgraded_sid = prev_entry.user_sid.is_none() && user_sid.is_some();
+
+                    if upgraded_parent {
+                        prev_entry.parent_instance_id = parent_instance_id.clone();
+                    }
+                    if upgraded_ppid {
+                        prev_entry.ppid = parent_pid;
+                    }
+                    if upgraded_exe {
+                        prev_entry.exe_path = exe_path;
+                    }
+                    if upgraded_cmd {
+                        prev_entry.command_line = command_line;
+                    }
+                    if upgraded_sid {
+                        prev_entry.user_sid = user_sid;
+                    }
+
+                    let enriched = upgraded_parent
+                        || upgraded_ppid
+                        || upgraded_exe
+                        || upgraded_cmd
+                        || upgraded_sid;
+                    let should_evaluate_sigma =
+                        !prev_entry.sigma_evaluated || upgraded_parent || upgraded_cmd || upgraded_exe;
+                    prev_entry.sigma_evaluated = true;
+
+                    return ProcessStartResolution {
+                        resolved_identity: prev_entry.identity,
+                        instance_id: prev_entry.instance_id.clone(),
+                        parent_instance_id: prev_entry.parent_instance_id.clone(),
+                        parent_exe_path,
+                        parent_command_line,
+                        should_evaluate_sigma,
+                        exited_at_ms: None,
+                        superseded_exit: None,
+                        skip_store_ingest: !enriched,
+                    };
                 }
             }
+        }
+
+        if let Some((
+            existing_identity,
+            existing_created_at_ms,
+            existing_ppid,
+            existing_parent_id,
+        )) = self.entries.get(&instance_id).map(|e| {
+            (
+                e.identity,
+                e.created_at_ms,
+                e.ppid,
+                e.parent_instance_id.clone(),
+            )
+        }) {
+            let (parent_instance_id, parent_exe_path, parent_command_line) =
+                if let Some(ref existing_pid) = existing_parent_id {
+                    self.parent_metadata_by_id(existing_pid)
+                } else {
+                    let effective_parent_pid =
+                        if existing_ppid != 0 { existing_ppid } else { parent_pid };
+                    self.lookup_parent_for(
+                        effective_parent_pid,
+                        existing_identity,
+                        existing_created_at_ms,
+                        true,
+                    )
+                };
 
             let existing = self
                 .entries
@@ -133,6 +248,9 @@ impl ActiveProcessTable {
             if existing.parent_instance_id.is_none() {
                 existing.parent_instance_id = parent_instance_id.clone();
             }
+            if existing.ppid == 0 && parent_pid != 0 && parent_pid != existing.pid {
+                existing.ppid = parent_pid;
+            }
             if !exe_path.is_empty() {
                 existing.exe_path = exe_path;
             }
@@ -148,15 +266,22 @@ impl ActiveProcessTable {
                 self.pid_to_identity.insert(identity.pid, identity);
             }
             return ProcessStartResolution {
+                resolved_identity: identity,
                 instance_id,
                 parent_instance_id: resolved_parent_id,
                 parent_exe_path,
                 parent_command_line,
                 should_evaluate_sigma,
                 exited_at_ms: None,
+                superseded_exit: None,
+                skip_store_ingest: false,
             };
         }
 
+        let (parent_instance_id, parent_exe_path, parent_command_line) =
+            self.lookup_parent_for(parent_pid, identity, created_at_ms, true);
+
+        let mut superseded_exit: Option<(String, i64)> = None;
         if let Some(prev_id) = self
             .pid_to_identity
             .get(&identity.pid)
@@ -165,8 +290,9 @@ impl ActiveProcessTable {
             .map(|prev| prev.instance_id())
         {
             if let Some(prev_entry) = self.entries.get(&prev_id) {
-                if (prev_entry.created_at_ms, prev_entry.identity.create_time_100ns)
-                    > (created_at_ms, identity.create_time_100ns)
+                if prev_entry.identity.create_time_100ns != 0
+                    && (prev_entry.created_at_ms, prev_entry.identity.create_time_100ns)
+                        > (created_at_ms, identity.create_time_100ns)
                 {
                     // Arriving ProcessStart is older than the already-registered process for this PID:
                     // preserve the newer active mapping and record this older incarnation as exited.
@@ -192,25 +318,31 @@ impl ActiveProcessTable {
                     self.insertion_fifo.push_back(instance_id.clone());
                     self.evict_if_over_capacity(&instance_id);
                     return ProcessStartResolution {
+                        resolved_identity: identity,
                         instance_id,
                         parent_instance_id,
                         parent_exe_path,
                         parent_command_line,
                         should_evaluate_sigma: true,
                         exited_at_ms: Some(inferred_exit_ms),
+                        superseded_exit: None,
+                        skip_store_ingest: false,
                     };
                 }
             }
 
-            // If a previous process with the same PID is still marked active (missed stop), mark it exited.
+            // If a previous process with the same PID is still marked active (missed stop or
+            // `pid:0` snapshot placeholder), mark it exited without inverting its timestamp.
             if let Some(prev_entry) = self
                 .entries
                 .get_mut(&prev_id)
                 .filter(|entry| entry.exited_at_ms.is_none())
             {
-                prev_entry.exited_at_ms = Some(created_at_ms);
+                let exit_ms = created_at_ms.max(prev_entry.created_at_ms);
+                prev_entry.exited_at_ms = Some(exit_ms);
                 self.active_count = self.active_count.saturating_sub(1);
-                self.exited_fifo.push_back(prev_id);
+                self.exited_fifo.push_back(prev_id.clone());
+                superseded_exit = Some((prev_id, exit_ms));
             }
         }
 
@@ -238,12 +370,15 @@ impl ActiveProcessTable {
         self.evict_if_over_capacity(&instance_id);
 
         ProcessStartResolution {
+            resolved_identity: identity,
             instance_id,
             parent_instance_id,
             parent_exe_path,
             parent_command_line,
             should_evaluate_sigma: true,
             exited_at_ms: None,
+            superseded_exit,
+            skip_store_ingest: false,
         }
     }
 
@@ -447,12 +582,11 @@ impl ActiveProcessTable {
                 .filter(|e| {
                     e.exited_at_ms.is_none()
                         && e.identity.create_time_100ns != 0
+                        && e.identity.create_time_100ns >= parent.create_time_100ns
                         && !visited.contains(&e.identity)
                         && !is_never_suspend_process(&e.exe_path)
                         && (e.parent_instance_id.as_deref() == Some(parent_id.as_str())
-                            || (e.parent_instance_id.is_none()
-                                && e.ppid == parent.pid
-                                && e.identity.create_time_100ns >= parent.create_time_100ns))
+                            || (e.parent_instance_id.is_none() && e.ppid == parent.pid))
                 })
                 .collect();
             children.sort_by_key(|e| (e.identity.create_time_100ns, e.pid));
@@ -480,6 +614,75 @@ impl ActiveProcessTable {
     /// Returns the configured maximum entry capacity.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    fn parent_metadata_from_entry(
+        entry: &ActiveProcessEntry,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            Some(entry.instance_id.clone()),
+            Some(entry.exe_path.clone()),
+            (!entry.command_line.is_empty()).then(|| entry.command_line.clone()),
+        )
+    }
+
+    fn parent_metadata_by_id(
+        &self,
+        parent_id: &str,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        if let Some(parent_entry) = self.entries.get(parent_id) {
+            Self::parent_metadata_from_entry(parent_entry)
+        } else {
+            (Some(parent_id.to_string()), None, None)
+        }
+    }
+
+    fn lookup_parent_for(
+        &self,
+        parent_pid: u32,
+        child_identity: ProcessIdentity,
+        child_created_at_ms: i64,
+        allow_unverified_parent: bool,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        if parent_pid == 0 || parent_pid == child_identity.pid {
+            return (None, None, None);
+        }
+
+        let matches_verified_parent = |entry: &&ActiveProcessEntry| -> bool {
+            entry.identity.pid == parent_pid
+                && entry.identity.create_time_100ns != 0
+                && entry.created_at_ms <= child_created_at_ms
+                && entry
+                    .exited_at_ms
+                    .is_none_or(|exit_ts| child_created_at_ms <= exit_ts)
+                && (child_identity.create_time_100ns == 0
+                    || entry.identity.create_time_100ns <= child_identity.create_time_100ns)
+        };
+
+        let verified_parent = self
+            .lookup_by_pid(parent_pid)
+            .filter(matches_verified_parent)
+            .or_else(|| {
+                self.entries
+                    .values()
+                    .filter(matches_verified_parent)
+                    .max_by_key(|e| (e.created_at_ms, e.identity.create_time_100ns))
+            });
+
+        let parent_opt = verified_parent.or_else(|| {
+            allow_unverified_parent
+                .then(|| {
+                    self.lookup_by_pid(parent_pid).filter(|entry| {
+                        entry.identity.create_time_100ns == 0
+                            && entry
+                                .exited_at_ms
+                                .is_none_or(|exit_ts| child_created_at_ms <= exit_ts)
+                    })
+                })
+                .flatten()
+        });
+
+        parent_opt.map_or((None, None, None), Self::parent_metadata_from_entry)
     }
 
     fn evict_if_over_capacity(&mut self, protect_id: &str) {
@@ -854,5 +1057,169 @@ mod tests {
         table.on_process_start(early_pid, 4, exe.to_string(), String::new(), None, 5_000);
         let before_spawn = table.candidates_by_exe_key_at(exe_key, 2_000);
         assert!(!before_spawn.iter().any(|e| e.pid == 7004));
+    }
+
+    /// `PR23-R26-T1-01`: Integrating a zero-timestamp snapshot into an existing verified child
+    /// must search for its parent using the child's own creation timestamp/100ns order, reject
+    /// conflicting `parent_pid`, and `collect_unexited_descendants` must enforce creation order
+    /// even when `parent_instance_id` matches.
+    #[test]
+    fn process_table_zero_ts_snapshot_rejects_reused_parent_pid_and_conflicting_ppid() {
+        let mut table = ActiveProcessTable::new(32);
+
+        // Case 1: Child B (verified) started at ms=200 with parent_pid=800 (parent A missing),
+        // then unrelated C acquires reused PID 800 at ms=300. Zero-ts snapshot for B at ms=400
+        // must NOT link B to C.
+        let child_b = ProcessIdentity::new(900, 200_000);
+        let res_b = table.on_process_start(
+            child_b,
+            800,
+            r"C:\Tools\child_b.exe".to_string(),
+            "child_b.exe".to_string(),
+            None,
+            200,
+        );
+        assert_eq!(res_b.parent_instance_id, None);
+
+        let unrelated_c = ProcessIdentity::new(800, 300_000);
+        table.on_process_start(
+            unrelated_c,
+            4,
+            r"C:\Tools\unrelated_c.exe".to_string(),
+            "unrelated_c.exe".to_string(),
+            None,
+            300,
+        );
+
+        let snap_b = table.on_process_start(
+            ProcessIdentity::new(900, 0),
+            800,
+            r"C:\Tools\child_b.exe".to_string(),
+            "child_b.exe".to_string(),
+            None,
+            400,
+        );
+        assert_eq!(snap_b.resolved_identity, child_b);
+        assert_eq!(snap_b.parent_instance_id, None);
+        assert!(snap_b.skip_store_ingest);
+        assert_eq!(
+            table
+                .get_by_instance_id(&child_b.instance_id())
+                .and_then(|e| e.parent_instance_id.as_deref()),
+            None
+        );
+        assert!(table.collect_unexited_descendants(&unrelated_c).is_empty());
+
+        // Case 2: Same millisecond, C2 started later in 100ns ticks than B2 must also be rejected.
+        let child_b2 = ProcessIdentity::new(904, 200_005_000);
+        table.on_process_start(
+            child_b2,
+            804,
+            r"C:\Tools\child_b2.exe".to_string(),
+            "child_b2.exe".to_string(),
+            None,
+            200,
+        );
+        let unrelated_c2 = ProcessIdentity::new(804, 200_009_000);
+        table.on_process_start(
+            unrelated_c2,
+            4,
+            r"C:\Tools\unrelated_c2.exe".to_string(),
+            "unrelated_c2.exe".to_string(),
+            None,
+            200,
+        );
+        let snap_b2 = table.on_process_start(
+            ProcessIdentity::new(904, 0),
+            804,
+            r"C:\Tools\child_b2.exe".to_string(),
+            "child_b2.exe".to_string(),
+            None,
+            400,
+        );
+        assert_eq!(snap_b2.parent_instance_id, None);
+        assert!(table.collect_unexited_descendants(&unrelated_c2).is_empty());
+
+        // Case 3: Conflicting parent_pid (999 != known ppid 800) on zero-ts snapshot must be
+        // rejected completely without mutating B or linking PID 999.
+        let other_999 = ProcessIdentity::new(999, 50_000);
+        table.on_process_start(
+            other_999,
+            4,
+            r"C:\Tools\other_999.exe".to_string(),
+            "other_999.exe".to_string(),
+            None,
+            50,
+        );
+        let conflict_res = table.on_process_start(
+            ProcessIdentity::new(900, 0),
+            999,
+            r"C:\Tools\spoofed.exe".to_string(),
+            "spoofed.exe --evil".to_string(),
+            Some("S-1-5-18".to_string()),
+            450,
+        );
+        assert!(conflict_res.skip_store_ingest);
+        assert_eq!(conflict_res.parent_instance_id, None);
+        let b_after = table
+            .get_by_instance_id(&child_b.instance_id())
+            .expect("child_b remains");
+        assert_eq!(b_after.ppid, 800);
+        assert_eq!(b_after.parent_instance_id, None);
+        assert_eq!(b_after.exe_path, r"C:\Tools\child_b.exe");
+        assert_eq!(b_after.command_line, "child_b.exe");
+        assert_eq!(b_after.user_sid, None);
+
+        // Case 4: Verified parent A started BEFORE child B3 (initially ppid=0) IS legitimately
+        // linked when B3 receives a zero-ts snapshot carrying parent_pid=808.
+        let real_parent_a = ProcessIdentity::new(808, 100_000);
+        table.on_process_start(
+            real_parent_a,
+            4,
+            r"C:\Windows\System32\cmd.exe".to_string(),
+            "cmd.exe".to_string(),
+            None,
+            100,
+        );
+        let child_b3 = ProcessIdentity::new(908, 200_000);
+        let init_b3 = table.on_process_start(
+            child_b3,
+            0,
+            r"C:\Tools\child_b3.exe".to_string(),
+            "child_b3.exe".to_string(),
+            None,
+            200,
+        );
+        assert_eq!(init_b3.parent_instance_id, None);
+
+        let snap_b3 = table.on_process_start(
+            ProcessIdentity::new(908, 0),
+            808,
+            String::new(),
+            String::new(),
+            None,
+            400,
+        );
+        assert!(!snap_b3.skip_store_ingest);
+        assert_eq!(
+            snap_b3.parent_instance_id.as_deref(),
+            Some(real_parent_a.instance_id().as_str())
+        );
+        assert_eq!(
+            snap_b3.parent_exe_path.as_deref(),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(
+            table.collect_unexited_descendants(&real_parent_a),
+            vec![child_b3]
+        );
+
+        // Case 5: Defense-in-depth — even if an entry's `parent_instance_id` points to a
+        // newer process with `create_time_100ns > child.create_time_100ns`, descendant collection
+        // excludes it.
+        if let Some(entry) = table.entries.get_mut(&child_b.instance_id()) {
+            entry.parent_instance_id = Some(unrelated_c.instance_id());
+        }
+        assert!(table.collect_unexited_descendants(&unrelated_c).is_empty());
     }
 }

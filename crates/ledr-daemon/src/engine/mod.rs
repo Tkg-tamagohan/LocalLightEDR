@@ -18,8 +18,10 @@ mod wfp_drops;
 mod wfp_premat;
 
 pub use alerts::ResolvedAlertOutcome;
-pub use binary_inspector::{BinaryInspector, WindowsBinaryInspector};
-pub use config::DaemonConfig;
+pub use binary_inspector::{
+    BinaryInspector, LiveProcessInspector, WindowsBinaryInspector, WindowsLiveProcessInspector,
+};
+pub use config::{DaemonConfig, OutboundEnforcementMode};
 pub use policy::PolicyRuleError;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -68,6 +70,7 @@ pub struct DaemonEngine {
     defense: Arc<dyn ActiveDefenseController>,
     notifier: Arc<dyn NotificationDispatcher>,
     inspector: Arc<dyn BinaryInspector>,
+    live_process_inspector: Arc<dyn LiveProcessInspector>,
     process_table: Mutex<ActiveProcessTable>,
     firewall: Mutex<WfpRuleManager>,
     outbound_classifier: Arc<OutboundLaneClassifier>,

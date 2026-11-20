@@ -9,7 +9,8 @@ use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, EVENT_TRACE_LOGFILE
 use super::context::EtwCallbackContext;
 use super::registry::handle_kernel_registry;
 use super::tdh::{
-    TdhEventInfo, filetime_100ns_to_unix_ms, inspect_process_by_pid, parse_dns_query_results,
+    ProcessInspectInfo, TdhEventInfo, filetime_100ns_to_unix_ms, inspect_process_by_pid,
+    parse_dns_query_results,
 };
 
 static KERNEL_PROCESS_RECEIVED: AtomicU64 = AtomicU64::new(0);
@@ -131,9 +132,52 @@ pub(super) unsafe extern "system" fn event_record_callback(event_record: *mut EV
     let _ = ctx.dispatch_event(event);
 }
 
+trait ProcessStartPropertySource {
+    fn get_u32(&self, name: &str) -> Option<u32>;
+    fn get_u64(&self, name: &str) -> Option<u64>;
+    fn get_string(&self, name: &str) -> Option<String>;
+    fn get_sid_string(&self, name: &str) -> Option<String>;
+}
+
+impl ProcessStartPropertySource for TdhEventInfo<'_> {
+    fn get_u32(&self, name: &str) -> Option<u32> {
+        TdhEventInfo::get_u32(self, name)
+    }
+
+    fn get_u64(&self, name: &str) -> Option<u64> {
+        TdhEventInfo::get_u64(self, name)
+    }
+
+    fn get_string(&self, name: &str) -> Option<String> {
+        TdhEventInfo::get_string(self, name)
+    }
+
+    fn get_sid_string(&self, name: &str) -> Option<String> {
+        TdhEventInfo::get_sid_string(self, name)
+    }
+}
+
 fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Option<SensorEvent> {
-    let (pid, parent_pid, mut create_time_100ns, mut exe_path, mut command_line, user_sid) =
-        match TdhEventInfo::from_record_with_status(record) {
+    build_process_start_event(
+        record,
+        ctx,
+        TdhEventInfo::from_record_with_status(record),
+        |pid| inspect_process_by_pid(pid, Some(&ctx.volume_map)),
+    )
+}
+
+fn build_process_start_event<S, F>(
+    record: &EVENT_RECORD,
+    ctx: &EtwCallbackContext,
+    tdh_result: Result<S, u32>,
+    inspect_fn: F,
+) -> Option<SensorEvent>
+where
+    S: ProcessStartPropertySource,
+    F: FnOnce(u32) -> Option<ProcessInspectInfo>,
+{
+    let (pid, mut parent_pid, mut create_time_100ns, mut exe_path, mut command_line, user_sid) =
+        match tdh_result {
             Ok(info) => {
                 let Some(pid) = info
                     .get_u32("ProcessID")
@@ -147,9 +191,9 @@ fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Opti
                     );
                     return None;
                 };
-                // Never substitute `EventHeader.ProcessId` when ETW omits the parent PID: the header
-                // records the event issuer thread's PID, not necessarily the true parent, and a
-                // non-zero placeholder would block later same-instance snapshot enrichment.
+                // Never substitute `EventHeader.ProcessId` when ETW omits the parent PID:
+                // backfill via `inspect_process_by_pid` (`InheritedFromUniqueProcessId`) or leave
+                // as `0` so same-instance snapshot enrichment remains unblocked.
                 let parent_pid = info
                     .get_u32("ParentProcessID")
                     .or_else(|| info.get_u32("ParentProcessId"))
@@ -186,7 +230,7 @@ fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Opti
                 let pid = read_raw_userdata_u32_at_0(record).filter(|&p| p != 0)?;
                 (
                     pid,
-                    // Leave parent_pid as 0 (unknown) so Toolhelp32 snapshot can backfill it.
+                    // Leave parent_pid as 0 so live process inspection / snapshot can supply it.
                     0,
                     0,
                     String::new(),
@@ -198,21 +242,34 @@ fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Opti
 
     ctx.evict_dns_pid(pid);
 
-    let needs_inspect = create_time_100ns == 0 || exe_path.is_empty() || command_line.is_empty();
+    let needs_inspect = parent_pid == 0
+        || create_time_100ns == 0
+        || exe_path.is_empty()
+        || command_line.is_empty();
     let inspected = if needs_inspect {
-        inspect_process_by_pid(pid, Some(&ctx.volume_map))
+        inspect_fn(pid)
     } else {
         None
     };
     if let Some(inspected) = inspected {
-        if create_time_100ns == 0 && inspected.create_time_100ns > 0 {
-            create_time_100ns = inspected.create_time_100ns;
-        }
-        if exe_path.is_empty() {
-            exe_path = inspected.exe_path.unwrap_or_default();
-        }
-        if command_line.is_empty() {
-            command_line = inspected.command_line.unwrap_or_default();
+        // Verify process generation before merging live attributes when ETW provided a creation time.
+        let same_incarnation =
+            create_time_100ns == 0 || inspected.create_time_100ns == create_time_100ns;
+        if same_incarnation {
+            if parent_pid == 0 {
+                if let Some(inspected_ppid) = inspected.parent_pid {
+                    parent_pid = inspected_ppid;
+                }
+            }
+            if create_time_100ns == 0 && inspected.create_time_100ns > 0 {
+                create_time_100ns = inspected.create_time_100ns;
+            }
+            if exe_path.is_empty() {
+                exe_path = inspected.exe_path.unwrap_or_default();
+            }
+            if command_line.is_empty() {
+                command_line = inspected.command_line.unwrap_or_default();
+            }
         }
     }
 
@@ -508,14 +565,11 @@ mod tests {
     use super::super::context::HoneypotHandleTracker;
     use super::super::file_canary::CanaryMatcher;
     use super::super::session::EventSinkFn;
+    use super::super::snapshot::try_capture_running_processes;
 
-    /// `PR23-R30-T1-01`: When ETW omits or fails to decode `ParentProcessID` in `ProcessStart`,
-    /// `handle_process_start` must emit `parent_pid = 0` rather than substituting
-    /// `record.EventHeader.ProcessId`.
-    #[test]
-    fn sens_p3_15_pr23_r30_t1_process_start_missing_parent_pid_does_not_substitute_header_pid() {
+    fn dummy_etw_ctx() -> EtwCallbackContext {
         let sink: EventSinkFn = Arc::new(|_| true);
-        let ctx = EtwCallbackContext {
+        EtwCallbackContext {
             sink,
             dns_cache: Mutex::new(DnsResolutionCache::default()),
             volume_map: DosVolumeMap::with_mappings(Vec::new()),
@@ -525,7 +579,52 @@ mod tests {
             registry_kcb_names: Mutex::new(HashMap::new()),
             stop_requested: Arc::new(AtomicBool::new(false)),
             session_name_nul: vec![0],
-        };
+        }
+    }
+
+    struct StubPropertySource {
+        pid: Option<u32>,
+        parent_pid: Option<u32>,
+        create_time_100ns: Option<u64>,
+        image_name: Option<String>,
+        command_line: Option<String>,
+    }
+
+    impl ProcessStartPropertySource for StubPropertySource {
+        fn get_u32(&self, name: &str) -> Option<u32> {
+            match name {
+                "ProcessID" | "ProcessId" => self.pid,
+                "ParentProcessID" | "ParentProcessId" => self.parent_pid,
+                _ => None,
+            }
+        }
+
+        fn get_u64(&self, name: &str) -> Option<u64> {
+            match name {
+                "CreateTime" => self.create_time_100ns,
+                _ => None,
+            }
+        }
+
+        fn get_string(&self, name: &str) -> Option<String> {
+            match name {
+                "ImageName" | "ImageFileName" => self.image_name.clone(),
+                "CommandLine" => self.command_line.clone(),
+                _ => None,
+            }
+        }
+
+        fn get_sid_string(&self, _name: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// `PR23-R30-T1-01`: When ETW fails and live inspection cannot resolve the process,
+    /// `handle_process_start` must emit `parent_pid = 0` rather than substituting
+    /// `record.EventHeader.ProcessId`.
+    #[test]
+    fn sens_p3_15_pr23_r30_t1_process_start_missing_parent_pid_does_not_substitute_header_pid() {
+        let ctx = dummy_etw_ctx();
 
         // 4-byte aligned non-existent dummy PID so `inspect_process_by_pid` returns `None`.
         let child_pid: u32 = 0xFFFF_FFFC;
@@ -550,6 +649,136 @@ mod tests {
                     "missing ETW parent PID must remain 0 instead of using EventHeader.ProcessId"
                 );
             }
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
+    }
+
+    /// `PR23-R33-T1-01`: `inspect_process_by_pid` must query `InheritedFromUniqueProcessId`
+    /// via `NtQueryInformationProcess(ProcessBasicInformation)` and agree with Toolhelp32 snapshot.
+    #[test]
+    fn sens_p3_16_pr23_r33_t1_inspect_process_parent_pid_matches_toolhelp_snapshot() {
+        let self_pid = std::process::id();
+        let inspected = inspect_process_by_pid(self_pid, None)
+            .expect("inspect_process_by_pid must resolve current process");
+        let ppid = inspected
+            .parent_pid
+            .expect("current process must resolve non-zero InheritedFromUniqueProcessId");
+        assert_ne!(ppid, 0);
+        assert_ne!(ppid, self_pid);
+
+        let snap = try_capture_running_processes().expect("Toolhelp32 snapshot succeeds");
+        let snap_ppid = snap
+            .into_iter()
+            .find_map(|ev| match ev {
+                SensorEvent::ProcessStart {
+                    identity,
+                    parent_pid,
+                    ..
+                } if identity.pid == self_pid => Some(parent_pid),
+                _ => None,
+            })
+            .expect("current process must appear in Toolhelp32 snapshot");
+        assert_eq!(ppid, snap_ppid);
+    }
+
+    /// `PR23-R33-T1-02`: On TDH metadata failure (`Err`) for a live process,
+    /// `handle_process_start` must backfill the OS parent PID via `inspect_process_by_pid`
+    /// instead of using `EventHeader.ProcessId` or leaving `parent_pid = 0`.
+    #[test]
+    fn sens_p3_17_pr23_r33_t1_tdh_failure_backfills_parent_pid_from_live_process() {
+        let ctx = dummy_etw_ctx();
+        let self_pid = std::process::id();
+        let expected_info = inspect_process_by_pid(self_pid, None)
+            .expect("inspect_process_by_pid resolves current process");
+        let expected_ppid = expected_info
+            .parent_pid
+            .expect("current process has non-zero OS parent PID");
+
+        let dummy_header_pid: u32 = 0xFFFF_FFF8;
+        assert_ne!(expected_ppid, dummy_header_pid);
+
+        let mut user_data = self_pid.to_le_bytes();
+        let mut record = EVENT_RECORD::default();
+        record.EventHeader.ProcessId = dummy_header_pid;
+        record.EventHeader.EventDescriptor.Id = 1;
+        record.UserData = user_data.as_mut_ptr().cast();
+        record.UserDataLength = user_data.len() as u16;
+
+        let event = handle_process_start(&record, &ctx)
+            .expect("handle_process_start must emit event for live self PID");
+        match event {
+            SensorEvent::ProcessStart {
+                identity,
+                parent_pid,
+                ..
+            } => {
+                assert_eq!(identity.pid, self_pid);
+                assert!(identity.create_time_100ns > 0);
+                assert_eq!(
+                    parent_pid, expected_ppid,
+                    "TDH failure fallback must use OS InheritedFromUniqueProcessId, not EventHeader.ProcessId"
+                );
+            }
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
+    }
+
+    /// `PR23-R33-T2-01`: When TDH succeeds (`Ok`) and provides `ProcessID`/`CreateTime`/paths
+    /// but omits `ParentProcessID`/`ParentProcessId`, `build_process_start_event` must:
+    /// (a) backfill `parent_pid` when live inspection confirms the same `create_time_100ns`,
+    /// (b) leave `parent_pid = 0` when live inspection returns `None` (never using header PID),
+    /// (c) reject live inspection with a mismatched `create_time_100ns` (PID reuse).
+    #[test]
+    fn sens_p3_18_pr23_r33_t2_tdh_ok_missing_parent_pid_uses_verified_live_inspect_not_header_pid()
+    {
+        let ctx = dummy_etw_ctx();
+        let mut record = EVENT_RECORD::default();
+        record.EventHeader.ProcessId = 800;
+        record.EventHeader.EventDescriptor.Id = 1;
+
+        let make_props = || StubPropertySource {
+            pid: Some(4242),
+            parent_pid: None,
+            create_time_100ns: Some(133_800_000_000_000_000),
+            image_name: Some(r"\Device\HarddiskVolume1\Tools\app.exe".to_string()),
+            command_line: Some("app.exe --run".to_string()),
+        };
+
+        // (a) Same creation time: live inspection supplies the OS parent PID (1200).
+        let ev_same = build_process_start_event(&record, &ctx, Ok(make_props()), |_| {
+            Some(ProcessInspectInfo {
+                parent_pid: Some(1200),
+                create_time_100ns: 133_800_000_000_000_000,
+                exe_path: Some(r"C:\Tools\app.exe".to_string()),
+                command_line: Some("app.exe --run".to_string()),
+            })
+        })
+        .expect("event emitted on same incarnation");
+        match ev_same {
+            SensorEvent::ProcessStart { parent_pid, .. } => assert_eq!(parent_pid, 1200),
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
+
+        // (b) Live inspection returns None: parent_pid stays 0, never EventHeader.ProcessId (800).
+        let ev_none = build_process_start_event(&record, &ctx, Ok(make_props()), |_| None)
+            .expect("event emitted when inspect returns None");
+        match ev_none {
+            SensorEvent::ProcessStart { parent_pid, .. } => assert_eq!(parent_pid, 0),
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
+
+        // (c) Mismatched creation time (PID reused by a newer process): reject live inspection.
+        let ev_reused = build_process_start_event(&record, &ctx, Ok(make_props()), |_| {
+            Some(ProcessInspectInfo {
+                parent_pid: Some(7777),
+                create_time_100ns: 133_800_000_999_000_000,
+                exe_path: Some(r"C:\Tools\other.exe".to_string()),
+                command_line: Some("other.exe".to_string()),
+            })
+        })
+        .expect("event emitted when inspect sees reused PID");
+        match ev_reused {
+            SensorEvent::ProcessStart { parent_pid, .. } => assert_eq!(parent_pid, 0),
             other => panic!("expected ProcessStart, got {other:?}"),
         }
     }

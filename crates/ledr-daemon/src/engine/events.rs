@@ -72,8 +72,9 @@ impl DaemonEngine {
             return None;
         }
 
+        let effective_event = proc_ctx.effective_process_start.as_ref().unwrap_or(event);
         let ctx = EventContext::with_parent(
-            event,
+            effective_event,
             proc_ctx.parent_exe_path.as_deref(),
             proc_ctx.parent_command_line.as_deref(),
         );
@@ -104,7 +105,7 @@ impl DaemonEngine {
                     }
                 }
                 let context_json = serde_json::json!({
-                    "event": event,
+                    "event": effective_event,
                     "parent_exe_path": proc_ctx.parent_exe_path,
                     "parent_command_line": proc_ctx.parent_command_line,
                     "matched_fields": m.matched_fields,
@@ -283,9 +284,8 @@ impl DaemonEngine {
         };
 
         if !proc_ctx.skip_store_ingest {
-            let store_event = proc_ctx.store_process_start_override.as_ref().unwrap_or(event);
             if let Err(err) = self.store.ingest_event_with_lifecycle(
-                store_event,
+                effective_event,
                 proc_ctx.store_hint.as_deref(),
                 proc_ctx.exited_at_ms,
                 proc_ctx
@@ -840,18 +840,21 @@ impl DaemonEngine {
                     user_sid.clone(),
                     event_ts_ms,
                 );
-                let (resolved_exe, resolved_cmd, store_process_start_override) =
+                let (resolved_exe, resolved_cmd, effective_process_start) =
                     if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
-                        let override_ev = (!res.skip_store_ingest
-                            && res.resolved_identity != *identity)
-                            .then(|| SensorEvent::ProcessStart {
-                                identity: entry.identity,
-                                parent_pid: entry.ppid,
-                                exe_path: entry.exe_path.clone(),
-                                command_line: entry.command_line.clone(),
-                                user_sid: entry.user_sid.clone(),
-                            });
-                        (entry.exe_path.clone(), entry.command_line.clone(), override_ev)
+                        let differs = entry.identity != *identity
+                            || entry.ppid != *parent_pid
+                            || entry.exe_path != *exe_path
+                            || entry.command_line != *command_line
+                            || entry.user_sid != *user_sid;
+                        let merged_ev = differs.then(|| SensorEvent::ProcessStart {
+                            identity: entry.identity,
+                            parent_pid: entry.ppid,
+                            exe_path: entry.exe_path.clone(),
+                            command_line: entry.command_line.clone(),
+                            user_sid: entry.user_sid.clone(),
+                        });
+                        (entry.exe_path.clone(), entry.command_line.clone(), merged_ev)
                     } else {
                         (exe_path.clone(), command_line.clone(), None)
                     };
@@ -867,7 +870,7 @@ impl DaemonEngine {
                     exited_at_ms: res.exited_at_ms,
                     superseded_exit: res.superseded_exit,
                     skip_store_ingest: res.skip_store_ingest,
-                    store_process_start_override,
+                    effective_process_start,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
@@ -888,7 +891,7 @@ impl DaemonEngine {
                     exited_at_ms: None,
                     superseded_exit: None,
                     skip_store_ingest: false,
-                    store_process_start_override: None,
+                    effective_process_start: None,
                 }
             }
             SensorEvent::DnsQuery { pid, .. }
@@ -932,7 +935,7 @@ impl DaemonEngine {
                     exited_at_ms: None,
                     superseded_exit: None,
                     skip_store_ingest: false,
-                    store_process_start_override: None,
+                    effective_process_start: None,
                 }
             }
         }
@@ -957,9 +960,11 @@ pub(super) struct ResolvedProcessContext {
     /// `true` when an unverified `create_time_100ns == 0` snapshot was absorbed into an active
     /// verified process without adding any new metadata and must not write a `pid:0` row.
     pub(super) skip_store_ingest: bool,
-    /// Merged `ProcessStart` carrying the already-verified identity and non-clobbering metadata
-    /// when a `create_time_100ns == 0` snapshot enriched missing fields on an active verified row.
-    pub(super) store_process_start_override: Option<SensorEvent>,
+    /// Merged `ProcessStart` carrying the table's consolidated identity and non-clobbering
+    /// metadata whenever the normalized in-memory entry differs from the incoming `ProcessStart`
+    /// event, so `EarlyPruner`, `SigmaEngine`, alert context, and SQLite ingestion evaluate the
+    /// same launch metadata.
+    pub(super) effective_process_start: Option<SensorEvent>,
 }
 
 impl Default for ResolvedProcessContext {
@@ -976,7 +981,7 @@ impl Default for ResolvedProcessContext {
             exited_at_ms: None,
             superseded_exit: None,
             skip_store_ingest: false,
-            store_process_start_override: None,
+            effective_process_start: None,
         }
     }
 }

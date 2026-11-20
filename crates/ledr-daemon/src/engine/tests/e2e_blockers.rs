@@ -2815,3 +2815,259 @@ async fn pr23_u3_shutdown_clear_distinguishes_resumed_vs_gone_in_audit_context()
     assert!(ctx_c.get("shutdown_cleared_at_ms").is_none());
     assert!(ctx_c.get("shutdown_gone_identities").is_none());
 }
+
+/// `PR23-R26-T1-02`: Integration verification that a zero-timestamp snapshot for an existing
+/// verified child cannot attach the child to a newer unrelated process that reused its parent
+/// PID in SQLite or cause canary descendant suspension to freeze the unrelated child.
+#[tokio::test]
+async fn pr23_r26_t1_reused_parent_pid_not_linked_or_frozen_on_canary() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let engine = start_stopped_engine(
+        store.clone(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("7".repeat(64))),
+    )
+    .await;
+
+    let now_ms = current_unix_ms();
+    let child_b_ms = now_ms - 5_000;
+    let proc_c_ms = now_ms - 1_000;
+    let child_b_100ns = 116_444_736_000_000_000u64 + (child_b_ms as u64) * 10_000;
+    let proc_c_100ns = 116_444_736_000_000_000u64 + (proc_c_ms as u64) * 10_000;
+
+    let child_b = ProcessIdentity::new(4804, child_b_100ns);
+    let proc_c = ProcessIdentity::new(4800, proc_c_100ns);
+
+    // Child B starts earlier with parent PID 4800 (original parent A is absent from table).
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: child_b,
+            parent_pid: 4800,
+            exe_path: r"C:\Tools\child_b.exe".to_string(),
+            command_line: "child_b.exe --worker".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Later, unrelated process C reuses PID 4800.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: proc_c,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\unrelated_c.exe".to_string(),
+            command_line: "unrelated_c.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Zero-timestamp snapshot for child B arrives after C took PID 4800.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(4804, 0),
+            parent_pid: 4800,
+            exe_path: r"C:\Tools\child_b.exe".to_string(),
+            command_line: "child_b.exe --worker".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Unrelated C writes to a Honeypot decoy: only C may be suspended, never B.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::CanaryFileAccess {
+            pid: 4800,
+            target_path: r"C:\Users\alice\Documents\.ledr-canary-test.txt".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x0012_0089,
+            is_write_or_delete: true,
+            timestamp_ms: now_ms,
+        },
+        EventLane::HighPriority,
+    );
+
+    let snap = store
+        .query_flight_recorder(50, None)
+        .expect("query flight recorder");
+    let b_row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == child_b.instance_id())
+        .expect("child B row exists in SQLite");
+    assert_eq!(
+        b_row.parent_instance_id, None,
+        "child B must not be linked to newer unrelated C in SQLite"
+    );
+
+    let suspended = defense.suspended();
+    assert_eq!(
+        suspended,
+        vec![proc_c],
+        "only C may be suspended; child B must not be frozen"
+    );
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    let honeypot_alert = alerts
+        .iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(proc_c.instance_id().as_str()))
+        .expect("honeypot alert for C exists");
+    let ctx: serde_json::Value =
+        serde_json::from_str(&honeypot_alert.context_json).expect("valid alert context");
+    let suspended_children = ctx["suspended_children"]
+        .as_array()
+        .expect("suspended_children array");
+    assert!(
+        !suspended_children
+            .iter()
+            .any(|v| v.as_str() == Some(child_b.instance_id().as_str())),
+        "unrelated child B must not be recorded in suspended_children: {ctx}"
+    );
+}
+
+/// `PR23-R26-T2-01`: Parent-only enrichment (`create_time_100ns == 0` snapshot or same
+/// `instance_id` re-observation with empty `exe_path`/`command_line`) must re-evaluate Sigma
+/// using the consolidated launch metadata (`LEDR-LOTL-001`) and persist the merged event in alert
+/// context.
+#[tokio::test]
+async fn pr23_r26_t2_parent_only_enrichment_reevaluates_sigma_with_merged_launch_info() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let rules_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/lotl_core.json");
+    let sigma = SigmaEngine::from_json_file(&rules_path).expect("load lotl_core.json");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        sigma,
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("6".repeat(64))),
+    );
+    if let Some(h) = engine.worker_handle.lock().await.take() {
+        h.abort();
+        let _ = h.await;
+    }
+
+    let now_ms = current_unix_ms();
+    let parent_ms = now_ms - 10_000;
+    let child_a_ms = now_ms - 5_000;
+    let child_b_ms = now_ms - 4_000;
+    let parent_100ns = 116_444_736_000_000_000u64 + (parent_ms as u64) * 10_000;
+    let child_a_100ns = 116_444_736_000_000_000u64 + (child_a_ms as u64) * 10_000;
+    let child_b_100ns = 116_444_736_000_000_000u64 + (child_b_ms as u64) * 10_000;
+
+    let cmd_parent = ProcessIdentity::new(4900, parent_100ns);
+    let ps_a = ProcessIdentity::new(4904, child_a_100ns);
+    let ps_b = ProcessIdentity::new(4908, child_b_100ns);
+    let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let ps_cmd = "powershell.exe -enc SQBFAFgA";
+
+    // Subcase (a): Verified PowerShell arrives without parent_pid -> LEDR-LOTL-001 cannot match yet.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_a,
+            parent_pid: 0,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_cmd.to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert!(
+        store.list_alerts(None, 20).expect("list alerts").is_empty(),
+        "LEDR-LOTL-001 must not fire before cmd.exe parent is known"
+    );
+
+    // Subcase (b) initial event: second PowerShell arrives before parent cmd.exe as well.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_b,
+            parent_pid: 0,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_cmd.to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert!(
+        store.list_alerts(None, 20).expect("list alerts").is_empty(),
+        "LEDR-LOTL-001 must not fire for ps_b before parent is known"
+    );
+
+    // Parent cmd.exe arrives.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: cmd_parent,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\cmd.exe".to_string(),
+            command_line: "cmd.exe /c powershell.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Subcase (a) enrichment: zero-timestamp snapshot supplies ONLY parent_pid (empty exe/cmd).
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(4904, 0),
+            parent_pid: 4900,
+            exe_path: String::new(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Subcase (b) enrichment: same instance_id supplies ONLY parent_pid (empty exe/cmd).
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_b,
+            parent_pid: 4900,
+            exe_path: String::new(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    for (label, ident) in [("zero-ts snapshot", ps_a), ("same instance_id", ps_b)] {
+        let alert = alerts
+            .iter()
+            .find(|a| {
+                a.rule_id == "LEDR-LOTL-001"
+                    && a.process_instance_id.as_deref() == Some(ident.instance_id().as_str())
+            })
+            .unwrap_or_else(|| panic!("expected LEDR-LOTL-001 alert for {label} ({ident:?}); got {alerts:?}"));
+        let ctx: serde_json::Value =
+            serde_json::from_str(&alert.context_json).expect("valid alert context");
+        assert_eq!(
+            ctx["parent_exe_path"].as_str(),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(
+            ctx["event"]["ProcessStart"]["exe_path"].as_str(),
+            Some(ps_exe),
+            "alert context event must carry merged verified exe_path for {label}"
+        );
+        assert_eq!(
+            ctx["event"]["ProcessStart"]["command_line"].as_str(),
+            Some(ps_cmd),
+            "alert context event must carry merged verified command_line for {label}"
+        );
+        assert_eq!(
+            ctx["event"]["ProcessStart"]["parent_pid"].as_u64(),
+            Some(4900)
+        );
+    }
+}

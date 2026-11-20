@@ -7,8 +7,9 @@ use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
 
 use super::guard::validate_open_handle;
 use super::process_probe::{
-    SnapshotEntry, find_process_exe_toolhelp32, open_process_checked, query_full_image_name,
-    query_process_creation_time, snapshot_process_entries,
+    OpenProcessError, SnapshotEntry, find_process_exe_toolhelp32, open_process_checked,
+    open_process_checked_detailed, query_full_image_name, query_process_creation_time,
+    snapshot_process_entries,
 };
 
 /// Collects all currently live, validated descendant identities of `target`.
@@ -23,33 +24,48 @@ pub fn collect_live_descendants(target: &ProcessIdentity) -> Vec<ProcessIdentity
 }
 
 pub(super) fn collect_validated_descendants(root: &ProcessIdentity) -> Vec<ProcessIdentity> {
+    let self_pid = std::process::id();
+    let canonical_root = root.pid & !3;
     if root.create_time_100ns == 0
-        || root.pid == 0
-        || root.pid == 4
-        || root.pid == std::process::id()
+        || canonical_root == 0
+        || canonical_root == 4
+        || canonical_root == (self_pid & !3)
     {
         return Vec::new();
     }
 
     let mut recycled_cutoff_100ns = None;
-    if let Ok(root_handle) = open_process_checked(root.pid, PROCESS_QUERY_LIMITED_INFORMATION) {
-        let actual_ct = query_process_creation_time(root_handle.as_raw());
-        if actual_ct == Some(root.create_time_100ns) {
-            if let Some(exe) = query_full_image_name(root_handle.as_raw())
-                .or_else(|| find_process_exe_toolhelp32(root.pid))
-            {
+    match open_process_checked_detailed(root.pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(root_handle) => {
+            let actual_ct = query_process_creation_time(root_handle.as_raw());
+            if actual_ct == Some(root.create_time_100ns) {
+                if let Some(exe) = query_full_image_name(root_handle.as_raw())
+                    .or_else(|| find_process_exe_toolhelp32(root.pid))
+                {
+                    if is_never_suspend_process(&exe) {
+                        return Vec::new();
+                    }
+                }
+            } else if let Some(ct) = actual_ct {
+                // `root.pid` currently belongs to a different process instance; skip any child created
+                // at or after its creation timestamp.
+                recycled_cutoff_100ns = Some(ct);
+            }
+        }
+        Err(OpenProcessError::PidZero | OpenProcessError::PidMismatch { .. }) => {
+            return Vec::new();
+        }
+        Err(OpenProcessError::Failed(_)) => {
+            let fallback_exe = find_process_exe_toolhelp32(root.pid).or_else(|| {
+                (root.pid & 3 != 0)
+                    .then(|| find_process_exe_toolhelp32(canonical_root))
+                    .flatten()
+            });
+            if let Some(exe) = fallback_exe {
                 if is_never_suspend_process(&exe) {
                     return Vec::new();
                 }
             }
-        } else if let Some(ct) = actual_ct {
-            // `root.pid` currently belongs to a different process instance; skip any child created
-            // at or after its creation timestamp.
-            recycled_cutoff_100ns = Some(ct);
-        }
-    } else if let Some(exe) = find_process_exe_toolhelp32(root.pid) {
-        if is_never_suspend_process(&exe) {
-            return Vec::new();
         }
     }
 

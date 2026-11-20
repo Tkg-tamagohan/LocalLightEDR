@@ -5,8 +5,8 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
 
 use super::process_probe::{
-    find_process_exe_toolhelp32, open_process_checked, query_full_image_name,
-    query_process_creation_time,
+    OpenProcessError, find_process_exe_toolhelp32, open_process_checked_detailed,
+    query_full_image_name, query_process_creation_time,
 };
 
 #[derive(Debug, Clone)]
@@ -53,13 +53,31 @@ pub(super) fn validate_and_inspect_target(target: &ProcessIdentity) -> Result<Va
 pub(super) fn validate_and_inspect_target_detailed(
     target: &ProcessIdentity,
 ) -> Result<ValidatedTarget, TargetValidationError> {
-    validate_pid_basics(target.pid, std::process::id())
+    let self_pid = std::process::id();
+    validate_pid_basics(target.pid, self_pid)
+        .map_err(TargetValidationError::PolicyRejected)?;
+    validate_live_pid_aliases(target.pid, self_pid)
         .map_err(TargetValidationError::PolicyRejected)?;
 
-    let handle = match open_process_checked(target.pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+    let handle = match open_process_checked_detailed(target.pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         Ok(h) => h,
-        Err(open_err) => {
-            if let Some(fallback_exe) = find_process_exe_toolhelp32(target.pid) {
+        Err(OpenProcessError::PidZero) => {
+            return Err(TargetValidationError::PolicyRejected(
+                "refusing to act on Idle process (PID 0)".to_string(),
+            ));
+        }
+        Err(OpenProcessError::PidMismatch { requested, actual }) => {
+            return Err(TargetValidationError::PolicyRejected(format!(
+                "refusing to act on aliased PID {requested}: OpenProcess(PID {requested}) resolved to mismatched PID {actual}"
+            )));
+        }
+        Err(OpenProcessError::Failed(open_err)) => {
+            let fallback_exe = find_process_exe_toolhelp32(target.pid).or_else(|| {
+                (target.pid & 3 != 0)
+                    .then(|| find_process_exe_toolhelp32(target.pid & !3))
+                    .flatten()
+            });
+            if let Some(fallback_exe) = fallback_exe {
                 if is_never_suspend_process(&fallback_exe) {
                     return Err(TargetValidationError::PolicyRejected(format!(
                         "refusing to act on protected process `{fallback_exe}` (PID {})",
@@ -78,6 +96,20 @@ pub(super) fn validate_and_inspect_target_detailed(
     };
 
     validate_open_handle_detailed(handle.as_raw(), target)
+}
+
+fn validate_live_pid_aliases(pid: u32, self_pid: u32) -> Result<(), String> {
+    let canonical = pid & !3;
+    if canonical == 0 {
+        return Err(format!("refusing to act on Idle process alias (PID {pid})"));
+    }
+    if canonical == 4 {
+        return Err(format!("refusing to act on System process alias (PID {pid})"));
+    }
+    if canonical == (self_pid & !3) {
+        return Err(format!("refusing to act on self process alias (PID {pid})"));
+    }
+    Ok(())
 }
 
 fn validate_pid_basics(pid: u32, self_pid: u32) -> Result<(), String> {

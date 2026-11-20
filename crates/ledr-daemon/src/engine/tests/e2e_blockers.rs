@@ -1785,6 +1785,68 @@ async fn pr21_v2_bug_0002_deferred_sibling_children_survive_shutdown_and_partial
     );
 }
 
+struct MapLiveProcessInspector {
+    entries: Mutex<std::collections::HashMap<u32, ledr_sensor_win::etw::LiveProcessInfo>>,
+    calls: AtomicU64,
+}
+
+impl MapLiveProcessInspector {
+    fn new(
+        entries: impl IntoIterator<Item = (u32, ledr_sensor_win::etw::LiveProcessInfo)>,
+    ) -> Self {
+        Self {
+            entries: Mutex::new(entries.into_iter().collect()),
+            calls: AtomicU64::new(0),
+        }
+    }
+
+    fn set(&self, pid: u32, info: ledr_sensor_win::etw::LiveProcessInfo) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid, info);
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl crate::engine::LiveProcessInspector for MapLiveProcessInspector {
+    fn inspect_live_process(&self, pid: u32) -> Option<ledr_sensor_win::etw::LiveProcessInfo> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned()
+    }
+}
+
+async fn start_stopped_engine_with_live_inspector(
+    store: LedrStore,
+    config: DaemonConfig,
+    defense: Arc<dyn ActiveDefenseController>,
+    inspector: Arc<dyn crate::engine::BinaryInspector>,
+    live_inspector: Arc<dyn crate::engine::LiveProcessInspector>,
+) -> Arc<DaemonEngine> {
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        config,
+        defense,
+        Arc::new(StubNotifier),
+        inspector,
+        live_inspector,
+    );
+    if let Some(h) = engine.worker_handle.lock().await.take() {
+        h.abort();
+        let _ = h.await;
+    }
+    engine
+}
+
 #[tokio::test]
 async fn pr21_v2_ci_0001_canary_backfill_rejects_low_bit_pid_alias_and_missing_live_exe() {
     let store = LedrStore::open_in_memory().expect("in-memory store");
@@ -1829,47 +1891,323 @@ async fn pr21_v2_ci_0001_canary_backfill_rejects_low_bit_pid_alias_and_missing_l
     assert!(alerts.iter().all(|a| !a.process_suspended));
     assert!(alerts.iter().all(|a| a.process_instance_id.is_none()));
 
-    // Part B: When the process table already has a known exe_path with `create_time_100ns == 0`,
-    // backfill must fail closed if the live OS query cannot verify `exe_path` (`None` or empty).
-    let zero_ident = ProcessIdentity::new(live_pid, 0);
-    let mut proc_ctx = crate::engine::events::ResolvedProcessContext {
-        proc_identity: Some(zero_ident),
-        proc_instance_id: Some(zero_ident.instance_id()),
-        proc_exe_path: Some(r"C:\Temp\zero_ts.exe".to_string()),
-        ..Default::default()
-    };
-    let live_without_exe = ledr_sensor_win::etw::LiveProcessInfo {
-        create_time_100ns: 133_000_000_000_000_000,
-        exe_path: None,
-        command_line: None,
-    };
-    engine.apply_canary_live_process_backfill(
-        live_pid,
-        &mut proc_ctx,
-        now_ms + 100,
-        live_without_exe,
-    );
-    assert_eq!(
-        proc_ctx.proc_identity,
-        Some(zero_ident),
-        "backfill must fail closed when existing exe_path cannot be verified against live exe_path"
-    );
-    assert_eq!(
-        proc_ctx.proc_instance_id.as_deref(),
-        Some(zero_ident.instance_id().as_str())
-    );
+    // Part B: Exercise the REAL `process_event_with_lane` pipeline with an injected
+    // `LiveProcessInspector` when a multiple-of-4 synthetic PID already has a known `exe_path`
+    // and `create_time_100ns == 0`: backfill must fail closed if live `exe_path` is `None` or blank.
+    let store_b = LedrStore::open_in_memory().expect("in-memory store B");
+    let defense_b = Arc::new(RecordingDefense::new());
+    let live_create_100ns = 116_444_736_000_000_000u64 + ((now_ms as u64).saturating_sub(5_000)) * 10_000;
+    let live_inspector = Arc::new(MapLiveProcessInspector::new([
+        (
+            7700,
+            ledr_sensor_win::etw::LiveProcessInfo {
+                create_time_100ns: live_create_100ns,
+                exe_path: None,
+                command_line: None,
+            },
+        ),
+        (
+            7704,
+            ledr_sensor_win::etw::LiveProcessInfo {
+                create_time_100ns: live_create_100ns,
+                exe_path: Some("   ".to_string()),
+                command_line: None,
+            },
+        ),
+    ]));
+    let engine_b = start_stopped_engine_with_live_inspector(
+        store_b.clone(),
+        DaemonConfig::default(),
+        Arc::clone(&defense_b) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("9".repeat(64))),
+        Arc::clone(&live_inspector) as Arc<dyn crate::engine::LiveProcessInspector>,
+    )
+    .await;
 
-    // Same for whitespace-only live exe_path.
-    let live_blank_exe = ledr_sensor_win::etw::LiveProcessInfo {
-        create_time_100ns: 133_000_000_000_000_000,
-        exe_path: Some("   ".to_string()),
-        command_line: None,
-    };
-    engine.apply_canary_live_process_backfill(
-        live_pid,
-        &mut proc_ctx,
-        now_ms + 100,
-        live_blank_exe,
+    for (pid, target) in [
+        (7700u32, r"C:\Users\alice\.aws\credentials_none"),
+        (7704u32, r"C:\Users\alice\.aws\credentials_blank"),
+    ] {
+        let zero_ident = ProcessIdentity::new(pid, 0);
+        send_process_start(&engine_b, zero_ident, r"C:\Temp\zero_ts.exe");
+        let _ = engine_b.process_event_with_lane(
+            &SensorEvent::CanaryFileAccess {
+                pid,
+                target_path: target.to_string(),
+                category: CanaryCategory::CloudCredential,
+                access_mask: 1,
+                is_write_or_delete: false,
+                timestamp_ms: now_ms + 100,
+            },
+            EventLane::HighPriority,
+        );
+    }
+
+    assert_eq!(live_inspector.calls(), 2);
+    assert!(
+        defense_b.suspended().is_empty(),
+        "real CanaryFileAccess pipeline must fail closed and never suspend when live exe_path is None or whitespace"
     );
-    assert_eq!(proc_ctx.proc_identity, Some(zero_ident));
+    let alerts_b = store_b.list_alerts(None, 10).expect("list alerts B");
+    assert_eq!(alerts_b.len(), 2);
+    assert!(alerts_b.iter().all(|a| !a.process_suspended));
+    assert!(alerts_b
+        .iter()
+        .all(|a| a.process_instance_id.as_deref().is_some_and(|id| id.ends_with(":0"))));
+}
+
+#[tokio::test]
+async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noop_writes() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let now_ms = current_unix_ms();
+    let created_ms = now_ms - 5_000;
+    let created_100ns = 116_444_736_000_000_000u64 + (created_ms as u64) * 10_000;
+
+    let live_inspector = Arc::new(MapLiveProcessInspector::new([
+        (
+            4400,
+            ledr_sensor_win::etw::LiveProcessInfo {
+                create_time_100ns: created_100ns,
+                exe_path: Some(r"C:\Temp\unregistered_stealer.exe".to_string()),
+                command_line: Some("unregistered_stealer.exe --dump".to_string()),
+            },
+        ),
+        (
+            4404,
+            ledr_sensor_win::etw::LiveProcessInfo {
+                create_time_100ns: created_100ns,
+                exe_path: Some(r"C:\Temp\zero_ts_upgraded.exe".to_string()),
+                command_line: None,
+            },
+        ),
+        (
+            4408,
+            ledr_sensor_win::etw::LiveProcessInfo {
+                create_time_100ns: created_100ns,
+                exe_path: None,
+                command_line: None,
+            },
+        ),
+    ]));
+
+    let engine = start_stopped_engine_with_live_inspector(
+        store.clone(),
+        DaemonConfig::default(),
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("8".repeat(64))),
+        Arc::clone(&live_inspector) as Arc<dyn crate::engine::LiveProcessInspector>,
+    )
+    .await;
+
+    // 1. Unregistered multiple-of-4 PID 4400 backfills with actual `created_ms` (not `event_ts_ms`),
+    //    so `lookup_by_pid_at` resolves timestamps between process creation and the canary event.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::CanaryFileAccess {
+            pid: 4400,
+            target_path: r"C:\Users\alice\.ssh\id_rsa".to_string(),
+            category: CanaryCategory::SshKey,
+            access_mask: 1,
+            is_write_or_delete: false,
+            timestamp_ms: now_ms,
+        },
+        EventLane::HighPriority,
+    );
+    let id_4400 = ProcessIdentity::new(4400, created_100ns);
+    assert_eq!(defense.suspended(), vec![id_4400]);
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let mid_ts = created_ms + 2_000;
+        let resolved = table
+            .lookup_by_pid_at(4400, mid_ts)
+            .expect("backfilled entry must use live created_at_ms so earlier events resolve");
+        assert_eq!(resolved.identity, id_4400);
+        assert_eq!(resolved.created_at_ms, created_ms);
+    }
+    // Late real ETW ProcessStart arriving with parent_pid=1234 upgrades ppid in table & store.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: id_4400,
+            parent_pid: 1234,
+            exe_path: r"C:\Temp\unregistered_stealer.exe".to_string(),
+            command_line: "unregistered_stealer.exe --dump".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            table.get_by_instance_id(&id_4400.instance_id()).map(|e| e.ppid),
+            Some(1234)
+        );
+    }
+
+    // 2. Existing `(4404, 0)` placeholder (whose fallback created_at_ms is `now_ms > created_ms`)
+    //    upgraded by matching live exe_path must become the ACTIVE entry (not inferred-exited!)
+    //    and preserve its existing `ppid = 2222`.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(4404, 0),
+            parent_pid: 2222,
+            exe_path: r"C:\Temp\zero_ts_upgraded.exe".to_string(),
+            command_line: "zero_ts_upgraded.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::CanaryFileAccess {
+            pid: 4404,
+            target_path: r"C:\Users\alice\.aws\credentials".to_string(),
+            category: CanaryCategory::CloudCredential,
+            access_mask: 1,
+            is_write_or_delete: false,
+            timestamp_ms: now_ms + 50,
+        },
+        EventLane::HighPriority,
+    );
+    let id_4404 = ProcessIdentity::new(4404, created_100ns);
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let active = table
+            .lookup_by_pid(4404)
+            .expect("upgraded verified identity must be active");
+        assert_eq!(active.identity, id_4404);
+        assert_eq!(active.exited_at_ms, None, "verified backfill must not be marked exited");
+        assert_eq!(active.ppid, 2222, "upgraded entry must preserve existing ppid");
+    }
+
+    // 3. Existing verified `(4408, created_100ns)` with `ppid = 3333` and empty `exe_path`:
+    //    (a) no-op backfill (`live.exe_path == None`) must NOT overwrite ppid=3333 in SQLite;
+    //    (b) subsequent backfill supplying `exe_path` must ALSO preserve ppid=3333 in SQLite.
+    let id_4408 = ProcessIdentity::new(4408, created_100ns);
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: id_4408,
+            parent_pid: 3333,
+            exe_path: String::new(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::CanaryFileAccess {
+            pid: 4408,
+            target_path: r"C:\Users\alice\.env.noop".to_string(),
+            category: CanaryCategory::EnvFile,
+            access_mask: 1,
+            is_write_or_delete: false,
+            timestamp_ms: now_ms + 100,
+        },
+        EventLane::HighPriority,
+    );
+    store.flush_batch().expect("flush after noop backfill");
+    let snap_noop = store
+        .query_flight_recorder(10, Some(&id_4408.instance_id()))
+        .expect("query after noop backfill");
+    let row_noop = snap_noop
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == id_4408.instance_id())
+        .expect("4408 row exists");
+    assert_eq!(row_noop.ppid, 3333, "no-op backfill must not clobber ppid in SQLite");
+    assert_eq!(row_noop.exe_path, "");
+
+    live_inspector.set(
+        4408,
+        ledr_sensor_win::etw::LiveProcessInfo {
+            create_time_100ns: created_100ns,
+            exe_path: Some(r"C:\Temp\enriched_4408.exe".to_string()),
+            command_line: None,
+        },
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::CanaryFileAccess {
+            pid: 4408,
+            target_path: r"C:\Users\alice\.env.enriched".to_string(),
+            category: CanaryCategory::EnvFile,
+            access_mask: 1,
+            is_write_or_delete: false,
+            timestamp_ms: now_ms + 200,
+        },
+        EventLane::HighPriority,
+    );
+    store.flush_batch().expect("flush after enriched backfill");
+    let snap_enriched = store
+        .query_flight_recorder(10, Some(&id_4408.instance_id()))
+        .expect("query after enriched backfill");
+    let row_enriched = snap_enriched
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == id_4408.instance_id())
+        .expect("4408 row exists after enrichment");
+    assert_eq!(
+        row_enriched.ppid, 3333,
+        "exe_path backfill must preserve existing ppid in SQLite"
+    );
+    assert_eq!(row_enriched.exe_path, r"C:\Temp\enriched_4408.exe");
+}
+
+#[tokio::test]
+async fn pr21_v2_ci_0003_resolve_alert_refuses_low_bit_pid_alias_from_defense_guard() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let real_defense = Arc::new(ledr_sensor_win::WindowsDefenseController::new());
+    let engine = start_stopped_engine(
+        store.clone(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            ..DaemonConfig::default()
+        },
+        real_defense as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("7".repeat(64))),
+    )
+    .await;
+
+    let self_alias = ProcessIdentity::new(std::process::id().saturating_add(1), 133_800_000_000_000_000);
+    let system_alias = ProcessIdentity::new(5, 133_800_000_000_000_000);
+
+    for (alert_id, ident) in [("alias-self", self_alias), ("alias-system", system_alias)] {
+        store
+            .record_alert(&AlertRecord {
+                alert_id: alert_id.to_string(),
+                timestamp_ms: current_unix_ms(),
+                severity: AlertSeverity::High,
+                source_layer: "LAYER_1_CANARY".to_string(),
+                rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
+                title: "Forged low-bit PID alias alert".to_string(),
+                process_instance_id: Some(ident.instance_id()),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: r#"{"exe_path":"C:\\Temp\\forged.exe"}"#.to_string(),
+                resolved_at_ms: None,
+            })
+            .expect("seed aliased alert");
+
+        let allow_err = engine
+            .resolve_alert(alert_id, ledr_proto::AlertDecision::AllowOnce)
+            .expect_err("AllowOnce must NOT swallow low-bit PID alias refusal as Gone");
+        assert!(
+            allow_err.contains("refusing to act on"),
+            "expected policy refusal on AllowOnce for {alert_id}, got: {allow_err}"
+        );
+        let term_err = engine
+            .resolve_alert(
+                alert_id,
+                ledr_proto::AlertDecision::TerminateAndBlock {
+                    add_block_rule: false,
+                },
+            )
+            .expect_err("TerminateAndBlock must NOT swallow low-bit PID alias refusal as Gone");
+        assert!(
+            term_err.contains("refusing to act on"),
+            "expected policy refusal on TerminateAndBlock for {alert_id}, got: {term_err}"
+        );
+        assert_eq!(
+            store.get_alert(alert_id).unwrap().unwrap().status,
+            AlertStatus::Pending,
+            "aliased alert {alert_id} must remain Pending after policy refusal"
+        );
+    }
 }

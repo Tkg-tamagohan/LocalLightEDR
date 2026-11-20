@@ -235,8 +235,14 @@ fn upsert_process_row(tx: &Transaction<'_>, process: &ProcessRecord) -> Result<(
          ON CONFLICT(process_instance_id) DO UPDATE SET
             pid = excluded.pid,
             parent_instance_id = COALESCE(excluded.parent_instance_id, processes.parent_instance_id),
-            ppid = excluded.ppid,
-            exe_path = excluded.exe_path,
+            ppid = CASE
+                WHEN excluded.ppid != 0 THEN excluded.ppid
+                ELSE processes.ppid
+            END,
+            exe_path = CASE
+                WHEN excluded.exe_path != '' THEN excluded.exe_path
+                ELSE processes.exe_path
+            END,
             command_line = COALESCE(excluded.command_line, processes.command_line),
             sha256 = COALESCE(excluded.sha256, processes.sha256),
             signer_subject = COALESCE(excluded.signer_subject, processes.signer_subject),

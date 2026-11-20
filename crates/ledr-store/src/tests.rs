@@ -695,3 +695,63 @@ fn store_p2_analysis_list_unresolved_suspended_alerts_uses_top_level_json_array(
         ]
     );
 }
+
+#[test]
+fn store_p2_upsert_process_preserves_existing_ppid_and_exe_path() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let ident = ProcessIdentity::new(4200, 133_800_000_000_000_000);
+    let inst_id = ident.instance_id();
+
+    // Initial ProcessStart with known ppid and empty exe_path.
+    let initial = SensorEvent::ProcessStart {
+        identity: ident,
+        parent_pid: 1234,
+        exe_path: String::new(),
+        command_line: "tool.exe --run".to_string(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_exit(&initial, None, None, false, "OBSERVED")
+        .expect("ingest initial");
+    store.flush_batch().expect("flush initial");
+
+    // Partial backfill carrying exe_path but parent_pid == 0 must preserve ppid=1234.
+    let backfill_exe = SensorEvent::ProcessStart {
+        identity: ident,
+        parent_pid: 0,
+        exe_path: r"C:\Temp\tool.exe".to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_exit(&backfill_exe, None, None, false, "OBSERVED")
+        .expect("ingest backfill");
+    store.flush_batch().expect("flush backfill");
+
+    // Subsequent partial upsert with empty exe_path and parent_pid == 0 must preserve both.
+    let empty_partial = SensorEvent::ProcessStart {
+        identity: ident,
+        parent_pid: 0,
+        exe_path: String::new(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_exit(&empty_partial, None, None, false, "OBSERVED")
+        .expect("ingest empty partial");
+    store.flush_batch().expect("flush empty partial");
+
+    let snap = store
+        .query_flight_recorder(10, Some(&inst_id))
+        .expect("query flight recorder");
+    let row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == inst_id)
+        .expect("process row exists");
+    assert_eq!(row.ppid, 1234, "partial upsert with ppid=0 must not clobber existing ppid");
+    assert_eq!(
+        row.exe_path, r"C:\Temp\tool.exe",
+        "partial upsert with empty exe_path must not clobber existing exe_path"
+    );
+}

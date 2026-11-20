@@ -1,5 +1,7 @@
 use super::*;
-use super::guard::validate_process_metadata;
+use super::guard::{
+    TargetValidationError, validate_and_inspect_target_detailed, validate_process_metadata,
+};
 use super::process_probe::{
     open_process_checked, query_process_creation_time, snapshot_process_entries,
 };
@@ -632,6 +634,8 @@ fn sens_p3_11_defense_controller_wfp_drop_sink_before_and_after_init() {
 
 #[test]
 fn sens_p3_14_open_process_and_guard_reject_low_bit_pid_aliases() {
+    use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+
     assert!(
         open_process_checked(0, PROCESS_QUERY_LIMITED_INFORMATION).is_err(),
         "open_process_checked must refuse PID 0"
@@ -645,8 +649,33 @@ fn sens_p3_14_open_process_and_guard_reject_low_bit_pid_aliases() {
     drop(self_handle);
     assert!(self_create_time > 0);
 
+    // Calling open_process_checked without PROCESS_QUERY_LIMITED_INFORMATION /
+    // PROCESS_QUERY_INFORMATION must fail closed when GetProcessId returns 0.
+    let no_query_err = match open_process_checked(self_pid, PROCESS_SYNCHRONIZE) {
+        Ok(_) => panic!("open_process_checked without query rights must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        no_query_err.contains("GetProcessId"),
+        "expected GetProcessId failure without query rights, got: {no_query_err}"
+    );
+
     let controller = WindowsDefenseController::new();
     for offset in 1..=3u32 {
+        // Idle (PID 0) aliases: 1..=3 must be PolicyRejected.
+        let idle_alias = ProcessIdentity::new(offset, 12_345);
+        match validate_and_inspect_target_detailed(&idle_alias) {
+            Err(TargetValidationError::PolicyRejected(msg)) => {
+                assert!(
+                    msg.contains("refusing to act on"),
+                    "Idle alias must carry refusal prefix: {msg}"
+                );
+            }
+            other => panic!("expected PolicyRejected for Idle alias {offset}, got: {other:?}"),
+        }
+        assert!(collect_live_descendants(&idle_alias).is_empty());
+
+        // Self-PID aliases: self_pid + 1..=3.
         let alias_pid = self_pid.saturating_add(offset);
         let err = match open_process_checked(alias_pid, PROCESS_QUERY_LIMITED_INFORMATION) {
             Ok(_) => panic!("open_process_checked must reject low-bit PID alias {alias_pid}"),
@@ -658,21 +687,116 @@ fn sens_p3_14_open_process_and_guard_reject_low_bit_pid_aliases() {
         );
 
         let alias_ident = ProcessIdentity::new(alias_pid, self_create_time);
+        match validate_and_inspect_target_detailed(&alias_ident) {
+            Err(TargetValidationError::PolicyRejected(msg)) => {
+                assert!(
+                    msg.contains("refusing to act on"),
+                    "self-PID alias must carry refusal prefix: {msg}"
+                );
+            }
+            other => {
+                panic!("expected PolicyRejected for self-PID alias {alias_pid}, got: {other:?}")
+            }
+        }
         assert!(
-            validate_target_process(&alias_ident).is_err(),
-            "validate_target_process must reject self-PID alias {alias_pid}"
+            controller
+                .suspend_process(&alias_ident, false)
+                .is_err_and(|e| e.contains("refusing to act on")),
+            "suspend_process must PolicyReject self-PID alias {alias_pid}"
         );
         assert!(
-            controller.suspend_process(&alias_ident, false).is_err(),
-            "suspend_process must reject self-PID alias {alias_pid}"
+            controller
+                .resume_process(&alias_ident)
+                .is_err_and(|e| e.contains("refusing to act on")),
+            "resume_process must PolicyReject self-PID alias {alias_pid}"
         );
+        assert!(
+            controller
+                .terminate_process(&alias_ident, true)
+                .is_err_and(|e| e.contains("refusing to act on")),
+            "terminate_process must PolicyReject self-PID alias {alias_pid}"
+        );
+        assert!(collect_live_descendants(&alias_ident).is_empty());
 
-        // Also ensure PIDs 5..=7 cannot alias System (PID 4).
+        // System (PID 4) aliases: 5..=7 must be PolicyRejected even when non-elevated.
         let system_alias = ProcessIdentity::new(4 + offset, 12_345);
-        assert!(
-            validate_target_process(&system_alias).is_err(),
-            "validate_target_process must reject System PID alias {}",
-            system_alias.pid
-        );
+        match validate_and_inspect_target_detailed(&system_alias) {
+            Err(TargetValidationError::PolicyRejected(msg)) => {
+                assert!(
+                    msg.contains("refusing to act on"),
+                    "System alias must carry refusal prefix: {msg}"
+                );
+            }
+            other => {
+                panic!(
+                    "expected PolicyRejected for System PID alias {}, got: {other:?}",
+                    system_alias.pid
+                )
+            }
+        }
+        assert!(collect_live_descendants(&system_alias).is_empty());
     }
+
+    // Spawn a real non-self child process to exercise OpenProcessError::PidMismatch ->
+    // TargetValidationError::PolicyRejected directly (bypassing the self/System shortcut).
+    let mut child = Command::new("cmd.exe")
+        .args(["/c", "findstr .*"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn harmless cmd.exe child for PID alias guard test");
+    let _stdin_keepalive = child.stdin.take();
+    let child_pid = child.id();
+    let child_handle = open_process_checked(child_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .expect("open spawned child");
+    let child_ct =
+        query_process_creation_time(child_handle.as_raw()).expect("query child CreationTime");
+    drop(child_handle);
+
+    for offset in 1..=3u32 {
+        let child_alias = ProcessIdentity::new(child_pid.saturating_add(offset), child_ct);
+        match validate_and_inspect_target_detailed(&child_alias) {
+            Err(TargetValidationError::PolicyRejected(msg)) => {
+                assert!(
+                    msg.contains("refusing to act on") && msg.contains("mismatched PID"),
+                    "live child alias must fail with PolicyRejected + mismatched PID: {msg}"
+                );
+            }
+            other => panic!(
+                "expected PolicyRejected for live child PID alias {}, got: {other:?}",
+                child_alias.pid
+            ),
+        }
+        assert!(
+            controller
+                .suspend_process(&child_alias, false)
+                .is_err_and(|e| e.contains("refusing to act on")),
+            "suspend_process must PolicyReject live child alias {}",
+            child_alias.pid
+        );
+        assert!(
+            controller
+                .resume_process(&child_alias)
+                .is_err_and(|e| e.contains("refusing to act on")),
+            "resume_process must PolicyReject live child alias {}",
+            child_alias.pid
+        );
+        assert!(
+            controller
+                .terminate_process(&child_alias, true)
+                .is_err_and(|e| e.contains("refusing to act on")),
+            "terminate_process must PolicyReject live child alias {}",
+            child_alias.pid
+        );
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "live child PID {child_pid} must remain untouched after alias {} refusal",
+            child_alias.pid
+        );
+        assert!(collect_live_descendants(&child_alias).is_empty());
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
 }

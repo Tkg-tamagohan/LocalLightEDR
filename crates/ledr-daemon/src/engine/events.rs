@@ -324,13 +324,13 @@ impl DaemonEngine {
             return;
         }
 
-        let Some(live) = ledr_sensor_win::etw::inspect_live_process(*pid) else {
+        let Some(live) = self.live_process_inspector.inspect_live_process(*pid) else {
             return;
         };
         self.apply_canary_live_process_backfill(*pid, proc_ctx, event_ts_ms, live);
     }
 
-    pub(super) fn apply_canary_live_process_backfill(
+    fn apply_canary_live_process_backfill(
         &self,
         pid: u32,
         proc_ctx: &mut ResolvedProcessContext,
@@ -363,76 +363,97 @@ impl DaemonEngine {
             }
         }
 
-        // If the table already had a non-empty exe_path (e.g., synthetic PID with zero timestamp),
-        // only backfill when the live OS process reports a matching executable path (fail closed
-        // if the live image path cannot be queried).
-        if let Some(existing_exe) = proc_ctx
+        let existing_exe_opt = proc_ctx
             .proc_exe_path
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let Some(live_exe) = live
-                .exe_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
+            .filter(|s| !s.is_empty());
+        let live_exe_opt = live
+            .exe_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        // If the table already had a non-empty exe_path (e.g., synthetic PID with zero timestamp),
+        // only backfill when the live OS process reports a matching executable path (fail closed
+        // if the live image path cannot be queried).
+        if let Some(existing_exe) = existing_exe_opt {
+            let Some(live_exe) = live_exe_opt else {
                 return;
             };
-            if !existing_exe.eq_ignore_ascii_case(live_exe) {
+            if !existing_exe
+                .replace('/', "\\")
+                .eq_ignore_ascii_case(&live_exe.replace('/', "\\"))
+            {
                 return;
             }
         }
 
-        let exe_path = proc_ctx
-            .proc_exe_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                live.exe_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-        let command_line = proc_ctx
+        let existing_cmd_opt = proc_ctx
             .proc_command_line
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty());
+        let live_cmd_opt = live
+            .command_line
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let gained_create_time = proc_ctx
+            .proc_identity
+            .is_none_or(|id| id.create_time_100ns == 0);
+        let gained_exe_path = existing_exe_opt.is_none() && live_exe_opt.is_some();
+        let gained_command_line = existing_cmd_opt.is_none() && live_cmd_opt.is_some();
+        if !gained_create_time && !gained_exe_path && !gained_command_line {
+            return;
+        }
+
+        let exe_path = existing_exe_opt
+            .or(live_exe_opt)
             .map(str::to_string)
-            .or_else(|| {
-                live.command_line
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
+            .unwrap_or_default();
+        let command_line = existing_cmd_opt
+            .or(live_cmd_opt)
+            .map(str::to_string)
             .unwrap_or_default();
 
+        // Record the live process's actual creation timestamp (`live_created_ms <= event_ts_ms`)
+        // so `ActiveProcessTable::lookup_by_pid_at` matches events and child ProcessStarts
+        // occurring between process creation and this canary event.
+        let backfilled_created_ms =
+            super::filetime_100ns_to_unix_ms(live.create_time_100ns, event_ts_ms);
         let ident = ProcessIdentity::new(pid, live.create_time_100ns);
-        let res = {
+        let ident_instance_id = ident.instance_id();
+        let (existing_ppid, res) = {
             let mut table = self
                 .process_table
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            table.on_process_start(
+            let existing_ppid = table
+                .get_by_instance_id(&ident_instance_id)
+                .or_else(|| {
+                    proc_ctx
+                        .proc_instance_id
+                        .as_deref()
+                        .and_then(|id| table.get_by_instance_id(id))
+                })
+                .map(|entry| entry.ppid)
+                .unwrap_or(0);
+            let res = table.on_process_start(
                 ident,
-                0,
+                existing_ppid,
                 exe_path.clone(),
                 command_line.clone(),
                 None,
-                event_ts_ms,
-            )
+                backfilled_created_ms,
+            );
+            (existing_ppid, res)
         };
 
         let synthetic_start = SensorEvent::ProcessStart {
             identity: ident,
-            parent_pid: 0,
+            parent_pid: existing_ppid,
             exe_path: exe_path.clone(),
             command_line: command_line.clone(),
             user_sid: None,

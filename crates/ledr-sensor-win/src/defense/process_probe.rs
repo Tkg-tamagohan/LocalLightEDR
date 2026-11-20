@@ -57,26 +57,62 @@ pub(super) fn snapshot_process_entries() -> Result<Vec<SnapshotEntry>, String> {
     Ok(out)
 }
 
-pub(super) fn open_process_checked(pid: u32, access: PROCESS_ACCESS_RIGHTS) -> Result<OwnedHandle, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OpenProcessError {
+    PidZero,
+    PidMismatch { requested: u32, actual: u32 },
+    Failed(String),
+}
+
+impl OpenProcessError {
+    pub(super) fn into_message(self) -> String {
+        match self {
+            Self::PidZero => "OpenProcess(PID 0) refused".to_string(),
+            Self::PidMismatch { requested, actual } => {
+                format!("OpenProcess(PID {requested}) resolved to mismatched PID {actual}")
+            }
+            Self::Failed(msg) => msg,
+        }
+    }
+}
+
+pub(super) fn open_process_checked_detailed(
+    pid: u32,
+    access: PROCESS_ACCESS_RIGHTS,
+) -> Result<OwnedHandle, OpenProcessError> {
     if pid == 0 {
-        return Err("OpenProcess(PID 0) refused".to_string());
+        return Err(OpenProcessError::PidZero);
     }
     // SAFETY: `OpenProcess` takes plain integer flags and PID; result handle is RAII-wrapped.
     let raw = unsafe { OpenProcess(access, false, pid) }
-        .map_err(|err| format!("OpenProcess(PID {pid}) failed: {err}"))?;
-    let handle = OwnedHandle::new(raw)
-        .ok_or_else(|| format!("OpenProcess(PID {pid}) returned invalid handle"))?;
+        .map_err(|err| OpenProcessError::Failed(format!("OpenProcess(PID {pid}) failed: {err}")))?;
+    let handle = OwnedHandle::new(raw).ok_or_else(|| {
+        OpenProcessError::Failed(format!("OpenProcess(PID {pid}) returned invalid handle"))
+    })?;
     // Windows `OpenProcess` ignores the low 2 bits of `pid` (`pid & !3`), so `pid + 1..=3` can
     // silently open `pid & !3` (including PID 4 via 5..=7 or self via `self_pid + 1..=3`).
-    // Callers pass `PROCESS_QUERY_LIMITED_INFORMATION`; fail closed on any PID mismatch or `0`.
+    // Callers pass `PROCESS_QUERY_LIMITED_INFORMATION`; fail closed on `0` or any PID mismatch.
     // SAFETY: `handle` is an open process handle owned by `handle`.
     let actual_pid = unsafe { GetProcessId(handle.as_raw()) };
+    if actual_pid == 0 {
+        return Err(OpenProcessError::Failed(format!(
+            "GetProcessId(PID {pid}) failed (handle lacks query access or is invalid)"
+        )));
+    }
     if actual_pid != pid {
-        return Err(format!(
-            "OpenProcess(PID {pid}) resolved to mismatched PID {actual_pid}"
-        ));
+        return Err(OpenProcessError::PidMismatch {
+            requested: pid,
+            actual: actual_pid,
+        });
     }
     Ok(handle)
+}
+
+pub(super) fn open_process_checked(
+    pid: u32,
+    access: PROCESS_ACCESS_RIGHTS,
+) -> Result<OwnedHandle, String> {
+    open_process_checked_detailed(pid, access).map_err(OpenProcessError::into_message)
 }
 
 pub(super) fn query_full_image_name(handle: HANDLE) -> Option<String> {

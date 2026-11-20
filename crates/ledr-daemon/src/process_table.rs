@@ -133,6 +133,9 @@ impl ActiveProcessTable {
             if existing.parent_instance_id.is_none() {
                 existing.parent_instance_id = parent_instance_id.clone();
             }
+            if existing.ppid == 0 && parent_pid != 0 {
+                existing.ppid = parent_pid;
+            }
             if !exe_path.is_empty() {
                 existing.exe_path = exe_path;
             }
@@ -165,8 +168,9 @@ impl ActiveProcessTable {
             .map(|prev| prev.instance_id())
         {
             if let Some(prev_entry) = self.entries.get(&prev_id) {
-                if (prev_entry.created_at_ms, prev_entry.identity.create_time_100ns)
-                    > (created_at_ms, identity.create_time_100ns)
+                if prev_entry.identity.create_time_100ns != 0
+                    && (prev_entry.created_at_ms, prev_entry.identity.create_time_100ns)
+                        > (created_at_ms, identity.create_time_100ns)
                 {
                     // Arriving ProcessStart is older than the already-registered process for this PID:
                     // preserve the newer active mapping and record this older incarnation as exited.

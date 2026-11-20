@@ -16,8 +16,9 @@ use crate::process_table::ActiveProcessTable;
 use super::dns_history::ProcessDnsHistory;
 use super::wfp_drops::{AppWfpAlertDedup, WfpDropDedupCache, WfpDropOverflowQueue};
 use super::{
-    current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, WindowsBinaryInspector,
-    APP_WFP_ALERT_DEDUP_CAPACITY, WFP_DROP_DEDUP_CAPACITY, WFP_DROP_DEDUP_WINDOW_MS,
+    current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, LiveProcessInspector,
+    WindowsBinaryInspector, WindowsLiveProcessInspector, APP_WFP_ALERT_DEDUP_CAPACITY,
+    WFP_DROP_DEDUP_CAPACITY, WFP_DROP_DEDUP_WINDOW_MS,
 };
 
 impl DaemonEngine {
@@ -69,6 +70,32 @@ impl DaemonEngine {
         defense: Arc<dyn ActiveDefenseController>,
         notifier: Arc<dyn NotificationDispatcher>,
         inspector: Arc<dyn BinaryInspector>,
+    ) -> Arc<Self> {
+        Self::start_with_all_dependencies(
+            store,
+            sigma,
+            pruner,
+            config,
+            defense,
+            notifier,
+            inspector,
+            Arc::new(WindowsLiveProcessInspector::new()),
+        )
+    }
+
+    /// Starts a new [`DaemonEngine`] with custom [`ActiveDefenseController`],
+    /// [`NotificationDispatcher`], [`BinaryInspector`], and [`LiveProcessInspector`]
+    /// implementations (enabling deterministic test isolation from host OS PIDs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_all_dependencies(
+        store: LedrStore,
+        sigma: SigmaEngine,
+        pruner: EarlyPruner,
+        config: DaemonConfig,
+        defense: Arc<dyn ActiveDefenseController>,
+        notifier: Arc<dyn NotificationDispatcher>,
+        inspector: Arc<dyn BinaryInspector>,
+        live_process_inspector: Arc<dyn LiveProcessInspector>,
     ) -> Arc<Self> {
         let prior_running_candidates = store.list_running_process_instance_ids().unwrap_or_default();
         let (sender, receiver) = TwoLaneChannel::with_capacities(
@@ -130,6 +157,7 @@ impl DaemonEngine {
             defense,
             notifier,
             inspector,
+            live_process_inspector,
             process_table,
             firewall: Mutex::new(wfp_manager),
             outbound_classifier,

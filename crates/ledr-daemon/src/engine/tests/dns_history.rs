@@ -81,33 +81,55 @@ fn daemon_p3_43a_dual_stack_dns_family_independent_timestamps_and_non_regression
     let v6_2 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2));
     let v6_stale = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 99));
 
-    // 1. A(1000) -> AAAA(3000) -> A(2000): IPv4 is newer than prior IPv4 (2000 >= 1000)
-    //    so it must be accepted even though AAAA has a newer timestamp (3000).
-    assert_eq!(
-        hist.record_for_exe("10:1", exe, "api.example.", &[v4_1], 1_000),
-        vec![v4_1]
+    // 1 & 2. Family-independent acceptance: A(1000)->AAAA(3000)->A(2000) and reverse order
+    //        AAAA(1000)->A(3000)->AAAA(2000).
+    fn assert_family_independent_order(
+        hist: &mut ProcessDnsHistory,
+        inst: &str,
+        exe: &str,
+        query_name: &str,
+        canon_domain: &str,
+        ips: (IpAddr, IpAddr, IpAddr),
+        msg: &str,
+    ) {
+        let (primary_1, other, primary_2) = ips;
+        assert_eq!(
+            hist.record_for_exe(inst, exe, query_name, &[primary_1], 1_000),
+            vec![primary_1]
+        );
+        assert_eq!(
+            hist.record_for_exe(inst, exe, query_name, &[other], 3_000),
+            vec![other]
+        );
+        assert_eq!(
+            hist.record_for_exe(inst, exe, query_name, &[primary_2], 2_000),
+            vec![primary_2],
+            "{msg}"
+        );
+        assert!(hist.lookup_for_process(inst, primary_1).is_none());
+        assert_eq!(
+            hist.lookup_for_process(inst, primary_2),
+            Some((canon_domain.to_string(), 2_000))
+        );
+        assert_eq!(
+            hist.lookup_for_process(inst, other),
+            Some((canon_domain.to_string(), 3_000))
+        );
+        assert!(hist.is_domain_ip_superseded(exe, canon_domain, primary_1));
+        assert!(!hist.is_domain_ip_superseded(exe, canon_domain, primary_2));
+        assert!(!hist.is_domain_ip_superseded(exe, canon_domain, other));
+    }
+
+    // 1. A(1000) -> AAAA(3000) -> A(2000)
+    assert_family_independent_order(
+        &mut hist,
+        "10:1",
+        exe,
+        "api.example.",
+        "api.example",
+        (v4_1, v6_1, v4_2),
+        "newer IPv4 response at t=2000 must not be rejected by AAAA at t=3000",
     );
-    assert_eq!(
-        hist.record_for_exe("10:1", exe, "api.example.", &[v6_1], 3_000),
-        vec![v6_1]
-    );
-    assert_eq!(
-        hist.record_for_exe("10:1", exe, "api.example.", &[v4_2], 2_000),
-        vec![v4_2],
-        "newer IPv4 response at t=2000 must not be rejected by AAAA at t=3000"
-    );
-    assert!(hist.lookup_for_process("10:1", v4_1).is_none());
-    assert_eq!(
-        hist.lookup_for_process("10:1", v4_2),
-        Some(("api.example".to_string(), 2_000))
-    );
-    assert_eq!(
-        hist.lookup_for_process("10:1", v6_1),
-        Some(("api.example".to_string(), 3_000))
-    );
-    assert!(hist.is_domain_ip_superseded(exe, "api.example", v4_1));
-    assert!(!hist.is_domain_ip_superseded(exe, "api.example", v4_2));
-    assert!(!hist.is_domain_ip_superseded(exe, "api.example", v6_1));
     // IPv4-mapped IPv6 address must map to the IPv4 family for superseding checks.
     let v4_1_mapped = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 10).to_ipv6_mapped());
     let v4_2_mapped = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 20).to_ipv6_mapped());
@@ -115,31 +137,15 @@ fn daemon_p3_43a_dual_stack_dns_family_independent_timestamps_and_non_regression
     assert!(!hist.is_domain_ip_superseded(exe, "api.example", v4_2_mapped));
 
     // 2. Reverse order: AAAA(1000) -> A(3000) -> AAAA(2000).
-    assert_eq!(
-        hist.record_for_exe("20:1", exe, "rev.example", &[v6_1], 1_000),
-        vec![v6_1]
+    assert_family_independent_order(
+        &mut hist,
+        "20:1",
+        exe,
+        "rev.example",
+        "rev.example",
+        (v6_1, v4_1, v6_2),
+        "newer IPv6 response at t=2000 must not be rejected by A at t=3000",
     );
-    assert_eq!(
-        hist.record_for_exe("20:1", exe, "rev.example", &[v4_1], 3_000),
-        vec![v4_1]
-    );
-    assert_eq!(
-        hist.record_for_exe("20:1", exe, "rev.example", &[v6_2], 2_000),
-        vec![v6_2],
-        "newer IPv6 response at t=2000 must not be rejected by A at t=3000"
-    );
-    assert!(hist.lookup_for_process("20:1", v6_1).is_none());
-    assert_eq!(
-        hist.lookup_for_process("20:1", v6_2),
-        Some(("rev.example".to_string(), 2_000))
-    );
-    assert_eq!(
-        hist.lookup_for_process("20:1", v4_1),
-        Some(("rev.example".to_string(), 3_000))
-    );
-    assert!(hist.is_domain_ip_superseded(exe, "rev.example", v6_1));
-    assert!(!hist.is_domain_ip_superseded(exe, "rev.example", v6_2));
-    assert!(!hist.is_domain_ip_superseded(exe, "rev.example", v4_1));
 
     // 3. Mixed IPv4/IPv6 query where one family is fresh and the other is delayed.
     assert_eq!(
@@ -263,15 +269,17 @@ fn daemon_p3_43a_dual_stack_dns_family_independent_timestamps_and_non_regression
 /// whenever `ProcessDnsHistory::lookup_for_process` has no usable record for that instance.
 #[test]
 fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
-    use super::{
-        current_unix_ms, DaemonConfig, DaemonEngine, EventLane, PendingWfpDrop, QueuedWfpDrop,
-        WfpRuleManager,
+    use super::helpers::{
+        make_net_rule, make_queued_drop, send_dns, send_dns_typed, send_process_start,
+        send_process_stop, start_stopped_engine, FixedShaInspector, TestDefense,
     };
-    use ledr_proto::{ProcessIdentity, SensorEvent};
+    use super::{current_unix_ms, DaemonConfig, DaemonEngine, PendingWfpDrop, WfpRuleManager};
+    use ledr_proto::{ProcessIdentity, RuleScope};
     use ledr_rules::{EarlyPruner, SigmaEngine};
     use ledr_store::LedrStore;
     use std::collections::VecDeque;
     use std::net::Ipv6Addr;
+    use std::sync::Arc;
     use std::time::Duration;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -303,32 +311,13 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
         let proc_id = ProcessIdentity::new(9401, (now_ms as u64 + 11_644_473_600_000) * 10_000);
         let inst_id = format!("{}:{}", proc_id.pid, proc_id.create_time_100ns);
 
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: proc_id,
-                parent_pid: 4,
-                exe_path: exe.to_string(),
-                command_line: exe.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine, proc_id, exe);
 
         let v4_new = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
         let v4_stale = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
         let v6_new = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x42));
 
-        let upd1 = engine
-            .process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: proc_id.pid,
-                    query_name: "svc.example".to_string(),
-                    query_type: 1,
-                    resolved_ips: vec![v4_new],
-                    timestamp_ms: now_ms + 200,
-                },
-                EventLane::HighPriority,
-            )
+        let upd1 = send_dns(&engine, proc_id.pid, "svc.example", &[v4_new], now_ms + 200)
             .expect("fresh v4 dns accepted");
         assert_eq!(upd1.instance_id, inst_id);
         assert_eq!(upd1.exe_key, exe_key);
@@ -336,34 +325,20 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
 
         // Stale v4-only DNS response must yield `None` (no accepted IPs).
         assert!(
-            engine
-                .process_event_with_lane(
-                    &SensorEvent::DnsQuery {
-                        pid: proc_id.pid,
-                        query_name: "svc.example".to_string(),
-                        query_type: 1,
-                        resolved_ips: vec![v4_stale],
-                        timestamp_ms: now_ms + 100,
-                    },
-                    EventLane::HighPriority,
-                )
-                .is_none(),
+            send_dns(&engine, proc_id.pid, "svc.example", &[v4_stale], now_ms + 100).is_none(),
             "stale DNS response must return None and never wake pending WFP drops"
         );
 
         // Mixed query: stale v4 is dropped, fresh v6 is returned in `accepted_ips`.
-        let upd_mixed = engine
-            .process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: proc_id.pid,
-                    query_name: "svc.example".to_string(),
-                    query_type: 28,
-                    resolved_ips: vec![v4_stale, v6_new],
-                    timestamp_ms: now_ms + 150,
-                },
-                EventLane::HighPriority,
-            )
-            .expect("mixed query must accept v6");
+        let upd_mixed = send_dns_typed(
+            &engine,
+            proc_id.pid,
+            "svc.example",
+            28,
+            &[v4_stale, v6_new],
+            now_ms + 150,
+        )
+        .expect("mixed query must accept v6");
         assert_eq!(upd_mixed.accepted_ips, vec![v6_new]);
 
         // Even with `candidates.len() == 1`, `flush_ready_pending_wfp_drops` must keep a
@@ -371,15 +346,7 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
         let mut pending = VecDeque::new();
         let future_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         pending.push_back(PendingWfpDrop {
-            item: QueuedWfpDrop {
-                exe_path: exe.to_string(),
-                exe_key: exe_key.clone(),
-                dst_ip: v4_stale,
-                dst_port: 443,
-                protocol: 6,
-                timestamp_ms: now_ms + 250,
-                os_filter_id: 1,
-            },
+            item: make_queued_drop(exe, v4_stale, now_ms + 250, 1),
             deadline: future_deadline,
         });
         engine.flush_ready_pending_wfp_drops(
@@ -398,15 +365,7 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
         // Once the pending drop matches an IP present in `lookup_for_process`, it flushes.
         pending.clear();
         pending.push_back(PendingWfpDrop {
-            item: QueuedWfpDrop {
-                exe_path: exe.to_string(),
-                exe_key: exe_key.clone(),
-                dst_ip: v6_new,
-                dst_port: 443,
-                protocol: 6,
-                timestamp_ms: now_ms + 250,
-                os_filter_id: 2,
-            },
+            item: make_queued_drop(exe, v6_new, now_ms + 250, 2),
             deadline: future_deadline,
         });
         engine.flush_ready_pending_wfp_drops(
@@ -425,122 +384,52 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
         // DNS older than `AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS`, `on_wfp_drop_dequeued` must still
         // park the drop during the grace window, and `flush_ready_pending_wfp_drops` must keep
         // it parked on stale-age DNS until a fresh allowed DNS arrives.
-        struct StubDefense(std::sync::atomic::AtomicU64);
-        impl ledr_proto::ActiveDefenseController for StubDefense {
-            fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
-                Ok(())
-            }
-            fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
-                Ok(())
-            }
-            fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
-                Ok(())
-            }
-            fn add_wfp_app_rule(
-                &self,
-                _: &std::path::Path,
-                _: Option<IpAddr>,
-                _: bool,
-            ) -> Result<u64, String> {
-                Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-            }
-            fn remove_wfp_rule(&self, _: u64) -> Result<(), String> {
-                Ok(())
-            }
-        }
-        struct StubNotifier;
-        impl super::NotificationDispatcher for StubNotifier {
-            fn notify_alert(&self, _: &ledr_proto::AlertRecord) -> Result<(), String> {
-                Ok(())
-            }
-        }
-        struct FixedShaInspector(String);
-        impl super::BinaryInspector for FixedShaInspector {
-            fn inspect(&self, exe_path: &str) -> ledr_rules::BinaryIdentity {
-                ledr_rules::BinaryIdentity {
-                    exe_path: exe_path.to_string(),
-                    sha256: Some(self.0.clone()),
-                    authenticode: None,
-                }
-            }
-        }
-
         let test_sha = "a".repeat(64);
         let allow_exe = r"C:\Temp\multi_r03.exe";
         let allow_exe_key = WfpRuleManager::exe_key(allow_exe);
         let allow_store = LedrStore::open_in_memory().expect("open allow store");
         allow_store
-            .upsert_rule(&ledr_proto::AllowlistRuleRecord {
-                rule_id: "R-MULTI-ALLOW".to_string(),
-                scope: ledr_proto::RuleScope::NetworkAllow,
-                exe_path_pattern: allow_exe.to_string(),
-                sha256: Some(test_sha.clone()),
-                signer_subject: None,
-                root_thumbprint: None,
-                allowed_target: Some("good.example".to_string()),
-                created_at_ms: now_ms - 10_000,
-                created_by: "test".to_string(),
-            })
+            .upsert_rule(&make_net_rule(
+                "R-MULTI-ALLOW",
+                RuleScope::NetworkAllow,
+                allow_exe,
+                &test_sha,
+                "good.example",
+                now_ms - 10_000,
+            ))
             .expect("seed allow rule");
-        let multi_engine = DaemonEngine::start_with_dependencies(
+        let multi_engine = start_stopped_engine(
             allow_store,
-            SigmaEngine::default(),
-            EarlyPruner::default(),
             DaemonConfig {
                 outbound_firewall_enabled: true,
                 wfp_drop_dns_grace_ms: 500,
                 ..DaemonConfig::default()
             },
-            std::sync::Arc::new(StubDefense(std::sync::atomic::AtomicU64::new(1))),
-            std::sync::Arc::new(StubNotifier),
-            std::sync::Arc::new(FixedShaInspector(test_sha.clone())),
-        );
-        if let Some(h) = multi_engine.worker_handle.lock().await.take() {
-            h.abort();
-            let _ = h.await;
-        }
+            Arc::new(TestDefense::new(1)),
+            Arc::new(FixedShaInspector(test_sha.clone())),
+        )
+        .await;
         let proc_start_ms = now_ms - super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS - 20_000;
         let p_a =
             ProcessIdentity::new(9411, (proc_start_ms as u64 + 11_644_473_600_000) * 10_000);
         let p_b =
             ProcessIdentity::new(9412, (proc_start_ms as u64 + 11_644_473_600_000) * 10_000);
         for pid_id in [p_a, p_b] {
-            let _ = multi_engine.process_event_with_lane(
-                &SensorEvent::ProcessStart {
-                    identity: pid_id,
-                    parent_pid: 4,
-                    exe_path: allow_exe.to_string(),
-                    command_line: allow_exe.to_string(),
-                    user_sid: None,
-                },
-                EventLane::HighPriority,
-            );
+            send_process_start(&multi_engine, pid_id, allow_exe);
         }
         let shared_dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
         // Seed stale DNS (> AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS old) on sibling `p_a`.
-        let stale_upd = multi_engine
-            .process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: p_a.pid,
-                    query_name: "good.example".to_string(),
-                    query_type: 1,
-                    resolved_ips: vec![shared_dst],
-                    timestamp_ms: now_ms - super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS - 5_000,
-                },
-                EventLane::HighPriority,
-            )
-            .expect("stale-age dns accepted as initial");
+        let stale_upd = send_dns(
+            &multi_engine,
+            p_a.pid,
+            "good.example",
+            &[shared_dst],
+            now_ms - super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS - 5_000,
+        )
+        .expect("stale-age dns accepted as initial");
         let mut multi_pending = VecDeque::new();
         multi_engine.on_wfp_drop_dequeued(
-            QueuedWfpDrop {
-                exe_path: allow_exe.to_string(),
-                exe_key: allow_exe_key.clone(),
-                dst_ip: shared_dst,
-                dst_port: 443,
-                protocol: 6,
-                timestamp_ms: now_ms + 1_000,
-                os_filter_id: 3,
-            },
+            make_queued_drop(allow_exe, shared_dst, now_ms + 1_000, 3),
             &mut multi_pending,
         );
         assert_eq!(
@@ -560,18 +449,14 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
             1,
             "stale-age sibling DNS must not prematurely wake parked multi-instance drop"
         );
-        let fresh_upd = multi_engine
-            .process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: p_b.pid,
-                    query_name: "good.example".to_string(),
-                    query_type: 1,
-                    resolved_ips: vec![shared_dst],
-                    timestamp_ms: now_ms + 900,
-                },
-                EventLane::HighPriority,
-            )
-            .expect("fresh dns accepted");
+        let fresh_upd = send_dns(
+            &multi_engine,
+            p_b.pid,
+            "good.example",
+            &[shared_dst],
+            now_ms + 900,
+        )
+        .expect("fresh dns accepted");
         multi_engine.flush_ready_pending_wfp_drops(
             &fresh_upd.instance_id,
             &allow_exe_key,
@@ -592,116 +477,50 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
         let blk_store = LedrStore::open_in_memory().expect("open blk store");
         for (rid, dom) in [("R-BLK-A", "a.bad.example"), ("R-BLK-B", "b.bad.example")] {
             blk_store
-                .upsert_rule(&ledr_proto::AllowlistRuleRecord {
-                    rule_id: rid.to_string(),
-                    scope: ledr_proto::RuleScope::NetworkBlock,
-                    exe_path_pattern: blk_exe.to_string(),
-                    sha256: Some(test_sha.clone()),
-                    signer_subject: None,
-                    root_thumbprint: None,
-                    allowed_target: Some(dom.to_string()),
-                    created_at_ms: now_ms - 10_000,
-                    created_by: "test".to_string(),
-                })
+                .upsert_rule(&make_net_rule(
+                    rid,
+                    RuleScope::NetworkBlock,
+                    blk_exe,
+                    &test_sha,
+                    dom,
+                    now_ms - 10_000,
+                ))
                 .expect("seed block rule");
         }
-        let blk_engine = DaemonEngine::start_with_dependencies(
+        let blk_engine = start_stopped_engine(
             blk_store,
-            SigmaEngine::default(),
-            EarlyPruner::default(),
             DaemonConfig {
                 outbound_firewall_enabled: true,
                 ..DaemonConfig::default()
             },
-            std::sync::Arc::new(StubDefense(std::sync::atomic::AtomicU64::new(100))),
-            std::sync::Arc::new(StubNotifier),
-            std::sync::Arc::new(FixedShaInspector(test_sha)),
-        );
-        if let Some(h) = blk_engine.worker_handle.lock().await.take() {
-            h.abort();
-            let _ = h.await;
-        }
+            Arc::new(TestDefense::new(100)),
+            Arc::new(FixedShaInspector(test_sha)),
+        )
+        .await;
         let shared_blk_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88));
         let moved_a_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88));
         let moved_b_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 89));
         let bp1 = ProcessIdentity::new(9421, (now_ms as u64 + 11_644_473_600_000) * 10_000);
         let bp2 = ProcessIdentity::new(9422, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = blk_engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: bp1,
-                parent_pid: 4,
-                exe_path: blk_exe.to_string(),
-                command_line: blk_exe.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = blk_engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: bp1.pid,
-                query_name: "a.bad.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![shared_blk_ip],
-                timestamp_ms: now_ms + 100,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = blk_engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: bp1.pid,
-                query_name: "b.bad.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![shared_blk_ip],
-                timestamp_ms: now_ms + 110,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&blk_engine, bp1, blk_exe);
+        let _ = send_dns(&blk_engine, bp1.pid, "a.bad.example", &[shared_blk_ip], now_ms + 100);
+        let _ = send_dns(&blk_engine, bp1.pid, "b.bad.example", &[shared_blk_ip], now_ms + 110);
         assert!(blk_engine.has_active_wfp_filter(blk_exe, Some(shared_blk_ip), false));
         // `bp1` exits, clearing `ProcessDnsHistory::entries` completely.
-        let _ = blk_engine.process_event_with_lane(
-            &SensorEvent::ProcessStop {
-                pid: bp1.pid,
-                exit_time_100ns: (now_ms as u64 + 11_644_473_600_200) * 10_000,
-                exit_code: 0,
-            },
-            EventLane::HighPriority,
+        send_process_stop(
+            &blk_engine,
+            bp1.pid,
+            (now_ms as u64 + 11_644_473_600_200) * 10_000,
         );
-        let _ = blk_engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: bp2,
-                parent_pid: 4,
-                exe_path: blk_exe.to_string(),
-                command_line: blk_exe.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&blk_engine, bp2, blk_exe);
         // `a.bad.example` moves off `shared_blk_ip`, but `b.bad.example` still maps to it.
-        let _ = blk_engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: bp2.pid,
-                query_name: "a.bad.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![moved_a_ip],
-                timestamp_ms: now_ms + 300,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&blk_engine, bp2.pid, "a.bad.example", &[moved_a_ip], now_ms + 300);
         assert!(
             blk_engine.has_active_wfp_filter(blk_exe, Some(shared_blk_ip), false),
             "shared_blk_ip must stay blocked while b.bad.example still points there in latest_domain_by_exe after bp1 exit"
         );
         // Once `b.bad.example` also moves off `shared_blk_ip`, the retired block is removed.
-        let _ = blk_engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: bp2.pid,
-                query_name: "b.bad.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![moved_b_ip],
-                timestamp_ms: now_ms + 400,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&blk_engine, bp2.pid, "b.bad.example", &[moved_b_ip], now_ms + 400);
         assert!(
             !blk_engine.has_active_wfp_filter(blk_exe, Some(shared_blk_ip), false),
             "shared_blk_ip block must be removed once both blocked domains rotated away"

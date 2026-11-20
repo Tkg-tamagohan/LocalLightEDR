@@ -515,42 +515,43 @@ mod tests {
         assert!(!service_strict.foreground);
         assert!(!service_strict.dev_bypass_auth);
 
-        assert!(parse_cli_args(["ledr-daemon", "--db"]).is_err());
-        assert!(parse_cli_args(["ledr-daemon", "--ui-sha256"]).is_err());
-        assert!(parse_cli_args(["ledr-daemon", "--ui-signer"]).is_err());
         // BUG_0007: --ui-signer without --ui-root-thumbprint must be rejected at startup.
-        assert!(
-            parse_cli_args(["ledr-daemon", "--ui-signer", "CN=LocalEDR"]).is_err(),
-            "--ui-signer alone must fail (root thumbprint pin required)"
-        );
-        // Under --dev-bypass-auth no authorization runs, so the signer/thumbprint
+        // BUG_0004: under --dev-bypass-auth no authorization runs, so the signer/thumbprint
         // pair is not required.
-        assert!(
-            parse_cli_args([
-                "ledr-daemon",
-                "--dev-bypass-auth",
-                "--ui-signer",
-                "CN=LocalEDR",
-            ])
-            .is_ok(),
-            "--dev-bypass-auth + --ui-signer must be accepted"
-        );
-        assert!(
-            parse_cli_args([
-                "ledr-daemon",
-                "--ui-signer",
-                "CN=LocalEDR",
-                "--ui-root-thumbprint",
-                "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
-            ])
-            .is_ok(),
-            "signer + root thumbprint pair must be accepted"
-        );
-        assert!(parse_cli_args(["ledr-daemon", "--ui-root-thumbprint"]).is_err());
-        assert!(parse_cli_args(["ledr-daemon", "--nrd-feed-url"]).is_err());
-        assert!(parse_cli_args(["ledr-daemon", "--nrd-feed-url", "   "]).is_err());
-        assert!(parse_cli_args(["ledr-daemon", "--nrd-cache"]).is_err());
-        assert!(parse_cli_args(["ledr-daemon", "--nrd-cache", ""]).is_err());
-        assert!(parse_cli_args(["ledr-daemon", "--unknown"]).is_err());
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("--db missing value", &["ledr-daemon", "--db"], false),
+            ("--ui-sha256 missing value", &["ledr-daemon", "--ui-sha256"], false),
+            ("--ui-signer missing value", &["ledr-daemon", "--ui-signer"], false),
+            (
+                "--ui-signer alone must fail (root thumbprint pin required)",
+                &["ledr-daemon", "--ui-signer", "CN=LocalEDR"],
+                false,
+            ),
+            (
+                "--dev-bypass-auth + --ui-signer must be accepted",
+                &["ledr-daemon", "--dev-bypass-auth", "--ui-signer", "CN=LocalEDR"],
+                true,
+            ),
+            (
+                "signer + root thumbprint pair must be accepted",
+                &[
+                    "ledr-daemon",
+                    "--ui-signer",
+                    "CN=LocalEDR",
+                    "--ui-root-thumbprint",
+                    "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+                ],
+                true,
+            ),
+            ("--ui-root-thumbprint missing value", &["ledr-daemon", "--ui-root-thumbprint"], false),
+            ("--nrd-feed-url missing value", &["ledr-daemon", "--nrd-feed-url"], false),
+            ("--nrd-feed-url whitespace", &["ledr-daemon", "--nrd-feed-url", "   "], false),
+            ("--nrd-cache missing value", &["ledr-daemon", "--nrd-cache"], false),
+            ("--nrd-cache empty", &["ledr-daemon", "--nrd-cache", ""], false),
+            ("unknown flag", &["ledr-daemon", "--unknown"], false),
+        ];
+        for (label, args, expect_ok) in cases {
+            assert_eq!(parse_cli_args(args.iter().copied()).is_ok(), *expect_ok, "{label}");
+        }
     }
 }

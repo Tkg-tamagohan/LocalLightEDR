@@ -9,15 +9,19 @@ use std::net::{IpAddr, Ipv4Addr};
 /// early wakeup, WFP drop triage, and `NetworkConnect` hint resolution.
 #[test]
 fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence() {
-    use super::{
-        current_unix_ms, select_outbound_decision_for_domains, DaemonConfig, DaemonEngine,
-        EventLane, QueuedWfpDrop, WfpRuleManager, MAX_DOMAINS_PER_PROCESS_IP,
+    use super::helpers::{
+        assert_domain_policy_hints, make_net_rule, make_pending_net_alert, make_queued_drop,
+        send_connect, send_dns, send_process_start, send_process_stop, start_stopped_engine,
+        FixedShaInspector, TestDefense,
     };
-    use ledr_proto::{AllowlistRuleRecord, ProcessIdentity, RuleScope, SensorEvent};
-    use ledr_rules::{BinaryIdentity, EarlyPruner, OutboundDecision, SigmaEngine};
+    use super::{
+        current_unix_ms, select_outbound_decision_for_domains, DaemonConfig, WfpRuleManager,
+        MAX_DOMAINS_PER_PROCESS_IP,
+    };
+    use ledr_proto::{ProcessIdentity, RuleScope};
+    use ledr_rules::{BinaryIdentity, OutboundDecision};
     use ledr_store::LedrStore;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     // Part A: `ProcessDnsHistory` multi-domain retention, selective eviction, and cap bound.
@@ -150,28 +154,22 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         sha256: Some(sha.clone()),
         authenticode: None,
     };
-    let allow_rule = AllowlistRuleRecord {
-        rule_id: "R-ALLOW".to_string(),
-        scope: RuleScope::NetworkAllow,
-        exe_path_pattern: app_identity.exe_path.clone(),
-        sha256: Some(sha.clone()),
-        signer_subject: None,
-        root_thumbprint: None,
-        allowed_target: Some("allowed.example".to_string()),
-        created_at_ms: 1,
-        created_by: "test".to_string(),
-    };
-    let block_rule = AllowlistRuleRecord {
-        rule_id: "R-BLOCK".to_string(),
-        scope: RuleScope::NetworkBlock,
-        exe_path_pattern: app_identity.exe_path.clone(),
-        sha256: Some(sha.clone()),
-        signer_subject: None,
-        root_thumbprint: None,
-        allowed_target: Some("blocked.example".to_string()),
-        created_at_ms: 2,
-        created_by: "test".to_string(),
-    };
+    let allow_rule = make_net_rule(
+        "R-ALLOW",
+        RuleScope::NetworkAllow,
+        &app_identity.exe_path,
+        &sha,
+        "allowed.example",
+        1,
+    );
+    let block_rule = make_net_rule(
+        "R-BLOCK",
+        RuleScope::NetworkBlock,
+        &app_identity.exe_path,
+        &sha,
+        "blocked.example",
+        2,
+    );
     let rules = vec![allow_rule.clone(), block_rule];
 
     // 1. ProtectedOs short-circuits immediately.
@@ -250,54 +248,6 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
 
     // Part C: Engine-level grace parking, non-premature wakeup on unallowed domain, delayed
     // allowed wakeup without mis-suspension or permit revocation, and `dns_history_capacity`.
-    struct CountingDefense {
-        next_handle: AtomicU64,
-        suspends: AtomicUsize,
-        fail_removes: std::sync::atomic::AtomicBool,
-    }
-    impl ledr_proto::ActiveDefenseController for CountingDefense {
-        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
-            self.suspends.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
-            Ok(())
-        }
-        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
-            Ok(())
-        }
-        fn add_wfp_app_rule(
-            &self,
-            _: &std::path::Path,
-            _: Option<IpAddr>,
-            _: bool,
-        ) -> Result<u64, String> {
-            Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
-        }
-        fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
-            if self.fail_removes.load(Ordering::Acquire) {
-                return Err(format!("mock remove failure for handle {filter_id}"));
-            }
-            Ok(())
-        }
-    }
-    struct StubNotifier;
-    impl super::NotificationDispatcher for StubNotifier {
-        fn notify_alert(&self, _: &ledr_proto::AlertRecord) -> Result<(), String> {
-            Ok(())
-        }
-    }
-    struct FixedShaInspector(String);
-    impl super::BinaryInspector for FixedShaInspector {
-        fn inspect(&self, exe_path: &str) -> BinaryIdentity {
-            BinaryIdentity {
-                exe_path: exe_path.to_string(),
-                sha256: Some(self.0.clone()),
-                authenticode: None,
-            }
-        }
-    }
-
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -305,15 +255,9 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
     rt.block_on(async {
         let store = LedrStore::open_in_memory().expect("open store");
         store.upsert_rule(&allow_rule).expect("seed allow rule");
-        let defense = Arc::new(CountingDefense {
-            next_handle: AtomicU64::new(1),
-            suspends: AtomicUsize::new(0),
-            fail_removes: std::sync::atomic::AtomicBool::new(false),
-        });
-        let engine = DaemonEngine::start_with_dependencies(
+        let defense = Arc::new(TestDefense::new(1));
+        let engine = start_stopped_engine(
             store.clone(),
-            SigmaEngine::default(),
-            EarlyPruner::default(),
             DaemonConfig {
                 outbound_firewall_enabled: true,
                 wfp_drop_dns_grace_ms: 500,
@@ -321,66 +265,27 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 ..DaemonConfig::default()
             },
             defense.clone(),
-            Arc::new(StubNotifier),
             Arc::new(FixedShaInspector(sha.clone())),
-        );
-        if let Some(h) = engine.worker_handle.lock().await.take() {
-            h.abort();
-            let _ = h.await;
-        }
+        )
+        .await;
 
         let now_ms = current_unix_ms();
         let exe_path = r"C:\Temp\shared_cdn_app.exe";
         let exe_key = WfpRuleManager::exe_key(exe_path);
         let p1 = ProcessIdentity::new(9601, (now_ms as u64 + 11_644_473_600_000) * 10_000);
         let p2 = ProcessIdentity::new(9602, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: p1,
-                parent_pid: 4,
-                exe_path: exe_path.to_string(),
-                command_line: exe_path.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: p2,
-                parent_pid: 4,
-                exe_path: r"C:\Tools\other_app.exe".to_string(),
-                command_line: r"C:\Tools\other_app.exe".to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine, p1, exe_path);
+        send_process_start(&engine, p2, r"C:\Tools\other_app.exe");
         assert!(engine.has_active_wfp_filter(exe_path, None, false));
 
         // Newer unallowed `other.example` arrives first on `shared_ip`.
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "other.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![shared_ip],
-                timestamp_ms: now_ms + 2_000,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p1.pid, "other.example", &[shared_ip], now_ms + 2_000);
 
         // Drop arrives while only unallowed `other.example` is in history -> MUST park because
         // a domain-scoped NetworkAllow rule exists for `exe_path`.
         let mut pending = VecDeque::new();
         engine.on_wfp_drop_dequeued(
-            QueuedWfpDrop {
-                exe_path: exe_path.to_string(),
-                exe_key: exe_key.clone(),
-                dst_ip: shared_ip,
-                dst_port: 443,
-                protocol: 6,
-                timestamp_ms: now_ms + 2_050,
-                os_filter_id: 1,
-            },
+            make_queued_drop(exe_path, shared_ip, now_ms + 2_050, 1),
             &mut pending,
         );
         assert_eq!(
@@ -390,17 +295,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         );
 
         // Another unallowed domain arriving must NOT prematurely wake the parked drop.
-        let upd_third = engine
-            .process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: p1.pid,
-                    query_name: "third.example".to_string(),
-                    query_type: 1,
-                    resolved_ips: vec![shared_ip],
-                    timestamp_ms: now_ms + 2_100,
-                },
-                EventLane::HighPriority,
-            )
+        let upd_third = send_dns(&engine, p1.pid, "third.example", &[shared_ip], now_ms + 2_100)
             .expect("third.example accepted");
         engine.flush_ready_pending_wfp_drops(
             &upd_third.instance_id,
@@ -417,18 +312,9 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
 
         // Delayed `allowed.example` (t=1500 < 2000) arrives -> pre-materializes IP Permit and
         // wakes parked drop immediately without suspending or revoking the Permit!
-        let upd_allowed = engine
-            .process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: p1.pid,
-                    query_name: "allowed.example".to_string(),
-                    query_type: 1,
-                    resolved_ips: vec![shared_ip],
-                    timestamp_ms: now_ms + 1_500,
-                },
-                EventLane::HighPriority,
-            )
-            .expect("delayed allowed.example accepted");
+        let upd_allowed =
+            send_dns(&engine, p1.pid, "allowed.example", &[shared_ip], now_ms + 1_500)
+                .expect("delayed allowed.example accepted");
         assert!(engine.has_active_wfp_filter(exe_path, Some(shared_ip), true));
         engine.flush_ready_pending_wfp_drops(
             &upd_allowed.instance_id,
@@ -445,21 +331,12 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             engine.has_active_wfp_filter(exe_path, Some(shared_ip), true),
             "IP Permit for allowed.example must survive WFP drop triage"
         );
-        assert_eq!(defense.suspends.load(Ordering::Relaxed), 0);
+        assert_eq!(defense.suspends(), 0);
         assert!(store.list_alerts(None, 20).unwrap().is_empty());
 
         // Another process also resolving `allowed.example` must NOT cause `p1`'s own
         // `allowed.example` raw hint to be mistaken for cross-process contamination.
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "allowed.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![shared_ip],
-                timestamp_ms: now_ms + 2_200,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p2.pid, "allowed.example", &[shared_ip], now_ms + 2_200);
         let resolved_cands = engine.resolve_effective_domain_candidates(
             Some(&p1.instance_id()),
             Some(exe_path),
@@ -478,17 +355,14 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         // Currently `shared_ip` has a named `DomainPolicy` Permit tagged `["allowed.example"]`
         // AND `other.example` is in `p1`'s DNS history for `shared_ip`.
         // Adding `NetworkBlock("other.example")` MUST revoke the named shared-IP Permit!
-        let block_other_rule = AllowlistRuleRecord {
-            rule_id: "R-BLK-OTHER".to_string(),
-            scope: RuleScope::NetworkBlock,
-            exe_path_pattern: exe_path.to_string(),
-            sha256: Some(sha.clone()),
-            signer_subject: None,
-            root_thumbprint: None,
-            allowed_target: Some("other.example".to_string()),
-            created_at_ms: now_ms + 2_300,
-            created_by: "test".to_string(),
-        };
+        let block_other_rule = make_net_rule(
+            "R-BLK-OTHER",
+            RuleScope::NetworkBlock,
+            exe_path,
+            &sha,
+            "other.example",
+            now_ms + 2_300,
+        );
         engine
             .upsert_policy_rule(&block_other_rule)
             .expect("upsert block rule for other.example");
@@ -499,16 +373,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
 
         // Re-querying `allowed.example -> shared_ip` while `other.example` is still active on
         // `shared_ip` MUST NOT re-create the Permit (deny-overrides-allow in prematerialize).
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "allowed.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![shared_ip],
-                timestamp_ms: now_ms + 2_400,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p1.pid, "allowed.example", &[shared_ip], now_ms + 2_400);
         assert!(
             !engine.has_active_wfp_filter(exe_path, Some(shared_ip), true),
             "prematerialize must suppress Permit when another active domain on shared_ip is blocked"
@@ -527,9 +392,9 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             )
             .expect("install multi-hint permit");
         }
-        defense.fail_removes.store(true, Ordering::Release);
+        defense.set_fail_removes(true);
         let rep_dup_check = engine.deploy_persisted_network_rules();
-        defense.fail_removes.store(false, Ordering::Release);
+        defense.set_fail_removes(false);
         assert_eq!(
             rep_dup_check.failed, 1,
             "failed removal of shared-IP Permit must not be double-counted across reconcile + DNS cross-check"
@@ -554,7 +419,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             )
             .expect("install allowed-only permit");
         }
-        defense.fail_removes.store(true, Ordering::Release);
+        defense.set_fail_removes(true);
         let del_res = engine.delete_policy_rule("R-ALLOW");
         assert!(
             matches!(del_res, Err(super::PolicyRuleError::FirewallSync(_))),
@@ -564,66 +429,39 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             store.get_rule("R-ALLOW").unwrap().is_some(),
             "R-ALLOW must be rolled back into SQLite after failed Permit removal"
         );
-        let unrelated_allow = AllowlistRuleRecord {
-            rule_id: "R-UNRELATED-ALLOW".to_string(),
-            scope: RuleScope::NetworkAllow,
-            exe_path_pattern: exe_path.to_string(),
-            sha256: Some(sha.clone()),
-            signer_subject: None,
-            root_thumbprint: None,
-            allowed_target: Some("unrelated.example".to_string()),
-            created_at_ms: now_ms + 2_450,
-            created_by: "test".to_string(),
-        };
+        let unrelated_allow = make_net_rule(
+            "R-UNRELATED-ALLOW",
+            RuleScope::NetworkAllow,
+            exe_path,
+            &sha,
+            "unrelated.example",
+            now_ms + 2_450,
+        );
         engine
             .upsert_policy_rule(&unrelated_allow)
             .expect("unrelated domain rule save on same exe must succeed");
-        defense.fail_removes.store(false, Ordering::Release);
+        defense.set_fail_removes(false);
         let _ = engine.deploy_persisted_network_rules();
 
         // Part F: `AllowPermanent` multi-domain hint propagation + exe-level deny-overrides-allow
         // suppression across sibling/exited process (`latest_domain_by_exe`), AND
         // `evaluate_and_handle_outbound_connect` preserving that Permit suppression!
         let clean_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 78));
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "clean-a.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![clean_ip],
-                timestamp_ms: now_ms + 2_500,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "clean-b.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![clean_ip],
-                timestamp_ms: now_ms + 2_510,
-            },
-            EventLane::HighPriority,
-        );
-        let clean_alert = ledr_proto::AlertRecord {
-            alert_id: "AL-P3-46A-CLEAN".to_string(),
-            timestamp_ms: now_ms + 2_520,
-            severity: ledr_proto::AlertSeverity::High,
-            source_layer: "LAYER_3_NETWORK".to_string(),
-            rule_id: "LEDR-NET-HIGH-RISK-PATH".to_string(),
-            title: "Clean multi-domain alert".to_string(),
-            process_instance_id: Some(p1.instance_id()),
-            process_suspended: false,
-            status: ledr_proto::AlertStatus::Pending,
-            context_json: serde_json::json!({
+        let _ = send_dns(&engine, p1.pid, "clean-a.example", &[clean_ip], now_ms + 2_500);
+        let _ = send_dns(&engine, p1.pid, "clean-b.example", &[clean_ip], now_ms + 2_510);
+        let clean_alert = make_pending_net_alert(
+            "AL-P3-46A-CLEAN",
+            now_ms + 2_520,
+            "LEDR-NET-HIGH-RISK-PATH",
+            "Clean multi-domain alert",
+            Some(p1.instance_id()),
+            serde_json::json!({
                 "exe_path": exe_path,
                 "dst_ip": clean_ip.to_string(),
                 "domain_hint": "clean-a.example",
                 "sha256": sha,
-            })
-            .to_string(),
-            resolved_at_ms: None,
-        };
+            }),
+        );
         store.record_alert(&clean_alert).expect("record clean alert");
         engine
             .resolve_alert(
@@ -634,16 +472,12 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 },
             )
             .expect("AllowPermanent clean multi-domain");
-        assert_eq!(
-            engine
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_path, Some(clean_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["clean-a.example".to_string(), "clean-b.example".to_string()],
-            }),
-            "AllowPermanent must propagate all candidate domain hints on clean shared IP"
+        assert_domain_policy_hints(
+            &engine,
+            exe_path,
+            clean_ip,
+            &["clean-a.example", "clean-b.example"],
+            "AllowPermanent must propagate all candidate domain hints on clean shared IP",
         );
 
         // Exe-level deny-overrides-allow on shared IP where sibling `p3` resolved blocked
@@ -651,75 +485,39 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         // filter yet), while `p1` resolved `share-allow.example` on the same IP.
         let shared_deny_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 79));
         let p3 = ProcessIdentity::new(9603, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: p3,
-                parent_pid: 4,
-                exe_path: exe_path.to_string(),
-                command_line: exe_path.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine, p3, exe_path);
         // Temporarily remove R-BLK-OTHER before p3 resolves so no DomainPolicy Block is
         // materialized on `shared_deny_ip`, then re-insert R-BLK-OTHER and exit p3.
         engine
             .delete_policy_rule("R-BLK-OTHER")
             .expect("remove block before p3 dns");
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p3.pid,
-                query_name: "other.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![shared_deny_ip],
-                timestamp_ms: now_ms + 2_600,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::ProcessStop {
-                pid: p3.pid,
-                exit_code: 0,
-                exit_time_100ns: ((now_ms + 2_610) as u64 + 11_644_473_600_000) * 10_000,
-            },
-            EventLane::HighPriority,
+        let _ = send_dns(&engine, p3.pid, "other.example", &[shared_deny_ip], now_ms + 2_600);
+        send_process_stop(
+            &engine,
+            p3.pid,
+            ((now_ms + 2_610) as u64 + 11_644_473_600_000) * 10_000,
         );
         engine
             .upsert_policy_rule(&block_other_rule)
             .expect("re-insert block after p3 exit");
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "share-allow.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![shared_deny_ip],
-                timestamp_ms: now_ms + 2_620,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p1.pid, "share-allow.example", &[shared_deny_ip], now_ms + 2_620);
         assert!(
             !engine.has_active_wfp_filter(exe_path, Some(shared_deny_ip), false),
             "no IP Block filter exists yet on shared_deny_ip"
         );
-        let deny_share_alert = ledr_proto::AlertRecord {
-            alert_id: "AL-P3-46A-DENY-SHARE".to_string(),
-            timestamp_ms: now_ms + 2_630,
-            severity: ledr_proto::AlertSeverity::High,
-            source_layer: "LAYER_3_NETWORK".to_string(),
-            rule_id: "LEDR-NET-HIGH-RISK-PATH".to_string(),
-            title: "Shared deny IP alert".to_string(),
-            process_instance_id: Some(p1.instance_id()),
-            process_suspended: false,
-            status: ledr_proto::AlertStatus::Pending,
-            context_json: serde_json::json!({
+        let deny_share_alert = make_pending_net_alert(
+            "AL-P3-46A-DENY-SHARE",
+            now_ms + 2_630,
+            "LEDR-NET-HIGH-RISK-PATH",
+            "Shared deny IP alert",
+            Some(p1.instance_id()),
+            serde_json::json!({
                 "exe_path": exe_path,
                 "dst_ip": shared_deny_ip.to_string(),
                 "domain_hint": "share-allow.example",
                 "sha256": sha,
-            })
-            .to_string(),
-            resolved_at_ms: None,
-        };
+            }),
+        );
         store
             .record_alert(&deny_share_alert)
             .expect("record deny-share alert");
@@ -738,17 +536,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         );
         // Subsequent outbound connect from `p1` (which only sees `share-allow.example` in its
         // own per-instance history) must ALSO keep the exe-wide WFP Permit suppressed!
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: p1.pid,
-                protocol: 6,
-                dst_ip: shared_deny_ip,
-                dst_port: 443,
-                domain_hint: Some("share-allow.example".to_string()),
-                timestamp_ms: now_ms + 2_640,
-            },
-            EventLane::HighPriority,
-        );
+        send_connect(&engine, p1.pid, shared_deny_ip, Some("share-allow.example"), now_ms + 2_640);
         assert!(
             !engine.has_active_wfp_filter(exe_path, Some(shared_deny_ip), true),
             "evaluate_and_handle_outbound_connect must NOT install exe-wide IP Permit while exe-level blocked domain shares shared_deny_ip"
@@ -756,15 +544,12 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
 
         // Verify `DaemonConfig::dns_history_capacity` (`4`) bounds `latest_domain_by_exe`.
         for idx in 0..6 {
-            let _ = engine.process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: p2.pid,
-                    query_name: format!("cap-{idx}.example"),
-                    query_type: 1,
-                    resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 100 + idx))],
-                    timestamp_ms: now_ms + 3_000 + idx as i64,
-                },
-                EventLane::HighPriority,
+            let _ = send_dns(
+                &engine,
+                p2.pid,
+                &format!("cap-{idx}.example"),
+                &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 100 + idx))],
+                now_ms + 3_000 + idx as i64,
             );
         }
         let latest_len = engine
@@ -788,15 +573,9 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         //      overriding an existing live Permit, non-CIDR live Permit suppression / no-Permit
         //      alert / blocked-candidate non-suppression, and CIDR Block pure vs hybrid hints).
         let store_g = LedrStore::open_in_memory().expect("open store_g");
-        let defense_g = Arc::new(CountingDefense {
-            next_handle: AtomicU64::new(100),
-            suspends: AtomicUsize::new(0),
-            fail_removes: std::sync::atomic::AtomicBool::new(false),
-        });
-        let engine_g = DaemonEngine::start_with_dependencies(
+        let defense_g = Arc::new(TestDefense::new(100));
+        let engine_g = start_stopped_engine(
             store_g.clone(),
-            SigmaEngine::default(),
-            EarlyPruner::default(),
             DaemonConfig {
                 outbound_firewall_enabled: true,
                 wfp_drop_dns_grace_ms: 500,
@@ -804,41 +583,17 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 ..DaemonConfig::default()
             },
             defense_g.clone(),
-            Arc::new(StubNotifier),
             Arc::new(FixedShaInspector(sha.clone())),
-        );
-        if let Some(h) = engine_g.worker_handle.lock().await.take() {
-            h.abort();
-            let _ = h.await;
-        }
+        )
+        .await;
 
         let exe_g = r"C:\Temp\block_hygiene_app.exe";
-        let exe_g_key = WfpRuleManager::exe_key(exe_g);
         let gp1 = ProcessIdentity::new(9701, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: gp1,
-                parent_pid: 4,
-                exe_path: exe_g.to_string(),
-                command_line: exe_g.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine_g, gp1, exe_g);
         assert!(engine_g.has_active_wfp_filter(exe_g, None, false));
 
         let mk_net_rule = |rule_id: &str, scope: RuleScope, target: &str, created_at_ms: i64| {
-            AllowlistRuleRecord {
-                rule_id: rule_id.to_string(),
-                scope,
-                exe_path_pattern: exe_g.to_string(),
-                sha256: Some(sha.clone()),
-                signer_subject: None,
-                root_thumbprint: None,
-                allowed_target: Some(target.to_string()),
-                created_at_ms,
-                created_by: "test".to_string(),
-            }
+            make_net_rule(rule_id, scope, exe_g, &sha, target, created_at_ms)
         };
 
         // Part G1: Pure CIDR NetworkBlock connect (with no DNS and with unblocked domain) and
@@ -846,16 +601,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         let cidr_no_dns_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
         let cidr_innocent_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11));
         let cidr_premat_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 12));
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "innocent.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![cidr_innocent_ip],
-                timestamp_ms: now_ms + 100,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine_g, gp1.pid, "innocent.example", &[cidr_innocent_ip], now_ms + 100);
         engine_g
             .upsert_policy_rule(&mk_net_rule(
                 "R-CIDR-PURE",
@@ -867,49 +613,27 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_no_dns_ip), false));
         assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_innocent_ip), false));
 
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: gp1.pid,
-                protocol: 6,
-                dst_ip: cidr_no_dns_ip,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 110,
-            },
-            EventLane::HighPriority,
+        send_connect(&engine_g, gp1.pid, cidr_no_dns_ip, None, now_ms + 110);
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            cidr_no_dns_ip,
+            &[],
+            "pure CIDR connect without DNS must leave domain_hints empty, not tag CIDR literal",
         );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(cidr_no_dns_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            }),
-            "pure CIDR connect without DNS must leave domain_hints empty, not tag CIDR literal"
+        send_connect(
+            &engine_g,
+            gp1.pid,
+            cidr_innocent_ip,
+            Some("innocent.example"),
+            now_ms + 115,
         );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: gp1.pid,
-                protocol: 6,
-                dst_ip: cidr_innocent_ip,
-                dst_port: 443,
-                domain_hint: Some("innocent.example".to_string()),
-                timestamp_ms: now_ms + 115,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(cidr_innocent_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            }),
-            "pure CIDR connect with unblocked domain must leave domain_hints empty"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            cidr_innocent_ip,
+            &[],
+            "pure CIDR connect with unblocked domain must leave domain_hints empty",
         );
         // When any domain-scoped rule exists (enabling DNS prematerialization), a DnsQuery
         // for an unblocked domain resolving inside `R-CIDR-PURE` must also materialize an
@@ -922,26 +646,13 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 now_ms + 118,
             ))
             .expect("upsert unrelated domain rule to enable prematerialize");
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "innocent2.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![cidr_premat_ip],
-                timestamp_ms: now_ms + 120,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(cidr_premat_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            }),
-            "pure CIDR prematerialize must keep domain_hints empty"
+        let _ = send_dns(&engine_g, gp1.pid, "innocent2.example", &[cidr_premat_ip], now_ms + 120);
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            cidr_premat_ip,
+            &[],
+            "pure CIDR prematerialize must keep domain_hints empty",
         );
         engine_g
             .delete_policy_rule("R-UNRELATED-DOM-G1")
@@ -957,26 +668,8 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         // `blk.example`. Connect must tag ONLY `["blk.example"]`, and deleting `R-CIDR-HYBRID`
         // must keep the block filter active until `R-BLK-HYBRID` is also deleted.
         let hybrid_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "blk.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![hybrid_ip],
-                timestamp_ms: now_ms + 200,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "innocent.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![hybrid_ip],
-                timestamp_ms: now_ms + 300,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine_g, gp1.pid, "blk.example", &[hybrid_ip], now_ms + 200);
+        let _ = send_dns(&engine_g, gp1.pid, "innocent.example", &[hybrid_ip], now_ms + 300);
         engine_g
             .upsert_policy_rule(&mk_net_rule(
                 "R-CIDR-HYBRID",
@@ -995,27 +688,13 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             .expect("upsert hybrid domain block");
         assert!(!engine_g.has_active_wfp_filter(exe_g, Some(hybrid_ip), false));
 
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: gp1.pid,
-                protocol: 6,
-                dst_ip: hybrid_ip,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 310,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(hybrid_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["blk.example".to_string()],
-            }),
-            "hybrid CIDR + domain connect must record only domain-specific blocked hint blk.example"
+        send_connect(&engine_g, gp1.pid, hybrid_ip, None, now_ms + 310);
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            hybrid_ip,
+            &["blk.example"],
+            "hybrid CIDR + domain connect must record only domain-specific blocked hint blk.example",
         );
         engine_g
             .delete_policy_rule("R-CIDR-HYBRID")
@@ -1024,16 +703,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             engine_g.has_active_wfp_filter(exe_g, Some(hybrid_ip), false),
             "deleting R-CIDR-HYBRID must keep DomainPolicy Block alive while R-BLK-HYBRID remains"
         );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(hybrid_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["blk.example".to_string()],
-            })
-        );
+        assert_domain_policy_hints(&engine_g, exe_g, hybrid_ip, &["blk.example"], "");
         engine_g
             .delete_policy_rule("R-BLK-HYBRID")
             .expect("delete hybrid domain block");
@@ -1044,35 +714,14 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         // `blk2.example` (excluding `innocent-multi.example`), and deleting `R-BLK-1` must
         // preserve the block filter with `["blk2.example"]`.
         let multi_blk_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30));
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "blk2.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![multi_blk_ip],
-                timestamp_ms: now_ms + 400,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "blk1.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![multi_blk_ip],
-                timestamp_ms: now_ms + 500,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "innocent-multi.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![multi_blk_ip],
-                timestamp_ms: now_ms + 600,
-            },
-            EventLane::HighPriority,
+        let _ = send_dns(&engine_g, gp1.pid, "blk2.example", &[multi_blk_ip], now_ms + 400);
+        let _ = send_dns(&engine_g, gp1.pid, "blk1.example", &[multi_blk_ip], now_ms + 500);
+        let _ = send_dns(
+            &engine_g,
+            gp1.pid,
+            "innocent-multi.example",
+            &[multi_blk_ip],
+            now_ms + 600,
         );
         engine_g
             .upsert_policy_rule(&mk_net_rule(
@@ -1092,27 +741,13 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             .expect("upsert R-BLK-2");
         assert!(!engine_g.has_active_wfp_filter(exe_g, Some(multi_blk_ip), false));
 
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: gp1.pid,
-                protocol: 6,
-                dst_ip: multi_blk_ip,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 610,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(multi_blk_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["blk1.example".to_string(), "blk2.example".to_string()],
-            }),
-            "multi-domain blocked connect must retain all domain-specific blocked hints and skip innocent domains"
+        send_connect(&engine_g, gp1.pid, multi_blk_ip, None, now_ms + 610);
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            multi_blk_ip,
+            &["blk1.example", "blk2.example"],
+            "multi-domain blocked connect must retain all domain-specific blocked hints and skip innocent domains",
         );
         engine_g
             .delete_policy_rule("R-BLK-1")
@@ -1121,16 +756,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             engine_g.has_active_wfp_filter(exe_g, Some(multi_blk_ip), false),
             "deleting R-BLK-1 must preserve DomainPolicy Block while R-BLK-2 remains active"
         );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(multi_blk_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["blk2.example".to_string()],
-            })
-        );
+        assert_domain_policy_hints(&engine_g, exe_g, multi_blk_ip, &["blk2.example"], "");
         engine_g
             .delete_policy_rule("R-BLK-2")
             .expect("delete R-BLK-2");
@@ -1139,16 +765,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         // Part G4: Wildcard-IP NetworkBlock (`203.0.113.*`) with an unblocked domain must also
         // stay untagged (`domain_hints: []`) instead of tagging the wildcard or unblocked domain.
         let wc_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 25));
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "innocent-wc.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![wc_ip],
-                timestamp_ms: now_ms + 700,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine_g, gp1.pid, "innocent-wc.example", &[wc_ip], now_ms + 700);
         engine_g
             .upsert_policy_rule(&mk_net_rule(
                 "R-WC-BLK",
@@ -1157,27 +774,19 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 now_ms + 705,
             ))
             .expect("upsert wildcard-IP block");
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: gp1.pid,
-                protocol: 6,
-                dst_ip: wc_ip,
-                dst_port: 443,
-                domain_hint: Some("innocent-wc.example".to_string()),
-                timestamp_ms: now_ms + 710,
-            },
-            EventLane::HighPriority,
+        send_connect(
+            &engine_g,
+            gp1.pid,
+            wc_ip,
+            Some("innocent-wc.example"),
+            now_ms + 710,
         );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(wc_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            }),
-            "wildcard-IP static block must not pollute domain_hints"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            wc_ip,
+            &[],
+            "wildcard-IP static block must not pollute domain_hints",
         );
         engine_g
             .delete_policy_rule("R-WC-BLK")
@@ -1187,58 +796,25 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         // Part H: `AllowPermanent` on ambiguous (`process_instance_id: None`,
         // `candidate_instance_ids`) alerts with multiple shared-IP domains.
         let gp2 = ProcessIdentity::new(9702, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: gp2,
-                parent_pid: 4,
-                exe_path: exe_g.to_string(),
-                command_line: exe_g.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine_g, gp2, exe_g);
         let ambig_clean_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 40));
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "ambig-a.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ambig_clean_ip],
-                timestamp_ms: now_ms + 1_000,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp2.pid,
-                query_name: "ambig-b.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ambig_clean_ip],
-                timestamp_ms: now_ms + 1_010,
-            },
-            EventLane::HighPriority,
-        );
-        let ambig_clean_alert = ledr_proto::AlertRecord {
-            alert_id: "AL-P3-46A-AMBIG-CLEAN".to_string(),
-            timestamp_ms: now_ms + 1_020,
-            severity: ledr_proto::AlertSeverity::High,
-            source_layer: "LAYER_3_NETWORK".to_string(),
-            rule_id: "LEDR-NET-HIGH-RISK-PATH".to_string(),
-            title: "Ambiguous multi-domain alert".to_string(),
-            process_instance_id: None,
-            process_suspended: false,
-            status: ledr_proto::AlertStatus::Pending,
-            context_json: serde_json::json!({
+        let _ = send_dns(&engine_g, gp1.pid, "ambig-a.example", &[ambig_clean_ip], now_ms + 1_000);
+        let _ = send_dns(&engine_g, gp2.pid, "ambig-b.example", &[ambig_clean_ip], now_ms + 1_010);
+        let ambig_clean_alert = make_pending_net_alert(
+            "AL-P3-46A-AMBIG-CLEAN",
+            now_ms + 1_020,
+            "LEDR-NET-HIGH-RISK-PATH",
+            "Ambiguous multi-domain alert",
+            None,
+            serde_json::json!({
                 "attribution": "app_level_ambiguous",
                 "candidate_instance_ids": [gp1.instance_id(), gp2.instance_id()],
                 "exe_path": exe_g,
                 "dst_ip": ambig_clean_ip.to_string(),
                 "domain_hint": serde_json::Value::Null,
                 "sha256": sha,
-            })
-            .to_string(),
-            resolved_at_ms: None,
-        };
+            }),
+        );
         store_g
             .record_alert(&ambig_clean_alert)
             .expect("record ambiguous clean alert");
@@ -1252,19 +828,12 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             )
             .expect("AllowPermanent on ambiguous alert");
         assert!(engine_g.has_active_wfp_filter(exe_g, Some(ambig_clean_ip), true));
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(ambig_clean_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec![
-                    "ambig-a.example".to_string(),
-                    "ambig-b.example".to_string(),
-                ],
-            }),
-            "AllowPermanent on ambiguous alert must propagate all candidate_instance_ids shared-IP hints"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            ambig_clean_ip,
+            &["ambig-a.example", "ambig-b.example"],
+            "AllowPermanent on ambiguous alert must propagate all candidate_instance_ids shared-IP hints",
         );
         // Blocking the sibling hint `ambig-b.example` must immediately revoke the Permit.
         engine_g
@@ -1288,33 +857,12 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         // blocked domain on the same shared IP.
         let ambig_deny_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 41));
         let gp3 = ProcessIdentity::new(9703, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: gp3,
-                parent_pid: 4,
-                exe_path: exe_g.to_string(),
-                command_line: exe_g.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp3.pid,
-                query_name: "ambig-evil.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ambig_deny_ip],
-                timestamp_ms: now_ms + 1_100,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::ProcessStop {
-                pid: gp3.pid,
-                exit_code: 0,
-                exit_time_100ns: ((now_ms + 1_110) as u64 + 11_644_473_600_000) * 10_000,
-            },
-            EventLane::HighPriority,
+        send_process_start(&engine_g, gp3, exe_g);
+        let _ = send_dns(&engine_g, gp3.pid, "ambig-evil.example", &[ambig_deny_ip], now_ms + 1_100);
+        send_process_stop(
+            &engine_g,
+            gp3.pid,
+            ((now_ms + 1_110) as u64 + 11_644_473_600_000) * 10_000,
         );
         engine_g
             .upsert_policy_rule(&mk_net_rule(
@@ -1324,48 +872,24 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 now_ms + 1_115,
             ))
             .expect("upsert R-BLK-AMBIG-EVIL");
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "ambig-good1.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ambig_deny_ip],
-                timestamp_ms: now_ms + 1_120,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp2.pid,
-                query_name: "ambig-good2.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ambig_deny_ip],
-                timestamp_ms: now_ms + 1_130,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine_g, gp1.pid, "ambig-good1.example", &[ambig_deny_ip], now_ms + 1_120);
+        let _ = send_dns(&engine_g, gp2.pid, "ambig-good2.example", &[ambig_deny_ip], now_ms + 1_130);
         assert!(!engine_g.has_active_wfp_filter(exe_g, Some(ambig_deny_ip), false));
-        let ambig_deny_alert = ledr_proto::AlertRecord {
-            alert_id: "AL-P3-46A-AMBIG-DENY".to_string(),
-            timestamp_ms: now_ms + 1_140,
-            severity: ledr_proto::AlertSeverity::High,
-            source_layer: "LAYER_3_NETWORK".to_string(),
-            rule_id: "LEDR-NET-HIGH-RISK-PATH".to_string(),
-            title: "Ambiguous deny-override alert".to_string(),
-            process_instance_id: None,
-            process_suspended: false,
-            status: ledr_proto::AlertStatus::Pending,
-            context_json: serde_json::json!({
+        let ambig_deny_alert = make_pending_net_alert(
+            "AL-P3-46A-AMBIG-DENY",
+            now_ms + 1_140,
+            "LEDR-NET-HIGH-RISK-PATH",
+            "Ambiguous deny-override alert",
+            None,
+            serde_json::json!({
                 "attribution": "app_level_ambiguous",
                 "candidate_instance_ids": [gp1.instance_id(), gp2.instance_id()],
                 "exe_path": exe_g,
                 "dst_ip": ambig_deny_ip.to_string(),
                 "domain_hint": serde_json::Value::Null,
                 "sha256": sha,
-            })
-            .to_string(),
-            resolved_at_ms: None,
-        };
+            }),
+        );
         store_g
             .record_alert(&ambig_deny_alert)
             .expect("record ambiguous deny alert");
@@ -1400,16 +924,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             (gp1.pid, "ov-blk1.example", cidr_override_ip, now_ms + 3_030),
             (gp2.pid, "ov-blk2.example", cidr_override_ip, now_ms + 3_035),
         ] {
-            let _ = engine_g.process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid,
-                    query_name: dom.to_string(),
-                    query_type: 1,
-                    resolved_ips: vec![ip],
-                    timestamp_ms: ts,
-                },
-                EventLane::HighPriority,
-            );
+            let _ = send_dns(&engine_g, pid, dom, &[ip], ts);
         }
         engine_g
             .upsert_policy_rule(&mk_net_rule(
@@ -1441,14 +956,8 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                             .unwrap_or(false)
                 })
         };
-        let mk_drop = |dst_ip: IpAddr, timestamp_ms: i64| QueuedWfpDrop {
-            exe_path: exe_g.to_string(),
-            exe_key: exe_g_key.clone(),
-            dst_ip,
-            dst_port: 443,
-            protocol: 6,
-            timestamp_ms,
-            os_filter_id: 1,
+        let mk_drop = |dst_ip: IpAddr, timestamp_ms: i64| {
+            make_queued_drop(exe_g, dst_ip, timestamp_ms, 1)
         };
 
         // I1: CIDR allow materializes Permit carrying ALL fresh candidate domain hints.
@@ -1458,16 +967,12 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             "CIDR-allowed ambiguous drop must not emit an alert"
         );
         assert!(engine_g.has_active_wfp_filter(exe_g, Some(cidr_allow_ip), true));
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(cidr_allow_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["cdn-2.example".to_string(), "cdn-1.example".to_string()],
-            }),
-            "handle_ambiguous_wfp_drop CIDR allow must propagate all fresh candidate domain hints"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            cidr_allow_ip,
+            &["cdn-2.example", "cdn-1.example"],
+            "handle_ambiguous_wfp_drop CIDR allow must propagate all fresh candidate domain hints",
         );
 
         // I2a: CIDR allow overridden by fresh blocked candidate (`i2-evil.example` older than
@@ -1516,19 +1021,12 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         engine_g.handle_wfp_drop_event_now(&mk_drop(cidr_override_ip, now_ms + 3_070));
         assert!(!engine_g.has_active_wfp_filter(exe_g, Some(cidr_override_ip), true));
         assert!(engine_g.has_active_wfp_filter(exe_g, Some(cidr_override_ip), false));
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(cidr_override_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec![
-                    "ov-blk2.example".to_string(),
-                    "ov-blk1.example".to_string(),
-                ],
-            }),
-            "ambiguous drop replacing live Permit must merge all fresh domain-specific blocked hints"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            cidr_override_ip,
+            &["ov-blk2.example", "ov-blk1.example"],
+            "ambiguous drop replacing live Permit must merge all fresh domain-specific blocked hints",
         );
         engine_g
             .delete_policy_rule("R-OV-BLK1")
@@ -1537,16 +1035,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             engine_g.has_active_wfp_filter(exe_g, Some(cidr_override_ip), false),
             "deleting R-OV-BLK1 must keep block alive for ov-blk2.example"
         );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(cidr_override_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["ov-blk2.example".to_string()],
-            })
-        );
+        assert_domain_policy_hints(&engine_g, exe_g, cidr_override_ip, &["ov-blk2.example"], "");
         engine_g
             .delete_policy_rule("R-OV-BLK2")
             .expect("delete R-OV-BLK2");
@@ -1569,26 +1058,8 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 now_ms + 3_090,
             ))
             .expect("upsert R-ALLOW-I3");
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "i3-allow.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![non_cidr_live_ip],
-                timestamp_ms: now_ms + 3_100,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp2.pid,
-                query_name: "i3-other.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![non_cidr_live_ip],
-                timestamp_ms: now_ms + 3_110,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine_g, gp1.pid, "i3-allow.example", &[non_cidr_live_ip], now_ms + 3_100);
+        let _ = send_dns(&engine_g, gp2.pid, "i3-other.example", &[non_cidr_live_ip], now_ms + 3_110);
         assert!(engine_g.has_active_wfp_filter(exe_g, Some(non_cidr_live_ip), true));
         engine_g.handle_wfp_drop_event_now(&mk_drop(non_cidr_live_ip, now_ms + 3_120));
         assert!(
@@ -1596,15 +1067,12 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             "non-CIDR live IP Permit + allowed candidate must suppress false ambiguous drop alert"
         );
 
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "i3-noperm.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![non_cidr_noperm_ip],
-                timestamp_ms: now_ms + 3_130,
-            },
-            EventLane::HighPriority,
+        let _ = send_dns(
+            &engine_g,
+            gp1.pid,
+            "i3-noperm.example",
+            &[non_cidr_noperm_ip],
+            now_ms + 3_130,
         );
         engine_g
             .upsert_policy_rule(&mk_net_rule(
@@ -1650,16 +1118,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             (gp1.pid, "innocent-ah.example", ambig_cidr_hybrid_ip, now_ms + 3_220),
             (gp2.pid, "blk-ah.example", ambig_cidr_hybrid_ip, now_ms + 3_210),
         ] {
-            let _ = engine_g.process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid,
-                    query_name: dom.to_string(),
-                    query_type: 1,
-                    resolved_ips: vec![ip],
-                    timestamp_ms: ts,
-                },
-                EventLane::HighPriority,
-            );
+            let _ = send_dns(&engine_g, pid, dom, &[ip], ts);
         }
         engine_g
             .upsert_policy_rule(&mk_net_rule(
@@ -1678,28 +1137,20 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             ))
             .expect("upsert R-AMBIG-DOM-BLK");
         engine_g.handle_wfp_drop_event_now(&mk_drop(ambig_cidr_pure_ip, now_ms + 3_250));
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(ambig_cidr_pure_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            }),
-            "ambiguous pure CIDR block must leave domain_hints empty"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            ambig_cidr_pure_ip,
+            &[],
+            "ambiguous pure CIDR block must leave domain_hints empty",
         );
         engine_g.handle_wfp_drop_event_now(&mk_drop(ambig_cidr_hybrid_ip, now_ms + 3_250));
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(ambig_cidr_hybrid_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["blk-ah.example".to_string()],
-            }),
-            "ambiguous hybrid CIDR + domain block must retain fresh domain-specific blocked hint"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            ambig_cidr_hybrid_ip,
+            &["blk-ah.example"],
+            "ambiguous hybrid CIDR + domain block must retain fresh domain-specific blocked hint",
         );
         engine_g
             .delete_policy_rule("R-AMBIG-CIDR-BLK")
@@ -1712,16 +1163,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             engine_g.has_active_wfp_filter(exe_g, Some(ambig_cidr_hybrid_ip), false),
             "hybrid block must survive R-AMBIG-CIDR-BLK deletion while R-AMBIG-DOM-BLK remains"
         );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(ambig_cidr_hybrid_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["blk-ah.example".to_string()],
-            })
-        );
+        assert_domain_policy_hints(&engine_g, exe_g, ambig_cidr_hybrid_ip, &["blk-ah.example"], "");
         engine_g
             .delete_policy_rule("R-AMBIG-DOM-BLK")
             .expect("delete R-AMBIG-DOM-BLK");
@@ -1754,50 +1196,13 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             ("j-first.example", post_dom_ip, now_ms + 3_306),
             ("j-second.example", post_dom_ip, now_ms + 3_307),
         ] {
-            let _ = engine_g.process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: gp1.pid,
-                    query_name: dom.to_string(),
-                    query_type: 1,
-                    resolved_ips: vec![ip],
-                    timestamp_ms: ts,
-                },
-                EventLane::HighPriority,
-            );
+            let _ = send_dns(&engine_g, gp1.pid, dom, &[ip], ts);
         }
         // Install untagged CIDR Block on `post_cidr_ip` (`domain_hints: []`); `post_dom_ip`
         // already has `domain_hints: ["j-first.example"]`.
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: gp1.pid,
-                protocol: 6,
-                dst_ip: post_cidr_ip,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 3_310,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(post_cidr_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            })
-        );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(post_dom_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["j-first.example".to_string()],
-            })
-        );
+        send_connect(&engine_g, gp1.pid, post_cidr_ip, None, now_ms + 3_310);
+        assert_domain_policy_hints(&engine_g, exe_g, post_cidr_ip, &[], "");
+        assert_domain_policy_hints(&engine_g, exe_g, post_dom_ip, &["j-first.example"], "");
         // Upsert post-DNS block rules -> existing Blocks immediately sync live DNS domains.
         engine_g
             .upsert_policy_rule(&mk_net_rule(
@@ -1815,28 +1220,13 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 now_ms + 3_316,
             ))
             .expect("upsert R-J-BLK2");
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(post_cidr_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["j-post.example".to_string()],
-            })
-        );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(post_dom_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec![
-                    "j-first.example".to_string(),
-                    "j-second.example".to_string(),
-                ],
-            })
+        assert_domain_policy_hints(&engine_g, exe_g, post_cidr_ip, &["j-post.example"], "");
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            post_dom_ip,
+            &["j-first.example", "j-second.example"],
+            "",
         );
         // Deleting R-J-CIDR and R-J-BLK1 MUST preserve both Blocks for `j-post.example` /
         // `j-second.example`.
@@ -1846,27 +1236,19 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         engine_g
             .delete_policy_rule("R-J-BLK1")
             .expect("delete R-J-BLK1");
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(post_cidr_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["j-post.example".to_string()],
-            }),
-            "deleting co-blocking CIDR rule must preserve Block for post-DNS j-post.example"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            post_cidr_ip,
+            &["j-post.example"],
+            "deleting co-blocking CIDR rule must preserve Block for post-DNS j-post.example",
         );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(post_dom_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["j-second.example".to_string()],
-            }),
-            "deleting first domain block must preserve Block for post-DNS j-second.example"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            post_dom_ip,
+            &["j-second.example"],
+            "deleting first domain block must preserve Block for post-DNS j-second.example",
         );
         engine_g
             .delete_policy_rule("R-J-POST")
@@ -1881,15 +1263,9 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         // `prematerialize_domain_wfp_filters` and `evaluate_and_handle_outbound_connect`) AND
         // migrated-domain Permit hint pruning (preventing false revocation after migration).
         let store_k = LedrStore::open_in_memory().expect("open store_k");
-        let defense_k = Arc::new(CountingDefense {
-            next_handle: AtomicU64::new(500),
-            suspends: AtomicUsize::new(0),
-            fail_removes: std::sync::atomic::AtomicBool::new(false),
-        });
-        let engine_k = DaemonEngine::start_with_dependencies(
+        let defense_k = Arc::new(TestDefense::new(500));
+        let engine_k = start_stopped_engine(
             store_k.clone(),
-            SigmaEngine::default(),
-            EarlyPruner::default(),
             DaemonConfig {
                 outbound_firewall_enabled: true,
                 wfp_drop_dns_grace_ms: 500,
@@ -1897,37 +1273,14 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 ..DaemonConfig::default()
             },
             defense_k.clone(),
-            Arc::new(StubNotifier),
             Arc::new(FixedShaInspector(sha.clone())),
-        );
-        if let Some(h) = engine_k.worker_handle.lock().await.take() {
-            h.abort();
-            let _ = h.await;
-        }
+        )
+        .await;
         let exe_k = r"C:\Temp\permit_hygiene_app.exe";
         let kp1 = ProcessIdentity::new(9801, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: kp1,
-                parent_pid: 4,
-                exe_path: exe_k.to_string(),
-                command_line: exe_k.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine_k, kp1, exe_k);
         let mk_k_rule = |rule_id: &str, scope: RuleScope, target: &str, created_at_ms: i64| {
-            AllowlistRuleRecord {
-                rule_id: rule_id.to_string(),
-                scope,
-                exe_path_pattern: exe_k.to_string(),
-                sha256: Some(sha.clone()),
-                signer_subject: None,
-                root_thumbprint: None,
-                allowed_target: Some(target.to_string()),
-                created_at_ms,
-                created_by: "test".to_string(),
-            }
+            make_net_rule(rule_id, scope, exe_k, &sha, target, created_at_ms)
         };
 
         // K4 first (while `has_domain_network_rules() == false`): CIDR Permit prunes migrated
@@ -1943,57 +1296,16 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             ))
             .expect("upsert R-K4-CIDR");
         assert!(!engine_k.firewall.lock().unwrap().has_domain_network_rules());
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: kp1.pid,
-                query_name: "cdn-mig.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![k_cidr_ip],
-                timestamp_ms: now_ms + 4_005,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: kp1.pid,
-                protocol: 6,
-                dst_ip: k_cidr_ip,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 4_010,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_k
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_k, Some(k_cidr_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["cdn-mig.example".to_string()],
-            })
-        );
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: kp1.pid,
-                query_name: "cdn-mig.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![k_mig_away],
-                timestamp_ms: now_ms + 4_020,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_k
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_k, Some(k_cidr_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            }),
-            "migrated domain must be pruned from CIDR Permit even with no domain rules active"
+        let _ = send_dns(&engine_k, kp1.pid, "cdn-mig.example", &[k_cidr_ip], now_ms + 4_005);
+        send_connect(&engine_k, kp1.pid, k_cidr_ip, None, now_ms + 4_010);
+        assert_domain_policy_hints(&engine_k, exe_k, k_cidr_ip, &["cdn-mig.example"], "");
+        let _ = send_dns(&engine_k, kp1.pid, "cdn-mig.example", &[k_mig_away], now_ms + 4_020);
+        assert_domain_policy_hints(
+            &engine_k,
+            exe_k,
+            k_cidr_ip,
+            &[],
+            "migrated domain must be pruned from CIDR Permit even with no domain rules active",
         );
         engine_k
             .upsert_policy_rule(&mk_k_rule(
@@ -2021,63 +1333,20 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 now_ms + 4_030,
             ))
             .expect("upsert R-K1-ALLOW");
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: kp1.pid,
-                query_name: "cohost1.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![k1_ip],
-                timestamp_ms: now_ms + 4_035,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: kp1.pid,
-                query_name: "allow-k1.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![k1_ip],
-                timestamp_ms: now_ms + 4_040,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_k
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_k, Some(k1_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec![
-                    "allow-k1.example".to_string(),
-                    "cohost1.example".to_string(),
-                ],
-            }),
-            "prematerialize must retain co-hosted shared-IP domains on DomainPolicy Permit"
+        let _ = send_dns(&engine_k, kp1.pid, "cohost1.example", &[k1_ip], now_ms + 4_035);
+        let _ = send_dns(&engine_k, kp1.pid, "allow-k1.example", &[k1_ip], now_ms + 4_040);
+        assert_domain_policy_hints(
+            &engine_k,
+            exe_k,
+            k1_ip,
+            &["allow-k1.example", "cohost1.example"],
+            "prematerialize must retain co-hosted shared-IP domains on DomainPolicy Permit",
         );
 
         // K2: `evaluate_and_handle_outbound_connect` (rule added after DNS) also propagates
         // co-hosted unallowed `cohost2.example` onto Permit.
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: kp1.pid,
-                query_name: "cohost2.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![k2_ip],
-                timestamp_ms: now_ms + 4_045,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: kp1.pid,
-                query_name: "allow-k2.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![k2_ip],
-                timestamp_ms: now_ms + 4_046,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine_k, kp1.pid, "cohost2.example", &[k2_ip], now_ms + 4_045);
+        let _ = send_dns(&engine_k, kp1.pid, "allow-k2.example", &[k2_ip], now_ms + 4_046);
         engine_k
             .upsert_policy_rule(&mk_k_rule(
                 "R-K2-ALLOW",
@@ -2087,44 +1356,24 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
             ))
             .expect("upsert R-K2-ALLOW");
         assert!(!engine_k.has_active_wfp_filter(exe_k, Some(k2_ip), true));
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: kp1.pid,
-                protocol: 6,
-                dst_ip: k2_ip,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 4_055,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_k
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_k, Some(k2_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec![
-                    "allow-k2.example".to_string(),
-                    "cohost2.example".to_string(),
-                ],
-            }),
-            "outbound connect Permit must retain co-hosted shared-IP domains"
+        send_connect(&engine_k, kp1.pid, k2_ip, None, now_ms + 4_055);
+        assert_domain_policy_hints(
+            &engine_k,
+            exe_k,
+            k2_ip,
+            &["allow-k2.example", "cohost2.example"],
+            "outbound connect Permit must retain co-hosted shared-IP domains",
         );
 
         // Flood 6 unrelated DNS queries to completely evict `cohost1`/`cohost2` from
         // `ProcessDnsHistory` (`dns_history_capacity = 4`).
         for idx in 0..6u8 {
-            let _ = engine_k.process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: kp1.pid,
-                    query_name: format!("evict-k-{idx}.example"),
-                    query_type: 1,
-                    resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 210 + idx))],
-                    timestamp_ms: now_ms + 4_100 + idx as i64,
-                },
-                EventLane::HighPriority,
+            let _ = send_dns(
+                &engine_k,
+                kp1.pid,
+                &format!("evict-k-{idx}.example"),
+                &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 210 + idx))],
+                now_ms + 4_100 + idx as i64,
             );
         }
         engine_k
@@ -2162,46 +1411,16 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 now_ms + 4_130,
             ))
             .expect("upsert R-K3-ALLOW");
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: kp1.pid,
-                query_name: "migrating-k3.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![k3_ip],
-                timestamp_ms: now_ms + 4_135,
-            },
-            EventLane::HighPriority,
+        let _ = send_dns(&engine_k, kp1.pid, "migrating-k3.example", &[k3_ip], now_ms + 4_135);
+        let _ = send_dns(&engine_k, kp1.pid, "allow-k3.example", &[k3_ip], now_ms + 4_140);
+        let _ = send_dns(
+            &engine_k,
+            kp1.pid,
+            "migrating-k3.example",
+            &[IpAddr::V4(Ipv4Addr::new(203, 0, 113, 205))],
+            now_ms + 4_150,
         );
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: kp1.pid,
-                query_name: "allow-k3.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![k3_ip],
-                timestamp_ms: now_ms + 4_140,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine_k.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: kp1.pid,
-                query_name: "migrating-k3.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 205))],
-                timestamp_ms: now_ms + 4_150,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_k
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_k, Some(k3_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: vec!["allow-k3.example".to_string()],
-            })
-        );
+        assert_domain_policy_hints(&engine_k, exe_k, k3_ip, &["allow-k3.example"], "");
         engine_k
             .upsert_policy_rule(&mk_k_rule(
                 "R-K3-BLK-MIG",
@@ -2260,27 +1479,9 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 now_ms + 4_500,
             ))
             .expect("upsert R-L2-BLK-EVIL");
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "l2-mig-evil.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![l2_old_ip],
-                timestamp_ms: now_ms + 4_510,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine_g, gp1.pid, "l2-mig-evil.example", &[l2_old_ip], now_ms + 4_510);
         assert!(engine_g.has_active_wfp_filter(exe_g, Some(l2_old_ip), false));
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: gp1.pid,
-                query_name: "l2-mig-evil.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![l2_new_ip],
-                timestamp_ms: now_ms + 4_520,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine_g, gp1.pid, "l2-mig-evil.example", &[l2_new_ip], now_ms + 4_520);
         assert!(!engine_g.has_active_wfp_filter(exe_g, Some(l2_old_ip), false));
         assert!(
             engine_g
@@ -2307,16 +1508,12 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         );
         // Full connect to `l2_old_ip` (covered by `R-CIDR-ALLOW-I` 198.51.100.48/29) carrying
         // stale sensor hint `l2-mig-evil.example` must be allowed (Permit, not Block).
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: gp1.pid,
-                protocol: 6,
-                dst_ip: l2_old_ip,
-                dst_port: 443,
-                domain_hint: Some("l2-mig-evil.example".to_string()),
-                timestamp_ms: now_ms + 4_530,
-            },
-            EventLane::HighPriority,
+        send_connect(
+            &engine_g,
+            gp1.pid,
+            l2_old_ip,
+            Some("l2-mig-evil.example"),
+            now_ms + 4_530,
         );
         assert!(
             !engine_g.has_active_wfp_filter(exe_g, Some(l2_old_ip), false),
@@ -2339,25 +1536,19 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         let wc_conn_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 231));
         let wc_ambig_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 232));
         let wc_perm_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 233));
-        let wc_allow_alert = ledr_proto::AlertRecord {
-            alert_id: "AL-P3-46A-WC-ALLOW".to_string(),
-            timestamp_ms: now_ms + 5_000,
-            severity: ledr_proto::AlertSeverity::High,
-            source_layer: "LAYER_3_NETWORK".to_string(),
-            rule_id: "LEDR-NET-HIGH-RISK-PATH".to_string(),
-            title: "Wildcard IP AllowPermanent alert".to_string(),
-            process_instance_id: Some(gp1.instance_id()),
-            process_suspended: false,
-            status: ledr_proto::AlertStatus::Pending,
-            context_json: serde_json::json!({
+        let wc_allow_alert = make_pending_net_alert(
+            "AL-P3-46A-WC-ALLOW",
+            now_ms + 5_000,
+            "LEDR-NET-HIGH-RISK-PATH",
+            "Wildcard IP AllowPermanent alert",
+            Some(gp1.instance_id()),
+            serde_json::json!({
                 "exe_path": exe_g,
                 "dst_ip": wc_perm_ip.to_string(),
                 "domain_hint": serde_json::Value::Null,
                 "sha256": sha,
-            })
-            .to_string(),
-            resolved_at_ms: None,
-        };
+            }),
+        );
         store_g
             .record_alert(&wc_allow_alert)
             .expect("record wildcard allow alert");
@@ -2370,50 +1561,28 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 },
             )
             .expect("AllowPermanent wildcard-IP allow");
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(wc_perm_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            }),
-            "AllowPermanent wildcard-IP allow with no DNS must leave domain_hints empty"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            wc_perm_ip,
+            &[],
+            "AllowPermanent wildcard-IP allow with no DNS must leave domain_hints empty",
         );
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: gp1.pid,
-                protocol: 6,
-                dst_ip: wc_conn_ip,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 5_010,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(wc_conn_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            }),
-            "outbound connect wildcard-IP allow with no DNS must leave domain_hints empty"
+        send_connect(&engine_g, gp1.pid, wc_conn_ip, None, now_ms + 5_010);
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            wc_conn_ip,
+            &[],
+            "outbound connect wildcard-IP allow with no DNS must leave domain_hints empty",
         );
         engine_g.handle_wfp_drop_event_now(&mk_drop(wc_ambig_ip, now_ms + 5_020));
-        assert_eq!(
-            engine_g
-                .firewall
-                .lock()
-                .unwrap()
-                .filter_origin(exe_g, Some(wc_ambig_ip)),
-            Some(&crate::firewall::WfpFilterOrigin::DomainPolicy {
-                domain_hints: Vec::new(),
-            }),
-            "ambiguous drop wildcard-IP allow with no DNS must leave domain_hints empty"
+        assert_domain_policy_hints(
+            &engine_g,
+            exe_g,
+            wc_ambig_ip,
+            &[],
+            "ambiguous drop wildcard-IP allow with no DNS must leave domain_hints empty",
         );
         if let Some(wc_rid) = wc_outcome.saved_rule_id {
             engine_g
@@ -2425,27 +1594,15 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
         //     on one shared IP via `evaluate_and_handle_outbound_connect` stays bounded at 32.
         let cap32_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 240));
         let gp4 = ProcessIdentity::new(9704, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: gp4,
-                parent_pid: 4,
-                exe_path: exe_g.to_string(),
-                command_line: exe_g.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine_g, gp4, exe_g);
         let pids = [gp1.pid, gp2.pid, gp4.pid];
         for idx in 0..36usize {
-            let _ = engine_g.process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: pids[idx / 12],
-                    query_name: format!("m2-{idx:02}.cap32.example"),
-                    query_type: 1,
-                    resolved_ips: vec![cap32_ip],
-                    timestamp_ms: now_ms + 5_100 + idx as i64,
-                },
-                EventLane::HighPriority,
+            let _ = send_dns(
+                &engine_g,
+                pids[idx / 12],
+                &format!("m2-{idx:02}.cap32.example"),
+                &[cap32_ip],
+                now_ms + 5_100 + idx as i64,
             );
         }
         engine_g
@@ -2456,17 +1613,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
                 now_ms + 5_200,
             ))
             .expect("upsert R-M2-CAP32");
-        let _ = engine_g.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: gp1.pid,
-                protocol: 6,
-                dst_ip: cap32_ip,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 5_210,
-            },
-            EventLane::HighPriority,
-        );
+        send_connect(&engine_g, gp1.pid, cap32_ip, None, now_ms + 5_210);
         let Some(crate::firewall::WfpFilterOrigin::DomainPolicy { domain_hints }) = engine_g
             .firewall
             .lock()

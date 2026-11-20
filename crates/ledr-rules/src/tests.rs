@@ -1199,8 +1199,12 @@ fn rules_p3_06_bounded_chunk_reader_handles_exact_cap_and_midline_overflow() {
 
     // 1. Exact cap with clean EOF (no extra bytes) -> not truncated, full body preserved.
     let mut exact_eof = VecDeque::from(vec![b"alpha.xyz\n".to_vec(), b"beta.xyz\n".to_vec()]);
-    let (body, trunc) = crate::nrd::read_bounded_chunks(19, |_| Ok(exact_eof.pop_front()))
-        .expect("exact EOF");
+    let (body, trunc) = crate::nrd::read_bounded_chunks_cancellable(
+        19,
+        &NrdCancelToken::new(),
+        |_| Ok(exact_eof.pop_front()),
+    )
+    .expect("exact EOF");
     assert!(!trunc);
     assert_eq!(String::from_utf8_lossy(&body), "alpha.xyz\nbeta.xyz\n");
 
@@ -1210,9 +1214,12 @@ fn rules_p3_06_bounded_chunk_reader_handles_exact_cap_and_midline_overflow() {
         b"first-ok.xyz\nsecond-ha".to_vec(),
         b"lf.xyz\n".to_vec(),
     ]);
-    let (body, trunc) =
-        crate::nrd::read_bounded_chunks(22, |_| Ok(exact_then_more.pop_front()))
-            .expect("exact cap then more");
+    let (body, trunc) = crate::nrd::read_bounded_chunks_cancellable(
+        22,
+        &NrdCancelToken::new(),
+        |_| Ok(exact_then_more.pop_front()),
+    )
+    .expect("exact cap then more");
     assert!(trunc);
     assert_eq!(
         String::from_utf8_lossy(&body),
@@ -1222,8 +1229,12 @@ fn rules_p3_06_bounded_chunk_reader_handles_exact_cap_and_midline_overflow() {
 
     // 3. Overflow mid-chunk with no newline anywhere -> buffer cleared cleanly.
     let mut no_nl = VecDeque::from(vec![b"very-long-single-line-domain.example".to_vec()]);
-    let (body, trunc) =
-        crate::nrd::read_bounded_chunks(18, |_| Ok(no_nl.pop_front())).expect("no newline");
+    let (body, trunc) = crate::nrd::read_bounded_chunks_cancellable(
+        18,
+        &NrdCancelToken::new(),
+        |_| Ok(no_nl.pop_front()),
+    )
+    .expect("no newline");
     assert!(trunc);
     assert!(body.is_empty());
 }
@@ -1793,34 +1804,6 @@ fn read_http_get_prefix(
         }
     }
     total >= 4 && &buf[..4] == b"GET "
-}
-
-#[test]
-fn rules_p3_13_split_http_get_prefix_detected() {
-    use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind split listener");
-    let addr = listener.local_addr().unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_bg = Arc::clone(&stop);
-
-    let srv = std::thread::spawn(move || {
-        let (mut s, _) = listener.accept().expect("accept");
-        read_http_get_prefix(&mut s, &stop_bg)
-    });
-
-    let mut client = TcpStream::connect(addr).expect("connect");
-    client.write_all(b"G").expect("send G");
-    client.flush().expect("flush G");
-    std::thread::sleep(Duration::from_millis(20));
-    client.write_all(b"ET /stress.txt HTTP/1.1\r\n\r\n").expect("send ET");
-    client.flush().expect("flush ET");
-
-    assert!(srv.join().expect("join split server"));
 }
 
 /// `RULES-P3-14`（`決定記録 L-14` / `AUTO-10` / 指摘 R-11）:

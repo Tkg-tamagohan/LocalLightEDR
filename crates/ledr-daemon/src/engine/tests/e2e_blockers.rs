@@ -938,6 +938,47 @@ async fn pr21_analysis_0001_dedup_fast_path_skips_binary_inspector_when_no_rule_
         1,
         "ANALYSIS_0001: BinaryInspector must run only once when no persisted rule matches exe_path"
     );
+
+    // Grant AllowOnce on the NET_OUTBOUND alert and confirm subsequent connects still skip
+    // BinaryInspector while preserving the "ALLOWED" action (not "DEDUP_SUPPRESSED").
+    let alerts = engine.store.list_alerts(None, 10).expect("list alerts");
+    let net_alert = alerts
+        .iter()
+        .find(|a| a.source_layer == "LAYER_3_NETWORK")
+        .expect("outbound alert exists");
+    engine
+        .resolve_alert(&net_alert.alert_id, ledr_proto::AlertDecision::AllowOnce)
+        .expect("AllowOnce");
+    let calls_after_resolve = inspector.calls();
+    let allow_connect_event = SensorEvent::NetworkConnect {
+        pid: app_id.pid,
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        dst_port: 8443,
+        domain_hint: None,
+        timestamp_ms: now_ms + 100,
+    };
+    let proc_ctx = engine.resolve_process_context(&allow_connect_event, now_ms + 100);
+    let (action_after_allow, _) = engine.evaluate_and_handle_outbound_connect(
+        Some(&allow_connect_event),
+        &proc_ctx,
+        r"C:\Apps\unrelated_app.exe",
+        app_id.pid,
+        6,
+        IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        8443,
+        &[],
+        now_ms + 100,
+    );
+    assert_eq!(
+        action_after_allow, "ALLOWED",
+        "ANALYSIS_0001: fast path must preserve ALLOWED action for AllowOnce-granted process"
+    );
+    assert_eq!(
+        inspector.calls(),
+        calls_after_resolve,
+        "ANALYSIS_0001: AllowOnce fast path must still skip BinaryInspector when no rule matches exe_path"
+    );
 }
 
 #[tokio::test]

@@ -440,6 +440,13 @@ fn store_p2_bug_0002_update_alert_suspension_state_updates_flag_and_context() {
     assert!(!updated.process_suspended);
     assert!(updated.context_json.contains("shutdown_resumed_identities"));
     assert_eq!(updated.status, AlertStatus::Pending);
+    assert!(
+        store
+            .list_unresolved_suspended_alerts()
+            .expect("list after clearing suspension")
+            .is_empty(),
+        "alert with process_suspended=false and empty suspended_children must not be re-listed"
+    );
 }
 
 #[test]

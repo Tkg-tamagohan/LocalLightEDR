@@ -50,14 +50,26 @@ impl LedrStore {
         let first_sql = format!(
             "SELECT {ALERT_COLS} FROM alerts
              WHERE status IN (?1, ?2)
-               AND (process_suspended = 1 OR context_json LIKE '%suspended_children%')
+               AND (
+                 process_suspended = 1
+                 OR (
+                   context_json LIKE '%\"suspended_children\"%'
+                   AND context_json NOT LIKE '%\"suspended_children\":[]%'
+                 )
+               )
              ORDER BY timestamp_ms ASC, alert_id ASC
              LIMIT ?3"
         );
         let next_sql = format!(
             "SELECT {ALERT_COLS} FROM alerts
              WHERE status IN (?1, ?2)
-               AND (process_suspended = 1 OR context_json LIKE '%suspended_children%')
+               AND (
+                 process_suspended = 1
+                 OR (
+                   context_json LIKE '%\"suspended_children\"%'
+                   AND context_json NOT LIKE '%\"suspended_children\":[]%'
+                 )
+               )
                AND (timestamp_ms > ?3 OR (timestamp_ms = ?3 AND alert_id > ?4))
              ORDER BY timestamp_ms ASC, alert_id ASC
              LIMIT ?5"

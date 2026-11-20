@@ -74,7 +74,7 @@ $honeypotPaths = @(
     "$env:USERPROFILE\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx",
     "$env:USERPROFILE\Pictures\!00_LocalEDR_Canary_DoNotEdit.docx"
 )
-$preexistingHoneypots = @($honeypotPaths | Where-Object { Test-Path $_ })
+$preexistingHoneypots = @($honeypotPaths | Where-Object { Test-Path -LiteralPath $_ })
 [System.IO.File]::WriteAllLines("C:\Temp\ledr-e2e\preexisting_honeypots.txt", [string[]]$preexistingHoneypots, [System.Text.UTF8Encoding]::new($false))
 .\target\debug\ledr-sim.exe --prepare-dir C:\Temp\ledr-e2e\canary_dir --json
 ```
@@ -450,14 +450,14 @@ $cpuPct = (($p1.CPU - $cpu0) / ($sampleSec * $logicalCores)) * 100.0
 Get-Process ledr-daemon, ledr-ui, ledr-sim -ErrorAction SilentlyContinue | Stop-Process -Force
 # 事前準備で記録した preexisting_honeypots.txt に基づき、検証前から存在したファイルは残して今回作成分だけを削除する
 $preexistingFile = "C:\Temp\ledr-e2e\preexisting_honeypots.txt"
-if (Test-Path $preexistingFile) {
-    $preexisting = @(Get-Content $preexistingFile)
+if (Test-Path -LiteralPath $preexistingFile) {
+    $preexisting = @([System.IO.File]::ReadAllLines($preexistingFile, [System.Text.UTF8Encoding]::new($false)))
     @(
         "$env:USERPROFILE\Documents\!00_LocalEDR_Canary_DoNotEdit.docx",
         "$env:USERPROFILE\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx",
         "$env:USERPROFILE\Pictures\!00_LocalEDR_Canary_DoNotEdit.docx"
     ) | Where-Object { $_ -notin $preexisting } | ForEach-Object {
-        Remove-Item $_ -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $_ -ErrorAction SilentlyContinue
     }
 } else {
     Write-Warning "preexisting_honeypots.txt が見つからないため、ユーザーフォルダのおとりファイル自動削除をスキップしました。必要に応じて手動で確認してください。"

@@ -20,15 +20,16 @@
       "description": "センサーから DaemonEngine への供給は TwoLaneSender（HIGH_PRIORITY_CHANNEL_CAPACITY = 1024 / TELEMETRY_CHANNEL_CAPACITY = 8192）直結とし、前段へ無制限チャネルを挟まない。",
       "source_file": "AGENTS.md",
       "path_globs": [
+        "crates/ledr-proto/src/lib.rs",
         "crates/ledr-daemon/src/**",
         "crates/ledr-sensor-win/src/**"
       ],
       "threshold": 0.65,
       "warn_threshold": 0.40,
-      "instructions": "Does the Git diff insert an unbounded channel (such as mpsc::unbounded_channel) upstream of TwoLaneSender, weaken bounded lane capacities (HIGH_PRIORITY_CHANNEL_CAPACITY = 1024 / TELEMETRY_CHANNEL_CAPACITY = 8192), or allow dropping high-priority lane events between the sensor and DaemonEngine? Answer Yes only if the diff introduces an unbounded queue, bypasses TwoLaneSender bounded backpressure, or permits high-priority lane drops. Answer No if bounded two-lane delivery and capacities remain intact or the diff is unrelated to event channel wiring.",
+      "instructions": "Does the Git diff insert an unbounded channel (such as mpsc::unbounded_channel) upstream of TwoLaneSender, weaken or alter the bounded lane capacities (HIGH_PRIORITY_CHANNEL_CAPACITY = 1024 / TELEMETRY_CHANNEL_CAPACITY = 8192), or allow dropping high-priority lane events between the sensor and DaemonEngine? Answer Yes only if the diff introduces an unbounded queue, alters or weakens the bounded two-lane capacities (1024 / 8192), bypasses TwoLaneSender bounded backpressure, or permits high-priority lane drops. Answer No if direct bounded two-lane delivery and default capacities (1024 / 8192) remain intact or the diff is unrelated to event channel wiring or capacity constants.",
       "criteria": {
-        "true_description": "The Git diff introduces an unbounded channel before TwoLaneSender, alters or bypasses the bounded two-lane capacities, or drops high-priority lane events.",
-        "false_description": "The Git diff preserves direct bounded TwoLaneSender delivery without an upstream unbounded queue, or does not affect sensor-to-engine channel wiring."
+        "true_description": "The Git diff introduces an unbounded channel before TwoLaneSender, alters or weakens the bounded two-lane capacities (1024 / 8192), bypasses bounded backpressure, or drops high-priority lane events.",
+        "false_description": "The Git diff preserves direct bounded TwoLaneSender delivery and the 1024 / 8192 lane capacities without an upstream unbounded queue, or does not affect sensor-to-engine channel wiring or lane capacity constants."
       }
     },
     "never_suspend_and_create_time": {
@@ -53,14 +54,17 @@
       "source_file": ".agents/rules/active-defense-guards.md",
       "path_globs": [
         "crates/ledr-sensor-win/src/etw/file_canary/**",
-        "crates/ledr-daemon/src/engine/**"
+        "crates/ledr-sensor-win/src/etw/handlers.rs",
+        "crates/ledr-daemon/src/engine/**",
+        "crates/ledr-store/src/alerts.rs",
+        "crates/ledr-proto/src/lib.rs"
       ],
       "threshold": 0.65,
       "warn_threshold": 0.40,
-      "instructions": "Does the Git diff cause honeypot or canary triggers to fire on file read operations, or change the 60-second unanswered alert timeout to automatically resume or terminate suspended processes instead of transitioning to EXPIRED_SUSPENDED (AlertStatus::ExpiredSuspended)? Answer Yes only if the diff triggers canary alerts on reads or introduces auto-resume or auto-kill upon alert timeout. Answer No if canary detection remains restricted to write, delete, and rename events and timeout keeps processes suspended in ExpiredSuspended.",
+      "instructions": "Does the Git diff cause honeypot or canary triggers to fire on file read operations, alter the 60-second unanswered alert timeout default (DEFAULT_ALERT_TIMEOUT_SECS = 60 / alert_timeout_ms), omit or disable transitioning overdue pending alerts to EXPIRED_SUSPENDED (AlertStatus::ExpiredSuspended), or automatically resume or terminate suspended processes on timeout? Answer Yes if the diff triggers canary alerts on reads, changes the 60-second timeout default, removes or skips the EXPIRED_SUSPENDED transition on expiry, or introduces automatic process resumption or termination on alert timeout. Answer No if canary detection stays restricted to write, delete, and rename events, the 60-second timeout default and EXPIRED_SUSPENDED transition remain enforced without auto-resume or auto-kill, or the diff is unrelated.",
       "criteria": {
-        "true_description": "The Git diff triggers file canary alerts on read access, or replaces the EXPIRED_SUSPENDED timeout transition with automatic process resumption or termination.",
-        "false_description": "The Git diff restricts canary triggers to write, delete, and rename events and maintains EXPIRED_SUSPENDED without auto-resume on timeout, or is unrelated."
+        "true_description": "The Git diff triggers file canary alerts on read access, changes the 60-second unanswered alert timeout default, omits or disables the EXPIRED_SUSPENDED transition for overdue alerts, or automatically resumes or terminates suspended processes upon timeout.",
+        "false_description": "The Git diff restricts canary triggers to write, delete, and rename events and preserves both the 60-second timeout default and the EXPIRED_SUSPENDED transition without auto-resume or auto-kill, or is unrelated."
       }
     },
     "session0_non_system_and_ui_zero_exit": {
@@ -103,14 +107,16 @@
         "crates/ledr-sensor-win/src/wfp/**",
         "crates/ledr-daemon/src/firewall/**",
         "crates/ledr-daemon/src/engine/wfp_*.rs",
-        "crates/ledr-daemon/src/engine/domain_policy.rs"
+        "crates/ledr-daemon/src/engine/domain_policy.rs",
+        "crates/ledr-daemon/src/engine/outbound.rs",
+        "crates/ledr-daemon/src/engine/dns_history.rs"
       ],
       "threshold": 0.65,
       "warn_threshold": 0.40,
-      "instructions": "Does the Git diff remove FWPM_SESSION_FLAG_DYNAMIC or the dedicated LocalEDR SubLayer (risking persistent kernel filters after crash), skip rollback or compensation when suspend or WFP filter reconciliation partially fails, or violate deny-overrides-allow across shared IPs or stale dual-stack DNS history? Answer Yes only if dynamic session or SubLayer guarantees, partial-failure rollback, or shared-IP deny priority are broken. Answer No if dynamic WFP session flags, SubLayer scoping, rollback, and deny priority remain intact.",
+      "instructions": "Does the Git diff remove FWPM_SESSION_FLAG_DYNAMIC or the dedicated LocalEDR SubLayer (risking persistent kernel filters after crash), skip rollback or compensation when suspend or WFP filter reconciliation partially fails, violate deny-overrides-allow across shared IPs, or weaken dual-stack DNS freshness (independent IPv4/IPv6 timestamp tracking that prevents delayed responses from regressing newer records)? Answer Yes only if dynamic session or SubLayer guarantees, partial-failure rollback, shared-IP deny priority, or dual-stack DNS freshness checks are broken. Answer No if dynamic WFP session flags, SubLayer scoping, partial-failure rollback, deny-overrides-allow priority, and dual-stack DNS freshness remain intact, or the diff is unrelated.",
       "criteria": {
-        "true_description": "The Git diff drops FWPM_SESSION_FLAG_DYNAMIC or dedicated SubLayer usage, leaves orphaned state on partial suspend or WFP failure, or weakens shared-IP deny-overrides-allow or dual-stack freshness evaluation.",
-        "false_description": "The Git diff preserves FWPM_SESSION_FLAG_DYNAMIC, dedicated SubLayer, compensation rollback on partial failure, and deny-overrides-allow priority, or is unrelated."
+        "true_description": "The Git diff drops FWPM_SESSION_FLAG_DYNAMIC or dedicated SubLayer usage, leaves orphaned state on partial suspend or WFP failure, weakens shared-IP deny-overrides-allow, or breaks independent IPv4/IPv6 dual-stack DNS freshness checks.",
+        "false_description": "The Git diff preserves FWPM_SESSION_FLAG_DYNAMIC, dedicated SubLayer, compensation rollback on partial failure, deny-overrides-allow priority, and independent IPv4/IPv6 dual-stack DNS freshness checks, or is unrelated."
       }
     },
     "nrd_shutdown_nonblocking_and_checkpoint": {
@@ -124,10 +130,10 @@
       ],
       "threshold": 0.65,
       "warn_threshold": 0.40,
-      "instructions": "Does the Git diff introduce tokio::task::spawn_blocking to join the NRD worker thread, skip prioritizing checkpoint_truncate before waiting on NRD shutdown, or remove per-chunk cancellation checks (including before ErrorKind::Interrupted retries) in bounded NRD file or stream readers? Answer Yes only if blocking join via spawn_blocking is introduced, checkpoint priority on shutdown is removed, or chunked cancellation checks are bypassed. Answer No if non-blocking oneshot/InFlightGuard shutdown, checkpoint priority, and cancellable chunk reads remain intact.",
+      "instructions": "Does the Git diff introduce tokio::task::spawn_blocking to join the NRD worker thread, skip prioritizing checkpoint_truncate before waiting on NRD shutdown, raise the NRD file read chunk size limit above 64 KiB (NRD_FILE_READ_CHUNK_BYTES = 64 * 1024), or remove per-chunk cancellation checks (including before ErrorKind::Interrupted retries) in bounded NRD file or stream readers? Answer Yes only if blocking join via spawn_blocking is introduced, checkpoint priority on shutdown is removed, the 64 KiB read chunk limit is increased, or chunked cancellation checks are bypassed. Answer No if non-blocking oneshot/InFlightGuard shutdown, checkpoint priority, the 64 KiB chunk limit, and cancellable chunk reads remain intact, or the diff is unrelated.",
       "criteria": {
-        "true_description": "The Git diff introduces spawn_blocking for NRD thread join, omits shutdown checkpoint priority before waiting, or removes bounded chunk cancellation checks around reads or Interrupted retries.",
-        "false_description": "The Git diff preserves non-blocking NrdThreadHandle shutdown, checkpoint_truncate priority, and per-chunk cancellation checks, or does not touch NRD lifecycle or reader logic."
+        "true_description": "The Git diff introduces spawn_blocking for NRD thread join, omits shutdown checkpoint priority before waiting, raises the NRD read chunk size limit above 64 KiB (NRD_FILE_READ_CHUNK_BYTES), or removes bounded chunk cancellation checks around reads or Interrupted retries.",
+        "false_description": "The Git diff preserves non-blocking NrdThreadHandle shutdown, checkpoint_truncate priority, the 64 KiB maximum read chunk size (NRD_FILE_READ_CHUNK_BYTES), and per-chunk cancellation checks, or does not touch NRD lifecycle or reader logic."
       }
     },
     "phase4_nrd_local_only_and_motw": {

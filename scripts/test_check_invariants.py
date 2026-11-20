@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Specification tests for LocalEDR invariant gate config and wrapper (T1-01..T1-06).
+"""Specification tests for LocalEDR invariant gate config and wrapper (T1-01..T1-07).
 
 All tests run offline without GEMINI_API_KEY.
 """
@@ -35,7 +35,11 @@ EXPECTED_QUESTIONS: dict[str, tuple[list[str], float, float]] = {
         0.35,
     ),
     "two_lane_no_unbounded_channel": (
-        ["crates/ledr-daemon/src/**", "crates/ledr-sensor-win/src/**"],
+        [
+            "crates/ledr-proto/src/lib.rs",
+            "crates/ledr-daemon/src/**",
+            "crates/ledr-sensor-win/src/**",
+        ],
         0.65,
         0.40,
     ),
@@ -45,7 +49,13 @@ EXPECTED_QUESTIONS: dict[str, tuple[list[str], float, float]] = {
         0.40,
     ),
     "canary_write_only_and_expired_suspended": (
-        ["crates/ledr-sensor-win/src/etw/file_canary/**", "crates/ledr-daemon/src/engine/**"],
+        [
+            "crates/ledr-sensor-win/src/etw/file_canary/**",
+            "crates/ledr-sensor-win/src/etw/handlers.rs",
+            "crates/ledr-daemon/src/engine/**",
+            "crates/ledr-store/src/alerts.rs",
+            "crates/ledr-proto/src/lib.rs",
+        ],
         0.65,
         0.40,
     ),
@@ -65,6 +75,8 @@ EXPECTED_QUESTIONS: dict[str, tuple[list[str], float, float]] = {
             "crates/ledr-daemon/src/firewall/**",
             "crates/ledr-daemon/src/engine/wfp_*.rs",
             "crates/ledr-daemon/src/engine/domain_policy.rs",
+            "crates/ledr-daemon/src/engine/outbound.rs",
+            "crates/ledr-daemon/src/engine/dns_history.rs",
         ],
         0.65,
         0.40,
@@ -331,6 +343,40 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertTrue(str(criteria.get("true_description", "")).strip())
             self.assertTrue(str(criteria.get("false_description", "")).strip())
 
+        two_lane = questions["two_lane_no_unbounded_channel"]
+        for text_field in (
+            two_lane["instructions"],
+            two_lane["criteria"]["true_description"],
+            two_lane["criteria"]["false_description"],
+        ):
+            self.assertIn("1024", text_field)
+            self.assertIn("8192", text_field)
+
+        canary = questions["canary_write_only_and_expired_suspended"]
+        self.assertIn("DEFAULT_ALERT_TIMEOUT_SECS", canary["instructions"])
+        for text_field in (
+            canary["instructions"],
+            canary["criteria"]["true_description"],
+            canary["criteria"]["false_description"],
+        ):
+            self.assertIn("60-second", text_field)
+            self.assertIn("EXPIRED_SUSPENDED", text_field)
+
+        wfp = questions["wfp_dynamic_session_and_deny_priority"]
+        _, answer_yes_section = wfp["instructions"].split("Answer Yes", 1)
+        self.assertIn("dual-stack", answer_yes_section.lower())
+        self.assertIn("dual-stack", wfp["criteria"]["true_description"].lower())
+        self.assertIn("dual-stack", wfp["criteria"]["false_description"].lower())
+
+        nrd = questions["nrd_shutdown_nonblocking_and_checkpoint"]
+        for text_field in (
+            nrd["instructions"],
+            nrd["criteria"]["true_description"],
+            nrd["criteria"]["false_description"],
+        ):
+            self.assertIn("64 KiB", text_field)
+            self.assertIn("NRD_FILE_READ_CHUNK_BYTES", text_field)
+
         try:
             gate_script = check_invariants.resolve_gate_script()
         except FileNotFoundError as exc:
@@ -344,6 +390,41 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertEqual(item.path_globs, exp_globs)
             self.assertAlmostEqual(item.threshold, exp_thresh)
             self.assertAlmostEqual(item.warn_threshold, exp_warn)
+
+    def _run_wrapper_dry_run(self, diff_text: str) -> dict[str, object]:
+        """Run check_invariants.py --dry-run --format json on an in-memory unified diff."""
+        child_env = dict(os.environ)
+        child_env.pop("GEMINI_API_KEY", None)
+        child_env["PYTHONUTF8"] = "1"
+        child_env["PYTHONIOENCODING"] = "utf-8"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            diff_path = Path(tmp) / "mock.diff"
+            diff_path.write_text(diff_text, encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "check_invariants.py"),
+                    "--diff-file",
+                    str(diff_path),
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                cwd=str(REPO_ROOT),
+                env=child_env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr}\nstdout={proc.stdout}")
+        output = json.loads(proc.stdout)
+        self.assertEqual(output["status"], "dry_run")
+        self.assertEqual(output["exit_code"], 0)
+        return output
 
     def test_T1_06_dry_run_mock_diff_extracts_proto_and_excludes_artifact(self) -> None:
         """T1-06: Mock diff via real check_invariants_decision1.py extracts proto_frozen_api_compat and excludes ledr_artifact.html."""
@@ -371,37 +452,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             " </html>\n"
         )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            diff_path = Path(tmp) / "mock.diff"
-            diff_path.write_text(mock_diff, encoding="utf-8")
-
-            child_env = dict(os.environ)
-            child_env.pop("GEMINI_API_KEY", None)
-            child_env["PYTHONUTF8"] = "1"
-            child_env["PYTHONIOENCODING"] = "utf-8"
-
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPTS_DIR / "check_invariants.py"),
-                    "--diff-file",
-                    str(diff_path),
-                    "--dry-run",
-                    "--format",
-                    "json",
-                ],
-                cwd=str(REPO_ROOT),
-                env=child_env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                check=False,
-            )
-
-        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr}\nstdout={proc.stdout}")
-        output = json.loads(proc.stdout)
-        self.assertEqual(output["status"], "dry_run")
-        self.assertEqual(output["exit_code"], 0)
+        output = self._run_wrapper_dry_run(mock_diff)
 
         changed_files = output["changed_files"]
         self.assertIn("crates/ledr-proto/src/lib.rs", changed_files)
@@ -419,6 +470,84 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
         self.assertIn("crates/ledr-proto/src/lib.rs", input_text)
         self.assertNotIn("ledr_artifact.html", input_text)
         self.assertNotIn(artifact_marker, input_text)
+
+    def test_T1_07_single_file_diffs_select_updated_custom_rules(self) -> None:
+        """T1-07: Single-file diffs extract each updated custom invariant rule."""
+        try:
+            check_invariants.resolve_gate_script()
+        except FileNotFoundError as exc:
+            self.skipTest(f"Global invariant gate script not installed: {exc}")
+
+        cases: list[tuple[str, str, str, str, set[str]]] = [
+            (
+                "crates/ledr-proto/src/lib.rs",
+                "@@ -24,3 +24,3 @@",
+                " pub const HIGH_PRIORITY_CHANNEL_CAPACITY: usize = 1024;",
+                "-pub const DEFAULT_ALERT_TIMEOUT_SECS: u64 = 60;\n+pub const DEFAULT_ALERT_TIMEOUT_SECS: u64 = 120;",
+                {
+                    "proto_frozen_api_compat",
+                    "two_lane_no_unbounded_channel",
+                    "canary_write_only_and_expired_suspended",
+                },
+            ),
+            (
+                "crates/ledr-sensor-win/src/etw/handlers.rs",
+                "@@ -460,3 +460,3 @@",
+                ' let desired_access = info.get_u32("DesiredAccess");',
+                "-let write_disp = matches!(disposition, 0 | 2 | 4 | 5);\n+let write_disp = true;",
+                {"canary_write_only_and_expired_suspended"},
+            ),
+            (
+                "crates/ledr-store/src/alerts.rs",
+                "@@ -235,3 +235,3 @@",
+                " pub fn expire_pending_alerts(&self, cutoff_timestamp_ms: i64) -> Result<usize, StoreError> {",
+                "-AlertStatus::ExpiredSuspended.as_db_str(),\n+AlertStatus::Resolved.as_db_str(),",
+                {"canary_write_only_and_expired_suspended"},
+            ),
+            (
+                "crates/ledr-daemon/src/engine/outbound.rs",
+                "@@ -840,3 +840,3 @@",
+                ' "suspend_process failed during coupled outbound containment"',
+                "-let _ = self.defense.remove_wfp_rule(handle);\n+// rollback skipped",
+                {"wfp_dynamic_session_and_deny_priority"},
+            ),
+            (
+                "crates/ledr-daemon/src/engine/dns_history.rs",
+                "@@ -110,3 +110,3 @@",
+                " match &latest.ipv4 {",
+                "-Some((prev_ips, prev_ts)) if timestamp_ms < *prev_ts =>\n+Some((prev_ips, _prev_ts)) if false =>",
+                {"wfp_dynamic_session_and_deny_priority"},
+            ),
+            (
+                "crates/ledr-rules/src/nrd/reader.rs",
+                "@@ -8,3 +8,3 @@",
+                " use super::cancel::NrdCancelToken;",
+                "-pub(crate) const NRD_FILE_READ_CHUNK_BYTES: usize = 64 * 1024;\n+pub(crate) const NRD_FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;",
+                {"nrd_shutdown_nonblocking_and_checkpoint"},
+            ),
+        ]
+
+        for rel_path, hunk_header, context_line, change_lines, expected_keys in cases:
+            with self.subTest(path=rel_path):
+                diff_text = (
+                    f"diff --git a/{rel_path} b/{rel_path}\n"
+                    "index 1111111..2222222 100644\n"
+                    f"--- a/{rel_path}\n"
+                    f"+++ b/{rel_path}\n"
+                    f"{hunk_header}\n"
+                    f"{context_line}\n"
+                    f"{change_lines}\n"
+                )
+                output = self._run_wrapper_dry_run(diff_text)
+                self.assertEqual(output["changed_files"], [rel_path])
+                questions = output["payload"]["questions"]
+                self.assertTrue(
+                    expected_keys.issubset(questions.keys()),
+                    msg=(
+                        f"Missing {expected_keys - set(questions.keys())} for {rel_path}; "
+                        f"got {sorted(questions.keys())}"
+                    ),
+                )
 
 
 if __name__ == "__main__":

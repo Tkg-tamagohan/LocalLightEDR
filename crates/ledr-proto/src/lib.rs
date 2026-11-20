@@ -144,10 +144,11 @@ fn strip_ascii_prefix_ignore_case<'a>(s: &'a str, prefix_lower: &str) -> Option<
 
 fn is_in_trusted_never_suspend_directory(full_path: &str) -> bool {
     let normalized = full_path.replace('/', "\\");
-    let rest = normalized
-        .strip_prefix(r"\\?\")
-        .or_else(|| normalized.strip_prefix(r"\??\"))
-        .unwrap_or(&normalized);
+    let rest = if let Some(after_win32_ns) = normalized.strip_prefix(r"\\?\") {
+        strip_ascii_prefix_ignore_case(after_win32_ns, "globalroot").unwrap_or(after_win32_ns)
+    } else {
+        normalized.strip_prefix(r"\??\").unwrap_or(&normalized)
+    };
 
     let volume_relative_owned: String;
     let volume_relative: &str = if let Some(after_sysroot) =
@@ -1288,6 +1289,7 @@ mod tests {
             AUTHORIZED_UI_EXE_PATH,
             AUTHORIZED_BRIDGE_EXE_PATH,
             r"\Device\HarddiskVolume3\Windows\System32\lsass.exe",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Windows\System32\svchost.exe",
             r"\\?\C:\Windows\System32\dwm.exe",
             r"\??\C:\Windows\System32\services.exe",
             r"\SystemRoot\System32\smss.exe",

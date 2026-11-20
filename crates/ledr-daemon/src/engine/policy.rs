@@ -55,11 +55,9 @@ impl DaemonEngine {
             return WfpReconcileReport::default();
         }
         if self.config.outbound_enforcement_mode == super::OutboundEnforcementMode::Audit {
-            let has_domain_rules = self
-                .store
-                .list_network_rules()
-                .map(|rules| {
-                    rules.iter().any(|rule| {
+            match self.store.list_network_rules() {
+                Ok(rules) => {
+                    let has_domain_rules = rules.iter().any(|rule| {
                         matches!(rule.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow)
                             && !rule.exe_path_pattern.trim().is_empty()
                             && rule
@@ -71,11 +69,17 @@ impl DaemonEngine {
                                     crate::firewall::parse_literal_target_ip(target).is_none()
                                         && ledr_rules::parse_cidr_target(target).is_err()
                                 })
-                    })
-                })
-                .unwrap_or(false);
-            self.outbound_classifier
-                .set_has_domain_rules(has_domain_rules);
+                    });
+                    self.outbound_classifier
+                        .set_has_domain_rules(has_domain_rules);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to load persisted network rules in audit mode; preserving previous has_domain_rules state"
+                    );
+                }
+            }
             return WfpReconcileReport::default();
         }
         let rules = match self.store.list_network_rules() {

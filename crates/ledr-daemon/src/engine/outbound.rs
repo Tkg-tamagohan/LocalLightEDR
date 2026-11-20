@@ -290,19 +290,40 @@ impl DaemonEngine {
             .proc_instance_id
             .as_deref()
             .is_some_and(|inst_id| self.has_rule_alert_emitted(inst_id, "NET_OUTBOUND"));
-        let rules = self.store.list_network_rules().unwrap_or_default();
+        let (rules, rules_loaded) = match self.store.list_network_rules() {
+            Ok(rules) => (rules, true),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to load network rules during outbound evaluation"
+                );
+                (Vec::new(), false)
+            }
+        };
         let has_potentially_matching_rule = rules.iter().any(|r| {
             let pat = r.exe_path_pattern.trim();
             pat.is_empty() || matches_path_pattern(exe_path, pat)
         });
         // Fast path (`ANALYSIS_0001`): when already alerted and no persisted network rule can
         // match this executable path, avoid re-running BinaryInspector (full SHA-256) on every
-        // repeated connect in a burst. When any rule could match `exe_path`, always evaluate
-        // policy first so explicit NetworkBlock / NetworkAllow rules are never bypassed by
-        // NET_OUTBOUND alert deduplication.
-        if already_outbound_alerted && !has_potentially_matching_rule {
-            self.outbound_classifier.mark_steady(pid);
-            return ("DEDUP_SUPPRESSED", false);
+        // repeated connect in a burst. When any rule could match `exe_path` (or rule loading
+        // failed), always evaluate policy first so explicit NetworkBlock / NetworkAllow rules are
+        // never bypassed by NET_OUTBOUND alert deduplication.
+        if rules_loaded && !has_potentially_matching_rule {
+            let once_allowed = proc_ctx.proc_instance_id.as_deref().is_some_and(|inst_id| {
+                self.firewall
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_once_allowed(inst_id)
+            });
+            if once_allowed {
+                self.outbound_classifier.mark_steady(pid);
+                return ("ALLOWED", false);
+            }
+            if already_outbound_alerted {
+                self.outbound_classifier.mark_steady(pid);
+                return ("DEDUP_SUPPRESSED", false);
+            }
         }
 
         let bin_identity = self.inspector.inspect(exe_path);

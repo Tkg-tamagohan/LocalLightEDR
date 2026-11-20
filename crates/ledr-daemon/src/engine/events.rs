@@ -752,7 +752,7 @@ impl DaemonEngine {
         table.clear_rule_alert_emitted(instance_id, rule_id)
     }
 
-    fn resolve_process_context(
+    pub(super) fn resolve_process_context(
         &self,
         event: &SensorEvent,
         event_ts_ms: i64,

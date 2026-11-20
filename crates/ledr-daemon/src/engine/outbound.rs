@@ -291,11 +291,16 @@ impl DaemonEngine {
             .as_deref()
             .is_some_and(|inst_id| self.has_rule_alert_emitted(inst_id, "NET_OUTBOUND"));
         let rules = self.store.list_network_rules().unwrap_or_default();
-        // Fast path: when already alerted and no persisted network rules exist, avoid re-running
-        // BinaryInspector on every repeated connect in a burst. When persisted rules exist, always
-        // evaluate policy first so explicit NetworkBlock / NetworkAllow rules are never bypassed
-        // by NET_OUTBOUND alert deduplication.
-        if already_outbound_alerted && rules.is_empty() {
+        let has_potentially_matching_rule = rules.iter().any(|r| {
+            let pat = r.exe_path_pattern.trim();
+            pat.is_empty() || matches_path_pattern(exe_path, pat)
+        });
+        // Fast path (`ANALYSIS_0001`): when already alerted and no persisted network rule can
+        // match this executable path, avoid re-running BinaryInspector (full SHA-256) on every
+        // repeated connect in a burst. When any rule could match `exe_path`, always evaluate
+        // policy first so explicit NetworkBlock / NetworkAllow rules are never bypassed by
+        // NET_OUTBOUND alert deduplication.
+        if already_outbound_alerted && !has_potentially_matching_rule {
             self.outbound_classifier.mark_steady(pid);
             return ("DEDUP_SUPPRESSED", false);
         }

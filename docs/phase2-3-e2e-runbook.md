@@ -68,6 +68,14 @@ cd e:\Documents\code\LocalEDR
 Get-Process ledr-daemon, ledr-ui, ledr-sim -ErrorAction SilentlyContinue | Stop-Process -Force
 Remove-Item -Recurse -Force C:\Temp\ledr-e2e -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path C:\Temp\ledr-e2e\canary_dir | Out-Null
+# 検証前から存在するおとりファイルを記録し、後片付けで今回作成分だけを削除できるようにする
+$honeypotPaths = @(
+    "$env:USERPROFILE\Documents\!00_LocalEDR_Canary_DoNotEdit.docx",
+    "$env:USERPROFILE\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx",
+    "$env:USERPROFILE\Pictures\!00_LocalEDR_Canary_DoNotEdit.docx"
+)
+$preexistingHoneypots = @($honeypotPaths | Where-Object { Test-Path $_ })
+[System.IO.File]::WriteAllLines("C:\Temp\ledr-e2e\preexisting_honeypots.txt", [string[]]$preexistingHoneypots, [System.Text.UTF8Encoding]::new($false))
 .\target\debug\ledr-sim.exe --prepare-dir C:\Temp\ledr-e2e\canary_dir --json
 ```
 
@@ -209,10 +217,18 @@ Get-Process -Id $regAdd.Id -ErrorAction SilentlyContinue | Select-Object Id, Pro
 
 `reg.exe` は書き込み速度によってサスペンドより先に終了する場合もありますが、`ledr-ui` の **`Refresh`** 後に `View 1` へ `LEDR-CANARY-AUTORUN_REGISTRY`（`Autorun Persistence Modification: LocalEdrE2eProbe`）が記録されていれば ETW `Kernel-Registry` 監視が動作している（凍結中の場合は **`Allow Once`** で解放する）。
 
-続けて、テスト登録したレジストリ値を削除して元へ戻し、直後に無関係な一時キーを作成、更新、および削除して `CloseKey` 後のハンドル再利用誤検知が起きないことを確かめてください。
+続けて、テスト登録したレジストリ値を別プロセス（`-PassThru`、`-Wait` なし）で削除して元へ戻します。
+`DeleteValueKey` 監視により `reg.exe` が凍結した場合はウィンドウ B がブロックされないため、`ledr-ui` で **`Refresh`** を押して該当の `LEDR-CANARY-AUTORUN_REGISTRY` アラートを **`Allow Once`** で再開してから、終了確認後に一時キーを作成、更新、および削除して `CloseKey` 後のハンドル再利用誤検知が起きないことを確かめてください。
 
 ```powershell
-Start-Process -FilePath "reg.exe" -ArgumentList "delete", "HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "LocalEdrE2eProbe", "/f" -Wait
+$regDel = Start-Process -FilePath "reg.exe" -ArgumentList "delete", "HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "LocalEdrE2eProbe", "/f" -PassThru
+Start-Sleep -Seconds 2
+Get-Process -Id $regDel.Id -ErrorAction SilentlyContinue | Select-Object Id, ProcessName
+```
+
+`reg.exe` が凍結していれば `ledr-ui` の **`Allow Once`** で解放して終了を確認したうえで、次の一時キー操作を実行してください。
+
+```powershell
 $tmpKey = "HKCU:\Software\LocalEdrE2eTmp"
 New-Item -Path $tmpKey -Force | Out-Null
 Set-ItemProperty -Path $tmpKey -Name "Probe" -Value "ok"
@@ -432,9 +448,21 @@ $cpuPct = (($p1.CPU - $cpu0) / ($sampleSec * $logicalCores)) * 100.0
 
 ```powershell
 Get-Process ledr-daemon, ledr-ui, ledr-sim -ErrorAction SilentlyContinue | Stop-Process -Force
+# 事前準備で記録した preexisting_honeypots.txt に基づき、検証前から存在したファイルは残して今回作成分だけを削除する
+$preexistingFile = "C:\Temp\ledr-e2e\preexisting_honeypots.txt"
+if (Test-Path $preexistingFile) {
+    $preexisting = @(Get-Content $preexistingFile)
+    @(
+        "$env:USERPROFILE\Documents\!00_LocalEDR_Canary_DoNotEdit.docx",
+        "$env:USERPROFILE\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx",
+        "$env:USERPROFILE\Pictures\!00_LocalEDR_Canary_DoNotEdit.docx"
+    ) | Where-Object { $_ -notin $preexisting } | ForEach-Object {
+        Remove-Item $_ -ErrorAction SilentlyContinue
+    }
+} else {
+    Write-Warning "preexisting_honeypots.txt が見つからないため、ユーザーフォルダのおとりファイル自動削除をスキップしました。必要に応じて手動で確認してください。"
+}
 Remove-Item -Recurse -Force C:\Temp\ledr-e2e -ErrorAction SilentlyContinue
-# 必要に応じてユーザーフォルダに配置されたおとりファイル 3 件を削除する
-Remove-Item "$env:USERPROFILE\Documents\!00_LocalEDR_Canary_DoNotEdit.docx","$env:USERPROFILE\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx","$env:USERPROFILE\Pictures\!00_LocalEDR_Canary_DoNotEdit.docx" -ErrorAction SilentlyContinue
 # 必要に応じて HKCU\Software\Classes\ledr と LocalEDR.AlertUI のテスト登録を削除する
 # Remove-Item -Recurse -Force "HKCU:\Software\Classes\ledr","HKCU:\Software\Classes\AppUserModelId\LocalEDR.AlertUI" -ErrorAction SilentlyContinue
 ```

@@ -1,6 +1,7 @@
 //! Allowlist and firewall policy rule CRUD methods for [`LedrStore`].
 
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ledr_proto::{AllowlistRuleRecord, RuleScope};
 use rusqlite::params;
@@ -126,5 +127,55 @@ impl LedrStore {
             params![rule_id],
         )?;
         Ok(deleted > 0)
+    }
+
+    /// Seeds default allowlist rules at most once per database (`BUG_0004`).
+    ///
+    /// Any `rule_id` already recorded in `default_rule_seeds` is skipped even if the operator
+    /// later deleted it from `allowlist_rules`. Existing rows in `allowlist_rules` with the same
+    /// `rule_id` are preserved (`INSERT OR IGNORE`) without overwriting operator edits.
+    /// Returns the number of rules newly inserted into `allowlist_rules`.
+    pub fn seed_default_rules_once(
+        &self,
+        rules: &[AllowlistRuleRecord],
+    ) -> Result<usize, StoreError> {
+        if rules.is_empty() {
+            return Ok(0);
+        }
+        let seeded_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let mut writer = self.lock_writer()?;
+        let tx = writer.transaction()?;
+        let mut inserted = 0usize;
+        {
+            let mut seed_stmt = tx.prepare(
+                "INSERT OR IGNORE INTO default_rule_seeds (rule_id, seeded_at_ms) VALUES (?1, ?2)",
+            )?;
+            let mut rule_stmt = tx.prepare(
+                "INSERT OR IGNORE INTO allowlist_rules (
+                    rule_id, scope, exe_path_pattern, sha256, signer_subject,
+                    root_thumbprint, allowed_target, created_at_ms, created_by
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for rule in rules {
+                let seed_added = seed_stmt.execute(params![rule.rule_id, seeded_at_ms])?;
+                if seed_added > 0 {
+                    inserted += rule_stmt.execute(params![
+                        rule.rule_id,
+                        rule.scope.as_db_str(),
+                        rule.exe_path_pattern,
+                        rule.sha256,
+                        rule.signer_subject,
+                        rule.root_thumbprint,
+                        rule.allowed_target,
+                        rule.created_at_ms,
+                        rule.created_by,
+                    ])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
 }

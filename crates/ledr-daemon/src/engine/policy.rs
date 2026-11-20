@@ -50,10 +50,32 @@ impl DaemonEngine {
         &self,
         prev_rules: Option<&[AllowlistRuleRecord]>,
     ) -> WfpReconcileReport {
-        if !self.config.outbound_firewall_enabled
-            || self.config.outbound_enforcement_mode == super::OutboundEnforcementMode::Audit
-        {
+        if !self.config.outbound_firewall_enabled {
             self.outbound_classifier.set_has_domain_rules(false);
+            return WfpReconcileReport::default();
+        }
+        if self.config.outbound_enforcement_mode == super::OutboundEnforcementMode::Audit {
+            let has_domain_rules = self
+                .store
+                .list_network_rules()
+                .map(|rules| {
+                    rules.iter().any(|rule| {
+                        matches!(rule.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow)
+                            && !rule.exe_path_pattern.trim().is_empty()
+                            && rule
+                                .allowed_target
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .is_some_and(|target| {
+                                    crate::firewall::parse_literal_target_ip(target).is_none()
+                                        && ledr_rules::parse_cidr_target(target).is_err()
+                                })
+                    })
+                })
+                .unwrap_or(false);
+            self.outbound_classifier
+                .set_has_domain_rules(has_domain_rules);
             return WfpReconcileReport::default();
         }
         let rules = match self.store.list_network_rules() {

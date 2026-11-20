@@ -100,6 +100,8 @@ jobs:
                       path.startswith("crates/")
                       or (path.startswith("apps/ledr-ui/") and not path.startswith("apps/ledr-ui/ui/"))
                       or path.startswith("rules/")
+                      or path in {"rust-toolchain", "rust-toolchain.toml"}
+                      or path.startswith(".cargo/")
                   ):
                       rust = True
 
@@ -109,7 +111,7 @@ jobs:
                       or path.startswith("rules/")
                       or path.startswith(".github/")
                       or pathlib.Path(path).suffix.lower()
-                      in {".js", ".json", ".html", ".css", ".md", ".yml", ".yaml", ".toml"}
+                      in {".rs", ".js", ".json", ".html", ".css", ".md", ".yml", ".yaml", ".toml"}
                   ):
                       web = True
 
@@ -130,13 +132,43 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      - name: Check JS syntax (apps/ledr-ui/ui/app.js)
-        run: node --check apps/ledr-ui/ui/app.js
-      - name: Check JS syntax (extensions/ledr-chrome-mv3/background.js)
-        run: node --check extensions/ledr-chrome-mv3/background.js
-      - name: Check JS syntax (extensions/ledr-chrome-mv3/content.js)
-        run: node --check extensions/ledr-chrome-mv3/content.js
+          node-version: '22'
+      - name: Check JS syntax (all tracked .js files)
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          import subprocess
+          import sys
+
+          required_js_files = [
+              "apps/ledr-ui/ui/app.js",
+              "extensions/ledr-chrome-mv3/background.js",
+              "extensions/ledr-chrome-mv3/content.js",
+          ]
+          errors = []
+          for rel in required_js_files:
+              if not pathlib.Path(rel).is_file():
+                  errors.append(f"Missing required JS file: {rel}")
+
+          ls_res = subprocess.run(
+              ["git", "ls-files", "-z", "*.js"],
+              capture_output=True,
+              check=True,
+          )
+          js_files = [p for p in ls_res.stdout.decode("utf-8", errors="strict").split("\0") if p]
+          for rel in js_files:
+              res = subprocess.run(["node", "--check", rel], capture_output=True, text=True, check=False)
+              if res.returncode != 0:
+                  detail = (res.stderr or res.stdout).strip()
+                  errors.append(f"JS syntax check failed for {rel}: {detail}")
+
+          if errors:
+              for err in errors:
+                  print(err, file=sys.stderr)
+              sys.exit(1)
+
+          print(f"JS syntax checks passed ({len(js_files)} files).")
+          EOF
       - name: Validate JSON, text integrity, conflict markers, and UI assets
         run: |
           python3 - <<'EOF'
@@ -148,7 +180,7 @@ jobs:
 
           errors = []
 
-          json_files = [
+          required_json_files = [
               "rules/lotl_core.json",
               "rules/default_allowlist.json",
               "apps/ledr-ui/tauri.conf.json",
@@ -156,36 +188,50 @@ jobs:
               "extensions/ledr-chrome-mv3/manifest.json",
               "extensions/ledr-chrome-mv3/rules/dnr_static.json",
           ]
-          for rel in json_files:
-              p = pathlib.Path(rel)
-              if not p.is_file():
+          for rel in required_json_files:
+              if not pathlib.Path(rel).is_file():
                   errors.append(f"Missing required JSON file: {rel}")
-                  continue
-              try:
-                  json.loads(p.read_text(encoding="utf-8"))
-              except Exception as exc:
-                  errors.append(f"Invalid JSON in {rel}: {exc}")
-
-          required_ui_files = [
-              "apps/ledr-ui/ui/index.html",
-              "apps/ledr-ui/ui/app.js",
-          ]
-          for rel in required_ui_files:
-              p = pathlib.Path(rel)
-              if not p.is_file() or p.stat().st_size == 0 or not p.read_text(encoding="utf-8").strip():
-                  errors.append(f"Required UI file missing or empty: {rel}")
 
           ls_res = subprocess.run(
               ["git", "ls-files", "-z"],
               capture_output=True,
               check=True,
           )
+          tracked_files = [p for p in ls_res.stdout.decode("utf-8", errors="strict").split("\0") if p]
+
+          def reject_nonstandard_json_constant(token: str) -> None:
+              raise ValueError(f"Non-standard JSON constant {token!r} is not allowed")
+
+          json_files = sorted(
+              {rel for rel in tracked_files if pathlib.Path(rel).suffix.lower() == ".json"}
+              | {rel for rel in required_json_files if pathlib.Path(rel).is_file()}
+          )
+          for rel in json_files:
+              p = pathlib.Path(rel)
+              if not p.is_file():
+                  continue
+              try:
+                  json.loads(
+                      p.read_text(encoding="utf-8"),
+                      parse_constant=reject_nonstandard_json_constant,
+                  )
+              except Exception as exc:
+                  errors.append(f"Invalid JSON in {rel}: {exc}")
+
+          required_ui_files = [
+              "apps/ledr-ui/ui/index.html",
+              "apps/ledr-ui/ui/app.js",
+              "apps/ledr-ui/ui/styles.css",
+          ]
+          for rel in required_ui_files:
+              p = pathlib.Path(rel)
+              if not p.is_file() or p.stat().st_size == 0 or not p.read_text(encoding="utf-8").strip():
+                  errors.append(f"Required UI file missing or empty: {rel}")
+
           text_exts = {".rs", ".toml", ".json", ".js", ".html", ".css", ".md", ".yml", ".yaml"}
           conflict_re = re.compile(r"^(?:<{7}(?: |$)|={7}$|>{7}(?: |$))")
 
-          for rel in ls_res.stdout.decode("utf-8", errors="strict").split("\0"):
-              if not rel:
-                  continue
+          for rel in tracked_files:
               p = pathlib.Path(rel)
               if p.suffix.lower() not in text_exts or not p.is_file():
                   continue
@@ -235,6 +281,11 @@ jobs:
       - name: Cargo test (ledr-store ttl_purge_lineage)
         shell: pwsh
         run: cargo test -p ledr-store --test ttl_purge_lineage --locked
+      - name: Cargo doc (broken intra-doc links)
+        shell: pwsh
+        env:
+          RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+        run: cargo doc --workspace --no-deps --locked
 
   ci-gate:
     runs-on: ubuntu-latest

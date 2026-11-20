@@ -1806,6 +1806,9 @@ fn read_http_get_prefix(
     total >= 4 && &buf[..4] == b"GET "
 }
 
+// Note: `RULES-P3-13` was intentionally retired in PR #14 (`8268dfe`) during test pruning;
+// `RULES-P3-14` and `RULES-P3-15` retain their original IDs to match existing `rules_p3_01`..`rules_p3_12`
+// function names and preserve historical traceability.
 /// `RULES-P3-14`（`決定記録 L-14` / `AUTO-10` / 指摘 R-11）:
 /// ファイル形式 NRD フィードの 64 KiB チャンク単位読み取り（`read_bounded_reader_cancellable` /
 /// `read_bounded_file`）について、1 チャンク読み込み後のキャンセルで 2 チャンク目の `read()` を

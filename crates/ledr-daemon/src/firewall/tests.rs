@@ -314,7 +314,8 @@ fn firewall_reconcile_scoping_and_rollback_fidelity() {
     );
 }
 
-/// `FIREWALL-P3-47A` (`#4`, `#1`): Shared-IP `DomainPolicy` filters retain a bounded,
+/// `FIREWALL-P3-47A` (`#4`, `#1`; unit-boundary counterpart to integration test `DAEMON-P3-47`):
+/// Shared-IP `DomainPolicy` filters retain a bounded,
 /// normalized set of domain hints across reuse, prune migrated domains and sync active
 /// blocking reasons on migration so final migration removes the block even after earlier
 /// domains were evicted from DNS history FIFO, preserve dual-stack IPv6 blocks, enforce
@@ -975,7 +976,8 @@ fn firewall_p3_47a_domain_policy_hint_set_migration_cleanup_and_rollback_fidelit
     );
 }
 
-/// `FIREWALL-P3-48A` (`PRRT_kwDOVyjVyM65e5kL` + `AUD-P3-02`):
+/// `FIREWALL-P3-48A` (`PRRT_kwDOVyjVyM65e5kL` + `AUD-P3-02`; unit-boundary counterpart to
+/// integration test `DAEMON-P3-48`):
 /// - Shared IP (`api.example` allowed + `other.example` unallowed) migrating `api.example`
 ///   retains the authorizing hint across DNS-time pruning and unrelated reconciliation;
 /// - Subsequent migration of unallowed `other.example` selectively prunes `other.example`

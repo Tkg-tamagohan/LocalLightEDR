@@ -8,6 +8,10 @@ use ledr_rules::{
     evaluate_outbound_policy, matches_network_allow_rule, BinaryIdentity, OutboundDecision,
 };
 
+#[cfg(doc)]
+use super::manager::WfpRuleManager;
+#[cfg(doc)]
+use super::types::WfpFilterOrigin;
 use super::types::MAX_DOMAIN_HINTS_PER_FILTER;
 
 /// Normalizes a domain hint (trim whitespace, strip trailing DNS dots, ASCII lowercase).

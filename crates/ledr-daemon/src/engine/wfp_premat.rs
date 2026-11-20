@@ -27,6 +27,11 @@ impl DaemonEngine {
         resolved_ips: &[IpAddr],
         proc_ctx: &ResolvedProcessContext,
     ) {
+        if !self.config.outbound_firewall_enabled
+            || self.config.outbound_enforcement_mode == super::OutboundEnforcementMode::Audit
+        {
+            return;
+        }
         let norm_query = query_name.trim().trim_end_matches('.');
         if norm_query.is_empty() {
             return;
@@ -370,6 +375,9 @@ impl DaemonEngine {
     }
 
     pub(super) fn maybe_apply_preemptive_wfp_block(&self, exe_path: &str) {
+        if self.config.outbound_enforcement_mode == super::OutboundEnforcementMode::Audit {
+            return;
+        }
         let trimmed = exe_path.trim();
         if trimmed.is_empty() || WfpRuleManager::is_wildcard_pattern(trimmed) {
             return;

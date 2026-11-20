@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::firewall::WfpFilterOrigin;
 use crate::firewall::{parse_literal_target_ip, WfpRuleManager};
 
+use super::config::OutboundEnforcementMode;
 use super::domain_policy::{
     collect_domain_specific_blocked_hints, extend_authorizing_hints_from_existing_permit,
     network_allow_rule_identity_matches, outbound_alert_title, partition_permit_hints,
@@ -289,14 +290,40 @@ impl DaemonEngine {
             .proc_instance_id
             .as_deref()
             .is_some_and(|inst_id| self.has_rule_alert_emitted(inst_id, "NET_OUTBOUND"));
-        let rules = self.store.list_network_rules().unwrap_or_default();
-        // Fast path: when already alerted and no persisted network rules exist, avoid re-running
-        // BinaryInspector on every repeated connect in a burst. When persisted rules exist, always
-        // evaluate policy first so explicit NetworkBlock / NetworkAllow rules are never bypassed
-        // by NET_OUTBOUND alert deduplication.
-        if already_outbound_alerted && rules.is_empty() {
-            self.outbound_classifier.mark_steady(pid);
-            return ("DEDUP_SUPPRESSED", false);
+        let (rules, rules_loaded) = match self.store.list_network_rules() {
+            Ok(rules) => (rules, true),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to load network rules during outbound evaluation"
+                );
+                (Vec::new(), false)
+            }
+        };
+        let has_potentially_matching_rule = rules.iter().any(|r| {
+            let pat = r.exe_path_pattern.trim();
+            pat.is_empty() || matches_path_pattern(exe_path, pat)
+        });
+        // Fast path (`ANALYSIS_0001`): when already alerted and no persisted network rule can
+        // match this executable path, avoid re-running BinaryInspector (full SHA-256) on every
+        // repeated connect in a burst. When any rule could match `exe_path` (or rule loading
+        // failed), always evaluate policy first so explicit NetworkBlock / NetworkAllow rules are
+        // never bypassed by NET_OUTBOUND alert deduplication.
+        if rules_loaded && !has_potentially_matching_rule {
+            let once_allowed = proc_ctx.proc_instance_id.as_deref().is_some_and(|inst_id| {
+                self.firewall
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_once_allowed(inst_id)
+            });
+            if once_allowed {
+                self.outbound_classifier.mark_steady(pid);
+                return ("ALLOWED", false);
+            }
+            if already_outbound_alerted {
+                self.outbound_classifier.mark_steady(pid);
+                return ("DEDUP_SUPPRESSED", false);
+            }
         }
 
         let bin_identity = self.inspector.inspect(exe_path);
@@ -492,7 +519,11 @@ impl DaemonEngine {
                 } else {
                     Vec::new()
                 };
-                let wfp_handle = {
+                let is_audit_mode =
+                    self.config.outbound_enforcement_mode == OutboundEnforcementMode::Audit;
+                let wfp_handle = if is_audit_mode {
+                    None
+                } else {
                     let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                     let res = match matched_target {
                         None => fw.ensure_policy_block(exe_path, None, &*self.defense),
@@ -551,7 +582,7 @@ impl DaemonEngine {
                     .as_deref()
                     .is_none_or(|inst_id| self.is_new_rule_alert(inst_id, "NET_POLICY_BLOCK"));
                 if !is_new_block_alert {
-                    return ("BLOCKED", false);
+                    return (if is_audit_mode { "ALERTED" } else { "BLOCKED" }, false);
                 }
 
                 let domain_risk = effective_domain_hint
@@ -610,12 +641,19 @@ impl DaemonEngine {
                     if let Some(ref inst_id) = proc_ctx.proc_instance_id {
                         self.clear_rule_alert(inst_id, "NET_POLICY_BLOCK");
                     }
-                    return ("BLOCKED", false);
+                    return (if is_audit_mode { "ALERTED" } else { "BLOCKED" }, false);
                 }
                 self.alerts_emitted.fetch_add(1, Ordering::Relaxed);
-                ("BLOCKED", true)
+                (if is_audit_mode { "ALERTED" } else { "BLOCKED" }, true)
             }
             OutboundDecision::PreemptiveRestrict(_) | OutboundDecision::UnknownFirstConnect => {
+                let should_enforce = match self.config.outbound_enforcement_mode {
+                    OutboundEnforcementMode::Enforce => true,
+                    OutboundEnforcementMode::PreemptiveOnly => {
+                        matches!(decision, OutboundDecision::PreemptiveRestrict(_))
+                    }
+                    OutboundEnforcementMode::Audit => false,
+                };
                 // Respect per-process AllowOnce grant (only when no NetworkBlock matched above).
                 if let Some(inst_id) = proc_ctx.proc_instance_id.as_deref() {
                     if self
@@ -654,31 +692,33 @@ impl DaemonEngine {
                 // Security #8: If a stale WFP Permit filter remains in `firewall` (e.g., binary
                 // replaced on disk after ProcessStart), revoke it before registering transient
                 // containment so `register_transient_containment` is never shadowed by a stale Permit.
-                let any_allow_identity_valid = rules
-                    .iter()
-                    .any(|r| network_allow_rule_identity_matches(r, &bin_identity));
-                let revoked_permits = {
-                    let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                    if !any_allow_identity_valid {
-                        fw.revoke_permits_for_exe(exe_path, &*self.defense)
-                    } else {
-                        let mut count = 0usize;
-                        if fw.revoke_permit_for_target(exe_path, None, &*self.defense) {
-                            count += 1;
+                if should_enforce {
+                    let any_allow_identity_valid = rules
+                        .iter()
+                        .any(|r| network_allow_rule_identity_matches(r, &bin_identity));
+                    let revoked_permits = {
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        if !any_allow_identity_valid {
+                            fw.revoke_permits_for_exe(exe_path, &*self.defense)
+                        } else {
+                            let mut count = 0usize;
+                            if fw.revoke_permit_for_target(exe_path, None, &*self.defense) {
+                                count += 1;
+                            }
+                            if fw.revoke_permit_for_target(exe_path, Some(dst_ip), &*self.defense) {
+                                count += 1;
+                            }
+                            count
                         }
-                        if fw.revoke_permit_for_target(exe_path, Some(dst_ip), &*self.defense) {
-                            count += 1;
-                        }
-                        count
+                    };
+                    if revoked_permits > 0 {
+                        tracing::warn!(
+                            exe_path = %exe_path,
+                            revoked_permits,
+                            "revoked stale WFP Permit filter(s) before applying outbound containment"
+                        );
+                        self.invalidate_non_protected_steady_pids();
                     }
-                };
-                if revoked_permits > 0 {
-                    tracing::warn!(
-                        exe_path = %exe_path,
-                        revoked_permits,
-                        "revoked stale WFP Permit filter(s) before applying outbound containment"
-                    );
-                    self.invalidate_non_protected_steady_pids();
                 }
 
                 let alert_id = Uuid::new_v4().to_string();
@@ -687,12 +727,14 @@ impl DaemonEngine {
                     .filter(|id| id.create_time_100ns != 0);
 
                 let exe_key = WfpRuleManager::exe_key(exe_path);
-                let (existing_preemptive, shared_allow_once_active) = {
+                let (existing_preemptive, shared_allow_once_active) = if should_enforce {
                     let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                     (
                         fw.active_app_block(exe_path),
                         fw.has_once_allowed_for_exe(&exe_key),
                     )
+                } else {
+                    (None, false)
                 };
 
                 let mut process_suspended = false;
@@ -701,7 +743,17 @@ impl DaemonEngine {
                 let mut bound_existing_alert = false;
                 let mut wfp_shared_allow_once_deferred = false;
 
-                if let Some((existing_handle, _existing_origin)) = existing_preemptive {
+                if !should_enforce {
+                    tracing::info!(
+                        pid,
+                        exe_path = %exe_path,
+                        dst_ip = %dst_ip,
+                        dst_port,
+                        risk_class = ?risk,
+                        outbound_mode = self.config.outbound_enforcement_mode.as_str(),
+                        "observed outbound connection without containment due to outbound enforcement mode"
+                    );
+                } else if let Some((existing_handle, _existing_origin)) = existing_preemptive {
                     wfp_filter_id = Some(existing_handle);
                     bound_existing_alert = self
                         .firewall
@@ -935,12 +987,14 @@ impl DaemonEngine {
                 }
 
                 self.alerts_emitted.fetch_add(1, Ordering::Relaxed);
-                if let Err(err) = self.notifier.notify_alert(&alert) {
-                    tracing::warn!(
-                        alert_id = %alert.alert_id,
-                        error = %err,
-                        "failed to dispatch toast notification for outbound alert"
-                    );
+                if should_enforce {
+                    if let Err(err) = self.notifier.notify_alert(&alert) {
+                        tracing::warn!(
+                            alert_id = %alert.alert_id,
+                            error = %err,
+                            "failed to dispatch toast notification for outbound alert"
+                        );
+                    }
                 }
 
                 let action = match (process_suspended, wfp_filter_id.is_some()) {

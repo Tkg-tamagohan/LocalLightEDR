@@ -14,5 +14,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = "2.12"
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "UI_Notifications",
+    "Data_Xml_Dom",
+    "Win32_System_Com",
+] }
+winreg = { workspace = true }
+
 [build-dependencies]
 tauri-build = "2.7"

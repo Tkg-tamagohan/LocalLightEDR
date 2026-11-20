@@ -23,6 +23,96 @@ impl LedrStore {
         Ok(updated > 0)
     }
 
+    /// Updates an alert's `process_suspended` flag and `context_json` atomically; returns `true`
+    /// if a row existed (`BUG_0002`).
+    pub fn update_alert_suspension_state(
+        &self,
+        alert_id: &str,
+        process_suspended: bool,
+        context_json: &str,
+    ) -> Result<bool, StoreError> {
+        let writer = self.lock_writer()?;
+        let updated = writer.execute(
+            "UPDATE alerts SET process_suspended = ?1, context_json = ?2 WHERE alert_id = ?3",
+            params![i64::from(process_suspended), context_json, alert_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Lists all unresolved (`PENDING` / `EXPIRED_SUSPENDED`) alerts that still record a suspended
+    /// parent (`process_suspended = 1`) or suspended children (`suspended_children` in `context_json`),
+    /// using keyset pagination so large alert histories never truncate older suspended rows (`BUG_0003`).
+    pub fn list_unresolved_suspended_alerts(&self) -> Result<Vec<AlertRecord>, StoreError> {
+        const PAGE_SIZE: usize = 500;
+        let reader = self.lock_reader()?;
+        let pending = AlertStatus::Pending.as_db_str();
+        let expired = AlertStatus::ExpiredSuspended.as_db_str();
+        let first_sql = format!(
+            "SELECT {ALERT_COLS} FROM alerts
+             WHERE status IN (?1, ?2)
+               AND (
+                 process_suspended = 1
+                 OR (
+                   context_json LIKE '%\"suspended_children\"%'
+                   AND context_json NOT LIKE '%\"suspended_children\":[]%'
+                 )
+               )
+             ORDER BY timestamp_ms ASC, alert_id ASC
+             LIMIT ?3"
+        );
+        let next_sql = format!(
+            "SELECT {ALERT_COLS} FROM alerts
+             WHERE status IN (?1, ?2)
+               AND (
+                 process_suspended = 1
+                 OR (
+                   context_json LIKE '%\"suspended_children\"%'
+                   AND context_json NOT LIKE '%\"suspended_children\":[]%'
+                 )
+               )
+               AND (timestamp_ms > ?3 OR (timestamp_ms = ?3 AND alert_id > ?4))
+             ORDER BY timestamp_ms ASC, alert_id ASC
+             LIMIT ?5"
+        );
+        let mut first_stmt = reader.prepare(&first_sql)?;
+        let mut next_stmt = reader.prepare(&next_sql)?;
+
+        let mut all = Vec::new();
+        let mut cursor: Option<(i64, String)> = None;
+        loop {
+            let mut page = Vec::new();
+            match &cursor {
+                None => {
+                    let mut rows = first_stmt.query(params![pending, expired, PAGE_SIZE as i64])?;
+                    while let Some(row) = rows.next()? {
+                        page.push(row_to_alert(row)?);
+                    }
+                }
+                Some((last_ts, last_id)) => {
+                    let mut rows = next_stmt.query(params![
+                        pending,
+                        expired,
+                        *last_ts,
+                        last_id.as_str(),
+                        PAGE_SIZE as i64
+                    ])?;
+                    while let Some(row) = rows.next()? {
+                        page.push(row_to_alert(row)?);
+                    }
+                }
+            }
+            let fetched = page.len();
+            if let Some(last) = page.last() {
+                cursor = Some((last.timestamp_ms, last.alert_id.clone()));
+            }
+            all.extend(page);
+            if fetched < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
     /// Lists alerts ordered by newest `timestamp_ms` first, optionally filtered by [`AlertStatus`].
     pub fn list_alerts(
         &self,

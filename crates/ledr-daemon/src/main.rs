@@ -4,7 +4,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ledr_daemon::{start_ipc_server, DaemonConfig, DaemonEngine, Session0ToastLauncher};
+use ledr_daemon::{
+    start_ipc_server, DaemonConfig, DaemonEngine, OutboundEnforcementMode, Session0ToastLauncher,
+};
 use ledr_proto::{
     AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, IPC_PIPE_NAME, PROGRAM_DATA_DIR,
     SensorBackend,
@@ -27,6 +29,9 @@ struct CliArgs {
     foreground: bool,
     dev_bypass_auth: bool,
     disable_nrd_refresh: bool,
+    disable_outbound_firewall: bool,
+    outbound_mode: OutboundEnforcementMode,
+    resume_suspended_on_shutdown: bool,
     db_path: Option<PathBuf>,
     rules_dir: Option<PathBuf>,
     nrd_cache_path: Option<PathBuf>,
@@ -44,6 +49,9 @@ impl Default for CliArgs {
             foreground: true,
             dev_bypass_auth: false,
             disable_nrd_refresh: false,
+            disable_outbound_firewall: false,
+            outbound_mode: OutboundEnforcementMode::Enforce,
+            resume_suspended_on_shutdown: false,
             db_path: None,
             rules_dir: None,
             nrd_cache_path: None,
@@ -73,6 +81,24 @@ where
             "--service-strict" => parsed.foreground = false,
             "--dev-bypass-auth" => parsed.dev_bypass_auth = true,
             "--disable-nrd-refresh" => parsed.disable_nrd_refresh = true,
+            "--disable-outbound-firewall" => parsed.disable_outbound_firewall = true,
+            "--resume-suspended-on-shutdown" => parsed.resume_suspended_on_shutdown = true,
+            "--outbound-mode" => {
+                let val = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--outbound-mode requires one of: enforce, preemptive-only, audit"
+                    )
+                })?;
+                let raw = val.to_string_lossy().trim().to_ascii_lowercase();
+                parsed.outbound_mode = match raw.as_str() {
+                    "enforce" => OutboundEnforcementMode::Enforce,
+                    "preemptive-only" => OutboundEnforcementMode::PreemptiveOnly,
+                    "audit" => OutboundEnforcementMode::Audit,
+                    other => anyhow::bail!(
+                        "invalid --outbound-mode '{other}' (expected enforce, preemptive-only, or audit)"
+                    ),
+                };
+            }
             "--nrd-feed-url" => {
                 let val = iter
                     .next()
@@ -252,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = parse_cli_args(std::env::args_os())?;
     if cli.show_help {
         println!(
-            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>]"
+            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>]"
         );
         return Ok(());
     }
@@ -273,9 +299,18 @@ async fn main() -> anyhow::Result<()> {
     let (sigma, pruner, default_allowlists) = load_rules_or_default(cli.rules_dir.as_deref())?;
     let rule_count = sigma.rule_count();
 
-    for rule in &default_allowlists {
-        if let Err(err) = store.upsert_rule(rule) {
-            tracing::warn!(rule_id = %rule.rule_id, error = %err, "failed seeding default allowlist rule");
+    match store.seed_default_rules_once(&default_allowlists) {
+        Ok(seeded) => {
+            if seeded > 0 {
+                tracing::info!(
+                    seeded,
+                    total = default_allowlists.len(),
+                    "seeded default allowlist rules"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed seeding default allowlist rules");
         }
     }
 
@@ -305,15 +340,24 @@ async fn main() -> anyhow::Result<()> {
         cli.nrd_feed_urls.clone()
     };
 
+    let outbound_firewall_enabled = !cli.disable_outbound_firewall;
+    let resume_suspended_on_shutdown = cli.resume_suspended_on_shutdown || cli.foreground;
     let defense_controller = Arc::new(WindowsDefenseController::new());
-    if let Err(err) = defense_controller.init_wfp_session() {
-        tracing::warn!(
-            error = %err,
-            "WFP dynamic session could not be initialized (non-elevated session?); outbound WFP filtering will retry on demand"
-        );
+    if outbound_firewall_enabled && cli.outbound_mode != OutboundEnforcementMode::Audit {
+        if let Err(err) = defense_controller.init_wfp_session() {
+            tracing::warn!(
+                error = %err,
+                "WFP dynamic session could not be initialized (non-elevated session?); outbound WFP filtering will retry on demand"
+            );
+        }
     }
 
-    let preemptive_startup_executables = discover_default_prerestricted_interpreters();
+    let preemptive_startup_executables =
+        if outbound_firewall_enabled && cli.outbound_mode != OutboundEnforcementMode::Audit {
+            discover_default_prerestricted_interpreters()
+        } else {
+            Vec::new()
+        };
     let config = DaemonConfig {
         pipe_name: cli.pipe_name.clone(),
         dev_mode_bypass_ui_auth: cli.dev_bypass_auth,
@@ -322,6 +366,9 @@ async fn main() -> anyhow::Result<()> {
         authorized_ui_signer: cli.ui_signer.clone(),
         authorized_ui_root_thumbprint: cli.ui_root_thumbprint.clone(),
         authorized_bridge_sha256,
+        outbound_firewall_enabled,
+        outbound_enforcement_mode: cli.outbound_mode,
+        resume_suspended_on_shutdown,
         preemptive_startup_executables,
         nrd_refresh_enabled: !cli.disable_nrd_refresh,
         nrd_cache_path,
@@ -329,7 +376,8 @@ async fn main() -> anyhow::Result<()> {
         ..DaemonConfig::default()
     };
     let wfp_defense = Arc::clone(&defense_controller);
-    let outbound_firewall_enabled = config.outbound_firewall_enabled;
+    let attach_wfp_drop_sink =
+        config.outbound_firewall_enabled && config.outbound_enforcement_mode != OutboundEnforcementMode::Audit;
     let engine = DaemonEngine::start_with_controllers(
         store,
         sigma,
@@ -341,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
             cli.foreground,
         )),
     );
-    if outbound_firewall_enabled {
+    if attach_wfp_drop_sink {
         if let Err(err) = wfp_defense.set_wfp_drop_sink(engine.wfp_drop_sink()) {
             tracing::warn!(
                 error = %err,
@@ -514,11 +562,33 @@ mod tests {
         let service_strict = parse_cli_args(["ledr-daemon", "--service-strict"]).expect("service strict");
         assert!(!service_strict.foreground);
         assert!(!service_strict.dev_bypass_auth);
+        assert_eq!(service_strict.outbound_mode, OutboundEnforcementMode::Enforce);
+        assert!(!service_strict.disable_outbound_firewall);
+        assert!(!service_strict.resume_suspended_on_shutdown);
+
+        let safe_host = parse_cli_args([
+            "ledr-daemon",
+            "--service-strict",
+            "--outbound-mode",
+            "preemptive-only",
+            "--disable-outbound-firewall",
+            "--resume-suspended-on-shutdown",
+        ])
+        .expect("safe host flags");
+        assert_eq!(safe_host.outbound_mode, OutboundEnforcementMode::PreemptiveOnly);
+        assert!(safe_host.disable_outbound_firewall);
+        assert!(safe_host.resume_suspended_on_shutdown);
+
+        let audit_mode = parse_cli_args(["ledr-daemon", "--outbound-mode", "audit"])
+            .expect("audit mode");
+        assert_eq!(audit_mode.outbound_mode, OutboundEnforcementMode::Audit);
 
         // BUG_0007: --ui-signer without --ui-root-thumbprint must be rejected at startup.
         // BUG_0004: under --dev-bypass-auth no authorization runs, so the signer/thumbprint
         // pair is not required.
         let cases: &[(&str, &[&str], bool)] = &[
+            ("--outbound-mode missing value", &["ledr-daemon", "--outbound-mode"], false),
+            ("--outbound-mode invalid value", &["ledr-daemon", "--outbound-mode", "bogus"], false),
             ("--db missing value", &["ledr-daemon", "--db"], false),
             ("--ui-sha256 missing value", &["ledr-daemon", "--ui-sha256"], false),
             ("--ui-signer missing value", &["ledr-daemon", "--ui-signer"], false),

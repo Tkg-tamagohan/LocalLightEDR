@@ -24,6 +24,9 @@ pub struct ActiveProcessEntry {
 /// Resolution result returned when recording a new `ProcessStart` into [`ActiveProcessTable`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessStartResolution {
+    /// Effective [`ProcessIdentity`] resolved in memory (equals the already-running verified
+    /// identity when a `create_time_100ns == 0` snapshot is absorbed into it).
+    pub resolved_identity: ProcessIdentity,
     pub instance_id: String,
     pub parent_instance_id: Option<String>,
     pub parent_exe_path: Option<String>,
@@ -36,6 +39,10 @@ pub struct ProcessStartResolution {
     /// supersedes an earlier active entry for the same PID (such as a `pid:0` snapshot
     /// placeholder); the engine propagates it to the store in the same transaction.
     pub superseded_exit: Option<(String, i64)>,
+    /// `true` when an unverified `create_time_100ns == 0` snapshot was absorbed into an already
+    /// running verified process without enriching any missing metadata, so persisting a synthetic
+    /// `pid:0` row into SQLite must be skipped.
+    pub skip_store_ingest: bool,
 }
 
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
@@ -104,6 +111,86 @@ impl ActiveProcessTable {
                 (None, None, None)
             };
 
+        if identity.create_time_100ns == 0 {
+            if let Some(active_verified_id) = self
+                .pid_to_identity
+                .get(&identity.pid)
+                .copied()
+                .filter(|prev| prev.create_time_100ns != 0)
+                .map(|prev| prev.instance_id())
+            {
+                if self
+                    .entries
+                    .get(&active_verified_id)
+                    .is_some_and(|e| e.exited_at_ms.is_none())
+                {
+                    if parent_instance_id.is_none() {
+                        let existing_parent_id = self
+                            .entries
+                            .get(&active_verified_id)
+                            .and_then(|e| e.parent_instance_id.clone());
+                        if let Some(ref existing_pid) = existing_parent_id {
+                            if let Some(parent_entry) = self.entries.get(existing_pid) {
+                                parent_instance_id = Some(parent_entry.instance_id.clone());
+                                parent_exe_path = Some(parent_entry.exe_path.clone());
+                                parent_command_line = (!parent_entry.command_line.is_empty())
+                                    .then(|| parent_entry.command_line.clone());
+                            }
+                        }
+                    }
+
+                    let prev_entry = self
+                        .entries
+                        .get_mut(&active_verified_id)
+                        .expect("verified active entry presence verified");
+                    let upgraded_parent =
+                        prev_entry.parent_instance_id.is_none() && parent_instance_id.is_some();
+                    let upgraded_ppid = prev_entry.ppid == 0 && parent_pid != 0;
+                    let upgraded_exe = prev_entry.exe_path.is_empty() && !exe_path.is_empty();
+                    let upgraded_cmd =
+                        prev_entry.command_line.is_empty() && !command_line.is_empty();
+                    let upgraded_sid = prev_entry.user_sid.is_none() && user_sid.is_some();
+
+                    if upgraded_parent {
+                        prev_entry.parent_instance_id = parent_instance_id.clone();
+                    }
+                    if upgraded_ppid {
+                        prev_entry.ppid = parent_pid;
+                    }
+                    if upgraded_exe {
+                        prev_entry.exe_path = exe_path;
+                    }
+                    if upgraded_cmd {
+                        prev_entry.command_line = command_line;
+                    }
+                    if upgraded_sid {
+                        prev_entry.user_sid = user_sid;
+                    }
+
+                    let enriched = upgraded_parent
+                        || upgraded_ppid
+                        || upgraded_exe
+                        || upgraded_cmd
+                        || upgraded_sid;
+                    let should_evaluate_sigma =
+                        !prev_entry.sigma_evaluated || upgraded_parent || upgraded_cmd || upgraded_exe;
+                    prev_entry.sigma_evaluated = true;
+
+                    return ProcessStartResolution {
+                        resolved_identity: prev_entry.identity,
+                        instance_id: prev_entry.instance_id.clone(),
+                        parent_instance_id: prev_entry.parent_instance_id.clone(),
+                        parent_exe_path,
+                        parent_command_line,
+                        should_evaluate_sigma,
+                        exited_at_ms: None,
+                        superseded_exit: None,
+                        skip_store_ingest: !enriched,
+                    };
+                }
+            }
+        }
+
         if self.entries.contains_key(&instance_id) {
             // Before mutating `existing`, populate parent metadata from `existing.parent_instance_id`
             // if `parent_pid` lookup returned `None`.
@@ -155,6 +242,7 @@ impl ActiveProcessTable {
                 self.pid_to_identity.insert(identity.pid, identity);
             }
             return ProcessStartResolution {
+                resolved_identity: identity,
                 instance_id,
                 parent_instance_id: resolved_parent_id,
                 parent_exe_path,
@@ -162,6 +250,7 @@ impl ActiveProcessTable {
                 should_evaluate_sigma,
                 exited_at_ms: None,
                 superseded_exit: None,
+                skip_store_ingest: false,
             };
         }
 
@@ -202,6 +291,7 @@ impl ActiveProcessTable {
                     self.insertion_fifo.push_back(instance_id.clone());
                     self.evict_if_over_capacity(&instance_id);
                     return ProcessStartResolution {
+                        resolved_identity: identity,
                         instance_id,
                         parent_instance_id,
                         parent_exe_path,
@@ -209,6 +299,7 @@ impl ActiveProcessTable {
                         should_evaluate_sigma: true,
                         exited_at_ms: Some(inferred_exit_ms),
                         superseded_exit: None,
+                        skip_store_ingest: false,
                     };
                 }
             }
@@ -252,6 +343,7 @@ impl ActiveProcessTable {
         self.evict_if_over_capacity(&instance_id);
 
         ProcessStartResolution {
+            resolved_identity: identity,
             instance_id,
             parent_instance_id,
             parent_exe_path,
@@ -259,6 +351,7 @@ impl ActiveProcessTable {
             should_evaluate_sigma: true,
             exited_at_ms: None,
             superseded_exit,
+            skip_store_ingest: false,
         }
     }
 

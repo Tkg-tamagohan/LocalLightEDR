@@ -217,9 +217,10 @@ impl DaemonEngine {
         let mut count = 0usize;
         let mut active_id_set = HashSet::with_capacity(snapshots.len());
         for ev in snapshots {
-            if let SensorEvent::ProcessStart { identity, .. } = &ev {
-                active_id_set.insert(identity.instance_id());
-                self.process_event(&ev);
+            if matches!(&ev, SensorEvent::ProcessStart { .. }) {
+                if let Some(resolved_id) = self.process_seed_process_start(&ev) {
+                    active_id_set.insert(resolved_id);
+                }
                 count += 1;
             }
         }
@@ -408,10 +409,11 @@ impl DaemonEngine {
     /// processes recorded as suspended in SQLite within the shared shutdown `deadline` when
     /// `resume_suspended_on_shutdown` is enabled (`--foreground` or `--resume-suspended-on-shutdown`).
     ///
-    /// Confirmed resumed (or gone/PID-reused) identities are cleared from SQLite's active
-    /// suspension state (`process_suspended` and `context_json.suspended_children`) while
-    /// preserving an audit trail in `context_json.shutdown_resumed_identities` /
-    /// `context_json.shutdown_resumed_at_ms` (`BUG_0002`, `BUG_0003`, `ANALYSIS_0003`).
+    /// Confirmed resumed identities are recorded under `context_json.shutdown_resumed_identities` /
+    /// `context_json.shutdown_resumed_at_ms`, while already-exited or PID-reused identities are
+    /// separated into `context_json.shutdown_gone_identities` / `context_json.shutdown_cleared_at_ms`
+    /// so UI and toast surfaces never claim a vanished process was resumed (`BUG_0002`, `BUG_0003`,
+    /// `ANALYSIS_0003`, `PR23-U3`).
     /// Returns `true` if any SQLite alert row was updated and requires WAL checkpointing.
     pub(super) fn resume_unresolved_suspended_processes_on_shutdown(
         &self,
@@ -472,7 +474,8 @@ impl DaemonEngine {
         let mut gone_or_replaced = 0usize;
         let mut failed = 0usize;
         let mut skipped_budget = 0usize;
-        let mut cleared_identities: HashSet<ProcessIdentity> = HashSet::new();
+        let mut resumed_identities: HashSet<ProcessIdentity> = HashSet::new();
+        let mut gone_identities: HashSet<ProcessIdentity> = HashSet::new();
 
         for (idx, ident) in to_resume.iter().enumerate() {
             if tokio::time::Instant::now() >= deadline {
@@ -488,14 +491,14 @@ impl DaemonEngine {
             match self.defense.resume_process(ident) {
                 Ok(()) => {
                     resumed += 1;
-                    cleared_identities.insert(*ident);
+                    resumed_identities.insert(*ident);
                 }
                 Err(err) => {
                     if !super::alerts::is_protected_process_refusal(&err)
                         && super::alerts::is_process_gone_or_replaced(&err, ident.pid)
                     {
                         gone_or_replaced += 1;
-                        cleared_identities.insert(*ident);
+                        gone_identities.insert(*ident);
                         tracing::info!(
                             pid = ident.pid,
                             create_time_100ns = ident.create_time_100ns,
@@ -516,26 +519,32 @@ impl DaemonEngine {
         }
 
         let mut updated_alerts = 0usize;
-        if !cleared_identities.is_empty() {
-            let resumed_at_ms = current_unix_ms();
+        if !resumed_identities.is_empty() || !gone_identities.is_empty() {
+            let cleared_at_ms = current_unix_ms();
             for alert in &alerts {
                 let parent_ident = alert
                     .process_instance_id
                     .as_deref()
                     .and_then(ProcessIdentity::from_instance_id)
                     .filter(|id| id.create_time_100ns != 0);
-                let parent_cleared = alert.process_suspended
-                    && parent_ident.is_some_and(|id| cleared_identities.contains(&id));
+                let parent_resumed = alert.process_suspended
+                    && parent_ident.is_some_and(|id| resumed_identities.contains(&id));
+                let parent_gone = alert.process_suspended
+                    && parent_ident.is_some_and(|id| gone_identities.contains(&id));
+                let parent_cleared = parent_resumed || parent_gone;
                 let new_process_suspended = if parent_cleared {
                     false
                 } else {
                     alert.process_suspended
                 };
 
-                let mut newly_cleared_ids: Vec<String> = Vec::new();
-                if parent_cleared {
-                    if let Some(id) = parent_ident {
-                        newly_cleared_ids.push(id.instance_id());
+                let mut newly_resumed_ids: Vec<String> = Vec::new();
+                let mut newly_gone_ids: Vec<String> = Vec::new();
+                if let Some(id) = parent_ident {
+                    if parent_resumed {
+                        newly_resumed_ids.push(id.instance_id());
+                    } else if parent_gone {
+                        newly_gone_ids.push(id.instance_id());
                     }
                 }
 
@@ -550,16 +559,25 @@ impl DaemonEngine {
                             {
                                 let mut remaining = Vec::with_capacity(arr.len());
                                 for item in arr {
-                                    let cleared_child = item
+                                    let child_ident = item
                                         .as_str()
                                         .and_then(ProcessIdentity::from_instance_id)
-                                        .filter(|id| id.create_time_100ns != 0)
-                                        .filter(|id| cleared_identities.contains(id));
-                                    if let Some(child_id) = cleared_child {
+                                        .filter(|id| id.create_time_100ns != 0);
+                                    if let Some(child_id) =
+                                        child_ident.filter(|id| resumed_identities.contains(id))
+                                    {
                                         children_changed = true;
                                         let id_str = child_id.instance_id();
-                                        if !newly_cleared_ids.contains(&id_str) {
-                                            newly_cleared_ids.push(id_str);
+                                        if !newly_resumed_ids.contains(&id_str) {
+                                            newly_resumed_ids.push(id_str);
+                                        }
+                                    } else if let Some(child_id) =
+                                        child_ident.filter(|id| gone_identities.contains(id))
+                                    {
+                                        children_changed = true;
+                                        let id_str = child_id.instance_id();
+                                        if !newly_gone_ids.contains(&id_str) {
+                                            newly_gone_ids.push(id_str);
                                         }
                                     } else {
                                         remaining.push(item.clone());
@@ -573,25 +591,48 @@ impl DaemonEngine {
                                 }
                             }
                             if parent_cleared || children_changed {
-                                let existing_audit = obj
-                                    .entry("shutdown_resumed_identities".to_string())
-                                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-                                if let Some(audit_arr) = existing_audit.as_array_mut() {
-                                    for id_str in &newly_cleared_ids {
-                                        let exists = audit_arr
-                                            .iter()
-                                            .any(|v| v.as_str() == Some(id_str.as_str()));
-                                        if !exists {
-                                            audit_arr.push(serde_json::Value::String(
-                                                id_str.clone(),
-                                            ));
+                                if !newly_resumed_ids.is_empty() {
+                                    let existing_audit = obj
+                                        .entry("shutdown_resumed_identities".to_string())
+                                        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                                    if let Some(audit_arr) = existing_audit.as_array_mut() {
+                                        for id_str in &newly_resumed_ids {
+                                            let exists = audit_arr
+                                                .iter()
+                                                .any(|v| v.as_str() == Some(id_str.as_str()));
+                                            if !exists {
+                                                audit_arr.push(serde_json::Value::String(
+                                                    id_str.clone(),
+                                                ));
+                                            }
                                         }
                                     }
+                                    obj.insert(
+                                        "shutdown_resumed_at_ms".to_string(),
+                                        serde_json::Value::from(cleared_at_ms),
+                                    );
                                 }
-                                obj.insert(
-                                    "shutdown_resumed_at_ms".to_string(),
-                                    serde_json::Value::from(resumed_at_ms),
-                                );
+                                if !newly_gone_ids.is_empty() {
+                                    let existing_gone = obj
+                                        .entry("shutdown_gone_identities".to_string())
+                                        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                                    if let Some(gone_arr) = existing_gone.as_array_mut() {
+                                        for id_str in &newly_gone_ids {
+                                            let exists = gone_arr
+                                                .iter()
+                                                .any(|v| v.as_str() == Some(id_str.as_str()));
+                                            if !exists {
+                                                gone_arr.push(serde_json::Value::String(
+                                                    id_str.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    obj.insert(
+                                        "shutdown_cleared_at_ms".to_string(),
+                                        serde_json::Value::from(cleared_at_ms),
+                                    );
+                                }
                             }
                         }
                         if parent_cleared || children_changed {

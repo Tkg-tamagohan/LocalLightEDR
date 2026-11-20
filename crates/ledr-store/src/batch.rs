@@ -1,5 +1,6 @@
 //! Write batch buffering, transactional flush, and PID time-window attribution.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_proto::{
@@ -123,6 +124,7 @@ impl LedrStore {
             return Ok(0);
         }
 
+        let initial_pending = self.lock_pending_superseded_exits()?.snapshot();
         let tx = writer.transaction()?;
         let events = match self.drain_batch() {
             Ok(events) => events,
@@ -137,9 +139,15 @@ impl LedrStore {
         }
 
         let count = events.len();
-        if let Err(err) = execute_batch_tx(tx, &events, None) {
+        let mut tracker = SupersededExitTracker::new(initial_pending);
+        if let Err(err) = execute_batch_tx(tx, &events, None, &mut tracker) {
             let _ = self.prepend_batch(events);
             return Err(err);
+        }
+        let (consumed, inserted) = tracker.into_delta();
+        if !consumed.is_empty() || !inserted.is_empty() {
+            self.lock_pending_superseded_exits()?
+                .apply_delta(&consumed, inserted);
         }
 
         Ok(count)
@@ -177,15 +185,34 @@ impl LedrStore {
     /// preserving any already-recorded `exited_at_ms` and `Option`-typed fields when `None`.
     pub fn upsert_process_record(&self, process: &ProcessRecord) -> Result<(), StoreError> {
         let mut writer = self.lock_writer()?;
+        let pending_exit_ms = self
+            .lock_pending_superseded_exits()?
+            .get(&process.process_instance_id);
         let tx = writer.transaction()?;
-        upsert_process_row(&tx, process, false)?;
+        if let Some(exit_ms) = pending_exit_ms {
+            let mut adjusted = process.clone();
+            adjusted.exited_at_ms = Some(
+                adjusted
+                    .exited_at_ms
+                    .unwrap_or(exit_ms)
+                    .max(adjusted.created_at_ms),
+            );
+            upsert_process_row(&tx, &adjusted, false)?;
+        } else {
+            upsert_process_row(&tx, process, false)?;
+        }
         tx.commit()?;
+        if pending_exit_ms.is_some() {
+            self.lock_pending_superseded_exits()?
+                .remove(&process.process_instance_id);
+        }
         Ok(())
     }
 
     /// Records or updates an alert immediately in a transaction (flushing any pending batch first).
     pub fn record_alert(&self, alert: &AlertRecord) -> Result<(), StoreError> {
         let mut writer = self.lock_writer()?;
+        let initial_pending = self.lock_pending_superseded_exits()?.snapshot();
         let tx = writer.transaction()?;
         let events = match self.drain_batch() {
             Ok(events) => events,
@@ -195,9 +222,15 @@ impl LedrStore {
             }
         };
 
-        if let Err(err) = execute_batch_tx(tx, &events, Some(alert)) {
+        let mut tracker = SupersededExitTracker::new(initial_pending);
+        if let Err(err) = execute_batch_tx(tx, &events, Some(alert), &mut tracker) {
             let _ = self.prepend_batch(events);
             return Err(err);
+        }
+        let (consumed, inserted) = tracker.into_delta();
+        if !consumed.is_empty() || !inserted.is_empty() {
+            self.lock_pending_superseded_exits()?
+                .apply_delta(&consumed, inserted);
         }
 
         Ok(())
@@ -238,13 +271,63 @@ fn filetime_100ns_to_unix_ms(ticks: u64, fallback_now_ms: i64) -> i64 {
     }
 }
 
+/// Transaction-local tracker for superseded process exits whose target row has not yet reached
+/// SQLite. Deltas are committed to [`LedrStore`] only after `tx.commit()` succeeds.
+struct SupersededExitTracker {
+    initial: HashMap<String, i64>,
+    initial_consumed: Vec<String>,
+    newly_pending: HashMap<String, i64>,
+    newly_pending_order: Vec<String>,
+}
+
+impl SupersededExitTracker {
+    fn new(initial: HashMap<String, i64>) -> Self {
+        Self {
+            initial,
+            initial_consumed: Vec::new(),
+            newly_pending: HashMap::new(),
+            newly_pending_order: Vec::new(),
+        }
+    }
+
+    fn take(&mut self, instance_id: &str) -> Option<i64> {
+        if let Some(exit_ms) = self.newly_pending.remove(instance_id) {
+            return Some(exit_ms);
+        }
+        if let Some(exit_ms) = self.initial.remove(instance_id) {
+            self.initial_consumed.push(instance_id.to_owned());
+            return Some(exit_ms);
+        }
+        None
+    }
+
+    fn record_missing(&mut self, instance_id: String, exit_ms: i64) {
+        if self.initial.contains_key(&instance_id) || self.newly_pending.contains_key(&instance_id)
+        {
+            return;
+        }
+        self.newly_pending.insert(instance_id.clone(), exit_ms);
+        self.newly_pending_order.push(instance_id);
+    }
+
+    fn into_delta(mut self) -> (Vec<String>, Vec<(String, i64)>) {
+        let inserted = self
+            .newly_pending_order
+            .into_iter()
+            .filter_map(|id| self.newly_pending.remove(&id).map(|ms| (id, ms)))
+            .collect();
+        (self.initial_consumed, inserted)
+    }
+}
+
 fn execute_batch_tx(
     tx: Transaction<'_>,
     events: &[BufferedEvent],
     alert: Option<&AlertRecord>,
+    tracker: &mut SupersededExitTracker,
 ) -> Result<(), StoreError> {
     if !events.is_empty() {
-        write_buffered_events(&tx, events)?;
+        write_buffered_events(&tx, events, tracker)?;
     }
     if let Some(alert) = alert {
         insert_alert_row(&tx, alert)?;
@@ -373,7 +456,11 @@ pub(crate) fn resolve_process_instance_id(
     Ok(format!("{pid}:0"))
 }
 
-fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Result<(), StoreError> {
+fn write_buffered_events(
+    tx: &Transaction<'_>,
+    events: &[BufferedEvent],
+    tracker: &mut SupersededExitTracker,
+) -> Result<(), StoreError> {
     for item in events {
         let hint = item.parent_instance_id.as_deref();
         match &item.event {
@@ -386,7 +473,7 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
             } => {
                 let instance_id = identity.instance_id();
                 let cmd = (!command_line.is_empty()).then(|| command_line.clone());
-                let record = ProcessRecord {
+                let mut record = ProcessRecord {
                     process_instance_id: instance_id,
                     pid: identity.pid,
                     parent_instance_id: item.parent_instance_id.clone(),
@@ -404,16 +491,36 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                     ),
                     exited_at_ms: item.exited_at_ms,
                 };
+                if let Some(pending_exit_ms) = tracker.take(&record.process_instance_id) {
+                    record.exited_at_ms = Some(
+                        record
+                            .exited_at_ms
+                            .unwrap_or(pending_exit_ms)
+                            .max(record.created_at_ms),
+                    );
+                }
                 upsert_process_row(tx, &record, true)?;
                 if let Some((superseded_id, superseded_exit_ms)) = &item.superseded_process_exit {
                     if superseded_id != &record.process_instance_id {
-                        tx.execute(
+                        let updated = tx.execute(
                             "UPDATE processes
                              SET exited_at_ms = MAX(created_at_ms, ?1)
                              WHERE process_instance_id = ?2
                                AND exited_at_ms IS NULL",
                             params![superseded_exit_ms, superseded_id],
                         )?;
+                        if updated == 0 {
+                            let exists: Option<i64> = tx
+                                .query_row(
+                                    "SELECT 1 FROM processes WHERE process_instance_id = ?1",
+                                    params![superseded_id],
+                                    |row| row.get(0),
+                                )
+                                .optional()?;
+                            if exists.is_none() {
+                                tracker.record_missing(superseded_id.clone(), *superseded_exit_ms);
+                            }
+                        }
                     }
                 }
             }

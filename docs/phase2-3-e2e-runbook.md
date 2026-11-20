@@ -256,8 +256,9 @@ Remove-Item -Path $tmpKey -Force
 
 ```powershell
 cd e:\Documents\code\LocalEDR
-netsh wfp show filters file=(Join-Path $runDir "filters_active.xml")
-Select-String -Path (Join-Path $runDir "filters_active.xml") -Pattern "LocalEDR" | Select-Object -First 20
+$activeFiltersXml = Join-Path $runDir "filters_active.xml"
+netsh wfp show filters "file=$activeFiltersXml"
+Select-String -Path $activeFiltersXml -Pattern "LocalEDR" | Select-Object -First 20
 ```
 
 出力に `LocalEDR Outbound SubLayer`、`LocalEDR Loopback Permit (v4)`、`LocalEDR Loopback Permit (v6)`、および標準スクリプトインタプリタ（`powershell.exe` や環境上の `python.exe`、`node.exe` 等）に対する `LocalEDR Block` フィルタが含まれていれば、事前制限が有効になっている。
@@ -396,8 +397,9 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 $p = Get-Process ledr-daemon
 taskkill /F /PID $p.Id
 Start-Sleep -Seconds 1
-netsh wfp show filters file=(Join-Path $runDir "filters_after_kill.xml")
-Select-String -Path (Join-Path $runDir "filters_after_kill.xml") -Pattern "LocalEDR"
+$afterKillFiltersXml = Join-Path $runDir "filters_after_kill.xml"
+netsh wfp show filters "file=$afterKillFiltersXml"
+Select-String -Path $afterKillFiltersXml -Pattern "LocalEDR"
 ```
 
 `Select-String` の一致件数が **0 件** になり、そのままウィンドウ B で手順 2 の外部接続コマンド（`93.184.216.34` ポート `80`）を再実行して `External connect succeeded` で通信が回復していれば、動的セッション（`FWPM_SESSION_FLAG_DYNAMIC`）による異常終了時フェイルセーフは合格である。

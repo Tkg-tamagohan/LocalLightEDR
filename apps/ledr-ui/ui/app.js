@@ -981,6 +981,10 @@
       typeof ctx.shutdown_resumed_at_ms === "number"
         ? ctx.shutdown_resumed_at_ms
         : null;
+    const shutdownClearedAtMs =
+      typeof ctx.shutdown_cleared_at_ms === "number"
+        ? ctx.shutdown_cleared_at_ms
+        : null;
     const parentSuspended = Boolean(alert?.process_suspended);
     const remainingChildren = suspendedChildren.length;
     const stillFrozen = parentSuspended || remainingChildren > 0;
@@ -989,6 +993,7 @@
       remainingChildren,
       stillFrozen,
       shutdownResumedAtMs,
+      shutdownClearedAtMs,
     };
   }
 
@@ -1000,6 +1005,9 @@
       }
       if (susp.stillFrozen) {
         return `<span class="state-pill state-expired">EXPIRED_SUSPENDED (${susp.remainingChildren} CHILD FROZEN)</span>`;
+      }
+      if (susp.shutdownClearedAtMs !== null) {
+        return `<span class="state-pill state-pending">EXPIRED (CLEARED)</span>`;
       }
       if (susp.shutdownResumedAtMs !== null) {
         return `<span class="state-pill state-pending">EXPIRED (RESUMED)</span>`;
@@ -1232,6 +1240,17 @@
               ? "60s timeout elapsed — process tree remains frozen without data loss"
               : "60s timeout elapsed — process remains frozen without data loss";
         }
+      } else if (
+        susp.shutdownResumedAtMs !== null &&
+        susp.shutdownClearedAtMs !== null
+      ) {
+        const clearedTs = Math.max(
+          susp.shutdownResumedAtMs,
+          susp.shutdownClearedAtMs,
+        );
+        subline = `60s timeout elapsed — suspension cleared on daemon shutdown at ${formatTime(clearedTs)} (active target resumed; others already exited or PID reused; awaiting triage)`;
+      } else if (susp.shutdownClearedAtMs !== null) {
+        subline = `60s timeout elapsed — suspended process already exited or PID reused before daemon shutdown at ${formatTime(susp.shutdownClearedAtMs)} (awaiting triage)`;
       } else if (susp.shutdownResumedAtMs !== null) {
         subline = `60s timeout elapsed — process resumed on daemon shutdown at ${formatTime(susp.shutdownResumedAtMs)} (awaiting triage)`;
       } else {

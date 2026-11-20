@@ -20,6 +20,7 @@ pub(crate) struct ToastAlertSummary {
     pub(crate) is_expired_suspended: bool,
     pub(crate) has_suspended_children: bool,
     pub(crate) shutdown_resumed: bool,
+    pub(crate) shutdown_cleared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,9 +152,9 @@ fn extract_context_paths(context_json: &str) -> (Option<String>, Option<String>)
     (target_path, exe_path)
 }
 
-fn extract_context_suspension_state(context_json: &str) -> (bool, bool) {
+fn extract_context_suspension_state(context_json: &str) -> (bool, bool, bool) {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(context_json) else {
-        return (false, false);
+        return (false, false, false);
     };
     let has_suspended_children = val
         .get("suspended_children")
@@ -163,14 +164,18 @@ fn extract_context_suspension_state(context_json: &str) -> (bool, bool) {
         .get("shutdown_resumed_at_ms")
         .and_then(serde_json::Value::as_i64)
         .is_some();
-    (has_suspended_children, shutdown_resumed)
+    let shutdown_cleared = val
+        .get("shutdown_cleared_at_ms")
+        .and_then(serde_json::Value::as_i64)
+        .is_some();
+    (has_suspended_children, shutdown_resumed, shutdown_cleared)
 }
 
 pub(crate) fn summarize_alert_for_toast(alert_id: &str, alert: Option<&AlertRecord>) -> ToastAlertSummary {
     match alert {
         Some(rec) => {
             let (target_path, exe_path) = extract_context_paths(&rec.context_json);
-            let (has_suspended_children, shutdown_resumed) =
+            let (has_suspended_children, shutdown_resumed, shutdown_cleared) =
                 extract_context_suspension_state(&rec.context_json);
             ToastAlertSummary {
                 alert_id: rec.alert_id.clone(),
@@ -183,6 +188,7 @@ pub(crate) fn summarize_alert_for_toast(alert_id: &str, alert: Option<&AlertReco
                 is_expired_suspended: rec.status == AlertStatus::ExpiredSuspended,
                 has_suspended_children,
                 shutdown_resumed,
+                shutdown_cleared,
             }
         }
         None => ToastAlertSummary {
@@ -196,6 +202,7 @@ pub(crate) fn summarize_alert_for_toast(alert_id: &str, alert: Option<&AlertReco
             is_expired_suspended: false,
             has_suspended_children: false,
             shutdown_resumed: false,
+            shutdown_cleared: false,
         },
     }
 }
@@ -209,6 +216,8 @@ pub(crate) fn build_winrt_toast_xml(summary: &ToastAlertSummary) -> String {
     let suspended_badge = if summary.is_expired_suspended {
         if still_frozen {
             "[EXPIRED_SUSPENDED · FROZEN]"
+        } else if summary.shutdown_cleared {
+            "[EXPIRED · CLEARED]"
         } else if summary.shutdown_resumed {
             "[EXPIRED · RESUMED]"
         } else {

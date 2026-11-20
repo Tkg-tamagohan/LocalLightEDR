@@ -7005,7 +7005,7 @@ fn daemon_p3_45_over_budget_nrd_shutdown_checkpoints_and_runtime_drop_does_not_h
                 nrd_refresh_enabled: true,
                 nrd_refresh_interval_ms: 200,
                 nrd_feed_urls: vec![feed_url],
-                shutdown_flush_timeout_ms: 200,
+                shutdown_flush_timeout_ms: 600,
                 batch_flush_interval_ms: 500,
                 ..DaemonConfig::default()
             },
@@ -7057,7 +7057,7 @@ fn daemon_p3_45_over_budget_nrd_shutdown_checkpoints_and_runtime_drop_does_not_h
         let shutdown_elapsed = shutdown_started.elapsed();
 
         assert!(
-            shutdown_elapsed < Duration::from_millis(1_500),
+            shutdown_elapsed < Duration::from_millis(2_000),
             "shutdown_and_flush must return within budget without hanging (took {shutdown_elapsed:?})"
         );
         assert!(

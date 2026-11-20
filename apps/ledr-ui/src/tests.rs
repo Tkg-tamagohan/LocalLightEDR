@@ -412,6 +412,7 @@ fn ui_p2_02_winrt_toast_xml_escaping_and_launch_uri() {
         is_expired_suspended: false,
         has_suspended_children: false,
         shutdown_resumed: false,
+        shutdown_cleared: false,
     };
 
     let xml = build_winrt_toast_xml(&summary);
@@ -437,6 +438,7 @@ fn ui_p2_02_winrt_toast_xml_escaping_and_launch_uri() {
         is_expired_suspended: true,
         has_suspended_children: false,
         shutdown_resumed: false,
+        shutdown_cleared: false,
     };
     let expired_xml = build_winrt_toast_xml(&expired_summary);
     assert!(expired_xml.contains("[EXPIRED_SUSPENDED · FROZEN]"));
@@ -481,6 +483,44 @@ fn ui_p2_02_winrt_toast_xml_escaping_and_launch_uri() {
     assert!(partial_summary.has_suspended_children);
     let partial_xml = build_winrt_toast_xml(&partial_summary);
     assert!(partial_xml.contains("[EXPIRED_SUSPENDED · FROZEN]"));
+
+    // PR23-U3-02: Shutdown clear of an already-exited / PID-reused process must NOT claim RESUMED.
+    let shutdown_gone_record = AlertRecord {
+        alert_id: "alert-exp-gone".to_string(),
+        context_json: r#"{"suspended_children":[],"shutdown_gone_identities":["4200:133800000000000000"],"shutdown_cleared_at_ms":1700000099500}"#
+            .to_string(),
+        ..partial_child_record.clone()
+    };
+    let gone_summary =
+        summarize_alert_for_toast(&shutdown_gone_record.alert_id, Some(&shutdown_gone_record));
+    assert!(!gone_summary.shutdown_resumed);
+    assert!(gone_summary.shutdown_cleared);
+    let gone_xml = build_winrt_toast_xml(&gone_summary);
+    assert!(
+        gone_xml.contains("[EXPIRED · CLEARED]"),
+        "shutdown-cleared gone process must show CLEARED badge: {gone_xml}"
+    );
+    assert!(!gone_xml.contains("RESUMED"));
+    assert!(!gone_xml.contains("FROZEN"));
+
+    // PR23-U3-02 (mixed): When both a resumed target and a gone/reused target were cleared on
+    // shutdown, badge must use CLEARED instead of claiming all targets resumed.
+    let shutdown_mixed_record = AlertRecord {
+        alert_id: "alert-exp-mixed".to_string(),
+        context_json: r#"{"suspended_children":[],"shutdown_resumed_identities":["4200:133800000000000000"],"shutdown_resumed_at_ms":1700000099000,"shutdown_gone_identities":["4204:133800000000000000"],"shutdown_cleared_at_ms":1700000099000}"#
+            .to_string(),
+        ..shutdown_gone_record
+    };
+    let mixed_summary =
+        summarize_alert_for_toast(&shutdown_mixed_record.alert_id, Some(&shutdown_mixed_record));
+    assert!(mixed_summary.shutdown_resumed);
+    assert!(mixed_summary.shutdown_cleared);
+    let mixed_xml = build_winrt_toast_xml(&mixed_summary);
+    assert!(
+        mixed_xml.contains("[EXPIRED · CLEARED]"),
+        "mixed shutdown resume/gone clear must show CLEARED badge: {mixed_xml}"
+    );
+    assert!(!mixed_xml.contains("RESUMED"));
 
     // RFC 4648 base64 sanity check for PowerShell -EncodedCommand encoding.
     assert_eq!(base64_encode(b""), "");

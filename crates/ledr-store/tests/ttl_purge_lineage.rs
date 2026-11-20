@@ -1423,3 +1423,131 @@ fn store_09_same_ms_pid_reuse_prefers_newer_create_time_100ns() {
         "same-created_at_ms tie must resolve to the row with the newer 100ns create time"
     );
 }
+
+/// `PR23-U2-01`: Superseded placeholder exit must apply even when SQLite persistence order
+/// reverses relative to in-memory `ActiveProcessTable` order (both within a single batch and
+/// across separate `flush_batch` transactions).
+#[test]
+fn store_10_pr23_u2_out_of_order_superseded_exit_closes_late_placeholder() {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let base_ms: i64 = 1_760_000_000_000;
+
+    // Case A: Reversed order within the same batch (`4610:<real>` with superseded `4610:0` first,
+    // then `4610:0` placeholder second).
+    let real_a = ProcessIdentity::new(4610, unix_ms_to_filetime(base_ms));
+    let placeholder_a = ProcessIdentity::new(4610, 0);
+    let real_a_start = SensorEvent::ProcessStart {
+        identity: real_a,
+        parent_pid: 4,
+        exe_path: r"C:\Temp\reordered_same_batch.exe".to_string(),
+        command_line: "reordered_same_batch.exe".to_string(),
+        user_sid: None,
+    };
+    let placeholder_a_start = SensorEvent::ProcessStart {
+        identity: placeholder_a,
+        parent_pid: 4,
+        exe_path: r"C:\Temp\reordered_same_batch.exe".to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_lifecycle(
+            &real_a_start,
+            Some("4:1"),
+            None,
+            Some((&placeholder_a.instance_id(), base_ms + 50)),
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest superseding start A first");
+    store
+        .ingest_event_with_lifecycle(&placeholder_a_start, Some("4:1"), None, None, false, "OBSERVED")
+        .expect("ingest late placeholder A second");
+    store.flush_batch().expect("flush same-batch reversed pair");
+
+    let snap_a = store
+        .query_flight_recorder(20, None)
+        .expect("query flight recorder A");
+    let ph_a = snap_a
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == placeholder_a.instance_id())
+        .expect("placeholder A row exists");
+    let rl_a = snap_a
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == real_a.instance_id())
+        .expect("real A row exists");
+    assert!(
+        ph_a.exited_at_ms.is_some_and(|ex| ex >= ph_a.created_at_ms),
+        "same-batch late placeholder 4610:0 must be closed (created={}, exited={:?})",
+        ph_a.created_at_ms,
+        ph_a.exited_at_ms
+    );
+    assert_eq!(rl_a.exited_at_ms, None, "real A row must remain running");
+
+    // Case B: Reversed order across two separate transactions (`flush #1` commits `4611:<real>`
+    // with superseded `4611:0`; `flush #2` later inserts `4611:0`).
+    let real_b = ProcessIdentity::new(4611, unix_ms_to_filetime(base_ms + 1_000));
+    let placeholder_b = ProcessIdentity::new(4611, 0);
+    let real_b_start = SensorEvent::ProcessStart {
+        identity: real_b,
+        parent_pid: 4,
+        exe_path: r"C:\Temp\reordered_cross_tx.exe".to_string(),
+        command_line: "reordered_cross_tx.exe".to_string(),
+        user_sid: None,
+    };
+    let placeholder_b_start = SensorEvent::ProcessStart {
+        identity: placeholder_b,
+        parent_pid: 4,
+        exe_path: r"C:\Temp\reordered_cross_tx.exe".to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_lifecycle(
+            &real_b_start,
+            Some("4:1"),
+            None,
+            Some((&placeholder_b.instance_id(), base_ms + 1_050)),
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest superseding start B");
+    store.flush_batch().expect("flush tx #1 with real B only");
+
+    // Verify no synthetic empty row was prematurely fabricated for 4611:0 before it arrives.
+    let mid_b = store
+        .query_flight_recorder(20, Some(&placeholder_b.instance_id()))
+        .expect("query before late placeholder B");
+    assert!(
+        mid_b.processes.is_empty(),
+        "store must not fabricate placeholder row before late ProcessStart arrives"
+    );
+
+    store
+        .ingest_event_with_lifecycle(&placeholder_b_start, Some("4:1"), None, None, false, "OBSERVED")
+        .expect("ingest late placeholder B in tx #2");
+    store.flush_batch().expect("flush tx #2 with late placeholder B");
+
+    let snap_b = store
+        .query_flight_recorder(20, None)
+        .expect("query flight recorder B");
+    let ph_b = snap_b
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == placeholder_b.instance_id())
+        .expect("placeholder B row exists after tx #2");
+    let rl_b = snap_b
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == real_b.instance_id())
+        .expect("real B row exists");
+    assert!(
+        ph_b.exited_at_ms.is_some_and(|ex| ex >= ph_b.created_at_ms),
+        "cross-tx late placeholder 4611:0 must be closed (created={}, exited={:?})",
+        ph_b.created_at_ms,
+        ph_b.exited_at_ms
+    );
+    assert_eq!(rl_b.exited_at_ms, None, "real B row must remain running");
+}

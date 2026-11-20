@@ -2434,3 +2434,384 @@ async fn pr23_bug_0001_superseded_zero_ts_placeholder_closed_in_sqlite_on_start_
     );
     assert_eq!(real_b_row.exited_at_ms, None, "backfilled real row remains active");
 }
+
+/// `PR23-U1-01`: A startup snapshot whose process creation time could not be queried
+/// (`create_time_100ns == 0`) must never supersede or mark exited an already-running verified
+/// process entry for the same PID in memory or SQLite, must keep subsequent network attribution
+/// on the verified row, and must preserve `ProtectedOs` classification while safely enriching
+/// only missing metadata on the verified row.
+#[tokio::test]
+async fn pr23_u1_zero_ts_snapshot_preserves_verified_running_process_and_network_attribution() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let engine = start_stopped_engine(
+        store.clone(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("8".repeat(64))),
+    )
+    .await;
+
+    let now_ms = current_unix_ms();
+    let created_ms = now_ms - 2_000;
+    let created_100ns = 116_444_736_000_000_000u64 + (created_ms as u64) * 10_000;
+
+    // Case 1: Verified ETW ProcessStart (`4200:<real>`) -> zero-timestamp snapshot (`4200:0`)
+    // -> NetworkConnect (`now_ms + 500`). Verified row must remain running, no `4200:0` row may
+    // be written, network event must attribute to `4200:<real>`, and TTL purge must keep it.
+    let verified_4200 = ProcessIdentity::new(4200, created_100ns);
+    let zero_4200 = ProcessIdentity::new(4200, 0);
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: verified_4200,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\verified_4200.exe".to_string(),
+            command_line: "verified_4200.exe --run".to_string(),
+            user_sid: Some("S-1-5-21-1000".to_string()),
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: zero_4200,
+            parent_pid: 4,
+            exe_path: "verified_4200.exe".to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let net_ts = current_unix_ms() + 500;
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: 4200,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            dst_port: 443,
+            domain_hint: Some("example.com".to_string()),
+            timestamp_ms: net_ts,
+        },
+        EventLane::Telemetry,
+    );
+
+    // Case 2: Verified ETW ProcessStart (`4204:<real>`) with missing `ppid` and `command_line`
+    // receives zero-timestamp snapshot (`4204:0`) carrying those fields -> enriches `4204:<real>`
+    // in place without creating `4204:0` in SQLite.
+    let verified_4204 = ProcessIdentity::new(4204, created_100ns);
+    let zero_4204 = ProcessIdentity::new(4204, 0);
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: verified_4204,
+            parent_pid: 0,
+            exe_path: r"C:\Tools\partial_4204.exe".to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: zero_4204,
+            parent_pid: 888,
+            exe_path: "partial_4204.exe".to_string(),
+            command_line: "partial_4204.exe --enriched".to_string(),
+            user_sid: Some("S-1-5-21-2000".to_string()),
+        },
+        EventLane::HighPriority,
+    );
+
+    // Case 3: Verified ProtectedOs process (`4208:<real>`) receiving an empty-path `4208:0`
+    // snapshot must retain ProtectedOs marking and remain running.
+    let verified_4208 = ProcessIdentity::new(4208, created_100ns);
+    let zero_4208 = ProcessIdentity::new(4208, 0);
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: verified_4208,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\svchost.exe".to_string(),
+            command_line: "svchost.exe -k netsvcs".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert!(engine.outbound_classifier.is_steady_pid(4208));
+
+    // Seed through `seed_processes` as well to exercise startup snapshot reconciliation.
+    let seeded = engine
+        .seed_processes(vec![
+            SensorEvent::ProcessStart {
+                identity: zero_4200,
+                parent_pid: 4,
+                exe_path: String::new(),
+                command_line: String::new(),
+                user_sid: None,
+            },
+            SensorEvent::ProcessStart {
+                identity: zero_4208,
+                parent_pid: 4,
+                exe_path: String::new(),
+                command_line: String::new(),
+                user_sid: None,
+            },
+        ])
+        .expect("seed_processes with zero-ts snapshots");
+    assert_eq!(seeded, 2);
+    assert!(
+        engine.outbound_classifier.is_steady_pid(4208),
+        "zero-ts snapshot with empty path must not clear ProtectedOs steady mark"
+    );
+
+    // In-memory verification.
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let active_4200 = table.lookup_by_pid(4200).expect("4200 must remain active");
+        assert_eq!(active_4200.identity, verified_4200);
+        assert_eq!(active_4200.exited_at_ms, None);
+        assert!(table.get_by_instance_id(&zero_4200.instance_id()).is_none());
+
+        let active_4204 = table.lookup_by_pid(4204).expect("4204 must remain active");
+        assert_eq!(active_4204.identity, verified_4204);
+        assert_eq!(active_4204.exited_at_ms, None);
+        assert_eq!(active_4204.ppid, 888);
+        assert_eq!(active_4204.command_line, "partial_4204.exe --enriched");
+        assert!(table.get_by_instance_id(&zero_4204.instance_id()).is_none());
+    }
+
+    // SQLite verification.
+    let snap = store
+        .query_flight_recorder(50, None)
+        .expect("query flight recorder");
+    let row_4200 = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == verified_4200.instance_id())
+        .expect("verified 4200 row exists");
+    assert_eq!(row_4200.exited_at_ms, None, "verified 4200 must stay running in SQLite");
+    assert_eq!(row_4200.exe_path, r"C:\Tools\verified_4200.exe");
+    assert!(
+        snap.processes
+            .iter()
+            .all(|p| p.process_instance_id != zero_4200.instance_id()),
+        "synthetic 4200:0 row must not be inserted into SQLite"
+    );
+    let net_row = snap
+        .network_events
+        .iter()
+        .find(|n| n.dst_port == 443)
+        .expect("network event recorded");
+    assert_eq!(
+        net_row.process_instance_id,
+        verified_4200.instance_id(),
+        "subsequent network event must attribute to verified 4200 row"
+    );
+
+    let row_4204 = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == verified_4204.instance_id())
+        .expect("verified 4204 row exists");
+    assert_eq!(row_4204.exited_at_ms, None, "verified 4204 must stay running");
+    assert_eq!(
+        row_4204.exe_path,
+        r"C:\Tools\partial_4204.exe",
+        "snapshot basename must not overwrite verified full exe_path in SQLite"
+    );
+    assert_eq!(row_4204.ppid, 888, "missing ppid must be enriched on verified 4204");
+    assert_eq!(
+        row_4204.command_line.as_deref(),
+        Some("partial_4204.exe --enriched")
+    );
+    assert!(
+        snap.processes
+            .iter()
+            .all(|p| p.process_instance_id != zero_4204.instance_id()),
+        "synthetic 4204:0 row must not be inserted into SQLite on enrichment"
+    );
+
+    // Running verified row must survive TTL purge far in the future.
+    let future_now = net_ts + 30 * 24 * 60 * 60 * 1_000;
+    let _ = store.purge_expired(future_now, 7).expect("purge expired");
+    assert!(
+        store
+            .query_flight_recorder(50, Some(&verified_4200.instance_id()))
+            .expect("query after purge")
+            .processes
+            .iter()
+            .any(|p| p.process_instance_id == verified_4200.instance_id()),
+        "running verified 4200 row must not be TTL-purged"
+    );
+}
+
+/// `PR23-U3-01`: Shutdown suspension clearing must separate actually resumed identities
+/// (`shutdown_resumed_identities` / `shutdown_resumed_at_ms`) from already-exited or PID-reused
+/// identities (`shutdown_gone_identities` / `shutdown_cleared_at_ms`).
+#[tokio::test]
+async fn pr23_u3_shutdown_clear_distinguishes_resumed_vs_gone_in_audit_context() {
+    struct SelectiveGoneResumeDefense {
+        gone_targets: std::collections::HashSet<ProcessIdentity>,
+        resumed: Mutex<Vec<ProcessIdentity>>,
+    }
+
+    impl ActiveDefenseController for SelectiveGoneResumeDefense {
+        fn suspend_process(&self, _target: &ProcessIdentity, _include_children: bool) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resume_process(&self, target: &ProcessIdentity) -> Result<(), String> {
+            if self.gone_targets.contains(target) {
+                return Err(format!(
+                    "CreationTime mismatch for PID {}: expected {}, got 999",
+                    target.pid, target.create_time_100ns
+                ));
+            }
+            self.resumed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(*target);
+            Ok(())
+        }
+
+        fn terminate_process(&self, _target: &ProcessIdentity, _include_children: bool) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn add_wfp_app_rule(&self, _exe_path: &Path, _remote_ip: Option<IpAddr>, _allow: bool) -> Result<u64, String> {
+            Ok(1)
+        }
+
+        fn remove_wfp_rule(&self, _filter_id: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let gone_only_parent = ProcessIdentity::new(5100, 133_800_000_000_005_100);
+    let mixed_parent = ProcessIdentity::new(5200, 133_800_000_000_005_200);
+    let mixed_gone_child = ProcessIdentity::new(5204, 133_800_000_000_005_204);
+    let resumed_only_parent = ProcessIdentity::new(5300, 133_800_000_000_005_300);
+
+    let defense = Arc::new(SelectiveGoneResumeDefense {
+        gone_targets: [gone_only_parent, mixed_gone_child].into_iter().collect(),
+        resumed: Mutex::new(Vec::new()),
+    });
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            resume_suspended_on_shutdown: true,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("a".repeat(64))),
+    );
+
+    let now_ms = current_unix_ms();
+    // Alert A: gone/PID-reused parent only.
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-u3-gone-only".to_string(),
+            timestamp_ms: now_ms,
+            severity: AlertSeverity::High,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-SSH_KEY".to_string(),
+            title: "Gone parent expired alert".to_string(),
+            process_instance_id: Some(gone_only_parent.instance_id()),
+            process_suspended: true,
+            status: AlertStatus::ExpiredSuspended,
+            context_json: r#"{"suspended_children":[]}"#.to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("seed gone-only alert");
+
+    // Alert B: resumed parent + gone child.
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-u3-mixed".to_string(),
+            timestamp_ms: now_ms,
+            severity: AlertSeverity::Critical,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+            title: "Mixed parent/child expired alert".to_string(),
+            process_instance_id: Some(mixed_parent.instance_id()),
+            process_suspended: true,
+            status: AlertStatus::ExpiredSuspended,
+            context_json: serde_json::json!({
+                "suspended_children": [mixed_gone_child.instance_id()]
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("seed mixed alert");
+
+    // Alert C: resumed parent only.
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-u3-resumed-only".to_string(),
+            timestamp_ms: now_ms,
+            severity: AlertSeverity::High,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
+            title: "Resumed parent expired alert".to_string(),
+            process_instance_id: Some(resumed_only_parent.instance_id()),
+            process_suspended: true,
+            status: AlertStatus::ExpiredSuspended,
+            context_json: r#"{"suspended_children":[]}"#.to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("seed resumed-only alert");
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    // Alert A: only shutdown_gone_identities + shutdown_cleared_at_ms, NO shutdown_resumed_*.
+    let a = store.get_alert("alert-u3-gone-only").unwrap().unwrap();
+    assert!(!a.process_suspended);
+    let ctx_a: serde_json::Value = serde_json::from_str(&a.context_json).unwrap();
+    assert_eq!(
+        ctx_a["shutdown_gone_identities"],
+        serde_json::json!([gone_only_parent.instance_id()])
+    );
+    assert!(ctx_a["shutdown_cleared_at_ms"].as_i64().is_some());
+    assert!(
+        ctx_a.get("shutdown_resumed_at_ms").is_none(),
+        "gone-only clear must not set shutdown_resumed_at_ms: {ctx_a}"
+    );
+    assert!(
+        ctx_a.get("shutdown_resumed_identities").is_none(),
+        "gone-only clear must not set shutdown_resumed_identities: {ctx_a}"
+    );
+
+    // Alert B: both resumed and gone audit trails recorded separately.
+    let b = store.get_alert("alert-u3-mixed").unwrap().unwrap();
+    assert!(!b.process_suspended);
+    let ctx_b: serde_json::Value = serde_json::from_str(&b.context_json).unwrap();
+    assert_eq!(ctx_b["suspended_children"], serde_json::json!([]));
+    assert_eq!(
+        ctx_b["shutdown_resumed_identities"],
+        serde_json::json!([mixed_parent.instance_id()])
+    );
+    assert!(ctx_b["shutdown_resumed_at_ms"].as_i64().is_some());
+    assert_eq!(
+        ctx_b["shutdown_gone_identities"],
+        serde_json::json!([mixed_gone_child.instance_id()])
+    );
+    assert!(ctx_b["shutdown_cleared_at_ms"].as_i64().is_some());
+
+    // Alert C: only shutdown_resumed_identities + shutdown_resumed_at_ms, NO shutdown_gone/cleared.
+    let c = store.get_alert("alert-u3-resumed-only").unwrap().unwrap();
+    assert!(!c.process_suspended);
+    let ctx_c: serde_json::Value = serde_json::from_str(&c.context_json).unwrap();
+    assert_eq!(
+        ctx_c["shutdown_resumed_identities"],
+        serde_json::json!([resumed_only_parent.instance_id()])
+    );
+    assert!(ctx_c["shutdown_resumed_at_ms"].as_i64().is_some());
+    assert!(ctx_c.get("shutdown_cleared_at_ms").is_none());
+    assert!(ctx_c.get("shutdown_gone_identities").is_none());
+}

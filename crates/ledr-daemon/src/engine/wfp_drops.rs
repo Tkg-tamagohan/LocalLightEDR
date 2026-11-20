@@ -632,6 +632,8 @@ impl DaemonEngine {
             should_evaluate_sigma: true,
             exited_at_ms: None,
             superseded_exit: None,
+            skip_store_ingest: false,
+            store_process_start_override: None,
         };
         let (_action, emitted_alert) = self.evaluate_and_handle_outbound_connect(
             None,

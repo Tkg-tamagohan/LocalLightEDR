@@ -13,7 +13,7 @@ const DEFAULT_IPC_FRAME_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_IPC_SESSION_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_WFP_DROP_DNS_GRACE_MS: u64 = 300;
 
-/// Configuration options for [`DaemonEngine`] and the Named Pipe IPC server.
+/// Configuration options for [`super::DaemonEngine`] and the Named Pipe IPC server.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub high_priority_capacity: usize,
@@ -74,7 +74,7 @@ pub struct DaemonConfig {
     /// configured (`#5` / Thread 13). Defaults to `300 ms`.
     pub wfp_drop_dns_grace_ms: u64,
     /// Maximum number of `(process_instance_id, IpAddr)` entries and `(exe_key, domain)` latest
-    /// records retained in [`ProcessDnsHistory`] (`L-10`). Defaults to
+    /// records retained in `ProcessDnsHistory` (`L-10`). Defaults to
     /// [`DNS_RESOLUTION_CACHE_CAPACITY`] (`4,096`). Values of `0` are clamped to `1`.
     pub dns_history_capacity: usize,
 }

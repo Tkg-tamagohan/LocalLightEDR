@@ -13,12 +13,12 @@ use ledr_proto::{
 };
 use notify::{
     ToastAlertSummary, base64_encode, build_notify_oneshot_event, build_winrt_toast_xml,
-    is_os_toast_disabled_value, summarize_alert_for_toast,
+    is_os_toast_disabled_value, is_os_toast_suppressed_by_setting, summarize_alert_for_toast,
 };
 use std::io::{self, Read, Write};
 use tree::build_process_tree;
 #[cfg(windows)]
-use uri_reg::{LEDR_URI_DESCRIPTION, win_uri_reg};
+use uri_reg::{LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, win_uri_reg};
 use uri_reg::{
     LEDR_URI_REG_SUBKEY, UriRegistrationOutcome, build_register_uri_event, format_ledr_uri_command,
 };
@@ -947,4 +947,59 @@ fn ui_p3_03_network_alert_toast_extracts_dst_and_domain() {
     assert_eq!(summary.exe_path.as_deref(), Some(r"C:\Tools\probe.exe"));
     let xml = build_winrt_toast_xml(&summary);
     assert!(xml.contains("c2.fresh-nrd.example (198.51.100.42:443)"));
+}
+
+#[test]
+fn ui_p3_04_toast_os_setting_suppression_and_aumid_registration() {
+    assert!(is_os_toast_suppressed_by_setting(Some(0)));
+    assert!(!is_os_toast_suppressed_by_setting(Some(1)));
+    assert!(!is_os_toast_suppressed_by_setting(None));
+
+    // Ensure notify.rs no longer spawns PowerShell with -EncodedCommand / FromBase64String
+    // (which self-triggered LEDR-SCRIPT-001 and LEDR-LOTL-001).
+    let notify_src = include_str!("notify.rs");
+    assert!(
+        !notify_src.contains("powershell.exe"),
+        "notify.rs must use native WinRT instead of spawning powershell.exe"
+    );
+    assert!(
+        !notify_src.contains("FromBase64String"),
+        "notify.rs must not emit FromBase64String scripts"
+    );
+    assert!(
+        !notify_src.contains("-EncodedCommand"),
+        "notify.rs must not emit -EncodedCommand arguments"
+    );
+
+    #[cfg(windows)]
+    {
+        struct TestKeyCleanup(String);
+        impl Drop for TestKeyCleanup {
+            fn drop(&mut self) {
+                win_uri_reg::reg_delete_hkcu_tree(&self.0);
+            }
+        }
+
+        let root_cleanup = format!(r"Software\LocalEDRTest\ui-p3-04-{}", std::process::id());
+        let aumid_subkey = format!(r"{root_cleanup}\AppUserModelId\LocalEDR.AlertUI");
+        let _guard = TestKeyCleanup(root_cleanup);
+
+        let first =
+            win_uri_reg::ensure_hkcu_aumid_registered_at(&aumid_subkey, LEDR_AUMID_DISPLAY_NAME)
+                .expect("initial AUMID registration");
+        assert!(first, "initial AUMID registration must report updated=true");
+
+        let key = win_uri_reg::reg_open_hkcu(&aumid_subkey, 0x0001)
+            .expect("open AUMID key")
+            .expect("AUMID key exists");
+        assert_eq!(
+            win_uri_reg::reg_query_sz(&key, Some("DisplayName")).expect("query DisplayName"),
+            Some(LEDR_AUMID_DISPLAY_NAME.to_string())
+        );
+
+        let second =
+            win_uri_reg::ensure_hkcu_aumid_registered_at(&aumid_subkey, LEDR_AUMID_DISPLAY_NAME)
+                .expect("idempotent AUMID check");
+        assert!(!second, "second AUMID registration must be idempotent");
+    }
 }

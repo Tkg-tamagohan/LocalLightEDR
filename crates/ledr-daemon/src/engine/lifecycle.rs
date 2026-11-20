@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use ledr_proto::{ActiveDefenseController, ProcessIdentity, SensorEvent};
+use ledr_proto::{ActiveDefenseController, AlertStatus, ProcessIdentity, SensorEvent};
 use ledr_rules::{EarlyPruner, NrdCache, NrdCancelToken, SigmaEngine, NRD_MAX_ENTRIES};
 use ledr_sensor_win::NoopDefenseController;
 use ledr_store::{LedrStore, PurgeStats, StoreError};
@@ -102,7 +102,11 @@ impl DaemonEngine {
             .unwrap_or_default();
 
         let mut wfp_manager = WfpRuleManager::new();
-        wfp_manager.set_startup_preemptive_executables(&config.preemptive_startup_executables);
+        if config.outbound_firewall_enabled
+            && config.outbound_enforcement_mode != super::OutboundEnforcementMode::Audit
+        {
+            wfp_manager.set_startup_preemptive_executables(&config.preemptive_startup_executables);
+        }
         let outbound_classifier = Arc::new(OutboundLaneClassifier::new(
             config.outbound_firewall_enabled,
         ));
@@ -359,9 +363,86 @@ impl DaemonEngine {
             }
         }
 
+        if self.config.resume_suspended_on_shutdown {
+            self.resume_unresolved_suspended_processes_on_shutdown();
+        }
+
         if let Some(err) = drain_err {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Best-effort resumes all unresolved (`Pending` / `ExpiredSuspended`) parent and child
+    /// processes recorded as suspended in SQLite when `resume_suspended_on_shutdown` is enabled
+    /// (`--foreground` or `--resume-suspended-on-shutdown`).
+    fn resume_unresolved_suspended_processes_on_shutdown(&self) {
+        let mut alerts = self
+            .store
+            .list_alerts(Some(AlertStatus::Pending), 1000)
+            .unwrap_or_default();
+        alerts.extend(
+            self.store
+                .list_alerts(Some(AlertStatus::ExpiredSuspended), 1000)
+                .unwrap_or_default(),
+        );
+
+        let mut seen: HashSet<ProcessIdentity> = HashSet::new();
+        let mut to_resume: Vec<ProcessIdentity> = Vec::new();
+
+        for alert in alerts {
+            let parent_ident = alert
+                .process_instance_id
+                .as_deref()
+                .and_then(ProcessIdentity::from_instance_id)
+                .filter(|id| id.create_time_100ns != 0);
+            if alert.process_suspended {
+                if let Some(id) = parent_ident {
+                    if seen.insert(id) {
+                        to_resume.push(id);
+                    }
+                }
+            }
+            if let Ok(ctx_val) = serde_json::from_str::<serde_json::Value>(&alert.context_json) {
+                super::alerts::collect_suspended_children_from_ctx(
+                    &ctx_val,
+                    if alert.process_suspended {
+                        parent_ident
+                    } else {
+                        None
+                    },
+                    &mut seen,
+                    &mut to_resume,
+                );
+            }
+        }
+
+        if to_resume.is_empty() {
+            return;
+        }
+
+        let mut resumed = 0usize;
+        let mut failed = 0usize;
+        for ident in &to_resume {
+            match self.defense.resume_process(ident) {
+                Ok(()) => resumed += 1,
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(
+                        pid = ident.pid,
+                        create_time_100ns = ident.create_time_100ns,
+                        error = %err,
+                        "best-effort resume_process failed during shutdown"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            total = to_resume.len(),
+            resumed,
+            failed,
+            "completed best-effort resume of unresolved suspended processes on shutdown"
+        );
     }
 }

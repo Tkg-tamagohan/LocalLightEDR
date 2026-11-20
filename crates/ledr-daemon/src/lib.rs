@@ -15,7 +15,8 @@ pub use channel::{
     TwoLaneChannel, TwoLaneReceiver, TwoLaneSender,
 };
 pub use engine::{
-    BinaryInspector, DaemonConfig, DaemonEngine, PolicyRuleError, WindowsBinaryInspector,
+    BinaryInspector, DaemonConfig, DaemonEngine, OutboundEnforcementMode, PolicyRuleError,
+    WindowsBinaryInspector,
 };
 pub use firewall::{
     InstalledWfpFilter, WfpFailedOp, WfpFilterOrigin, WfpReconcileReport, WfpRuleManager,

@@ -50,7 +50,9 @@ impl DaemonEngine {
         &self,
         prev_rules: Option<&[AllowlistRuleRecord]>,
     ) -> WfpReconcileReport {
-        if !self.config.outbound_firewall_enabled {
+        if !self.config.outbound_firewall_enabled
+            || self.config.outbound_enforcement_mode == super::OutboundEnforcementMode::Audit
+        {
             self.outbound_classifier.set_has_domain_rules(false);
             return WfpReconcileReport::default();
         }

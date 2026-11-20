@@ -86,6 +86,49 @@ fn send_pipe_request(pipe_name: &str, req: &IpcRequest) -> IpcResponse {
     read_ipc_frame::<_, IpcResponse>(&mut pipe).expect("read IPC response frame")
 }
 
+fn now_unix_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+fn load_lotl_rules() -> (SigmaEngine, EarlyPruner) {
+    let lotl_json = include_str!("../../../rules/lotl_core.json");
+    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
+    let sigma = SigmaEngine::from_json_str(lotl_json).expect("compile lotl_core.json");
+    let pruner = EarlyPruner::from_json_str(allowlist_json).expect("build pruner");
+    (sigma, pruner)
+}
+
+fn start_default_in_memory_engine(
+    sigma: SigmaEngine,
+    pruner: EarlyPruner,
+) -> (LedrStore, Arc<DaemonEngine>) {
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let engine = DaemonEngine::start(
+        store.clone(),
+        sigma,
+        pruner,
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+    );
+    (store, engine)
+}
+
+async fn wait_high_priority_processed(engine: &DaemonEngine, expected: u64, context: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().high_priority_processed < expected {
+        assert!(Instant::now() < deadline, "timed out waiting for {context}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 #[tokio::test]
 async fn burst_01_two_lane_budget_and_10k_event_flush() {
     // Part A: Direct channel overflow verification (>8,192 telemetry drop-oldest, 0 high-priority drop).
@@ -151,17 +194,9 @@ async fn burst_01_two_lane_budget_and_10k_event_flush() {
     }
 
     // Part B: End-to-end DaemonEngine 10,000-event burst + batch flush + <= 20 MB budget check.
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let sigma = SigmaEngine::from_rules(Vec::new()).expect("empty rules");
-    let pruner = EarlyPruner::default();
-    let engine = DaemonEngine::start(
-        store.clone(),
-        sigma,
-        pruner,
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
+    let (store, engine) = start_default_in_memory_engine(
+        SigmaEngine::from_rules(Vec::new()).expect("empty rules"),
+        EarlyPruner::default(),
     );
     let sender = engine.sender();
 
@@ -268,22 +303,8 @@ async fn burst_01_two_lane_budget_and_10k_event_flush() {
 
 #[tokio::test]
 async fn burst_02_lotl_cmd_powershell_end_to_end() {
-    let lotl_json = include_str!("../../../rules/lotl_core.json");
-    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
-
-    let sigma = SigmaEngine::from_json_str(lotl_json).expect("compile lotl_core.json");
-    let pruner = EarlyPruner::from_json_str(allowlist_json).expect("build pruner");
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-
-    let engine = DaemonEngine::start(
-        store.clone(),
-        sigma,
-        pruner,
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-    );
+    let (sigma, pruner) = load_lotl_rules();
+    let (store, engine) = start_default_in_memory_engine(sigma, pruner);
     let sender = engine.sender();
 
     let cmd_ident = ProcessIdentity::new(4100, 133_765_432_100_000_001);
@@ -493,17 +514,9 @@ async fn burst_03_named_pipe_ipc_roundtrip_and_auth() {
 #[tokio::test]
 async fn burst_04_pid_reuse_telemetry_attribution_and_channel_close_drain() {
     // Part A: PID reuse time-window attribution (`A start -> A stop -> B start -> A dns`).
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-    let sigma = SigmaEngine::from_rules(Vec::new()).expect("empty rules");
-    let pruner = EarlyPruner::default();
-    let engine = DaemonEngine::start(
-        store.clone(),
-        sigma,
-        pruner,
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
+    let (store, engine) = start_default_in_memory_engine(
+        SigmaEngine::from_rules(Vec::new()).expect("empty rules"),
+        EarlyPruner::default(),
     );
     let sender = engine.sender();
 
@@ -542,14 +555,7 @@ async fn burst_04_pid_reuse_telemetry_attribution_and_channel_close_drain() {
         .expect("send proc B start");
 
     // Ensure high-priority lifecycle events are processed first so active PID mapping points to B.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while engine.metrics().high_priority_processed < 3 {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for high-priority lifecycle processing"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_high_priority_processed(&engine, 3, "high-priority lifecycle processing").await;
 
     sender
         .send(SensorEvent::DnsQuery {
@@ -644,13 +650,7 @@ async fn burst_05_periodic_ttl_purge_and_startup_stale_reconciliation() {
     let dir = TestTempDir::new("ledr-burst-05");
     let db_path = dir.path.join("daemon_ttl_reconcile.db");
 
-    let now_ms = i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_millis(),
-    )
-    .unwrap_or(i64::MAX);
+    let now_ms = now_unix_ms();
 
     let expired_ident = ProcessIdentity::new(7001, unix_ms_to_filetime(now_ms - 20 * DAY_MS));
     let stale_ident = ProcessIdentity::new(7002, unix_ms_to_filetime(now_ms - 60_000));
@@ -1018,18 +1018,8 @@ async fn burst_07_startup_reconcile_preserves_new_etw_process_and_deduplicates_a
     let dir = TestTempDir::new("ledr-burst-07");
     let db_path = dir.path.join("daemon_startup_reconcile.db");
 
-    let lotl_json = include_str!("../../../rules/lotl_core.json");
-    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
-    let sigma = SigmaEngine::from_json_str(lotl_json).expect("compile lotl_core.json");
-    let pruner = EarlyPruner::from_json_str(allowlist_json).expect("build pruner");
-
-    let now_ms = i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_millis(),
-    )
-    .unwrap_or(i64::MAX);
+    let (sigma, pruner) = load_lotl_rules();
+    let now_ms = now_unix_ms();
 
     let prior_stale_ident = ProcessIdentity::new(8101, unix_ms_to_filetime(now_ms - 60_000));
     let prior_live_ident = ProcessIdentity::new(8102, unix_ms_to_filetime(now_ms - 30_000));
@@ -1108,14 +1098,7 @@ async fn burst_07_startup_reconcile_preserves_new_etw_process_and_deduplicates_a
     sender.send(new_etw_cmd_ev).await.expect("send ETW cmd");
     sender.send(lotl_both_ev.clone()).await.expect("send ETW lotl");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while engine.metrics().high_priority_processed < 2 {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for ETW events to process before seed_processes"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_high_priority_processed(&engine, 2, "ETW events to process before seed_processes").await;
     store2.flush_batch().expect("flush ETW events before seed");
 
     // Seed with prior_live + duplicate lotl_both, intentionally omitting new_etw_cmd_ident and prior_stale.
@@ -1203,13 +1186,7 @@ async fn burst_08_shutdown_interrupts_large_purge_within_budget() {
     let dir = TestTempDir::new("ledr-burst-08");
     let db_path = dir.path.join("daemon_large_purge.db");
 
-    let now_ms = i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_millis(),
-    )
-    .unwrap_or(i64::MAX);
+    let now_ms = now_unix_ms();
 
     {
         let store1 = LedrStore::open(&db_path).expect("open seed store");
@@ -1322,21 +1299,8 @@ async fn burst_08_shutdown_interrupts_large_purge_within_budget() {
 
 #[tokio::test]
 async fn burst_09_parent_enrichment_triggers_lotl_alert_and_older_snapshot_preserves_newer_pid() {
-    let lotl_json = include_str!("../../../rules/lotl_core.json");
-    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
-    let sigma = SigmaEngine::from_json_str(lotl_json).expect("compile lotl_core.json");
-    let pruner = EarlyPruner::from_json_str(allowlist_json).expect("build pruner");
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-
-    let engine = DaemonEngine::start(
-        store.clone(),
-        sigma,
-        pruner,
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-    );
+    let (sigma, pruner) = load_lotl_rules();
+    let (store, engine) = start_default_in_memory_engine(sigma, pruner);
     let sender = engine.sender();
 
     let t_base = 1_750_000_000_000i64;
@@ -1363,14 +1327,7 @@ async fn burst_09_parent_enrichment_triggers_lotl_alert_and_older_snapshot_prese
         .send(ps_ev.clone())
         .await
         .expect("send child powershell before parent");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while engine.metrics().high_priority_processed < 1 {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for initial child ProcessStart"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    wait_high_priority_processed(&engine, 1, "initial child ProcessStart").await;
     store.flush_batch().expect("flush initial child");
     assert!(
         store
@@ -1407,14 +1364,7 @@ async fn burst_09_parent_enrichment_triggers_lotl_alert_and_older_snapshot_prese
         .send(ps_ev)
         .await
         .expect("resend duplicate powershell ProcessStart");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while engine.metrics().high_priority_processed < 2 {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for duplicate child ProcessStart"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    wait_high_priority_processed(&engine, 2, "duplicate child ProcessStart").await;
     assert_eq!(
         store
             .list_alerts(Some(AlertStatus::Pending), 20)
@@ -1438,14 +1388,7 @@ async fn burst_09_parent_enrichment_triggers_lotl_alert_and_older_snapshot_prese
         })
         .await
         .expect("send newer PID 42 ETW start");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while engine.metrics().high_priority_processed < 3 {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for newer PID 42 ETW start"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    wait_high_priority_processed(&engine, 3, "newer PID 42 ETW start").await;
 
     engine
         .seed_processes(vec![SensorEvent::ProcessStart {
@@ -1499,18 +1442,9 @@ async fn burst_09_parent_enrichment_triggers_lotl_alert_and_older_snapshot_prese
 
 #[tokio::test]
 async fn burst_10_older_snapshot_process_gets_inferred_exit_in_store() {
-    let sigma = SigmaEngine::from_rules(Vec::new()).expect("empty rules");
-    let pruner = EarlyPruner::default();
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-
-    let engine = DaemonEngine::start(
-        store.clone(),
-        sigma,
-        pruner,
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
+    let (store, engine) = start_default_in_memory_engine(
+        SigmaEngine::from_rules(Vec::new()).expect("empty rules"),
+        EarlyPruner::default(),
     );
     let sender = engine.sender();
 
@@ -1530,14 +1464,7 @@ async fn burst_10_older_snapshot_process_gets_inferred_exit_in_store() {
         })
         .await
         .expect("send newer PID 42 ETW start");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while engine.metrics().high_priority_processed < 1 {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for newer PID 42 ETW start"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    wait_high_priority_processed(&engine, 1, "newer PID 42 ETW start").await;
 
     engine
         .seed_processes(vec![SensorEvent::ProcessStart {
@@ -1574,21 +1501,8 @@ async fn burst_10_older_snapshot_process_gets_inferred_exit_in_store() {
 
 #[tokio::test]
 async fn burst_11_distinct_script_bodies_each_emit_alert_per_rule() {
-    let lotl_json = include_str!("../../../rules/lotl_core.json");
-    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
-    let sigma = SigmaEngine::from_json_str(lotl_json).expect("compile lotl_core.json");
-    let pruner = EarlyPruner::from_json_str(allowlist_json).expect("build pruner");
-    let store = LedrStore::open_in_memory().expect("open in-memory store");
-
-    let engine = DaemonEngine::start(
-        store.clone(),
-        sigma,
-        pruner,
-        DaemonConfig {
-            pipe_name: unique_test_pipe_name(),
-            ..DaemonConfig::default()
-        },
-    );
+    let (sigma, pruner) = load_lotl_rules();
+    let (store, engine) = start_default_in_memory_engine(sigma, pruner);
     let sender = engine.sender();
 
     let t_base = 1_750_000_000_000i64;
@@ -1603,14 +1517,7 @@ async fn burst_11_distinct_script_bodies_each_emit_alert_per_rule() {
         })
         .await
         .expect("send powershell ProcessStart");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while engine.metrics().high_priority_processed < 1 {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for powershell ProcessStart"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    wait_high_priority_processed(&engine, 1, "powershell ProcessStart").await;
 
     // Two different script bodies matching the same rule must each emit an alert; replaying the
     // identical body must still be deduplicated.
@@ -1631,14 +1538,7 @@ async fn burst_11_distinct_script_bodies_each_emit_alert_per_rule() {
             .await
             .expect("send ScriptEvaluated");
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while engine.metrics().high_priority_processed < 4 {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for ScriptEvaluated processing"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    wait_high_priority_processed(&engine, 4, "ScriptEvaluated processing").await;
 
     engine.shutdown_and_flush().await.expect("shutdown_and_flush");
 

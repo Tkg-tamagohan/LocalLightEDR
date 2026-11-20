@@ -2233,3 +2233,120 @@ fn rules_p3_15_nrd_cancel_token_blocking_read_observation_and_guard_reset() {
         );
     }
 }
+
+#[test]
+fn rules_p3_16_load_rules_dir_separates_shipped_defaults_from_managed_rules() {
+    let tmp = TestTempDir::new("ledr-rules-dir-split");
+    let default_json = serde_json::json!({
+        "allowlist_rules": [
+            {
+                "rule_id": "ALLOW-SHIPPED-1",
+                "scope": "NetworkAllow",
+                "exe_path_pattern": r"C:\Apps\browser.exe",
+                "sha256": null,
+                "signer_subject": "CN=Example",
+                "root_thumbprint": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "allowed_target": null,
+                "created_at_ms": 0,
+                "created_by": "default_allowlist"
+            },
+            {
+                "rule_id": "OPS-IN-DEFAULT-FILE-BLOCK",
+                "scope": "NetworkBlock",
+                "exe_path_pattern": r"C:\Apps\blocked.exe",
+                "sha256": null,
+                "signer_subject": null,
+                "root_thumbprint": null,
+                "allowed_target": null,
+                "created_at_ms": 0,
+                "created_by": "default_allowlist"
+            },
+            {
+                "rule_id": "OPS-IN-DEFAULT-FILE-ALLOW",
+                "scope": "NetworkAllow",
+                "exe_path_pattern": r"C:\Apps\custom.exe",
+                "sha256": null,
+                "signer_subject": null,
+                "root_thumbprint": null,
+                "allowed_target": "api.example.com",
+                "created_at_ms": 0,
+                "created_by": "operator"
+            }
+        ],
+        "early_pruner": {
+            "prune_loopback_network": false,
+            "ignored_dns_names": ["custom-ignored.local"]
+        }
+    });
+    let ops_json = serde_json::json!({
+        "allowlist_rules": [
+            {
+                "rule_id": "OPS-POLICY-BLOCK",
+                "scope": "NetworkBlock",
+                "exe_path_pattern": r"C:\Apps\tool.exe",
+                "sha256": null,
+                "signer_subject": null,
+                "root_thumbprint": null,
+                "allowed_target": "203.0.113.10",
+                "created_at_ms": 0,
+                "created_by": "default_allowlist"
+            },
+            {
+                "rule_id": "OPS-POLICY-ALLOW",
+                "scope": "NetworkAllow",
+                "exe_path_pattern": r"C:\Apps\helper.exe",
+                "sha256": null,
+                "signer_subject": null,
+                "root_thumbprint": null,
+                "allowed_target": null,
+                "created_at_ms": 0,
+                "created_by": "default_allowlist"
+            }
+        ]
+    });
+
+    std::fs::write(
+        tmp.path().join("default_allowlist.json"),
+        default_json.to_string(),
+    )
+    .expect("write default_allowlist.json");
+    std::fs::write(tmp.path().join("z_ops_policy.json"), ops_json.to_string())
+        .expect("write z_ops_policy.json");
+
+    let loaded = load_rules_dir(tmp.path()).expect("load_rules_dir");
+    let default_ids: Vec<&str> = loaded
+        .default_allowlists
+        .iter()
+        .map(|r| r.rule_id.as_str())
+        .collect();
+    let managed_ids: Vec<&str> = loaded
+        .managed_rules
+        .iter()
+        .map(|r| r.rule_id.as_str())
+        .collect();
+
+    assert_eq!(default_ids, vec!["ALLOW-SHIPPED-1"]);
+    assert_eq!(
+        managed_ids,
+        vec![
+            "OPS-IN-DEFAULT-FILE-BLOCK",
+            "OPS-IN-DEFAULT-FILE-ALLOW",
+            "OPS-POLICY-BLOCK",
+            "OPS-POLICY-ALLOW",
+        ]
+    );
+
+    // Secondary policy file omitting `early_pruner` must NOT clobber `default_allowlist.json`'s pruner.
+    let loopback_ev = SensorEvent::NetworkConnect {
+        pid: 1234,
+        protocol: 6,
+        dst_ip: "127.0.0.1".parse().unwrap(),
+        dst_port: 8080,
+        domain_hint: None,
+        timestamp_ms: 1_732_000_000_000,
+    };
+    assert!(
+        !loaded.pruner.should_prune(&EventContext::new(&loopback_ev)),
+        "early_pruner.prune_loopback_network=false from default_allowlist.json must be preserved"
+    );
+}

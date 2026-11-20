@@ -939,9 +939,11 @@ async fn pr21_analysis_0001_dedup_fast_path_skips_binary_inspector_when_no_rule_
         "ANALYSIS_0001: BinaryInspector must run only once when no persisted rule matches exe_path"
     );
 
-    // Grant AllowOnce on the NET_OUTBOUND alert and confirm subsequent connects still skip
-    // BinaryInspector while preserving the "ALLOWED" action (not "DEDUP_SUPPRESSED").
+    // Grant AllowOnce on the NET_OUTBOUND alert and confirm subsequent connects through the
+    // real event-ingestion path (`process_event_with_lane` -> `events.rs` -> SQLite
+    // `network_events`) skip BinaryInspector while persisting `"ALLOWED"` (`PRRT_kwDOVyjVyM657t_9`).
     let alerts = engine.store.list_alerts(None, 10).expect("list alerts");
+    assert_eq!(alerts.len(), 1);
     let net_alert = alerts
         .iter()
         .find(|a| a.source_layer == "LAYER_3_NETWORK")
@@ -958,21 +960,38 @@ async fn pr21_analysis_0001_dedup_fast_path_skips_binary_inspector_when_no_rule_
         domain_hint: None,
         timestamp_ms: now_ms + 100,
     };
-    let proc_ctx = engine.resolve_process_context(&allow_connect_event, now_ms + 100);
-    let (action_after_allow, _) = engine.evaluate_and_handle_outbound_connect(
-        Some(&allow_connect_event),
-        &proc_ctx,
-        r"C:\Apps\unrelated_app.exe",
-        app_id.pid,
-        6,
-        IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-        8443,
-        &[],
-        now_ms + 100,
+    let _ = engine.process_event_with_lane(&allow_connect_event, EventLane::HighPriority);
+    engine
+        .store
+        .flush_batch()
+        .expect("flush network events batch");
+
+    let snap = engine
+        .store
+        .query_flight_recorder(20, Some(&app_id.instance_id()))
+        .expect("query flight recorder");
+    let allowed_row = snap
+        .network_events
+        .iter()
+        .find(|ev| ev.dst_port == 8443)
+        .expect("AllowOnce connect event must be persisted in network_events");
+    assert_eq!(
+        allowed_row.action, "ALLOWED",
+        "ANALYSIS_0001: real event ingestion path must persist ALLOWED for AllowOnce-granted process"
+    );
+    let dedup_count = snap
+        .network_events
+        .iter()
+        .filter(|ev| (444..=447).contains(&ev.dst_port) && ev.action == "DEDUP_SUPPRESSED")
+        .count();
+    assert_eq!(
+        dedup_count, 4,
+        "pre-AllowOnce burst connects must persist DEDUP_SUPPRESSED"
     );
     assert_eq!(
-        action_after_allow, "ALLOWED",
-        "ANALYSIS_0001: fast path must preserve ALLOWED action for AllowOnce-granted process"
+        engine.store.list_alerts(None, 10).expect("list alerts").len(),
+        1,
+        "AllowOnce connect must not emit a duplicate alert"
     );
     assert_eq!(
         inspector.calls(),
@@ -1106,8 +1125,8 @@ fn pr21_analysis_0003_shutdown_resumes_and_checkpoints_within_budget_before_nrd_
             engine.shutdown_and_flush().await.expect("shutdown");
             let elapsed = started.elapsed();
             assert!(
-                elapsed < Duration::from_secs(2),
-                "ANALYSIS_0003: shutdown must complete within budget even with wedged NRD (took {elapsed:?})"
+                elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(750),
+                "ANALYSIS_0003: shutdown with 250 ms budget and wedged NRD must respect budget window (took {elapsed:?})"
             );
 
             assert!(
@@ -1132,4 +1151,411 @@ fn pr21_analysis_0003_shutdown_resumes_and_checkpoints_within_budget_before_nrd_
 
     let _ = release_tx.send(());
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+struct SlowResumeDefense {
+    per_call_delay: std::time::Duration,
+    resumed: Mutex<Vec<ProcessIdentity>>,
+}
+
+impl SlowResumeDefense {
+    fn new(per_call_delay: std::time::Duration) -> Self {
+        Self {
+            per_call_delay,
+            resumed: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn resumed(&self) -> Vec<ProcessIdentity> {
+        self.resumed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+impl ActiveDefenseController for SlowResumeDefense {
+    fn suspend_process(&self, _target: &ProcessIdentity, _include_children: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resume_process(&self, target: &ProcessIdentity) -> Result<(), String> {
+        std::thread::sleep(self.per_call_delay);
+        self.resumed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(*target);
+        Ok(())
+    }
+
+    fn terminate_process(
+        &self,
+        _target: &ProcessIdentity,
+        _include_children: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn add_wfp_app_rule(
+        &self,
+        _exe_path: &Path,
+        _remote_ip: Option<IpAddr>,
+        _allow: bool,
+    ) -> Result<u64, String> {
+        Ok(1)
+    }
+
+    fn remove_wfp_rule(&self, _filter_id: u64) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn pr21_v2_analysis_0003_shutdown_budget_caps_resume_loop_and_skips_nrd_wait_when_exhausted() {
+    use super::NrdThreadHandle;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ledr-pr21-v2-budget-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+    let db_path = tmp_dir.join("ledr.db");
+    let wal_path = tmp_dir.join("ledr.db-wal");
+
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let t1 = ProcessIdentity::new(66001, 600_001);
+    let t2 = ProcessIdentity::new(66002, 600_002);
+    let t3 = ProcessIdentity::new(66003, 600_003);
+    // Each resume_process call takes 250 ms > 150 ms total shutdown budget, so after t1
+    // finishes the shared deadline is already exhausted: t2/t3 must be skipped and the
+    // wedged NRD thread must be detached immediately without starting a second budget wait.
+    let defense = Arc::new(SlowResumeDefense::new(Duration::from_millis(250)));
+
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build rt");
+
+        rt.block_on(async {
+            let store = LedrStore::open(&db_path).expect("open file store");
+            for (idx, target) in [(1, t1), (2, t2), (3, t3)] {
+                store
+                    .record_alert(&AlertRecord {
+                        alert_id: format!("alert-budget-{idx}"),
+                        timestamp_ms: 1_732_000_000_000 + idx,
+                        severity: AlertSeverity::High,
+                        source_layer: "LAYER_1_CANARY".to_string(),
+                        rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
+                        title: format!("Suspended target {idx}"),
+                        process_instance_id: Some(target.instance_id()),
+                        process_suspended: true,
+                        status: AlertStatus::Pending,
+                        context_json: "{}".to_string(),
+                        resolved_at_ms: None,
+                    })
+                    .expect("seed suspended alert");
+            }
+
+            let engine = DaemonEngine::start_with_dependencies(
+                store.clone(),
+                SigmaEngine::default(),
+                EarlyPruner::default(),
+                DaemonConfig {
+                    shutdown_flush_timeout_ms: 150,
+                    resume_suspended_on_shutdown: true,
+                    outbound_firewall_enabled: false,
+                    ..DaemonConfig::default()
+                },
+                Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+                Arc::new(StubNotifier),
+                Arc::new(FixedShaInspector("f".repeat(64))),
+            );
+
+            // Also verify pre-expired deadline guard skips querying/resuming immediately.
+            let pre_expired = tokio::time::Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap_or_else(tokio::time::Instant::now);
+            assert!(
+                !engine.resume_unresolved_suspended_processes_on_shutdown(pre_expired),
+                "pre-expired shutdown deadline must skip resume pass without touching defense"
+            );
+            assert!(defense.resumed().is_empty());
+
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let join_handle = std::thread::Builder::new()
+                .name("ledr-pr21-v2-wedged-nrd".to_string())
+                .spawn(move || {
+                    let _ = release_rx.recv();
+                    let _ = done_tx.send(());
+                })
+                .expect("spawn wedged nrd");
+            *engine
+                .nrd_thread_handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(NrdThreadHandle {
+                join_handle,
+                done_rx,
+            });
+
+            let started = Instant::now();
+            engine.shutdown_and_flush().await.expect("shutdown");
+            let elapsed = started.elapsed();
+
+            // Deterministic assertion: only t1 ran before the shared 150 ms budget expired.
+            assert_eq!(
+                defense.resumed(),
+                vec![t1],
+                "shutdown resume loop must stop once shared budget is exhausted"
+            );
+            assert!(
+                elapsed < Duration::from_millis(650),
+                "shutdown must neither resume t2/t3 nor wait a second budget for wedged NRD (took {elapsed:?})"
+            );
+
+            // SQLite reflects exact partial progress: t1 cleared, t2 & t3 preserved as suspended.
+            assert!(
+                !store.get_alert("alert-budget-1").unwrap().unwrap().process_suspended,
+                "t1 must be cleared in SQLite after confirmed resume"
+            );
+            assert!(
+                store.get_alert("alert-budget-2").unwrap().unwrap().process_suspended,
+                "skipped t2 must remain process_suspended=true in SQLite"
+            );
+            assert!(
+                store.get_alert("alert-budget-3").unwrap().unwrap().process_suspended,
+                "skipped t3 must remain process_suspended=true in SQLite"
+            );
+            let wal_len_after = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(
+                wal_len_after, 0,
+                "WAL must still be truncated to 0 bytes after budget-capped shutdown resume"
+            );
+        });
+    }
+
+    let _ = release_tx.send(());
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn pr21_v2_bug_0002_allow_decisions_resume_leftover_children_after_partial_shutdown() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let parent_once = ProcessIdentity::new(67001, 700_001);
+    // Use current live PID so ProcessLiveness reports Running when resume fails.
+    let leftover_child_once = ProcessIdentity::new(std::process::id(), 700_002);
+
+    // Part A: Shutdown resumes parent_once but fails leftover_child_once, leaving
+    // process_suspended=false with suspended_children=[leftover_child_once].
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-partial-once".to_string(),
+            timestamp_ms: 1_732_000_000_000,
+            severity: AlertSeverity::Critical,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+            title: "Honeypot tree partially resumed on shutdown".to_string(),
+            process_instance_id: Some(parent_once.instance_id()),
+            process_suspended: true,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": r"C:\Temp\partial_once.exe",
+                "suspended_children": [leftover_child_once.instance_id()]
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("seed partial once alert");
+
+    let shutdown_defense = Arc::new(PartialResumeDefense::new(leftover_child_once));
+    let engine_before_restart = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            resume_suspended_on_shutdown: true,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&shutdown_defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("a".repeat(64))),
+    );
+    engine_before_restart
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown with partial resume");
+    assert_eq!(shutdown_defense.resumed(), vec![parent_once]);
+
+    let after_shutdown = store
+        .get_alert("alert-partial-once")
+        .unwrap()
+        .expect("alert exists");
+    assert!(!after_shutdown.process_suspended);
+
+    // After restart, if child resume still fails on AllowOnce, the alert must stay unresolved.
+    let failing_after_restart = Arc::new(PartialResumeDefense::new(leftover_child_once));
+    let engine_fail = start_stopped_engine(
+        store.clone(),
+        DaemonConfig::default(),
+        Arc::clone(&failing_after_restart) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("a".repeat(64))),
+    )
+    .await;
+    assert!(
+        engine_fail
+            .resolve_alert("alert-partial-once", ledr_proto::AlertDecision::AllowOnce)
+            .is_err(),
+        "AllowOnce must fail and keep alert unresolved when leftover child fails to resume"
+    );
+    assert_eq!(
+        store.get_alert("alert-partial-once").unwrap().unwrap().status,
+        AlertStatus::Pending
+    );
+
+    // Once child resume succeeds, AllowOnce must resume ONLY the leftover child (not the
+    // already-resumed parent) and resolve the alert.
+    let ok_defense_once = Arc::new(RecordingDefense::new());
+    let engine_ok_once = start_stopped_engine(
+        store.clone(),
+        DaemonConfig::default(),
+        Arc::clone(&ok_defense_once) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("a".repeat(64))),
+    )
+    .await;
+    let resolved_once = engine_ok_once
+        .resolve_alert("alert-partial-once", ledr_proto::AlertDecision::AllowOnce)
+        .expect("AllowOnce must resume leftover child");
+    assert_eq!(resolved_once.status, AlertStatus::ApprovedOnce);
+    assert_eq!(
+        ok_defense_once.resumed(),
+        vec![leftover_child_once],
+        "AllowOnce must resume leftover suspended child without re-resuming parent"
+    );
+
+    // Part B: AllowPermanent on a parent-resumed / child-frozen alert must roll back the
+    // saved rule when child resume fails, and resume the child when it succeeds.
+    let parent_perm = ProcessIdentity::new(67010, 700_010);
+    let leftover_child_perm = ProcessIdentity::new(std::process::id(), 700_011);
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-partial-perm".to_string(),
+            timestamp_ms: 1_732_000_010_000,
+            severity: AlertSeverity::Critical,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+            title: "Honeypot tree partially resumed before AllowPermanent".to_string(),
+            process_instance_id: Some(parent_perm.instance_id()),
+            process_suspended: false,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": r"C:\Temp\partial_perm.exe",
+                "suspended_children": [leftover_child_perm.instance_id()]
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("seed partial perm alert");
+
+    let fail_perm_defense = Arc::new(PartialResumeDefense::new(leftover_child_perm));
+    let engine_fail_perm = start_stopped_engine(
+        store.clone(),
+        DaemonConfig::default(),
+        Arc::clone(&fail_perm_defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("b".repeat(64))),
+    )
+    .await;
+    assert!(
+        engine_fail_perm
+            .resolve_alert(
+                "alert-partial-perm",
+                ledr_proto::AlertDecision::AllowPermanent {
+                    use_signer_if_available: false,
+                    allow_dest: None,
+                },
+            )
+            .is_err(),
+        "AllowPermanent must fail when leftover child fails to resume"
+    );
+    assert!(
+        store.list_rules(None).unwrap().is_empty(),
+        "AllowPermanent must roll back saved allowlist rule when leftover child resume fails"
+    );
+    assert_eq!(
+        store.get_alert("alert-partial-perm").unwrap().unwrap().status,
+        AlertStatus::Pending
+    );
+
+    let ok_defense_perm = Arc::new(RecordingDefense::new());
+    let engine_ok_perm = start_stopped_engine(
+        store.clone(),
+        DaemonConfig::default(),
+        Arc::clone(&ok_defense_perm) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("b".repeat(64))),
+    )
+    .await;
+    let resolved_perm = engine_ok_perm
+        .resolve_alert(
+            "alert-partial-perm",
+            ledr_proto::AlertDecision::AllowPermanent {
+                use_signer_if_available: false,
+                allow_dest: None,
+            },
+        )
+        .expect("AllowPermanent must resume leftover child");
+    assert_eq!(resolved_perm.status, AlertStatus::ApprovedRule);
+    assert_eq!(ok_defense_perm.resumed(), vec![leftover_child_perm]);
+    assert_eq!(store.list_rules(None).unwrap().len(), 1);
+
+    // Part C: Another unresolved alert still holding the same child must keep it frozen until
+    // both alerts are resolved.
+    let parent_sib = ProcessIdentity::new(67020, 700_020);
+    let shared_child = ProcessIdentity::new(67021, 700_021);
+    for id in ["alert-sib-child-1", "alert-sib-child-2"] {
+        store
+            .record_alert(&AlertRecord {
+                alert_id: id.to_string(),
+                timestamp_ms: 1_732_000_020_000,
+                severity: AlertSeverity::Critical,
+                source_layer: "LAYER_1_CANARY".to_string(),
+                rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+                title: "Sibling child containment".to_string(),
+                process_instance_id: Some(parent_sib.instance_id()),
+                process_suspended: false,
+                status: AlertStatus::Pending,
+                context_json: serde_json::json!({
+                    "exe_path": r"C:\Temp\partial_sib.exe",
+                    "suspended_children": [shared_child.instance_id()]
+                })
+                .to_string(),
+                resolved_at_ms: None,
+            })
+            .expect("seed sibling child alert");
+    }
+
+    let sib_defense = Arc::new(RecordingDefense::new());
+    let engine_sib = start_stopped_engine(
+        store.clone(),
+        DaemonConfig::default(),
+        Arc::clone(&sib_defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("c".repeat(64))),
+    )
+    .await;
+    engine_sib
+        .resolve_alert("alert-sib-child-1", ledr_proto::AlertDecision::AllowOnce)
+        .expect("resolve first sibling alert");
+    assert!(
+        sib_defense.resumed().is_empty(),
+        "shared child must remain frozen while sibling unresolved alert still holds it"
+    );
+    engine_sib
+        .resolve_alert("alert-sib-child-2", ledr_proto::AlertDecision::AllowOnce)
+        .expect("resolve second sibling alert");
+    assert_eq!(
+        sib_defense.resumed(),
+        vec![shared_child],
+        "shared child must be resumed once the last unresolved alert holding it is allowed"
+    );
 }

@@ -40,36 +40,39 @@ impl LedrStore {
     }
 
     /// Lists all unresolved (`PENDING` / `EXPIRED_SUSPENDED`) alerts that still record a suspended
-    /// parent (`process_suspended = 1`) or suspended children (`suspended_children` in `context_json`),
-    /// using keyset pagination so large alert histories never truncate older suspended rows (`BUG_0003`).
+    /// parent (`process_suspended = 1`) or non-empty top-level `$.suspended_children` array in
+    /// `context_json`, using keyset pagination so large alert histories never truncate older
+    /// suspended rows (`BUG_0003`, `PRRT_kwDOVyjVyM657t-x`).
     pub fn list_unresolved_suspended_alerts(&self) -> Result<Vec<AlertRecord>, StoreError> {
         const PAGE_SIZE: usize = 500;
+        // Guard `json_type` and `json_array_length` behind nested `CASE WHEN json_valid(...)`
+        // so malformed legacy `context_json` rows never trigger a SQLite JSON runtime error.
+        const SUSPENDED_PREDICATE: &str = "(
+                 process_suspended = 1
+                 OR CASE
+                      WHEN json_valid(context_json) THEN
+                        CASE
+                          WHEN json_type(context_json, '$.suspended_children') = 'array'
+                          THEN json_array_length(context_json, '$.suspended_children') > 0
+                          ELSE 0
+                        END
+                      ELSE 0
+                    END
+               )";
         let reader = self.lock_reader()?;
         let pending = AlertStatus::Pending.as_db_str();
         let expired = AlertStatus::ExpiredSuspended.as_db_str();
         let first_sql = format!(
             "SELECT {ALERT_COLS} FROM alerts
              WHERE status IN (?1, ?2)
-               AND (
-                 process_suspended = 1
-                 OR (
-                   context_json LIKE '%\"suspended_children\"%'
-                   AND context_json NOT LIKE '%\"suspended_children\":[]%'
-                 )
-               )
+               AND {SUSPENDED_PREDICATE}
              ORDER BY timestamp_ms ASC, alert_id ASC
              LIMIT ?3"
         );
         let next_sql = format!(
             "SELECT {ALERT_COLS} FROM alerts
              WHERE status IN (?1, ?2)
-               AND (
-                 process_suspended = 1
-                 OR (
-                   context_json LIKE '%\"suspended_children\"%'
-                   AND context_json NOT LIKE '%\"suspended_children\":[]%'
-                 )
-               )
+               AND {SUSPENDED_PREDICATE}
                AND (timestamp_ms > ?3 OR (timestamp_ms = ?3 AND alert_id > ?4))
              ORDER BY timestamp_ms ASC, alert_id ASC
              LIMIT ?5"

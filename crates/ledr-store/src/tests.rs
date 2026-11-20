@@ -577,3 +577,99 @@ fn store_p2_bug_0004_seed_default_rules_once_does_not_resurrect_deleted_or_overw
     assert_eq!(r2.created_by, "operator");
     assert!(store.get_rule("DEF-3").expect("get DEF-3").is_some());
 }
+
+#[test]
+fn store_p2_analysis_list_unresolved_suspended_alerts_uses_top_level_json_array() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let mk_alert = |id: &str, ts: i64, suspended: bool, ctx: &str| AlertRecord {
+        alert_id: id.to_string(),
+        timestamp_ms: ts,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+        title: format!("Alert {id}"),
+        process_instance_id: Some(format!("4000:{ts}")),
+        process_suspended: suspended,
+        status: AlertStatus::Pending,
+        context_json: ctx.to_string(),
+        resolved_at_ms: None,
+    };
+
+    // Must be INCLUDED:
+    // 1. Top-level non-empty array even when a nested object carries an empty same-named array.
+    store
+        .record_alert(&mk_alert(
+            "inc-nested-empty",
+            1,
+            false,
+            r#"{"suspended_children":["101:1001"],"meta":{"suspended_children":[]}}"#,
+        ))
+        .expect("record inc-nested-empty");
+    // 2. Pretty-printed / whitespace-formatted top-level non-empty array.
+    store
+        .record_alert(&mk_alert(
+            "inc-whitespace",
+            2,
+            false,
+            "{ \"suspended_children\" : [ \"102:1002\" ] }",
+        ))
+        .expect("record inc-whitespace");
+    // 3. Parent suspended with malformed JSON must still be included without error.
+    store
+        .record_alert(&mk_alert("inc-malformed-parent", 3, true, "{bad json"))
+        .expect("record inc-malformed-parent");
+
+    // Must be EXCLUDED:
+    // 4. Pretty-printed empty array with spaces (would fool LIKE/NOT LIKE).
+    store
+        .record_alert(&mk_alert(
+            "exc-whitespace-empty",
+            4,
+            false,
+            "{ \"suspended_children\" : [ ] }",
+        ))
+        .expect("record exc-whitespace-empty");
+    // 5. Nested non-empty array when top-level has no suspended_children.
+    store
+        .record_alert(&mk_alert(
+            "exc-nested-only",
+            5,
+            false,
+            r#"{"meta":{"suspended_children":["103:1003"]}}"#,
+        ))
+        .expect("record exc-nested-only");
+    // 6. Top-level non-array value (string / null / object).
+    store
+        .record_alert(&mk_alert(
+            "exc-string",
+            6,
+            false,
+            r#"{"suspended_children":"104:1004"}"#,
+        ))
+        .expect("record exc-string");
+    store
+        .record_alert(&mk_alert(
+            "exc-null",
+            7,
+            false,
+            r#"{"suspended_children":null}"#,
+        ))
+        .expect("record exc-null");
+    // 7. Malformed JSON with process_suspended=false must be excluded without SQLite error.
+    store
+        .record_alert(&mk_alert("exc-malformed", 8, false, "{not valid json"))
+        .expect("record exc-malformed");
+    // 8. Top-level JSON array instead of object.
+    store
+        .record_alert(&mk_alert("exc-top-array", 9, false, r#"["105:1005"]"#))
+        .expect("record exc-top-array");
+
+    let found = store
+        .list_unresolved_suspended_alerts()
+        .expect("list unresolved suspended alerts with SQLite JSON functions");
+    let found_ids: Vec<&str> = found.iter().map(|a| a.alert_id.as_str()).collect();
+    assert_eq!(
+        found_ids,
+        vec!["inc-nested-empty", "inc-whitespace", "inc-malformed-parent"]
+    );
+}

@@ -12,8 +12,8 @@ use ledr_proto::{
     SensorBackend,
 };
 use ledr_rules::{
-    compute_file_sha256_hex, discover_default_prerestricted_interpreters,
-    load_rules_and_pruner_from_dir, EarlyPruner, SigmaEngine, DEFAULT_NRD_FEED_URLS,
+    compute_file_sha256_hex, discover_default_prerestricted_interpreters, load_rules_dir,
+    LoadedRulesDir, DEFAULT_NRD_FEED_URLS,
 };
 use ledr_sensor_win::defense::{HoneypotManager, WindowsDefenseController};
 use ledr_sensor_win::etw::{
@@ -228,11 +228,9 @@ fn open_store_with_fallback(explicit_db: Option<&Path>) -> anyhow::Result<(LedrS
     }
 }
 
-fn load_rules_or_default(
-    explicit_dir: Option<&Path>,
-) -> anyhow::Result<(SigmaEngine, EarlyPruner, Vec<ledr_proto::AllowlistRuleRecord>)> {
+fn load_rules_or_default(explicit_dir: Option<&Path>) -> anyhow::Result<LoadedRulesDir> {
     if let Some(dir) = explicit_dir {
-        let loaded = load_rules_and_pruner_from_dir(dir)?;
+        let loaded = load_rules_dir(dir)?;
         return Ok(loaded);
     }
 
@@ -242,7 +240,7 @@ fn load_rules_or_default(
     ];
     for dir in candidates {
         if dir.is_dir() {
-            match load_rules_and_pruner_from_dir(&dir) {
+            match load_rules_dir(&dir) {
                 Ok(loaded) => {
                     tracing::info!(rules_dir = %dir.display(), "loaded Sigma rules and allowlists");
                     return Ok(loaded);
@@ -255,7 +253,45 @@ fn load_rules_or_default(
     }
 
     tracing::warn!("no rules directory found; running with empty Sigma rules and default EarlyPruner");
-    Ok((SigmaEngine::default(), EarlyPruner::default(), Vec::new()))
+    Ok(LoadedRulesDir::default())
+}
+
+fn apply_startup_rules(store: &LedrStore, loaded: &LoadedRulesDir) {
+    match store.seed_default_rules_once(&loaded.default_allowlists) {
+        Ok(seeded) => {
+            if seeded > 0 {
+                tracing::info!(
+                    seeded,
+                    total = loaded.default_allowlists.len(),
+                    "seeded default allowlist rules"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed seeding default allowlist rules");
+        }
+    }
+
+    let mut upserted = 0usize;
+    for rule in &loaded.managed_rules {
+        match store.upsert_rule(rule) {
+            Ok(()) => upserted += 1,
+            Err(err) => {
+                tracing::warn!(
+                    rule_id = %rule.rule_id,
+                    error = %err,
+                    "failed applying operator-managed rule"
+                );
+            }
+        }
+    }
+    if upserted > 0 {
+        tracing::info!(
+            upserted,
+            total = loaded.managed_rules.len(),
+            "applied operator-managed policy rules"
+        );
+    }
 }
 
 fn resolve_ui_exe_path(foreground: bool) -> PathBuf {
@@ -296,23 +332,14 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (store, db_path) = open_store_with_fallback(cli.db_path.as_deref())?;
-    let (sigma, pruner, default_allowlists) = load_rules_or_default(cli.rules_dir.as_deref())?;
+    let loaded_rules = load_rules_or_default(cli.rules_dir.as_deref())?;
+    apply_startup_rules(&store, &loaded_rules);
+    let LoadedRulesDir {
+        sigma,
+        pruner,
+        ..
+    } = loaded_rules;
     let rule_count = sigma.rule_count();
-
-    match store.seed_default_rules_once(&default_allowlists) {
-        Ok(seeded) => {
-            if seeded > 0 {
-                tracing::info!(
-                    seeded,
-                    total = default_allowlists.len(),
-                    "seeded default allowlist rules"
-                );
-            }
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "failed seeding default allowlist rules");
-        }
-    }
 
     let ui_exe = resolve_ui_exe_path(cli.foreground);
     let authorized_ui_sha256 = cli.ui_sha256.clone().or_else(|| {
@@ -623,5 +650,141 @@ mod tests {
         for (label, args, expect_ok) in cases {
             assert_eq!(parse_cli_args(args.iter().copied()).is_ok(), *expect_ok, "{label}");
         }
+    }
+
+    #[test]
+    fn startup_rules_seed_defaults_once_and_upsert_edited_managed_rules_across_restarts() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-main-rules-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp rules dir");
+
+        let default_path = tmp_dir.join("default_allowlist.json");
+        let ops_path = tmp_dir.join("ops_network_policy.json");
+
+        std::fs::write(
+            &default_path,
+            serde_json::json!({
+                "allowlist_rules": [
+                    {
+                        "rule_id": "DEF-ALLOW-DELETE-ME",
+                        "scope": "NetworkAllow",
+                        "exe_path_pattern": r"C:\Apps\browser.exe",
+                        "sha256": null,
+                        "signer_subject": "CN=Example",
+                        "root_thumbprint": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "allowed_target": null,
+                        "created_at_ms": 0,
+                        "created_by": "default_allowlist"
+                    },
+                    {
+                        "rule_id": "DEF-ALLOW-KEEP-EDIT",
+                        "scope": "NetworkAllow",
+                        "exe_path_pattern": r"C:\Apps\edge.exe",
+                        "sha256": null,
+                        "signer_subject": "CN=Example",
+                        "root_thumbprint": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "allowed_target": null,
+                        "created_at_ms": 0,
+                        "created_by": "default_allowlist"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write default_allowlist.json");
+
+        // Boot 1: operator sets an app-wide NetworkBlock rule via --rules.
+        std::fs::write(
+            &ops_path,
+            serde_json::json!({
+                "allowlist_rules": [
+                    {
+                        "rule_id": "OPS-NET-BLOCK-1",
+                        "scope": "NetworkBlock",
+                        "exe_path_pattern": r"C:\Apps\tool.exe",
+                        "sha256": null,
+                        "signer_subject": null,
+                        "root_thumbprint": null,
+                        "allowed_target": null,
+                        "created_at_ms": 1000,
+                        "created_by": "operator"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write initial ops_network_policy.json");
+
+        let store = LedrStore::open_in_memory().expect("in-memory store");
+        let loaded_boot1 = load_rules_or_default(Some(&tmp_dir)).expect("boot1 load rules");
+        apply_startup_rules(&store, &loaded_boot1);
+
+        assert!(store.get_rule("DEF-ALLOW-DELETE-ME").unwrap().is_some());
+        let block_boot1 = store
+            .get_rule("OPS-NET-BLOCK-1")
+            .unwrap()
+            .expect("OPS-NET-BLOCK-1 exists after boot 1");
+        assert_eq!(block_boot1.allowed_target, None);
+
+        // Between boots: operator deletes one default rule, customizes another in SQLite,
+        // and narrows OPS-NET-BLOCK-1 in the --rules file to a specific IP.
+        assert!(store.delete_rule("DEF-ALLOW-DELETE-ME").unwrap());
+        let mut edited_default = store.get_rule("DEF-ALLOW-KEEP-EDIT").unwrap().unwrap();
+        edited_default.allowed_target = Some("allowed.example.com".to_string());
+        edited_default.created_by = "user_triage".to_string();
+        store.upsert_rule(&edited_default).unwrap();
+
+        std::fs::write(
+            &ops_path,
+            serde_json::json!({
+                "allowlist_rules": [
+                    {
+                        "rule_id": "OPS-NET-BLOCK-1",
+                        "scope": "NetworkBlock",
+                        "exe_path_pattern": r"C:\Apps\tool.exe",
+                        "sha256": null,
+                        "signer_subject": null,
+                        "root_thumbprint": null,
+                        "allowed_target": "203.0.113.10",
+                        "created_at_ms": 2000,
+                        "created_by": "operator"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("update ops_network_policy.json");
+
+        // Boot 2: reload from --rules and apply startup rules.
+        let loaded_boot2 = load_rules_or_default(Some(&tmp_dir)).expect("boot2 load rules");
+        apply_startup_rules(&store, &loaded_boot2);
+
+        assert!(
+            store.get_rule("DEF-ALLOW-DELETE-ME").unwrap().is_none(),
+            "deleted shipped default rule must NOT be resurrected on restart"
+        );
+        let kept = store
+            .get_rule("DEF-ALLOW-KEEP-EDIT")
+            .unwrap()
+            .expect("DEF-ALLOW-KEEP-EDIT exists");
+        assert_eq!(
+            kept.allowed_target.as_deref(),
+            Some("allowed.example.com"),
+            "SQLite edit to shipped default rule must NOT be overwritten on restart"
+        );
+        let block_boot2 = store
+            .get_rule("OPS-NET-BLOCK-1")
+            .unwrap()
+            .expect("OPS-NET-BLOCK-1 exists after boot 2");
+        assert_eq!(
+            block_boot2.allowed_target.as_deref(),
+            Some("203.0.113.10"),
+            "edited operator-managed rule in --rules must update SQLite on restart"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

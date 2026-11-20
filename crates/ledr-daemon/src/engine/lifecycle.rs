@@ -385,10 +385,16 @@ impl DaemonEngine {
     /// preserving an audit trail in `context_json.shutdown_resumed_identities` /
     /// `context_json.shutdown_resumed_at_ms` (`BUG_0002`, `BUG_0003`, `ANALYSIS_0003`).
     /// Returns `true` if any SQLite alert row was updated and requires WAL checkpointing.
-    fn resume_unresolved_suspended_processes_on_shutdown(
+    pub(super) fn resume_unresolved_suspended_processes_on_shutdown(
         &self,
         deadline: tokio::time::Instant,
     ) -> bool {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "shutdown budget already exhausted before resuming unresolved suspended processes"
+            );
+            return false;
+        }
         let alerts = match self.store.list_unresolved_suspended_alerts() {
             Ok(alerts) => alerts,
             Err(err) => {

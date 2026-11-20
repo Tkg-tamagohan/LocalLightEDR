@@ -299,9 +299,18 @@ async fn main() -> anyhow::Result<()> {
     let (sigma, pruner, default_allowlists) = load_rules_or_default(cli.rules_dir.as_deref())?;
     let rule_count = sigma.rule_count();
 
-    for rule in &default_allowlists {
-        if let Err(err) = store.upsert_rule(rule) {
-            tracing::warn!(rule_id = %rule.rule_id, error = %err, "failed seeding default allowlist rule");
+    match store.seed_default_rules_once(&default_allowlists) {
+        Ok(seeded) => {
+            if seeded > 0 {
+                tracing::info!(
+                    seeded,
+                    total = default_allowlists.len(),
+                    "seeded default allowlist rules"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed seeding default allowlist rules");
         }
     }
 

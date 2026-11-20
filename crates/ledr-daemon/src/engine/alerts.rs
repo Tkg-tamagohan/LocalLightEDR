@@ -1099,7 +1099,7 @@ pub(super) fn collect_suspended_children_from_ctx(
     }
 }
 
-fn is_protected_process_refusal(err: &str) -> bool {
+pub(super) fn is_protected_process_refusal(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("refusing to act on") || lower.contains("never-suspend")
 }
@@ -1108,7 +1108,7 @@ fn is_protected_process_refusal(err: &str) -> bool {
 /// the snapshot positively reports the PID absent or its PID was reused (CreationTime
 /// mismatch). Live processes and unverifiable states are genuine failures the caller
 /// must surface (`BUG_0004`, `BUG_0002`).
-fn is_process_gone_or_replaced(err: &str, pid: u32) -> bool {
+pub(super) fn is_process_gone_or_replaced(err: &str, pid: u32) -> bool {
     tolerate_missing_target(err, ledr_sensor_win::defense::process_liveness(pid))
 }
 

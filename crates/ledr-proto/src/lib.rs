@@ -98,15 +98,143 @@ pub const NEVER_SUSPEND_PROCESS_NAMES: &[&str] = &[
 ];
 
 /// Returns `true` if `exe_name_or_path` matches a protected OS or LocalEDR binary in
-/// [`NEVER_SUSPEND_PROCESS_NAMES`] (ASCII case-insensitive, matching on filename component).
+/// [`NEVER_SUSPEND_PROCESS_NAMES`] (ASCII case-insensitive).
+///
+/// - Basename-only inputs (containing neither `\` nor `/`) match directly against
+///   [`NEVER_SUSPEND_PROCESS_NAMES`] for backward compatibility with callers that only have
+///   an image filename (e.g., Toolhelp32 `szExeFile`).
+/// - Full paths (containing `\` or `/`) must additionally reside in a canonical Windows OS,
+///   Windows Defender, or LocalEDR install directory (supporting `C:\...`, `\\?\C:\...`,
+///   `\??\C:\...`, `\SystemRoot\...`, and `\Device\HarddiskVolume<N>\...`) with no path
+///   traversal segments (`SEC_0001`).
 pub fn is_never_suspend_process(exe_name_or_path: &str) -> bool {
-    let file_name = exe_name_or_path
+    let trimmed = exe_name_or_path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let has_separator = trimmed.contains('\\') || trimmed.contains('/');
+    let file_name = trimmed
         .rsplit(['\\', '/'])
         .next()
-        .unwrap_or(exe_name_or_path);
-    NEVER_SUSPEND_PROCESS_NAMES
+        .unwrap_or(trimmed);
+    if !NEVER_SUSPEND_PROCESS_NAMES
         .iter()
         .any(|protected| file_name.eq_ignore_ascii_case(protected))
+    {
+        return false;
+    }
+    if !has_separator {
+        return true;
+    }
+
+    is_in_trusted_never_suspend_directory(trimmed)
+}
+
+fn strip_ascii_prefix_ignore_case<'a>(s: &'a str, prefix_lower: &str) -> Option<&'a str> {
+    if s.len() < prefix_lower.len() || !s.is_char_boundary(prefix_lower.len()) {
+        return None;
+    }
+    let (head, tail) = s.split_at(prefix_lower.len());
+    if head.eq_ignore_ascii_case(prefix_lower) {
+        Some(tail)
+    } else {
+        None
+    }
+}
+
+fn is_in_trusted_never_suspend_directory(full_path: &str) -> bool {
+    let normalized = full_path.replace('/', "\\");
+    let rest = normalized
+        .strip_prefix(r"\\?\")
+        .or_else(|| normalized.strip_prefix(r"\??\"))
+        .unwrap_or(&normalized);
+
+    let volume_relative_owned: String;
+    let volume_relative: &str = if let Some(after_sysroot) =
+        strip_ascii_prefix_ignore_case(rest, r"\systemroot\")
+    {
+        volume_relative_owned = format!(r"windows\{after_sysroot}");
+        &volume_relative_owned
+    } else if let Some(after_dev) =
+        strip_ascii_prefix_ignore_case(rest, r"\device\harddiskvolume")
+    {
+        let digits_len = after_dev
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits_len == 0 || after_dev.as_bytes().get(digits_len) != Some(&b'\\') {
+            return false;
+        }
+        &after_dev[digits_len + 1..]
+    } else {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].eq_ignore_ascii_case(&b'c')
+            && bytes[1] == b':'
+            && bytes[2] == b'\\'
+        {
+            &rest[3..]
+        } else {
+            return false;
+        }
+    };
+
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in volume_relative.split('\\') {
+        if seg.is_empty() {
+            continue;
+        }
+        if seg == "." || seg == ".." {
+            return false;
+        }
+        segments.push(seg);
+    }
+    if segments.len() < 2 {
+        return false;
+    }
+    let dir_segments = &segments[..segments.len() - 1];
+
+    // Exact canonical directories:
+    // - C:\Windows\ (e.g., explorer.exe)
+    // - C:\Windows\System32\
+    // - C:\Windows\SysWOW64\
+    // - C:\Program Files\Windows Defender\
+    // - C:\Program Files\LocalEDR\
+    if dir_segments.len() == 1 && dir_segments[0].eq_ignore_ascii_case("windows") {
+        return true;
+    }
+    if dir_segments.len() == 2
+        && dir_segments[0].eq_ignore_ascii_case("windows")
+        && (dir_segments[1].eq_ignore_ascii_case("system32")
+            || dir_segments[1].eq_ignore_ascii_case("syswow64"))
+    {
+        return true;
+    }
+    if dir_segments.len() == 2
+        && dir_segments[0].eq_ignore_ascii_case("program files")
+        && (dir_segments[1].eq_ignore_ascii_case("windows defender")
+            || dir_segments[1].eq_ignore_ascii_case("localedr"))
+    {
+        return true;
+    }
+    // C:\Windows\SystemApps\<AppPackage>\*.exe
+    if dir_segments.len() == 3
+        && dir_segments[0].eq_ignore_ascii_case("windows")
+        && dir_segments[1].eq_ignore_ascii_case("systemapps")
+    {
+        return true;
+    }
+    // C:\ProgramData\Microsoft\Windows Defender\Platform\<Version>\*.exe
+    if dir_segments.len() == 5
+        && dir_segments[0].eq_ignore_ascii_case("programdata")
+        && dir_segments[1].eq_ignore_ascii_case("microsoft")
+        && dir_segments[2].eq_ignore_ascii_case("windows defender")
+        && dir_segments[3].eq_ignore_ascii_case("platform")
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Composite unique process identifier preventing PID reuse collisions (`AUTO-01`).
@@ -1143,5 +1271,52 @@ mod tests {
         assert!(is_never_suspend_process(AUTHORIZED_BRIDGE_EXE_PATH));
         assert!(!is_never_suspend_process("ledr-sim.exe"));
         assert!(!is_never_suspend_process(r"C:\Users\test\Downloads\evil.exe"));
+    }
+
+    #[test]
+    fn proto_06_sec_0001_never_suspend_full_path_requires_canonical_directory() {
+        // Canonical OS, Windows Defender, and LocalEDR install paths must be protected.
+        for trusted in [
+            r"C:\Windows\explorer.exe",
+            r"C:\Windows\System32\svchost.exe",
+            r"C:\Windows\SysWOW64\csrss.exe",
+            r"C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe",
+            r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe",
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.24010.12-0\MsMpEng.exe",
+            r"C:\Program Files\Windows Defender\MpDefenderCoreService.exe",
+            r"C:\Program Files\LocalEDR\ledr-daemon.exe",
+            AUTHORIZED_UI_EXE_PATH,
+            AUTHORIZED_BRIDGE_EXE_PATH,
+            r"\Device\HarddiskVolume3\Windows\System32\lsass.exe",
+            r"\\?\C:\Windows\System32\dwm.exe",
+            r"\??\C:\Windows\System32\services.exe",
+            r"\SystemRoot\System32\smss.exe",
+            "C:/Windows/System32/RuntimeBroker.exe",
+        ] {
+            assert!(
+                is_never_suspend_process(trusted),
+                "canonical protected path should return true: {trusted}"
+            );
+        }
+
+        // Spoofed or non-canonical paths with protected filenames must NOT be exempted.
+        for spoofed in [
+            r"C:\Users\alice\Downloads\svchost.exe",
+            r"C:\Temp\StartMenuExperienceHost.exe",
+            r"C:\Windows\Temp\svchost.exe",
+            r"C:\Windows\System32\..\..\Users\alice\svchost.exe",
+            r"C:\Windows\System32\subdir\svchost.exe",
+            r"D:\Windows\System32\svchost.exe",
+            r".\svchost.exe",
+            r"..\lsass.exe",
+            r"C:\Users\alice\target\debug\ledr-ui.exe",
+            r"\Device\HarddiskVolume3\Users\alice\explorer.exe",
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18\nested\MsMpEng.exe",
+        ] {
+            assert!(
+                !is_never_suspend_process(spoofed),
+                "spoofed non-canonical path must return false: {spoofed}"
+            );
+        }
     }
 }

@@ -330,6 +330,18 @@ impl DaemonEngine {
         if live.create_time_100ns == 0 {
             return;
         }
+        // Guard against PID reuse (`BUG_0001`): if the live OS process at `*pid` was created
+        // strictly after the canary event timestamp, it cannot be the original accessor.
+        let live_created_ms = super::filetime_100ns_to_unix_ms(live.create_time_100ns, i64::MAX);
+        if live_created_ms > event_ts_ms {
+            tracing::debug!(
+                pid = *pid,
+                live_created_ms,
+                event_ts_ms,
+                "skipping canary process backfill because live process started after event timestamp (possible PID reuse)"
+            );
+            return;
+        }
 
         // Guard against PID reuse: if we already have a non-zero creation timestamp for this
         // process context, never overwrite it with a different live process that reused the PID.

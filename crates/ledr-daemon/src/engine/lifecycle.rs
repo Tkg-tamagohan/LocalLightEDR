@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use ledr_proto::{ActiveDefenseController, AlertStatus, ProcessIdentity, SensorEvent};
+use ledr_proto::{ActiveDefenseController, ProcessIdentity, SensorEvent};
 use ledr_rules::{EarlyPruner, NrdCache, NrdCancelToken, SigmaEngine, NRD_MAX_ENTRIES};
 use ledr_sensor_win::NoopDefenseController;
 use ledr_store::{LedrStore, PurgeStats, StoreError};
@@ -317,9 +317,16 @@ impl DaemonEngine {
             }
         }
 
+        let mut needs_checkpoint = !worker_checkpointed;
+        if self.config.resume_suspended_on_shutdown
+            && self.resume_unresolved_suspended_processes_on_shutdown(deadline)
+        {
+            needs_checkpoint = true;
+        }
+
         // Prioritize WAL truncation BEFORE waiting on any remaining NRD refresh thread so a slow
-        // or wedged NRD thread can never delay or starve SQLite checkpointing (`AUTO-10`, `R-11`).
-        if !worker_checkpointed {
+        // or wedged NRD thread can never delay or starve SQLite checkpointing (`AUTO-10`, `R-11`, `ANALYSIS_0003`).
+        if needs_checkpoint {
             self.store.checkpoint_truncate()?;
         }
 
@@ -363,10 +370,6 @@ impl DaemonEngine {
             }
         }
 
-        if self.config.resume_suspended_on_shutdown {
-            self.resume_unresolved_suspended_processes_on_shutdown();
-        }
-
         if let Some(err) = drain_err {
             return Err(err);
         }
@@ -374,23 +377,33 @@ impl DaemonEngine {
     }
 
     /// Best-effort resumes all unresolved (`Pending` / `ExpiredSuspended`) parent and child
-    /// processes recorded as suspended in SQLite when `resume_suspended_on_shutdown` is enabled
-    /// (`--foreground` or `--resume-suspended-on-shutdown`).
-    fn resume_unresolved_suspended_processes_on_shutdown(&self) {
-        let mut alerts = self
-            .store
-            .list_alerts(Some(AlertStatus::Pending), 1000)
-            .unwrap_or_default();
-        alerts.extend(
-            self.store
-                .list_alerts(Some(AlertStatus::ExpiredSuspended), 1000)
-                .unwrap_or_default(),
-        );
+    /// processes recorded as suspended in SQLite within the shared shutdown `deadline` when
+    /// `resume_suspended_on_shutdown` is enabled (`--foreground` or `--resume-suspended-on-shutdown`).
+    ///
+    /// Confirmed resumed (or gone/PID-reused) identities are cleared from SQLite's active
+    /// suspension state (`process_suspended` and `context_json.suspended_children`) while
+    /// preserving an audit trail in `context_json.shutdown_resumed_identities` /
+    /// `context_json.shutdown_resumed_at_ms` (`BUG_0002`, `BUG_0003`, `ANALYSIS_0003`).
+    /// Returns `true` if any SQLite alert row was updated and requires WAL checkpointing.
+    fn resume_unresolved_suspended_processes_on_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let alerts = match self.store.list_unresolved_suspended_alerts() {
+            Ok(alerts) => alerts,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to query unresolved suspended alerts during shutdown"
+                );
+                return false;
+            }
+        };
 
         let mut seen: HashSet<ProcessIdentity> = HashSet::new();
         let mut to_resume: Vec<ProcessIdentity> = Vec::new();
 
-        for alert in alerts {
+        for alert in &alerts {
             let parent_ident = alert
                 .process_instance_id
                 .as_deref()
@@ -418,22 +431,166 @@ impl DaemonEngine {
         }
 
         if to_resume.is_empty() {
-            return;
+            return false;
         }
 
         let mut resumed = 0usize;
+        let mut gone_or_replaced = 0usize;
         let mut failed = 0usize;
-        for ident in &to_resume {
+        let mut skipped_budget = 0usize;
+        let mut cleared_identities: HashSet<ProcessIdentity> = HashSet::new();
+
+        for (idx, ident) in to_resume.iter().enumerate() {
+            if tokio::time::Instant::now() >= deadline {
+                skipped_budget = to_resume.len().saturating_sub(idx);
+                tracing::warn!(
+                    attempted = idx,
+                    skipped_budget,
+                    total = to_resume.len(),
+                    "shutdown budget exhausted while resuming unresolved suspended processes"
+                );
+                break;
+            }
             match self.defense.resume_process(ident) {
-                Ok(()) => resumed += 1,
+                Ok(()) => {
+                    resumed += 1;
+                    cleared_identities.insert(*ident);
+                }
                 Err(err) => {
-                    failed += 1;
-                    tracing::warn!(
-                        pid = ident.pid,
-                        create_time_100ns = ident.create_time_100ns,
-                        error = %err,
-                        "best-effort resume_process failed during shutdown"
-                    );
+                    if !super::alerts::is_protected_process_refusal(&err)
+                        && super::alerts::is_process_gone_or_replaced(&err, ident.pid)
+                    {
+                        gone_or_replaced += 1;
+                        cleared_identities.insert(*ident);
+                        tracing::info!(
+                            pid = ident.pid,
+                            create_time_100ns = ident.create_time_100ns,
+                            error = %err,
+                            "suspended process already exited or PID reused during shutdown resume; clearing suspension state"
+                        );
+                    } else {
+                        failed += 1;
+                        tracing::warn!(
+                            pid = ident.pid,
+                            create_time_100ns = ident.create_time_100ns,
+                            error = %err,
+                            "best-effort resume_process failed during shutdown; keeping suspension state"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut updated_alerts = 0usize;
+        if !cleared_identities.is_empty() {
+            let resumed_at_ms = current_unix_ms();
+            for alert in &alerts {
+                let parent_ident = alert
+                    .process_instance_id
+                    .as_deref()
+                    .and_then(ProcessIdentity::from_instance_id)
+                    .filter(|id| id.create_time_100ns != 0);
+                let parent_cleared = alert.process_suspended
+                    && parent_ident.is_some_and(|id| cleared_identities.contains(&id));
+                let new_process_suspended = if parent_cleared {
+                    false
+                } else {
+                    alert.process_suspended
+                };
+
+                let mut newly_cleared_ids: Vec<String> = Vec::new();
+                if parent_cleared {
+                    if let Some(id) = parent_ident {
+                        newly_cleared_ids.push(id.instance_id());
+                    }
+                }
+
+                let mut children_changed = false;
+                let updated_context_json = match serde_json::from_str::<serde_json::Value>(
+                    &alert.context_json,
+                ) {
+                    Ok(mut ctx_val) => {
+                        if let Some(obj) = ctx_val.as_object_mut() {
+                            if let Some(arr) =
+                                obj.get("suspended_children").and_then(|v| v.as_array())
+                            {
+                                let mut remaining = Vec::with_capacity(arr.len());
+                                for item in arr {
+                                    let cleared_child = item
+                                        .as_str()
+                                        .and_then(ProcessIdentity::from_instance_id)
+                                        .filter(|id| id.create_time_100ns != 0)
+                                        .filter(|id| cleared_identities.contains(id));
+                                    if let Some(child_id) = cleared_child {
+                                        children_changed = true;
+                                        let id_str = child_id.instance_id();
+                                        if !newly_cleared_ids.contains(&id_str) {
+                                            newly_cleared_ids.push(id_str);
+                                        }
+                                    } else {
+                                        remaining.push(item.clone());
+                                    }
+                                }
+                                if children_changed {
+                                    obj.insert(
+                                        "suspended_children".to_string(),
+                                        serde_json::Value::Array(remaining),
+                                    );
+                                }
+                            }
+                            if parent_cleared || children_changed {
+                                let existing_audit = obj
+                                    .entry("shutdown_resumed_identities".to_string())
+                                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                                if let Some(audit_arr) = existing_audit.as_array_mut() {
+                                    for id_str in &newly_cleared_ids {
+                                        let exists = audit_arr
+                                            .iter()
+                                            .any(|v| v.as_str() == Some(id_str.as_str()));
+                                        if !exists {
+                                            audit_arr.push(serde_json::Value::String(
+                                                id_str.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                obj.insert(
+                                    "shutdown_resumed_at_ms".to_string(),
+                                    serde_json::Value::from(resumed_at_ms),
+                                );
+                            }
+                        }
+                        if parent_cleared || children_changed {
+                            Some(ctx_val.to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => {
+                        if parent_cleared {
+                            Some(alert.context_json.clone())
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                if let Some(new_ctx_json) = updated_context_json {
+                    match self.store.update_alert_suspension_state(
+                        &alert.alert_id,
+                        new_process_suspended,
+                        &new_ctx_json,
+                    ) {
+                        Ok(true) => updated_alerts += 1,
+                        Ok(false) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                alert_id = %alert.alert_id,
+                                error = %err,
+                                "failed to update alert suspension state after shutdown resume"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -441,8 +598,12 @@ impl DaemonEngine {
         tracing::info!(
             total = to_resume.len(),
             resumed,
+            gone_or_replaced,
             failed,
+            skipped_budget,
+            updated_alerts,
             "completed best-effort resume of unresolved suspended processes on shutdown"
         );
+        updated_alerts > 0
     }
 }

@@ -54,34 +54,6 @@ impl DaemonEngine {
             self.outbound_classifier.set_has_domain_rules(false);
             return WfpReconcileReport::default();
         }
-        if self.config.outbound_enforcement_mode == super::OutboundEnforcementMode::Audit {
-            match self.store.list_network_rules() {
-                Ok(rules) => {
-                    let has_domain_rules = rules.iter().any(|rule| {
-                        matches!(rule.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow)
-                            && !rule.exe_path_pattern.trim().is_empty()
-                            && rule
-                                .allowed_target
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .is_some_and(|target| {
-                                    crate::firewall::parse_literal_target_ip(target).is_none()
-                                        && ledr_rules::parse_cidr_target(target).is_err()
-                                })
-                    });
-                    self.outbound_classifier
-                        .set_has_domain_rules(has_domain_rules);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "failed to load persisted network rules in audit mode; preserving previous has_domain_rules state"
-                    );
-                }
-            }
-            return WfpReconcileReport::default();
-        }
         let rules = match self.store.list_network_rules() {
             Ok(rules) => rules,
             Err(err) => {

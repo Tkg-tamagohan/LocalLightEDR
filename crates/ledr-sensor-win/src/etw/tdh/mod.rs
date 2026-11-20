@@ -4,9 +4,7 @@ mod decode;
 mod process;
 
 pub(crate) use decode::{decode_tdh_string, inspect_raw_utf16_bytes, parse_dns_query_results};
-pub(crate) use process::{
-    ProcessInspectInfo, filetime_100ns_to_unix_ms, filetime_to_u64, inspect_process_by_pid,
-};
+pub(crate) use process::{filetime_100ns_to_unix_ms, filetime_to_u64, inspect_process_by_pid};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -60,11 +58,6 @@ impl<'a> TdhEventInfo<'a> {
 
     /// Queries TDH metadata for `record`. Returns `None` if schema decoding is unavailable.
     pub(crate) fn from_record(record: &'a EVENT_RECORD) -> Option<Self> {
-        Self::from_record_with_status(record).ok()
-    }
-
-    /// Queries TDH metadata for `record`, returning the Win32 TDH error code on failure.
-    pub(crate) fn from_record_with_status(record: &'a EVENT_RECORD) -> Result<Self, u32> {
         let mut stack = [0u64; 256];
         let mut buf_size: u32 = (stack.len() * 8) as u32;
         // SAFETY: `record` is valid for the callback duration and `stack` is 8-byte aligned.
@@ -80,9 +73,9 @@ impl<'a> TdhEventInfo<'a> {
             if buf_size < std::mem::size_of::<TRACE_EVENT_INFO>() as u32
                 || (buf_size as usize) > stack.len() * 8
             {
-                return Err(ERROR_INSUFFICIENT_BUFFER.0);
+                return None;
             }
-            return Ok(Self {
+            return Some(Self {
                 record,
                 stack,
                 stack_byte_len: buf_size as usize,
@@ -90,10 +83,10 @@ impl<'a> TdhEventInfo<'a> {
             });
         }
         if status != ERROR_INSUFFICIENT_BUFFER.0 {
-            return Err(status);
+            return None;
         }
         if buf_size < std::mem::size_of::<TRACE_EVENT_INFO>() as u32 || buf_size > MAX_TEI_BYTES {
-            return Err(status);
+            return None;
         }
 
         let mut buf = vec![0u64; (buf_size as usize).div_ceil(8)];
@@ -107,10 +100,10 @@ impl<'a> TdhEventInfo<'a> {
             )
         };
         if status != 0 {
-            return Err(status);
+            return None;
         }
 
-        Ok(Self {
+        Some(Self {
             record,
             stack: [0u64; 256],
             stack_byte_len: 0,

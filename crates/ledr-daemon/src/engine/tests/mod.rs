@@ -8,7 +8,6 @@ use super::{
 
 mod cached_permit;
 mod dns_history;
-mod e2e_blockers;
 mod helpers;
 mod overflow_and_lifecycle;
 mod shared_ip_policy;

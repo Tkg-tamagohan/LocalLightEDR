@@ -52,8 +52,6 @@ impl DaemonEngine {
         let proc_ctx = self.resolve_process_context(event, event_ts_ms);
 
         if matches!(event, SensorEvent::CanaryFileAccess { .. }) {
-            let mut proc_ctx = proc_ctx;
-            self.backfill_canary_process_context_if_missing(event, &mut proc_ctx, event_ts_ms);
             self.handle_canary_file_access(event, &proc_ctx, event_ts_ms);
             self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -300,161 +298,6 @@ impl DaemonEngine {
         } else {
             self.store.record_alert(alert)
         }
-    }
-
-    /// On-demand PID lookup fallback for ETW cross-provider ordering races (`Kernel-File`
-    /// delivering a canary access milliseconds before `Kernel-Process` delivers `ProcessStart`).
-    fn backfill_canary_process_context_if_missing(
-        &self,
-        event: &SensorEvent,
-        proc_ctx: &mut ResolvedProcessContext,
-        event_ts_ms: i64,
-    ) {
-        let SensorEvent::CanaryFileAccess { pid, .. } = event else {
-            return;
-        };
-        let needs_create_time = proc_ctx
-            .proc_identity
-            .is_none_or(|id| id.create_time_100ns == 0);
-        let needs_exe_path = proc_ctx
-            .proc_exe_path
-            .as_deref()
-            .is_none_or(|p| p.trim().is_empty());
-        if !needs_create_time && !needs_exe_path {
-            return;
-        }
-
-        let Some(live) = ledr_sensor_win::etw::inspect_live_process(*pid) else {
-            return;
-        };
-        if live.create_time_100ns == 0 {
-            return;
-        }
-        // Guard against PID reuse (`BUG_0001`): if the live OS process at `*pid` was created
-        // strictly after the canary event timestamp, it cannot be the original accessor.
-        let live_created_ms = super::filetime_100ns_to_unix_ms(live.create_time_100ns, i64::MAX);
-        if live_created_ms > event_ts_ms {
-            tracing::debug!(
-                pid = *pid,
-                live_created_ms,
-                event_ts_ms,
-                "skipping canary process backfill because live process started after event timestamp (possible PID reuse)"
-            );
-            return;
-        }
-
-        // Guard against PID reuse: if we already have a non-zero creation timestamp for this
-        // process context, never overwrite it with a different live process that reused the PID.
-        if let Some(existing_id) = proc_ctx.proc_identity {
-            if existing_id.create_time_100ns != 0
-                && existing_id.create_time_100ns != live.create_time_100ns
-            {
-                return;
-            }
-        }
-
-        // If the table already had a non-empty exe_path (e.g., synthetic PID with zero timestamp),
-        // only backfill when the live OS process matches that executable path.
-        if let (Some(existing_exe), Some(live_exe)) = (
-            proc_ctx
-                .proc_exe_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-            live.exe_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        ) {
-            if !existing_exe.eq_ignore_ascii_case(live_exe) {
-                return;
-            }
-        }
-
-        let exe_path = proc_ctx
-            .proc_exe_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                live.exe_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-        let command_line = proc_ctx
-            .proc_command_line
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                live.command_line
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-
-        let ident = ProcessIdentity::new(*pid, live.create_time_100ns);
-        let res = {
-            let mut table = self
-                .process_table
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            table.on_process_start(
-                ident,
-                0,
-                exe_path.clone(),
-                command_line.clone(),
-                None,
-                event_ts_ms,
-            )
-        };
-
-        let synthetic_start = SensorEvent::ProcessStart {
-            identity: ident,
-            parent_pid: 0,
-            exe_path: exe_path.clone(),
-            command_line: command_line.clone(),
-            user_sid: None,
-        };
-        if let Err(err) = self.store.ingest_event_with_exit(
-            &synthetic_start,
-            res.parent_instance_id.as_deref(),
-            res.exited_at_ms,
-            false,
-            "OBSERVED",
-        ) {
-            tracing::warn!(
-                pid = *pid,
-                error = %err,
-                "failed to persist on-demand backfilled ProcessStart into SQLite store"
-            );
-        }
-
-        proc_ctx.proc_identity = Some(ident);
-        proc_ctx.proc_instance_id = Some(res.instance_id.clone());
-        proc_ctx.proc_exe_path = (!exe_path.is_empty()).then_some(exe_path.clone());
-        proc_ctx.proc_command_line = (!command_line.is_empty()).then_some(command_line);
-        proc_ctx.store_hint = Some(res.instance_id);
-        if proc_ctx.parent_exe_path.is_none() {
-            proc_ctx.parent_exe_path = res.parent_exe_path;
-        }
-        if proc_ctx.parent_command_line.is_none() {
-            proc_ctx.parent_command_line = res.parent_command_line;
-        }
-
-        tracing::debug!(
-            pid = *pid,
-            create_time_100ns = live.create_time_100ns,
-            exe_path = %exe_path,
-            "backfilled missing process context on canary file access via on-demand PID lookup"
-        );
     }
 
     fn handle_canary_file_access(
@@ -752,7 +595,7 @@ impl DaemonEngine {
         table.clear_rule_alert_emitted(instance_id, rule_id)
     }
 
-    pub(super) fn resolve_process_context(
+    fn resolve_process_context(
         &self,
         event: &SensorEvent,
         event_ts_ms: i64,

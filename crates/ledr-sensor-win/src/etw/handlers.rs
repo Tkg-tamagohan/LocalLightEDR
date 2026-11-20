@@ -1,6 +1,6 @@
 //! ETW raw FFI callbacks and per-provider event handlers.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use ledr_proto::{CanaryCategory, ProcessIdentity, ScriptSource, SensorEvent};
 use windows::core::GUID;
@@ -11,21 +11,6 @@ use super::registry::handle_kernel_registry;
 use super::tdh::{
     TdhEventInfo, filetime_100ns_to_unix_ms, inspect_process_by_pid, parse_dns_query_results,
 };
-
-static KERNEL_PROCESS_RECEIVED: AtomicU64 = AtomicU64::new(0);
-static KERNEL_PROCESS_TDH_FAILURES: AtomicU64 = AtomicU64::new(0);
-static KERNEL_PROCESS_START_EMITTED: AtomicU64 = AtomicU64::new(0);
-static KERNEL_PROCESS_STOP_EMITTED: AtomicU64 = AtomicU64::new(0);
-
-#[inline]
-fn read_raw_userdata_u32_at_0(record: &EVENT_RECORD) -> Option<u32> {
-    if record.UserData.is_null() || record.UserDataLength < 4 {
-        return None;
-    }
-    // SAFETY: `record.UserData` is non-null and has at least 4 readable bytes per `UserDataLength`.
-    let bytes = unsafe { std::slice::from_raw_parts(record.UserData.cast::<u8>(), 4) };
-    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
 
 pub(super) const WINEVENT_KEYWORD_PROCESS: u64 = 0x10;
 pub(super) const KERNEL_FILE_KEYWORDS: u64 = 0x0010 | 0x0020 | 0x0080 | 0x0200 | 0x0400 | 0x0800 | 0x1000;
@@ -87,17 +72,6 @@ pub(super) unsafe extern "system" fn event_record_callback(event_record: *mut EV
     let event_id = record.EventHeader.EventDescriptor.Id;
 
     let emitted = if provider == KERNEL_PROCESS_GUID {
-        let received = KERNEL_PROCESS_RECEIVED.fetch_add(1, Ordering::Relaxed) + 1;
-        if received.is_power_of_two() {
-            tracing::debug!(
-                received,
-                event_id,
-                version = record.EventHeader.EventDescriptor.Version,
-                header_pid = record.EventHeader.ProcessId,
-                user_data_len = record.UserDataLength,
-                "received Microsoft-Windows-Kernel-Process ETW event"
-            );
-        }
         match event_id {
             1 => handle_process_start(record, ctx),
             2 => handle_process_stop(record, ctx),
@@ -132,67 +106,20 @@ pub(super) unsafe extern "system" fn event_record_callback(event_record: *mut EV
 }
 
 fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Option<SensorEvent> {
-    let (pid, parent_pid, mut create_time_100ns, mut exe_path, mut command_line, user_sid) =
-        match TdhEventInfo::from_record_with_status(record) {
-            Ok(info) => {
-                let Some(pid) = info
-                    .get_u32("ProcessID")
-                    .or_else(|| info.get_u32("ProcessId"))
-                    .or_else(|| read_raw_userdata_u32_at_0(record).filter(|&p| p != 0))
-                else {
-                    tracing::debug!(
-                        version = record.EventHeader.EventDescriptor.Version,
-                        user_data_len = record.UserDataLength,
-                        "Kernel-Process ProcessStart missing ProcessID property"
-                    );
-                    return None;
-                };
-                let parent_pid = info
-                    .get_u32("ParentProcessID")
-                    .or_else(|| info.get_u32("ParentProcessId"))
-                    .unwrap_or(record.EventHeader.ProcessId);
-                let create_time_100ns = info.get_u64("CreateTime").unwrap_or(0);
-                let exe_path = info
-                    .get_string("ImageName")
-                    .or_else(|| info.get_string("ImageFileName"))
-                    .map(|raw| ctx.volume_map.normalize_path(&raw))
-                    .unwrap_or_default();
-                let command_line = info.get_string("CommandLine").unwrap_or_default();
-                let user_sid = info.get_sid_string("UserSID");
-                (
-                    pid,
-                    parent_pid,
-                    create_time_100ns,
-                    exe_path,
-                    command_line,
-                    user_sid,
-                )
-            }
-            Err(tdh_status) => {
-                let fail_count = KERNEL_PROCESS_TDH_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                if fail_count.is_power_of_two() {
-                    tracing::warn!(
-                        tdh_status,
-                        fail_count,
-                        event_id = record.EventHeader.EventDescriptor.Id,
-                        version = record.EventHeader.EventDescriptor.Version,
-                        user_data_len = record.UserDataLength,
-                        "TdhGetEventInformation failed for Kernel-Process ProcessStart; using raw UserData + Win32 fallback"
-                    );
-                }
-                let pid = read_raw_userdata_u32_at_0(record).filter(|&p| p != 0)?;
-                (
-                    pid,
-                    record.EventHeader.ProcessId,
-                    0,
-                    String::new(),
-                    String::new(),
-                    None,
-                )
-            }
-        };
-
+    let info = TdhEventInfo::from_record(record)?;
+    let pid = info.get_u32("ProcessID")?;
     ctx.evict_dns_pid(pid);
+    let parent_pid = info
+        .get_u32("ParentProcessID")
+        .unwrap_or(record.EventHeader.ProcessId);
+
+    let mut create_time_100ns = info.get_u64("CreateTime").unwrap_or(0);
+    let mut exe_path = info
+        .get_string("ImageName")
+        .map(|raw| ctx.volume_map.normalize_path(&raw))
+        .unwrap_or_default();
+    let mut command_line = info.get_string("CommandLine").unwrap_or_default();
+    let user_sid = info.get_sid_string("UserSID");
 
     let needs_inspect = create_time_100ns == 0 || exe_path.is_empty() || command_line.is_empty();
     let inspected = if needs_inspect {
@@ -216,18 +143,6 @@ fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Opti
         create_time_100ns = record.EventHeader.TimeStamp as u64;
     }
 
-    let emitted = KERNEL_PROCESS_START_EMITTED.fetch_add(1, Ordering::Relaxed) + 1;
-    if emitted.is_power_of_two() {
-        tracing::debug!(
-            emitted,
-            pid,
-            parent_pid,
-            create_time_100ns,
-            exe_path = %exe_path,
-            "emitted ProcessStart from Kernel-Process ETW"
-        );
-    }
-
     Some(SensorEvent::ProcessStart {
         identity: ProcessIdentity::new(pid, create_time_100ns),
         parent_pid,
@@ -238,51 +153,16 @@ fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Opti
 }
 
 fn handle_process_stop(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Option<SensorEvent> {
-    let (pid, exit_time_100ns, exit_code) = match TdhEventInfo::from_record_with_status(record) {
-        Ok(info) => {
-            let pid = info
-                .get_u32("ProcessID")
-                .or_else(|| info.get_u32("ProcessId"))
-                .or_else(|| read_raw_userdata_u32_at_0(record).filter(|&p| p != 0))
-                .unwrap_or(record.EventHeader.ProcessId);
-            let exit_time_100ns = info
-                .get_u64("ExitTime")
-                .filter(|&t| t > 0)
-                .unwrap_or_else(|| record.EventHeader.TimeStamp.max(0) as u64);
-            let exit_code = info.get_u32("ExitCode").unwrap_or(0);
-            (pid, exit_time_100ns, exit_code)
-        }
-        Err(tdh_status) => {
-            let fail_count = KERNEL_PROCESS_TDH_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-            if fail_count.is_power_of_two() {
-                tracing::warn!(
-                    tdh_status,
-                    fail_count,
-                    event_id = record.EventHeader.EventDescriptor.Id,
-                    version = record.EventHeader.EventDescriptor.Version,
-                    user_data_len = record.UserDataLength,
-                    "TdhGetEventInformation failed for Kernel-Process ProcessStop; using raw UserData fallback"
-                );
-            }
-            let pid = read_raw_userdata_u32_at_0(record)
-                .filter(|&p| p != 0)
-                .unwrap_or(record.EventHeader.ProcessId);
-            let exit_time_100ns = record.EventHeader.TimeStamp.max(0) as u64;
-            (pid, exit_time_100ns, 0)
-        }
-    };
+    let info = TdhEventInfo::from_record(record)?;
+    let pid = info
+        .get_u32("ProcessID")
+        .unwrap_or(record.EventHeader.ProcessId);
     ctx.evict_dns_pid(pid);
-
-    let emitted = KERNEL_PROCESS_STOP_EMITTED.fetch_add(1, Ordering::Relaxed) + 1;
-    if emitted.is_power_of_two() {
-        tracing::debug!(
-            emitted,
-            pid,
-            exit_time_100ns,
-            exit_code,
-            "emitted ProcessStop from Kernel-Process ETW"
-        );
-    }
+    let exit_time_100ns = info
+        .get_u64("ExitTime")
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| record.EventHeader.TimeStamp.max(0) as u64);
+    let exit_code = info.get_u32("ExitCode").unwrap_or(0);
 
     Some(SensorEvent::ProcessStop {
         pid,

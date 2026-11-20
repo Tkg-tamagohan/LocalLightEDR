@@ -13,32 +13,6 @@ const DEFAULT_IPC_FRAME_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_IPC_SESSION_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_WFP_DROP_DNS_GRACE_MS: u64 = 300;
 
-/// Controls how aggressively Phase 3 outbound firewall rules enforce containment (`L-03`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutboundEnforcementMode {
-    /// Full `L-03` enforcement: pre-restrict high-risk/script interpreters, enforce explicit
-    /// `NetworkBlock` rules, and dynamically WFP-block + suspend `GeneralUnknown` first connects.
-    #[default]
-    Enforce,
-    /// Enforce pre-emptive restrictions (`ScriptInterpreter`, `HighRiskPath`) and explicit
-    /// `NetworkBlock` rules only; record `GeneralUnknown` outbound connects as non-suspended
-    /// observation alerts without WFP blocking or suspension.
-    PreemptiveOnly,
-    /// Audit-only mode: never install WFP block filters or suspend processes on outbound
-    /// connections; record policy decisions as observation alerts only.
-    Audit,
-}
-
-impl OutboundEnforcementMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Enforce => "enforce",
-            Self::PreemptiveOnly => "preemptive-only",
-            Self::Audit => "audit",
-        }
-    }
-}
-
 /// Configuration options for [`super::DaemonEngine`] and the Named Pipe IPC server.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -79,15 +53,6 @@ pub struct DaemonConfig {
     /// Enables Phase 3 outbound firewall (pre-emptive WFP restriction + unknown first-connect
     /// suspend & dynamic block coupling, `L-03`). Defaults to `true`.
     pub outbound_firewall_enabled: bool,
-    /// Controls whether outbound firewall containment enforces all unknown connections
-    /// (`Enforce`), only pre-emptive / explicit block targets (`PreemptiveOnly`), or
-    /// records audit alerts without blocking/suspending (`Audit`). Defaults to `Enforce`.
-    pub outbound_enforcement_mode: OutboundEnforcementMode,
-    /// When `true` (`--foreground` or `--resume-suspended-on-shutdown`), `shutdown_and_flush`
-    /// issues best-effort `resume_process` calls for unresolved suspended parent/child
-    /// processes so interactive hosts are not left frozen after daemon shutdown.
-    /// Production Windows Service mode leaves this `false` to preserve `L-07` containment.
-    pub resume_suspended_on_shutdown: bool,
     /// Concrete executable paths (e.g., standard script interpreters discovered at daemon startup)
     /// that receive startup-pinned `Preemptive` WFP blocks before any `ProcessStart` event and
     /// remain protected across `ProcessStop` (`L-03`). Defaults to empty in `DaemonConfig::default()`
@@ -138,8 +103,6 @@ impl Default for DaemonConfig {
             authorized_bridge_signer: None,
             authorized_bridge_root_thumbprint: None,
             outbound_firewall_enabled: true,
-            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
-            resume_suspended_on_shutdown: false,
             preemptive_startup_executables: Vec::new(),
             nrd_refresh_enabled: false,
             nrd_refresh_interval_ms: NRD_REFRESH_INTERVAL_MS,

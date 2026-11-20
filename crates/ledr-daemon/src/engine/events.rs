@@ -14,6 +14,8 @@ use ledr_store::StoreError;
 use uuid::Uuid;
 
 use crate::firewall::{WfpFilterOrigin, WfpRuleManager};
+#[cfg(doc)]
+use crate::process_table::ProcessStartResolution;
 
 use super::{current_unix_ms, event_timestamp_ms, DaemonEngine};
 

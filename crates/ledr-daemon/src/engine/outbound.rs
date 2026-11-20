@@ -11,6 +11,8 @@ use ledr_rules::{
 };
 use uuid::Uuid;
 
+#[cfg(doc)]
+use crate::firewall::WfpFilterOrigin;
 use crate::firewall::{parse_literal_target_ip, WfpRuleManager};
 
 use super::domain_policy::{

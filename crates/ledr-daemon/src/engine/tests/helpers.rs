@@ -5,15 +5,17 @@ use std::sync::Arc;
 
 use ledr_proto::{
     ActiveDefenseController, AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord,
-    EventLane, ProcessIdentity, RuleScope, SensorEvent,
+    ProcessIdentity, RuleScope, SensorEvent,
 };
 use ledr_rules::{BinaryIdentity, EarlyPruner, SigmaEngine};
 use ledr_store::LedrStore;
 
+use crate::engine::events::DnsCorrelationUpdate;
 use crate::firewall::{WfpFilterOrigin, WfpRuleManager};
 
-use super::super::DnsCorrelationUpdate;
-use super::{BinaryInspector, DaemonConfig, DaemonEngine, NotificationDispatcher, QueuedWfpDrop};
+use super::{
+    BinaryInspector, DaemonConfig, DaemonEngine, EventLane, NotificationDispatcher, QueuedWfpDrop,
+};
 
 pub(super) struct TestDefense {
     next_handle: AtomicU64,
@@ -242,6 +244,7 @@ pub(super) fn make_queued_drop(
     }
 }
 
+#[track_caller]
 pub(super) fn assert_domain_policy_hints(
     engine: &DaemonEngine,
     exe_path: &str,

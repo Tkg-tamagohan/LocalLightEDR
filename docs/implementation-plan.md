@@ -294,7 +294,7 @@ pub trait ActiveDefenseController: Send + Sync {
 
 ### Layer 1 カーネルセンサーと疑似攻撃シミュレータ
 
-Worker 1 が担当する `crates/ledr-sensor-win` は、`privileges.rs`、`path_norm.rs`、`dns_cache.rs`、`etw/`（`process.rs`、`network_dns.rs`、`file_canary.rs`、`amsi_reg.rs`）、`defense/`（`actuator.rs`、`canary_files.rs`）、および `wfp/engine.rs` で構成する。
+Worker 1 が担当する `crates/ledr-sensor-win` は、`privileges.rs`、`path_norm.rs`、`dns_cache.rs`、`etw/`（`context.rs`、`handlers.rs`、`registry.rs`、`session.rs`、`snapshot.rs`、`file_canary/`、`tdh/`）、`defense/`（`controller.rs`、`guard.rs`、`honeypot.rs`、`process_probe.rs`、`tree.rs`）、および `wfp/`（`backend.rs`、`engine.rs`、`net_events.rs`、`spec.rs`）で構成する。
 初期化時に `SeSystemProfilePrivilege`、`SeDebugPrivilege`、`SeSecurityPrivilege` を有効化し、`CreateToolhelp32Snapshot` で起動中プロセスの初期テーブルを構築する（`AUTO-03`、`AUTO-13`）。
 
 ETW `Microsoft-Windows-Kernel-File` は非同期の事後テレメトリであるため、単独でファイル Open を同期阻止することは Windows の仕様上できない（`決定記録 L-02`）。
@@ -363,6 +363,7 @@ PRAGMA temp_store = MEMORY;
 PRAGMA mmap_size = 0;
 PRAGMA wal_autocheckpoint = 1000;
 PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
 ```
 
 データベースには次の 7 テーブルとインデックスを作成する（`AUTO-01`、`AUTO-09`、`AUTO-12`、`決定記録 L-04`、`決定記録 L-06`）。
@@ -383,9 +384,10 @@ CREATE TABLE IF NOT EXISTS processes (
     created_at_ms       INTEGER NOT NULL,
     exited_at_ms        INTEGER
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_processes_created ON processes(created_at_ms);
-CREATE INDEX IF NOT EXISTS idx_processes_parent  ON processes(parent_instance_id);
-CREATE INDEX IF NOT EXISTS idx_processes_sha256  ON processes(sha256);
+CREATE INDEX IF NOT EXISTS idx_processes_created     ON processes(created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_processes_parent      ON processes(parent_instance_id);
+CREATE INDEX IF NOT EXISTS idx_processes_pid_created ON processes(pid, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_processes_sha256      ON processes(sha256);
 
 CREATE TABLE IF NOT EXISTS dns_queries (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -396,8 +398,9 @@ CREATE TABLE IF NOT EXISTS dns_queries (
     resolved_ips        TEXT,
     is_nrd              INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_dns_ts_proc ON dns_queries(timestamp_ms, process_instance_id);
-CREATE INDEX IF NOT EXISTS idx_dns_name    ON dns_queries(query_name);
+CREATE INDEX IF NOT EXISTS idx_dns_ts_proc     ON dns_queries(timestamp_ms, process_instance_id);
+CREATE INDEX IF NOT EXISTS idx_dns_name        ON dns_queries(query_name);
+CREATE INDEX IF NOT EXISTS idx_dns_name_nocase ON dns_queries(query_name COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS network_events (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -435,7 +438,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     context_json        TEXT NOT NULL,
     resolved_at_ms      INTEGER
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_alerts_status_ts ON alerts(status, timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_status_ts   ON alerts(status, timestamp_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_proc_status ON alerts(process_instance_id, status);
 
 CREATE TABLE IF NOT EXISTS allowlist_rules (
     rule_id             TEXT PRIMARY KEY,
@@ -448,6 +452,7 @@ CREATE TABLE IF NOT EXISTS allowlist_rules (
     created_at_ms       INTEGER NOT NULL,
     created_by          TEXT NOT NULL
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_rules_scope_created ON allowlist_rules(scope, created_at_ms DESC, rule_id ASC);
 
 CREATE TABLE IF NOT EXISTS download_origins (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -551,14 +556,14 @@ Phase 3 の実装項目 4 件は合成自動テストに合格して `main` へ�
 
 ```powershell
 # 静的検査とワークスペース全単体テスト（Phase 0〜4 共通）
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 
 # Layer 2 と Layer 3 バースト負荷テスト（毎秒 10,000 イベント投入時にメモリ 20 MB 以下、高優先度ドロップ 0 件を検証）
-cargo test -p ledr-daemon --test burst_budget -- --nocapture
+cargo test -p ledr-daemon --test burst_budget --locked -- --nocapture
 
 # SQLite TTL パージ（長期稼働親プロセスの孤児化防止検証）
-cargo test -p ledr-store --test ttl_purge_lineage
+cargo test -p ledr-store --test ttl_purge_lineage --locked
 ```
 
 ### 実機検証
@@ -569,7 +574,8 @@ cargo test -p ledr-store --test ttl_purge_lineage
 
 ## 引き継ぎと次セッションへの移行手順
 
-開発フェーズが要件定義と設計から実装へ移行するため、次段階の作業は新しいセッションで開始する。
+Phase 0 から Phase 3 までの実装および合成自動テストは `main` ブランチへマージ済みであり、残作業は Phase 4 の実装と Phase 2 および Phase 3 の実機 E2E 検証に分かれる。
+後続の作業はいずれも新しいセッションで開始する。
 
 ### 現在地の確認方法
 
@@ -587,8 +593,16 @@ ETW、WFP、Named Pipe DACL、`NtSuspendProcess`、`CreateProcessAsUser`、お�
 
 ### 次セッション再開プロンプト案
 
-次セッションの開始時は以下の再開プロンプト案を使用する。
+次セッションの開始時は着手対象に応じて以下の再開プロンプト案を使用する。
+
+#### Phase 4（`phase-4-chrome-mv3`）着手用
 
 ```text
-docs/implementation-plan.md と docs/decision-records.md（L-01〜L-16）に基づき、main の最新コミットから作業ブランチ phase-0-scaffold を切って Phase 0（Cargo Workspace と crates/ledr-proto の凍結および全クレートスケルトン配置）を実装し、cargo check --workspace まで検証してください。Phase 0 完了後に Phase 1 を /swarm で並列実装します。
+docs/implementation-plan.md、docs/decision-records.md（L-01〜L-16）、および AGENTS.md に基づき、main の最新コミットから作業ブランチ phase-4-chrome-mv3 を作成して Phase 4（crates/ledr-bridge-nm、extensions/ledr-chrome-mv3、:Zone.Identifier と 3 段階 MOTW 紐付け、apps/ledr-ui の View 1〜3 統合）を実装し、標準検証コマンド一式まで通してください。
+```
+
+#### Phase 2〜3 実機 E2E 検証（`FU-E2E-01`）用
+
+```text
+docs/follow-up-notes.md の FU-E2E-01、docs/implementation-plan.md、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU の管理者昇格環境で Phase 2 および Phase 3 の実機 E2E 検証を実施し、検証結果と必要に応じた調整を独立した PR としてまとめてください。
 ```

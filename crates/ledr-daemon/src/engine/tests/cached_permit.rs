@@ -13,48 +13,18 @@ use std::net::{IpAddr, Ipv4Addr};
 ///    authorizing hint via `partition_permit_hints` + `ensure_ip_permit_for_domain_hints_prioritized`.
 #[test]
 fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
-    use super::{current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, QueuedWfpDrop};
+    use super::helpers::{
+        make_net_rule, make_pending_net_alert, make_queued_drop, send_connect, send_dns,
+        send_process_start, StubNotifier, TestDefense,
+    };
+    use super::{current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine};
     use crate::firewall::{WfpRuleManager, MAX_DOMAIN_HINTS_PER_FILTER};
-    use ledr_proto::{AllowlistRuleRecord, EventLane, ProcessIdentity, RuleScope, SensorEvent};
+    use ledr_proto::{ProcessIdentity, RuleScope};
     use ledr_rules::{BinaryIdentity, EarlyPruner, SigmaEngine};
     use ledr_store::LedrStore;
     use std::collections::{HashMap, VecDeque};
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock};
 
-    struct CountingDefense {
-        next_handle: AtomicU64,
-        suspends: AtomicUsize,
-    }
-    impl ledr_proto::ActiveDefenseController for CountingDefense {
-        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
-            self.suspends.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
-            Ok(())
-        }
-        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
-            Ok(())
-        }
-        fn add_wfp_app_rule(
-            &self,
-            _: &std::path::Path,
-            _: Option<IpAddr>,
-            _: bool,
-        ) -> Result<u64, String> {
-            Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
-        }
-        fn remove_wfp_rule(&self, _: u64) -> Result<(), String> {
-            Ok(())
-        }
-    }
-    struct StubNotifier;
-    impl super::NotificationDispatcher for StubNotifier {
-        fn notify_alert(&self, _: &ledr_proto::AlertRecord) -> Result<(), String> {
-            Ok(())
-        }
-    }
     struct MapShaInspector {
         shas: RwLock<HashMap<String, String>>,
     }
@@ -105,10 +75,7 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         inspector.set_sha(other_exe, &sha_other);
         inspector.set_sha(unrelated_exe, &sha_unrel);
 
-        let defense = Arc::new(CountingDefense {
-            next_handle: AtomicU64::new(1),
-            suspends: AtomicUsize::new(0),
-        });
+        let defense = Arc::new(TestDefense::new(1));
         let store = LedrStore::open_in_memory().expect("open store");
         let engine = DaemonEngine::start_with_dependencies(
             store.clone(),
@@ -127,17 +94,7 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
 
         let now_ms = current_unix_ms();
         let mk_rule = |id: &str, exe: &str, sha: &str, scope: RuleScope, target: &str, ts: i64| {
-            AllowlistRuleRecord {
-                rule_id: id.to_string(),
-                scope,
-                exe_path_pattern: exe.to_string(),
-                sha256: Some(sha.to_string()),
-                signer_subject: None,
-                root_thumbprint: None,
-                allowed_target: Some(target.to_string()),
-                created_at_ms: ts,
-                created_by: "test".to_string(),
-            }
+            make_net_rule(id, scope, exe, sha, target, ts)
         };
 
         let r_allow_api = mk_rule(
@@ -153,16 +110,7 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
             .expect("upsert R-ALLOW-API");
 
         let p1 = ProcessIdentity::new(9801, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: p1,
-                parent_pid: 4,
-                exe_path: ps_exe.to_string(),
-                command_line: ps_exe.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine, p1, ps_exe);
         assert!(
             engine.has_active_wfp_filter(ps_exe, None, false),
             "pre-restricted PowerShell must have app-wide Preemptive WFP Block"
@@ -174,26 +122,8 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
 
         // 1. Shared IP `ip1` (`other.example` unallowed + `api.example` allowed), then
         //    `api.example` migrates to `ip2`, followed by unrelated rule `upsert_policy_rule`.
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "other.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ip1],
-                timestamp_ms: now_ms + 20,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ip1],
-                timestamp_ms: now_ms + 30,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p1.pid, "other.example", &[ip1], now_ms + 20);
+        let _ = send_dns(&engine, p1.pid, "api.example", &[ip1], now_ms + 30);
         assert_eq!(
             engine
                 .firewall
@@ -203,16 +133,7 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
             Some(vec!["api.example".to_string(), "other.example".to_string()])
         );
 
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ip2],
-                timestamp_ms: now_ms + 40,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p1.pid, "api.example", &[ip2], now_ms + 40);
         assert!(engine.has_active_wfp_filter(ps_exe, Some(ip1), true));
         assert!(engine.has_active_wfp_filter(ps_exe, Some(ip2), true));
         assert_eq!(
@@ -244,55 +165,28 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
 
         // 2. Cached old-IP `NetworkConnect` and `WfpDropEvent` (`on_wfp_drop_dequeued` single-
         //    PID and multi-PID ambiguous) must pass cleanly with 0 suspends and 0 alerts.
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: p1.pid,
-                protocol: 6,
-                dst_ip: ip1,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 60,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(defense.suspends.load(Ordering::Relaxed), 0);
+        send_connect(&engine, p1.pid, ip1, None, now_ms + 60);
+        assert_eq!(defense.suspends(), 0);
         assert_eq!(engine.alerts_emitted(), 0);
         assert!(engine.has_active_wfp_filter(ps_exe, Some(ip1), true));
 
-        let mk_drop = |exe: &str, ip: IpAddr, ts: i64| QueuedWfpDrop {
-            exe_path: exe.to_string(),
-            exe_key: WfpRuleManager::exe_key(exe),
-            dst_ip: ip,
-            dst_port: 443,
-            protocol: 6,
-            timestamp_ms: ts,
-            os_filter_id: 77,
-        };
+        let mk_drop = |exe: &str, ip: IpAddr, ts: i64| make_queued_drop(exe, ip, ts, 77);
         let mut pending = VecDeque::new();
         engine.on_wfp_drop_dequeued(mk_drop(ps_exe, ip1, now_ms + 70), &mut pending);
         assert!(
             pending.is_empty(),
             "live valid DomainPolicy Permit must bypass grace parking in on_wfp_drop_dequeued"
         );
-        assert_eq!(defense.suspends.load(Ordering::Relaxed), 0);
+        assert_eq!(defense.suspends(), 0);
         assert_eq!(engine.alerts_emitted(), 0);
         assert!(engine.has_active_wfp_filter(ps_exe, Some(ip1), true));
 
         // Multi-PID ambiguous drop for `ps_exe -> ip1` also stays silent.
         let p2 = ProcessIdentity::new(9802, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: p2,
-                parent_pid: 4,
-                exe_path: ps_exe.to_string(),
-                command_line: ps_exe.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine, p2, ps_exe);
         engine.on_wfp_drop_dequeued(mk_drop(ps_exe, ip1, now_ms + 80), &mut pending);
         assert!(pending.is_empty());
-        assert_eq!(defense.suspends.load(Ordering::Relaxed), 0);
+        assert_eq!(defense.suspends(), 0);
         assert_eq!(engine.alerts_emitted(), 0);
 
         // Stale (> AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS) multi-PID drop must still park so
@@ -315,29 +209,10 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
 
         // 3. Separate executable (`SEC_0002`) connecting to `ip1` must NOT inherit PowerShell's Permit.
         let p_other = ProcessIdentity::new(9803, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: p_other,
-                parent_pid: 4,
-                exe_path: other_exe.to_string(),
-                command_line: other_exe.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: p_other.pid,
-                protocol: 6,
-                dst_ip: ip1,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 90,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine, p_other, other_exe);
+        send_connect(&engine, p_other.pid, ip1, None, now_ms + 90);
         assert_eq!(
-            defense.suspends.load(Ordering::Relaxed),
+            defense.suspends(),
             1,
             "different executable must be suspended when connecting to ip1 (SEC_0002)"
         );
@@ -400,46 +275,10 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         engine
             .delete_policy_rule("R-BLK-OTHER")
             .expect("delete R-BLK-OTHER");
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "other.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ip1],
-                timestamp_ms: now_ms + 110,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ip1],
-                timestamp_ms: now_ms + 120,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ip2],
-                timestamp_ms: now_ms + 130,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "other.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ip3],
-                timestamp_ms: now_ms + 140,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p1.pid, "other.example", &[ip1], now_ms + 110);
+        let _ = send_dns(&engine, p1.pid, "api.example", &[ip1], now_ms + 120);
+        let _ = send_dns(&engine, p1.pid, "api.example", &[ip2], now_ms + 130);
+        let _ = send_dns(&engine, p1.pid, "other.example", &[ip3], now_ms + 140);
         assert_eq!(
             engine
                 .firewall
@@ -456,20 +295,10 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
             engine.has_active_wfp_filter(ps_exe, Some(ip1), true),
             "blocking migrated other.example must preserve ip1 Permit"
         );
-        let susp_before_post_mig = defense.suspends.load(Ordering::Relaxed);
+        let susp_before_post_mig = defense.suspends();
         let alerts_before_post_mig = engine.alerts_emitted();
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: p1.pid,
-                protocol: 6,
-                dst_ip: ip1,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 150,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(defense.suspends.load(Ordering::Relaxed), susp_before_post_mig);
+        send_connect(&engine, p1.pid, ip1, None, now_ms + 150);
+        assert_eq!(defense.suspends(), susp_before_post_mig);
         assert_eq!(engine.alerts_emitted(), alerts_before_post_mig);
         engine
             .delete_policy_rule("R-BLK-OTHER")
@@ -478,48 +307,20 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         // 5. Binary SHA-256 swap (`SEC_0001`): connecting to cached `ip1` must fail live
         //    Permit re-validation, revoke stale Permits, suspend `p1`, and emit an alert.
         inspector.set_sha(ps_exe, &sha_swapped);
-        let susp_before_swap = defense.suspends.load(Ordering::Relaxed);
+        let susp_before_swap = defense.suspends();
         let alerts_before_swap = engine.alerts_emitted();
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: p1.pid,
-                protocol: 6,
-                dst_ip: ip1,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: now_ms + 160,
-            },
-            EventLane::HighPriority,
-        );
+        send_connect(&engine, p1.pid, ip1, None, now_ms + 160);
         assert!(
             !engine.has_active_wfp_filter(ps_exe, Some(ip1), true),
             "binary SHA-256 swap must revoke stale ip1 Permit (SEC_0001)"
         );
-        assert_eq!(defense.suspends.load(Ordering::Relaxed), susp_before_swap + 1);
+        assert_eq!(defense.suspends(), susp_before_swap + 1);
         assert_eq!(engine.alerts_emitted(), alerts_before_swap + 1);
 
         // Restore original SHA-256 and verify `delete_policy_rule` revokes Permits.
         inspector.set_sha(ps_exe, &sha_orig);
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ip1],
-                timestamp_ms: now_ms + 170,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ip2],
-                timestamp_ms: now_ms + 180,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p2.pid, "api.example", &[ip1], now_ms + 170);
+        let _ = send_dns(&engine, p2.pid, "api.example", &[ip2], now_ms + 180);
         assert!(engine.has_active_wfp_filter(ps_exe, Some(ip1), true));
         assert!(engine.has_active_wfp_filter(ps_exe, Some(ip2), true));
         engine
@@ -537,39 +338,18 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         let cap_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 190));
         let cap_ip2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 191));
         let p3 = ProcessIdentity::new(9804, (now_ms as u64 + 11_644_473_600_000) * 10_000);
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::ProcessStart {
-                identity: p3,
-                parent_pid: 4,
-                exe_path: ps_exe.to_string(),
-                command_line: ps_exe.to_string(),
-                user_sid: None,
-            },
-            EventLane::HighPriority,
-        );
+        send_process_start(&engine, p3, ps_exe);
         let pids = [p1.pid, p2.pid, p3.pid];
         for idx in 0..36usize {
-            let _ = engine.process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: pids[idx / 12],
-                    query_name: format!("cohost-{idx:02}.shared.example"),
-                    query_type: 1,
-                    resolved_ips: vec![cap_ip],
-                    timestamp_ms: now_ms + 200 + idx as i64,
-                },
-                EventLane::HighPriority,
+            let _ = send_dns(
+                &engine,
+                pids[idx / 12],
+                &format!("cohost-{idx:02}.shared.example"),
+                &[cap_ip],
+                now_ms + 200 + idx as i64,
             );
         }
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![cap_ip],
-                timestamp_ms: now_ms + 300,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p1.pid, "api.example", &[cap_ip], now_ms + 300);
         let cap_hints = engine
             .firewall
             .lock()
@@ -583,16 +363,7 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         );
         // Migrate `api.example` off `cap_ip` to `cap_ip2` and save another unrelated rule ->
         // `cap_ip` Permit must survive!
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p1.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![cap_ip2],
-                timestamp_ms: now_ms + 310,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p1.pid, "api.example", &[cap_ip2], now_ms + 310);
         let r_unrelated_2 = mk_rule(
             "R-UNRELATED-2",
             unrelated_exe,
@@ -616,15 +387,12 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         //    multi-PID `handle_ambiguous_wfp_drop`) and via a second allow rule `keep.example`.
         let churn_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 250));
         for idx in 0..80usize {
-            let _ = engine.process_event_with_lane(
-                &SensorEvent::DnsQuery {
-                    pid: p3.pid,
-                    query_name: format!("churn-{idx:03}.noise.example"),
-                    query_type: 1,
-                    resolved_ips: vec![churn_ip],
-                    timestamp_ms: now_ms + 400 + idx as i64,
-                },
-                EventLane::HighPriority,
+            let _ = send_dns(
+                &engine,
+                p3.pid,
+                &format!("churn-{idx:03}.noise.example"),
+                &[churn_ip],
+                now_ms + 400 + idx as i64,
             );
         }
         // 7a. Co-existing CIDR allow triggers `prematerialize`, `NetworkConnect`, and
@@ -642,26 +410,19 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         engine
             .upsert_policy_rule(&r_allow_cap_cidr)
             .expect("upsert co-existing CIDR allow for cap_ip");
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "cohost-cidr-90.shared.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![cap_ip],
-                timestamp_ms: now_ms + 510,
-            },
-            EventLane::HighPriority,
+        let _ = send_dns(
+            &engine,
+            p2.pid,
+            "cohost-cidr-90.shared.example",
+            &[cap_ip],
+            now_ms + 510,
         );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: p2.pid,
-                protocol: 6,
-                dst_ip: cap_ip,
-                dst_port: 443,
-                domain_hint: Some("cohost-cidr-91.shared.example".to_string()),
-                timestamp_ms: now_ms + 520,
-            },
-            EventLane::HighPriority,
+        send_connect(
+            &engine,
+            p2.pid,
+            cap_ip,
+            Some("cohost-cidr-91.shared.example"),
+            now_ms + 520,
         );
         engine.on_wfp_drop_dequeued(mk_drop(ps_exe, cap_ip, now_ms + 530), &mut pending);
         assert!(pending.is_empty());
@@ -698,16 +459,7 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         engine
             .upsert_policy_rule(&r_allow_keep)
             .expect("upsert R-ALLOW-KEEP");
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "keep.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![cap_ip],
-                timestamp_ms: now_ms + 550,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p2.pid, "keep.example", &[cap_ip], now_ms + 550);
         let cap_hints_after_keep = engine
             .firewall
             .lock()
@@ -731,25 +483,19 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         // 7c. `AllowPermanent` (`resolve_alert`) on a full 32-hint Permit while `api.example`
         //     is absent from `ProcessDnsHistory`: CIDR allow with a new co-hosted hint must
         //     preserve existing `api.example` via `extend_authorizing_hints_from_existing_permit`.
-        let allow_perm_alert = ledr_proto::AlertRecord {
-            alert_id: "AL-P3-49A-CAP-ALLOWPERM".to_string(),
-            timestamp_ms: now_ms + 560,
-            severity: ledr_proto::AlertSeverity::High,
-            source_layer: "LAYER_3_NETWORK".to_string(),
-            rule_id: "LEDR-NET-SCRIPT-INTERPRETER".to_string(),
-            title: "Full-32 AllowPermanent preservation check".to_string(),
-            process_instance_id: Some(p2.instance_id()),
-            process_suspended: false,
-            status: ledr_proto::AlertStatus::Pending,
-            context_json: serde_json::json!({
+        let allow_perm_alert = make_pending_net_alert(
+            "AL-P3-49A-CAP-ALLOWPERM",
+            now_ms + 560,
+            "LEDR-NET-SCRIPT-INTERPRETER",
+            "Full-32 AllowPermanent preservation check",
+            Some(p2.instance_id()),
+            serde_json::json!({
                 "exe_path": ps_exe,
                 "dst_ip": cap_ip.to_string(),
                 "domain_hint": "cohost-allowperm-99.shared.example",
                 "sha256": sha_orig,
-            })
-            .to_string(),
-            resolved_at_ms: None,
-        };
+            }),
+        );
         store
             .record_alert(&allow_perm_alert)
             .expect("record AllowPermanent test alert");
@@ -835,16 +581,7 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
             )
             .expect("install wildcard fallback DomainPolicy Permit");
         }
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "sub.wild.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![wild_ip2],
-                timestamp_ms: now_ms + 610,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p2.pid, "sub.wild.example", &[wild_ip2], now_ms + 610);
         let alerts_before_wild = engine.alerts_emitted();
         engine.on_wfp_drop_dequeued(mk_drop(ps_exe, wild_ip1, now_ms + 620), &mut pending);
         assert!(
@@ -856,15 +593,12 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         // Advance past `AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS` so `sub.wild.example` is stale, then
         // record a fresh DNS query ONLY for blocked `evil.wild.example`: must STILL park!
         let stale_wild_ts = now_ms + 610 + super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS + 5_000;
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "evil.wild.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![wild_ip3],
-                timestamp_ms: stale_wild_ts - 10,
-            },
-            EventLane::HighPriority,
+        let _ = send_dns(
+            &engine,
+            p2.pid,
+            "evil.wild.example",
+            &[wild_ip3],
+            stale_wild_ts - 10,
         );
         engine.on_wfp_drop_dequeued(mk_drop(ps_exe, wild_ip1, stale_wild_ts), &mut pending);
         assert_eq!(
@@ -886,63 +620,16 @@ fn daemon_p3_49a_cached_ip_live_permit_revalidation_and_prioritized_hints() {
         ));
         let ds_t0 = now_ms + 700;
         let ds_t_v4_mig = ds_t0 + super::AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS + 5_000;
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "other.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ds_v4_old, ds_v6_old],
-                timestamp_ms: ds_t0,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ds_v4_old, ds_v6_old],
-                timestamp_ms: ds_t0,
-            },
-            EventLane::HighPriority,
-        );
+        let _ = send_dns(&engine, p2.pid, "other.example", &[ds_v4_old, ds_v6_old], ds_t0);
+        let _ = send_dns(&engine, p2.pid, "api.example", &[ds_v4_old, ds_v6_old], ds_t0);
         // Migrate ONLY IPv4 at `ds_t_v4_mig` (making `AAAA` at `ds_t0` stale > 60s while `A`
         // is fresh!).
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::DnsQuery {
-                pid: p2.pid,
-                query_name: "api.example".to_string(),
-                query_type: 1,
-                resolved_ips: vec![ds_v4_new],
-                timestamp_ms: ds_t_v4_mig,
-            },
-            EventLane::HighPriority,
-        );
-        let susp_before_ds = defense.suspends.load(Ordering::Relaxed);
+        let _ = send_dns(&engine, p2.pid, "api.example", &[ds_v4_new], ds_t_v4_mig);
+        let susp_before_ds = defense.suspends();
         let alerts_before_ds = engine.alerts_emitted();
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: p2.pid,
-                protocol: 6,
-                dst_ip: ds_v4_old_mapped,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: ds_t_v4_mig + 10,
-            },
-            EventLane::HighPriority,
-        );
-        let _ = engine.process_event_with_lane(
-            &SensorEvent::NetworkConnect {
-                pid: p2.pid,
-                protocol: 6,
-                dst_ip: ds_v6_old,
-                dst_port: 443,
-                domain_hint: None,
-                timestamp_ms: ds_t_v4_mig + 15,
-            },
-            EventLane::HighPriority,
-        );
-        assert_eq!(defense.suspends.load(Ordering::Relaxed), susp_before_ds);
+        send_connect(&engine, p2.pid, ds_v4_old_mapped, None, ds_t_v4_mig + 10);
+        send_connect(&engine, p2.pid, ds_v6_old, None, ds_t_v4_mig + 15);
+        assert_eq!(defense.suspends(), susp_before_ds);
         assert_eq!(engine.alerts_emitted(), alerts_before_ds);
 
         // Multi-instance drops at `ds_t_v4_mig + 20`: `::ffff:ds_v4_old` has fresh v4 migration

@@ -1,28 +1,76 @@
-use super::tolerate_missing_target;
+use super::{tolerate_missing_target, DaemonConfig, DaemonEngine};
+use ledr_rules::{EarlyPruner, SigmaEngine};
 use ledr_sensor_win::defense::ProcessLiveness;
+use ledr_sensor_win::WfpDropEvent;
+use ledr_store::LedrStore;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+async fn wait_until_nrd_handle_taken<T>(
+    engine: &DaemonEngine,
+    shutdown_task: &tokio::task::JoinHandle<T>,
+    take_msg: &str,
+    parked_msg: &str,
+) {
+    let sync_deadline = Instant::now() + Duration::from_secs(2);
+    while engine.nrd_thread_handle.lock().unwrap().is_some() {
+        assert!(Instant::now() < sync_deadline, "{take_msg}");
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!shutdown_task.is_finished(), "{parked_msg}");
+}
+
+fn make_wfp_drop_event(exe: &str, last_octet: u8, timestamp_ms: i64) -> WfpDropEvent {
+    WfpDropEvent {
+        os_filter_id: 1,
+        rule_handle: 1,
+        exe_path: exe.to_string(),
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, last_octet)),
+        dst_port: 443,
+        timestamp_ms,
+    }
+}
+
+fn start_overflow_engine(store: LedrStore) -> Arc<DaemonEngine> {
+    DaemonEngine::start(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            high_priority_capacity: 1,
+            outbound_firewall_enabled: true,
+            ..DaemonConfig::default()
+        },
+    )
+}
 
 /// `DAEMON-P2-28` (`BUG_0002`): a snapshot/enumeration failure (`Unknown`) must not
 /// be treated as "gone" — only a positively absent PID or a proven PID reuse may
 /// swallow a suspend/resume/terminate error.
 #[test]
 fn daemon_p2_28_bug_0002_unknown_liveness_is_not_tolerated() {
-    assert!(tolerate_missing_target(
-        "OpenProcess failed",
-        ProcessLiveness::Gone
-    ));
-    assert!(tolerate_missing_target(
-        "PID reused: CreationTime mismatch",
-        ProcessLiveness::Running
-    ));
-    assert!(!tolerate_missing_target(
-        "OpenProcess failed",
-        ProcessLiveness::Running
-    ));
-    assert!(!tolerate_missing_target(
-        "OpenProcess failed",
-        ProcessLiveness::Unknown
-    ));
+    let cases = [
+        ("OpenProcess failed", ProcessLiveness::Gone, true),
+        (
+            "PID reused: CreationTime mismatch",
+            ProcessLiveness::Running,
+            true,
+        ),
+        ("OpenProcess failed", ProcessLiveness::Running, false),
+        ("OpenProcess failed", ProcessLiveness::Unknown, false),
+    ];
+    for (err, liveness, expected) in cases {
+        assert_eq!(
+            tolerate_missing_target(err, liveness),
+            expected,
+            "tolerate_missing_target({err:?}, {liveness:?})"
+        );
+    }
 }
 
 /// `DAEMON-P3-44A` (`R-13`): `WfpDropOverflowQueue` reports `CoalescedOverwritten` when a
@@ -31,13 +79,7 @@ fn daemon_p2_28_bug_0002_unknown_liveness_is_not_tolerated() {
 /// FIFO order, and exposes the counter via `DaemonEngine::wfp_drop_overflow_coalesced`.
 #[test]
 fn daemon_p3_44a_wfp_drop_overflow_queue_coalescing_and_fifo_eviction() {
-    use super::{
-        current_unix_ms, DaemonConfig, DaemonEngine, OverflowPushOutcome, QueuedWfpDrop,
-        WfpDropOverflowQueue,
-    };
-    use ledr_rules::{EarlyPruner, SigmaEngine};
-    use ledr_sensor_win::WfpDropEvent;
-    use ledr_store::LedrStore;
+    use super::{current_unix_ms, OverflowPushOutcome, QueuedWfpDrop, WfpDropOverflowQueue};
 
     let make_item = |exe_key: &str, ip: IpAddr, port: u16| QueuedWfpDrop {
         exe_path: exe_key.to_string(),
@@ -193,16 +235,7 @@ fn daemon_p3_44a_wfp_drop_overflow_queue_coalescing_and_fifo_eviction() {
         .expect("build rt");
     rt.block_on(async {
         let store = LedrStore::open_in_memory().expect("open store");
-        let engine = DaemonEngine::start(
-            store,
-            SigmaEngine::default(),
-            EarlyPruner::default(),
-            DaemonConfig {
-                high_priority_capacity: 1,
-                outbound_firewall_enabled: true,
-                ..DaemonConfig::default()
-            },
-        );
+        let engine = start_overflow_engine(store);
         // Current-thread worker has not yielded yet, so `wfp_drop_tx` (cap 1) and
         // `wfp_drop_overflow.queue` (cap 1) saturate deterministically before any `.await`.
         let exe = r"C:\Tools\burst_app.exe";
@@ -338,21 +371,13 @@ fn daemon_p3_45a_r11_shutdown_checkpoints_first_and_detaches_wedged_nrd_without_
             // Deterministically wait until `shutdown_and_flush` has already executed
             // `checkpoint_truncate`, taken `nrd_thread_handle`, and parked in `Poll::Pending`
             // on `timeout(remaining, &mut nrd.done_rx)`.
-            let sync_deadline = Instant::now() + Duration::from_secs(2);
-            while engine.nrd_thread_handle.lock().unwrap().is_some() {
-                assert!(
-                    Instant::now() < sync_deadline,
-                    "shutdown_and_flush did not take nrd_thread_handle in time"
-                );
-                tokio::task::yield_now().await;
-            }
-            for _ in 0..4 {
-                tokio::task::yield_now().await;
-            }
-            assert!(
-                !shutdown_task.is_finished(),
-                "shutdown_and_flush must be parked awaiting remaining NRD budget on done_rx"
-            );
+            wait_until_nrd_handle_taken(
+                &engine,
+                &shutdown_task,
+                "shutdown_and_flush did not take nrd_thread_handle in time",
+                "shutdown_and_flush must be parked awaiting remaining NRD budget on done_rx",
+            )
+            .await;
             let wal_len_mid = std::fs::metadata(&wal_check_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
@@ -455,21 +480,13 @@ fn daemon_p3_45a_r11_shutdown_checkpoints_first_and_detaches_wedged_nrd_without_
         let shutdown_b2 = tokio::spawn(async move { engine2_c.shutdown_and_flush().await });
         // Deterministically synchronize until `shutdown_and_flush` has taken `nrd_thread_handle`
         // and parked in `Poll::Pending` on `done_rx2` before triggering the panic.
-        let sync_b2_deadline = Instant::now() + Duration::from_secs(2);
-        while engine2.nrd_thread_handle.lock().unwrap().is_some() {
-            assert!(
-                Instant::now() < sync_b2_deadline,
-                "shutdown B2 did not take nrd_thread_handle in time"
-            );
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !shutdown_b2.is_finished(),
-            "shutdown B2 must be parked awaiting done_rx2 before panic trigger"
-        );
+        wait_until_nrd_handle_taken(
+            &engine2,
+            &shutdown_b2,
+            "shutdown B2 did not take nrd_thread_handle in time",
+            "shutdown B2 must be parked awaiting done_rx2 before panic trigger",
+        )
+        .await;
         let t1 = Instant::now();
         let _ = go_tx.send(());
         shutdown_b2
@@ -491,12 +508,8 @@ fn daemon_p3_45a_r11_shutdown_checkpoints_first_and_detaches_wedged_nrd_without_
 /// with the engine's internal cancellation token.
 #[test]
 fn daemon_p3_48a_ingest_wfp_drop_emits_zero_sync_logs_and_worker_warns_aggregated() {
-    use super::{current_unix_ms, DaemonConfig, DaemonEngine};
-    use ledr_rules::{EarlyPruner, SigmaEngine};
-    use ledr_sensor_win::WfpDropEvent;
-    use ledr_store::LedrStore;
+    use super::current_unix_ms;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     struct CountingSubscriber {
         total_events: Arc<AtomicUsize>,
@@ -531,16 +544,7 @@ fn daemon_p3_48a_ingest_wfp_drop_emits_zero_sync_logs_and_worker_warns_aggregate
         .expect("build rt");
     rt.block_on(async {
         let store = LedrStore::open_in_memory().expect("open store");
-        let engine = DaemonEngine::start(
-            store,
-            SigmaEngine::default(),
-            EarlyPruner::default(),
-            DaemonConfig {
-                high_priority_capacity: 1,
-                outbound_firewall_enabled: true,
-                ..DaemonConfig::default()
-            },
-        );
+        let engine = start_overflow_engine(store);
 
         // T1-4 check: `nrd_cancel_token()` exposes a live clone of `self.nrd_cancel`.
         let ext_token = engine.nrd_cancel_token();
@@ -557,15 +561,7 @@ fn daemon_p3_48a_ingest_wfp_drop_emits_zero_sync_logs_and_worker_warns_aggregate
 
         let exe = r"C:\Tools\bfe_callback_no_log.exe";
         let ts = current_unix_ms();
-        let mk = |last_octet: u8| WfpDropEvent {
-            os_filter_id: 1,
-            rule_handle: 1,
-            exe_path: exe.to_string(),
-            protocol: 6,
-            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, last_octet)),
-            dst_port: 443,
-            timestamp_ms: ts,
-        };
+        let mk = |last_octet: u8| make_wfp_drop_event(exe, last_octet, ts);
 
         // Worker has not yielded yet -> `wfp_drop_tx` (cap 1) + `overflow.queue` (cap 1)
         // fill deterministically and hit `CoalescedOverwritten` #1, #2, #3, #4 synchronously.
@@ -662,27 +658,10 @@ fn daemon_p3_48a_ingest_wfp_drop_emits_zero_sync_logs_and_worker_warns_aggregate
     tracing::subscriber::with_default(live_sub, || {
         rt_live.block_on(async {
             let store = LedrStore::open_in_memory().expect("open live store");
-            let live_engine = DaemonEngine::start(
-                store,
-                SigmaEngine::default(),
-                EarlyPruner::default(),
-                DaemonConfig {
-                    high_priority_capacity: 1,
-                    outbound_firewall_enabled: true,
-                    ..DaemonConfig::default()
-                },
-            );
+            let live_engine = start_overflow_engine(store);
             let exe = r"C:\Tools\bfe_live_worker_warn.exe";
             let ts = current_unix_ms();
-            let mk = |last_octet: u8| WfpDropEvent {
-                os_filter_id: 1,
-                rule_handle: 1,
-                exe_path: exe.to_string(),
-                protocol: 6,
-                dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, last_octet)),
-                dst_port: 443,
-                timestamp_ms: ts,
-            };
+            let mk = |last_octet: u8| make_wfp_drop_event(exe, last_octet, ts);
             // Reset counts after startup so only ingest + worker events are counted.
             live_total.store(0, Ordering::SeqCst);
             live_warns.store(0, Ordering::SeqCst);

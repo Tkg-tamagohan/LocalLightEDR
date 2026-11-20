@@ -673,6 +673,37 @@ mod tests {
     use ledr_proto::ProcessIdentity;
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn dns_query(
+        pid: u32,
+        query_name: impl Into<String>,
+        ip: Ipv4Addr,
+        timestamp_ms: i64,
+    ) -> SensorEvent {
+        SensorEvent::DnsQuery {
+            pid,
+            query_name: query_name.into(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(ip)],
+            timestamp_ms,
+        }
+    }
+
+    fn network_connect(
+        pid: u32,
+        dst_ip: Ipv4Addr,
+        domain_hint: Option<&str>,
+        timestamp_ms: i64,
+    ) -> SensorEvent {
+        SensorEvent::NetworkConnect {
+            pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(dst_ip),
+            dst_port: 443,
+            domain_hint: domain_hint.map(str::to_string),
+            timestamp_ms,
+        }
+    }
+
     #[tokio::test]
     async fn channel_prioritizes_high_priority_and_drops_oldest_telemetry() {
         let (tx, mut rx) = TwoLaneChannel::with_capacities(2, 3).split();
@@ -680,14 +711,8 @@ mod tests {
         assert_eq!(tx.telemetry_capacity(), 3);
 
         for i in 0..5 {
-            tx.send_telemetry(SensorEvent::DnsQuery {
-                pid: 1,
-                query_name: format!("d{i}.test"),
-                query_type: 1,
-                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
-                timestamp_ms: i,
-            })
-            .expect("telemetry send");
+            tx.send_telemetry(dns_query(1, format!("d{i}.test"), Ipv4Addr::new(1, 1, 1, 1), i))
+                .expect("telemetry send");
         }
         assert_eq!(tx.telemetry_depth(), 3);
         assert_eq!(tx.telemetry_dropped(), 2);
@@ -740,34 +765,14 @@ mod tests {
         classifier.mark_steady(99);
 
         // Private IP is NOT promoted; steady/protected PID external IP is NOT promoted.
-        let private_ev = SensorEvent::NetworkConnect {
-            pid: 500,
-            protocol: 6,
-            dst_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
-            dst_port: 443,
-            domain_hint: None,
-            timestamp_ms: 1,
-        };
-        let steady_ev = SensorEvent::NetworkConnect {
-            pid: 99,
-            protocol: 6,
-            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            dst_port: 443,
-            domain_hint: None,
-            timestamp_ms: 2,
-        };
+        let private_ev = network_connect(500, Ipv4Addr::new(192, 168, 1, 10), None, 1);
+        let steady_ev = network_connect(99, Ipv4Addr::new(93, 184, 216, 34), None, 2);
         assert!(!classified.should_promote(&private_ev));
         assert!(!classified.should_promote(&steady_ev));
 
         // Unknown external NetworkConnect IS promoted via high-priority lane even when telemetry overflows.
-        let unknown_ext = SensorEvent::NetworkConnect {
-            pid: 500,
-            protocol: 6,
-            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            dst_port: 443,
-            domain_hint: Some("unknown.example".to_string()),
-            timestamp_ms: 3,
-        };
+        let unknown_ext =
+            network_connect(500, Ipv4Addr::new(93, 184, 216, 34), Some("unknown.example"), 3);
         assert!(classified.should_promote(&unknown_ext));
 
         // Send promoted event synchronously from a non-runtime OS thread via `blocking_send`.
@@ -784,13 +789,12 @@ mod tests {
         // Saturate telemetry AFTER sending unknown_ext so telemetry drops older entries.
         for i in 0..6 {
             classified
-                .send(SensorEvent::DnsQuery {
-                    pid: 99,
-                    query_name: format!("noise-{i}.example"),
-                    query_type: 1,
-                    resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))],
-                    timestamp_ms: 10 + i,
-                })
+                .send(dns_query(
+                    99,
+                    format!("noise-{i}.example"),
+                    Ipv4Addr::new(198, 51, 100, 1),
+                    10 + i,
+                ))
                 .await
                 .expect("noise dns");
         }
@@ -821,27 +825,9 @@ mod tests {
         let classified = ClassifiedEventSender::new(tx, Arc::clone(&classifier));
         classifier.mark_steady(99);
 
-        let ext_dns = SensorEvent::DnsQuery {
-            pid: 500,
-            query_name: "api.allowed.example".to_string(),
-            query_type: 1,
-            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
-            timestamp_ms: 1,
-        };
-        let steady_dns = SensorEvent::DnsQuery {
-            pid: 99,
-            query_name: "steady.example".to_string(),
-            query_type: 1,
-            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
-            timestamp_ms: 2,
-        };
-        let local_dns = SensorEvent::DnsQuery {
-            pid: 500,
-            query_name: "intranet.local".to_string(),
-            query_type: 1,
-            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))],
-            timestamp_ms: 3,
-        };
+        let ext_dns = dns_query(500, "api.allowed.example", Ipv4Addr::new(93, 184, 216, 34), 1);
+        let steady_dns = dns_query(99, "steady.example", Ipv4Addr::new(93, 184, 216, 34), 2);
+        let local_dns = dns_query(500, "intranet.local", Ipv4Addr::new(10, 0, 0, 5), 3);
 
         // Without domain rules, DnsQuery stays on Telemetry so telemetry backpressure can shed it.
         assert!(!classified.should_promote(&ext_dns));
@@ -853,27 +839,19 @@ mod tests {
         assert!(!classified.should_promote(&steady_dns));
         assert!(!classified.should_promote(&local_dns));
 
-        let connect = SensorEvent::NetworkConnect {
-            pid: 500,
-            protocol: 6,
-            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            dst_port: 443,
-            domain_hint: None,
-            timestamp_ms: 4,
-        };
+        let connect = network_connect(500, Ipv4Addr::new(93, 184, 216, 34), None, 4);
         classified.send(ext_dns.clone()).await.expect("dns");
         classified.send(connect.clone()).await.expect("connect");
 
         // Overflow Telemetry with steady noise; HighPriority DNS + Connect remain lossless & ordered.
         for i in 0..5 {
             classified
-                .send(SensorEvent::DnsQuery {
-                    pid: 99,
-                    query_name: format!("overflow-{i}.example"),
-                    query_type: 1,
-                    resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
-                    timestamp_ms: 10 + i,
-                })
+                .send(dns_query(
+                    99,
+                    format!("overflow-{i}.example"),
+                    Ipv4Addr::new(1, 1, 1, 1),
+                    10 + i,
+                ))
                 .await
                 .expect("noise");
         }

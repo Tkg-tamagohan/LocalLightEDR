@@ -26,8 +26,7 @@ pub(crate) use parser::matches_domain_or_parent_in_set;
 pub use parser::{normalize_nrd_domain, parse_nrd_feed_bytes, parse_nrd_line};
 #[cfg(test)]
 pub(crate) use reader::{
-    read_bounded_chunks, read_bounded_chunks_cancellable, read_bounded_reader_cancellable,
-    NRD_FILE_READ_CHUNK_BYTES,
+    read_bounded_chunks_cancellable, read_bounded_reader_cancellable, NRD_FILE_READ_CHUNK_BYTES,
 };
 pub(crate) use reader::read_bounded_file;
 pub(crate) use url::is_loopback_http_host;

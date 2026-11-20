@@ -123,21 +123,9 @@ fn trim_partial_trailing_line(buf: &mut Vec<u8>) {
     }
 }
 
-/// Reads chunks from a streaming source via `next_chunk(max_to_read)` until EOF (`Ok(None)`) or
-/// `max_bytes` is exceeded. When truncated, trims any partial trailing line (clearing the buffer
-/// if no newline was seen) so NRD parsers never ingest a half-domain.
-#[cfg(test)]
-pub(crate) fn read_bounded_chunks<F>(
-    max_bytes: usize,
-    next_chunk: F,
-) -> Result<(Vec<u8>, bool), String>
-where
-    F: FnMut(usize) -> Result<Option<Vec<u8>>, String>,
-{
-    read_bounded_chunks_cancellable(max_bytes, &NrdCancelToken::new(), next_chunk)
-}
-
-/// Cancellable variant of [`read_bounded_chunks`].
+/// Reads chunks from a streaming source via `next_chunk(max_to_read)` until EOF (`Ok(None)`),
+/// `max_bytes` is exceeded, or `cancel` is triggered. When truncated, trims any partial trailing
+/// line (clearing the buffer if no newline was seen) so NRD parsers never ingest a half-domain.
 pub(crate) fn read_bounded_chunks_cancellable<F>(
     max_bytes: usize,
     cancel: &NrdCancelToken,

@@ -103,11 +103,6 @@ CREATE TABLE IF NOT EXISTS allowlist_rules (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_rules_scope_created ON allowlist_rules(scope, created_at_ms DESC, rule_id ASC);
 
-CREATE TABLE IF NOT EXISTS default_rule_seeds (
-    rule_id             TEXT PRIMARY KEY,
-    seeded_at_ms        INTEGER NOT NULL
-) WITHOUT ROWID;
-
 CREATE TABLE IF NOT EXISTS download_origins (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     file_path           TEXT NOT NULL,

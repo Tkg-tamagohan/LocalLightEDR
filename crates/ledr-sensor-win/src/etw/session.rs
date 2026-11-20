@@ -517,12 +517,6 @@ fn enable_all_providers(
                 message: format!("{name}: {detail} (error {})", status.0),
             });
         }
-        tracing::debug!(
-            provider = name,
-            level,
-            keyword = format_args!("{keyword:#x}"),
-            "enabled ETW provider"
-        );
     }
 
     Ok(())

@@ -19,7 +19,7 @@ mod wfp_premat;
 
 pub use alerts::ResolvedAlertOutcome;
 pub use binary_inspector::{BinaryInspector, WindowsBinaryInspector};
-pub use config::{DaemonConfig, OutboundEnforcementMode};
+pub use config::DaemonConfig;
 pub use policy::PolicyRuleError;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

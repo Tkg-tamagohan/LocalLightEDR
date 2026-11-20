@@ -21,6 +21,13 @@ pub(crate) struct RegisterUriEvent {
 pub(crate) const LEDR_URI_REG_SUBKEY: &str = r"Software\Classes\ledr";
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const LEDR_URI_DESCRIPTION: &str = "URL:LocalEDR Alert Protocol";
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const LEDR_AUMID: &str = "LocalEDR.AlertUI";
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const LEDR_AUMID_REG_SUBKEY: &str =
+    r"Software\Classes\AppUserModelId\LocalEDR.AlertUI";
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const LEDR_AUMID_DISPLAY_NAME: &str = "LocalEDR";
 
 pub(crate) fn format_ledr_uri_command(exe_path: &std::path::Path) -> String {
     let raw = exe_path.to_string_lossy();
@@ -266,6 +273,29 @@ pub(crate) mod win_uri_reg {
         })
     }
 
+    /// Ensures `HKCU\Software\Classes\AppUserModelId\<AUMID>` has `DisplayName = display_name`
+    /// so WinRT `ToastNotificationManager::CreateToastNotifierWithId` resolves LocalEDR's
+    /// dedicated AUMID without borrowing PowerShell's AppID.
+    pub(crate) fn ensure_hkcu_aumid_registered_at(
+        base_subkey: &str,
+        display_name: &str,
+    ) -> Result<bool, String> {
+        if let Ok(Some(base_key)) = reg_open_hkcu(base_subkey, KEY_QUERY_VALUE) {
+            let name_ok = reg_query_sz(&base_key, Some("DisplayName"))
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(display_name);
+            if name_ok {
+                return Ok(false);
+            }
+        }
+
+        let base_key = reg_create_hkcu(base_subkey, KEY_SET_VALUE | KEY_CREATE_SUB_KEY)?;
+        reg_set_sz(&base_key, Some("DisplayName"), display_name)?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn reg_delete_hkcu_tree(subkey: &str) {
         let subkey_w = to_utf16_nul(subkey);
@@ -276,13 +306,20 @@ pub(crate) mod win_uri_reg {
     }
 }
 
-/// Ensures per-user `HKCU\Software\Classes\ledr` protocol handler registration matches the
+/// Ensures per-user `HKCU\Software\Classes\ledr` protocol handler registration and
+/// `HKCU\Software\Classes\AppUserModelId\LocalEDR.AlertUI` AUMID registration match the
 /// current `ledr-ui` executable path (idempotent; checks existing values before writing).
 #[cfg(windows)]
 pub(crate) fn ensure_hkcu_ledr_uri_registered() -> Result<UriRegistrationOutcome, String> {
     let exe_path =
         std::env::current_exe().map_err(|err| format!("failed to resolve current_exe: {err}"))?;
-    win_uri_reg::ensure_hkcu_uri_registered_at(LEDR_URI_REG_SUBKEY, &exe_path)
+    let mut outcome = win_uri_reg::ensure_hkcu_uri_registered_at(LEDR_URI_REG_SUBKEY, &exe_path)?;
+    let aumid_updated = win_uri_reg::ensure_hkcu_aumid_registered_at(
+        LEDR_AUMID_REG_SUBKEY,
+        LEDR_AUMID_DISPLAY_NAME,
+    )?;
+    outcome.updated |= aumid_updated;
+    Ok(outcome)
 }
 
 #[cfg(not(windows))]

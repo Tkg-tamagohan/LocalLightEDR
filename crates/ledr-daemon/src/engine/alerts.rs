@@ -1078,7 +1078,7 @@ impl DaemonEngine {
     }
 }
 
-fn collect_suspended_children_from_ctx(
+pub(super) fn collect_suspended_children_from_ctx(
     ctx_val: &serde_json::Value,
     parent_identity: Option<ProcessIdentity>,
     seen: &mut HashSet<ProcessIdentity>,

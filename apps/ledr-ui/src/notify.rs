@@ -1,13 +1,12 @@
 use crate::ipc::IpcClient;
+#[cfg(windows)]
+use crate::uri_reg::LEDR_AUMID;
 use crate::uri_reg::ensure_hkcu_ledr_uri_registered;
 use ledr_proto::{AlertRecord, AlertStatus};
 use serde::{Deserialize, Serialize};
 
 /// Environment variable disabling OS WinRT toast emission during headless/CI tests.
 pub const DISABLE_OS_TOAST_ENV: &str = "LEDR_UI_DISABLE_OS_TOAST";
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToastAlertSummary {
@@ -59,6 +58,7 @@ pub(crate) fn xml_escape(input: &str) -> String {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -244,11 +244,76 @@ fn is_os_toast_disabled() -> bool {
     is_os_toast_disabled_value(std::env::var(DISABLE_OS_TOAST_ENV).ok().as_deref())
 }
 
+/// Returns `true` when Windows global toast notifications are explicitly disabled
+/// (`HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications\ToastEnabled == 0`).
+pub(crate) fn is_os_toast_suppressed_by_setting(toast_enabled: Option<u32>) -> bool {
+    toast_enabled == Some(0)
+}
+
+#[cfg(windows)]
+fn read_hkcu_toast_enabled() -> Option<u32> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = hkcu
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\PushNotifications")
+        .ok()?;
+    key.get_value::<u32, _>("ToastEnabled").ok()
+}
+
+#[cfg(windows)]
+struct ComGuard {
+    should_uninit: bool,
+}
+
+#[cfg(windows)]
+impl ComGuard {
+    fn init_multithreaded() -> Self {
+        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+        // SAFETY: `CoInitializeEx` with `None` reserved pointer is valid on the calling thread.
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        Self {
+            should_uninit: hr.is_ok(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.should_uninit {
+            use windows::Win32::System::Com::CoUninitialize;
+            // SAFETY: Paired with a successful `CoInitializeEx` on this thread.
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn dispatch_winrt_toast_native(toast_xml: &str, aumid: &str) -> Result<(), String> {
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+    use windows::core::HSTRING;
+
+    let _com = ComGuard::init_multithreaded();
+    let doc = XmlDocument::new().map_err(|err| format!("XmlDocument::new failed: {err}"))?;
+    doc.LoadXml(&HSTRING::from(toast_xml))
+        .map_err(|err| format!("XmlDocument::LoadXml failed: {err}"))?;
+    let toast = ToastNotification::CreateToastNotification(&doc)
+        .map_err(|err| format!("ToastNotification::CreateToastNotification failed: {err}"))?;
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(aumid))
+        .map_err(|err| format!("CreateToastNotifierWithId('{aumid}') failed: {err}"))?;
+    notifier
+        .Show(&toast)
+        .map_err(|err| format!("ToastNotifier::Show failed: {err}"))?;
+    Ok(())
+}
+
 #[cfg(windows)]
 fn dispatch_os_toast_nonblocking(toast_xml: &str, disable_os_toast: bool) -> OsToastOutcome {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
     if disable_os_toast {
         return OsToastOutcome {
             status: "disabled_by_env",
@@ -256,45 +321,23 @@ fn dispatch_os_toast_nonblocking(toast_xml: &str, disable_os_toast: bool) -> OsT
         };
     }
 
-    let xml_b64 = base64_encode(toast_xml.as_bytes());
-    let ps_script = format!(
-        "$ErrorActionPreference = 'Stop';\n\
-         $xml = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{xml_b64}'));\n\
-         [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;\n\
-         [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;\n\
-         $doc = New-Object Windows.Data.Xml.Dom.XmlDocument;\n\
-         $doc.LoadXml($xml);\n\
-         $toast = [Windows.UI.Notifications.ToastNotification]::new($doc);\n\
-         $appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe';\n\
-         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast);"
-    );
-    let utf16_le: Vec<u8> = ps_script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let encoded_cmd = base64_encode(&utf16_le);
+    if is_os_toast_suppressed_by_setting(read_hkcu_toast_enabled()) {
+        return OsToastOutcome {
+            status: "suppressed_by_os_settings",
+            error: Some(
+                "Windows notifications are disabled (HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications\\ToastEnabled = 0). Enable 'Settings > System > Notifications' to display alert toasts.".to_string(),
+            ),
+        };
+    }
 
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-EncodedCommand",
-        &encoded_cmd,
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .creation_flags(CREATE_NO_WINDOW);
-
-    match cmd.spawn() {
-        Ok(_child) => OsToastOutcome {
+    match dispatch_winrt_toast_native(toast_xml, LEDR_AUMID) {
+        Ok(()) => OsToastOutcome {
             status: "dispatched",
             error: None,
         },
         Err(err) => OsToastOutcome {
-            status: "spawn_failed",
-            error: Some(err.to_string()),
+            status: "winrt_toast_failed",
+            error: Some(err),
         },
     }
 }
@@ -331,6 +374,7 @@ pub(crate) fn build_notify_oneshot_event(
     let overall_status = match outcome.status {
         "dispatched" => "dispatched",
         "disabled_by_env" => "disabled_by_env",
+        "suppressed_by_os_settings" => "suppressed_by_os_settings",
         _ => "toast_unavailable",
     };
 

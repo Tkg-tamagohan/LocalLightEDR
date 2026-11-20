@@ -147,10 +147,13 @@ fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Opti
                     );
                     return None;
                 };
+                // Never substitute `EventHeader.ProcessId` when ETW omits the parent PID: the header
+                // records the event issuer thread's PID, not necessarily the true parent, and a
+                // non-zero placeholder would block later same-instance snapshot enrichment.
                 let parent_pid = info
                     .get_u32("ParentProcessID")
                     .or_else(|| info.get_u32("ParentProcessId"))
-                    .unwrap_or(record.EventHeader.ProcessId);
+                    .unwrap_or(0);
                 let create_time_100ns = info.get_u64("CreateTime").unwrap_or(0);
                 let exe_path = info
                     .get_string("ImageName")
@@ -183,7 +186,8 @@ fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Opti
                 let pid = read_raw_userdata_u32_at_0(record).filter(|&p| p != 0)?;
                 (
                     pid,
-                    record.EventHeader.ProcessId,
+                    // Leave parent_pid as 0 (unknown) so Toolhelp32 snapshot can backfill it.
+                    0,
                     0,
                     String::new(),
                     String::new(),
@@ -488,5 +492,65 @@ fn handle_kernel_file(
             None
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, RwLock};
+
+    use crate::dns_cache::DnsResolutionCache;
+    use crate::path_norm::DosVolumeMap;
+
+    use super::super::context::HoneypotHandleTracker;
+    use super::super::file_canary::CanaryMatcher;
+    use super::super::session::EventSinkFn;
+
+    /// `PR23-R30-T1-01`: When ETW omits or fails to decode `ParentProcessID` in `ProcessStart`,
+    /// `handle_process_start` must emit `parent_pid = 0` rather than substituting
+    /// `record.EventHeader.ProcessId`.
+    #[test]
+    fn sens_p3_15_pr23_r30_t1_process_start_missing_parent_pid_does_not_substitute_header_pid() {
+        let sink: EventSinkFn = Arc::new(|_| true);
+        let ctx = EtwCallbackContext {
+            sink,
+            dns_cache: Mutex::new(DnsResolutionCache::default()),
+            volume_map: DosVolumeMap::with_mappings(Vec::new()),
+            canary_matcher: Arc::new(RwLock::new(CanaryMatcher::default())),
+            honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
+            has_honeypot_handles: AtomicBool::new(false),
+            registry_kcb_names: Mutex::new(HashMap::new()),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            session_name_nul: vec![0],
+        };
+
+        // 4-byte aligned non-existent dummy PID so `inspect_process_by_pid` returns `None`.
+        let child_pid: u32 = 0xFFFF_FFFC;
+        let mut user_data = child_pid.to_le_bytes();
+        let mut record = EVENT_RECORD::default();
+        record.EventHeader.ProcessId = 800;
+        record.EventHeader.EventDescriptor.Id = 1;
+        record.UserData = user_data.as_mut_ptr().cast();
+        record.UserDataLength = user_data.len() as u16;
+
+        let event = handle_process_start(&record, &ctx)
+            .expect("ProcessStart with valid UserData PID should emit event");
+        match event {
+            SensorEvent::ProcessStart {
+                identity,
+                parent_pid,
+                ..
+            } => {
+                assert_eq!(identity.pid, child_pid);
+                assert_eq!(
+                    parent_pid, 0,
+                    "missing ETW parent PID must remain 0 instead of using EventHeader.ProcessId"
+                );
+            }
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
     }
 }

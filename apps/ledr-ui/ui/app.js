@@ -1267,17 +1267,9 @@
         bannerClass += " is-expired";
         if (!susp.parentSuspended && susp.remainingChildren > 0) {
           if (susp.parentShutdownOutcome === "gone") {
-            const atCleared =
-              susp.shutdownClearedAtMs !== null
-                ? ` at ${formatTime(susp.shutdownClearedAtMs)}`
-                : "";
-            subline = `60s timeout elapsed — parent already exited or PID reused before daemon shutdown${atCleared}, ${susp.remainingChildren} child process(es) still frozen`;
+            subline = `60s timeout elapsed — parent already exited or PID reused before daemon shutdown, ${susp.remainingChildren} child process(es) still frozen`;
           } else if (susp.parentShutdownOutcome === "resumed") {
-            const atResumed =
-              susp.shutdownResumedAtMs !== null
-                ? ` at ${formatTime(susp.shutdownResumedAtMs)}`
-                : "";
-            subline = `60s timeout elapsed — parent resumed on daemon shutdown${atResumed}, ${susp.remainingChildren} child process(es) still frozen`;
+            subline = `60s timeout elapsed — parent resumed on daemon shutdown, ${susp.remainingChildren} child process(es) still frozen`;
           } else {
             subline = `60s timeout elapsed — parent not currently suspended, ${susp.remainingChildren} child process(es) still frozen`;
           }
@@ -1310,17 +1302,9 @@
         bannerClass += " is-frozen";
         if (!susp.parentSuspended && susp.remainingChildren > 0) {
           if (susp.parentShutdownOutcome === "gone") {
-            const atCleared =
-              susp.shutdownClearedAtMs !== null
-                ? ` at ${formatTime(susp.shutdownClearedAtMs)}`
-                : "";
-            subline = `Parent already exited or PID reused before daemon shutdown${atCleared}; ${susp.remainingChildren} child process(es) still frozen — awaiting decision`;
+            subline = `Parent already exited or PID reused before daemon shutdown; ${susp.remainingChildren} child process(es) still frozen — awaiting decision`;
           } else if (susp.parentShutdownOutcome === "resumed") {
-            const atResumed =
-              susp.shutdownResumedAtMs !== null
-                ? ` at ${formatTime(susp.shutdownResumedAtMs)}`
-                : "";
-            subline = `Parent resumed on daemon shutdown${atResumed}; ${susp.remainingChildren} child process(es) still frozen — awaiting decision`;
+            subline = `Parent resumed on daemon shutdown; ${susp.remainingChildren} child process(es) still frozen — awaiting decision`;
           } else {
             subline = `${susp.remainingChildren} child process(es) still frozen (NtSuspendProcess) — awaiting decision`;
           }

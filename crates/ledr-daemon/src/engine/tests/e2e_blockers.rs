@@ -279,8 +279,10 @@ async fn outbound_mode_audit_never_suspends_or_adds_wfp_blocks() {
     assert_eq!(report.failed, 0);
 
     let now_ms = current_unix_ms();
-    let script_id = ProcessIdentity::new(42001, 2001);
-    let unknown_id = ProcessIdentity::new(42002, 2002);
+    let created_ms = now_ms - 1_000;
+    let created_100ns = 116_444_736_000_000_000u64 + (created_ms as u64) * 10_000;
+    let script_id = ProcessIdentity::new(42001, created_100ns);
+    let unknown_id = ProcessIdentity::new(42002, created_100ns + 1);
 
     send_process_start(
         &engine,
@@ -289,6 +291,8 @@ async fn outbound_mode_audit_never_suspends_or_adds_wfp_blocks() {
     );
     send_process_start(&engine, unknown_id, r"C:\Apps\unknown.exe");
 
+    let event_ts_ms = current_unix_ms();
+
     // DNS resolution for a domain-scoped NetworkBlock must not pre-materialize WFP filters in Audit mode.
     let _ = engine.process_event_with_lane(
         &SensorEvent::DnsQuery {
@@ -296,7 +300,7 @@ async fn outbound_mode_audit_never_suspends_or_adds_wfp_blocks() {
             query_name: "c2.audit-blocked.example".to_string(),
             query_type: 1,
             resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 89))],
-            timestamp_ms: now_ms,
+            timestamp_ms: event_ts_ms,
         },
         EventLane::HighPriority,
     );
@@ -313,7 +317,7 @@ async fn outbound_mode_audit_never_suspends_or_adds_wfp_blocks() {
                 dst_ip,
                 dst_port: 443,
                 domain_hint: None,
-                timestamp_ms: now_ms,
+                timestamp_ms: event_ts_ms,
             },
             EventLane::HighPriority,
         );
@@ -3070,4 +3074,136 @@ async fn pr23_r26_t2_parent_only_enrichment_reevaluates_sigma_with_merged_launch
             Some(4900)
         );
     }
+}
+
+/// `PR23-R30-T1-02`: When an ETW `ProcessStart` arrives with `parent_pid = 0` (omitted by ETW),
+/// a subsequent same-instance Toolhelp32 snapshot carrying the real `parent_pid` must correct
+/// both `ppid` and `parent_instance_id` in memory and SQLite without losing existing metadata or
+/// allowing a later conflicting `parent_pid` to overwrite the confirmed parent.
+#[tokio::test]
+async fn pr23_r30_t1_same_instance_snapshot_corrects_missing_etw_ppid_in_memory_and_sqlite() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let engine = start_stopped_engine(
+        store.clone(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("5".repeat(64))),
+    )
+    .await;
+
+    let now_ms = current_unix_ms();
+    let parent_ms = now_ms - 10_000;
+    let child_ms = now_ms - 5_000;
+    let parent_100ns = 116_444_736_000_000_000u64 + (parent_ms as u64) * 10_000;
+    let child_100ns = 116_444_736_000_000_000u64 + (child_ms as u64) * 10_000;
+
+    let parent_1200 = ProcessIdentity::new(4920, parent_100ns);
+    let child = ProcessIdentity::new(4924, child_100ns);
+    let child_exe = r"C:\Tools\worker.exe";
+    let child_cmd = "worker.exe --run";
+
+    // 1. Initial ETW ProcessStart arrives with unknown parent_pid = 0.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: child,
+            parent_pid: 0,
+            exe_path: child_exe.to_string(),
+            command_line: child_cmd.to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    store.flush_batch().expect("flush initial child");
+    let initial_snap = store
+        .query_flight_recorder(50, Some(&child.instance_id()))
+        .expect("query initial child");
+    let initial_row = initial_snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == child.instance_id())
+        .expect("initial child row exists");
+    assert_eq!(initial_row.ppid, 0);
+    assert_eq!(initial_row.parent_instance_id, None);
+
+    // 2. Real parent arrives, followed by same-instance Toolhelp32 snapshot carrying ppid = 4920
+    //    and empty command_line.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: parent_1200,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\cmd.exe".to_string(),
+            command_line: "cmd.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: child,
+            parent_pid: 4920,
+            exe_path: child_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = table
+            .get_by_instance_id(&child.instance_id())
+            .expect("child entry in memory");
+        assert_eq!(entry.ppid, 4920);
+        assert_eq!(
+            entry.parent_instance_id.as_deref(),
+            Some(parent_1200.instance_id().as_str())
+        );
+    }
+
+    store.flush_batch().expect("flush corrected child");
+    let corrected_snap = store
+        .query_flight_recorder(50, Some(&child.instance_id()))
+        .expect("query corrected child");
+    let corrected_row = corrected_snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == child.instance_id())
+        .expect("corrected child row exists");
+    assert_eq!(corrected_row.ppid, 4920);
+    assert_eq!(
+        corrected_row.parent_instance_id.as_deref(),
+        Some(parent_1200.instance_id().as_str())
+    );
+    assert_eq!(corrected_row.command_line.as_deref(), Some(child_cmd));
+
+    // 3. Subsequent conflicting parent_pid (9999) must NOT overwrite confirmed ppid/parent_instance_id.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: child,
+            parent_pid: 9999,
+            exe_path: child_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    store.flush_batch().expect("flush after conflict");
+    let after_conflict_snap = store
+        .query_flight_recorder(50, Some(&child.instance_id()))
+        .expect("query after conflicting ppid");
+    let after_conflict_row = after_conflict_snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == child.instance_id())
+        .expect("child row after conflict exists");
+    assert_eq!(after_conflict_row.ppid, 4920);
+    assert_eq!(
+        after_conflict_row.parent_instance_id.as_deref(),
+        Some(parent_1200.instance_id().as_str())
+    );
 }

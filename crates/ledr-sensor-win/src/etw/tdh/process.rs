@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    GetProcessId, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 
 use crate::OwnedHandle;
@@ -78,6 +78,16 @@ pub(crate) fn inspect_process_by_pid(
     // SAFETY: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` is read-only metadata access.
     let raw_handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
     let handle = OwnedHandle::new(raw_handle)?;
+
+    // Windows `OpenProcess` -> `PsLookupProcessByProcessId` ignores the low 2 bits of `pid`
+    // (`pid & !3`), so non-multiple-of-4 PIDs such as `pid + 1..=3` silently open `pid & !3`.
+    // Reject handles whose actual kernel PID does not match the requested `pid` (also fails
+    // closed if `GetProcessId` returns `0`).
+    // SAFETY: `handle` is an open process handle with `PROCESS_QUERY_LIMITED_INFORMATION`.
+    let actual_pid = unsafe { GetProcessId(handle.as_raw()) };
+    if actual_pid != pid {
+        return None;
+    }
 
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();

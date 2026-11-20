@@ -629,3 +629,50 @@ fn sens_p3_11_defense_controller_wfp_drop_sink_before_and_after_init() {
         assert!(!s.has_sink);
     }
 }
+
+#[test]
+fn sens_p3_14_open_process_and_guard_reject_low_bit_pid_aliases() {
+    assert!(
+        open_process_checked(0, PROCESS_QUERY_LIMITED_INFORMATION).is_err(),
+        "open_process_checked must refuse PID 0"
+    );
+
+    let self_pid = std::process::id();
+    let self_handle = open_process_checked(self_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .expect("open_process_checked must open the exact current process PID");
+    let self_create_time = query_process_creation_time(self_handle.as_raw())
+        .expect("query current process CreationTime");
+    drop(self_handle);
+    assert!(self_create_time > 0);
+
+    let controller = WindowsDefenseController::new();
+    for offset in 1..=3u32 {
+        let alias_pid = self_pid.saturating_add(offset);
+        let err = match open_process_checked(alias_pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+            Ok(_) => panic!("open_process_checked must reject low-bit PID alias {alias_pid}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("mismatched PID"),
+            "expected mismatched PID error for alias {alias_pid}, got: {err}"
+        );
+
+        let alias_ident = ProcessIdentity::new(alias_pid, self_create_time);
+        assert!(
+            validate_target_process(&alias_ident).is_err(),
+            "validate_target_process must reject self-PID alias {alias_pid}"
+        );
+        assert!(
+            controller.suspend_process(&alias_ident, false).is_err(),
+            "suspend_process must reject self-PID alias {alias_pid}"
+        );
+
+        // Also ensure PIDs 5..=7 cannot alias System (PID 4).
+        let system_alias = ProcessIdentity::new(4 + offset, 12_345);
+        assert!(
+            validate_target_process(&system_alias).is_err(),
+            "validate_target_process must reject System PID alias {}",
+            system_alias.pid
+        );
+    }
+}

@@ -1784,3 +1784,92 @@ async fn pr21_v2_bug_0002_deferred_sibling_children_survive_shutdown_and_partial
         "surviving sibling must resume transferred child_b even after partial shutdown cleared process_suspended"
     );
 }
+
+#[tokio::test]
+async fn pr21_v2_ci_0001_canary_backfill_rejects_low_bit_pid_alias_and_missing_live_exe() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let inspector = Arc::new(FixedShaInspector("9".repeat(64)));
+
+    let engine = start_stopped_engine(
+        store.clone(),
+        DaemonConfig::default(),
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        inspector,
+    )
+    .await;
+
+    let live_pid = std::process::id();
+    let now_ms = current_unix_ms();
+
+    // Part A: Windows OpenProcess masks off the low 2 bits (`pid & !3`), so `live_pid + 1..=3`
+    // would previously open `live_pid` and falsely backfill & suspend an unregistered synthetic PID
+    // (the exact CI failure mode hit by `daemon_p2_10` when PID 7700 existed on the runner).
+    for offset in 1..=3u32 {
+        let alias_pid = live_pid.saturating_add(offset);
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::CanaryFileAccess {
+                pid: alias_pid,
+                target_path: format!(r"C:\Users\alice\.ssh\id_rsa_{offset}"),
+                category: CanaryCategory::SshKey,
+                access_mask: 1,
+                is_write_or_delete: false,
+                timestamp_ms: now_ms + i64::from(offset),
+            },
+            EventLane::HighPriority,
+        );
+    }
+
+    assert!(
+        defense.suspended().is_empty(),
+        "low-bit PID aliases of a live process must never be backfilled or suspended"
+    );
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    assert_eq!(alerts.len(), 3);
+    assert!(alerts.iter().all(|a| !a.process_suspended));
+    assert!(alerts.iter().all(|a| a.process_instance_id.is_none()));
+
+    // Part B: When the process table already has a known exe_path with `create_time_100ns == 0`,
+    // backfill must fail closed if the live OS query cannot verify `exe_path` (`None` or empty).
+    let zero_ident = ProcessIdentity::new(live_pid, 0);
+    let mut proc_ctx = crate::engine::events::ResolvedProcessContext {
+        proc_identity: Some(zero_ident),
+        proc_instance_id: Some(zero_ident.instance_id()),
+        proc_exe_path: Some(r"C:\Temp\zero_ts.exe".to_string()),
+        ..Default::default()
+    };
+    let live_without_exe = ledr_sensor_win::etw::LiveProcessInfo {
+        create_time_100ns: 133_000_000_000_000_000,
+        exe_path: None,
+        command_line: None,
+    };
+    engine.apply_canary_live_process_backfill(
+        live_pid,
+        &mut proc_ctx,
+        now_ms + 100,
+        live_without_exe,
+    );
+    assert_eq!(
+        proc_ctx.proc_identity,
+        Some(zero_ident),
+        "backfill must fail closed when existing exe_path cannot be verified against live exe_path"
+    );
+    assert_eq!(
+        proc_ctx.proc_instance_id.as_deref(),
+        Some(zero_ident.instance_id().as_str())
+    );
+
+    // Same for whitespace-only live exe_path.
+    let live_blank_exe = ledr_sensor_win::etw::LiveProcessInfo {
+        create_time_100ns: 133_000_000_000_000_000,
+        exe_path: Some("   ".to_string()),
+        command_line: None,
+    };
+    engine.apply_canary_live_process_backfill(
+        live_pid,
+        &mut proc_ctx,
+        now_ms + 100,
+        live_blank_exe,
+    );
+    assert_eq!(proc_ctx.proc_identity, Some(zero_ident));
+}

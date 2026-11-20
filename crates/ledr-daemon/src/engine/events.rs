@@ -327,15 +327,25 @@ impl DaemonEngine {
         let Some(live) = ledr_sensor_win::etw::inspect_live_process(*pid) else {
             return;
         };
+        self.apply_canary_live_process_backfill(*pid, proc_ctx, event_ts_ms, live);
+    }
+
+    pub(super) fn apply_canary_live_process_backfill(
+        &self,
+        pid: u32,
+        proc_ctx: &mut ResolvedProcessContext,
+        event_ts_ms: i64,
+        live: ledr_sensor_win::etw::LiveProcessInfo,
+    ) {
         if live.create_time_100ns == 0 {
             return;
         }
-        // Guard against PID reuse (`BUG_0001`): if the live OS process at `*pid` was created
+        // Guard against PID reuse (`BUG_0001`): if the live OS process at `pid` was created
         // strictly after the canary event timestamp, it cannot be the original accessor.
         let live_created_ms = super::filetime_100ns_to_unix_ms(live.create_time_100ns, i64::MAX);
         if live_created_ms > event_ts_ms {
             tracing::debug!(
-                pid = *pid,
+                pid,
                 live_created_ms,
                 event_ts_ms,
                 "skipping canary process backfill because live process started after event timestamp (possible PID reuse)"
@@ -354,18 +364,22 @@ impl DaemonEngine {
         }
 
         // If the table already had a non-empty exe_path (e.g., synthetic PID with zero timestamp),
-        // only backfill when the live OS process matches that executable path.
-        if let (Some(existing_exe), Some(live_exe)) = (
-            proc_ctx
-                .proc_exe_path
+        // only backfill when the live OS process reports a matching executable path (fail closed
+        // if the live image path cannot be queried).
+        if let Some(existing_exe) = proc_ctx
+            .proc_exe_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let Some(live_exe) = live
+                .exe_path
                 .as_deref()
                 .map(str::trim)
-                .filter(|s| !s.is_empty()),
-            live.exe_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        ) {
+                .filter(|s| !s.is_empty())
+            else {
+                return;
+            };
             if !existing_exe.eq_ignore_ascii_case(live_exe) {
                 return;
             }
@@ -400,7 +414,7 @@ impl DaemonEngine {
             })
             .unwrap_or_default();
 
-        let ident = ProcessIdentity::new(*pid, live.create_time_100ns);
+        let ident = ProcessIdentity::new(pid, live.create_time_100ns);
         let res = {
             let mut table = self
                 .process_table
@@ -431,7 +445,7 @@ impl DaemonEngine {
             "OBSERVED",
         ) {
             tracing::warn!(
-                pid = *pid,
+                pid,
                 error = %err,
                 "failed to persist on-demand backfilled ProcessStart into SQLite store"
             );
@@ -450,7 +464,7 @@ impl DaemonEngine {
         }
 
         tracing::debug!(
-            pid = *pid,
+            pid,
             create_time_100ns = live.create_time_100ns,
             exe_path = %exe_path,
             "backfilled missing process context on canary file access via on-demand PID lookup"

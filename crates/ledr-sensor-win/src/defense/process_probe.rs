@@ -6,7 +6,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+    GetProcessId, GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
     QueryFullProcessImageNameW,
 };
 
@@ -58,10 +58,25 @@ pub(super) fn snapshot_process_entries() -> Result<Vec<SnapshotEntry>, String> {
 }
 
 pub(super) fn open_process_checked(pid: u32, access: PROCESS_ACCESS_RIGHTS) -> Result<OwnedHandle, String> {
+    if pid == 0 {
+        return Err("OpenProcess(PID 0) refused".to_string());
+    }
     // SAFETY: `OpenProcess` takes plain integer flags and PID; result handle is RAII-wrapped.
     let raw = unsafe { OpenProcess(access, false, pid) }
         .map_err(|err| format!("OpenProcess(PID {pid}) failed: {err}"))?;
-    OwnedHandle::new(raw).ok_or_else(|| format!("OpenProcess(PID {pid}) returned invalid handle"))
+    let handle = OwnedHandle::new(raw)
+        .ok_or_else(|| format!("OpenProcess(PID {pid}) returned invalid handle"))?;
+    // Windows `OpenProcess` ignores the low 2 bits of `pid` (`pid & !3`), so `pid + 1..=3` can
+    // silently open `pid & !3` (including PID 4 via 5..=7 or self via `self_pid + 1..=3`).
+    // Callers pass `PROCESS_QUERY_LIMITED_INFORMATION`; fail closed on any PID mismatch or `0`.
+    // SAFETY: `handle` is an open process handle owned by `handle`.
+    let actual_pid = unsafe { GetProcessId(handle.as_raw()) };
+    if actual_pid != pid {
+        return Err(format!(
+            "OpenProcess(PID {pid}) resolved to mismatched PID {actual_pid}"
+        ));
+    }
+    Ok(handle)
 }
 
 pub(super) fn query_full_image_name(handle: HANDLE) -> Option<String> {

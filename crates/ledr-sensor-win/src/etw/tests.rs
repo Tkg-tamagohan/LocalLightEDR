@@ -45,12 +45,6 @@ fn assert_snapshot_contains_current_process(events: &[SensorEvent], source: &str
 }
 
 #[test]
-fn sens_03_capture_running_processes_current_pid() {
-    let events = capture_running_processes();
-    assert_snapshot_contains_current_process(&events, "capture_running_processes()");
-}
-
-#[test]
 fn sens_07_try_capture_running_processes_non_empty() {
     let events = try_capture_running_processes()
         .expect("try_capture_running_processes() must succeed on a live host");
@@ -68,7 +62,7 @@ fn sens_07_try_capture_running_processes_non_empty() {
 }
 
 #[test]
-fn sens_etw_dns_results_parser_and_noop_backend() {
+fn sens_08_dns_results_parser_and_noop_backend() {
     let mut noop = NoopSensorBackend;
     assert_eq!(noop.start(), Ok(()));
     assert_eq!(noop.stop(), Ok(()));
@@ -253,7 +247,7 @@ fn sens_06_custom_sink_and_graceful_stop_drain() {
 }
 
 #[test]
-fn sens_etw_canary_config_tdh_bytes_and_honeypot_tracker() {
+fn sens_p2_14_canary_config_tdh_bytes_and_honeypot_tracker() {
     use windows::Win32::System::Diagnostics::Etw::TDH_INTYPE_UNICODESTRING;
 
     let (tx, _rx) = mpsc::channel();

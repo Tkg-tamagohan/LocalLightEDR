@@ -252,9 +252,19 @@ where
         None
     };
     if let Some(inspected) = inspected {
-        // Verify process generation before merging live attributes when ETW provided a creation time.
-        let same_incarnation =
-            create_time_100ns == 0 || inspected.create_time_100ns == create_time_100ns;
+        // Verify process generation before merging live attributes:
+        // - When ETW provided `CreateTime`, require an exact 100ns match.
+        // - When `CreateTime` is missing (`0`), bound by `EventHeader.TimeStamp`
+        //   (FILETIME 100ns under `ClientContext = 2`) to reject newer PID-reused processes.
+        // - When both timestamps are absent, fail closed.
+        let same_incarnation = if create_time_100ns != 0 {
+            inspected.create_time_100ns == create_time_100ns
+        } else if record.EventHeader.TimeStamp > 0 {
+            let event_ts_100ns = record.EventHeader.TimeStamp as u64;
+            inspected.create_time_100ns > 0 && inspected.create_time_100ns <= event_ts_100ns
+        } else {
+            false
+        };
         if same_incarnation {
             if parent_pid == 0 {
                 if let Some(inspected_ppid) = inspected.parent_pid {
@@ -700,6 +710,7 @@ mod tests {
         let mut user_data = self_pid.to_le_bytes();
         let mut record = EVENT_RECORD::default();
         record.EventHeader.ProcessId = dummy_header_pid;
+        record.EventHeader.TimeStamp = expected_info.create_time_100ns as i64;
         record.EventHeader.EventDescriptor.Id = 1;
         record.UserData = user_data.as_mut_ptr().cast();
         record.UserDataLength = user_data.len() as u16;
@@ -779,6 +790,138 @@ mod tests {
         .expect("event emitted when inspect sees reused PID");
         match ev_reused {
             SensorEvent::ProcessStart { parent_pid, .. } => assert_eq!(parent_pid, 0),
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
+    }
+
+    /// `PR23-R36-T1-01`: When `CreateTime` is missing (`0`), live inspection must verify
+    /// `0 < inspected.create_time_100ns <= EventHeader.TimeStamp` (and fail closed when
+    /// `EventHeader.TimeStamp <= 0`) across both TDH `Ok` and TDH `Err` paths so a newer
+    /// process that reused the PID cannot supply `parent_pid` or launch metadata.
+    #[test]
+    fn sens_p3_19_pr23_r36_t1_missing_create_time_bounds_live_inspect_by_event_timestamp() {
+        let ctx = dummy_etw_ctx();
+        let event_ts_100ns: u64 = 133_800_000_005_000_000;
+        let earlier_create_100ns: u64 = 133_800_000_000_000_000;
+        let newer_reused_create_100ns: u64 = 133_800_000_009_000_000;
+
+        let mut user_data = 4242u32.to_le_bytes();
+        let mut record = EVENT_RECORD::default();
+        record.EventHeader.ProcessId = 800;
+        record.EventHeader.TimeStamp = event_ts_100ns as i64;
+        record.EventHeader.EventDescriptor.Id = 1;
+        record.UserData = user_data.as_mut_ptr().cast();
+        record.UserDataLength = user_data.len() as u16;
+
+        let make_props_no_ct = || StubPropertySource {
+            pid: Some(4242),
+            parent_pid: None,
+            create_time_100ns: None,
+            image_name: None,
+            command_line: None,
+        };
+        let older_inspect = || {
+            Some(ProcessInspectInfo {
+                parent_pid: Some(1200),
+                create_time_100ns: earlier_create_100ns,
+                exe_path: Some(r"C:\Tools\legit.exe".to_string()),
+                command_line: Some("legit.exe --ok".to_string()),
+            })
+        };
+        let newer_inspect = || {
+            Some(ProcessInspectInfo {
+                parent_pid: Some(7777),
+                create_time_100ns: newer_reused_create_100ns,
+                exe_path: Some(r"C:\Tools\reused.exe".to_string()),
+                command_line: Some("reused.exe --after".to_string()),
+            })
+        };
+
+        // (a) TDH Ok + missing CreateTime, inspected created <= event timestamp -> accepted.
+        let ev_ok_valid =
+            build_process_start_event(&record, &ctx, Ok(make_props_no_ct()), |_| older_inspect())
+                .expect("tdh Ok with valid bounded inspect emits event");
+        match ev_ok_valid {
+            SensorEvent::ProcessStart {
+                identity,
+                parent_pid,
+                exe_path,
+                command_line,
+                ..
+            } => {
+                assert_eq!(identity.create_time_100ns, earlier_create_100ns);
+                assert_eq!(parent_pid, 1200);
+                assert_eq!(exe_path, r"C:\Tools\legit.exe");
+                assert_eq!(command_line, "legit.exe --ok");
+            }
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
+
+        // (b-1) TDH Ok + missing CreateTime, inspected created > event timestamp -> rejected.
+        let ev_ok_reused =
+            build_process_start_event(&record, &ctx, Ok(make_props_no_ct()), |_| newer_inspect())
+                .expect("tdh Ok with reused PID inspect emits event without reused metadata");
+        match ev_ok_reused {
+            SensorEvent::ProcessStart {
+                identity,
+                parent_pid,
+                exe_path,
+                command_line,
+                ..
+            } => {
+                assert_eq!(identity.create_time_100ns, event_ts_100ns);
+                assert_eq!(parent_pid, 0);
+                assert!(exe_path.is_empty());
+                assert!(command_line.is_empty());
+            }
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
+
+        // (b-2) TDH Err, inspected created > event timestamp -> rejected.
+        let ev_err_reused = build_process_start_event::<StubPropertySource, _>(
+            &record,
+            &ctx,
+            Err(1168),
+            |_| newer_inspect(),
+        )
+        .expect("tdh Err with reused PID inspect emits event without reused metadata");
+        match ev_err_reused {
+            SensorEvent::ProcessStart {
+                identity,
+                parent_pid,
+                exe_path,
+                command_line,
+                ..
+            } => {
+                assert_eq!(identity.create_time_100ns, event_ts_100ns);
+                assert_eq!(parent_pid, 0);
+                assert!(exe_path.is_empty());
+                assert!(command_line.is_empty());
+            }
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
+
+        // (c) Both CreateTime and EventHeader.TimeStamp absent -> fail closed.
+        let mut no_ts_record = record;
+        no_ts_record.EventHeader.TimeStamp = 0;
+        let ev_no_ts =
+            build_process_start_event(&no_ts_record, &ctx, Ok(make_props_no_ct()), |_| {
+                older_inspect()
+            })
+            .expect("missing both timestamps still emits event without unverified live inspect");
+        match ev_no_ts {
+            SensorEvent::ProcessStart {
+                identity,
+                parent_pid,
+                exe_path,
+                command_line,
+                ..
+            } => {
+                assert_eq!(identity.create_time_100ns, 0);
+                assert_eq!(parent_pid, 0);
+                assert!(exe_path.is_empty());
+                assert!(command_line.is_empty());
+            }
             other => panic!("expected ProcessStart, got {other:?}"),
         }
     }

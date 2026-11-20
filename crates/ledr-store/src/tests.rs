@@ -618,6 +618,17 @@ fn store_p2_analysis_list_unresolved_suspended_alerts_uses_top_level_json_array(
     store
         .record_alert(&mk_alert("inc-malformed-parent", 3, true, "{bad json"))
         .expect("record inc-malformed-parent");
+    // 3b. EXPIRED_SUSPENDED alert with process_suspended=false and non-empty top-level array.
+    let mut expired_child_only = mk_alert(
+        "inc-expired-child",
+        35,
+        false,
+        r#"{"suspended_children":["106:1006"]}"#,
+    );
+    expired_child_only.status = AlertStatus::ExpiredSuspended;
+    store
+        .record_alert(&expired_child_only)
+        .expect("record inc-expired-child");
 
     // Must be EXCLUDED:
     // 4. Pretty-printed empty array with spaces (would fool LIKE/NOT LIKE).
@@ -655,14 +666,20 @@ fn store_p2_analysis_list_unresolved_suspended_alerts_uses_top_level_json_array(
             r#"{"suspended_children":null}"#,
         ))
         .expect("record exc-null");
-    // 7. Malformed JSON with process_suspended=false must be excluded without SQLite error.
+    // 7. Malformed JSON / empty string with process_suspended=false must be excluded without SQLite error.
     store
         .record_alert(&mk_alert("exc-malformed", 8, false, "{not valid json"))
         .expect("record exc-malformed");
-    // 8. Top-level JSON array instead of object.
+    store
+        .record_alert(&mk_alert("exc-empty-str", 81, false, ""))
+        .expect("record exc-empty-str");
+    // 8. Top-level JSON array / scalar instead of object.
     store
         .record_alert(&mk_alert("exc-top-array", 9, false, r#"["105:1005"]"#))
         .expect("record exc-top-array");
+    store
+        .record_alert(&mk_alert("exc-top-scalar", 91, false, "null"))
+        .expect("record exc-top-scalar");
 
     let found = store
         .list_unresolved_suspended_alerts()
@@ -670,6 +687,11 @@ fn store_p2_analysis_list_unresolved_suspended_alerts_uses_top_level_json_array(
     let found_ids: Vec<&str> = found.iter().map(|a| a.alert_id.as_str()).collect();
     assert_eq!(
         found_ids,
-        vec!["inc-nested-empty", "inc-whitespace", "inc-malformed-parent"]
+        vec![
+            "inc-nested-empty",
+            "inc-whitespace",
+            "inc-malformed-parent",
+            "inc-expired-child",
+        ]
     );
 }

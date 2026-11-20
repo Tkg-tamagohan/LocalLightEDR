@@ -816,20 +816,21 @@ impl DaemonEngine {
         })
     }
 
-    /// Inspects all other unresolved suspended alerts to determine whether `process_instance_id`
-    /// is still held suspended as a parent, and collects every specific [`ProcessIdentity`] still
-    /// held suspended (as parent or in `suspended_children`) by another unresolved alert.
+    /// Inspects all other unresolved suspended alerts to collect unresolved sibling alerts still
+    /// holding `process_instance_id` suspended as a parent, along with every specific
+    /// [`ProcessIdentity`] still held suspended (as parent or in `suspended_children`) by another
+    /// unresolved alert.
     fn other_unresolved_containment(
         &self,
         alert_id: &str,
         process_instance_id: Option<&str>,
-    ) -> Result<(bool, HashSet<ProcessIdentity>), String> {
+    ) -> Result<(Vec<AlertRecord>, HashSet<ProcessIdentity>), String> {
         let unresolved = self
             .store
             .list_unresolved_suspended_alerts()
             .map_err(|err| format!("failed to query unresolved alerts: {err}"))?;
 
-        let mut other_holds_parent = false;
+        let mut parent_holding_siblings = Vec::new();
         let mut other_held_identities = HashSet::new();
 
         for other in unresolved {
@@ -842,15 +843,13 @@ impl DaemonEngine {
                 .and_then(ProcessIdentity::from_instance_id)
                 .filter(|id| id.create_time_100ns != 0);
 
+            let holds_target_parent = other.process_suspended
+                && matches!(
+                    (process_instance_id, other.process_instance_id.as_deref()),
+                    (Some(target_proc), Some(other_proc)) if target_proc == other_proc
+                );
+
             if other.process_suspended {
-                if let (Some(target_proc), Some(other_proc)) = (
-                    process_instance_id,
-                    other.process_instance_id.as_deref(),
-                ) {
-                    if target_proc == other_proc {
-                        other_holds_parent = true;
-                    }
-                }
                 if let Some(id) = other_parent {
                     other_held_identities.insert(id);
                 }
@@ -869,24 +868,137 @@ impl DaemonEngine {
                     &mut other_children,
                 );
             }
+
+            if holds_target_parent {
+                parent_holding_siblings.push(other);
+            }
         }
 
-        if other_holds_parent {
+        if !parent_holding_siblings.is_empty() {
             tracing::info!(
                 alert_id = %alert_id,
                 process_instance_id = process_instance_id.unwrap_or("<none>"),
+                sibling_count = parent_holding_siblings.len(),
                 "keeping process suspended because another unresolved suspended alert exists"
             );
         }
 
-        Ok((other_holds_parent, other_held_identities))
+        Ok((parent_holding_siblings, other_held_identities))
+    }
+
+    /// Transfers deferred `suspended_children` from an alert being allowed onto unresolved sibling
+    /// alert(s) that still hold the same parent suspended, so neither a subsequent shutdown
+    /// (`list_unresolved_suspended_alerts`) nor a post-partial-shutdown allow on the surviving
+    /// sibling can orphan frozen children.
+    fn transfer_deferred_suspended_children(
+        &self,
+        source_alert_id: &str,
+        parent_holding_siblings: &[AlertRecord],
+        deferred_children: &[ProcessIdentity],
+    ) -> Result<(), String> {
+        if deferred_children.is_empty() {
+            return Ok(());
+        }
+
+        let mut adopted_count = 0usize;
+        let mut last_err: Option<String> = None;
+
+        for sibling in parent_holding_siblings {
+            let mut ctx_val = match serde_json::from_str::<serde_json::Value>(&sibling.context_json)
+            {
+                Ok(val) => val,
+                Err(err) => {
+                    last_err = Some(format!(
+                        "sibling alert {} has invalid context_json: {err}",
+                        sibling.alert_id
+                    ));
+                    continue;
+                }
+            };
+            let Some(obj) = ctx_val.as_object_mut() else {
+                last_err = Some(format!(
+                    "sibling alert {} context_json is not a JSON object",
+                    sibling.alert_id
+                ));
+                continue;
+            };
+
+            let mut merged_entries: Vec<serde_json::Value> = match obj.get("suspended_children") {
+                Some(serde_json::Value::Array(arr)) => arr.clone(),
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(_) => {
+                    last_err = Some(format!(
+                        "sibling alert {} has non-array suspended_children field",
+                        sibling.alert_id
+                    ));
+                    continue;
+                }
+            };
+
+            let mut existing_ids: HashSet<ProcessIdentity> = merged_entries
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(ProcessIdentity::from_instance_id)
+                .filter(|id| id.create_time_100ns != 0)
+                .collect();
+
+            let mut changed = false;
+            for child in deferred_children {
+                if existing_ids.insert(*child) {
+                    merged_entries.push(serde_json::Value::String(child.instance_id()));
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                adopted_count += 1;
+                continue;
+            }
+
+            obj.insert(
+                "suspended_children".to_string(),
+                serde_json::Value::Array(merged_entries),
+            );
+            match self.store.update_alert_suspension_state(
+                &sibling.alert_id,
+                sibling.process_suspended,
+                &ctx_val.to_string(),
+            ) {
+                Ok(true) => {
+                    adopted_count += 1;
+                }
+                Ok(false) => {
+                    last_err = Some(format!(
+                        "sibling alert {} disappeared while transferring suspended_children",
+                        sibling.alert_id
+                    ));
+                }
+                Err(err) => {
+                    last_err = Some(format!(
+                        "failed updating sibling alert {} suspended_children: {err}",
+                        sibling.alert_id
+                    ));
+                }
+            }
+        }
+
+        if adopted_count == 0 {
+            return Err(format!(
+                "failed to preserve {} deferred suspended child(ren) from alert {source_alert_id} onto unresolved sibling alert(s): {}",
+                deferred_children.len(),
+                last_err.unwrap_or_else(|| "no eligible unresolved sibling alert".to_string())
+            ));
+        }
+
+        Ok(())
     }
 
     /// Resumes the parent and/or recorded `suspended_children` for `alert` on an allow decision
     /// (`AllowOnce` / `AllowPermanent`), handling parent and child suspension states
     /// independently so children left suspended after a partial shutdown resume are still
     /// resumed when `alert.process_suspended` is already `false`, while preserving containment
-    /// required by any other unresolved suspended alert.
+    /// required by any other unresolved suspended alert (including transferring deferred
+    /// `suspended_children` onto surviving parent-holding sibling alerts).
     fn resume_alert_targets_if_unblocked(
         &self,
         alert: &AlertRecord,
@@ -914,10 +1026,20 @@ impl DaemonEngine {
             None
         };
 
-        let (other_holds_parent, other_held_identities) =
+        let (parent_holding_siblings, other_held_identities) =
             self.other_unresolved_containment(alert_id, alert.process_instance_id.as_deref())?;
 
-        if other_holds_parent {
+        if !parent_holding_siblings.is_empty() {
+            let deferred_children: Vec<ProcessIdentity> = own_suspended_children
+                .iter()
+                .copied()
+                .filter(|child| !other_held_identities.contains(child))
+                .collect();
+            self.transfer_deferred_suspended_children(
+                alert_id,
+                &parent_holding_siblings,
+                &deferred_children,
+            )?;
             return Ok(());
         }
 

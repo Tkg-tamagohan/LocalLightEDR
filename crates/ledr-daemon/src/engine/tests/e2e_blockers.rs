@@ -952,6 +952,10 @@ async fn pr21_analysis_0001_dedup_fast_path_skips_binary_inspector_when_no_rule_
         .resolve_alert(&net_alert.alert_id, ledr_proto::AlertDecision::AllowOnce)
         .expect("AllowOnce");
     let calls_after_resolve = inspector.calls();
+    assert_eq!(
+        calls_after_resolve, 1,
+        "AllowOnce resolution must not re-run BinaryInspector when sha256 is already recorded"
+    );
     let allow_connect_event = SensorEvent::NetworkConnect {
         pid: app_id.pid,
         protocol: 6,
@@ -970,6 +974,15 @@ async fn pr21_analysis_0001_dedup_fast_path_skips_binary_inspector_when_no_rule_
         .store
         .query_flight_recorder(20, Some(&app_id.instance_id()))
         .expect("query flight recorder");
+    let initial_row = snap
+        .network_events
+        .iter()
+        .find(|ev| ev.dst_port == 443)
+        .expect("initial connect event must be persisted in network_events");
+    assert_eq!(
+        initial_row.action, "ALERTED",
+        "initial unknown connect in PreemptiveOnly mode must persist ALERTED"
+    );
     let allowed_row = snap
         .network_events
         .iter()
@@ -1125,8 +1138,8 @@ fn pr21_analysis_0003_shutdown_resumes_and_checkpoints_within_budget_before_nrd_
             engine.shutdown_and_flush().await.expect("shutdown");
             let elapsed = started.elapsed();
             assert!(
-                elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(750),
-                "ANALYSIS_0003: shutdown with 250 ms budget and wedged NRD must respect budget window (took {elapsed:?})"
+                elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(480),
+                "ANALYSIS_0003: shutdown with 250 ms budget and wedged NRD must respect budget window (< 2x budget, took {elapsed:?})"
             );
 
             assert!(
@@ -1156,6 +1169,7 @@ fn pr21_analysis_0003_shutdown_resumes_and_checkpoints_within_budget_before_nrd_
 struct SlowResumeDefense {
     per_call_delay: std::time::Duration,
     resumed: Mutex<Vec<ProcessIdentity>>,
+    last_resume_finished_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl SlowResumeDefense {
@@ -1163,6 +1177,7 @@ impl SlowResumeDefense {
         Self {
             per_call_delay,
             resumed: Mutex::new(Vec::new()),
+            last_resume_finished_at: Mutex::new(None),
         }
     }
 
@@ -1171,6 +1186,13 @@ impl SlowResumeDefense {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    fn last_resume_finished_at(&self) -> Option<std::time::Instant> {
+        *self
+            .last_resume_finished_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -1185,6 +1207,10 @@ impl ActiveDefenseController for SlowResumeDefense {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(*target);
+        *self
+            .last_resume_finished_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -1229,10 +1255,10 @@ fn pr21_v2_analysis_0003_shutdown_budget_caps_resume_loop_and_skips_nrd_wait_whe
     let t1 = ProcessIdentity::new(66001, 600_001);
     let t2 = ProcessIdentity::new(66002, 600_002);
     let t3 = ProcessIdentity::new(66003, 600_003);
-    // Each resume_process call takes 250 ms > 150 ms total shutdown budget, so after t1
+    // Each resume_process call takes 350 ms > 300 ms total shutdown budget, so after t1
     // finishes the shared deadline is already exhausted: t2/t3 must be skipped and the
-    // wedged NRD thread must be detached immediately without starting a second budget wait.
-    let defense = Arc::new(SlowResumeDefense::new(Duration::from_millis(250)));
+    // wedged NRD thread must be detached immediately without starting a second 300 ms wait.
+    let defense = Arc::new(SlowResumeDefense::new(Duration::from_millis(350)));
 
     {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1265,7 +1291,7 @@ fn pr21_v2_analysis_0003_shutdown_budget_caps_resume_loop_and_skips_nrd_wait_whe
                 SigmaEngine::default(),
                 EarlyPruner::default(),
                 DaemonConfig {
-                    shutdown_flush_timeout_ms: 150,
+                    shutdown_flush_timeout_ms: 300,
                     resume_suspended_on_shutdown: true,
                     outbound_firewall_enabled: false,
                     ..DaemonConfig::default()
@@ -1303,17 +1329,29 @@ fn pr21_v2_analysis_0003_shutdown_budget_caps_resume_loop_and_skips_nrd_wait_whe
 
             let started = Instant::now();
             engine.shutdown_and_flush().await.expect("shutdown");
-            let elapsed = started.elapsed();
+            let finished_at = Instant::now();
+            let elapsed = finished_at.saturating_duration_since(started);
 
-            // Deterministic assertion: only t1 ran before the shared 150 ms budget expired.
+            // Deterministic assertion: only t1 ran before the shared 300 ms budget expired.
             assert_eq!(
                 defense.resumed(),
                 vec![t1],
                 "shutdown resume loop must stop once shared budget is exhausted"
             );
+            // Measure strictly post-resume duration (< 250 ms, strictly below the 300 ms budget)
+            // so any regression that starts a second full NRD timeout wait is guaranteed to fail.
+            let after_resume_elapsed = finished_at.saturating_duration_since(
+                defense
+                    .last_resume_finished_at()
+                    .expect("t1 resume timestamp recorded"),
+            );
             assert!(
-                elapsed < Duration::from_millis(650),
-                "shutdown must neither resume t2/t3 nor wait a second budget for wedged NRD (took {elapsed:?})"
+                after_resume_elapsed < Duration::from_millis(250),
+                "post-resume checkpoint + immediate NRD detach must not wait a second 300 ms budget (post-resume took {after_resume_elapsed:?}, total {elapsed:?})"
+            );
+            assert!(
+                elapsed < Duration::from_millis(620),
+                "total shutdown must stay strictly below resume_delay + second_budget (took {elapsed:?})"
             );
 
             // SQLite reflects exact partial progress: t1 cleared, t2 & t3 preserved as suspended.
@@ -1557,5 +1595,192 @@ async fn pr21_v2_bug_0002_allow_decisions_resume_leftover_children_after_partial
         sib_defense.resumed(),
         vec![shared_child],
         "shared child must be resumed once the last unresolved alert holding it is allowed"
+    );
+}
+
+#[tokio::test]
+async fn pr21_v2_bug_0002_deferred_sibling_children_survive_shutdown_and_partial_resume() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+
+    // Scenario A: Alert A (parent + child C1) is allowed FIRST while sibling Alert B (same
+    // parent, no recorded children yet) stays pending. Resolving A defers resuming parent/C1
+    // AND transfers C1 onto Alert B so a subsequent shutdown resumes BOTH parent and C1.
+    let parent_a = ProcessIdentity::new(67101, 710_001);
+    let child_a = ProcessIdentity::new(67102, 710_002);
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-xfer-a1".to_string(),
+            timestamp_ms: 1_732_000_100_000,
+            severity: AlertSeverity::Critical,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+            title: "Honeypot alert with suspended child".to_string(),
+            process_instance_id: Some(parent_a.instance_id()),
+            process_suspended: true,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": r"C:\Temp\xfer_a.exe",
+                "suspended_children": [child_a.instance_id()]
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("seed alert-xfer-a1");
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-xfer-a2".to_string(),
+            timestamp_ms: 1_732_000_100_010,
+            severity: AlertSeverity::High,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
+            title: "CookieDb sibling holding same parent".to_string(),
+            process_instance_id: Some(parent_a.instance_id()),
+            process_suspended: true,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": r"C:\Temp\xfer_a.exe"
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("seed alert-xfer-a2");
+
+    let defense_a = Arc::new(RecordingDefense::new());
+    let engine_a = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            resume_suspended_on_shutdown: true,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense_a) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("a".repeat(64))),
+    );
+    engine_a
+        .resolve_alert("alert-xfer-a1", ledr_proto::AlertDecision::AllowOnce)
+        .expect("resolve alert-xfer-a1 while sibling holds parent");
+    assert!(
+        defense_a.resumed().is_empty(),
+        "parent and child must stay suspended while sibling alert-xfer-a2 holds parent"
+    );
+    // Verify child_a was transferred onto surviving unresolved sibling alert-xfer-a2.
+    let sib_a2 = store.get_alert("alert-xfer-a2").unwrap().expect("a2 exists");
+    let sib_a2_ctx: serde_json::Value = serde_json::from_str(&sib_a2.context_json).unwrap();
+    assert_eq!(
+        sib_a2_ctx["suspended_children"],
+        serde_json::json!([child_a.instance_id()]),
+        "deferred child must be transferred onto unresolved parent-holding sibling"
+    );
+
+    // Now shut down with resume_suspended_on_shutdown=true: BOTH parent_a and child_a must resume!
+    engine_a
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown must resume both parent and transferred child");
+    assert_eq!(
+        defense_a.resumed(),
+        vec![parent_a, child_a],
+        "shutdown after sibling deferral must resume both parent and transferred child"
+    );
+
+    // Scenario B: Same deferral, then PARTIAL shutdown resumes parent_b but fails live child_b.
+    // After restart, AllowOnce on the surviving sibling (now process_suspended=false) must STILL
+    // resume child_b instead of orphaning it frozen!
+    let parent_b = ProcessIdentity::new(67111, 710_011);
+    let child_b = ProcessIdentity::new(std::process::id(), 710_012);
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-xfer-b1".to_string(),
+            timestamp_ms: 1_732_000_200_000,
+            severity: AlertSeverity::Critical,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-HONEYPOT".to_string(),
+            title: "Honeypot alert deferred before partial shutdown".to_string(),
+            process_instance_id: Some(parent_b.instance_id()),
+            process_suspended: true,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": r"C:\Temp\xfer_b.exe",
+                "suspended_children": [child_b.instance_id()]
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("seed alert-xfer-b1");
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-xfer-b2".to_string(),
+            timestamp_ms: 1_732_000_200_010,
+            severity: AlertSeverity::High,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
+            title: "CookieDb sibling surviving partial shutdown".to_string(),
+            process_instance_id: Some(parent_b.instance_id()),
+            process_suspended: true,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": r"C:\Temp\xfer_b.exe"
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("seed alert-xfer-b2");
+
+    let partial_b_defense = Arc::new(PartialResumeDefense::new(child_b));
+    let engine_b1 = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            resume_suspended_on_shutdown: true,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&partial_b_defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("b".repeat(64))),
+    );
+    engine_b1
+        .resolve_alert("alert-xfer-b1", ledr_proto::AlertDecision::AllowOnce)
+        .expect("resolve b1 first");
+    assert!(partial_b_defense.resumed().is_empty());
+
+    engine_b1
+        .shutdown_and_flush()
+        .await
+        .expect("partial shutdown");
+    assert_eq!(partial_b_defense.resumed(), vec![parent_b]);
+
+    let sib_b2_after_shutdown = store.get_alert("alert-xfer-b2").unwrap().unwrap();
+    assert!(
+        !sib_b2_after_shutdown.process_suspended,
+        "parent_b was resumed during shutdown"
+    );
+    let sib_b2_ctx: serde_json::Value =
+        serde_json::from_str(&sib_b2_after_shutdown.context_json).unwrap();
+    assert_eq!(
+        sib_b2_ctx["suspended_children"],
+        serde_json::json!([child_b.instance_id()]),
+        "failed live child_b must remain on alert-xfer-b2 after partial shutdown"
+    );
+
+    // Post-restart AllowOnce on alert-xfer-b2 must resume child_b!
+    let restart_b_defense = Arc::new(RecordingDefense::new());
+    let engine_b2 = start_stopped_engine(
+        store.clone(),
+        DaemonConfig::default(),
+        Arc::clone(&restart_b_defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("b".repeat(64))),
+    )
+    .await;
+    let resolved_b2 = engine_b2
+        .resolve_alert("alert-xfer-b2", ledr_proto::AlertDecision::AllowOnce)
+        .expect("post-restart AllowOnce on surviving sibling must resume leftover child");
+    assert_eq!(resolved_b2.status, AlertStatus::ApprovedOnce);
+    assert_eq!(
+        restart_b_defense.resumed(),
+        vec![child_b],
+        "surviving sibling must resume transferred child_b even after partial shutdown cleared process_suspended"
     );
 }

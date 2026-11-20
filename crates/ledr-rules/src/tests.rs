@@ -2312,6 +2312,27 @@ fn rules_p3_16_load_rules_dir_separates_shipped_defaults_from_managed_rules() {
     .expect("write default_allowlist.json");
     std::fs::write(tmp.path().join("z_ops_policy.json"), ops_json.to_string())
         .expect("write z_ops_policy.json");
+    // Also verify uppercase .JSON extension and UTF-8 BOM (common on Windows editors/PowerShell).
+    let bom_upper_json = serde_json::json!({
+        "allowlist_rules": [
+            {
+                "rule_id": "OPS-POLICY-BOM-UPPER",
+                "scope": "NetworkBlock",
+                "exe_path_pattern": r"C:\Apps\upper.exe",
+                "sha256": null,
+                "signer_subject": null,
+                "root_thumbprint": null,
+                "allowed_target": "198.51.100.7",
+                "created_at_ms": 0,
+                "created_by": "operator"
+            }
+        ]
+    });
+    std::fs::write(
+        tmp.path().join("ZZ_OPS_UPPER.JSON"),
+        format!("\u{feff}{}", bom_upper_json),
+    )
+    .expect("write ZZ_OPS_UPPER.JSON");
 
     let loaded = load_rules_dir(tmp.path()).expect("load_rules_dir");
     let default_ids: Vec<&str> = loaded
@@ -2329,6 +2350,7 @@ fn rules_p3_16_load_rules_dir_separates_shipped_defaults_from_managed_rules() {
     assert_eq!(
         managed_ids,
         vec![
+            "OPS-POLICY-BOM-UPPER",
             "OPS-IN-DEFAULT-FILE-BLOCK",
             "OPS-IN-DEFAULT-FILE-ALLOW",
             "OPS-POLICY-BLOCK",

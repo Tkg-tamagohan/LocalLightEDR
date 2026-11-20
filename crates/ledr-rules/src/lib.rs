@@ -89,7 +89,11 @@ pub fn load_rules_dir(dir: impl AsRef<Path>) -> Result<LoadedRulesDir, RulesErro
     let mut paths: Vec<_> = fs::read_dir(dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
         .collect();
     paths.sort();
 
@@ -99,12 +103,13 @@ pub fn load_rules_dir(dir: impl AsRef<Path>) -> Result<LoadedRulesDir, RulesErro
     let mut managed_rules = Vec::new();
 
     for path in paths {
-        let raw = fs::read_to_string(&path)?;
-        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        let raw_file = fs::read_to_string(&path)?;
+        let raw = raw_file.strip_prefix('\u{feff}').unwrap_or(&raw_file);
+        let value: serde_json::Value = serde_json::from_str(raw)?;
         if value.is_array() || value.get("rules").is_some() {
-            rules.extend(sigma::parse_sigma_rules_json(&raw)?);
+            rules.extend(sigma::parse_sigma_rules_json(raw)?);
         } else if value.get("early_pruner").is_some() || value.get("allowlist_rules").is_some() {
-            let cfg = AllowlistConfig::from_json_str(&raw)?;
+            let cfg = AllowlistConfig::from_json_str(raw)?;
             if value.get("early_pruner").is_some() {
                 pruner = EarlyPruner::new(cfg.early_pruner);
             }

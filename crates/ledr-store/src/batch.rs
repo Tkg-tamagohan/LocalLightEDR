@@ -55,6 +55,23 @@ impl LedrStore {
         is_nrd: bool,
         action: &str,
     ) -> Result<bool, StoreError> {
+        self.ingest_event_with_lifecycle(event, parent_instance_id, exited_at_ms, None, is_nrd, action)
+    }
+
+    /// Same as [`Self::ingest_event_with_exit`] and additionally closes a superseded active
+    /// process row (such as a `pid:0` snapshot placeholder) inside the same SQLite transaction
+    /// as the superseding `ProcessStart`, clamping `exited_at_ms` to at least `created_at_ms`.
+    ///
+    /// Both `exited_at_ms` and `superseded_process_exit` are ignored for non-`ProcessStart` events.
+    pub fn ingest_event_with_lifecycle(
+        &self,
+        event: &SensorEvent,
+        parent_instance_id: Option<&str>,
+        exited_at_ms: Option<i64>,
+        superseded_process_exit: Option<(&str, i64)>,
+        is_nrd: bool,
+        action: &str,
+    ) -> Result<bool, StoreError> {
         if matches!(event, SensorEvent::ScriptEvaluated { .. }) {
             // Evaluated in-memory by Layer 2 SigmaEngine and stored in alerts.context_json on match.
             tracing::trace!("skipping direct telemetry table buffering for ScriptEvaluated");
@@ -62,13 +79,19 @@ impl LedrStore {
         }
 
         let is_canary = matches!(event, SensorEvent::CanaryFileAccess { .. });
+        let is_process_start = matches!(event, SensorEvent::ProcessStart { .. });
         let buffered = BufferedEvent {
             event: event.clone(),
             parent_instance_id: parent_instance_id.map(str::to_owned),
             is_nrd,
             action: action.to_owned(),
             received_at_ms: current_unix_ms(),
-            exited_at_ms,
+            exited_at_ms: if is_process_start { exited_at_ms } else { None },
+            superseded_process_exit: if is_process_start {
+                superseded_process_exit.map(|(id, exit_ms)| (id.to_owned(), exit_ms))
+            } else {
+                None
+            },
         };
 
         let should_flush = {
@@ -148,10 +171,14 @@ impl LedrStore {
     }
 
     /// Upserts a full [`ProcessRecord`] immediately in a transaction (useful for hash/signer/origin enrichment).
+    ///
+    /// Unlike partial `SensorEvent::ProcessStart` batch ingestion, explicit `ppid` and `exe_path`
+    /// values on the full record (including `0` and `""`) overwrite existing columns while still
+    /// preserving any already-recorded `exited_at_ms` and `Option`-typed fields when `None`.
     pub fn upsert_process_record(&self, process: &ProcessRecord) -> Result<(), StoreError> {
         let mut writer = self.lock_writer()?;
         let tx = writer.transaction()?;
-        upsert_process_row(&tx, process)?;
+        upsert_process_row(&tx, process, false)?;
         tx.commit()?;
         Ok(())
     }
@@ -226,8 +253,12 @@ fn execute_batch_tx(
     Ok(())
 }
 
-fn upsert_process_row(tx: &Transaction<'_>, process: &ProcessRecord) -> Result<(), StoreError> {
-    tx.execute(
+fn upsert_process_row(
+    tx: &Transaction<'_>,
+    process: &ProcessRecord,
+    preserve_existing_identity_fields: bool,
+) -> Result<(), StoreError> {
+    let sql = if preserve_existing_identity_fields {
         "INSERT INTO processes (
             process_instance_id, pid, parent_instance_id, ppid, exe_path, command_line,
             sha256, signer_subject, is_trusted_os, user_sid, origin_url, created_at_ms, exited_at_ms
@@ -252,7 +283,30 @@ fn upsert_process_row(tx: &Transaction<'_>, process: &ProcessRecord) -> Result<(
             END,
             user_sid = COALESCE(excluded.user_sid, processes.user_sid),
             origin_url = COALESCE(excluded.origin_url, processes.origin_url),
-            exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)",
+            exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)"
+    } else {
+        "INSERT INTO processes (
+            process_instance_id, pid, parent_instance_id, ppid, exe_path, command_line,
+            sha256, signer_subject, is_trusted_os, user_sid, origin_url, created_at_ms, exited_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(process_instance_id) DO UPDATE SET
+            pid = excluded.pid,
+            parent_instance_id = COALESCE(excluded.parent_instance_id, processes.parent_instance_id),
+            ppid = excluded.ppid,
+            exe_path = excluded.exe_path,
+            command_line = COALESCE(excluded.command_line, processes.command_line),
+            sha256 = COALESCE(excluded.sha256, processes.sha256),
+            signer_subject = COALESCE(excluded.signer_subject, processes.signer_subject),
+            is_trusted_os = CASE
+                WHEN excluded.is_trusted_os != 0 THEN 1
+                ELSE processes.is_trusted_os
+            END,
+            user_sid = COALESCE(excluded.user_sid, processes.user_sid),
+            origin_url = COALESCE(excluded.origin_url, processes.origin_url),
+            exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)"
+    };
+    tx.execute(
+        sql,
         params![
             process.process_instance_id,
             i64::from(process.pid),
@@ -350,7 +404,18 @@ fn write_buffered_events(tx: &Transaction<'_>, events: &[BufferedEvent]) -> Resu
                     ),
                     exited_at_ms: item.exited_at_ms,
                 };
-                upsert_process_row(tx, &record)?;
+                upsert_process_row(tx, &record, true)?;
+                if let Some((superseded_id, superseded_exit_ms)) = &item.superseded_process_exit {
+                    if superseded_id != &record.process_instance_id {
+                        tx.execute(
+                            "UPDATE processes
+                             SET exited_at_ms = MAX(created_at_ms, ?1)
+                             WHERE process_instance_id = ?2
+                               AND exited_at_ms IS NULL",
+                            params![superseded_exit_ms, superseded_id],
+                        )?;
+                    }
+                }
             }
             SensorEvent::ProcessStop {
                 pid,

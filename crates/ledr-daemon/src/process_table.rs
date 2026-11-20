@@ -32,6 +32,10 @@ pub struct ProcessStartResolution {
     /// Inferred exit time set when this `ProcessStart` describes an older incarnation already
     /// superseded in memory; the engine propagates it to the store row.
     pub exited_at_ms: Option<i64>,
+    /// Previous `(process_instance_id, exit_ms)` marked exited in memory when this `ProcessStart`
+    /// supersedes an earlier active entry for the same PID (such as a `pid:0` snapshot
+    /// placeholder); the engine propagates it to the store in the same transaction.
+    pub superseded_exit: Option<(String, i64)>,
 }
 
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
@@ -157,9 +161,11 @@ impl ActiveProcessTable {
                 parent_command_line,
                 should_evaluate_sigma,
                 exited_at_ms: None,
+                superseded_exit: None,
             };
         }
 
+        let mut superseded_exit: Option<(String, i64)> = None;
         if let Some(prev_id) = self
             .pid_to_identity
             .get(&identity.pid)
@@ -202,19 +208,23 @@ impl ActiveProcessTable {
                         parent_command_line,
                         should_evaluate_sigma: true,
                         exited_at_ms: Some(inferred_exit_ms),
+                        superseded_exit: None,
                     };
                 }
             }
 
-            // If a previous process with the same PID is still marked active (missed stop), mark it exited.
+            // If a previous process with the same PID is still marked active (missed stop or
+            // `pid:0` snapshot placeholder), mark it exited without inverting its timestamp.
             if let Some(prev_entry) = self
                 .entries
                 .get_mut(&prev_id)
                 .filter(|entry| entry.exited_at_ms.is_none())
             {
-                prev_entry.exited_at_ms = Some(created_at_ms);
+                let exit_ms = created_at_ms.max(prev_entry.created_at_ms);
+                prev_entry.exited_at_ms = Some(exit_ms);
                 self.active_count = self.active_count.saturating_sub(1);
-                self.exited_fifo.push_back(prev_id);
+                self.exited_fifo.push_back(prev_id.clone());
+                superseded_exit = Some((prev_id, exit_ms));
             }
         }
 
@@ -248,6 +258,7 @@ impl ActiveProcessTable {
             parent_command_line,
             should_evaluate_sigma: true,
             exited_at_ms: None,
+            superseded_exit,
         }
     }
 

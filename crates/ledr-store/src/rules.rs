@@ -134,6 +134,13 @@ impl LedrStore {
     /// Any `rule_id` already recorded in `default_rule_seeds` is skipped even if the operator
     /// later deleted it from `allowlist_rules`. Existing rows in `allowlist_rules` with the same
     /// `rule_id` are preserved (`INSERT OR IGNORE`) without overwriting operator edits.
+    ///
+    /// Upgrade note: when opening an existing database created before `default_rule_seeds` was
+    /// introduced, the seed history table starts empty, so default rules that an operator had
+    /// deleted under an older version cannot be distinguished from unseeded defaults and will be
+    /// seeded once on the first upgrade startup. Any subsequent deletion is preserved across
+    /// restarts.
+    ///
     /// Returns the number of rules newly inserted into `allowlist_rules`.
     pub fn seed_default_rules_once(
         &self,

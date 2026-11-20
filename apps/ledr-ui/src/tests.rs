@@ -410,6 +410,8 @@ fn ui_p2_02_winrt_toast_xml_escaping_and_launch_uri() {
         severity: Some("CRITICAL".to_string()),
         process_suspended: true,
         is_expired_suspended: false,
+        has_suspended_children: false,
+        shutdown_resumed: false,
     };
 
     let xml = build_winrt_toast_xml(&summary);
@@ -433,10 +435,52 @@ fn ui_p2_02_winrt_toast_xml_escaping_and_launch_uri() {
         severity: Some("CRITICAL".to_string()),
         process_suspended: true,
         is_expired_suspended: true,
+        has_suspended_children: false,
+        shutdown_resumed: false,
     };
     let expired_xml = build_winrt_toast_xml(&expired_summary);
     assert!(expired_xml.contains("[EXPIRED_SUSPENDED · FROZEN]"));
     assert!(expired_xml.contains("launch=\"ledr://alert/alert-exp-1\""));
+
+    // Verify EXPIRED_SUSPENDED resumed on daemon shutdown distinguishes resumed vs still-frozen.
+    let shutdown_resumed_record = AlertRecord {
+        alert_id: "alert-exp-resumed".to_string(),
+        timestamp_ms: 1_700_000_000_000,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_CANARY".to_string(),
+        rule_id: "LEDR-CANARY-COOKIE_DB".to_string(),
+        title: "Cookies Access".to_string(),
+        process_instance_id: Some("4200:133800000000000000".to_string()),
+        process_suspended: false,
+        status: AlertStatus::ExpiredSuspended,
+        context_json: r#"{"suspended_children":[],"shutdown_resumed_at_ms":1700000099000}"#
+            .to_string(),
+        resolved_at_ms: None,
+    };
+    let resumed_summary =
+        summarize_alert_for_toast(&shutdown_resumed_record.alert_id, Some(&shutdown_resumed_record));
+    assert!(!resumed_summary.process_suspended);
+    assert!(!resumed_summary.has_suspended_children);
+    assert!(resumed_summary.shutdown_resumed);
+    let resumed_xml = build_winrt_toast_xml(&resumed_summary);
+    assert!(
+        resumed_xml.contains("[EXPIRED · RESUMED]"),
+        "shutdown-resumed expired alert must not claim FROZEN: {resumed_xml}"
+    );
+    assert!(!resumed_xml.contains("FROZEN"));
+
+    // Partial resume where parent resumed but a child remains suspended must still show FROZEN.
+    let partial_child_record = AlertRecord {
+        alert_id: "alert-exp-child-frozen".to_string(),
+        context_json: r#"{"suspended_children":["4204:133800000000000000"],"shutdown_resumed_at_ms":1700000099000}"#
+            .to_string(),
+        ..shutdown_resumed_record
+    };
+    let partial_summary =
+        summarize_alert_for_toast(&partial_child_record.alert_id, Some(&partial_child_record));
+    assert!(partial_summary.has_suspended_children);
+    let partial_xml = build_winrt_toast_xml(&partial_summary);
+    assert!(partial_xml.contains("[EXPIRED_SUSPENDED · FROZEN]"));
 
     // RFC 4648 base64 sanity check for PowerShell -EncodedCommand encoding.
     assert_eq!(base64_encode(b""), "");

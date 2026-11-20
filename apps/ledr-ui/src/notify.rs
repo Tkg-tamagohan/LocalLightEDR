@@ -18,6 +18,8 @@ pub(crate) struct ToastAlertSummary {
     pub(crate) severity: Option<String>,
     pub(crate) process_suspended: bool,
     pub(crate) is_expired_suspended: bool,
+    pub(crate) has_suspended_children: bool,
+    pub(crate) shutdown_resumed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,10 +151,27 @@ fn extract_context_paths(context_json: &str) -> (Option<String>, Option<String>)
     (target_path, exe_path)
 }
 
+fn extract_context_suspension_state(context_json: &str) -> (bool, bool) {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(context_json) else {
+        return (false, false);
+    };
+    let has_suspended_children = val
+        .get("suspended_children")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|arr| !arr.is_empty());
+    let shutdown_resumed = val
+        .get("shutdown_resumed_at_ms")
+        .and_then(serde_json::Value::as_i64)
+        .is_some();
+    (has_suspended_children, shutdown_resumed)
+}
+
 pub(crate) fn summarize_alert_for_toast(alert_id: &str, alert: Option<&AlertRecord>) -> ToastAlertSummary {
     match alert {
         Some(rec) => {
             let (target_path, exe_path) = extract_context_paths(&rec.context_json);
+            let (has_suspended_children, shutdown_resumed) =
+                extract_context_suspension_state(&rec.context_json);
             ToastAlertSummary {
                 alert_id: rec.alert_id.clone(),
                 title: rec.title.clone(),
@@ -162,6 +181,8 @@ pub(crate) fn summarize_alert_for_toast(alert_id: &str, alert: Option<&AlertReco
                 severity: Some(rec.severity.as_db_str().to_string()),
                 process_suspended: rec.process_suspended,
                 is_expired_suspended: rec.status == AlertStatus::ExpiredSuspended,
+                has_suspended_children,
+                shutdown_resumed,
             }
         }
         None => ToastAlertSummary {
@@ -173,6 +194,8 @@ pub(crate) fn summarize_alert_for_toast(alert_id: &str, alert: Option<&AlertReco
             severity: None,
             process_suspended: false,
             is_expired_suspended: false,
+            has_suspended_children: false,
+            shutdown_resumed: false,
         },
     }
 }
@@ -182,9 +205,16 @@ pub(crate) fn build_winrt_toast_xml(summary: &ToastAlertSummary) -> String {
     let launch_uri = format!("ledr://alert/{}", summary.alert_id);
     let escaped_uri = xml_escape(&launch_uri);
 
+    let still_frozen = summary.process_suspended || summary.has_suspended_children;
     let suspended_badge = if summary.is_expired_suspended {
-        "[EXPIRED_SUSPENDED · FROZEN]"
-    } else if summary.process_suspended {
+        if still_frozen {
+            "[EXPIRED_SUSPENDED · FROZEN]"
+        } else if summary.shutdown_resumed {
+            "[EXPIRED · RESUMED]"
+        } else {
+            "[EXPIRED]"
+        }
+    } else if still_frozen {
         "[SUSPENDED]"
     } else {
         "[ALERT]"

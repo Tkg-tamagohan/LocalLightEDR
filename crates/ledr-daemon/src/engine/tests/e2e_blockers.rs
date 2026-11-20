@@ -2056,6 +2056,17 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
         },
         EventLane::HighPriority,
     );
+    // Derive the canary event timestamp after registering the `(4404, 0)` placeholder so slow
+    // test runners (>50 ms elapsed since `now_ms`) never place the canary event before the
+    // placeholder's fallback `created_at_ms` (`ANALYSIS_0001`).
+    let canary_ts_4404 = {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let placeholder_created = table
+            .lookup_by_pid(4404)
+            .expect("placeholder 4404 must be registered")
+            .created_at_ms;
+        current_unix_ms().max(placeholder_created)
+    };
     let _ = engine.process_event_with_lane(
         &SensorEvent::CanaryFileAccess {
             pid: 4404,
@@ -2063,7 +2074,7 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
             category: CanaryCategory::CloudCredential,
             access_mask: 1,
             is_write_or_delete: false,
-            timestamp_ms: now_ms + 50,
+            timestamp_ms: canary_ts_4404,
         },
         EventLane::HighPriority,
     );
@@ -2092,6 +2103,7 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
         },
         EventLane::HighPriority,
     );
+    let canary_ts_4408_noop = current_unix_ms().max(created_ms + 100);
     let _ = engine.process_event_with_lane(
         &SensorEvent::CanaryFileAccess {
             pid: 4408,
@@ -2099,7 +2111,7 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
             category: CanaryCategory::EnvFile,
             access_mask: 1,
             is_write_or_delete: false,
-            timestamp_ms: now_ms + 100,
+            timestamp_ms: canary_ts_4408_noop,
         },
         EventLane::HighPriority,
     );
@@ -2123,6 +2135,7 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
             command_line: None,
         },
     );
+    let canary_ts_4408_enriched = current_unix_ms().max(canary_ts_4408_noop + 1);
     let _ = engine.process_event_with_lane(
         &SensorEvent::CanaryFileAccess {
             pid: 4408,
@@ -2130,7 +2143,7 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
             category: CanaryCategory::EnvFile,
             access_mask: 1,
             is_write_or_delete: false,
-            timestamp_ms: now_ms + 200,
+            timestamp_ms: canary_ts_4408_enriched,
         },
         EventLane::HighPriority,
     );
@@ -2210,4 +2223,214 @@ async fn pr21_v2_ci_0003_resolve_alert_refuses_low_bit_pid_alias_from_defense_gu
             "aliased alert {alert_id} must remain Pending after policy refusal"
         );
     }
+}
+
+#[tokio::test]
+async fn pr23_bug_0001_superseded_zero_ts_placeholder_closed_in_sqlite_on_start_and_backfill() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let now_ms = current_unix_ms();
+    let real_created_ms = now_ms - 5_000;
+    let real_created_100ns = 116_444_736_000_000_000u64 + (real_created_ms as u64) * 10_000;
+
+    let live_inspector = Arc::new(MapLiveProcessInspector::new([(
+        4604,
+        ledr_sensor_win::etw::LiveProcessInfo {
+            create_time_100ns: real_created_100ns,
+            exe_path: Some(r"C:\Temp\backfill_4604.exe".to_string()),
+            command_line: Some("backfill_4604.exe".to_string()),
+        },
+    )]));
+
+    let engine = start_stopped_engine_with_live_inspector(
+        store.clone(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("9".repeat(64))),
+        Arc::clone(&live_inspector) as Arc<dyn crate::engine::LiveProcessInspector>,
+    )
+    .await;
+
+    // Path A: startup snapshot records `4600:0` -> alert references `4600:0` -> late ETW
+    // ProcessStart delivers real `4600:<real_ts>` (older than snapshot fallback time) ->
+    // ProcessStop closes `4600:<real_ts>`. Neither row may stay running (`exited_at_ms IS NULL`),
+    // and the placeholder must have `exited_at_ms >= created_at_ms` while preserving references.
+    let placeholder_a = ProcessIdentity::new(4600, 0);
+    let real_a = ProcessIdentity::new(4600, real_created_100ns);
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: placeholder_a,
+            parent_pid: 4,
+            exe_path: r"C:\Temp\late_etw_4600.exe".to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    store.flush_batch().expect("flush snapshot placeholder A");
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-placeholder-4600".to_string(),
+            timestamp_ms: now_ms,
+            severity: AlertSeverity::Medium,
+            source_layer: "LAYER_1_CANARY".to_string(),
+            rule_id: "LEDR-TEST-PLACEHOLDER".to_string(),
+            title: "Alert tied to snapshot placeholder".to_string(),
+            process_instance_id: Some(placeholder_a.instance_id()),
+            process_suspended: false,
+            status: AlertStatus::Pending,
+            context_json: "{}".to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("record alert referencing placeholder");
+
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: real_a,
+            parent_pid: 4,
+            exe_path: r"C:\Temp\late_etw_4600.exe".to_string(),
+            command_line: "late_etw_4600.exe --svc".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let stop_ms = current_unix_ms() + 1_000;
+    let stop_100ns = 116_444_736_000_000_000u64 + (stop_ms as u64) * 10_000;
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: 4600,
+            exit_time_100ns: stop_100ns,
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+    store.flush_batch().expect("flush real start & stop A");
+
+    let snap_a = store
+        .query_flight_recorder(50, None)
+        .expect("query flight recorder A");
+    let ph_a_row = snap_a
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == placeholder_a.instance_id())
+        .expect("placeholder A row preserved for alert lineage");
+    let real_a_row = snap_a
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == real_a.instance_id())
+        .expect("real A row exists");
+    assert!(
+        ph_a_row.exited_at_ms.is_some(),
+        "superseded placeholder 4600:0 must not stay running in SQLite"
+    );
+    assert!(
+        ph_a_row.exited_at_ms.unwrap() >= ph_a_row.created_at_ms,
+        "placeholder exited_at_ms ({:?}) must not precede created_at_ms ({})",
+        ph_a_row.exited_at_ms,
+        ph_a_row.created_at_ms
+    );
+    assert_eq!(real_a_row.exited_at_ms, Some(stop_ms));
+    assert_eq!(
+        snap_a
+            .processes
+            .iter()
+            .filter(|p| p.pid == 4600 && p.exited_at_ms.is_none())
+            .count(),
+        0,
+        "no PID 4600 row may remain running after ProcessStop"
+    );
+
+    // Unresolved alert still protects `4600:0` from TTL purge; once resolved, purge removes both.
+    let future_now = stop_ms + 30 * 24 * 60 * 60 * 1_000;
+    let _ = store
+        .purge_expired(future_now, 7)
+        .expect("purge while alert unresolved");
+    assert!(
+        store
+            .query_flight_recorder(50, Some(&placeholder_a.instance_id()))
+            .expect("query protected placeholder")
+            .processes
+            .iter()
+            .any(|p| p.process_instance_id == placeholder_a.instance_id()),
+        "unresolved alert must keep placeholder row protected"
+    );
+    store
+        .update_alert_status(
+            "alert-placeholder-4600",
+            AlertStatus::ApprovedOnce,
+            Some(stop_ms),
+        )
+        .expect("resolve alert");
+    let stats = store
+        .purge_expired(future_now, 7)
+        .expect("purge after alert resolved");
+    assert!(
+        stats.processes_deleted >= 1,
+        "closed placeholder row must become purgeable once referencing alert is resolved"
+    );
+    assert!(
+        store
+            .query_flight_recorder(50, Some(&placeholder_a.instance_id()))
+            .expect("query purged placeholder")
+            .processes
+            .is_empty(),
+        "placeholder row should be purged after TTL once closed and unreferenced"
+    );
+
+    // Path B: canary live-process backfill upgrades `4604:0` -> `4604:<real_ts>` and closes
+    // the superseded `4604:0` row atomically in SQLite.
+    let placeholder_b = ProcessIdentity::new(4604, 0);
+    let real_b = ProcessIdentity::new(4604, real_created_100ns);
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: placeholder_b,
+            parent_pid: 4,
+            exe_path: r"C:\Temp\backfill_4604.exe".to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let canary_ts_4604 = {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let created = table
+            .lookup_by_pid(4604)
+            .expect("placeholder 4604 registered")
+            .created_at_ms;
+        current_unix_ms().max(created)
+    };
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::CanaryFileAccess {
+            pid: 4604,
+            target_path: r"C:\Users\alice\.aws\credentials".to_string(),
+            category: CanaryCategory::CloudCredential,
+            access_mask: 1,
+            is_write_or_delete: false,
+            timestamp_ms: canary_ts_4604,
+        },
+        EventLane::HighPriority,
+    );
+    store.flush_batch().expect("flush backfill B");
+
+    let snap_b = store
+        .query_flight_recorder(50, None)
+        .expect("query flight recorder B");
+    let ph_b_row = snap_b
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == placeholder_b.instance_id())
+        .expect("placeholder B row exists");
+    let real_b_row = snap_b
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == real_b.instance_id())
+        .expect("real B row exists");
+    assert!(
+        ph_b_row.exited_at_ms.is_some_and(|ex| ex >= ph_b_row.created_at_ms),
+        "backfill-superseded placeholder 4604:0 must be closed with exited_at_ms >= created_at_ms"
+    );
+    assert_eq!(real_b_row.exited_at_ms, None, "backfilled real row remains active");
 }

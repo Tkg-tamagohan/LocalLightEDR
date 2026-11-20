@@ -631,6 +631,7 @@ impl DaemonEngine {
             parent_command_line: cand.parent_command_line.clone(),
             should_evaluate_sigma: true,
             exited_at_ms: None,
+            superseded_exit: None,
         };
         let (_action, emitted_alert) = self.evaluate_and_handle_outbound_connect(
             None,

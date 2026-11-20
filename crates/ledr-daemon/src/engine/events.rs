@@ -265,10 +265,14 @@ impl DaemonEngine {
             _ => "OBSERVED",
         };
 
-        if let Err(err) = self.store.ingest_event_with_exit(
+        if let Err(err) = self.store.ingest_event_with_lifecycle(
             event,
             proc_ctx.store_hint.as_deref(),
             proc_ctx.exited_at_ms,
+            proc_ctx
+                .superseded_exit
+                .as_ref()
+                .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
             is_nrd,
             action,
         ) {
@@ -458,10 +462,13 @@ impl DaemonEngine {
             command_line: command_line.clone(),
             user_sid: None,
         };
-        if let Err(err) = self.store.ingest_event_with_exit(
+        if let Err(err) = self.store.ingest_event_with_lifecycle(
             &synthetic_start,
             res.parent_instance_id.as_deref(),
             res.exited_at_ms,
+            res.superseded_exit
+                .as_ref()
+                .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
             false,
             "OBSERVED",
         ) {
@@ -823,6 +830,7 @@ impl DaemonEngine {
                     parent_command_line: res.parent_command_line,
                     should_evaluate_sigma: res.should_evaluate_sigma,
                     exited_at_ms: res.exited_at_ms,
+                    superseded_exit: res.superseded_exit,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
@@ -841,6 +849,7 @@ impl DaemonEngine {
                     parent_command_line: None,
                     should_evaluate_sigma: true,
                     exited_at_ms: None,
+                    superseded_exit: None,
                 }
             }
             SensorEvent::DnsQuery { pid, .. }
@@ -882,6 +891,7 @@ impl DaemonEngine {
                     parent_command_line: parent_cmd,
                     should_evaluate_sigma: true,
                     exited_at_ms: None,
+                    superseded_exit: None,
                 }
             }
         }
@@ -900,6 +910,9 @@ pub(super) struct ResolvedProcessContext {
     /// Inferred exit time carried from [`ProcessStartResolution`] for older snapshot
     /// incarnations so the store row does not stay "running" forever.
     pub(super) exited_at_ms: Option<i64>,
+    /// Previous `(process_instance_id, exit_ms)` superseded in memory by this `ProcessStart`
+    /// so the store closes the replaced row atomically in the same transaction.
+    pub(super) superseded_exit: Option<(String, i64)>,
 }
 
 impl Default for ResolvedProcessContext {
@@ -914,6 +927,7 @@ impl Default for ResolvedProcessContext {
             parent_command_line: None,
             should_evaluate_sigma: true,
             exited_at_ms: None,
+            superseded_exit: None,
         }
     }
 }

@@ -755,3 +755,148 @@ fn store_p2_upsert_process_preserves_existing_ppid_and_exe_path() {
         "partial upsert with empty exe_path must not clobber existing exe_path"
     );
 }
+
+#[test]
+fn store_p2_upsert_process_record_allows_explicit_zero_ppid_and_empty_exe_path() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let inst_id = "4201:133800000000000000".to_string();
+    store
+        .upsert_process_record(&ProcessRecord {
+            process_instance_id: inst_id.clone(),
+            pid: 4201,
+            parent_instance_id: None,
+            ppid: 1234,
+            exe_path: r"C:\Temp\tool.exe".to_string(),
+            command_line: Some("tool.exe --run".to_string()),
+            sha256: None,
+            signer_subject: None,
+            is_trusted_os: false,
+            user_sid: None,
+            origin_url: None,
+            created_at_ms: 1_700_000_000_000,
+            exited_at_ms: Some(1_700_000_005_000),
+        })
+        .expect("seed full process record");
+
+    // Full-record upsert must allow explicitly clearing ppid and exe_path while keeping
+    // existing exited_at_ms and Option fields untouched when None.
+    store
+        .upsert_process_record(&ProcessRecord {
+            process_instance_id: inst_id.clone(),
+            pid: 4201,
+            parent_instance_id: None,
+            ppid: 0,
+            exe_path: String::new(),
+            command_line: None,
+            sha256: None,
+            signer_subject: None,
+            is_trusted_os: false,
+            user_sid: None,
+            origin_url: None,
+            created_at_ms: 1_700_000_000_000,
+            exited_at_ms: None,
+        })
+        .expect("overwrite full process record");
+
+    let snap = store
+        .query_flight_recorder(10, Some(&inst_id))
+        .expect("query flight recorder");
+    let row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == inst_id)
+        .expect("process row exists");
+    assert_eq!(row.ppid, 0, "full-record upsert must allow explicit ppid=0");
+    assert_eq!(row.exe_path, "", "full-record upsert must allow explicit empty exe_path");
+    assert_eq!(
+        row.command_line.as_deref(),
+        Some("tool.exe --run"),
+        "None Option fields remain preserved via COALESCE"
+    );
+    assert_eq!(
+        row.exited_at_ms,
+        Some(1_700_000_005_000),
+        "already-set exited_at_ms must remain preserved"
+    );
+}
+
+#[test]
+fn store_p2_ingest_process_start_closes_superseded_placeholder_atomically_without_time_inversion() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let placeholder_id = ProcessIdentity::new(4202, 0);
+    let placeholder_key = placeholder_id.instance_id();
+
+    // Seed placeholder row (create_time_100ns = 0 -> created_at_ms = received_at_ms).
+    store
+        .ingest_event_with_lifecycle(
+            &SensorEvent::ProcessStart {
+                identity: placeholder_id,
+                parent_pid: 4,
+                exe_path: r"C:\Temp\svc.exe".to_string(),
+                command_line: String::new(),
+                user_sid: None,
+            },
+            None,
+            None,
+            None,
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest placeholder");
+    store.flush_batch().expect("flush placeholder");
+
+    let placeholder_created = store
+        .query_flight_recorder(10, Some(&placeholder_key))
+        .expect("query placeholder")
+        .processes
+        .into_iter()
+        .find(|p| p.process_instance_id == placeholder_key)
+        .expect("placeholder exists")
+        .created_at_ms;
+
+    // Superseding real ProcessStart carries an earlier real start timestamp (< placeholder_created).
+    let real_created_ms = placeholder_created - 2_000;
+    let real_ticks =
+        (u64::try_from(real_created_ms).expect("positive ms") * 10_000) + 116_444_736_000_000_000;
+    let real_id = ProcessIdentity::new(4202, real_ticks);
+    let real_key = real_id.instance_id();
+
+    store
+        .ingest_event_with_lifecycle(
+            &SensorEvent::ProcessStart {
+                identity: real_id,
+                parent_pid: 4,
+                exe_path: r"C:\Temp\svc.exe".to_string(),
+                command_line: "svc.exe --run".to_string(),
+                user_sid: None,
+            },
+            None,
+            None,
+            Some((placeholder_key.as_str(), real_created_ms)),
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest superseding start");
+    store.flush_batch().expect("flush superseding start");
+
+    let snap = store
+        .query_flight_recorder(20, None)
+        .expect("query flight recorder");
+    let placeholder_row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == placeholder_key)
+        .expect("placeholder row remains for lineage/alert references");
+    let real_row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == real_key)
+        .expect("real row exists");
+
+    assert_eq!(
+        placeholder_row.exited_at_ms,
+        Some(placeholder_created),
+        "superseded placeholder must be closed with exited_at_ms clamped to >= created_at_ms"
+    );
+    assert_eq!(real_row.exited_at_ms, None, "real process row remains active");
+}

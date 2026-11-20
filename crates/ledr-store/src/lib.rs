@@ -78,6 +78,10 @@ struct BufferedEvent {
     /// Inferred exit time supplied by the daemon when a `ProcessStart` describes an older
     /// incarnation already superseded in memory; `None` for every other event.
     exited_at_ms: Option<i64>,
+    /// Previous `(process_instance_id, exit_ms)` closed in memory when a `ProcessStart`
+    /// supersedes an earlier active row (such as a `pid:0` snapshot placeholder); `None` for
+    /// every other event.
+    superseded_process_exit: Option<(String, i64)>,
 }
 
 #[derive(Default)]

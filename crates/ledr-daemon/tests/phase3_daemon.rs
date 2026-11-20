@@ -382,13 +382,22 @@ fn start_test_engine(
 }
 
 async fn send_process_start(sender: &TwoLaneSender, identity: ProcessIdentity, exe_path: &str) {
+    send_process_start_with_sid(sender, identity, exe_path, None).await;
+}
+
+async fn send_process_start_with_sid(
+    sender: &TwoLaneSender,
+    identity: ProcessIdentity,
+    exe_path: &str,
+    user_sid: Option<&str>,
+) {
     sender
         .send(SensorEvent::ProcessStart {
             identity,
             parent_pid: 4,
             exe_path: exe_path.to_string(),
             command_line: exe_path.to_string(),
-            user_sid: None,
+            user_sid: user_sid.map(ToString::to_string),
         })
         .await
         .expect("send ProcessStart");
@@ -462,6 +471,7 @@ fn make_net_rule(
     sha256: Option<&str>,
     allowed_target: Option<&str>,
     created_at_ms: i64,
+    created_by: &str,
 ) -> AllowlistRuleRecord {
     AllowlistRuleRecord {
         rule_id: rule_id.to_string(),
@@ -471,7 +481,7 @@ fn make_net_rule(
         signer_subject: None,
         root_thumbprint: None,
         allowed_target: allowed_target.map(ToString::to_string),
-        created_by: "test".to_string(),
+        created_by: created_by.to_string(),
         created_at_ms,
     }
 }
@@ -515,7 +525,7 @@ async fn daemon_p3_01_high_risk_and_script_interpreter_preemptive_wfp_and_guards
         (node_proc, r"C:\Program Files\nodejs\node.exe"),
         (local_app, r"C:\Tools\local_only.exe"),
     ] {
-        send_process_start(&sender, ident, exe).await;
+        send_process_start_with_sid(&sender, ident, exe, Some("S-1-5-21-1000")).await;
     }
 
     assert!(
@@ -1049,6 +1059,7 @@ async fn daemon_p3_04_allow_once_and_allow_permanent_rollback_invariants() {
             None,
             None,
             now_ms,
+            "user_quarantine",
         ))
         .expect("upsert block");
     assert!(engine.has_active_wfp_filter(exe_blocked, None, false));
@@ -1208,6 +1219,7 @@ async fn daemon_p3_06_startup_redeployment_and_ipc_rule_reconciliation() {
             Some(sha_conflict),
             None,
             now_ms - 1_000,
+            "user_triage",
         ))
         .expect("seed allow");
     store
@@ -1218,6 +1230,7 @@ async fn daemon_p3_06_startup_redeployment_and_ipc_rule_reconciliation() {
             Some(sha_conflict),
             None,
             now_ms - 500,
+            "user_quarantine",
         ))
         .expect("seed block");
     store
@@ -1228,6 +1241,7 @@ async fn daemon_p3_06_startup_redeployment_and_ipc_rule_reconciliation() {
             Some(sha_allow),
             Some("198.51.100.20"),
             now_ms - 400,
+            "user_triage",
         ))
         .expect("seed ip allow");
 
@@ -1286,6 +1300,7 @@ async fn daemon_p3_06_startup_redeployment_and_ipc_rule_reconciliation() {
                     None,
                     Some("198.51.100.20"),
                     now_ms,
+                    "user_policy",
                 ),
             },
         );
@@ -1567,6 +1582,7 @@ async fn daemon_p3_09_deleting_network_allow_rearms_preemptive_block_for_active_
             Some(sha),
             None,
             now_ms,
+            "user_triage",
         ))
         .expect("seed allow");
 
@@ -1645,6 +1661,7 @@ async fn daemon_p3_10_domain_policy_filters_survive_unrelated_reconcile_and_purg
             Some(ps_sha),
             Some("*.vendor.example"),
             now_ms,
+            "user_policy",
         ))
         .expect("seed domain allow");
     store
@@ -1655,6 +1672,7 @@ async fn daemon_p3_10_domain_policy_filters_survive_unrelated_reconcile_and_purg
             None,
             Some("*.evil-c2.example"),
             now_ms,
+            "user_policy",
         ))
         .expect("seed domain block");
 
@@ -1706,6 +1724,7 @@ async fn daemon_p3_10_domain_policy_filters_survive_unrelated_reconcile_and_purg
             None,
             None,
             now_ms + 10,
+            "user_policy",
         ))
         .expect("upsert unrelated");
     assert!(
@@ -1770,6 +1789,7 @@ async fn daemon_p3_11_wildcard_block_on_process_start_and_dedup_never_bypasses_n
             None,
             None,
             now_ms,
+            "user_policy",
         ))
         .expect("upsert wildcard block");
 
@@ -1815,6 +1835,7 @@ async fn daemon_p3_11_wildcard_block_on_process_start_and_dedup_never_bypasses_n
             None,
             Some(&blocked_v4.to_string()),
             now_ms + 20,
+            "user_policy",
         ))
         .expect("upsert IP block");
 
@@ -1971,6 +1992,7 @@ async fn daemon_p3_13_ipc_upsert_rule_enforces_server_side_l04_and_auto02_valida
             None,
             None,
             now_ms,
+            "test",
         ),
         AllowlistRuleRecord {
             rule_id: "BAD-ZERO-THUMBPRINT".to_string(),
@@ -1990,6 +2012,7 @@ async fn daemon_p3_13_ipc_upsert_rule_enforces_server_side_l04_and_auto02_valida
             Some("deadbeef"),
             None,
             now_ms,
+            "test",
         ),
         make_net_rule(
             "BAD-BLOCK-LSASS",
@@ -1998,6 +2021,7 @@ async fn daemon_p3_13_ipc_upsert_rule_enforces_server_side_l04_and_auto02_valida
             None,
             None,
             now_ms,
+            "test",
         ),
     ];
 
@@ -2392,6 +2416,7 @@ async fn daemon_p3_17_dns_query_prematerializes_domain_policy_wfp_filters_before
             Some(ps_sha),
             Some("*.packages.example"),
             now_ms,
+            "user_policy",
         ))
         .expect("seed domain allow");
     store
@@ -2402,6 +2427,7 @@ async fn daemon_p3_17_dns_query_prematerializes_domain_policy_wfp_filters_before
             None,
             Some("bad.packages.example"),
             now_ms,
+            "user_policy",
         ))
         .expect("seed overriding domain block");
     store
@@ -2412,6 +2438,7 @@ async fn daemon_p3_17_dns_query_prematerializes_domain_policy_wfp_filters_before
             None,
             Some("*.c2-drop.example"),
             now_ms,
+            "user_policy",
         ))
         .expect("seed app domain block");
 
@@ -2539,6 +2566,7 @@ async fn daemon_p3_18_startup_prerestriction_retention_across_stop_and_allow_ove
             Some(node_sha),
             None,
             now_ms,
+            "user_policy",
         ))
         .expect("seed node allow");
 
@@ -2678,6 +2706,7 @@ async fn daemon_p3_18_startup_prerestriction_retention_across_stop_and_allow_ove
             Some(ps_sha),
             None,
             now_ms + 1_000,
+            "user_policy",
         ))
         .expect("upsert ps wildcard allow");
     assert!(
@@ -2895,6 +2924,7 @@ async fn daemon_p3_20_shared_ip_block_precedence_for_domain_rules() {
             None,
             Some("blocked.example"),
             now_ms,
+            "user_policy",
         ))
         .expect("seed domain block");
     store
@@ -2905,6 +2935,7 @@ async fn daemon_p3_20_shared_ip_block_precedence_for_domain_rules() {
             Some(ps_sha),
             Some("api.example"),
             now_ms,
+            "user_policy",
         ))
         .expect("seed domain allow");
 
@@ -2995,6 +3026,7 @@ async fn daemon_p3_21_wfp_sync_failure_compensation_ipc_error_and_scope_change()
         None,
         None,
         now_ms,
+        "user_policy",
     );
     let pipe_c = pipe_name.clone();
     let rule_clone = valid_block.clone();
@@ -3016,6 +3048,7 @@ async fn daemon_p3_21_wfp_sync_failure_compensation_ipc_error_and_scope_change()
         None,
         None,
         now_ms,
+        "user_policy",
     );
     let fail_resp = send_ipc_async(&pipe_name, IpcRequest::UpsertRule { rule: failing_new }).await;
     match fail_resp {
@@ -3074,6 +3107,7 @@ async fn daemon_p3_21_wfp_sync_failure_compensation_ipc_error_and_scope_change()
         Some(dl_sha),
         None,
         now_ms,
+        "user_policy",
     );
     engine.upsert_policy_rule(&swap_rule).expect("allow dl_exe");
     assert!(engine.has_active_wfp_filter(dl_exe, None, true));
@@ -3101,6 +3135,7 @@ async fn daemon_p3_21_wfp_sync_failure_compensation_ipc_error_and_scope_change()
         Some(app_sha),
         None,
         now_ms,
+        "user_policy",
     ));
     assert!(err_upd.is_ok(), "healthy add succeeds");
     defense.set_fail_wfp_add(true);
@@ -3203,18 +3238,9 @@ async fn daemon_p3_21_wfp_sync_failure_compensation_ipc_error_and_scope_change()
     // then TerminateAndBlock { add_block_rule: true } fails WFP add -> keeps alert Pending!
     let term2_exe = r"C:\Tools\term2_sync_fail.exe";
     let term2_proc = ProcessIdentity::new(7304, unix_ms_to_filetime(now_ms - 250));
-    engine
-        .sender()
-        .send(SensorEvent::ProcessStart {
-            identity: term2_proc,
-            parent_pid: 4,
-            exe_path: term2_exe.to_string(),
-            command_line: term2_exe.to_string(),
-            user_sid: None,
-        })
-        .await
-        .expect("start term2");
-    assert!(wait_until(1_000, || engine.active_process_table_len() >= 2).await);
+    let hp_before = engine.metrics().high_priority_processed;
+    send_process_start(&engine.sender(), term2_proc, term2_exe).await;
+    assert!(wait_until(1_000, || engine.metrics().high_priority_processed > hp_before).await);
     defense.set_fail_wfp_add(true);
     engine
         .sender()
@@ -3393,6 +3419,7 @@ async fn daemon_p3_22_high_priority_promotion_over_saturated_telemetry() {
             None,
             None,
             now_ms + 900,
+            "user_policy",
         ))
         .expect("upsert policy rule");
     assert!(
@@ -3436,6 +3463,7 @@ async fn daemon_p3_23_binary_replacement_revokes_stale_wfp_permits() {
                 Some(sha),
                 None,
                 now_ms,
+                "user_policy",
             ))
             .expect("seed allow");
     }
@@ -3529,6 +3557,7 @@ async fn daemon_p3_24_cross_process_dns_isolation_layer2() {
             Some(allow_sha),
             Some("trusted.example"),
             now_ms,
+            "user_policy",
         ))
         .expect("seed trusted domain rule");
 
@@ -4258,6 +4287,7 @@ async fn daemon_p3_30_wfp_scoping_ignores_unrelated_failure_and_restores_domain_
             None,
             None,
             now_ms,
+            "test",
         ))
         .expect("seed broken rule");
     defense.add_fail_wfp_exe("broken_preexisting.exe");
@@ -4387,6 +4417,7 @@ async fn daemon_p3_30_wfp_scoping_ignores_unrelated_failure_and_restores_domain_
         None,
         Some("evil-rollback.example"),
         now_ms,
+        "test",
     );
     engine
         .upsert_policy_rule(&dom_rule)
@@ -4493,6 +4524,7 @@ async fn daemon_p3_31_cidr_network_allow_and_block_enforced_with_deny_precedence
         Some(app_hash.as_str()),
         Some("198.51.100.0/33"),
         now_ms,
+        "test",
     );
     let bad_resp = send_ipc_async(&pipe_name, IpcRequest::UpsertRule { rule: bad_rule }).await;
     assert!(matches!(bad_resp, IpcResponse::Error { .. }));
@@ -4519,6 +4551,7 @@ async fn daemon_p3_31_cidr_network_allow_and_block_enforced_with_deny_precedence
         None,
         Some("198.51.100.128/25"),
         now_ms,
+        "test",
     );
     let block_resp = send_ipc_async(&pipe_name, IpcRequest::UpsertRule { rule: block_rule }).await;
     assert!(matches!(block_resp, IpcResponse::Ack { .. }));
@@ -4620,6 +4653,7 @@ async fn daemon_p3_32_wfp_drop_ignores_unrelated_pid_dns_and_allows_ambiguous_ci
             Some(ps_hash.as_str()),
             Some("api.realps.example"),
             now_ms,
+            "test",
         ))
         .expect("seed ps domain allow");
     store
@@ -5143,6 +5177,7 @@ async fn daemon_p3_35_cidr_permanent_allow_revoked_when_domain_later_blocked() {
         None,
         Some("evil-later.example"),
         now_ms + 50,
+        "test",
     );
     let resp = send_ipc_async(&pipe_name, IpcRequest::UpsertRule { rule: block_rule }).await;
     assert!(matches!(resp, IpcResponse::Ack { .. }));
@@ -5209,6 +5244,7 @@ async fn daemon_p3_36_same_exe_unrelated_app_allow_failure_allows_domain_block_s
         None,
         Some("ads.example.com"),
         now_ms + 10,
+        "ui",
     );
     let resp_dom = send_ipc_async(&pipe_name, IpcRequest::UpsertRule { rule: ads_block }).await;
     assert!(
@@ -7619,6 +7655,7 @@ async fn daemon_p3_47_shared_ip_block_cleanup_after_fifo_eviction_of_first_domai
                 Some(sha.as_str()),
                 Some(dom),
                 now_ms - 10_000,
+                "seed",
             ))
             .expect("register NetworkBlock rule");
     }

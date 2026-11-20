@@ -111,6 +111,8 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 7. `ledr-daemon listening on Named Pipe IPC; press Ctrl+C to shut down`
 
 また、別プロセス起動時に `ledr_sensor_win` の debug ログへ `received Microsoft-Windows-Kernel-Process ETW event` および `emitted ProcessStart from Kernel-Process ETW` が出力されることも確認する。
+あわせて、Windows 10/11 の実 ETW（`ClientContext = 2` の `EventHeader.TimeStamp`）で、`CreateTime` 欠落や TDH 取得失敗時に `inspect_process_by_pid` から取得した作成時刻が `EventHeader.TimeStamp` 以下（`inspected.create_time_100ns <= EventHeader.TimeStamp`）として同一プロセス判定を通過し、`parent_pid` と `command_line` が補完されることも確認対象とする。
+具体的には、Phase 3 手順 3 の `ledr-sim.exe --scenario lotl` 実行後に `View 2` の親子系譜とコマンドラインおよび `emitted ProcessStart from Kernel-Process ETW` ログ（`parent_pid` と `create_time_100ns`）を確認し、実 ETW の時計粒度差等で `parent_pid = 0` または `command_line` 欠落が残る場合は差異として記録する。
 
 > [!NOTE]
 > `redeployed persisted firewall rules at engine startup` で `applied=8, failed=2`、続く `initialized ActiveProcessTable, WFP firewall rules, and SQLite WAL store` で `wfp_applied=0, wfp_failed=2` のように `failed` が出る場合があります。
@@ -504,7 +506,7 @@ if ($preexistingFile -and (Test-Path -LiteralPath $preexistingFile)) {
 | `E2E-P2-06` | Phase 2 | ETW `Kernel-Registry` 自動起動キー検知と `CloseKey` 無効化 | | |
 | `E2E-P3-01` | Phase 3 | BFE 動的 SubLayer、ループバック許可、事前制限と `FwpmNetEventSubscribe1` | | |
 | `E2E-P3-02` | Phase 3 | 複数インスタンス時の `App-Level (Ambiguous PID)` 非凍結 | | |
-| `E2E-P3-03` | Phase 3 | `ledr-sim` LOTL と一般パス DNS／外部 TCP 相関（View 1 と View 2） | | |
+| `E2E-P3-03` | Phase 3 | `ledr-sim` LOTL と一般パス DNS／外部 TCP 相関（View 1 と View 2、実 ETW での起動時刻比較と親 PID／コマンドライン補完確認を含む） | | |
 | `E2E-P3-04` | Phase 3 | View 1 と View 3 での許可保存、ドメイン `IP-resolved`、Deny 優先、削除連動 | | |
 | `E2E-P3-05` | Phase 3 | 実 WinHTTP NRD 取得と View 3 `NRD / Homograph Check` | | |
 | `E2E-P3-06` | Phase 3 | 未応答 UNC 共有での 3 秒停止予算、WAL 先行チェックポイント、非ハング終了 | | |

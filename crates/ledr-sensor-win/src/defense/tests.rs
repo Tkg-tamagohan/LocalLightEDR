@@ -44,7 +44,7 @@ impl Drop for TempTestDir {
 }
 
 #[test]
-fn sens_p2_04_never_suspend_guard_rejects_system_self_and_explorer() {
+fn sens_p2_09_never_suspend_guard_rejects_system_self_and_explorer() {
     let controller = WindowsDefenseController::new();
 
     // PID 0, PID 4, and self PID must be rejected by both validator and controller.
@@ -93,7 +93,7 @@ fn sens_p2_04_never_suspend_guard_rejects_system_self_and_explorer() {
 }
 
 #[test]
-fn sens_p2_05_creation_time_mismatch_and_tree_containment() {
+fn sens_p2_10_creation_time_mismatch_and_tree_containment() {
     let controller = WindowsDefenseController::new();
 
     // Spawn a harmless two-level process tree (`cmd.exe` -> `findstr.exe`) blocked on stdin.
@@ -164,18 +164,10 @@ fn sens_p2_05_creation_time_mismatch_and_tree_containment() {
 
     let status = child.wait().expect("wait terminated child");
     assert!(!status.success());
-
-    // Phase 3 WFP methods cleanly report Phase 3 status.
-    assert!(
-        controller
-            .add_wfp_app_rule(Path::new(r"C:\Temp\a.exe"), None, false)
-            .is_err()
-    );
-    assert!(controller.remove_wfp_rule(1).is_err());
 }
 
 #[test]
-fn sens_p2_06_honeypot_manager_deploy_and_remove_lifecycle() {
+fn sens_p2_11_honeypot_manager_deploy_and_remove_lifecycle() {
     let temp = TempTestDir::new("honeypot");
     let docs = temp.path().join("Documents");
     let desktop = temp.path().join("Desktop");
@@ -225,7 +217,7 @@ fn sens_p2_06_honeypot_manager_deploy_and_remove_lifecycle() {
 }
 
 #[test]
-fn sens_p2_07_idempotent_double_suspend_single_resume() {
+fn sens_p2_12_idempotent_double_suspend_single_resume() {
     let controller = WindowsDefenseController::new();
     let mut child = Command::new("cmd.exe")
         .args(["/c", "findstr .*"])
@@ -341,7 +333,7 @@ fn wait_process_exited(handle: &OwnedHandle, timeout_ms: u32) -> bool {
 }
 
 #[test]
-fn sens_p2_08_zero_create_time_rejected_and_orphan_descendant_resume() {
+fn sens_p2_13_zero_create_time_rejected_and_orphan_descendant_resume() {
     let controller = WindowsDefenseController::new();
 
     // 1. Metadata guard must reject create_time_100ns == 0 on non-protected executables.
@@ -555,7 +547,7 @@ fn sens_p3_04_defense_controller_wfp_delegation_and_guards() {
 
 #[test]
 fn sens_p3_11_defense_controller_wfp_drop_sink_before_and_after_init() {
-    use crate::wfp::{WfpBackend, WfpDropEvent, WfpDropSinkFn, WfpFilterMeta, WfpFilterSpec};
+    use crate::wfp::{WfpBackend, WfpDropSinkFn, WfpFilterMeta, WfpFilterSpec};
     use std::sync::RwLock;
 
     // 1. Pre-init registration succeeds before lazy WFP open and can be cleared cleanly.
@@ -620,13 +612,8 @@ fn sens_p3_11_defense_controller_wfp_drop_sink_before_and_after_init() {
         .expect("dynamic engine");
     let controller = WindowsDefenseController::with_wfp_engine(wfp);
 
-    let events = Arc::new(Mutex::new(Vec::<WfpDropEvent>::new()));
-    let events_clone = Arc::clone(&events);
-    let recording_sink: WfpDropSinkFn = Arc::new(move |ev| {
-        events_clone.lock().unwrap().push(ev);
-    });
     controller
-        .set_wfp_drop_sink(recording_sink)
+        .set_wfp_drop_sink(sink)
         .expect("set_wfp_drop_sink on active engine");
     {
         let s = shared.lock().unwrap();

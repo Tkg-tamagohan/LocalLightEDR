@@ -1,0 +1,367 @@
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use ledr_proto::{ActiveDefenseController, ProcessIdentity, SensorEvent};
+use ledr_rules::{EarlyPruner, NrdCache, NrdCancelToken, SigmaEngine, NRD_MAX_ENTRIES};
+use ledr_sensor_win::NoopDefenseController;
+use ledr_store::{LedrStore, PurgeStats, StoreError};
+
+use crate::channel::{OutboundLaneClassifier, TwoLaneChannel};
+use crate::firewall::WfpRuleManager;
+use crate::notify::{NoopNotificationDispatcher, NotificationDispatcher};
+use crate::process_table::ActiveProcessTable;
+
+use super::dns_history::ProcessDnsHistory;
+use super::wfp_drops::{AppWfpAlertDedup, WfpDropDedupCache, WfpDropOverflowQueue};
+use super::{
+    current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, WindowsBinaryInspector,
+    APP_WFP_ALERT_DEDUP_CAPACITY, WFP_DROP_DEDUP_CAPACITY, WFP_DROP_DEDUP_WINDOW_MS,
+};
+
+impl DaemonEngine {
+    /// Starts a new [`DaemonEngine`] using [`NoopDefenseController`] and [`NoopNotificationDispatcher`].
+    pub fn start(
+        store: LedrStore,
+        sigma: SigmaEngine,
+        pruner: EarlyPruner,
+        config: DaemonConfig,
+    ) -> Arc<Self> {
+        Self::start_with_controllers(
+            store,
+            sigma,
+            pruner,
+            config,
+            Arc::new(NoopDefenseController),
+            Arc::new(NoopNotificationDispatcher),
+        )
+    }
+
+    /// Starts a new [`DaemonEngine`] with explicit [`ActiveDefenseController`] and
+    /// [`NotificationDispatcher`] implementations (`L-01`, `L-07`, `L-08`).
+    pub fn start_with_controllers(
+        store: LedrStore,
+        sigma: SigmaEngine,
+        pruner: EarlyPruner,
+        config: DaemonConfig,
+        defense: Arc<dyn ActiveDefenseController>,
+        notifier: Arc<dyn NotificationDispatcher>,
+    ) -> Arc<Self> {
+        Self::start_with_dependencies(
+            store,
+            sigma,
+            pruner,
+            config,
+            defense,
+            notifier,
+            Arc::new(WindowsBinaryInspector::new()),
+        )
+    }
+
+    /// Starts a new [`DaemonEngine`] with custom [`ActiveDefenseController`],
+    /// [`NotificationDispatcher`], and [`BinaryInspector`] implementations.
+    pub fn start_with_dependencies(
+        store: LedrStore,
+        sigma: SigmaEngine,
+        pruner: EarlyPruner,
+        config: DaemonConfig,
+        defense: Arc<dyn ActiveDefenseController>,
+        notifier: Arc<dyn NotificationDispatcher>,
+        inspector: Arc<dyn BinaryInspector>,
+    ) -> Arc<Self> {
+        let prior_running_candidates = store.list_running_process_instance_ids().unwrap_or_default();
+        let (sender, receiver) = TwoLaneChannel::with_capacities(
+            config.high_priority_capacity,
+            config.telemetry_capacity,
+        )
+        .split();
+        let process_table = Mutex::new(ActiveProcessTable::new(config.active_process_capacity));
+        let initial_nrd = config
+            .nrd_cache_path
+            .as_deref()
+            .filter(|p| p.is_file())
+            .and_then(|p| match NrdCache::load_from_file(p, NRD_MAX_ENTRIES) {
+                Ok(cache) => {
+                    tracing::info!(
+                        path = %p.display(),
+                        entries = cache.len(),
+                        "loaded local NRD cache from disk"
+                    );
+                    Some(cache)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %p.display(),
+                        error = %err,
+                        "failed loading local NRD cache; starting with empty NRD cache"
+                    );
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let mut wfp_manager = WfpRuleManager::new();
+        wfp_manager.set_startup_preemptive_executables(&config.preemptive_startup_executables);
+        let outbound_classifier = Arc::new(OutboundLaneClassifier::new(
+            config.outbound_firewall_enabled,
+        ));
+        let process_dns_history =
+            Mutex::new(ProcessDnsHistory::new(config.dns_history_capacity));
+        let wfp_drop_dedup = Mutex::new(WfpDropDedupCache::new(
+            WFP_DROP_DEDUP_CAPACITY,
+            WFP_DROP_DEDUP_WINDOW_MS,
+        ));
+        let (wfp_drop_tx, wfp_drop_rx) =
+            tokio::sync::mpsc::channel(config.high_priority_capacity.max(1));
+        let wfp_drop_overflow = Mutex::new(WfpDropOverflowQueue::new(
+            config.high_priority_capacity.max(1),
+        ));
+
+        let engine = Arc::new(Self {
+            config,
+            store,
+            sigma,
+            pruner,
+            defense,
+            notifier,
+            inspector,
+            process_table,
+            firewall: Mutex::new(wfp_manager),
+            outbound_classifier,
+            process_dns_history,
+            wfp_drop_dedup,
+            wfp_drop_tx,
+            wfp_drop_overflow,
+            wfp_drop_overflow_notify: tokio::sync::Notify::new(),
+            wfp_drop_overflow_pushed: AtomicU64::new(0),
+            wfp_drop_overflow_coalesced: AtomicU64::new(0),
+            app_wfp_alert_dedup: Mutex::new(AppWfpAlertDedup::new(APP_WFP_ALERT_DEDUP_CAPACITY)),
+            nrd_cache: Arc::new(RwLock::new(initial_nrd)),
+            nrd_cancel: NrdCancelToken::new(),
+            nrd_in_flight: Arc::new(AtomicBool::new(false)),
+            nrd_thread_handle: Mutex::new(None),
+            resolve_lock: Mutex::new(()),
+            policy_lock: Mutex::new(()),
+            prior_running_candidates: Mutex::new(prior_running_candidates),
+            sender,
+            started_at: Instant::now(),
+            high_priority_processed: AtomicU64::new(0),
+            telemetry_processed: AtomicU64::new(0),
+            pruned_events: AtomicU64::new(0),
+            alerts_emitted: AtomicU64::new(0),
+            fail_record_alert_for_test: AtomicBool::new(false),
+            worker_handle: tokio::sync::Mutex::new(None),
+        });
+
+        if engine.config.outbound_firewall_enabled {
+            let report = engine.deploy_persisted_network_rules();
+            if report.applied > 0 || report.failed > 0 {
+                tracing::info!(
+                    applied = report.applied,
+                    removed = report.removed,
+                    failed = report.failed,
+                    "redeployed persisted firewall rules at engine startup"
+                );
+            }
+        }
+
+        let worker_engine = Arc::clone(&engine);
+        let handle = tokio::spawn(async move {
+            worker_engine.run_pipeline(receiver, wfp_drop_rx).await
+        });
+
+        if let Ok(mut slot) = engine.worker_handle.try_lock() {
+            *slot = Some(handle);
+        }
+
+        engine
+    }
+
+    /// Seeds the in-memory [`ActiveProcessTable`] and SQLite store with initial OS process snapshots
+    /// (`AUTO-03`), flushes them immediately, and reconciles any stale running processes from prior
+    /// daemon sessions (`BUG_0001`, `BUG_0002`).
+    pub fn seed_processes(&self, snapshots: Vec<SensorEvent>) -> Result<usize, anyhow::Error> {
+        let mut count = 0usize;
+        let mut active_id_set = HashSet::with_capacity(snapshots.len());
+        for ev in snapshots {
+            if let SensorEvent::ProcessStart { identity, .. } = &ev {
+                active_id_set.insert(identity.instance_id());
+                self.process_event(&ev);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            tracing::warn!(
+                "seed_processes received zero ProcessStart snapshots; skipping stale reconciliation"
+            );
+            return Ok(0);
+        }
+        self.store.flush_batch()?;
+        {
+            let table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for id in table.active_instance_ids() {
+                active_id_set.insert(id);
+            }
+        }
+        let candidates = {
+            let mut guard = self
+                .prior_running_candidates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        let active_ids: Vec<String> = active_id_set.into_iter().collect();
+        let reconciled = self.store.reconcile_stale_running_candidates(
+            &candidates,
+            &active_ids,
+            current_unix_ms(),
+        )?;
+        if reconciled > 0 {
+            tracing::info!(
+                reconciled_stale_processes = reconciled,
+                "reconciled stale running processes from prior session"
+            );
+        }
+        Ok(count)
+    }
+
+    /// Executes a single SQLite TTL purge pass using the configured retention window (`L-11`).
+    pub fn run_ttl_purge_once(&self) -> Result<PurgeStats, StoreError> {
+        self.store
+            .purge_expired(current_unix_ms(), self.config.ttl_retention_days)
+    }
+
+    /// Transitions overdue `PENDING` alerts older than `alert_timeout_ms` to
+    /// `EXPIRED_SUSPENDED` WITHOUT resuming the suspended processes (`L-07`).
+    pub fn expire_overdue_alerts(&self, now_ms: i64) -> Result<usize, StoreError> {
+        let timeout_ms = i64::try_from(self.config.alert_timeout_ms).unwrap_or(i64::MAX);
+        let cutoff_ms = now_ms.saturating_sub(timeout_ms);
+        self.store.expire_pending_alerts(cutoff_ms)
+    }
+
+    /// Collects unexited descendant [`ProcessIdentity`] values for `root_ident` by combining
+    /// the in-memory [`ActiveProcessTable`] with live OS Toolhelp32 descendants (`BUG_0005`).
+    pub fn collect_descendant_identities_for_pid(
+        &self,
+        root_ident: &ProcessIdentity,
+    ) -> Vec<ProcessIdentity> {
+        if root_ident.create_time_100ns == 0 {
+            return Vec::new();
+        }
+        let mut combined = {
+            let table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            table.collect_unexited_descendants(root_ident)
+        };
+        let mut seen: HashSet<ProcessIdentity> = combined.iter().copied().collect();
+        seen.insert(*root_ident);
+        for live in ledr_sensor_win::defense::collect_live_descendants(root_ident) {
+            if live.create_time_100ns != 0 && seen.insert(live) {
+                combined.push(live);
+            }
+        }
+        combined
+    }
+
+    /// Closes ingestion, drains remaining queued events, joins background worker & NRD refresh
+    /// threads, flushes SQLite batches, and runs `PRAGMA wal_checkpoint(TRUNCATE)` within
+    /// `SHUTDOWN_FLUSH_TIMEOUT_MS` (`3,000 ms`, `AUTO-10`).
+    pub async fn shutdown_and_flush(&self) -> Result<(), anyhow::Error> {
+        let total_budget = Duration::from_millis(self.config.shutdown_flush_timeout_ms.max(1));
+        let deadline = tokio::time::Instant::now() + total_budget;
+        self.nrd_cancel.cancel();
+        self.store.request_shutdown();
+        self.sender.close();
+
+        let handle = {
+            let mut guard = self.worker_handle.lock().await;
+            guard.take()
+        };
+
+        let mut worker_checkpointed = false;
+        let mut drain_err: Option<anyhow::Error> = None;
+        if let Some(h) = handle {
+            match tokio::time::timeout_at(deadline, h).await {
+                Ok(Ok(Ok(()))) => {
+                    worker_checkpointed = true;
+                }
+                Ok(Ok(Err(store_err))) => {
+                    drain_err = Some(anyhow::Error::new(store_err));
+                }
+                Ok(Err(join_err)) => {
+                    tracing::error!(error = %join_err, "daemon worker task panicked during shutdown");
+                    drain_err = Some(anyhow::anyhow!(
+                        "daemon worker task panicked during shutdown: {join_err}"
+                    ));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = self.config.shutdown_flush_timeout_ms,
+                        "daemon pipeline drain exceeded shutdown flush timeout; forcing best-effort checkpoint"
+                    );
+                    drain_err = Some(anyhow::anyhow!(
+                        "daemon pipeline drain exceeded {} ms shutdown flush timeout",
+                        self.config.shutdown_flush_timeout_ms
+                    ));
+                }
+            }
+        }
+
+        // Prioritize WAL truncation BEFORE waiting on any remaining NRD refresh thread so a slow
+        // or wedged NRD thread can never delay or starve SQLite checkpointing (`AUTO-10`, `R-11`).
+        if !worker_checkpointed {
+            self.store.checkpoint_truncate()?;
+        }
+
+        let nrd_handle = {
+            let mut guard = self
+                .nrd_thread_handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(mut nrd) = nrd_handle {
+            let mut completed = nrd.join_handle.is_finished()
+                || !matches!(
+                    nrd.done_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                );
+            if !completed {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !remaining.is_zero() {
+                    match tokio::time::timeout(remaining, &mut nrd.done_rx).await {
+                        Ok(Ok(())) | Ok(Err(_)) => {
+                            completed = true;
+                        }
+                        Err(_) => {
+                            completed = nrd.join_handle.is_finished();
+                        }
+                    }
+                }
+            }
+            if completed {
+                if nrd.join_handle.join().is_err() {
+                    tracing::warn!("background NRD refresh thread panicked during shutdown");
+                }
+            } else {
+                // Detach the raw OS thread without touching Tokio's blocking pool so subsequent
+                // `Runtime::drop` cannot hang on an unresponsive NRD I/O thread (`R-11`).
+                tracing::warn!(
+                    timeout_ms = self.config.shutdown_flush_timeout_ms,
+                    "shutdown budget exhausted waiting for background NRD refresh thread; detaching thread"
+                );
+            }
+        }
+
+        if let Some(err) = drain_err {
+            return Err(err);
+        }
+        Ok(())
+    }
+}

@@ -702,19 +702,7 @@ fn ui_p2_05_notify_oneshot_json_output() {
     assert!(offline_event
         .toast_xml
         .contains("launch=\"ledr://alert/alert-offline-99\""));
-    assert!(dispatch_notify_oneshot_disabled_check(&offline_client).is_ok());
-}
-
-fn dispatch_notify_oneshot_disabled_check(offline_client: &IpcClient) -> Result<(), String> {
-    let ev = build_notify_oneshot_event(
-        "alert-check",
-        offline_client.pipe_name(),
-        offline_client.get_alerts(None, 50),
-        true,
-    );
-    serde_json::to_string(&ev)
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    assert!(serde_json::to_string(&offline_event).is_ok());
 }
 
 #[test]

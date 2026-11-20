@@ -9,10 +9,10 @@
   },
   "lineage_and_motw_on_first_screen": {
     "type": "noul",
-    "instructions": "Are the process lineage, network/DNS activity, and browser origin (MOTW) sections all immediately visible together on the initial triage screen, showing either recorded evidence or an explicit unrecorded status (such as 'None recorded' or 'No network/DNS activity recorded') without switching views?",
+    "instructions": "Are the alert's detection target (such as destination/domain for network alerts in Detection Context), process lineage, recent network/DNS activity, and browser origin (MOTW) sections all immediately visible together on the initial triage screen without switching views, with explicit unrecorded statuses (such as 'None recorded' or 'No network/DNS activity recorded') allowed only for absent history or MOTW cards?",
     "criteria": {
-      "true_description": "Process lineage (executable path, parent process, command line, or signer), network/DNS activity, and browser origin (MOTW) cards all appear simultaneously on the initial triage screen, displaying either recorded values or explicit unrecorded placeholders (such as 'None recorded' or 'No network/DNS activity recorded') when an alert has no such evidence.",
-      "false_description": "One or more of the process lineage, network/DNS activity, or browser origin (MOTW) sections is missing from the initial screen, left blank without an explicit unrecorded status, or requires navigating to another view."
+      "true_description": "The initial triage screen simultaneously shows the alert's own detection target (including destination IP/port or domain in Detection Context for network alerts), process lineage (executable path, parent process, command line, or signer), recent network/DNS activity, and browser origin (MOTW) cards on one view; when supplemental history or MOTW evidence is absent, those cards display explicit unrecorded placeholders (such as 'None recorded' or 'No network/DNS activity recorded') while the alert's detection target remains visible.",
+      "false_description": "The alert's detection target (such as a network alert's destination or domain) is missing, or one or more of the process lineage, recent network/DNS activity, or browser origin (MOTW) sections is absent from the initial screen, left blank without an explicit unrecorded status, or requires navigating to another view."
     }
   },
   "three_stage_actions_visible": {

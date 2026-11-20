@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Specification tests for LocalEDR invariant gate config and wrapper (T1-01..T1-07).
+"""Specification tests for LocalEDR invariant gate config and wrapper (T1-01..T1-08).
 
-All tests run offline without GEMINI_API_KEY.
+Integration tests ``T1-05`` (gate loader part), ``T1-06``, and ``T1-07`` skip only when
+``LEDR_INVARIANT_GATE_SCRIPT`` is unset and the default global plugin script is
+not installed; an explicit ``LEDR_INVARIANT_GATE_SCRIPT`` pointing to a missing
+or non-file path fails the test. All tests run offline without GEMINI_API_KEY.
 """
 
 from __future__ import annotations
@@ -299,6 +302,17 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                 env_gate.resolve(),
             )
 
+    def _require_gate_script(self) -> Path:
+        env_override = os.environ.get(check_invariants.GATE_SCRIPT_ENV, "").strip()
+        try:
+            return check_invariants.resolve_gate_script()
+        except FileNotFoundError as exc:
+            if env_override:
+                self.fail(
+                    f"{check_invariants.GATE_SCRIPT_ENV} points to a missing or non-file path: {exc}"
+                )
+            self.skipTest(f"Global invariant gate script not installed: {exc}")
+
     def test_T1_05_invariants_json_strict_schema_and_gate_loader(self) -> None:
         """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 10 keys and load_custom_questions."""
         invariants_path = REPO_ROOT / ".agents" / "invariants.json"
@@ -377,10 +391,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertIn("64 KiB", text_field)
             self.assertIn("NRD_FILE_READ_CHUNK_BYTES", text_field)
 
-        try:
-            gate_script = check_invariants.resolve_gate_script()
-        except FileNotFoundError as exc:
-            self.skipTest(f"Global invariant gate script not installed: {exc}")
+        gate_script = self._require_gate_script()
 
         gate_mod = _load_gate_module(gate_script)
         loaded = gate_mod.load_custom_questions(invariants_path, REPO_ROOT)
@@ -401,6 +412,20 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             diff_path = Path(tmp) / "mock.diff"
             diff_path.write_text(diff_text, encoding="utf-8")
+
+            numstat_proc = subprocess.run(
+                ["git", "apply", "--numstat", str(diff_path)],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(
+                numstat_proc.returncode,
+                0,
+                msg=f"Invalid unified diff ({numstat_proc.stderr}):\n{diff_text}",
+            )
 
             proc = subprocess.run(
                 [
@@ -428,10 +453,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
 
     def test_T1_06_dry_run_mock_diff_extracts_proto_and_excludes_artifact(self) -> None:
         """T1-06: Mock diff via real check_invariants_decision1.py extracts proto_frozen_api_compat and excludes ledr_artifact.html."""
-        try:
-            check_invariants.resolve_gate_script()
-        except FileNotFoundError as exc:
-            self.skipTest(f"Global invariant gate script not installed: {exc}")
+        self._require_gate_script()
 
         artifact_marker = "UNIQUE_ARTIFACT_HTML_MARKER_DO_NOT_SEND_TO_API"
         mock_diff = (
@@ -439,7 +461,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             "index 1111111..2222222 100644\n"
             "--- a/crates/ledr-proto/src/lib.rs\n"
             "+++ b/crates/ledr-proto/src/lib.rs\n"
-            "@@ -19,3 +19,3 @@\n"
+            "@@ -19,1 +19,1 @@\n"
             "-pub const IPC_PROTOCOL_VERSION: u32 = 1;\n"
             "+pub const IPC_PROTOCOL_VERSION: u32 = 2;\n"
             "diff --git a/ledr_artifact.html b/ledr_artifact.html\n"
@@ -473,15 +495,12 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
 
     def test_T1_07_single_file_diffs_select_updated_custom_rules(self) -> None:
         """T1-07: Single-file diffs extract each updated custom invariant rule."""
-        try:
-            check_invariants.resolve_gate_script()
-        except FileNotFoundError as exc:
-            self.skipTest(f"Global invariant gate script not installed: {exc}")
+        self._require_gate_script()
 
         cases: list[tuple[str, str, str, str, set[str]]] = [
             (
                 "crates/ledr-proto/src/lib.rs",
-                "@@ -24,3 +24,3 @@",
+                "@@ -24,2 +24,2 @@",
                 " pub const HIGH_PRIORITY_CHANNEL_CAPACITY: usize = 1024;",
                 "-pub const DEFAULT_ALERT_TIMEOUT_SECS: u64 = 60;\n+pub const DEFAULT_ALERT_TIMEOUT_SECS: u64 = 120;",
                 {
@@ -492,35 +511,35 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             ),
             (
                 "crates/ledr-sensor-win/src/etw/handlers.rs",
-                "@@ -460,3 +460,3 @@",
+                "@@ -460,2 +460,2 @@",
                 ' let desired_access = info.get_u32("DesiredAccess");',
                 "-let write_disp = matches!(disposition, 0 | 2 | 4 | 5);\n+let write_disp = true;",
                 {"canary_write_only_and_expired_suspended"},
             ),
             (
                 "crates/ledr-store/src/alerts.rs",
-                "@@ -235,3 +235,3 @@",
+                "@@ -235,2 +235,2 @@",
                 " pub fn expire_pending_alerts(&self, cutoff_timestamp_ms: i64) -> Result<usize, StoreError> {",
                 "-AlertStatus::ExpiredSuspended.as_db_str(),\n+AlertStatus::Resolved.as_db_str(),",
                 {"canary_write_only_and_expired_suspended"},
             ),
             (
                 "crates/ledr-daemon/src/engine/outbound.rs",
-                "@@ -840,3 +840,3 @@",
+                "@@ -840,2 +840,2 @@",
                 ' "suspend_process failed during coupled outbound containment"',
                 "-let _ = self.defense.remove_wfp_rule(handle);\n+// rollback skipped",
                 {"wfp_dynamic_session_and_deny_priority"},
             ),
             (
                 "crates/ledr-daemon/src/engine/dns_history.rs",
-                "@@ -110,3 +110,3 @@",
+                "@@ -110,2 +110,2 @@",
                 " match &latest.ipv4 {",
                 "-Some((prev_ips, prev_ts)) if timestamp_ms < *prev_ts =>\n+Some((prev_ips, _prev_ts)) if false =>",
                 {"wfp_dynamic_session_and_deny_priority"},
             ),
             (
                 "crates/ledr-rules/src/nrd/reader.rs",
-                "@@ -8,3 +8,3 @@",
+                "@@ -8,2 +8,2 @@",
                 " use super::cancel::NrdCancelToken;",
                 "-pub(crate) const NRD_FILE_READ_CHUNK_BYTES: usize = 64 * 1024;\n+pub(crate) const NRD_FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;",
                 {"nrd_shutdown_nonblocking_and_checkpoint"},
@@ -548,6 +567,27 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                         f"got {sorted(questions.keys())}"
                     ),
                 )
+
+    def test_T1_08_require_gate_script_skips_missing_default_and_fails_bad_env(self) -> None:
+        """T1-08: Missing default plugin skips, whereas invalid explicit LEDR_INVARIANT_GATE_SCRIPT fails."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            clean_env = os.environ.copy()
+            clean_env.pop(check_invariants.GATE_SCRIPT_ENV, None)
+
+            with mock.patch.dict(os.environ, clean_env, clear=True):
+                with mock.patch("pathlib.Path.home", return_value=tmp_dir):
+                    with self.assertRaises(unittest.SkipTest):
+                        self._require_gate_script()
+
+            bad_path = tmp_dir / "nonexistent_gate.py"
+            with mock.patch.dict(
+                os.environ,
+                {check_invariants.GATE_SCRIPT_ENV: str(bad_path)},
+                clear=False,
+            ):
+                with self.assertRaises(AssertionError):
+                    self._require_gate_script()
 
 
 if __name__ == "__main__":

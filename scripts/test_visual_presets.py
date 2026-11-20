@@ -4,8 +4,10 @@ Integration tests ``VIS-05`` and ``VIS-06`` require the external
 ``shared-skills`` plugin script at
 ``~/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/scripts/run_decisions.py``
 (overridable via the ``LEDR_DECISIONS_RUN_SCRIPT`` environment variable). When
-the global plugin script is not installed, ``VIS-05`` and ``VIS-06`` are skipped
-consistently with ``test_check_invariants.py``.
+``LEDR_DECISIONS_RUN_SCRIPT`` is unset and the default global plugin script is
+not installed, ``VIS-05`` and ``VIS-06`` are skipped consistently with
+``test_check_invariants.py``; when ``LEDR_DECISIONS_RUN_SCRIPT`` is explicitly
+set to a missing or non-file path, the tests fail to surface misconfiguration.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import sys
 import tempfile
 from typing import Any
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -126,6 +129,17 @@ def _load_run_decisions_module(script_path: Path):
 class VisualPresetsTests(unittest.TestCase):
     """Verify schema, encoding, question contracts, and run_decisions dry-run compatibility."""
 
+    def _require_run_decisions_script(self) -> Path:
+        env_override = os.environ.get(RUN_DECISIONS_ENV, "").strip()
+        try:
+            return resolve_run_decisions_script()
+        except FileNotFoundError as exc:
+            if env_override:
+                self.fail(
+                    f"{RUN_DECISIONS_ENV} points to a missing or non-file path: {exc}"
+                )
+            self.skipTest(f"Global run_decisions.py not installed: {exc}")
+
     def test_VIS_01_strict_json_utf8_no_bom_no_fffd(self) -> None:
         """VIS-01: Both presets decode strictly as UTF-8 without BOM/U+FFFD and reject NaN/Infinity."""
         for path in (UI_PRESET_PATH, EXT_PRESET_PATH):
@@ -198,10 +212,7 @@ class VisualPresetsTests(unittest.TestCase):
 
     def test_VIS_05_validate_payload_via_global_run_decisions(self) -> None:
         """VIS-05: Imported run_decisions.validate_payload returns zero errors for text and image payloads."""
-        try:
-            run_decisions_script = resolve_run_decisions_script()
-        except FileNotFoundError as exc:
-            self.skipTest(f"Global run_decisions.py not installed: {exc}")
+        run_decisions_script = self._require_run_decisions_script()
 
         run_decisions = _load_run_decisions_module(run_decisions_script)
         for path in (UI_PRESET_PATH, EXT_PRESET_PATH):
@@ -231,10 +242,7 @@ class VisualPresetsTests(unittest.TestCase):
 
     def test_VIS_06_subprocess_dry_run_without_api_key(self) -> None:
         """VIS-06: run_decisions.py --dry-run succeeds with exit code 0 and no GEMINI_API_KEY."""
-        try:
-            run_decisions_script = resolve_run_decisions_script()
-        except FileNotFoundError as exc:
-            self.skipTest(f"Global run_decisions.py not installed: {exc}")
+        run_decisions_script = self._require_run_decisions_script()
 
         env = os.environ.copy()
         env.pop("GEMINI_API_KEY", None)
@@ -269,7 +277,7 @@ class VisualPresetsTests(unittest.TestCase):
                 self.assertEqual(list(payload.get("questions", {}).keys()), expected_keys)
 
     def test_VIS_07_resolve_run_decisions_script_env_override_and_missing(self) -> None:
-        """VIS-07: LEDR_DECISIONS_RUN_SCRIPT resolves existing files and raises FileNotFoundError when missing."""
+        """VIS-07: LEDR_DECISIONS_RUN_SCRIPT resolves existing files, fails on bad override, and skips missing default."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             fake_script = tmp_dir / "fake_run_decisions.py"
@@ -286,6 +294,21 @@ class VisualPresetsTests(unittest.TestCase):
 
             with self.assertRaises(FileNotFoundError):
                 resolve_run_decisions_script(env={RUN_DECISIONS_ENV: str(tmp_dir)})
+
+            clean_env = os.environ.copy()
+            clean_env.pop(RUN_DECISIONS_ENV, None)
+            with mock.patch.dict(os.environ, clean_env, clear=True):
+                with mock.patch("pathlib.Path.home", return_value=tmp_dir):
+                    with self.assertRaises(unittest.SkipTest):
+                        self._require_run_decisions_script()
+
+            with mock.patch.dict(
+                os.environ,
+                {RUN_DECISIONS_ENV: str(missing)},
+                clear=False,
+            ):
+                with self.assertRaises(AssertionError):
+                    self._require_run_decisions_script()
 
 
 if __name__ == "__main__":

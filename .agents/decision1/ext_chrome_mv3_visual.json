@@ -1,0 +1,45 @@
+{
+  "clickfix_warning_visible": {
+    "type": "noul",
+    "instructions": "Is a Pastejacking or ClickFix warning clearly visible and effectively communicating dangerous command indicators and execution risk?",
+    "criteria": {
+      "true_description": "A prominent Pastejacking or ClickFix warning banner or overlay is clearly visible and communicates suspicious clipboard rewriting or dangerous LOTL command indicators and execution risk.",
+      "false_description": "A Pastejacking or ClickFix warning is absent, visually faint, or fails to communicate dangerous command indicators and execution risk."
+    }
+  },
+  "nrd_password_warning_visible": {
+    "type": "noul",
+    "instructions": "Is a password input warning for a newly registered domain (NRD) or homograph URL clearly visible in context with the password input field?",
+    "criteria": {
+      "true_description": "A warning about a newly registered domain (NRD) or homograph URL is clearly visible and visually anchored or linked to the password input field context.",
+      "false_description": "An NRD or homograph password warning is absent, or appears disconnected from the password input field context."
+    }
+  },
+  "warning_clipped_or_obscured": {
+    "type": "noul",
+    "instructions": "Are any parts of the browser warning banner or its action buttons clipped, obscured, or hidden by host page elements or scrollbars?",
+    "criteria": {
+      "true_description": "Host page elements, fixed headers, overflow containers, scrollbars, or viewport edges overlap, obscure, or clip the warning message or its buttons.",
+      "false_description": "The entire warning banner, threat details, and action buttons render cleanly above page content with full visibility and zero clipping."
+    }
+  },
+  "has_unnecessary_alarm_clutter": {
+    "type": "noul",
+    "instructions": "Do unnecessary decorations or verbose explanations bury the primary abort or proceed decision controls?",
+    "criteria": {
+      "true_description": "Verbose explanations, decorative badges, or repetitive filler crowd the warning so that the primary abort or proceed decision controls are hard to locate quickly.",
+      "false_description": "The warning states the concrete threat and affected context concisely, keeping the abort and proceed decision path immediately prominent."
+    }
+  },
+  "warning_actionability": {
+    "type": "score",
+    "instructions": "Rate how clearly the warning directs the user toward the safe defensive action while preventing accidental misclicks.",
+    "criteria": [
+      "0: unactionable or unsafe; decision controls are missing, broken, or mislead the user toward the risky action",
+      "1: poor actionability; safe abort and risky proceed controls are hard to distinguish, crowded, or partially obscured",
+      "2: fair actionability; abort and proceed options exist, though weak visual hierarchy or dense text increases hesitation or misclick risk",
+      "3: good actionability; the safe abort action is clearly prioritized over proceeding, with only minor spacing or copy friction",
+      "4: optimal actionability; threat context is concise and unambiguous, and the safe abort action is unmistakably emphasized to prevent misclicks"
+    ]
+  }
+}

@@ -1,0 +1,167 @@
+{
+  "questions": {
+    "proto_frozen_api_compat": {
+      "heading": "Frozen ledr-proto API Compatibility",
+      "description": "crates/ledr-proto の既存公開型とシグネチャは後方互換なく変更しない。",
+      "source_file": "AGENTS.md",
+      "path_globs": [
+        "crates/ledr-proto/**"
+      ],
+      "threshold": 0.60,
+      "warn_threshold": 0.35,
+      "instructions": "Does the Git diff introduce a backward-incompatible change to any existing public type, enum variant, struct field, trait, constant, IPC message schema, or function signature in crates/ledr-proto? Answer Yes only if the diff removes, renames, changes types or signatures of, or alters serialization compatibility of existing public API items in crates/ledr-proto. Answer No if the diff only adds backward-compatible items, updates comments or tests, or preserves all existing public contracts.",
+      "criteria": {
+        "true_description": "The Git diff modifies, renames, removes, or breaks serialization or signature compatibility of an existing public API item in crates/ledr-proto.",
+        "false_description": "The Git diff preserves backward compatibility for all existing public types, traits, constants, IPC messages, and signatures in crates/ledr-proto, or only touches comments or tests."
+      }
+    },
+    "two_lane_no_unbounded_channel": {
+      "heading": "Phase 1 Two-Lane Bounded Channel Boundary",
+      "description": "センサーから DaemonEngine への供給は TwoLaneSender（HIGH_PRIORITY_CHANNEL_CAPACITY = 1024 / TELEMETRY_CHANNEL_CAPACITY = 8192）直結とし、前段へ無制限チャネルを挟まない。",
+      "source_file": "AGENTS.md",
+      "path_globs": [
+        "crates/ledr-daemon/src/**",
+        "crates/ledr-sensor-win/src/**"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff insert an unbounded channel (such as mpsc::unbounded_channel) upstream of TwoLaneSender, weaken bounded lane capacities (HIGH_PRIORITY_CHANNEL_CAPACITY = 1024 / TELEMETRY_CHANNEL_CAPACITY = 8192), or allow dropping high-priority lane events between the sensor and DaemonEngine? Answer Yes only if the diff introduces an unbounded queue, bypasses TwoLaneSender bounded backpressure, or permits high-priority lane drops. Answer No if bounded two-lane delivery and capacities remain intact or the diff is unrelated to event channel wiring.",
+      "criteria": {
+        "true_description": "The Git diff introduces an unbounded channel before TwoLaneSender, alters or bypasses the bounded two-lane capacities, or drops high-priority lane events.",
+        "false_description": "The Git diff preserves direct bounded TwoLaneSender delivery without an upstream unbounded queue, or does not affect sensor-to-engine channel wiring."
+      }
+    },
+    "never_suspend_and_create_time": {
+      "heading": "Active Defense Never-Suspend and Process Identity Guard",
+      "description": "NtSuspendProcess とプロセス終了の前に、is_never_suspend_process 判定と ProcessIdentity.create_time_100ns 一致を必ず検証する。",
+      "source_file": ".agents/rules/active-defense-guards.md",
+      "path_globs": [
+        "crates/ledr-sensor-win/src/defense/**",
+        "crates/ledr-daemon/src/**"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff invoke or wire NtSuspendProcess or process termination while omitting, bypassing, or weakening the is_never_suspend_process check, the ProcessIdentity.create_time_100ns match verification, or ProcessLiveness Unknown handling? Answer Yes only if the diff allows suspend or termination paths to skip is_never_suspend_process or create_time_100ns verification or treats Unknown liveness as Gone. Answer No if both guards remain enforced before suspend or terminate or the diff is unrelated to defense actuators.",
+      "criteria": {
+        "true_description": "The Git diff adds or modifies a suspend or termination path that skips, bypasses, or weakens is_never_suspend_process, create_time_100ns verification, or ProcessLiveness safety checks.",
+        "false_description": "The Git diff enforces is_never_suspend_process and create_time_100ns verification on all suspend and termination paths, or does not alter process defense actuation."
+      }
+    },
+    "canary_write_only_and_expired_suspended": {
+      "heading": "File Canary Write-Only Trigger and 60s ExpiredSuspended Transition",
+      "description": "おとりファイルは書き込み・削除・リネームのみで発火させ読み取りで発火させず、未応答 60 秒到達時は EXPIRED_SUSPENDED（AlertStatus::ExpiredSuspended）へ遷移させて自動再開しない。",
+      "source_file": ".agents/rules/active-defense-guards.md",
+      "path_globs": [
+        "crates/ledr-sensor-win/src/etw/file_canary/**",
+        "crates/ledr-daemon/src/engine/**"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff cause honeypot or canary triggers to fire on file read operations, or change the 60-second unanswered alert timeout to automatically resume or terminate suspended processes instead of transitioning to EXPIRED_SUSPENDED (AlertStatus::ExpiredSuspended)? Answer Yes only if the diff triggers canary alerts on reads or introduces auto-resume or auto-kill upon alert timeout. Answer No if canary detection remains restricted to write, delete, and rename events and timeout keeps processes suspended in ExpiredSuspended.",
+      "criteria": {
+        "true_description": "The Git diff triggers file canary alerts on read access, or replaces the EXPIRED_SUSPENDED timeout transition with automatic process resumption or termination.",
+        "false_description": "The Git diff restricts canary triggers to write, delete, and rename events and maintains EXPIRED_SUSPENDED without auto-resume on timeout, or is unrelated."
+      }
+    },
+    "session0_non_system_and_ui_zero_exit": {
+      "heading": "Session 0 Non-SYSTEM UI Launch and Zero Resident Process on Close",
+      "description": "--notify 起動は WTSQueryUserToken と CreateProcessAsUser で非 SYSTEM ユーザー権限を用い、ウィンドウ閉鎖時は ledr-ui と関連 WebView2 プロセスを 0 件にする。",
+      "source_file": ".agents/rules/active-defense-guards.md",
+      "path_globs": [
+        "crates/ledr-daemon/src/notify.rs",
+        "apps/ledr-ui/src/**"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff launch ledr-ui --notify under SYSTEM privileges instead of non-SYSTEM user impersonation via WTSQueryUserToken and CreateProcessAsUser, or keep ledr-ui or WebView2 processes resident in a tray or background after window close? Answer Yes only if the diff removes or bypasses non-SYSTEM user token launch for Session 0 notifications or introduces tray or background persistence that prevents zero processes on UI close. Answer No if non-SYSTEM token launch and zero-process exit remain preserved.",
+      "criteria": {
+        "true_description": "The Git diff spawns UI notifications as SYSTEM, bypasses WTSQueryUserToken or CreateProcessAsUser, or leaves ledr-ui or WebView2 resident after closing the window.",
+        "false_description": "The Git diff maintains non-SYSTEM user token UI launch for Session 0 notifications and clean full exit to zero processes on window close, or is unrelated."
+      }
+    },
+    "ipc_caller_auth_and_rw_timeout": {
+      "heading": "Named Pipe IPC Caller Authorization and Read/Write Timeouts",
+      "description": "状態変更要求および ReportDownloadOrigin と ReportBrowserEvent 等の監査報告要求は開発バイパス無効時に GetNamedPipeClientProcessId で正規バイナリを検証し、読み書き双方へタイムアウトを設定する。",
+      "source_file": ".agents/rules/active-defense-guards.md",
+      "path_globs": [
+        "crates/ledr-daemon/src/ipc/**",
+        "crates/ledr-bridge-nm/**"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff add or modify an IPC state-changing or audit-reporting handler (such as ReportDownloadOrigin or ReportBrowserEvent) that omits GetNamedPipeClientProcessId caller binary verification (AUTHORIZED_UI_EXE_PATH or AUTHORIZED_BRIDGE_EXE_PATH) when dev_bypass_auth is disabled, or omit read, write, or flush timeouts on IPC pipe I/O? Answer Yes only if caller authentication is skipped outside dev_bypass_auth or IPC I/O lacks bounded read, write, or flush timeouts. Answer No if caller authorization and bounded read/write/flush timeouts are enforced.",
+      "criteria": {
+        "true_description": "The Git diff omits GetNamedPipeClientProcessId caller authorization on state-changing or audit-reporting IPC requests when dev_bypass_auth is false, or leaves IPC read, write, or flush operations without timeouts.",
+        "false_description": "The Git diff enforces GetNamedPipeClientProcessId binary verification for non-bypass builds and applies explicit read, write, and flush timeouts across IPC handlers."
+      }
+    },
+    "wfp_dynamic_session_and_deny_priority": {
+      "heading": "WFP Dynamic Session, Partial Failure Rollback, and Shared-IP Deny Priority",
+      "description": "WFP エンジンは FWPM_SESSION_FLAG_DYNAMIC と独自 SubLayer を使い、片系失敗時の復元と共有 IP の deny-overrides-allow およびデュアルスタック鮮度検証を維持する。",
+      "source_file": ".agents/rules/active-defense-guards.md",
+      "path_globs": [
+        "crates/ledr-sensor-win/src/wfp/**",
+        "crates/ledr-daemon/src/firewall/**",
+        "crates/ledr-daemon/src/engine/wfp_*.rs",
+        "crates/ledr-daemon/src/engine/domain_policy.rs"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff remove FWPM_SESSION_FLAG_DYNAMIC or the dedicated LocalEDR SubLayer (risking persistent kernel filters after crash), skip rollback or compensation when suspend or WFP filter reconciliation partially fails, or violate deny-overrides-allow across shared IPs or stale dual-stack DNS history? Answer Yes only if dynamic session or SubLayer guarantees, partial-failure rollback, or shared-IP deny priority are broken. Answer No if dynamic WFP session flags, SubLayer scoping, rollback, and deny priority remain intact.",
+      "criteria": {
+        "true_description": "The Git diff drops FWPM_SESSION_FLAG_DYNAMIC or dedicated SubLayer usage, leaves orphaned state on partial suspend or WFP failure, or weakens shared-IP deny-overrides-allow or dual-stack freshness evaluation.",
+        "false_description": "The Git diff preserves FWPM_SESSION_FLAG_DYNAMIC, dedicated SubLayer, compensation rollback on partial failure, and deny-overrides-allow priority, or is unrelated."
+      }
+    },
+    "nrd_shutdown_nonblocking_and_checkpoint": {
+      "heading": "Phase 3 Non-Blocking NRD Shutdown, Checkpoint Priority, and Chunked Cancel",
+      "description": "NRD 更新スレッド停止は spawn_blocking を使わず NrdThreadHandle（oneshot と InFlightGuard::drop）で非ブロッキング待機し、checkpoint_truncate 優先と 64 KiB チャンク単位キャンセルを維持する。",
+      "source_file": "AGENTS.md",
+      "path_globs": [
+        "crates/ledr-daemon/src/engine/lifecycle.rs",
+        "crates/ledr-daemon/src/engine/nrd.rs",
+        "crates/ledr-rules/src/nrd/**"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff introduce tokio::task::spawn_blocking to join the NRD worker thread, skip prioritizing checkpoint_truncate before waiting on NRD shutdown, or remove per-chunk cancellation checks (including before ErrorKind::Interrupted retries) in bounded NRD file or stream readers? Answer Yes only if blocking join via spawn_blocking is introduced, checkpoint priority on shutdown is removed, or chunked cancellation checks are bypassed. Answer No if non-blocking oneshot/InFlightGuard shutdown, checkpoint priority, and cancellable chunk reads remain intact.",
+      "criteria": {
+        "true_description": "The Git diff introduces spawn_blocking for NRD thread join, omits shutdown checkpoint priority before waiting, or removes bounded chunk cancellation checks around reads or Interrupted retries.",
+        "false_description": "The Git diff preserves non-blocking NrdThreadHandle shutdown, checkpoint_truncate priority, and per-chunk cancellation checks, or does not touch NRD lifecycle or reader logic."
+      }
+    },
+    "phase4_nrd_local_only_and_motw": {
+      "heading": "Phase 4 Local-Only NRD Evaluation and 3-Stage MOTW Lineage",
+      "description": "Phase 4 の NRD 判定は閲覧ドメインを外部送信せずローカル完結に保ち、ダウンロード起源はパス・SHA-256・:Zone.Identifier の 3 段階で紐付ける。",
+      "source_file": ".agents/rules/active-defense-guards.md",
+      "path_globs": [
+        "extensions/ledr-chrome-mv3/**",
+        "crates/ledr-bridge-nm/**",
+        "crates/ledr-daemon/src/**",
+        "crates/ledr-sensor-win/src/**"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff transmit visited browser domains or URLs to an external remote service for NRD or phishing lookups, or omit any of the three required MOTW download-origin correlation stages (file path, SHA-256 hash, and :Zone.Identifier alternate data stream)? Answer Yes only if the diff sends browsed domains externally or weakens the three-stage MOTW correlation (path, SHA-256, and :Zone.Identifier). Answer No if NRD lookups stay strictly local and all three MOTW correlation stages are preserved or unmodified.",
+      "criteria": {
+        "true_description": "The Git diff sends visited domains or URLs to an external endpoint during NRD evaluation, or omits path, SHA-256, or :Zone.Identifier correlation in MOTW handling.",
+        "false_description": "The Git diff keeps NRD and homograph evaluation strictly local without external domain leakage and preserves three-stage MOTW correlation, or is unrelated."
+      }
+    },
+    "phase4_clickfix_l15_guard": {
+      "heading": "Decision Record L-15 ClickFix / Pastejacking Trigger Guard",
+      "description": "決定記録 L-15 に従い、ClickFix 警告発火は危険な LOTL コマンド特徴量または DOM getSelection() とクリップボード書き込み内容の不一致に限定し、通常コピーを誤警告しない。",
+      "source_file": "docs/decision-records.md",
+      "path_globs": [
+        "extensions/ledr-chrome-mv3/**"
+      ],
+      "threshold": 0.70,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff broaden ClickFix or Pastejacking warning triggers beyond dangerous LOTL command indicators or a mismatch between DOM getSelection() and clipboard write contents (Decision Record L-15), causing false alarms on ordinary developer code copies? Answer Yes only if copy or clipboard interception triggers alerts on benign copies lacking LOTL indicators and selection-clipboard mismatch. Answer No if triggers remain gated by LOTL features or getSelection() mismatch or the diff does not modify ClickFix detection.",
+      "criteria": {
+        "true_description": "The Git diff triggers ClickFix warnings broadly on normal copy operations without requiring dangerous LOTL command indicators or a getSelection() versus clipboard mismatch.",
+        "false_description": "The Git diff restricts ClickFix warning triggers to LOTL command indicators or DOM getSelection() versus clipboard content mismatches per Decision Record L-15, or is unrelated."
+      }
+    }
+  }
+}

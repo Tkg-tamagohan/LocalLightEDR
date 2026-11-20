@@ -1,0 +1,63 @@
+{
+  "suspend_banner_visible": {
+    "type": "noul",
+    "instructions": "Is a process suspension or alert containment status banner clearly visible at the top of the triage screen?",
+    "criteria": {
+      "true_description": "A distinct status banner at the top of the screen clearly displays the process suspension or containment state (such as suspended, expired suspended, WFP blocked, or active alert status) with severity and alert metadata.",
+      "false_description": "A suspension or containment status banner is absent from the top of the screen, hidden, or unreadable."
+    }
+  },
+  "lineage_and_motw_on_first_screen": {
+    "type": "noul",
+    "instructions": "Are process lineage, network destinations, and browser origin (MOTW) all immediately visible together on the initial screen in a single view?",
+    "criteria": {
+      "true_description": "Process lineage (executable path, parent process, command line, or signer), network or detection targets, and browser download origin (MOTW) appear simultaneously on the first triage screen.",
+      "false_description": "One or more of process lineage, network destinations, or browser origin (MOTW) is missing from the initial screen or requires navigating to another view."
+    }
+  },
+  "three_stage_actions_visible": {
+    "type": "noul",
+    "instructions": "Are all three tiered alert resolution action buttons (Terminate and Block, Allow Once, and Allow Permanent Rule) clearly visible?",
+    "criteria": {
+      "true_description": "All three resolution buttons—Terminate and Block (with permanent block rule option), Allow Once, and Allow Permanent Rule—are clearly labeled, visible, and immediately actionable.",
+      "false_description": "Fewer than three resolution buttons are visible, or at least one action tier is hidden off-screen, unlabeled, or covered."
+    }
+  },
+  "has_layout_breakage_or_clipping": {
+    "type": "noul",
+    "instructions": "Does the UI show overlapping elements, content overflowing container bounds, or clipped or truncated text on buttons and labels?",
+    "criteria": {
+      "true_description": "UI elements overlap, overflow past container or viewport boundaries, appear visibly misaligned, or clip and truncate button labels, headings, or field values.",
+      "false_description": "All UI elements, evidence cards, banners, and action buttons stay properly aligned and contained within layout bounds with legible, unclipped text."
+    }
+  },
+  "has_redundant_guide_copy": {
+    "type": "noul",
+    "instructions": "Does the screen display redundant explanatory copy, welcome banners, or usage guides that hinder urgent triage?",
+    "criteria": {
+      "true_description": "A welcome banner, tutorial walkthrough, decorative slogan, or verbose explanatory paragraph repeats self-evident controls and clutters the triage view.",
+      "false_description": "The interface leads directly with status alerts, evidence cards, and action controls, keeping text limited to labels, values, and brief irreversible-impact or constraint notes."
+    }
+  },
+  "five_second_triage_clarity": {
+    "type": "score",
+    "instructions": "Rate how clearly this UI allows an operator to grasp the incident context and execute a containment decision within 5 seconds of clicking an alert notification.",
+    "criteria": [
+      "0: unusable for rapid triage; critical containment status, evidence, or action buttons are missing, unreadable, or severely broken",
+      "1: poor triage clarity; major clutter, missing first-screen context, or buried actions block a fast decision",
+      "2: fair triage clarity; basic details and actions are visible, though weak hierarchy, spacing issues, or redundant text slow scanning",
+      "3: good 5-second triage clarity; suspension state, evidence cards, and three-tier actions are visible with only minor spacing or copy friction",
+      "4: optimal 5-second triage clarity; top suspension banner, process/network/MOTW evidence, and distinct three-tier actions are immediately scannable on one screen"
+    ]
+  },
+  "dominant_view": {
+    "type": "choice",
+    "instructions": "Which LocalEDR core view is predominantly displayed in this screenshot?",
+    "criteria": {
+      "view1_triage": "View 1 (Alert Triage): displays the alert queue, top suspension status banner, detection/lineage/MOTW/network evidence cards, and three-stage resolution action buttons.",
+      "view2_flight_recorder": "View 2 (Process Lineage and Flight Recorder): displays the process lineage tree panel alongside the process inspector and timeline/DNS/network/canary telemetry table.",
+      "view3_policy_shield": "View 3 (Defense Policy, Canary, and Browser Shield): displays firewall and allowlist rule management alongside canary/honeypot status and browser shield NRD/homograph diagnostics.",
+      "other": "A dialog, blank or error state, non-LocalEDR window, or ambiguous layout outside View 1, View 2, and View 3."
+    }
+  }
+}

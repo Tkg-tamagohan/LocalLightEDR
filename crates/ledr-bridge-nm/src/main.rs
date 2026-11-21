@@ -13,11 +13,12 @@ use std::io;
 use std::process;
 
 use cli::Command;
-use pipe_client::PipeClient;
+use pipe_client::{verify_browser_relay_caller, PipeClient};
 
 fn run() -> anyhow::Result<()> {
     match cli::parse_args()? {
         Command::Relay(args) => {
+            verify_browser_relay_caller(&args)?;
             // In relay mode Chrome treats any byte on stdout as a 4-byte LE frame header;
             // keep all diagnostic logging strictly on stderr.
             let stdin = io::stdin();

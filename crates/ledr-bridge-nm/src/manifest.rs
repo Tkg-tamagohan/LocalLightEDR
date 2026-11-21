@@ -8,10 +8,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cli::{BrowserKind, Scope};
 use crate::extension_id::{chrome_extension_origin, NATIVE_HOST_NAME};
 
-/// Filename of the Chrome / Edge / Brave Native Messaging Host manifest.
+/// Legacy shared filename of the Native Messaging Host manifest.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const MANIFEST_FILENAME: &str = "com.localedr.bridge.json";
+
+/// Returns the isolated Native Messaging Host manifest filename for `scope` and `browser`.
+pub fn manifest_filename_for(scope: Scope, browser: BrowserKind) -> String {
+    format!(
+        "com.localedr.bridge.{}.{}.json",
+        scope.as_str(),
+        browser.as_str()
+    )
+}
 
 /// Description written into the Native Messaging Host manifest.
 pub const MANIFEST_DESCRIPTION: &str = "LocalEDR Browser Shield Native Messaging Bridge";
@@ -36,6 +47,7 @@ pub struct ManifestValidation {
     pub valid: bool,
     pub bridge_exe_exists: bool,
     pub extension_id_matched: bool,
+    pub allowed_origins: Vec<String>,
     pub path: String,
     pub error: Option<String>,
 }
@@ -156,6 +168,7 @@ pub fn validate_manifest_file(
                 valid: false,
                 bridge_exe_exists: false,
                 extension_id_matched: false,
+                allowed_origins: Vec::new(),
                 path: path_str,
                 error: Some("manifest file does not exist".to_string()),
             };
@@ -166,6 +179,7 @@ pub fn validate_manifest_file(
                 valid: false,
                 bridge_exe_exists: false,
                 extension_id_matched: false,
+                allowed_origins: Vec::new(),
                 path: path_str,
                 error: Some(format!("failed to read manifest: {err}")),
             };
@@ -180,6 +194,7 @@ pub fn validate_manifest_file(
                 valid: false,
                 bridge_exe_exists: false,
                 extension_id_matched: false,
+                allowed_origins: Vec::new(),
                 path: path_str,
                 error: Some(format!("invalid manifest JSON: {err}")),
             };
@@ -221,6 +236,7 @@ pub fn validate_manifest_file(
         valid,
         bridge_exe_exists,
         extension_id_matched,
+        allowed_origins: parsed.allowed_origins,
         path: path_str,
         error: (!valid).then(|| problems.join("; ")),
     }

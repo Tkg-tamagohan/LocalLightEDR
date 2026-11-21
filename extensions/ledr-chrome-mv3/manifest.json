@@ -6,6 +6,7 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtMAe02u4HaagKt3B3U7qxalcsi5kDTupsK2p5shKumx5dNvyMf8WCTBgyPIPQmBM2YF+05fedfVfl87Aokz7ANavXloHMjM2wq5+jIy4Y8SwDYwKZatwIFg2U0sJTftsel0qmALi6hw3LOkgSIqQRWaGKYwOe0LxXUTNS5kI08YPHxG/sokvBKcV+AA3fK0YzLlss3YSfpWZZfam6oc8rSy7jS5vDZqoaJ2FUR9e7ThUVB+Ho5DjyFMIqO2XFoPmDdviMPb5CMHZCSfW6Hfxil5wZMDsPnhPa5gNoWNkf+5epUCstzoc8ONJs9nKxYU8bU7vXCo1Ws/U4dkA95yU8QIDAQAB",
   "permissions": [
     "declarativeNetRequest",
+    "declarativeNetRequestFeedback",
     "downloads",
     "nativeMessaging",
     "storage",
@@ -23,14 +24,14 @@
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content_main.js"],
-      "world": "MAIN",
+      "js": ["content.js"],
       "run_at": "document_start",
       "all_frames": true
     },
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content.js"],
+      "js": ["content_main.js"],
+      "world": "MAIN",
       "run_at": "document_start",
       "all_frames": true
     }

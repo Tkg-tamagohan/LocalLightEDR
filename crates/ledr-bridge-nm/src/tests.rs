@@ -1,4 +1,4 @@
-//! Specification-driven unit and Named Pipe tests for `ledr-bridge-nm` (`BRIDGE-01`..`BRIDGE-10`).
+//! Specification-driven unit and Named Pipe tests for `ledr-bridge-nm` (`BRIDGE-01`..`BRIDGE-14`).
 
 use std::fs;
 use std::io::Cursor;
@@ -7,19 +7,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ledr_proto::{decode_ipc_frame, encode_ipc_frame, IpcRequest, IpcResponse, IPC_MAX_FRAME_BYTES};
 
-use crate::cli::{parse_args_from, BrowserKind, Command, Scope, SetupArgs, StatusArgs, StatusScope, UnregisterArgs};
+use crate::cli::{
+    parse_args_from, BrowserKind, Command, RelayArgs, Scope, SetupArgs, StatusArgs, StatusScope,
+    UnregisterArgs,
+};
 use crate::extension_id::{
     chrome_extension_origin, decode_base64, derive_extension_id_from_base64_key,
     derive_extension_id_from_der, is_valid_extension_id, sha256, DEFAULT_CHROME_EXTENSION_ID,
 };
 use crate::manifest::{
-    build_manifest, validate_manifest_file, write_manifest_atomic, MANIFEST_FILENAME,
+    build_manifest, manifest_filename_for, validate_manifest_file, write_manifest_atomic,
+    MANIFEST_FILENAME,
 };
 use crate::pipe_client::{
-    is_authorized_pipe_server_exe_with, is_default_ipc_pipe, BridgeTransportError, PipeClient,
+    is_authorized_browser_parent_exe_with, is_authorized_pipe_server_exe_with,
+    is_default_ipc_pipe, is_valid_caller_origin, verify_browser_relay_caller,
+    verify_browser_relay_caller_with, BridgeTransportError, PipeClient,
 };
 use crate::relay::{read_raw_frame, run_relay_loop, write_raw_frame, FrameExchange, RawFrameError};
-use crate::setup::{run_setup_with, run_status_with, run_unregister_with, RegistryTarget};
+use crate::setup::{
+    resolve_bridge_exe_with, resolve_manifest_dir, resolve_ui_exe_with, run_setup_with,
+    run_status_with, run_unregister_with, RegistryTarget,
+};
 
 static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -681,26 +690,38 @@ fn bridge_07_pipe_io_enforces_bounded_read_timeout() {
 }
 
 #[cfg(windows)]
+struct RegTestGuard {
+    root_subkey: String,
+}
+
+#[cfg(windows)]
+impl RegTestGuard {
+    fn new(tag: &str) -> (Self, String) {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+
+        let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root_subkey = format!(r"Software\LocalEDR-Test\{tag}-{}-{seq}", std::process::id());
+        let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&root_subkey);
+        (Self { root_subkey: root_subkey.clone() }, root_subkey)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RegTestGuard {
+    fn drop(&mut self) {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let _ = hkcu.delete_subkey_all(&self.root_subkey);
+    }
+}
+
+#[cfg(windows)]
 #[test]
 fn bridge_08_setup_status_unregister_idempotent_roundtrip() {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-
-    struct RegTestGuard {
-        root_subkey: String,
-    }
-    impl Drop for RegTestGuard {
-        fn drop(&mut self) {
-            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-            let _ = hkcu.delete_subkey_all(&self.root_subkey);
-        }
-    }
-
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let prefix = format!(r"Software\LocalEDR-Test\bridge-nm-{}-{seq}", std::process::id());
-    let _reg_guard = RegTestGuard {
-        root_subkey: prefix.clone(),
-    };
+    let (_reg_guard, prefix) = RegTestGuard::new("bridge-nm-b08");
     let temp_dir = TempDirGuard::new("ledr-bridge-nm-b08");
     let fake_bridge = temp_dir.path().join("ledr-bridge-nm.exe");
     let fake_ui = temp_dir.path().join("ledr-ui.exe");
@@ -724,25 +745,32 @@ fn bridge_08_setup_status_unregister_idempotent_roundtrip() {
         json: false,
     };
 
-    // 1. First setup writes manifest + 3 browser keys + ledr:// URI + AUMID
+    let chrome_manifest = manifest_dir.join(manifest_filename_for(Scope::User, BrowserKind::Chrome));
+    let edge_manifest = manifest_dir.join(manifest_filename_for(Scope::User, BrowserKind::Edge));
+    let brave_manifest = manifest_dir.join(manifest_filename_for(Scope::User, BrowserKind::Brave));
+
+    // 1. First setup writes per-browser manifests + 3 browser keys + ledr:// URI + AUMID
     let first = run_setup_with(&setup_args, &target).expect("first setup");
     assert!(first.manifest_written);
     assert!(first.uri_registered);
     assert!(first.uri_updated);
     assert!(first.aumid_updated);
-    assert!(first.browsers.iter().all(|b| b.updated));
-    assert!(manifest_dir.join(MANIFEST_FILENAME).is_file());
+    assert!(first.browsers.iter().all(|b| b.updated && b.manifest_written));
+    assert!(chrome_manifest.is_file());
+    assert!(edge_manifest.is_file());
+    assert!(brave_manifest.is_file());
 
     // 2. Second setup is strictly idempotent
     let second = run_setup_with(&setup_args, &target).expect("second setup");
     assert!(!second.manifest_written);
     assert!(!second.uri_updated);
     assert!(!second.aumid_updated);
-    assert!(second.browsers.iter().all(|b| !b.updated));
+    assert!(second.browsers.iter().all(|b| !b.updated && !b.manifest_written));
 
-    // 3. Status reads all 3 browsers + valid manifest + URI + AUMID
+    // 3. Status reads all 3 browsers + valid manifests + URI + AUMID
     let status_args = StatusArgs {
         scope: StatusScope::User,
+        extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
         ping: false,
         pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
         json: false,
@@ -760,7 +788,7 @@ fn bridge_08_setup_status_unregister_idempotent_roundtrip() {
         .iter()
         .all(|b| b.registered && b.manifest.as_ref().is_some_and(|m| m.valid)));
 
-    // 4. Unregistering only Chrome preserves shared manifest while Edge & Brave remain
+    // 4. Unregistering only Chrome deletes Chrome's own manifest while Edge & Brave remain intact
     let unreg_chrome = UnregisterArgs {
         scope: Scope::User,
         browsers: vec![BrowserKind::Chrome],
@@ -768,11 +796,13 @@ fn bridge_08_setup_status_unregister_idempotent_roundtrip() {
         keep_uri: true,
         json: false,
     };
-    let res_chrome = run_unregister_with(&unreg_chrome, &target).expect("unreg chrome");
-    assert!(!res_chrome.manifest_removed);
-    assert!(manifest_dir.join(MANIFEST_FILENAME).is_file());
+    let res_chrome = run_unregister_with(&unreg_chrome, &target, None).expect("unreg chrome");
+    assert!(res_chrome.manifest_removed);
+    assert!(!chrome_manifest.exists());
+    assert!(edge_manifest.is_file());
+    assert!(brave_manifest.is_file());
 
-    // 5. Unregistering remaining browsers without --keep-uri deletes manifest + URI + AUMID
+    // 5. Unregistering remaining browsers without --keep-uri deletes remaining manifests + URI + AUMID
     let unreg_all = UnregisterArgs {
         scope: Scope::User,
         browsers: vec![BrowserKind::Edge, BrowserKind::Brave],
@@ -780,14 +810,15 @@ fn bridge_08_setup_status_unregister_idempotent_roundtrip() {
         keep_uri: false,
         json: false,
     };
-    let res_all = run_unregister_with(&unreg_all, &target).expect("unreg all");
+    let res_all = run_unregister_with(&unreg_all, &target, None).expect("unreg all");
     assert!(res_all.manifest_removed);
     assert!(res_all.uri_removed);
     assert!(res_all.aumid_removed);
-    assert!(!manifest_dir.join(MANIFEST_FILENAME).exists());
+    assert!(!edge_manifest.exists());
+    assert!(!brave_manifest.exists());
 
     // 6. Repeat unregister is cleanly idempotent
-    let res_repeat = run_unregister_with(&unreg_all, &target).expect("repeat unreg");
+    let res_repeat = run_unregister_with(&unreg_all, &target, None).expect("repeat unreg");
     assert!(!res_repeat.manifest_removed);
     assert!(!res_repeat.uri_removed);
     assert!(!res_repeat.aumid_removed);
@@ -892,5 +923,320 @@ fn bridge_10_manifest_validation_rejects_corrupt_or_mismatched_origins() {
     assert!(valid.valid);
     assert!(valid.bridge_exe_exists);
     assert!(valid.extension_id_matched);
+    assert_eq!(
+        valid.allowed_origins,
+        vec![format!("chrome-extension://{DEFAULT_CHROME_EXTENSION_ID}/")]
+    );
     assert!(valid.error.is_none());
+}
+
+#[test]
+fn bridge_11_user_scope_prefers_installed_authorized_paths() {
+    let temp = TempDirGuard::new("ledr-bridge-nm-b11");
+    let installed_bridge = temp.path().join("ledr-bridge-nm.exe");
+    let installed_ui = temp.path().join("ledr-ui.exe");
+    let nonexistent_bridge = temp.path().join("missing-bridge.exe");
+    let nonexistent_ui = temp.path().join("missing-ui.exe");
+    let override_bridge = temp.path().join("custom-bridge.exe");
+
+    fs::write(&installed_bridge, b"MZ-installed-bridge").unwrap();
+    fs::write(&installed_ui, b"MZ-installed-ui").unwrap();
+
+    // When installed authorized binaries exist on disk, User scope must choose them over current_exe().
+    let resolved_bridge =
+        resolve_bridge_exe_with(Scope::User, None, &installed_bridge).expect("installed bridge");
+    assert_eq!(resolved_bridge, installed_bridge);
+
+    let resolved_ui =
+        resolve_ui_exe_with(Scope::User, Path::new(r"C:\Temp\other\ledr-bridge-nm.exe"), None, &installed_ui)
+            .expect("installed ui");
+    assert_eq!(resolved_ui, installed_ui);
+
+    // When installed binaries do not exist yet, User scope falls back to current_exe() / AUTHORIZED_UI_EXE_PATH.
+    let fallback_bridge =
+        resolve_bridge_exe_with(Scope::User, None, &nonexistent_bridge).expect("fallback bridge");
+    assert_ne!(fallback_bridge, nonexistent_bridge);
+    assert_eq!(fallback_bridge, std::env::current_exe().unwrap());
+
+    let sibling_dir = temp.path().join("sibling");
+    fs::create_dir_all(&sibling_dir).unwrap();
+    let sibling_bridge = sibling_dir.join("ledr-bridge-nm.exe");
+    let sibling_ui = sibling_dir.join("ledr-ui.exe");
+    fs::write(&sibling_ui, b"MZ-sibling-ui").unwrap();
+    let fallback_ui =
+        resolve_ui_exe_with(Scope::User, &sibling_bridge, None, &nonexistent_ui).expect("sibling ui");
+    assert_eq!(fallback_ui, sibling_ui);
+
+    // Explicit --bridge-exe always overrides installed binary.
+    let explicit = resolve_bridge_exe_with(Scope::User, Some(&override_bridge), &installed_bridge)
+        .expect("override bridge");
+    assert_eq!(explicit, override_bridge);
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_12_per_browser_manifests_and_cross_scope_unregister_protection() {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    use winreg::RegKey;
+
+    let (_user_guard, user_prefix) = RegTestGuard::new("bridge-nm-b12-user");
+    let (_peer_guard, peer_prefix) = RegTestGuard::new("bridge-nm-b12-peer");
+    let temp = TempDirGuard::new("ledr-bridge-nm-b12");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    let fake_ui = temp.path().join("ledr-ui.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+    fs::write(&fake_ui, b"MZ-test-ui").unwrap();
+
+    let manifest_dir = temp.path().join("shared-nm");
+    let alt_ext_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let user_target = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: Some(user_prefix),
+    };
+    let peer_target = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: Some(peer_prefix),
+    };
+
+    // BUG_0004: Setting up Edge with a different --extension-id must not overwrite Chrome's manifest.
+    let setup_chrome = SetupArgs {
+        scope: Scope::User,
+        browsers: vec![BrowserKind::Chrome],
+        extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
+        bridge_exe: Some(fake_bridge.clone()),
+        ui_exe: Some(fake_ui.clone()),
+        manifest_dir: Some(manifest_dir.clone()),
+        skip_uri: true,
+        json: false,
+    };
+    let setup_edge = SetupArgs {
+        browsers: vec![BrowserKind::Edge],
+        extension_id: alt_ext_id.to_string(),
+        ..setup_chrome.clone()
+    };
+    run_setup_with(&setup_chrome, &user_target).expect("setup chrome");
+    run_setup_with(&setup_edge, &user_target).expect("setup edge");
+
+    let chrome_manifest = manifest_dir.join(manifest_filename_for(Scope::User, BrowserKind::Chrome));
+    let edge_manifest = manifest_dir.join(manifest_filename_for(Scope::User, BrowserKind::Edge));
+    assert!(validate_manifest_file(&chrome_manifest, DEFAULT_CHROME_EXTENSION_ID).valid);
+    assert!(validate_manifest_file(&edge_manifest, alt_ext_id).valid);
+    assert!(!validate_manifest_file(&chrome_manifest, alt_ext_id).extension_id_matched);
+
+    // Clean up Edge before testing BUG_0005.
+    run_unregister_with(
+        &UnregisterArgs {
+            scope: Scope::User,
+            browsers: vec![BrowserKind::Chrome, BrowserKind::Edge],
+            manifest_dir: Some(manifest_dir.clone()),
+            keep_uri: true,
+            json: false,
+        },
+        &user_target,
+        None,
+    )
+    .expect("cleanup isolated manifests");
+
+    // BUG_0005: If both current scope and opposite peer scope reference the same manifest path
+    // (e.g. legacy shared com.localedr.bridge.json), unregistering one scope must keep the file.
+    let shared_manifest = manifest_dir.join(MANIFEST_FILENAME);
+    let m = build_manifest(&fake_bridge, DEFAULT_CHROME_EXTENSION_ID).unwrap();
+    write_manifest_atomic(&shared_manifest, &m).unwrap();
+    let shared_display = shared_manifest.to_string_lossy().into_owned();
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (u_key, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key.set_value("", &shared_display).unwrap();
+    let (p_key, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key.set_value("", &shared_display).unwrap();
+
+    let unreg_chrome = UnregisterArgs {
+        scope: Scope::User,
+        browsers: vec![BrowserKind::Chrome],
+        manifest_dir: Some(manifest_dir.clone()),
+        keep_uri: true,
+        json: false,
+    };
+    let first_unreg =
+        run_unregister_with(&unreg_chrome, &user_target, Some(&peer_target)).expect("first unreg");
+    assert!(!first_unreg.manifest_removed);
+    assert!(shared_manifest.is_file(), "shared manifest must remain while peer scope still points to it");
+
+    // Once the peer scope also unregisters, no references remain so the shared manifest is removed.
+    let second_unreg =
+        run_unregister_with(&unreg_chrome, &peer_target, Some(&user_target)).expect("second unreg");
+    assert!(second_unreg.manifest_removed);
+    assert!(!shared_manifest.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_13_status_extension_id_and_relative_manifest_dir_absolutized() {
+    let (_reg_guard, prefix) = RegTestGuard::new("bridge-nm-b13");
+    let temp = TempDirGuard::new("ledr-bridge-nm-b13");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    let fake_ui = temp.path().join("ledr-ui.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+    fs::write(&fake_ui, b"MZ-test-ui").unwrap();
+
+    // BUG_0007: Relative overrides must be absolutized rather than stored verbatim as relative paths.
+    let rel_manifest_dir =
+        resolve_manifest_dir(Scope::User, Some(Path::new("relative-nm-dir"))).expect("abs manifest dir");
+    assert!(rel_manifest_dir.is_absolute());
+    let rel_bridge =
+        resolve_bridge_exe_with(Scope::User, Some(Path::new(r"bin\ledr-bridge-nm.exe")), &fake_bridge)
+            .expect("abs bridge exe");
+    assert!(rel_bridge.is_absolute());
+    let rel_ui = resolve_ui_exe_with(Scope::User, &fake_bridge, Some(Path::new(r"bin\ledr-ui.exe")), &fake_ui)
+        .expect("abs ui exe");
+    assert!(rel_ui.is_absolute());
+
+    // BUG_0006: CLI --extension-id flows into status validation against custom extension IDs.
+    let custom_ext_id = "cccccccccccccccccccccccccccccccc";
+    let parsed_status = parse_args_from(
+        ["ledr-bridge-nm.exe", "status", "--scope", "user", "--extension-id", custom_ext_id],
+        None,
+    )
+    .expect("parse status --extension-id");
+    let status_custom = match parsed_status {
+        Command::Status(s) => {
+            assert_eq!(s.extension_id, custom_ext_id);
+            s
+        }
+        other => panic!("expected Status command, got {other:?}"),
+    };
+
+    let manifest_dir = temp.path().join("nm");
+    let target = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: Some(prefix),
+    };
+    run_setup_with(
+        &SetupArgs {
+            scope: Scope::User,
+            browsers: vec![BrowserKind::Chrome],
+            extension_id: custom_ext_id.to_string(),
+            bridge_exe: Some(fake_bridge),
+            ui_exe: Some(fake_ui),
+            manifest_dir: Some(manifest_dir.clone()),
+            skip_uri: true,
+            json: false,
+        },
+        &target,
+    )
+    .expect("setup custom extension id");
+
+    let status_default = StatusArgs {
+        scope: StatusScope::User,
+        extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
+        ping: false,
+        pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+        json: false,
+    };
+    let mismatch_report =
+        run_status_with(&status_default, std::slice::from_ref(&target), Some(&manifest_dir))
+            .expect("status default mismatch");
+    let mismatch_chrome = &mismatch_report.scopes[0].browsers[0];
+    assert!(mismatch_chrome.registered);
+    let mismatch_val = mismatch_chrome.manifest.as_ref().unwrap();
+    assert!(!mismatch_val.valid);
+    assert!(!mismatch_val.extension_id_matched);
+
+    let matched_report =
+        run_status_with(&status_custom, std::slice::from_ref(&target), Some(&manifest_dir))
+            .expect("status custom match");
+    let matched_chrome = &matched_report.scopes[0].browsers[0];
+    let matched_val = matched_chrome.manifest.as_ref().unwrap();
+    assert!(matched_val.valid);
+    assert!(matched_val.extension_id_matched);
+    assert_eq!(
+        matched_val.allowed_origins,
+        vec![format!("chrome-extension://{custom_ext_id}/")]
+    );
+}
+
+#[test]
+fn bridge_14_relay_caller_origin_and_authorized_browser_parent_checks() {
+    let valid_origin = format!("chrome-extension://{DEFAULT_CHROME_EXTENSION_ID}/");
+    assert!(is_valid_caller_origin(&valid_origin));
+    assert!(!is_valid_caller_origin(""));
+    assert!(!is_valid_caller_origin(&format!(
+        "chrome-extension://{DEFAULT_CHROME_EXTENSION_ID}"
+    )));
+    assert!(!is_valid_caller_origin("chrome-extension://invalid-id/"));
+    assert!(!is_valid_caller_origin("https://example.com/"));
+    assert!(!is_valid_caller_origin(&format!("{valid_origin}extra")));
+
+    let roots = [
+        Path::new(r"C:\Program Files"),
+        Path::new(r"C:\Program Files (x86)"),
+        Path::new(r"C:\Users\Alice\AppData\Local"),
+    ];
+    assert!(is_authorized_browser_parent_exe_with(
+        Path::new(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+        &roots
+    ));
+    assert!(is_authorized_browser_parent_exe_with(
+        Path::new(r"\\?\C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+        &roots
+    ));
+    assert!(is_authorized_browser_parent_exe_with(
+        Path::new(r"C:\Users\Alice\AppData\Local\BraveSoftware\Brave-Browser-Nightly\Application\brave.exe"),
+        &roots
+    ));
+    // Reject traversal, arbitrary binaries, or non-standard parent shells
+    assert!(!is_authorized_browser_parent_exe_with(
+        Path::new(r"C:\Program Files\Google\Chrome\Application\..\..\Temp\chrome.exe"),
+        &roots
+    ));
+    assert!(!is_authorized_browser_parent_exe_with(
+        Path::new(r"C:\Temp\chrome.exe"),
+        &roots
+    ));
+    assert!(!is_authorized_browser_parent_exe_with(
+        Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+        &roots
+    ));
+
+    // Production default pipe requires both valid caller_origin and authorized browser parent
+    let missing_origin = RelayArgs {
+        pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+        caller_origin: None,
+        parent_window: None,
+    };
+    assert!(verify_browser_relay_caller_with(&missing_origin, || Ok(())).is_err());
+
+    let bad_origin = RelayArgs {
+        pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+        caller_origin: Some("chrome-extension://notvalid/".to_string()),
+        parent_window: None,
+    };
+    assert!(verify_browser_relay_caller_with(&bad_origin, || Ok(())).is_err());
+
+    let good_origin = RelayArgs {
+        pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+        caller_origin: Some(valid_origin.clone()),
+        parent_window: None,
+    };
+    assert!(verify_browser_relay_caller_with(&good_origin, || anyhow::bail!("bad parent")).is_err());
+    assert!(verify_browser_relay_caller_with(&good_origin, || Ok(())).is_ok());
+
+    // Custom --pipe overrides bypass parent/origin checks for local test harnesses
+    let custom_pipe = RelayArgs {
+        pipe_name: r"\\.\pipe\localedr-test-harness".to_string(),
+        caller_origin: None,
+        parent_window: None,
+    };
+    assert!(verify_browser_relay_caller_with(&custom_pipe, || anyhow::bail!("must not run")).is_ok());
+
+    // Live OS inspection under `cargo test` must reject the test runner / shell parent
+    #[cfg(windows)]
+    {
+        assert!(verify_browser_relay_caller(&good_origin).is_err());
+    }
 }

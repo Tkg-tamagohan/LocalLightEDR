@@ -4,13 +4,31 @@
   // ISOLATED-world content script (document_start): ClickFix/Pastejacking (L-15),
   // NRD/homograph password warnings (L-14), and closed Shadow DOM alert banners.
 
-  const OBSERVE_EVENT = "__ledr_clipboard_observe__";
+  const OBSERVE_CHANNEL_ATTR = "data-ledr-obs-ch";
   const CLICKFIX_HOST_ID = "ledr-clickfix-warning-host";
   const PASSWORD_HOST_ID = "ledr-domain-warning-host";
+  const PASSWORD_INPUT_DEBOUNCE_MS = 2000;
+
+  function createObserveChannelName() {
+    if (typeof crypto === "undefined" || typeof crypto.getRandomValues !== "function") {
+      return null;
+    }
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    let hex = "";
+    for (let i = 0; i < bytes.length; i++) {
+      hex += bytes[i].toString(16).padStart(2, "0");
+    }
+    return `__ledr_obs_${hex}`;
+  }
+
+  const OBSERVE_EVENT = createObserveChannelName();
 
   let lastMainCopyTimestampMs = 0;
-  let lastPasswordCheckHost = null;
-  let lastPasswordRiskResult = null;
+  let pendingPasswordCheckHost = null;
+  let pendingPasswordCheckPromise = null;
+  let lastPasswordInputHost = null;
+  let lastPasswordInputCheckAtMs = 0;
   let dismissedPasswordHost = null;
 
   function readActiveSelection() {
@@ -52,7 +70,10 @@
 
     const host = document.createElement("div");
     host.id = hostId;
-    const supportsPopover = Object.hasOwn(HTMLElement.prototype, "popover");
+    const supportsPopover =
+      typeof HTMLElement === "function" &&
+      HTMLElement.prototype &&
+      Object.hasOwn(HTMLElement.prototype, "popover");
     if (supportsPopover) {
       host.setAttribute("popover", "manual");
       host.style.cssText =
@@ -179,6 +200,15 @@
         outline: 2px solid #93c5fd;
         outline-offset: 2px;
       }
+      .status-error {
+        margin-top: 8px;
+        font-size: 12px;
+        color: #fecaca;
+        line-height: 1.4;
+      }
+      .status-error[hidden] {
+        display: none;
+      }
       @media (prefers-reduced-motion: reduce) {
         * {
           transition: none !important;
@@ -231,13 +261,25 @@
       }
     });
 
+    const statusErrorEl = document.createElement("div");
+    statusErrorEl.className = "status-error";
+    statusErrorEl.hidden = true;
+
     const primaryBtn = document.createElement("button");
     primaryBtn.type = "button";
     primaryBtn.className = "btn-primary";
     primaryBtn.textContent = primaryLabel;
     primaryBtn.addEventListener("click", async () => {
+      statusErrorEl.hidden = true;
+      statusErrorEl.textContent = "";
       if (typeof onPrimary === "function") {
-        await onPrimary();
+        const res = await onPrimary();
+        if (res && res.ok === false) {
+          statusErrorEl.textContent =
+            res.message || "Could not clear clipboard automatically; copy safe text manually.";
+          statusErrorEl.hidden = false;
+          return;
+        }
       }
       host.remove();
     });
@@ -245,6 +287,7 @@
     actions.appendChild(dismissBtn);
     actions.appendChild(primaryBtn);
     card.appendChild(actions);
+    card.appendChild(statusErrorEl);
 
     shadow.appendChild(style);
     shadow.appendChild(card);
@@ -288,12 +331,6 @@
 
     const reasonTags = Array.isArray(verdict.indicators) ? verdict.indicators.join(", ") : "";
     const details = `${verdict.summary}${reasonTags ? ` [${reasonTags}]` : ""}`;
-    await sendRuntimeMessage({
-      type: "REPORT_BROWSER_EVENT",
-      eventType: "ClickFixPastejacking",
-      url: window.location.href,
-      details: `${details} | ${verdict.excerpt}`,
-    });
 
     mountBanner({
       hostId: CLICKFIX_HOST_ID,
@@ -304,33 +341,70 @@
       primaryLabel: "Clear Clipboard",
       onPrimary: async () => {
         try {
+          if (!navigator?.clipboard || typeof navigator.clipboard.writeText !== "function") {
+            return {
+              ok: false,
+              message: "Clipboard API unavailable on this page; copy safe text manually.",
+            };
+          }
           await navigator.clipboard.writeText("");
+          return { ok: true };
         } catch {
-          // Page/user permission may deny programmatic clipboard clear outside gesture.
+          return {
+            ok: false,
+            message: "Could not clear clipboard automatically; copy safe text manually.",
+          };
         }
       },
       onDismiss: null,
       anchorRect: null,
     });
+
+    void sendRuntimeMessage({
+      type: "REPORT_BROWSER_EVENT",
+      eventType: "ClickFixPastejacking",
+      url: window.location.href,
+      details: `${details} | ${verdict.excerpt}`,
+    });
   }
 
-  document.addEventListener(
-    OBSERVE_EVENT,
-    async (event) => {
-      let parsed = null;
-      try {
-        parsed = typeof event?.detail === "string" ? JSON.parse(event.detail) : null;
-      } catch {
-        return;
-      }
-      if (!parsed) return;
-      if (parsed.trigger === "copy") {
-        lastMainCopyTimestampMs = Date.now();
-      }
-      await evaluateClipboardObservation(parsed);
-    },
-    true
-  );
+  if (OBSERVE_EVENT) {
+    document.addEventListener(
+      OBSERVE_EVENT,
+      async (event) => {
+        let parsed = null;
+        try {
+          parsed = typeof event?.detail === "string" ? JSON.parse(event.detail) : null;
+        } catch {
+          return;
+        }
+        if (!parsed) return;
+        if (parsed.trigger === "copy") {
+          lastMainCopyTimestampMs = Date.now();
+        }
+        await evaluateClipboardObservation(parsed);
+      },
+      true
+    );
+
+    const channelHost = document.documentElement || document;
+    if (channelHost && typeof channelHost.setAttribute === "function") {
+      channelHost.setAttribute(OBSERVE_CHANNEL_ATTR, OBSERVE_EVENT);
+      setTimeout(() => {
+        try {
+          if (
+            typeof channelHost.getAttribute === "function" &&
+            channelHost.getAttribute(OBSERVE_CHANNEL_ATTR) === OBSERVE_EVENT &&
+            typeof channelHost.removeAttribute === "function"
+          ) {
+            channelHost.removeAttribute(OBSERVE_CHANNEL_ATTR);
+          }
+        } catch {
+          // Ignore detached document cleanup errors.
+        }
+      }, 0);
+    }
+  }
 
   document.addEventListener(
     "copy",
@@ -357,11 +431,51 @@
     false
   );
 
-  async function inspectPasswordTarget(inputEl) {
-    if (!(inputEl instanceof HTMLInputElement)) {
-      return;
+  function isPasswordInputElement(node) {
+    return Boolean(
+      node &&
+        typeof node === "object" &&
+        typeof node.tagName === "string" &&
+        node.tagName.toUpperCase() === "INPUT" &&
+        String(node.type || "").toLowerCase() === "password"
+    );
+  }
+
+  function findPasswordInputFromEvent(event) {
+    const path = typeof event?.composedPath === "function" ? event.composedPath() : [event?.target];
+    if (!Array.isArray(path)) {
+      return isPasswordInputElement(event?.target) ? event.target : null;
     }
-    if ((inputEl.type || "").toLowerCase() !== "password") {
+    for (const node of path) {
+      if (isPasswordInputElement(node)) {
+        return node;
+      }
+    }
+    return null;
+  }
+
+  async function checkDomainRiskCoalesced(host) {
+    if (pendingPasswordCheckHost === host && pendingPasswordCheckPromise) {
+      return await pendingPasswordCheckPromise;
+    }
+    pendingPasswordCheckHost = host;
+    const promise = sendRuntimeMessage({
+      type: "CHECK_DOMAIN_RISK",
+      urlOrHost: window.location.href,
+    });
+    pendingPasswordCheckPromise = promise;
+    try {
+      return await promise;
+    } finally {
+      if (pendingPasswordCheckPromise === promise) {
+        pendingPasswordCheckHost = null;
+        pendingPasswordCheckPromise = null;
+      }
+    }
+  }
+
+  async function inspectPasswordTarget(inputEl, source = "focusin") {
+    if (!isPasswordInputElement(inputEl)) {
       return;
     }
 
@@ -370,21 +484,20 @@
       return;
     }
 
-    let risk = null;
-    if (lastPasswordCheckHost === host && lastPasswordRiskResult) {
-      risk = lastPasswordRiskResult;
-    } else {
-      const res = await sendRuntimeMessage({
-        type: "CHECK_DOMAIN_RISK",
-        urlOrHost: window.location.href,
-      });
-      risk = res?.risk || null;
-      if (risk) {
-        lastPasswordCheckHost = host;
-        lastPasswordRiskResult = risk;
+    if (source === "input") {
+      const now = Date.now();
+      if (
+        lastPasswordInputHost === host &&
+        now - lastPasswordInputCheckAtMs < PASSWORD_INPUT_DEBOUNCE_MS
+      ) {
+        return;
       }
+      lastPasswordInputHost = host;
+      lastPasswordInputCheckAtMs = now;
     }
 
+    const res = await checkDomainRiskCoalesced(host);
+    const risk = res?.risk || null;
     if (!risk || !risk.risky) {
       return;
     }
@@ -406,41 +519,46 @@
     const eventType = risk.isHomograph ? "HomographWarning" : "NrdPasswordWarning";
     const detailText = `${risk.domain}: ${reasons.join(" + ")}`;
 
-    await sendRuntimeMessage({
+    if (!document.getElementById(PASSWORD_HOST_ID)) {
+      const rect =
+        typeof inputEl.getBoundingClientRect === "function"
+          ? inputEl.getBoundingClientRect()
+          : { width: 0, height: 0 };
+      mountBanner({
+        hostId: PASSWORD_HOST_ID,
+        badgeText: risk.isHomograph ? "HOMOGRAPH RISK" : "NRD PASSWORD RISK",
+        titleText: risk.isHomograph ? "Suspicious Login Domain" : "Newly Registered Domain",
+        detailText,
+        excerptText: null,
+        primaryLabel: "Clear Password",
+        onPrimary: async () => {
+          inputEl.value = "";
+          if (typeof inputEl.blur === "function") {
+            inputEl.blur();
+          }
+          return { ok: true };
+        },
+        onDismiss: () => {
+          dismissedPasswordHost = host;
+        },
+        anchorRect: rect.width > 0 && rect.height > 0 ? rect : null,
+      });
+    }
+
+    void sendRuntimeMessage({
       type: "REPORT_BROWSER_EVENT",
       eventType,
       url: window.location.href,
       details: detailText,
-    });
-
-    if (document.getElementById(PASSWORD_HOST_ID)) {
-      return;
-    }
-
-    const rect = inputEl.getBoundingClientRect();
-    mountBanner({
-      hostId: PASSWORD_HOST_ID,
-      badgeText: risk.isHomograph ? "HOMOGRAPH RISK" : "NRD PASSWORD RISK",
-      titleText: risk.isHomograph ? "Suspicious Login Domain" : "Newly Registered Domain",
-      detailText,
-      excerptText: null,
-      primaryLabel: "Clear Password",
-      onPrimary: async () => {
-        inputEl.value = "";
-        inputEl.blur();
-      },
-      onDismiss: () => {
-        dismissedPasswordHost = host;
-      },
-      anchorRect: rect.width > 0 && rect.height > 0 ? rect : null,
     });
   }
 
   document.addEventListener(
     "focusin",
     async (event) => {
-      if (event.target instanceof HTMLInputElement && event.target.type.toLowerCase() === "password") {
-        await inspectPasswordTarget(event.target);
+      const passwordInput = findPasswordInputFromEvent(event);
+      if (passwordInput) {
+        await inspectPasswordTarget(passwordInput, "focusin");
       }
     },
     true
@@ -449,8 +567,9 @@
   document.addEventListener(
     "input",
     async (event) => {
-      if (event.target instanceof HTMLInputElement && event.target.type.toLowerCase() === "password") {
-        await inspectPasswordTarget(event.target);
+      const passwordInput = findPasswordInputFromEvent(event);
+      if (passwordInput) {
+        await inspectPasswordTarget(passwordInput, "input");
       }
     },
     true

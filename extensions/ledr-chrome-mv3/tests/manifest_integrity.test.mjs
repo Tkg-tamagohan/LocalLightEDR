@@ -30,6 +30,7 @@ test("EXT-11: MV3 manifest, DNR rules, popup CSP, and offline privacy checks hol
 
   for (const perm of [
     "declarativeNetRequest",
+    "declarativeNetRequestFeedback",
     "downloads",
     "nativeMessaging",
     "storage",
@@ -49,10 +50,14 @@ test("EXT-11: MV3 manifest, DNR rules, popup CSP, and offline privacy checks hol
   assert.ok(fs.existsSync(path.join(EXT_DIR, manifest.background.service_worker)));
 
   assert.equal(manifest.content_scripts.length, 2);
-  const mainCs = manifest.content_scripts.find((c) => c.world === "MAIN");
-  const isoCs = manifest.content_scripts.find((c) => !c.world || c.world === "ISOLATED");
-  assert.ok(mainCs, "MAIN world content script must be configured (L-21)");
-  assert.ok(isoCs, "ISOLATED world content script must be configured");
+  const mainIndex = manifest.content_scripts.findIndex((c) => c.world === "MAIN");
+  const isoIndex = manifest.content_scripts.findIndex((c) => !c.world || c.world === "ISOLATED");
+  assert.ok(mainIndex >= 0, "MAIN world content script must be configured (L-21)");
+  assert.ok(isoIndex >= 0, "ISOLATED world content script must be configured");
+  assert.ok(
+    isoIndex < mainIndex,
+    "ISOLATED world content.js must execute before MAIN world content_main.js for SEC_0002 channel handshake"
+  );
   for (const cs of manifest.content_scripts) {
     assert.equal(cs.run_at, "document_start");
     for (const file of cs.js) {
@@ -101,6 +106,7 @@ test("EXT-11: MV3 manifest, DNR rules, popup CSP, and offline privacy checks hol
     "content_main.js",
     "popup.js",
     "lib/clickfix.js",
+    "lib/dnr.js",
     "lib/domain_risk.js",
     "lib/downloads.js",
     "lib/native_bridge.js",

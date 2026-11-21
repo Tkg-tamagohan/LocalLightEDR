@@ -24,6 +24,43 @@ async function writePendingList(storageSession, entries) {
   return bounded;
 }
 
+function extractOrigin(rawUrl) {
+  const value = nonEmptyString(rawUrl);
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return parsed.origin;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+async function queryTabById(tabsApi, tabId) {
+  if (
+    typeof tabId !== "number" ||
+    tabId < 0 ||
+    !tabsApi ||
+    typeof tabsApi.get !== "function"
+  ) {
+    return null;
+  }
+  try {
+    const tab = await tabsApi.get(tabId);
+    const url = nonEmptyString(tab?.url);
+    if (url && !url.startsWith("chrome://downloads")) {
+      return url;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 async function queryActiveTabUrl(tabsApi) {
   if (!tabsApi || typeof tabsApi.query !== "function") {
     return null;
@@ -48,11 +85,24 @@ export async function handleDownloadCreated(downloadItem, deps) {
     return null;
   }
   const { storageSession, tabsApi, nowFn = () => Date.now() } = deps;
-  const activeTabUrl = await queryActiveTabUrl(tabsApi);
   const url = nonEmptyString(downloadItem.url) || "";
   const finalUrl = nonEmptyString(downloadItem.finalUrl) || url;
   const referrer = nonEmptyString(downloadItem.referrer);
-  const tabUrl = activeTabUrl || referrer || finalUrl || url;
+  const contextUrl = referrer || finalUrl || url;
+
+  let tabUrl = await queryTabById(tabsApi, downloadItem.tabId);
+  if (!tabUrl) {
+    const activeTabUrl = await queryActiveTabUrl(tabsApi);
+    if (activeTabUrl) {
+      const contextOrigin = extractOrigin(contextUrl);
+      if (!contextOrigin || extractOrigin(activeTabUrl) === contextOrigin) {
+        tabUrl = activeTabUrl;
+      }
+    }
+  }
+  if (!tabUrl) {
+    tabUrl = contextUrl;
+  }
 
   const entry = {
     id: downloadItem.id,

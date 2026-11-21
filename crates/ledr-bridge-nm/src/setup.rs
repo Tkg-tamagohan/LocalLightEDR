@@ -1,5 +1,6 @@
 //! Idempotent HKCU/HKLM Native Messaging Host, `ledr://` URI scheme, and AUMID setup/unregister/status.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -7,10 +8,9 @@ use ledr_proto::{AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, PROGRAM_DAT
 use serde::Serialize;
 
 use crate::cli::{BrowserKind, Scope, SetupArgs, StatusArgs, StatusScope, UnregisterArgs};
-use crate::extension_id::DEFAULT_CHROME_EXTENSION_ID;
 use crate::manifest::{
-    build_manifest, normalize_display_path, validate_manifest_file, write_manifest_atomic,
-    ManifestValidation, MANIFEST_FILENAME,
+    build_manifest, manifest_filename_for, normalize_display_path, validate_manifest_file,
+    write_manifest_atomic, ManifestValidation,
 };
 use crate::pipe_client::PipeClient;
 
@@ -82,13 +82,14 @@ pub struct BrowserRegistrationOutcome {
     pub browser: BrowserKind,
     pub registry_key: String,
     pub manifest_path: String,
+    pub manifest_written: bool,
     pub updated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SetupOutcome {
     pub scope: Scope,
-    pub manifest_path: String,
+    pub manifest_dir: String,
     pub manifest_written: bool,
     pub bridge_exe: String,
     pub ui_exe: String,
@@ -103,13 +104,16 @@ pub struct SetupOutcome {
 pub struct BrowserUnregisterOutcome {
     pub browser: BrowserKind,
     pub registry_key: String,
+    pub manifest_path: Option<String>,
     pub removed: bool,
+    pub manifest_removed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UnregisterOutcome {
     pub scope: Scope,
-    pub manifest_path: String,
+    pub manifest_dir: String,
+    pub manifest_paths_removed: Vec<String>,
     pub manifest_removed: bool,
     pub browsers: Vec<BrowserUnregisterOutcome>,
     pub uri_removed: bool,
@@ -128,7 +132,7 @@ pub struct BrowserStatusEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScopeStatusReport {
     pub scope: Scope,
-    pub default_manifest_path: String,
+    pub default_manifest_dir: String,
     pub browsers: Vec<BrowserStatusEntry>,
     pub uri_registered: bool,
     pub uri_command: Option<String>,
@@ -158,10 +162,19 @@ pub fn format_ledr_uri_command(ui_exe: &Path) -> String {
     format!("\"{normalized}\" \"%1\"")
 }
 
+fn absolutize_path(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        bail!("path must not be empty");
+    }
+    let abs = std::path::absolute(path)
+        .with_context(|| format!("failed to resolve absolute path for '{}'", path.display()))?;
+    Ok(PathBuf::from(normalize_display_path(&abs)))
+}
+
 /// Resolves the Native Messaging manifest directory for `scope`.
 pub fn resolve_manifest_dir(scope: Scope, override_dir: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = override_dir {
-        return Ok(dir.to_path_buf());
+        return absolutize_path(dir);
     }
     match scope {
         Scope::User => {
@@ -173,42 +186,80 @@ pub fn resolve_manifest_dir(scope: Scope, override_dir: Option<&Path>) -> Result
                         "LOCALAPPDATA environment variable is unset; pass --manifest-dir explicitly"
                     )
                 })?;
-            Ok(local_app_data.join("LocalEDR").join("native-messaging"))
+            absolutize_path(&local_app_data.join("LocalEDR").join("native-messaging"))
         }
         Scope::Machine => Ok(PathBuf::from(PROGRAM_DATA_DIR).join("native-messaging")),
     }
 }
 
-/// Resolves the `ledr-bridge-nm.exe` path for manifest generation.
-pub fn resolve_bridge_exe(scope: Scope, override_exe: Option<&Path>) -> PathBuf {
+/// Resolves the `ledr-bridge-nm.exe` path for manifest generation, preferring `installed_authorized_exe`
+/// when present on disk even under [`Scope::User`].
+pub fn resolve_bridge_exe_with(
+    scope: Scope,
+    override_exe: Option<&Path>,
+    installed_authorized_exe: &Path,
+) -> Result<PathBuf> {
     if let Some(exe) = override_exe {
-        return exe.to_path_buf();
+        return absolutize_path(exe);
     }
     match scope {
-        Scope::Machine => PathBuf::from(AUTHORIZED_BRIDGE_EXE_PATH),
-        Scope::User => std::env::current_exe()
-            .ok()
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| PathBuf::from(AUTHORIZED_BRIDGE_EXE_PATH)),
+        Scope::Machine => Ok(PathBuf::from(AUTHORIZED_BRIDGE_EXE_PATH)),
+        Scope::User => {
+            if installed_authorized_exe.is_file() {
+                return absolutize_path(installed_authorized_exe);
+            }
+            if let Some(exe) = std::env::current_exe().ok().filter(|p| p.is_absolute()) {
+                return Ok(exe);
+            }
+            Ok(PathBuf::from(AUTHORIZED_BRIDGE_EXE_PATH))
+        }
+    }
+}
+
+/// Resolves the `ledr-bridge-nm.exe` path for manifest generation.
+pub fn resolve_bridge_exe(scope: Scope, override_exe: Option<&Path>) -> Result<PathBuf> {
+    resolve_bridge_exe_with(scope, override_exe, Path::new(AUTHORIZED_BRIDGE_EXE_PATH))
+}
+
+/// Resolves the `ledr-ui.exe` path for `ledr://` URI scheme registration, preferring
+/// `installed_authorized_exe` when present on disk even under [`Scope::User`].
+pub fn resolve_ui_exe_with(
+    scope: Scope,
+    bridge_exe: &Path,
+    override_exe: Option<&Path>,
+    installed_authorized_exe: &Path,
+) -> Result<PathBuf> {
+    if let Some(exe) = override_exe {
+        return absolutize_path(exe);
+    }
+    match scope {
+        Scope::Machine => Ok(PathBuf::from(AUTHORIZED_UI_EXE_PATH)),
+        Scope::User => {
+            if installed_authorized_exe.is_file() {
+                return absolutize_path(installed_authorized_exe);
+            }
+            if let Some(sibling) = bridge_exe.parent().map(|dir| dir.join("ledr-ui.exe")) {
+                if sibling.is_file() {
+                    return absolutize_path(&sibling);
+                }
+            }
+            Ok(PathBuf::from(AUTHORIZED_UI_EXE_PATH))
+        }
     }
 }
 
 /// Resolves the `ledr-ui.exe` path for `ledr://` URI scheme registration.
-pub fn resolve_ui_exe(scope: Scope, bridge_exe: &Path, override_exe: Option<&Path>) -> PathBuf {
-    if let Some(exe) = override_exe {
-        return exe.to_path_buf();
-    }
-    match scope {
-        Scope::Machine => PathBuf::from(AUTHORIZED_UI_EXE_PATH),
-        Scope::User => {
-            if let Some(sibling) = bridge_exe.parent().map(|dir| dir.join("ledr-ui.exe")) {
-                if sibling.is_file() {
-                    return sibling;
-                }
-            }
-            PathBuf::from(AUTHORIZED_UI_EXE_PATH)
-        }
-    }
+pub fn resolve_ui_exe(
+    scope: Scope,
+    bridge_exe: &Path,
+    override_exe: Option<&Path>,
+) -> Result<PathBuf> {
+    resolve_ui_exe_with(
+        scope,
+        bridge_exe,
+        override_exe,
+        Path::new(AUTHORIZED_UI_EXE_PATH),
+    )
 }
 
 #[cfg(windows)]
@@ -466,23 +517,27 @@ pub fn run_setup_with(args: &SetupArgs, target: &RegistryTarget) -> Result<Setup
         bail!("at least one browser must be specified");
     }
     let manifest_dir = resolve_manifest_dir(args.scope, args.manifest_dir.as_deref())?;
-    let manifest_path = manifest_dir.join(MANIFEST_FILENAME);
-    let manifest_display = normalize_display_path(&manifest_path);
+    let manifest_dir_display = normalize_display_path(&manifest_dir);
 
-    let bridge_exe = resolve_bridge_exe(args.scope, args.bridge_exe.as_deref());
-    let ui_exe = resolve_ui_exe(args.scope, &bridge_exe, args.ui_exe.as_deref());
+    let bridge_exe = resolve_bridge_exe(args.scope, args.bridge_exe.as_deref())?;
+    let ui_exe = resolve_ui_exe(args.scope, &bridge_exe, args.ui_exe.as_deref())?;
 
     let manifest = build_manifest(&bridge_exe, &args.extension_id)?;
-    let manifest_written = write_manifest_atomic(&manifest_path, &manifest)?;
 
+    let mut any_manifest_written = false;
     let mut browser_outcomes = Vec::with_capacity(args.browsers.len());
     for &browser in &args.browsers {
+        let manifest_path = manifest_dir.join(manifest_filename_for(args.scope, browser));
+        let manifest_display = normalize_display_path(&manifest_path);
+        let manifest_written = write_manifest_atomic(&manifest_path, &manifest)?;
+        any_manifest_written |= manifest_written;
         let subkey = target.browser_subkey(browser);
         let updated = win_reg_ops::ensure_default_sz(target, &subkey, &manifest_display)?;
         browser_outcomes.push(BrowserRegistrationOutcome {
             browser,
             registry_key: format!(r"{}\{subkey}", target.hive_name()),
-            manifest_path: manifest_display.clone(),
+            manifest_path: manifest_display,
+            manifest_written,
             updated,
         });
     }
@@ -497,8 +552,8 @@ pub fn run_setup_with(args: &SetupArgs, target: &RegistryTarget) -> Result<Setup
 
     Ok(SetupOutcome {
         scope: args.scope,
-        manifest_path: manifest_display,
-        manifest_written,
+        manifest_dir: manifest_dir_display,
+        manifest_written: any_manifest_written,
         bridge_exe: normalize_display_path(&bridge_exe),
         ui_exe: normalize_display_path(&ui_exe),
         extension_id: args.extension_id.clone(),
@@ -509,28 +564,57 @@ pub fn run_setup_with(args: &SetupArgs, target: &RegistryTarget) -> Result<Setup
     })
 }
 
-/// Runs `ledr-bridge-nm unregister` against the standard `HKCU` / `HKLM` registry keys.
-pub fn run_unregister(args: &UnregisterArgs) -> Result<UnregisterOutcome> {
-    run_unregister_with(args, &RegistryTarget::for_scope(args.scope))
+fn is_localedr_manifest_filename(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("com.localedr.bridge") && lower.ends_with(".json")
 }
 
-/// Runs `unregister` against an explicit [`RegistryTarget`].
+/// Runs `ledr-bridge-nm unregister` against the standard `HKCU` / `HKLM` registry keys,
+/// checking the opposite registry scope before deleting manifest files.
+pub fn run_unregister(args: &UnregisterArgs) -> Result<UnregisterOutcome> {
+    let target = RegistryTarget::for_scope(args.scope);
+    let peer_target = RegistryTarget::for_scope(args.scope.other());
+    run_unregister_with(args, &target, Some(&peer_target))
+}
+
+/// Runs `unregister` against an explicit [`RegistryTarget`] and optional opposite-scope `peer_target`.
 pub fn run_unregister_with(
     args: &UnregisterArgs,
     target: &RegistryTarget,
+    peer_target: Option<&RegistryTarget>,
 ) -> Result<UnregisterOutcome> {
     let manifest_dir = resolve_manifest_dir(args.scope, args.manifest_dir.as_deref())?;
-    let manifest_path = manifest_dir.join(MANIFEST_FILENAME);
-    let manifest_display = normalize_display_path(&manifest_path);
+    let manifest_dir_display = normalize_display_path(&manifest_dir);
 
-    let mut browser_outcomes = Vec::with_capacity(args.browsers.len());
+    let mut per_browser_candidates = Vec::with_capacity(args.browsers.len());
+    let mut candidate_paths = BTreeSet::new();
     for &browser in &args.browsers {
         let subkey = target.browser_subkey(browser);
+        let reg_val = win_reg_ops::read_default_sz(target, &subkey)?;
+        if let Some(ref raw_path) = reg_val {
+            let reg_path = PathBuf::from(raw_path);
+            if is_localedr_manifest_filename(&reg_path) {
+                candidate_paths.insert(reg_path);
+            }
+        }
+        let default_browser_path = manifest_dir.join(manifest_filename_for(args.scope, browser));
+        candidate_paths.insert(default_browser_path.clone());
+        per_browser_candidates.push((browser, reg_val, default_browser_path));
+    }
+
+    let mut browser_outcomes = Vec::with_capacity(args.browsers.len());
+    for (browser, reg_val, _) in &per_browser_candidates {
+        let subkey = target.browser_subkey(*browser);
         let removed = win_reg_ops::delete_subkey_tree_idempotent(target, &subkey)?;
         browser_outcomes.push(BrowserUnregisterOutcome {
-            browser,
+            browser: *browser,
             registry_key: format!(r"{}\{subkey}", target.hive_name()),
+            manifest_path: reg_val.clone(),
             removed,
+            manifest_removed: false,
         });
     }
 
@@ -542,23 +626,51 @@ pub fn run_unregister_with(
         (u_rem, a_rem)
     };
 
-    let still_referenced =
-        win_reg_ops::any_browser_references_manifest(target, &manifest_display)?;
-    let manifest_removed = if !still_referenced && manifest_path.is_file() {
-        std::fs::remove_file(&manifest_path).with_context(|| {
-            format!(
-                "failed to remove Native Messaging manifest '{}'",
-                manifest_path.display()
-            )
-        })?;
-        true
-    } else {
-        false
-    };
+    let mut manifest_paths_removed = Vec::new();
+    for candidate in &candidate_paths {
+        let candidate_display = normalize_display_path(candidate);
+        let still_in_self =
+            win_reg_ops::any_browser_references_manifest(target, &candidate_display)
+                .unwrap_or(true);
+        let still_in_peer = match peer_target {
+            Some(peer) => win_reg_ops::any_browser_references_manifest(peer, &candidate_display)
+                .unwrap_or(true),
+            None => false,
+        };
+        if still_in_self || still_in_peer {
+            continue;
+        }
+        match std::fs::remove_file(candidate) {
+            Ok(()) => manifest_paths_removed.push(candidate_display),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to remove Native Messaging manifest '{}'",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
 
+    for (entry, (_, reg_val, default_browser_path)) in
+        browser_outcomes.iter_mut().zip(per_browser_candidates.iter())
+    {
+        let default_display = normalize_display_path(default_browser_path);
+        entry.manifest_removed = manifest_paths_removed.iter().any(|removed| {
+            removed.eq_ignore_ascii_case(&default_display)
+                || reg_val
+                    .as_deref()
+                    .is_some_and(|reg| removed.eq_ignore_ascii_case(reg))
+        });
+    }
+
+    let manifest_removed = !manifest_paths_removed.is_empty();
     Ok(UnregisterOutcome {
         scope: args.scope,
-        manifest_path: manifest_display,
+        manifest_dir: manifest_dir_display,
+        manifest_paths_removed,
         manifest_removed,
         browsers: browser_outcomes,
         uri_removed,
@@ -585,13 +697,13 @@ pub fn run_status_with(
     targets: &[RegistryTarget],
     manifest_dir_override: Option<&Path>,
 ) -> Result<StatusReport> {
-    let expected_extension_id = DEFAULT_CHROME_EXTENSION_ID.to_string();
+    let expected_extension_id = args.extension_id.clone();
     let mut scopes = Vec::with_capacity(targets.len());
 
     for target in targets {
-        let default_manifest_path = resolve_manifest_dir(target.scope, manifest_dir_override)
-            .map(|d| normalize_display_path(&d.join(MANIFEST_FILENAME)))
-            .unwrap_or_else(|_| MANIFEST_FILENAME.to_string());
+        let default_manifest_dir = resolve_manifest_dir(target.scope, manifest_dir_override)
+            .map(|d| normalize_display_path(&d))
+            .unwrap_or_default();
 
         let mut browsers = Vec::with_capacity(3);
         for browser in [BrowserKind::Chrome, BrowserKind::Edge, BrowserKind::Brave] {
@@ -614,7 +726,7 @@ pub fn run_status_with(
 
         scopes.push(ScopeStatusReport {
             scope: target.scope,
-            default_manifest_path,
+            default_manifest_dir,
             browsers,
             uri_registered,
             uri_command,
@@ -657,8 +769,8 @@ pub fn format_setup_text(outcome: &SetupOutcome) -> String {
     let mut lines = vec![
         format!("LocalEDR Native Messaging setup ({})", outcome.scope.as_str()),
         format!(
-            "  Manifest: {} ({})",
-            outcome.manifest_path,
+            "  Manifest Dir: {} ({})",
+            outcome.manifest_dir,
             if outcome.manifest_written {
                 "written"
             } else {
@@ -670,10 +782,16 @@ pub fn format_setup_text(outcome: &SetupOutcome) -> String {
     ];
     for b in &outcome.browsers {
         lines.push(format!(
-            "  {}: {} ({})",
+            "  {}: {} -> {} ({}, manifest {})",
             b.browser.display_name(),
             b.registry_key,
-            if b.updated { "updated" } else { "unchanged" }
+            b.manifest_path,
+            if b.updated { "updated" } else { "unchanged" },
+            if b.manifest_written {
+                "written"
+            } else {
+                "unchanged"
+            }
         ));
     }
     if outcome.uri_registered {
@@ -699,21 +817,33 @@ pub fn format_setup_text(outcome: &SetupOutcome) -> String {
 
 /// Formats `UnregisterOutcome` for human-readable CLI output.
 pub fn format_unregister_text(outcome: &UnregisterOutcome) -> String {
-    let mut lines = vec![format!(
-        "LocalEDR Native Messaging unregister ({})",
-        outcome.scope.as_str()
-    )];
+    let mut lines = vec![
+        format!(
+            "LocalEDR Native Messaging unregister ({})",
+            outcome.scope.as_str()
+        ),
+        format!("  Manifest Dir: {}", outcome.manifest_dir),
+    ];
     for b in &outcome.browsers {
         lines.push(format!(
-            "  {}: {} ({})",
+            "  {}: {} ({}, manifest {})",
             b.browser.display_name(),
             b.registry_key,
-            if b.removed { "removed" } else { "absent" }
+            if b.removed { "removed" } else { "absent" },
+            if b.manifest_removed {
+                "removed"
+            } else {
+                "kept/absent"
+            }
         ));
     }
     lines.push(format!(
-        "  Manifest: {} ({})",
-        outcome.manifest_path,
+        "  Manifest files: {} ({})",
+        if outcome.manifest_paths_removed.is_empty() {
+            "-".to_string()
+        } else {
+            outcome.manifest_paths_removed.join(", ")
+        },
         if outcome.manifest_removed {
             "removed"
         } else {

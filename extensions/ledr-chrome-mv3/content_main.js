@@ -8,6 +8,58 @@
   if (window.__LEDR_CLIPBOARD_HOOKED__) {
     return;
   }
+
+  const OBSERVE_CHANNEL_ATTR = "data-ledr-obs-ch";
+  const CHANNEL_TOKEN_RE = /^__ledr_obs_[0-9a-f]{32}$/;
+
+  const NativeCustomEvent = typeof CustomEvent === "function" ? CustomEvent : null;
+  const nativeDispatchEvent =
+    typeof Document === "function" &&
+    Document.prototype &&
+    typeof Document.prototype.dispatchEvent === "function"
+      ? Document.prototype.dispatchEvent
+      : typeof document.dispatchEvent === "function"
+        ? document.dispatchEvent
+        : null;
+  const nativeJsonStringify = JSON.stringify;
+  const nativeArrayFrom = Array.from;
+  const nativeIsArray = Array.isArray;
+  const NativeWeakSet = typeof WeakSet === "function" ? WeakSet : Set;
+  const nativeGetAttribute =
+    typeof Element === "function" &&
+    Element.prototype &&
+    typeof Element.prototype.getAttribute === "function"
+      ? Element.prototype.getAttribute
+      : null;
+  const nativeRemoveAttribute =
+    typeof Element === "function" &&
+    Element.prototype &&
+    typeof Element.prototype.removeAttribute === "function"
+      ? Element.prototype.removeAttribute
+      : null;
+
+  const channelHost = document.documentElement || document;
+  const OBSERVE_EVENT =
+    channelHost && nativeGetAttribute
+      ? nativeGetAttribute.call(channelHost, OBSERVE_CHANNEL_ATTR)
+      : channelHost && typeof channelHost.getAttribute === "function"
+        ? channelHost.getAttribute(OBSERVE_CHANNEL_ATTR)
+        : null;
+  if (channelHost) {
+    try {
+      if (nativeRemoveAttribute) {
+        nativeRemoveAttribute.call(channelHost, OBSERVE_CHANNEL_ATTR);
+      } else if (typeof channelHost.removeAttribute === "function") {
+        channelHost.removeAttribute(OBSERVE_CHANNEL_ATTR);
+      }
+    } catch {
+      // Ignore attribute cleanup errors.
+    }
+  }
+  if (typeof OBSERVE_EVENT !== "string" || !CHANNEL_TOKEN_RE.test(OBSERVE_EVENT)) {
+    return;
+  }
+
   try {
     Object.defineProperty(window, "__LEDR_CLIPBOARD_HOOKED__", {
       value: true,
@@ -17,8 +69,6 @@
   } catch {
     window.__LEDR_CLIPBOARD_HOOKED__ = true;
   }
-
-  const OBSERVE_EVENT = "__ledr_clipboard_observe__";
 
   function readActiveSelection() {
     try {
@@ -43,12 +93,15 @@
 
   function emitObservation(trigger, copiedText, selectionText) {
     try {
-      const detail = JSON.stringify({
+      if (!NativeCustomEvent || !nativeDispatchEvent) {
+        return;
+      }
+      const detail = nativeJsonStringify({
         trigger: String(trigger || "copy"),
         copiedText: typeof copiedText === "string" ? copiedText : String(copiedText ?? ""),
         selectionText: typeof selectionText === "string" ? selectionText : "",
       });
-      document.dispatchEvent(new CustomEvent(OBSERVE_EVENT, { detail }));
+      nativeDispatchEvent.call(document, new NativeCustomEvent(OBSERVE_EVENT, { detail }));
     } catch {
       // Never propagate hook errors into host page execution.
     }
@@ -69,7 +122,11 @@
       const origWrite = clipboardProto.write;
       clipboardProto.write = function ledrWrite(items) {
         const selectionSnapshot = readActiveSelection();
-        void inspectClipboardItems(items, selectionSnapshot);
+        if (items != null && typeof items[Symbol.iterator] === "function") {
+          const snapshot = nativeIsArray(items) ? items.slice() : nativeArrayFrom(items);
+          void inspectClipboardItems(snapshot, selectionSnapshot);
+          return origWrite.call(this, snapshot);
+        }
         return origWrite.apply(this, arguments);
       };
     }
@@ -86,7 +143,7 @@
         if (!item || typeof item.getType !== "function") {
           continue;
         }
-        const types = Array.isArray(item.types) ? item.types : [];
+        const types = nativeIsArray(item.types) ? item.types : [];
         if (types.includes("text/plain")) {
           const blob = await item.getType("text/plain");
           const text = await blob.text();
@@ -99,14 +156,13 @@
   }
 
   try {
-    let activeCopyClipboardData = null;
+    const copyDataTransfers = new NativeWeakSet();
     window.addEventListener(
       "copy",
       (event) => {
-        activeCopyClipboardData = event?.clipboardData || null;
-        queueMicrotask(() => {
-          activeCopyClipboardData = null;
-        });
+        if (event?.clipboardData) {
+          copyDataTransfers.add(event.clipboardData);
+        }
       },
       true
     );
@@ -115,7 +171,7 @@
       const origSetData = DataTransfer.prototype.setData;
       DataTransfer.prototype.setData = function ledrSetData(format, data) {
         const fmt = String(format || "").toLowerCase();
-        if (this === activeCopyClipboardData && (fmt === "text/plain" || fmt === "text")) {
+        if (copyDataTransfers.has(this) && (fmt === "text/plain" || fmt === "text")) {
           emitObservation("copy", data, readActiveSelection());
         }
         return origSetData.apply(this, arguments);

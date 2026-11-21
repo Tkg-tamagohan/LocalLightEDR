@@ -1,6 +1,7 @@
 // LocalEDR Browser Shield MV3 Service Worker (stateless across restarts; uses chrome.storage).
 
 import { analyzeClipboardPayload } from "./lib/clickfix.js";
+import { buildDynamicDnrUpdatePlan } from "./lib/dnr.js";
 import { assessLocalDomainRisk, mergeDomainRisk } from "./lib/domain_risk.js";
 import {
   handleDownloadChanged,
@@ -27,8 +28,6 @@ const EVENT_DEDUP_MAX_ENTRIES = 256;
 const CLEANUP_ALARM_NAME = "ledr-cleanup";
 const STATIC_RULESET_ID = "ruleset_static";
 const STATIC_RULESET_RULE_COUNT = 2;
-const DYNAMIC_RULE_ID_START = 10000;
-const DYNAMIC_RULE_ID_MAX = 39999;
 
 function extractOriginSafe(rawUrl) {
   if (typeof rawUrl !== "string" || !rawUrl.trim()) {
@@ -178,46 +177,7 @@ async function checkDomainRisk(urlOrHost) {
 
 async function updateDynamicDnrRules(blockDomains) {
   const existing = await chrome.declarativeNetRequest.getDynamicRules();
-  const removeRuleIds = existing
-    .map((r) => r.id)
-    .filter((id) => id >= DYNAMIC_RULE_ID_START && id <= DYNAMIC_RULE_ID_MAX);
-
-  const normalized = [];
-  const seen = new Set();
-  for (const raw of Array.isArray(blockDomains) ? blockDomains : []) {
-    if (typeof raw !== "string") continue;
-    const cleaned = raw.trim().replace(/\.+$/, "").toLowerCase();
-    if (
-      !cleaned ||
-      !cleaned.includes(".") ||
-      !/^[a-z0-9.-]+$/.test(cleaned) ||
-      seen.has(cleaned)
-    ) {
-      continue;
-    }
-    seen.add(cleaned);
-    normalized.push(cleaned);
-  }
-
-  const maxRules = DYNAMIC_RULE_ID_MAX - DYNAMIC_RULE_ID_START + 1;
-  const addRules = normalized.slice(0, maxRules).map((domain, idx) => ({
-    id: DYNAMIC_RULE_ID_START + idx,
-    priority: 1,
-    action: { type: "block" },
-    condition: {
-      urlFilter: `||${domain}^`,
-      resourceTypes: [
-        "main_frame",
-        "sub_frame",
-        "script",
-        "xmlhttprequest",
-        "image",
-        "websocket",
-        "ping",
-        "other",
-      ],
-    },
-  }));
+  const { removeRuleIds, addRules } = buildDynamicDnrUpdatePlan(existing, blockDomains);
 
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds,

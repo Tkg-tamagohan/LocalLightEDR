@@ -24,6 +24,13 @@ impl Scope {
         }
     }
 
+    pub fn other(self) -> Self {
+        match self {
+            Self::User => Self::Machine,
+            Self::Machine => Self::User,
+        }
+    }
+
     fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "user" => Ok(Self::User),
@@ -63,6 +70,14 @@ pub enum BrowserKind {
 }
 
 impl BrowserKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Edge => "edge",
+            Self::Brave => "brave",
+        }
+    }
+
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Chrome => "Google Chrome",
@@ -132,6 +147,7 @@ pub struct UnregisterArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusArgs {
     pub scope: StatusScope,
+    pub extension_id: String,
     pub ping: bool,
     pub pipe_name: String,
     pub json: bool,
@@ -209,7 +225,8 @@ pub fn usage_text() -> &'static str {
         "                       [--manifest-dir <dir>] [--skip-uri] [--json]\n",
         "  ledr-bridge-nm unregister [--scope user|machine] [--browsers chrome,edge,brave]\n",
         "                            [--manifest-dir <dir>] [--keep-uri] [--json]\n",
-        "  ledr-bridge-nm status [--scope all|user|machine] [--ping] [--pipe <name>] [--json]\n",
+        "  ledr-bridge-nm status [--scope all|user|machine] [--extension-id <id>] [--ping]\n",
+        "                        [--pipe <name>] [--json]\n",
     )
 }
 
@@ -281,15 +298,7 @@ fn parse_setup_args(args: &[String]) -> Result<Command> {
                     match flag {
                         "--scope" => scope = Scope::parse(val)?,
                         "--browsers" => browsers = BrowserKind::parse_list(val)?,
-                        "--extension-id" => {
-                            let trimmed = val.trim();
-                            if !is_valid_extension_id(trimmed) {
-                                bail!(
-                                    "invalid --extension-id '{trimmed}': expected 32 lowercase characters in 'a'..='p'"
-                                );
-                            }
-                            extension_id = trimmed.to_string();
-                        }
+                        "--extension-id" => extension_id = parse_extension_id(val)?,
                         "--bridge-exe" => bridge_exe = Some(require_non_empty_path(flag, val)?),
                         "--ui-exe" => ui_exe = Some(require_non_empty_path(flag, val)?),
                         "--manifest-dir" => manifest_dir = Some(require_non_empty_path(flag, val)?),
@@ -359,6 +368,7 @@ fn parse_unregister_args(args: &[String]) -> Result<Command> {
 
 fn parse_status_args(args: &[String], env_pipe: Option<&str>) -> Result<Command> {
     let mut scope = StatusScope::All;
+    let mut extension_id = DEFAULT_CHROME_EXTENSION_ID.to_string();
     let mut ping = false;
     let mut pipe_override: Option<String> = None;
     let mut json = false;
@@ -377,6 +387,7 @@ fn parse_status_args(args: &[String], env_pipe: Option<&str>) -> Result<Command>
                     }
                     match flag {
                         "--scope" => scope = StatusScope::parse(val)?,
+                        "--extension-id" => extension_id = parse_extension_id(val)?,
                         "--pipe" => {
                             if val.trim().is_empty() {
                                 bail!("--pipe requires a non-empty value");
@@ -395,10 +406,21 @@ fn parse_status_args(args: &[String], env_pipe: Option<&str>) -> Result<Command>
 
     Ok(Command::Status(StatusArgs {
         scope,
+        extension_id,
         ping,
         pipe_name: resolve_pipe_name(pipe_override.as_deref(), env_pipe),
         json,
     }))
+}
+
+fn parse_extension_id(val: &str) -> Result<String> {
+    let trimmed = val.trim();
+    if !is_valid_extension_id(trimmed) {
+        bail!(
+            "invalid --extension-id '{trimmed}': expected 32 lowercase characters in 'a'..='p'"
+        );
+    }
+    Ok(trimmed.to_string())
 }
 
 fn take_flag_value<'a>(

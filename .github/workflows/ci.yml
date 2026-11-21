@@ -147,6 +147,7 @@ jobs:
               "extensions/ledr-chrome-mv3/content_main.js",
               "extensions/ledr-chrome-mv3/popup.js",
               "extensions/ledr-chrome-mv3/lib/clickfix.js",
+              "extensions/ledr-chrome-mv3/lib/dnr.js",
               "extensions/ledr-chrome-mv3/lib/domain_risk.js",
               "extensions/ledr-chrome-mv3/lib/downloads.js",
               "extensions/ledr-chrome-mv3/lib/native_bridge.js",

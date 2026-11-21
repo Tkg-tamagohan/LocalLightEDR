@@ -211,3 +211,52 @@ test("EXT-10: native_bridge updates diagnostics cleanly across online, offline, 
   assert.equal(diag.counters.downloadsTracked, 2);
   assert.ok(localStorage.dump()[BRIDGE_DIAGNOSTICS_KEY]);
 });
+
+test("EXT-13: background download does not adopt unrelated foreground activeTabUrl (BUG_0003)", async () => {
+  const sessionStorage = createMemoryStorageArea();
+
+  // Case 1: Background download with a referrer on a different origin must keep its own context URL
+  const bgEntry = await handleDownloadCreated(
+    {
+      id: 101,
+      url: "https://cdn.evil.localedr.invalid/dropper.exe",
+      finalUrl: "https://cdn.evil.localedr.invalid/dropper.exe",
+      referrer: "https://portal.evil.localedr.invalid/landing",
+    },
+    {
+      storageSession: sessionStorage,
+      tabsApi: {
+        async query() {
+          return [{ url: "https://unrelated-bank.localedr.invalid/dashboard" }];
+        },
+      },
+      nowFn: () => 2000,
+    }
+  );
+  assert.equal(bgEntry.tabUrl, "https://portal.evil.localedr.invalid/landing");
+
+  // Case 2: When downloadItem.tabId is provided, tabsApi.get(tabId) takes precedence over foreground active tab
+  const byTabIdEntry = await handleDownloadCreated(
+    {
+      id: 102,
+      tabId: 77,
+      url: "https://cdn.evil.localedr.invalid/stage2.zip",
+      finalUrl: "https://cdn.evil.localedr.invalid/stage2.zip",
+      referrer: "",
+    },
+    {
+      storageSession: sessionStorage,
+      tabsApi: {
+        async get(tabId) {
+          assert.equal(tabId, 77);
+          return { id: 77, url: "https://source-tab.localedr.invalid/page.html" };
+        },
+        async query() {
+          return [{ url: "https://unrelated-foreground.localedr.invalid/" }];
+        },
+      },
+      nowFn: () => 2001,
+    }
+  );
+  assert.equal(byTabIdEntry.tabUrl, "https://source-tab.localedr.invalid/page.html");
+});

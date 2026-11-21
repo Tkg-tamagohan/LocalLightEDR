@@ -2766,15 +2766,16 @@
                     : bStatus === "unverified"
                       ? `<span class="badge badge-unsigned">${escapeHtml(b.effective_scope || "")} Unverified</span>`
                       : `<span class="badge badge-action-block">${escapeHtml(b.effective_scope || "")} Invalid</span>`;
+                const bPath = b.manifest_path
+                  ? ` <span class="mono-wrap">${escapeHtml(b.manifest_path)}</span>`
+                  : "";
                 const bErr =
                   bStatus !== "valid" && b.manifest_error
                     ? ` <span class="mono-wrap">${escapeHtml(b.manifest_error)}</span>`
-                    : b.manifest_path
-                      ? ` <span class="mono-wrap">${escapeHtml(b.manifest_path)}</span>`
-                      : "";
+                    : "";
                 return `<div class="browser-detail-row"><span class="badge badge-metric">${escapeHtml(
                   b.browser,
-                )}</span> ${bBadge}${bErr}</div>`;
+                )}</span> ${bBadge}${bPath}${bErr}</div>`;
               })
               .join("")}</div>`
           : "";

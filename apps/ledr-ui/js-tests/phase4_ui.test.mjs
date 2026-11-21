@@ -507,18 +507,30 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
   assert.match(html, /2 \(1 unresolved\)/);
   assert.match(html, /<dd class="mono">3<\/dd>/);
 
-  // Custom `--manifest-dir` outside default 2 directories renders as `Unverified` (distinct from red `Invalid`).
+  // Custom `--manifest-dir` outside default 2 directories renders as `Unverified` (distinct from red `Invalid`)
+  // and keeps each browser's manifest_path visible alongside the unverified note.
   const customUnverifiedNote =
     "manifest path is outside default LocalEDR manifest directories (unverified by UI; inspect the listed manifest file directly or run 'ledr-bridge-nm status' — note: CLI status checks only the 64-bit default registry view, not HKLM WOW64 32-bit view)";
+  const chromeCustomPath = "D:\\CustomChrome\\com.localedr.bridge.user.chrome.json";
+  const edgeCustomPath = "D:\\CustomEdge\\com.localedr.bridge.machine.edge.json";
+  ui.state.localDefenseStatus.browser_shield.manifest_path = chromeCustomPath;
   ui.state.localDefenseStatus.browser_shield.manifest_status = "unverified";
-  ui.state.localDefenseStatus.browser_shield.manifest_error = `Edge: ${customUnverifiedNote}`;
+  ui.state.localDefenseStatus.browser_shield.manifest_error = `Chrome: ${customUnverifiedNote}; Edge: ${customUnverifiedNote}`;
+  ui.state.localDefenseStatus.browser_shield.browsers[0].manifest_path = chromeCustomPath;
+  ui.state.localDefenseStatus.browser_shield.browsers[0].manifest_valid = false;
+  ui.state.localDefenseStatus.browser_shield.browsers[0].manifest_status = "unverified";
+  ui.state.localDefenseStatus.browser_shield.browsers[0].manifest_error = customUnverifiedNote;
+  ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_path = edgeCustomPath;
   ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_status = "unverified";
   ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_error = customUnverifiedNote;
   ui.renderPolicyView();
   const unverifiedHtml = ui.el.browserShieldDl.innerHTML;
   assert.match(unverifiedHtml, /badge-unsigned">Unverified</);
+  assert.match(unverifiedHtml, /badge-unsigned">HKCU Unverified</);
   assert.match(unverifiedHtml, /badge-unsigned">HKLM Unverified</);
   assert.doesNotMatch(unverifiedHtml, />Invalid</);
+  assert.match(unverifiedHtml, /CustomChrome\\com\.localedr\.bridge\.user\.chrome\.json/);
+  assert.match(unverifiedHtml, /CustomEdge\\com\.localedr\.bridge\.machine\.edge\.json/);
   assert.match(unverifiedHtml, /ledr-bridge-nm status/);
   assert.match(unverifiedHtml, /WOW64 32-bit/);
 });

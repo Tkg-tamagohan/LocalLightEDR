@@ -285,6 +285,9 @@ pub(crate) const DRIVE_RAMDISK: u32 = 6;
 
 pub(crate) const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 pub(crate) const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+pub(crate) const IO_REPARSE_TAG_DFS: u32 = 0x8000_000A;
+pub(crate) const IO_REPARSE_TAG_DFSR: u32 = 0x8000_0012;
+pub(crate) const IO_REPARSE_TAG_NFS: u32 = 0x8000_0014;
 pub(crate) const SYMLINK_FLAG_RELATIVE: u32 = 0x0000_0001;
 
 pub(crate) fn is_local_drive_type(drive_type: u32) -> bool {
@@ -376,21 +379,36 @@ pub(crate) struct ParsedReparseTarget {
     pub is_relative: bool,
 }
 
-/// Parses `IO_REPARSE_TAG_SYMLINK` or `IO_REPARSE_TAG_MOUNT_POINT` from a raw `REPARSE_DATA_BUFFER`.
-pub(crate) fn parse_reparse_data_buffer(buf: &[u8]) -> Option<ParsedReparseTarget> {
+/// Classification of a raw `REPARSE_DATA_BUFFER` distinguishing supported symlink/junction targets,
+/// known remote/network reparse tags (`DFS`, `DFSR`, `NFS`), and unrecognized/local filter tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedReparseBuffer {
+    Target(ParsedReparseTarget),
+    RemoteTag(u32),
+    Unsupported,
+}
+
+/// Parses a raw `REPARSE_DATA_BUFFER`, separating symlink/mount-point targets from known remote
+/// network reparse tags (`DFS`/`DFSR`/`NFS`) and unrecognized local/filter tags.
+pub(crate) fn parse_reparse_data_buffer(buf: &[u8]) -> ParsedReparseBuffer {
     if buf.len() < 8 {
-        return None;
+        return ParsedReparseBuffer::Unsupported;
     }
     let tag = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if matches!(tag, IO_REPARSE_TAG_DFS | IO_REPARSE_TAG_DFSR | IO_REPARSE_TAG_NFS) {
+        return ParsedReparseBuffer::RemoteTag(tag);
+    }
     let data_len = usize::from(u16::from_le_bytes([buf[4], buf[5]]));
-    let total_end = 8usize.checked_add(data_len)?;
+    let Some(total_end) = 8usize.checked_add(data_len) else {
+        return ParsedReparseBuffer::Unsupported;
+    };
     if total_end > buf.len() {
-        return None;
+        return ParsedReparseBuffer::Unsupported;
     }
     let (sub_offset, sub_len, is_relative, path_buf_start) = match tag {
         IO_REPARSE_TAG_SYMLINK => {
             if total_end < 20 {
-                return None;
+                return ParsedReparseBuffer::Unsupported;
             }
             let sub_off = usize::from(u16::from_le_bytes([buf[8], buf[9]]));
             let sub_len = usize::from(u16::from_le_bytes([buf[10], buf[11]]));
@@ -399,33 +417,101 @@ pub(crate) fn parse_reparse_data_buffer(buf: &[u8]) -> Option<ParsedReparseTarge
         }
         IO_REPARSE_TAG_MOUNT_POINT => {
             if total_end < 16 {
-                return None;
+                return ParsedReparseBuffer::Unsupported;
             }
             let sub_off = usize::from(u16::from_le_bytes([buf[8], buf[9]]));
             let sub_len = usize::from(u16::from_le_bytes([buf[10], buf[11]]));
             (sub_off, sub_len, false, 16usize)
         }
-        _ => return None,
+        _ => return ParsedReparseBuffer::Unsupported,
     };
     if sub_offset % 2 != 0 || sub_len % 2 != 0 || sub_len == 0 {
-        return None;
+        return ParsedReparseBuffer::Unsupported;
     }
     let path_buf = &buf[path_buf_start..total_end];
-    let sub_end = sub_offset.checked_add(sub_len)?;
+    let Some(sub_end) = sub_offset.checked_add(sub_len) else {
+        return ParsedReparseBuffer::Unsupported;
+    };
     if sub_end > path_buf.len() {
-        return None;
+        return ParsedReparseBuffer::Unsupported;
     }
     let sub_bytes = &path_buf[sub_offset..sub_end];
     let wide: Vec<u16> = (0..sub_bytes.len())
         .step_by(2)
         .map(|i| u16::from_le_bytes([sub_bytes[i], sub_bytes[i + 1]]))
         .collect();
-    let substitute_name = String::from_utf16(&wide).ok()?;
-    Some(ParsedReparseTarget {
+    let Ok(substitute_name) = String::from_utf16(&wide) else {
+        return ParsedReparseBuffer::Unsupported;
+    };
+    ParsedReparseBuffer::Target(ParsedReparseTarget {
         tag,
         substitute_name,
         is_relative,
     })
+}
+
+fn is_ascii_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (idx, &ch) in b.iter().enumerate() {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            if ch != b'-' {
+                return false;
+            }
+        } else if !ch.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parses a Windows local Volume GUID path (`\\?\Volume{uuid}\...` or `\??\Volume{uuid}\...`),
+/// returning the canonical `\\?\Volume{uuid}\` root and validated relative segments.
+pub(crate) fn parse_volume_guid_path(raw: &str) -> Option<(String, Vec<String>)> {
+    if raw.is_empty() || raw.contains('\0') {
+        return None;
+    }
+    let after_prefix = raw
+        .strip_prefix(r"\\?\")
+        .or_else(|| raw.strip_prefix(r"\??\"))?;
+    // Match `Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` case-insensitively on `Volume`.
+    let vol_head = after_prefix.get(..7)?;
+    if !vol_head.eq_ignore_ascii_case("Volume{") {
+        return None;
+    }
+    let guid = after_prefix.get(7..43)?;
+    if !is_ascii_uuid(guid) || after_prefix.as_bytes().get(43) != Some(&b'}') {
+        return None;
+    }
+    let tail = &after_prefix[44..];
+    let mut segments = Vec::new();
+    if !tail.is_empty() {
+        let rest = tail.strip_prefix('\\')?;
+        for seg in rest.split('\\') {
+            if seg.is_empty() {
+                continue;
+            }
+            if seg == "." || seg == ".." || seg.contains('/') {
+                return None;
+            }
+            segments.push(seg.to_string());
+        }
+    }
+    let volume_root = format!(r"\\?\Volume{{{}}}\", guid.to_ascii_lowercase());
+    Some((volume_root, segments))
+}
+
+/// Resolution outcome for a reparse point's `SubstituteName` (`SEC_0001` / `BUG_0001`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReparseTargetResolution {
+    LocalDrive(PathBuf),
+    VolumeGuid {
+        volume_root: String,
+        segments: Vec<String>,
+    },
+    Remote,
 }
 
 /// Classification of a Win32 `QueryDosDeviceW("X:")` target before calling `GetDriveTypeW` or
@@ -461,8 +547,9 @@ pub(crate) fn classify_dos_device_target(target: &str) -> DosDeviceTarget {
         };
         let synthetic = format!(r"\??\{rest}");
         return match resolve_local_reparse_target(&synthetic, false, Path::new(r"C:\")) {
-            Some(local_base) => DosDeviceTarget::Subst(local_base),
-            None => DosDeviceTarget::NonLocal,
+            ReparseTargetResolution::LocalDrive(local_base) => DosDeviceTarget::Subst(local_base),
+            ReparseTargetResolution::VolumeGuid { .. } => DosDeviceTarget::VolumeDevice,
+            ReparseTargetResolution::Remote => DosDeviceTarget::NonLocal,
         };
     }
 
@@ -490,16 +577,24 @@ pub(crate) fn classify_dos_device_target(target: &str) -> DosDeviceTarget {
     }
 }
 
-/// Validates that a reparse point's `SubstituteName` stays on a local drive path rather than
-/// pointing to UNC (`\??\UNC\`, `\\`), network redirectors (`\Device\Mup\`,
-/// `\Device\LanmanRedirector\`), or non-drive device paths (`SEC_0001`).
+/// Classifies a reparse point's `SubstituteName` into a local drive target, a local Volume GUID
+/// mount target (which must never be falsely skipped as remote), or a remote/non-local target
+/// (`\??\UNC\`, `\\`, `\Device\Mup\`, `\Device\LanmanRedirector\`, `\Device\`, `\??\GlobalRoot\`).
 pub(crate) fn resolve_local_reparse_target(
     substitute_name: &str,
     is_relative: bool,
     link_path: &Path,
-) -> Option<PathBuf> {
+) -> ReparseTargetResolution {
     if substitute_name.is_empty() || substitute_name.contains('\0') {
-        return None;
+        return ReparseTargetResolution::Remote;
+    }
+    if !is_relative {
+        if let Some((volume_root, segments)) = parse_volume_guid_path(substitute_name) {
+            return ReparseTargetResolution::VolumeGuid {
+                volume_root,
+                segments,
+            };
+        }
     }
     let normalized_lower = substitute_name.replace('/', "\\").to_ascii_lowercase();
     if normalized_lower.starts_with(r"\??\unc\")
@@ -519,7 +614,7 @@ pub(crate) fn resolve_local_reparse_target(
         || normalized_lower.starts_with(r"\device\")
         || normalized_lower.starts_with(r"device\")
     {
-        return None;
+        return ReparseTargetResolution::Remote;
     }
 
     if is_relative {
@@ -527,12 +622,16 @@ pub(crate) fn resolve_local_reparse_target(
             || substitute_name.starts_with('/')
             || substitute_name.as_bytes().get(1) == Some(&b':')
         {
-            return None;
+            return ReparseTargetResolution::Remote;
         }
         // Resolve relative to `link_path`'s parent segments directly so verbatim `\\?\` or long
         // (>= 248 byte) `link_path` values still support `.` / `..` / `/` relative symlink targets.
-        let (drive, mut segments, _) = parse_local_drive_path(link_path)?;
-        segments.pop()?;
+        let Some((drive, mut segments, _)) = parse_local_drive_path(link_path) else {
+            return ReparseTargetResolution::Remote;
+        };
+        if segments.pop().is_none() {
+            return ReparseTargetResolution::Remote;
+        }
         for seg in substitute_name.split(['\\', '/']) {
             match seg {
                 "" | "." => {}
@@ -542,7 +641,7 @@ pub(crate) fn resolve_local_reparse_target(
                 other => segments.push(other.to_string()),
             }
         }
-        return Some(build_drive_path(drive, &segments, false));
+        return ReparseTargetResolution::LocalDrive(build_drive_path(drive, &segments, false));
     }
 
     if let Some(rest) = substitute_name.strip_prefix(r"\\?\") {
@@ -554,8 +653,12 @@ pub(crate) fn resolve_local_reparse_target(
         } else {
             substitute_name.to_string()
         };
-        let (drive, segments, _) = parse_local_drive_path(Path::new(&candidate))?;
-        return Some(build_drive_path(drive, &segments, false));
+        return match parse_local_drive_path(Path::new(&candidate)) {
+            Some((drive, segments, _)) => {
+                ReparseTargetResolution::LocalDrive(build_drive_path(drive, &segments, false))
+            }
+            None => ReparseTargetResolution::Remote,
+        };
     }
 
     let stripped = substitute_name.strip_prefix(r"\??\").unwrap_or(substitute_name);
@@ -567,8 +670,12 @@ pub(crate) fn resolve_local_reparse_target(
     } else {
         stripped.to_string()
     };
-    let (drive, segments, _) = parse_local_drive_path(Path::new(&candidate))?;
-    Some(build_drive_path(drive, &segments, false))
+    match parse_local_drive_path(Path::new(&candidate)) {
+        Some((drive, segments, _)) => {
+            ReparseTargetResolution::LocalDrive(build_drive_path(drive, &segments, false))
+        }
+        None => ReparseTargetResolution::Remote,
+    }
 }
 
 #[cfg(windows)]
@@ -576,7 +683,8 @@ mod win_reg_ops {
     use super::{
         build_drive_path, classify_dos_device_target, format_ledr_uri_command, is_local_drive_type,
         normalize_display_path, parse_local_drive_path, parse_reparse_data_buffer,
-        resolve_local_reparse_target, BrowserKind, DosDeviceTarget, RegistryTarget, Scope,
+        parse_volume_guid_path, resolve_local_reparse_target, BrowserKind, DosDeviceTarget,
+        ParsedReparseBuffer, RegistryTarget, ReparseTargetResolution, Scope,
         LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
     };
     use anyhow::{Context, Result};
@@ -598,6 +706,7 @@ mod win_reg_ops {
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
     const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+    const ERROR_MORE_DATA: i32 = 234;
     const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
     const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
     const MAX_REPARSE_HOPS: usize = 16;
@@ -625,6 +734,12 @@ mod win_reg_ops {
             target_path: *mut u16,
             max_chars: u32,
         ) -> u32;
+        fn GetVolumePathNamesForVolumeNameW(
+            lpsz_volume_name: *const u16,
+            lpsz_volume_path_names: *mut u16,
+            cch_buffer_length: u32,
+            lpcch_return_length: *mut u32,
+        ) -> i32;
         fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
         fn GetFileAttributesW(lp_file_name: *const u16) -> u32;
         fn CreateFileW(
@@ -695,7 +810,74 @@ mod win_reg_ops {
         is_local_drive_type(drive_type)
     }
 
-    fn inspect_reparse_point_target(current: &Path) -> Result<Option<PathBuf>, PathLocality> {
+    fn resolve_volume_guid_to_drive_letter(volume_root: &str) -> Option<char> {
+        let mut wide_vol: Vec<u16> = volume_root.encode_utf16().collect();
+        if wide_vol.is_empty() || wide_vol.contains(&0) {
+            return None;
+        }
+        wide_vol.push(0);
+
+        let mut cap: usize = 512;
+        for _ in 0..3 {
+            let mut buf = vec![0u16; cap];
+            let mut ret_len: u32 = 0;
+            // SAFETY: `wide_vol` is NUL-terminated UTF-16 (`\\?\Volume{uuid}\`) and `buf` holds `cap` writable units.
+            let ok = unsafe {
+                GetVolumePathNamesForVolumeNameW(
+                    wide_vol.as_ptr(),
+                    buf.as_mut_ptr(),
+                    u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                    &mut ret_len,
+                )
+            };
+            if ok != 0 {
+                let used = usize::try_from(ret_len).unwrap_or(buf.len()).min(buf.len());
+                for entry in buf[..used].split(|&c| c == 0) {
+                    if entry.is_empty() {
+                        break;
+                    }
+                    if entry.len() == 3
+                        && entry[0] <= 0x7F
+                        && (entry[0] as u8).is_ascii_alphabetic()
+                        && entry[1] == u16::from(b':')
+                        && entry[2] == u16::from(b'\\')
+                    {
+                        return Some((entry[0] as u8 as char).to_ascii_uppercase());
+                    }
+                }
+                return None;
+            }
+            let err = std::io::Error::last_os_error();
+            let needed = usize::try_from(ret_len).unwrap_or(0);
+            if err.raw_os_error() == Some(ERROR_MORE_DATA) && needed > cap && needed <= 32_768 {
+                cap = needed;
+                continue;
+            }
+            return None;
+        }
+        None
+    }
+
+    fn resolve_volume_guid_path_locality(
+        volume_root: &str,
+        segments: &[String],
+        remaining_depth: usize,
+    ) -> PathLocality {
+        if remaining_depth == 0 {
+            return PathLocality::Indeterminate;
+        }
+        let Some(drive) = resolve_volume_guid_to_drive_letter(volume_root) else {
+            // Local volume GUID without a drive letter (e.g. folder-only mounted volume) or
+            // unavailable MountMgr lookup: never open via CreateFileW, conservatively keep manifest.
+            return PathLocality::Indeterminate;
+        };
+        let rewritten = build_drive_path(drive, segments, false);
+        verify_local_path_recursive(&rewritten, remaining_depth - 1)
+    }
+
+    fn inspect_reparse_point_target(
+        current: &Path,
+    ) -> Result<ReparseTargetResolution, PathLocality> {
         let mut wide: Vec<u16> = current.as_os_str().encode_wide().collect();
         if wide.is_empty() || wide.contains(&0) {
             return Err(PathLocality::Indeterminate);
@@ -741,19 +923,20 @@ mod win_reg_ops {
             )
         };
         if ok == 0 {
-            return Err(PathLocality::NonLocal);
+            return Err(PathLocality::Indeterminate);
         }
         let used = usize::try_from(bytes_returned)
             .unwrap_or(0)
             .min(buf.len());
-        let Some(parsed) = parse_reparse_data_buffer(&buf[..used]) else {
-            return Ok(None);
-        };
-        Ok(resolve_local_reparse_target(
-            &parsed.substitute_name,
-            parsed.is_relative,
-            current,
-        ))
+        match parse_reparse_data_buffer(&buf[..used]) {
+            ParsedReparseBuffer::Target(parsed) => Ok(resolve_local_reparse_target(
+                &parsed.substitute_name,
+                parsed.is_relative,
+                current,
+            )),
+            ParsedReparseBuffer::RemoteTag(_) => Err(PathLocality::NonLocal),
+            ParsedReparseBuffer::Unsupported => Err(PathLocality::Indeterminate),
+        }
     }
 
     fn query_dos_device_target(drive: char) -> Option<String> {
@@ -790,11 +973,24 @@ mod win_reg_ops {
 
     fn verify_local_path_recursive(path: &Path, remaining_depth: usize) -> PathLocality {
         if remaining_depth == 0 {
-            return PathLocality::NonLocal;
+            return PathLocality::Indeterminate;
         }
-        // Layer 1: syntactic local drive absolute path only (reject UNC, device, relative).
-        let Some((drive, segments, verbatim)) = parse_local_drive_path(path) else {
-            return PathLocality::NonLocal;
+        // Layer 1: syntactic local drive absolute path only (resolve local Volume GUIDs safely via
+        // MountMgr or preserve conservatively as `Indeterminate`; reject UNC, device, relative).
+        let (drive, segments, verbatim) = match parse_local_drive_path(path) {
+            Some(parsed) => parsed,
+            None => {
+                if let Some((volume_root, vol_segments)) =
+                    path.to_str().and_then(parse_volume_guid_path)
+                {
+                    return resolve_volume_guid_path_locality(
+                        &volume_root,
+                        &vol_segments,
+                        remaining_depth,
+                    );
+                }
+                return PathLocality::NonLocal;
+            }
         };
         // Layer 2: inspect DOS device target (`QueryDosDeviceW`) before any filesystem call so
         // `SUBST` aliases are expanded/verified from their real root and network redirectors are
@@ -839,16 +1035,28 @@ mod win_reg_ops {
             }
 
             if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-                let target_base = match inspect_reparse_point_target(&current) {
-                    Ok(Some(local_target)) => local_target,
-                    Ok(None) => return PathLocality::NonLocal,
+                match inspect_reparse_point_target(&current) {
+                    Ok(ReparseTargetResolution::LocalDrive(local_target)) => {
+                        let mut rewritten = local_target;
+                        for rest in &segments[prefix_len..] {
+                            rewritten.push(rest);
+                        }
+                        return verify_local_path_recursive(&rewritten, remaining_depth - 1);
+                    }
+                    Ok(ReparseTargetResolution::VolumeGuid {
+                        volume_root,
+                        segments: mut vol_segments,
+                    }) => {
+                        vol_segments.extend(segments[prefix_len..].iter().cloned());
+                        return resolve_volume_guid_path_locality(
+                            &volume_root,
+                            &vol_segments,
+                            remaining_depth,
+                        );
+                    }
+                    Ok(ReparseTargetResolution::Remote) => return PathLocality::NonLocal,
                     Err(status) => return status,
-                };
-                let mut rewritten = target_base;
-                for rest in &segments[prefix_len..] {
-                    rewritten.push(rest);
                 }
-                return verify_local_path_recursive(&rewritten, remaining_depth - 1);
             }
         }
 
@@ -907,7 +1115,7 @@ mod win_reg_ops {
             return FileIdentityLookup::Indeterminate;
         }
         if (info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return FileIdentityLookup::NonLocal;
+            return FileIdentityLookup::Indeterminate;
         }
         FileIdentityLookup::Found(FileIdentity {
             volume_serial_number: info.dw_volume_serial_number,

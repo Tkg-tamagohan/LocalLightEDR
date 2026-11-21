@@ -247,6 +247,11 @@ mod win_pipe_test_helpers {
             dw_mask: u32,
             dw_flags: u32,
         ) -> i32;
+        pub fn GetVolumeNameForVolumeMountPointW(
+            lpsz_volume_mount_point: *const u16,
+            lpsz_volume_name: *mut u16,
+            cch_buffer_length: u32,
+        ) -> i32;
         pub fn CloseHandle(object: *mut c_void) -> i32;
         pub fn ReadFile(
             h_file: *mut c_void,
@@ -1596,12 +1601,108 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
         );
     }
 
+    // 5c. Local Volume GUID references (e.g. volume mounted at both a drive letter and a folder,
+    // or folder-only volume mount without a drive letter) must never be misclassified as remote
+    // and cause shared manifest deletion (BUG_0001).
+    let vol_manifest = real_dir.join("com.localedr.bridge.volguid.json");
+    let vol_other = real_dir.join("com.localedr.bridge.volguid-other.json");
+    write_manifest_atomic(&vol_manifest, &manifest).unwrap();
+    write_manifest_atomic(&vol_other, &manifest).unwrap();
+
+    // Unmounted/folder-only Volume GUID peer must conservatively return Indeterminate and preserve file.
+    let (u_key_vg_unm, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key_vg_unm
+        .set_value("", &vol_manifest.to_string_lossy().into_owned())
+        .unwrap();
+    let (p_key_vg_unm, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key_vg_unm
+        .set_value(
+            "",
+            &r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\LEDR\com.localedr.bridge.json",
+        )
+        .unwrap();
+    let res_vg_unm = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg with unmounted Volume GUID peer");
+    assert!(
+        !res_vg_unm.manifest_removed,
+        "unresolvable local Volume GUID peer must conservatively keep shared manifest"
+    );
+    assert!(vol_manifest.is_file());
+
+    // Live OS Volume GUID for `real_dir`'s drive: resolves via GetVolumePathNamesForVolumeNameW
+    // to the same file ID (preserving shared manifest) and distinguishes a different file on that volume.
+    let drive_letter = crate::setup::extract_local_drive_letter(&vol_manifest)
+        .expect("temp manifest path must have a local drive letter");
+    let root_wide = [drive_letter as u16, b':' as u16, b'\\' as u16, 0];
+    let mut vol_name_buf = [0u16; 128];
+    // SAFETY: `root_wide` is NUL-terminated `X:\` and `vol_name_buf` holds 128 writable UTF-16 units.
+    let got_vol = unsafe {
+        win_pipe_test_helpers::GetVolumeNameForVolumeMountPointW(
+            root_wide.as_ptr(),
+            vol_name_buf.as_mut_ptr(),
+            u32::try_from(vol_name_buf.len()).unwrap(),
+        )
+    };
+    assert_ne!(got_vol, 0, "GetVolumeNameForVolumeMountPointW must succeed for local temp drive");
+    let vol_len = vol_name_buf
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(vol_name_buf.len());
+    let live_vol_root = String::from_utf16(&vol_name_buf[..vol_len]).unwrap();
+    let vol_manifest_str = vol_manifest.to_string_lossy();
+    let vol_other_str = vol_other.to_string_lossy();
+    let live_vol_same = format!("{live_vol_root}{}", &vol_manifest_str[3..]);
+    let live_vol_diff = format!("{live_vol_root}{}", &vol_other_str[3..]);
+
+    let (u_key_vg_same, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key_vg_same
+        .set_value("", &vol_manifest_str.into_owned())
+        .unwrap();
+    let (p_key_vg_same, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key_vg_same.set_value("", &live_vol_same).unwrap();
+    let res_vg_same = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg with live Volume GUID matching same manifest");
+    assert!(
+        !res_vg_same.manifest_removed,
+        "live Volume GUID pointing to same manifest must preserve shared manifest"
+    );
+    assert!(vol_manifest.is_file());
+
+    let (u_key_vg_diff, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key_vg_diff
+        .set_value("", &vol_manifest.to_string_lossy().into_owned())
+        .unwrap();
+    let (p_key_vg_diff, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key_vg_diff.set_value("", &live_vol_diff).unwrap();
+    let res_vg_diff = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg with live Volume GUID pointing to distinct file");
+    assert!(
+        res_vg_diff.manifest_removed,
+        "live Volume GUID pointing to a different file must not block removing unrelated manifest"
+    );
+    assert!(!vol_manifest.exists());
+    let _ = fs::remove_file(&vol_other);
+
     // 6. Boundary checks for Layer 1 path parsing, Layer 2 DOS device / drive types, and Layer 3 reparse targets.
     use crate::setup::{
         classify_dos_device_target, extract_local_drive_letter, is_local_drive_type,
-        parse_reparse_data_buffer, resolve_local_reparse_target, DosDeviceTarget, DRIVE_FIXED,
-        DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE, IO_REPARSE_TAG_MOUNT_POINT,
-        IO_REPARSE_TAG_SYMLINK, SYMLINK_FLAG_RELATIVE,
+        parse_reparse_data_buffer, parse_volume_guid_path, resolve_local_reparse_target,
+        DosDeviceTarget, ParsedReparseBuffer, ReparseTargetResolution, DRIVE_FIXED, DRIVE_RAMDISK,
+        DRIVE_REMOTE, DRIVE_REMOVABLE, IO_REPARSE_TAG_DFS, IO_REPARSE_TAG_DFSR,
+        IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_NFS, IO_REPARSE_TAG_SYMLINK,
+        SYMLINK_FLAG_RELATIVE,
     };
 
     assert_eq!(
@@ -1707,27 +1808,82 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
         buf
     };
 
+    assert_eq!(
+        parse_volume_guid_path(
+            r"\\?\Volume{01234567-89AB-cdef-0123-456789abcdef}\LEDR\com.localedr.bridge.json"
+        ),
+        Some((
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\".to_string(),
+            vec!["LEDR".to_string(), "com.localedr.bridge.json".to_string()],
+        ))
+    );
+    assert_eq!(
+        parse_volume_guid_path(r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\"),
+        Some((
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\".to_string(),
+            Vec::new(),
+        ))
+    );
+    assert_eq!(
+        parse_volume_guid_path(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\..\evil"),
+        None
+    );
+    assert_eq!(parse_volume_guid_path(r"\\?\Volume{not-a-guid}\a"), None);
+
     let link_path = Path::new(r"C:\Temp\links\alias");
     let mp_local = build_reparse_buf(IO_REPARSE_TAG_MOUNT_POINT, r"\??\C:\Temp\real", None);
-    let parsed_mp = parse_reparse_data_buffer(&mp_local).expect("parse local mount point");
+    let ParsedReparseBuffer::Target(parsed_mp) = parse_reparse_data_buffer(&mp_local) else {
+        panic!("parse local mount point");
+    };
     assert_eq!(parsed_mp.tag, IO_REPARSE_TAG_MOUNT_POINT);
     assert!(!parsed_mp.is_relative);
     assert_eq!(
         resolve_local_reparse_target(&parsed_mp.substitute_name, parsed_mp.is_relative, link_path),
-        Some(PathBuf::from(r"C:\Temp\real"))
+        ReparseTargetResolution::LocalDrive(PathBuf::from(r"C:\Temp\real"))
+    );
+    // Volume mount point targeting `\??\Volume{guid}\` must be classified as `VolumeGuid`, not `Remote`.
+    let mp_vol = build_reparse_buf(
+        IO_REPARSE_TAG_MOUNT_POINT,
+        r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+        None,
+    );
+    let ParsedReparseBuffer::Target(parsed_mp_vol) = parse_reparse_data_buffer(&mp_vol) else {
+        panic!("parse volume mount point");
+    };
+    assert_eq!(
+        resolve_local_reparse_target(
+            &parsed_mp_vol.substitute_name,
+            parsed_mp_vol.is_relative,
+            link_path
+        ),
+        ReparseTargetResolution::VolumeGuid {
+            volume_root: r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\".to_string(),
+            segments: Vec::new(),
+        }
+    );
+    assert_eq!(
+        resolve_local_reparse_target(
+            r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\a",
+            false,
+            link_path
+        ),
+        ReparseTargetResolution::VolumeGuid {
+            volume_root: r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\".to_string(),
+            segments: vec!["a".to_string()],
+        }
     );
     // Verbatim `\\?\X:\...` absolute reparse target must resolve locally while rejecting `\\?\X:\..\...`.
     assert_eq!(
         resolve_local_reparse_target(r"\\?\C:\Temp\real", false, link_path),
-        Some(PathBuf::from(r"C:\Temp\real"))
+        ReparseTargetResolution::LocalDrive(PathBuf::from(r"C:\Temp\real"))
     );
     assert_eq!(
         resolve_local_reparse_target(r"\\?\C:", false, link_path),
-        Some(PathBuf::from(r"C:\"))
+        ReparseTargetResolution::LocalDrive(PathBuf::from(r"C:\"))
     );
     assert_eq!(
         resolve_local_reparse_target(r"\\?\C:\Temp\..\real", false, link_path),
-        None
+        ReparseTargetResolution::Remote
     );
 
     let sym_rel = build_reparse_buf(
@@ -1735,7 +1891,9 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
         r"..\real\com.localedr.bridge.json",
         Some(SYMLINK_FLAG_RELATIVE),
     );
-    let parsed_rel = parse_reparse_data_buffer(&sym_rel).expect("parse relative symlink");
+    let ParsedReparseBuffer::Target(parsed_rel) = parse_reparse_data_buffer(&sym_rel) else {
+        panic!("parse relative symlink");
+    };
     assert!(parsed_rel.is_relative);
     assert_eq!(
         resolve_local_reparse_target(
@@ -1743,7 +1901,7 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
             parsed_rel.is_relative,
             Path::new(r"C:\Temp\links\alias.json")
         ),
-        Some(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
+        ReparseTargetResolution::LocalDrive(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
     );
     // Relative symlink under a `\\?\` verbatim (or >=248-byte) `link_path` must also resolve cleanly.
     assert_eq!(
@@ -1752,7 +1910,7 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
             true,
             Path::new(r"\\?\C:\Temp\links\alias.json")
         ),
-        Some(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
+        ReparseTargetResolution::LocalDrive(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
     );
     assert_eq!(
         resolve_local_reparse_target(
@@ -1760,11 +1918,11 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
             true,
             Path::new(r"\\?\C:\Temp\links\alias.json")
         ),
-        Some(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
+        ReparseTargetResolution::LocalDrive(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
     );
     assert_eq!(
         resolve_local_reparse_target(r"..\real\a.json", true, Path::new(r"C:\")),
-        None
+        ReparseTargetResolution::Remote
     );
 
     for (tag, target, flags) in [
@@ -1776,11 +1934,6 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
         (IO_REPARSE_TAG_SYMLINK, r"Device\LanmanRedirector\evil.invalid\share", Some(0)),
         (
             IO_REPARSE_TAG_SYMLINK,
-            r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\a",
-            Some(0),
-        ),
-        (
-            IO_REPARSE_TAG_SYMLINK,
             r"\\evil.invalid\share\a.json",
             Some(SYMLINK_FLAG_RELATIVE),
         ),
@@ -1788,17 +1941,30 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
         (IO_REPARSE_TAG_MOUNT_POINT, r"\Device\Mup\evil.invalid\share", None),
     ] {
         let buf = build_reparse_buf(tag, target, flags);
-        let parsed = parse_reparse_data_buffer(&buf).expect("parse remote reparse buffer");
+        let ParsedReparseBuffer::Target(parsed) = parse_reparse_data_buffer(&buf) else {
+            panic!("parse remote reparse buffer for '{target}'");
+        };
         assert_eq!(
             resolve_local_reparse_target(&parsed.substitute_name, parsed.is_relative, link_path),
-            None,
+            ReparseTargetResolution::Remote,
             "remote/non-local reparse substitute target must be rejected: '{target}'"
         );
     }
 
-    // Unsupported/network reparse tag (e.g. IO_REPARSE_TAG_DFS = 0x8000_000A) must be rejected.
-    let dfs_buf = build_reparse_buf(0x8000_000A, r"\??\C:\Temp\real", None);
-    assert!(parse_reparse_data_buffer(&dfs_buf).is_none());
+    // Known network reparse tags (DFS/DFSR/NFS) must classify as `RemoteTag` (skipped as NonLocal),
+    // while unknown local filter tags (e.g. WOF 0x8000_0017) classify as `Unsupported` (conservatively Indeterminate).
+    for remote_tag in [IO_REPARSE_TAG_DFS, IO_REPARSE_TAG_DFSR, IO_REPARSE_TAG_NFS] {
+        let rbuf = build_reparse_buf(remote_tag, r"\??\C:\Temp\real", None);
+        assert_eq!(
+            parse_reparse_data_buffer(&rbuf),
+            ParsedReparseBuffer::RemoteTag(remote_tag)
+        );
+    }
+    let wof_buf = build_reparse_buf(0x8000_0017, r"\??\C:\Temp\real", None);
+    assert_eq!(
+        parse_reparse_data_buffer(&wof_buf),
+        ParsedReparseBuffer::Unsupported
+    );
 }
 
 #[cfg(windows)]
@@ -2200,33 +2366,20 @@ fn bridge_18_cmd_mediated_pipe_inheritance_real_kernel() {
         let stdout_transport =
             win_pipe_auth::inspect_std_handle_transport(win_pipe_auth::STD_OUTPUT_HANDLE);
 
-        match stdin_transport {
-            StdHandleTransport::Pipe { pipe_server_pid } => {
-                if let Some(server_pid) = pipe_server_pid {
-                    assert_eq!(
-                        server_pid, expected_gp_pid,
-                        "stdin pipe server PID must match grandparent PID"
-                    );
-                }
-            }
-            StdHandleTransport::NonPipe => {
-                panic!("expected inherited STD_INPUT_HANDLE to be StdHandleTransport::Pipe");
-            }
-        }
-
-        match stdout_transport {
-            StdHandleTransport::Pipe { pipe_server_pid } => {
-                if let Some(server_pid) = pipe_server_pid {
-                    assert_eq!(
-                        server_pid, expected_gp_pid,
-                        "stdout pipe server PID must match grandparent PID"
-                    );
-                }
-            }
-            StdHandleTransport::NonPipe => {
-                panic!("expected inherited STD_OUTPUT_HANDLE to be StdHandleTransport::Pipe");
-            }
-        }
+        assert_eq!(
+            stdin_transport,
+            StdHandleTransport::Pipe {
+                pipe_server_pid: Some(expected_gp_pid),
+            },
+            "inherited STD_INPUT_HANDLE must be a pipe owned by grandparent PID {expected_gp_pid}"
+        );
+        assert_eq!(
+            stdout_transport,
+            StdHandleTransport::Pipe {
+                pipe_server_pid: Some(expected_gp_pid),
+            },
+            "inherited STD_OUTPUT_HANDLE must be a pipe owned by grandparent PID {expected_gp_pid}"
+        );
 
         // Grandparent is the test binary (not Chrome/Edge/Brave), so production caller verification
         // must successfully traverse self -> System cmd.exe -> grandparent and fail closed specifically

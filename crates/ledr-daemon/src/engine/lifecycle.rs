@@ -287,15 +287,14 @@ impl DaemonEngine {
                     active_id_set.insert(resolved_id);
                 }
                 if let Some((inst_id, normalized_exe)) = outcome.motw_candidate {
-                    let exe_k = WfpRuleManager::exe_key(&normalized_exe);
-                    if let Some(&idx) = motw_group_indices.get(&exe_k) {
+                    if let Some(&idx) = motw_group_indices.get(&normalized_exe) {
                         let ids = &mut motw_groups[idx].instance_ids;
                         if !ids.iter().any(|existing| existing == &inst_id) {
                             ids.push(inst_id);
                         }
                     } else {
                         let idx = motw_groups.len();
-                        motw_group_indices.insert(exe_k, idx);
+                        motw_group_indices.insert(normalized_exe.clone(), idx);
                         motw_groups.push(SeedMotwGroup {
                             exe_path: normalized_exe,
                             instance_ids: vec![inst_id],

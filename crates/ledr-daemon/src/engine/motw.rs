@@ -33,6 +33,8 @@ pub(super) const MOTW_STAGE2_CACHE_CAPACITY: usize = 512;
 pub(super) const MOTW_STAGE2_CACHE_TTL_SECS: u64 = 300;
 pub(super) const MOTW_IO_WORKERS: usize = 2;
 pub(super) const MOTW_IO_QUEUE_CAPACITY: usize = 64;
+const MOTW_PENDING_LATE_CAPACITY: usize = MOTW_IO_QUEUE_CAPACITY + MOTW_IO_WORKERS;
+const LATE_WAIT_RETRY_SLICE: Duration = Duration::from_millis(5);
 
 /// Abstraction for reading NTFS `:Zone.Identifier` MOTW metadata (`Phase 4A` DI boundary).
 pub trait MotwInspector: Send + Sync {
@@ -286,7 +288,7 @@ pub(super) struct LateMotwAttribution {
     pub(super) attribution: MotwAttribution,
 }
 
-/// Deduplicated startup seed group sharing one normalized executable path (`WfpRuleManager::exe_key`).
+/// Deduplicated startup seed group sharing one case-preserving normalized executable path.
 #[derive(Debug, Clone)]
 pub(super) struct SeedMotwGroup {
     pub(super) exe_path: String,
@@ -332,9 +334,15 @@ enum MotwIoJob {
 
 struct MotwIoQueueState {
     queue: VecDeque<MotwIoJob>,
+    pending_late: VecDeque<LateMotwAttribution>,
     seed_backlog: VecDeque<SeedMotwGroup>,
     seed_backlog_capacity: usize,
     closed: bool,
+}
+
+enum WorkerAction {
+    RunJob(MotwIoJob),
+    FlushPendingLate(LateMotwAttribution),
 }
 
 struct MotwWorkerHandle {
@@ -358,43 +366,38 @@ struct LateWaiterGuard<'a>(&'a AtomicUsize);
 
 impl Drop for LateWaiterGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-fn send_late_attribution_cancellable(
+fn enqueue_late_attribution_nonblocking(
     late_tx: &mpsc::Sender<LateMotwAttribution>,
-    mut item: LateMotwAttribution,
+    item: LateMotwAttribution,
     shutdown_flag: &AtomicBool,
     queue_pair: &(Mutex<MotwIoQueueState>, Condvar),
-    late_send_waiters: &AtomicUsize,
 ) {
-    const RETRY_SLICE: Duration = Duration::from_millis(5);
     if shutdown_flag.load(Ordering::Acquire) {
         return;
     }
     match late_tx.try_send(item) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         Err(mpsc::error::TrySendError::Full(returned)) => {
-            item = returned;
-        }
-    }
-    late_send_waiters.fetch_add(1, Ordering::AcqRel);
-    let _waiter_guard = LateWaiterGuard(late_send_waiters);
-    loop {
-        if shutdown_flag.load(Ordering::Acquire) {
-            return;
-        }
-        match late_tx.try_send(item) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
-            Err(mpsc::error::TrySendError::Full(returned)) => {
-                item = returned;
-                let (lock, cvar) = queue_pair;
-                let state = lock.lock().unwrap_or_else(|e| e.into_inner());
-                if state.closed || shutdown_flag.load(Ordering::Acquire) {
-                    return;
-                }
-                let _ = cvar.wait_timeout(state, RETRY_SLICE);
+            let (lock, cvar) = queue_pair;
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if state.closed || shutdown_flag.load(Ordering::Acquire) {
+                return;
+            }
+            if state.pending_late.len() >= MOTW_PENDING_LATE_CAPACITY {
+                tracing::warn!(
+                    pending_late_capacity = MOTW_PENDING_LATE_CAPACITY,
+                    instance_count = returned.instance_ids.len(),
+                    "MOTW pending late attribution queue saturated; dropping attribution"
+                );
+                return;
+            }
+            state.pending_late.push_back(returned);
+            if late_tx.capacity() > 0 {
+                cvar.notify_one();
             }
         }
     }
@@ -474,6 +477,7 @@ impl MotwIoWorkerPool {
         let queue_pair = Arc::new((
             Mutex::new(MotwIoQueueState {
                 queue: VecDeque::new(),
+                pending_late: VecDeque::new(),
                 seed_backlog: VecDeque::new(),
                 seed_backlog_capacity: seed_backlog_capacity.max(256),
                 closed: false,
@@ -535,189 +539,255 @@ impl MotwIoWorkerPool {
                     );
 
                     loop {
-                        let job = {
+                        let action = {
                             let (lock, cvar) = &*qp;
                             let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
                             loop {
+                                if state.closed || shutdown_flag.load(Ordering::Acquire) {
+                                    break None;
+                                }
                                 if let Some(job) = state.queue.pop_front() {
                                     // Reserve the busy slot atomically under the queue lock so
                                     // `busy_workers + queue.len()` never undercounts popped work.
                                     busy.fetch_add(1, Ordering::AcqRel);
-                                    break Some(job);
+                                    break Some(WorkerAction::RunJob(job));
                                 }
-                                if let Some(seed_group) = state.seed_backlog.pop_front() {
-                                    busy.fetch_add(1, Ordering::AcqRel);
-                                    break Some(MotwIoJob::ResolveSeedGroup {
-                                        exe_path: seed_group.exe_path,
-                                        instance_ids: seed_group.instance_ids,
-                                    });
+                                if w_late_tx.is_closed() {
+                                    state.pending_late.clear();
+                                    state.seed_backlog.clear();
+                                } else if w_late_tx.capacity() > 0 {
+                                    if let Some(item) = state.pending_late.pop_front() {
+                                        break Some(WorkerAction::FlushPendingLate(item));
+                                    }
+                                    if let Some(seed_group) = state.seed_backlog.pop_front() {
+                                        busy.fetch_add(1, Ordering::AcqRel);
+                                        break Some(WorkerAction::RunJob(
+                                            MotwIoJob::ResolveSeedGroup {
+                                                exe_path: seed_group.exe_path,
+                                                instance_ids: seed_group.instance_ids,
+                                            },
+                                        ));
+                                    }
                                 }
                                 if state.closed || shutdown_flag.load(Ordering::Acquire) {
                                     break None;
                                 }
-                                state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
-                            }
-                        };
-                        let Some(job) = job else {
-                            break;
-                        };
-                        let _busy_guard = BusyWorkerGuard(&busy);
-                        if shutdown_flag.load(Ordering::Acquire) {
-                            break;
-                        }
-
-                        match job {
-                            MotwIoJob::ResolveProcess {
-                                instance_id,
-                                exe_path,
-                                reply,
-                            } => {
-                                let attr = resolve_process_motw_core(
-                                    &w_store,
-                                    &*w_inspector,
-                                    &*w_motw,
-                                    &w_dl_state,
-                                    &w_cache,
-                                    download_hash_max_bytes,
-                                    &exe_path,
-                                    None,
-                                    false,
-                                );
-                                match reply {
-                                    Some(tx) => {
-                                        if let Err(Some(late_attr)) = tx.send(attr) {
-                                            if !instance_id.is_empty() {
-                                                send_late_attribution_cancellable(
-                                                    &w_late_tx,
-                                                    LateMotwAttribution {
-                                                        instance_ids: vec![instance_id],
-                                                        attribution: late_attr,
-                                                    },
-                                                    &shutdown_flag,
-                                                    &qp,
-                                                    &late_waiters,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        if let Some(late_attr) = attr {
-                                            if !instance_id.is_empty() {
-                                                send_late_attribution_cancellable(
-                                                    &w_late_tx,
-                                                    LateMotwAttribution {
-                                                        instance_ids: vec![instance_id],
-                                                        attribution: late_attr,
-                                                    },
-                                                    &shutdown_flag,
-                                                    &qp,
-                                                    &late_waiters,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            MotwIoJob::ResolveSeedGroup {
-                                exe_path,
-                                instance_ids,
-                            } => {
-                                let attr = resolve_process_motw_core(
-                                    &w_store,
-                                    &*w_inspector,
-                                    &*w_motw,
-                                    &w_dl_state,
-                                    &w_cache,
-                                    download_hash_max_bytes,
-                                    &exe_path,
-                                    None,
-                                    false,
-                                );
-                                if let Some(late_attr) = attr {
-                                    send_late_attribution_cancellable(
-                                        &w_late_tx,
-                                        LateMotwAttribution {
-                                            instance_ids,
-                                            attribution: late_attr,
-                                        },
-                                        &shutdown_flag,
-                                        &qp,
-                                        &late_waiters,
-                                    );
-                                }
-                            }
-                            MotwIoJob::InspectDownloadFile {
-                                normalized_path,
-                                max_hash_bytes,
-                                cancel,
-                                reply,
-                            } => {
-                                let _cancel_guard = {
-                                    let mut guard = cancels.lock().unwrap_or_else(|e| e.into_inner());
-                                    guard.push(Arc::clone(&cancel));
-                                    CancelRegistrationGuard {
-                                        active_cancels: Arc::clone(&cancels),
-                                        cancel: Arc::clone(&cancel),
-                                    }
-                                };
-                                if cancel.load(Ordering::Acquire)
-                                    || shutdown_flag.load(Ordering::Acquire)
+                                if !state.pending_late.is_empty() || !state.seed_backlog.is_empty()
                                 {
-                                    let _ = reply.send(DownloadFileIoResult {
-                                        sha256: None,
-                                        zone_info: None,
-                                        cancelled: true,
-                                    });
-                                    continue;
-                                }
-
-                                let sha256 = match w_inspector.compute_sha256_cancellable(
-                                    &normalized_path,
-                                    max_hash_bytes,
-                                    &cancel,
-                                ) {
-                                    Ok(opt) => opt.map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()),
-                                    Err(err)
-                                        if err.kind() == ErrorKind::Interrupted
-                                            && (cancel.load(Ordering::Acquire)
-                                                || shutdown_flag.load(Ordering::Acquire)) =>
-                                    {
-                                        let _ = reply.send(DownloadFileIoResult {
-                                            sha256: None,
-                                            zone_info: None,
-                                            cancelled: true,
-                                        });
+                                    late_waiters.fetch_add(1, Ordering::SeqCst);
+                                    let _waiter_guard = LateWaiterGuard(&late_waiters);
+                                    if w_late_tx.capacity() > 0 || w_late_tx.is_closed() {
                                         continue;
                                     }
-                                    Err(err) => {
-                                        tracing::debug!(
-                                            file_path = %normalized_path,
-                                            error = %err,
-                                            "failed computing SHA-256 for downloaded file; recording origin without hash"
-                                        );
-                                        None
-                                    }
-                                };
+                                    let (next_state, _) = cvar
+                                        .wait_timeout(state, LATE_WAIT_RETRY_SLICE)
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    state = next_state;
+                                } else {
+                                    state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
+                                }
+                            }
+                        };
+                        let Some(action) = action else {
+                            break;
+                        };
 
-                                if cancel.load(Ordering::Acquire)
-                                    || shutdown_flag.load(Ordering::Acquire)
-                                {
-                                    let _ = reply.send(DownloadFileIoResult {
-                                        sha256: None,
-                                        zone_info: None,
-                                        cancelled: true,
-                                    });
-                                    continue;
+                        match action {
+                            WorkerAction::FlushPendingLate(item) => {
+                                if shutdown_flag.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                match w_late_tx.try_send(item) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        let (lock, _) = &*qp;
+                                        let mut state =
+                                            lock.lock().unwrap_or_else(|e| e.into_inner());
+                                        state.pending_late.clear();
+                                        state.seed_backlog.clear();
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(returned)) => {
+                                        let (lock, _) = &*qp;
+                                        let mut state =
+                                            lock.lock().unwrap_or_else(|e| e.into_inner());
+                                        if !state.closed && !shutdown_flag.load(Ordering::Acquire) {
+                                            if state.pending_late.len() < MOTW_PENDING_LATE_CAPACITY
+                                            {
+                                                state.pending_late.push_front(returned);
+                                            } else {
+                                                tracing::warn!(
+                                                    pending_late_capacity =
+                                                        MOTW_PENDING_LATE_CAPACITY,
+                                                    instance_count = returned.instance_ids.len(),
+                                                    "MOTW pending late attribution queue saturated during retry; dropping attribution"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            WorkerAction::RunJob(job) => {
+                                let _busy_guard = BusyWorkerGuard(&busy);
+                                if shutdown_flag.load(Ordering::Acquire) {
+                                    break;
                                 }
 
-                                let zone_info = w_motw.read_zone_identifier(Path::new(&normalized_path));
-                                let cancelled = cancel.load(Ordering::Acquire)
-                                    || shutdown_flag.load(Ordering::Acquire);
-                                let _ = reply.send(DownloadFileIoResult {
-                                    sha256,
-                                    zone_info,
-                                    cancelled,
-                                });
+                                match job {
+                                    MotwIoJob::ResolveProcess {
+                                        instance_id,
+                                        exe_path,
+                                        reply,
+                                    } => {
+                                        let attr = resolve_process_motw_core(
+                                            &w_store,
+                                            &*w_inspector,
+                                            &*w_motw,
+                                            &w_dl_state,
+                                            &w_cache,
+                                            download_hash_max_bytes,
+                                            &exe_path,
+                                            None,
+                                            false,
+                                        );
+                                        match reply {
+                                            Some(tx) => {
+                                                if let Err(Some(late_attr)) = tx.send(attr) {
+                                                    if !instance_id.is_empty() {
+                                                        enqueue_late_attribution_nonblocking(
+                                                            &w_late_tx,
+                                                            LateMotwAttribution {
+                                                                instance_ids: vec![instance_id],
+                                                                attribution: late_attr,
+                                                            },
+                                                            &shutdown_flag,
+                                                            &qp,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                if let Some(late_attr) = attr {
+                                                    if !instance_id.is_empty() {
+                                                        enqueue_late_attribution_nonblocking(
+                                                            &w_late_tx,
+                                                            LateMotwAttribution {
+                                                                instance_ids: vec![instance_id],
+                                                                attribution: late_attr,
+                                                            },
+                                                            &shutdown_flag,
+                                                            &qp,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    MotwIoJob::ResolveSeedGroup {
+                                        exe_path,
+                                        instance_ids,
+                                    } => {
+                                        let attr = resolve_process_motw_core(
+                                            &w_store,
+                                            &*w_inspector,
+                                            &*w_motw,
+                                            &w_dl_state,
+                                            &w_cache,
+                                            download_hash_max_bytes,
+                                            &exe_path,
+                                            None,
+                                            false,
+                                        );
+                                        if let Some(late_attr) = attr {
+                                            enqueue_late_attribution_nonblocking(
+                                                &w_late_tx,
+                                                LateMotwAttribution {
+                                                    instance_ids,
+                                                    attribution: late_attr,
+                                                },
+                                                &shutdown_flag,
+                                                &qp,
+                                            );
+                                        }
+                                    }
+                                    MotwIoJob::InspectDownloadFile {
+                                        normalized_path,
+                                        max_hash_bytes,
+                                        cancel,
+                                        reply,
+                                    } => {
+                                        let _cancel_guard = {
+                                            let mut guard =
+                                                cancels.lock().unwrap_or_else(|e| e.into_inner());
+                                            guard.push(Arc::clone(&cancel));
+                                            CancelRegistrationGuard {
+                                                active_cancels: Arc::clone(&cancels),
+                                                cancel: Arc::clone(&cancel),
+                                            }
+                                        };
+                                        if cancel.load(Ordering::Acquire)
+                                            || shutdown_flag.load(Ordering::Acquire)
+                                        {
+                                            let _ = reply.send(DownloadFileIoResult {
+                                                sha256: None,
+                                                zone_info: None,
+                                                cancelled: true,
+                                            });
+                                            continue;
+                                        }
+
+                                        let sha256 = match w_inspector.compute_sha256_cancellable(
+                                            &normalized_path,
+                                            max_hash_bytes,
+                                            &cancel,
+                                        ) {
+                                            Ok(opt) => opt
+                                                .map(|h| h.trim().to_ascii_lowercase())
+                                                .filter(|h| !h.is_empty()),
+                                            Err(err)
+                                                if err.kind() == ErrorKind::Interrupted
+                                                    && (cancel.load(Ordering::Acquire)
+                                                        || shutdown_flag
+                                                            .load(Ordering::Acquire)) =>
+                                            {
+                                                let _ = reply.send(DownloadFileIoResult {
+                                                    sha256: None,
+                                                    zone_info: None,
+                                                    cancelled: true,
+                                                });
+                                                continue;
+                                            }
+                                            Err(err) => {
+                                                tracing::debug!(
+                                                    file_path = %normalized_path,
+                                                    error = %err,
+                                                    "failed computing SHA-256 for downloaded file; recording origin without hash"
+                                                );
+                                                None
+                                            }
+                                        };
+
+                                        if cancel.load(Ordering::Acquire)
+                                            || shutdown_flag.load(Ordering::Acquire)
+                                        {
+                                            let _ = reply.send(DownloadFileIoResult {
+                                                sha256: None,
+                                                zone_info: None,
+                                                cancelled: true,
+                                            });
+                                            continue;
+                                        }
+
+                                        let zone_info =
+                                            w_motw.read_zone_identifier(Path::new(&normalized_path));
+                                        let cancelled = cancel.load(Ordering::Acquire)
+                                            || shutdown_flag.load(Ordering::Acquire);
+                                        let _ = reply.send(DownloadFileIoResult {
+                                            sha256,
+                                            zone_info,
+                                            cancelled,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -743,7 +813,7 @@ impl MotwIoWorkerPool {
     }
 
     pub(super) fn notify_late_result_consumed(&self) {
-        if self.late_send_waiters.load(Ordering::Acquire) > 0 {
+        if self.late_send_waiters.load(Ordering::SeqCst) > 0 {
             let (lock, cvar) = &*self.queue_pair;
             let _state = lock.lock().unwrap_or_else(|e| e.into_inner());
             cvar.notify_all();
@@ -873,6 +943,7 @@ impl MotwIoWorkerPool {
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
         state.queue.clear();
+        state.pending_late.clear();
         state.seed_backlog.clear();
         cvar.notify_all();
     }
@@ -1623,5 +1694,231 @@ impl DaemonEngine {
         }
 
         Ok(BrowserEventOutcome::Recorded(alert))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ledr_rules::BinaryIdentity;
+
+    struct StaticTestBinaryInspector;
+
+    impl BinaryInspector for StaticTestBinaryInspector {
+        fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+            BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: Some(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                ),
+                authenticode: None,
+            }
+        }
+    }
+
+    struct StaticTestMotwInspector {
+        seed_calls: AtomicUsize,
+    }
+
+    impl MotwInspector for StaticTestMotwInspector {
+        fn read_zone_identifier(&self, path: &Path) -> Option<MotwZoneInfo> {
+            let raw = path.display().to_string();
+            if raw.contains("seed_") {
+                self.seed_calls.fetch_add(1, Ordering::AcqRel);
+            }
+            Some(MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(format!("https://unit.example.invalid/{}", raw.replace('\\', "/"))),
+                referrer_url: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn motw_pool_01_pending_late_preempted_by_download_inspect_and_cleared_on_shutdown() {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let inspector: Arc<dyn BinaryInspector> = Arc::new(StaticTestBinaryInspector);
+        let motw_impl = Arc::new(StaticTestMotwInspector {
+            seed_calls: AtomicUsize::new(0),
+        });
+        let motw_inspector: Arc<dyn MotwInspector> = motw_impl.clone();
+        let dl_state = Arc::new(AtomicU64::new(0));
+        let stage2_cache = Arc::new(Mutex::new(MotwStage2Cache::new(16, 60)));
+        let (late_tx, mut late_rx) = mpsc::channel(1);
+
+        // Pre-fill the single slot of `late_tx` so `capacity() == 0`.
+        late_tx
+            .try_send(LateMotwAttribution {
+                instance_ids: vec!["dummy-0".to_string()],
+                attribution: MotwAttribution {
+                    origin_url: "https://dummy.example.invalid/0".to_string(),
+                    referrer_url: None,
+                    frame_url: None,
+                    sha256: None,
+                    zone_id: Some(3),
+                    stage: MotwMatchStage::ZoneIdentifierAds,
+                },
+            })
+            .expect("pre-fill late_tx");
+
+        let pool = MotwIoWorkerPool::new(
+            store,
+            inspector,
+            motw_inspector,
+            dl_state,
+            stage2_cache,
+            MAX_DOWNLOAD_HASH_BYTES,
+            64,
+            late_tx.clone(),
+        );
+
+        // Queue 3 real-time async ResolveProcess jobs + 2 startup seed groups while `late_tx` is full.
+        for i in 0..3 {
+            assert!(matches!(
+                pool.submit_process_motw(
+                    format!("rt-{i}"),
+                    format!(r"C:\Apps\rt_{i}.exe"),
+                    false,
+                ),
+                SubmitProcessMotwOutcome::QueuedAsync
+            ));
+        }
+        assert_eq!(
+            pool.submit_seed_motw_groups(vec![
+                SeedMotwGroup {
+                    exe_path: r"C:\Apps\seed_0.exe".to_string(),
+                    instance_ids: vec!["seed-0".to_string()],
+                },
+                SeedMotwGroup {
+                    exe_path: r"C:\Apps\seed_1.exe".to_string(),
+                    instance_ids: vec!["seed-1".to_string()],
+                },
+            ]),
+            2
+        );
+
+        // Wait until all 3 real-time jobs have been stashed into bounded `pending_late`.
+        let stash_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let pending_len = pool
+                .queue_pair
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending_late
+                .len();
+            if pending_len == 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < stash_deadline,
+                "timed out waiting for 3 pending_late items (got {pending_len})"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            motw_impl.seed_calls.load(Ordering::Acquire),
+            0,
+            "seed_backlog must remain gated while late_tx is full"
+        );
+
+        // `submit_download_inspect` must preempt both `pending_late` and `seed_backlog` immediately.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let SubmitDownloadIoOutcome::Await(dl_rx) = pool.submit_download_inspect(
+            r"C:\Apps\download_probe.exe".to_string(),
+            MAX_DOWNLOAD_HASH_BYTES,
+            cancel,
+        ) else {
+            panic!("expected SubmitDownloadIoOutcome::Await");
+        };
+        let dl_res = tokio::time::timeout(Duration::from_secs(1), dl_rx)
+            .await
+            .expect("download inspect must not block behind full late_tx")
+            .expect("download inspect oneshot");
+        assert!(!dl_res.cancelled);
+        assert!(dl_res.sha256.is_some());
+        assert_eq!(
+            motw_impl.seed_calls.load(Ordering::Acquire),
+            0,
+            "seed_backlog must still stay gated after download inspect while late_tx is full"
+        );
+
+        // Drain dummy + 3 pending_late + 2 seed groups: pending_late must arrive before seed_backlog.
+        let dummy = late_rx.recv().await.expect("recv dummy");
+        assert_eq!(dummy.instance_ids, vec!["dummy-0"]);
+        pool.notify_late_result_consumed();
+
+        let mut received_ids: Vec<String> = Vec::new();
+        for _ in 0..5 {
+            let item = tokio::time::timeout(Duration::from_secs(2), late_rx.recv())
+                .await
+                .expect("timed out draining pending_late / seed_backlog")
+                .expect("late_rx open");
+            received_ids.extend(item.instance_ids);
+            pool.notify_late_result_consumed();
+        }
+        assert_eq!(received_ids.len(), 5);
+        assert!(
+            received_ids[..3].iter().all(|id| id.starts_with("rt-")),
+            "pending_late real-time results must flush before seed_backlog: {received_ids:?}"
+        );
+        assert!(
+            received_ids[3..].iter().all(|id| id.starts_with("seed-")),
+            "seed_backlog groups must flush once pending_late drains: {received_ids:?}"
+        );
+
+        // Re-fill `late_tx` and enqueue one more pending_late item, then verify `request_shutdown`
+        // clears `pending_late` and `seed_backlog` and joins cleanly.
+        late_tx
+            .try_send(LateMotwAttribution {
+                instance_ids: vec!["dummy-1".to_string()],
+                attribution: MotwAttribution {
+                    origin_url: "https://dummy.example.invalid/1".to_string(),
+                    referrer_url: None,
+                    frame_url: None,
+                    sha256: None,
+                    zone_id: Some(3),
+                    stage: MotwMatchStage::ZoneIdentifierAds,
+                },
+            })
+            .expect("refill late_tx");
+        assert!(matches!(
+            pool.submit_process_motw(
+                "rt-shutdown".to_string(),
+                r"C:\Apps\rt_shutdown.exe".to_string(),
+                false,
+            ),
+            SubmitProcessMotwOutcome::QueuedAsync
+        ));
+        let shutdown_stash_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let pending_len = pool
+                .queue_pair
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending_late
+                .len();
+            if pending_len >= 1 {
+                break;
+            }
+            assert!(Instant::now() < shutdown_stash_deadline);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        pool.request_shutdown();
+        {
+            let state = pool
+                .queue_pair
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(state.closed);
+            assert!(state.queue.is_empty());
+            assert!(state.pending_late.is_empty());
+            assert!(state.seed_backlog.is_empty());
+        }
+        pool.shutdown_and_join(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
     }
 }

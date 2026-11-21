@@ -14,6 +14,8 @@ use super::nrd::{execute_nrd_refresh, NrdThreadHandle};
 use super::wfp_drops::{PendingWfpDrop, QueuedWfpDrop};
 use super::{current_unix_ms, DaemonEngine};
 
+const HIGH_PRIORITY_MOTW_INTERLEAVE_STREAK: usize = 16;
+
 impl DaemonEngine {
     pub(super) async fn run_pipeline(
         self: Arc<Self>,
@@ -45,13 +47,16 @@ impl DaemonEngine {
         let mut pending_wfp_drops: VecDeque<PendingWfpDrop> = VecDeque::new();
         let mut wfp_drop_rx_closed = false;
         let mut motw_result_rx_closed = false;
+        let mut high_priority_streak = 0usize;
         let mut sync_telemetry_streak = 0usize;
         let mut last_warned_coalesced: u64 = 0;
 
         loop {
             // Tier 1: Drain non-dropping high-priority lane (ProcessStart/Stop, DnsQuery, Canary,
             // Script, unknown NetworkConnect) BEFORE WFP drops so process lineage and DNS history
-            // are always up to date for attribution (`L-10`).
+            // are always up to date for attribution (`L-10`). Interleave one Tier 1b MOTW result
+            // drain every `HIGH_PRIORITY_MOTW_INTERLEAVE_STREAK` (16) consecutive events so
+            // sustained high-priority bursts cannot starve `motw_result_rx` or seed backlog progress.
             if let Some(event) = receiver.try_recv_high_priority() {
                 sync_telemetry_streak = 0;
                 if let Some(dns_update) = self
@@ -68,8 +73,25 @@ impl DaemonEngine {
                         );
                     }
                 }
+                high_priority_streak += 1;
+                if high_priority_streak >= HIGH_PRIORITY_MOTW_INTERLEAVE_STREAK {
+                    high_priority_streak = 0;
+                    if !motw_result_rx_closed {
+                        match motw_result_rx.try_recv() {
+                            Ok(late_motw) => {
+                                self.apply_late_motw_attribution(late_motw);
+                                self.motw_pool.notify_late_result_consumed();
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                motw_result_rx_closed = true;
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                        }
+                    }
+                }
                 continue;
             }
+            high_priority_streak = 0;
 
             // Tier 1b: Drain completed asynchronous MOTW attributions promptly before Tier 2/3.
             if !motw_result_rx_closed {

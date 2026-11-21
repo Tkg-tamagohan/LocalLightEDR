@@ -1,9 +1,10 @@
-//! Phase 4A integration tests for `ledr-daemon` (`DAEMON-P4-01`..`DAEMON-P4-21`):
+//! Phase 4A integration tests for `ledr-daemon` (`DAEMON-P4-01`..`DAEMON-P4-22`):
 //! `ReportDownloadOrigin`, 3-stage MOTW attribution, `L-18` pre-emptive WFP restrictions,
 //! `ReportBrowserEvent` severity/dedup/`L-19` notification suppression, `LAYER_4_BROWSER`
 //! alert resolution, bridge IPC auth, `spawn_blocking` responsiveness, burst budget,
 //! delayed MOTW observe-to-enforce escalation, startup seed MOTW backlog deduplication,
-//! Stage 2 `(sha256, generation)` cache invalidation, and default cancellable SHA-256 contract.
+//! Stage 2 `(sha256, generation)` cache invalidation, default cancellable SHA-256 contract,
+//! case-preserving seed MOTW grouping, and non-blocking late attribution with fair drain.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -2970,7 +2971,7 @@ async fn daemon_p4_20_seed_processes_deduplicates_motw_groups_beyond_realtime_qu
 {
     let motw = Arc::new(MapMotwInspector::default());
     let distinct_motw_exes = 70usize; // Strictly exceeds MOTW_IO_QUEUE_CAPACITY (64)
-    let duplicate_instances = 50usize; // Extra instances sharing exe_key variants (total 120 MOTW procs)
+    let duplicate_instances = 50usize; // Extra instances sharing case-preserving normalized path variants (total 120 MOTW procs)
     let protected_os_instances = 10usize;
 
     let mut expected_origins: HashMap<String, String> = HashMap::new();
@@ -3004,9 +3005,9 @@ async fn daemon_p4_20_seed_processes_deduplicates_motw_groups_beyond_realtime_qu
 
     for i in 0..duplicate_instances {
         let variant_exe = match i % 3 {
-            0 => format!(r"c:\apps\seedtool{i:02}\TOOL{i:02}.EXE"),
-            1 => format!("C:/Apps/SeedTool{i:02}/tool{i:02}.exe"),
-            _ => format!(r"\\?\C:\Apps\SeedTool{i:02}\tool{i:02}.exe"),
+            0 => format!("C:/Apps/SeedTool{i:02}/tool{i:02}.exe"),
+            1 => format!(r"\\?\C:\Apps\SeedTool{i:02}\tool{i:02}.exe"),
+            _ => format!("//?/C:/Apps/SeedTool{i:02}/tool{i:02}.exe"),
         };
         let origin_url = format!("https://seed-origin.example.invalid/tool{i:02}.exe");
         let ident = ProcessIdentity::new(
@@ -3090,7 +3091,7 @@ async fn daemon_p4_20_seed_processes_deduplicates_motw_groups_beyond_realtime_qu
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // Deduplication by `WfpRuleManager::exe_key` must reduce MOTW I/O from 120 down to 70
+    // Deduplication by case-preserving normalized path must reduce MOTW I/O from 120 down to 70
     // (and skip all 10 ProtectedOs `svchost.exe` processes).
     assert_eq!(
         motw.calls().len(),
@@ -3421,4 +3422,495 @@ async fn daemon_p4_21_stage2_same_size_mtime_replacement_partial_purge_invalidat
         .expect_err("post-call cancel recheck must fail");
     assert_eq!(post_err.kind(), ErrorKind::Interrupted);
     assert_eq!(mid_mock.inspect_calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn daemon_p4_22_seed_case_sensitivity_and_nonblocking_late_motw_fair_drain() {
+    // --- Part A (`PRRT_kwDOVyjVyM66QCZw`): Case-preserving seed MOTW grouping separates
+    //     distinct case-sensitive NTFS executables (`Tool.exe` vs `tool.exe`). ---
+    struct CaseSensitiveMotwInspector {
+        zones: Mutex<HashMap<String, MotwZoneInfo>>,
+        calls: Mutex<Vec<String>>,
+        call_count: Arc<(Mutex<usize>, Condvar)>,
+    }
+
+    impl CaseSensitiveMotwInspector {
+        fn new() -> Self {
+            Self {
+                zones: Mutex::new(HashMap::new()),
+                calls: Mutex::new(Vec::new()),
+                call_count: Arc::new((Mutex::new(0usize), Condvar::new())),
+            }
+        }
+
+        fn insert_exact(&self, path: &str, zone: MotwZoneInfo) {
+            self.zones
+                .lock()
+                .expect("lock case-sensitive zones")
+                .insert(path.replace('/', "\\"), zone);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("lock case-sensitive calls").clone()
+        }
+    }
+
+    impl MotwInspector for CaseSensitiveMotwInspector {
+        fn read_zone_identifier(&self, path: &Path) -> Option<MotwZoneInfo> {
+            let raw = path.display().to_string();
+            let normalized = raw.replace('/', "\\");
+            self.calls
+                .lock()
+                .expect("lock case-sensitive calls")
+                .push(normalized.clone());
+            let result = self
+                .zones
+                .lock()
+                .expect("lock case-sensitive zones")
+                .get(&normalized)
+                .cloned();
+            let (lock, cvar) = &*self.call_count;
+            let mut count = lock.lock().expect("lock call_count");
+            *count += 1;
+            cvar.notify_all();
+            result
+        }
+    }
+
+    let case_motw = Arc::new(CaseSensitiveMotwInspector::new());
+    let upper_exe = r"C:\CaseApps\Tool.exe";
+    let lower_exe = r"C:\CaseApps\tool.exe";
+    case_motw.insert_exact(
+        upper_exe,
+        MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some("https://case-upper.example.invalid/Tool.exe".to_string()),
+            referrer_url: Some("https://case-ref.example.invalid/".to_string()),
+        },
+    );
+
+    let store_a = LedrStore::open_in_memory().expect("open store A");
+    let engine_a = DaemonEngine::start_with_motw_inspector(
+        store_a.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockDefense::new()),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(MapBinaryInspector::default()),
+        Arc::new(NullLiveProcessInspector),
+        case_motw.clone(),
+    );
+
+    let base_a_ms = 1_760_022_000_000i64;
+    let upper_ident = ProcessIdentity::new(22_001, unix_ms_to_filetime(base_a_ms));
+    let lower_ident = ProcessIdentity::new(22_002, unix_ms_to_filetime(base_a_ms + 10));
+    let seeded_a = engine_a
+        .seed_processes(vec![
+            SensorEvent::ProcessStart {
+                identity: upper_ident,
+                parent_pid: 4,
+                exe_path: upper_exe.to_string(),
+                command_line: "Tool.exe".to_string(),
+                user_sid: None,
+            },
+            SensorEvent::ProcessStart {
+                identity: lower_ident,
+                parent_pid: 4,
+                exe_path: lower_exe.to_string(),
+                command_line: "tool.exe".to_string(),
+                user_sid: None,
+            },
+        ])
+        .expect("seed_processes Part A");
+    assert_eq!(seeded_a, 2);
+
+    let call_count_wait = Arc::clone(&case_motw.call_count);
+    tokio::task::spawn_blocking(move || wait_count_reached(&call_count_wait, 2))
+        .await
+        .expect("wait both case-sensitive MOTW lookups");
+
+    let upper_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snap = store_a
+            .query_flight_recorder(10, Some(&upper_ident.instance_id()))
+            .expect("query upper Tool.exe");
+        if snap
+            .processes
+            .first()
+            .and_then(|p| p.origin_url.as_deref())
+            == Some("https://case-upper.example.invalid/Tool.exe")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < upper_deadline,
+            "timed out waiting for Tool.exe seed MOTW origin_url"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    engine_a
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown Part A engine");
+
+    let case_calls = case_motw.calls();
+    assert_eq!(
+        case_calls.len(),
+        2,
+        "Tool.exe and tool.exe must be resolved separately (calls={case_calls:?})"
+    );
+    assert!(case_calls.iter().any(|p| p == upper_exe));
+    assert!(case_calls.iter().any(|p| p == lower_exe));
+
+    let upper_final = store_a
+        .query_flight_recorder(10, Some(&upper_ident.instance_id()))
+        .expect("query final upper Tool.exe");
+    assert_eq!(
+        upper_final.processes[0].origin_url.as_deref(),
+        Some("https://case-upper.example.invalid/Tool.exe")
+    );
+    let lower_final = store_a
+        .query_flight_recorder(10, Some(&lower_ident.instance_id()))
+        .expect("query final lower tool.exe");
+    assert_eq!(
+        lower_final.processes[0].origin_url, None,
+        "tool.exe must not inherit Tool.exe's MOTW origin_url"
+    );
+    assert_eq!(
+        lower_final.processes[0].sha256, None,
+        "tool.exe must not inherit Tool.exe's SHA-256"
+    );
+
+    // --- Part B (`PRRT_kwDOVyjVyM66QCaz`, A-1): Saturated `motw_result_tx` (64) + 80 MOTW seed
+    //     groups + 200 HighPriority burst never starves IPC `ReportDownloadOrigin` (with real
+    //     file SHA-256), advances seeds during Tier 1 bursts via 16-event fair interleave,
+    //     completes all 80 seed groups with 0 drops, and shuts down within budget. ---
+    struct BurstGateMotwInspector {
+        zones: HashMap<String, MotwZoneInfo>,
+        seed_calls: Arc<(Mutex<usize>, Condvar)>,
+        gate1_entered: Arc<(Mutex<usize>, Condvar)>,
+        gate1_released: Arc<(Mutex<bool>, Condvar)>,
+        gate2_entered: Arc<(Mutex<usize>, Condvar)>,
+        gate2_released: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl MotwInspector for BurstGateMotwInspector {
+        fn read_zone_identifier(&self, path: &Path) -> Option<MotwZoneInfo> {
+            let raw = path.display().to_string();
+            if raw.ends_with("gate1_holder.exe") {
+                {
+                    let (lock, cvar) = &*self.gate1_entered;
+                    let mut count = lock.lock().expect("lock gate1_entered");
+                    *count += 1;
+                    cvar.notify_all();
+                }
+                {
+                    let (lock, cvar) = &*self.gate1_released;
+                    let mut flag = lock.lock().expect("lock gate1_released");
+                    while !*flag {
+                        flag = cvar.wait(flag).expect("wait gate1_released");
+                    }
+                }
+                return None;
+            }
+            if raw.ends_with("gate2_midburst.exe") {
+                {
+                    let (lock, cvar) = &*self.gate2_entered;
+                    let mut count = lock.lock().expect("lock gate2_entered");
+                    *count += 1;
+                    cvar.notify_all();
+                }
+                {
+                    let (lock, cvar) = &*self.gate2_released;
+                    let mut flag = lock.lock().expect("lock gate2_released");
+                    while !*flag {
+                        flag = cvar.wait(flag).expect("wait gate2_released");
+                    }
+                }
+                return None;
+            }
+            let normalized = raw.replace('/', "\\");
+            let found = self.zones.get(&normalized).cloned();
+            if normalized.contains(r"\seed_") {
+                let (lock, cvar) = &*self.seed_calls;
+                let mut count = lock.lock().expect("lock seed_calls");
+                *count += 1;
+                cvar.notify_all();
+            }
+            found
+        }
+    }
+
+    let seed_group_count = 80usize; // Strictly exceeds MOTW_IO_QUEUE_CAPACITY (64)
+    let burst_hp_count = 200u32;
+    let base_b_ms = 1_760_022_100_000i64;
+
+    let mut seed_zones: HashMap<String, MotwZoneInfo> = HashMap::with_capacity(seed_group_count);
+    let mut expected_seed_origins: HashMap<String, String> =
+        HashMap::with_capacity(seed_group_count);
+    let mut seed_snapshots: Vec<SensorEvent> = Vec::with_capacity(seed_group_count);
+    for i in 0..seed_group_count {
+        let exe = format!(r"C:\SeedBurst\seed_{i:02}.exe");
+        let url = format!("https://seed-burst.example.invalid/seed_{i:02}.exe");
+        seed_zones.insert(
+            exe.clone(),
+            MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(url.clone()),
+                referrer_url: Some("https://seed-burst-ref.example.invalid/".to_string()),
+            },
+        );
+        let ident = ProcessIdentity::new(
+            32_000 + i as u32,
+            unix_ms_to_filetime(base_b_ms + 10_000 + i as i64),
+        );
+        expected_seed_origins.insert(ident.instance_id(), url);
+        seed_snapshots.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe,
+            command_line: format!("seed_{i:02}.exe"),
+            user_sid: None,
+        });
+    }
+
+    let dir_b = TestTempDir::new("p4-22");
+    let dl_file = dir_b.0.join("urgent_download.exe");
+    std::fs::write(&dl_file, b"p4-22-urgent-download-payload-for-sha256")
+        .expect("write urgent_download.exe");
+    let expected_dl_sha = compute_file_sha256_hex(&dl_file).expect("hash urgent_download.exe");
+    let dl_path_str = dl_file.display().to_string();
+
+    let seed_calls = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let gate1_entered = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let gate1_released = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate2_entered = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let gate2_released = Arc::new((Mutex::new(false), Condvar::new()));
+    let _gate1_guard = GateReleaseGuard(Arc::clone(&gate1_released));
+    let _gate2_guard = GateReleaseGuard(Arc::clone(&gate2_released));
+
+    let burst_motw = Arc::new(BurstGateMotwInspector {
+        zones: seed_zones,
+        seed_calls: Arc::clone(&seed_calls),
+        gate1_entered: Arc::clone(&gate1_entered),
+        gate1_released: Arc::clone(&gate1_released),
+        gate2_entered: Arc::clone(&gate2_entered),
+        gate2_released: Arc::clone(&gate2_released),
+    });
+
+    let pipe_b = unique_test_pipe_name();
+    let store_b = LedrStore::open_in_memory().expect("open store B");
+    let engine_b = DaemonEngine::start_with_motw_inspector(
+        store_b.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_b.clone(),
+            dev_mode_bypass_ui_auth: true,
+            ipc_session_timeout_ms: 1_500,
+            motw_sync_wait_budget_ms: 5_000,
+            shutdown_flush_timeout_ms: 3_000,
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockDefense::new()),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(WindowsBinaryInspector::new()),
+        Arc::new(NullLiveProcessInspector),
+        burst_motw,
+    );
+    let ipc_b = start_ipc_server(Arc::clone(&engine_b)).expect("bind Part B IPC pipe");
+    let sender_b = engine_b.sender();
+
+    // 1. Park `run_pipeline` and worker 0 on `gate1_holder.exe` so `motw_result_rx` cannot drain
+    //    while worker 1 saturates `motw_result_tx` (capacity 64) with startup seed results.
+    sender_b
+        .send(SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(30_000, unix_ms_to_filetime(base_b_ms)),
+            parent_pid: 4,
+            exe_path: r"C:\SeedBurst\gate1_holder.exe".to_string(),
+            command_line: "gate1_holder.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send gate1_holder ProcessStart");
+    let gate1_wait = Arc::clone(&gate1_entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&gate1_wait, 1))
+        .await
+        .expect("wait gate1_holder in MOTW worker");
+
+    // 2. Preload a 200-event HighPriority burst behind `gate1_holder`, placing `gate2_midburst`
+    //    at index 40 (> 2 * 16 interleave cycles, with 159 HP events still queued behind it).
+    for i in 0..burst_hp_count {
+        let exe_path = if i == 40 {
+            r"C:\SeedBurst\gate2_midburst.exe".to_string()
+        } else {
+            r"C:\Windows\System32\svchost.exe".to_string()
+        };
+        sender_b
+            .send(SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(
+                    31_000 + i,
+                    unix_ms_to_filetime(base_b_ms + 1_000 + i64::from(i)),
+                ),
+                parent_pid: 4,
+                exe_path,
+                command_line: format!("hp_burst_{i}"),
+                user_sid: None,
+            })
+            .await
+            .expect("preload HighPriority burst event");
+    }
+
+    // 3. Seed 80 distinct MOTW groups and deterministically wait until worker 1 has filled all 64
+    //    slots of `motw_result_tx` and paused at the `w_late_tx.capacity() > 0` gate.
+    let seeded_b = engine_b
+        .seed_processes(seed_snapshots)
+        .expect("seed 80 MOTW groups");
+    assert_eq!(seeded_b, seed_group_count);
+
+    let seed_wait_64 = Arc::clone(&seed_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&seed_wait_64, 64))
+        .await
+        .expect("wait worker 1 to saturate motw_result_tx (64)");
+
+    // 4. While `gate1` is STILL closed (`motw_result_tx` 64/64 full, worker 0 held, 200 HP events
+    //    queued), send IPC `ReportDownloadOrigin` with real SHA-256 computation. Worker 1 must
+    //    preempt deferred seed work and reply `Ack` promptly instead of deadlocking.
+    let dl_t0 = Instant::now();
+    let pipe_for_dl = pipe_b.clone();
+    let dl_path_req = dl_path_str.clone();
+    let dl_resp = tokio::task::spawn_blocking(move || {
+        send_pipe_request(
+            &pipe_for_dl,
+            &IpcRequest::ReportDownloadOrigin {
+                file_path: dl_path_req,
+                tab_url: "https://urgent-dl.example.invalid/urgent_download.exe".to_string(),
+                frame_url: None,
+                referrer_url: Some("https://urgent-ref.example.invalid/".to_string()),
+                downloaded_at_ms: base_b_ms + 500,
+            },
+        )
+    })
+    .await
+    .expect("join ReportDownloadOrigin client");
+    let dl_elapsed = dl_t0.elapsed();
+    assert!(
+        matches!(dl_resp, IpcResponse::Ack { .. }),
+        "IPC ReportDownloadOrigin must return Ack while motw_result_tx is full: {dl_resp:?}"
+    );
+    assert!(
+        dl_elapsed < Duration::from_secs(1),
+        "IPC ReportDownloadOrigin took {dl_elapsed:?} under saturated motw_result_tx"
+    );
+    assert_eq!(
+        *seed_calls.0.lock().expect("lock seed_calls after dl"),
+        64,
+        "w_late_tx.capacity() > 0 gate must prevent popping the 65th seed while motw_result_tx is full"
+    );
+
+    let dl_snap = store_b
+        .query_flight_recorder(10, None)
+        .expect("query persisted download_origins");
+    assert_eq!(dl_snap.download_origins.len(), 1);
+    assert_eq!(
+        dl_snap.download_origins[0].sha256.as_deref(),
+        Some(expected_dl_sha.as_str()),
+        "IPC ReportDownloadOrigin must persist computed real-file SHA-256"
+    );
+    assert_eq!(
+        dl_snap.download_origins[0].tab_url,
+        "https://urgent-dl.example.invalid/urgent_download.exe"
+    );
+
+    // 5. Release `gate1`: Tier 1 processes 40 consecutive HP events before reaching `gate2`,
+    //    triggering at least two 16-event Tier 1b interleaves so `seed_backlog` advances to at
+    //    least the 66th group while 159 HP events remain queued in Tier 1.
+    {
+        let (lock, cvar) = &*gate1_released;
+        let mut flag = lock.lock().expect("lock gate1_released");
+        *flag = true;
+        cvar.notify_all();
+    }
+    let gate2_wait = Arc::clone(&gate2_entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&gate2_wait, 1))
+        .await
+        .expect("wait gate2_midburst after 40 Tier 1 events");
+    let seed_wait_66 = Arc::clone(&seed_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&seed_wait_66, 66))
+        .await
+        .expect("Tier 1 fair interleave must drain motw_result_rx and advance seed_backlog mid-burst");
+
+    // 6. Release `gate2`: confirm all 201 HP events and all 80 MOTW seed groups complete with
+    //    zero drops and `shutdown_and_flush` finishes within budget.
+    {
+        let (lock, cvar) = &*gate2_released;
+        let mut flag = lock.lock().expect("lock gate2_released");
+        *flag = true;
+        cvar.notify_all();
+    }
+    wait_high_priority_processed(
+        &engine_b,
+        1 + u64::from(burst_hp_count),
+        "gate1 + 200 HighPriority burst",
+    )
+    .await;
+
+    let seed_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = store_b
+            .query_flight_recorder(512, None)
+            .expect("query store B seeds");
+        let matched = snap
+            .processes
+            .iter()
+            .filter(|p| {
+                expected_seed_origins
+                    .get(&p.process_instance_id)
+                    .is_some_and(|exp| p.origin_url.as_deref() == Some(exp.as_str()))
+            })
+            .count();
+        if matched == seed_group_count {
+            break;
+        }
+        assert!(
+            Instant::now() < seed_deadline,
+            "timed out waiting for all {seed_group_count} MOTW seed groups (matched={matched})"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(engine_b.high_priority_dropped(), 0);
+    ipc_b.shutdown().await;
+    let shutdown_t0 = Instant::now();
+    engine_b
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown Part B engine cleanly within budget");
+    assert!(
+        shutdown_t0.elapsed() < Duration::from_secs(3),
+        "shutdown_and_flush exceeded 3s budget: {:?}",
+        shutdown_t0.elapsed()
+    );
+
+    let final_b = store_b
+        .query_flight_recorder(512, None)
+        .expect("query final store B");
+    let final_matched = final_b
+        .processes
+        .iter()
+        .filter(|p| {
+            expected_seed_origins
+                .get(&p.process_instance_id)
+                .is_some_and(|exp| p.origin_url.as_deref() == Some(exp.as_str()))
+        })
+        .count();
+    assert_eq!(
+        final_matched, seed_group_count,
+        "all 80 seed MOTW groups must persist origin_url with zero loss"
+    );
 }

@@ -3,20 +3,36 @@
   "name": "LocalEDR Browser Shield",
   "version": "0.1.0",
   "description": "LocalEDR Browser Shield for DNR blocking, ClickFix/Pastejacking detection, NRD/homograph password warnings, and download origin tracking.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtMAe02u4HaagKt3B3U7qxalcsi5kDTupsK2p5shKumx5dNvyMf8WCTBgyPIPQmBM2YF+05fedfVfl87Aokz7ANavXloHMjM2wq5+jIy4Y8SwDYwKZatwIFg2U0sJTftsel0qmALi6hw3LOkgSIqQRWaGKYwOe0LxXUTNS5kI08YPHxG/sokvBKcV+AA3fK0YzLlss3YSfpWZZfam6oc8rSy7jS5vDZqoaJ2FUR9e7ThUVB+Ho5DjyFMIqO2XFoPmDdviMPb5CMHZCSfW6Hfxil5wZMDsPnhPa5gNoWNkf+5epUCstzoc8ONJs9nKxYU8bU7vXCo1Ws/U4dkA95yU8QIDAQAB",
   "permissions": [
     "declarativeNetRequest",
     "downloads",
     "nativeMessaging",
-    "storage"
+    "storage",
+    "tabs",
+    "alarms"
   ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "LocalEDR Browser Shield"
+  },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content_main.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
       "js": ["content.js"],
-      "run_at": "document_start"
+      "run_at": "document_start",
+      "all_frames": true
     }
   ],
   "declarative_net_request": {

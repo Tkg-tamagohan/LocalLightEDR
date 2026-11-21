@@ -1,0 +1,798 @@
+//! Idempotent HKCU/HKLM Native Messaging Host, `ledr://` URI scheme, and AUMID setup/unregister/status.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use ledr_proto::{AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, PROGRAM_DATA_DIR};
+use serde::Serialize;
+
+use crate::cli::{BrowserKind, Scope, SetupArgs, StatusArgs, StatusScope, UnregisterArgs};
+use crate::extension_id::DEFAULT_CHROME_EXTENSION_ID;
+use crate::manifest::{
+    build_manifest, normalize_display_path, validate_manifest_file, write_manifest_atomic,
+    ManifestValidation, MANIFEST_FILENAME,
+};
+use crate::pipe_client::PipeClient;
+
+pub const CHROME_NMH_SUBKEY: &str = r"Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge";
+pub const EDGE_NMH_SUBKEY: &str = r"Software\Microsoft\Edge\NativeMessagingHosts\com.localedr.bridge";
+pub const BRAVE_NMH_SUBKEY: &str =
+    r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.localedr.bridge";
+
+pub const LEDR_URI_SUBKEY: &str = r"Software\Classes\ledr";
+pub const LEDR_URI_DESCRIPTION: &str = "URL:LocalEDR Alert Protocol";
+pub const LEDR_AUMID_SUBKEY: &str = r"Software\Classes\AppUserModelId\LocalEDR.AlertUI";
+pub const LEDR_AUMID_DISPLAY_NAME: &str = "LocalEDR";
+
+/// Target registry hive and optional subkey prefix (used to isolate unit tests under `HKCU\Software\LocalEDR-Test\...`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryTarget {
+    pub scope: Scope,
+    pub key_prefix: Option<String>,
+}
+
+impl RegistryTarget {
+    pub fn for_scope(scope: Scope) -> Self {
+        Self {
+            scope,
+            key_prefix: None,
+        }
+    }
+
+    pub fn hive_name(&self) -> &'static str {
+        match self.scope {
+            Scope::User => "HKCU",
+            Scope::Machine => "HKLM",
+        }
+    }
+
+    pub fn qualify_subkey(&self, subkey: &str) -> String {
+        let trimmed = subkey.trim_matches('\\');
+        match self
+            .key_prefix
+            .as_deref()
+            .map(|p| p.trim_matches('\\'))
+            .filter(|p| !p.is_empty())
+        {
+            Some(prefix) => format!(r"{prefix}\{trimmed}"),
+            None => trimmed.to_string(),
+        }
+    }
+
+    pub fn browser_subkey(&self, browser: BrowserKind) -> String {
+        let base = match browser {
+            BrowserKind::Chrome => CHROME_NMH_SUBKEY,
+            BrowserKind::Edge => EDGE_NMH_SUBKEY,
+            BrowserKind::Brave => BRAVE_NMH_SUBKEY,
+        };
+        self.qualify_subkey(base)
+    }
+
+    pub fn uri_subkey(&self) -> String {
+        self.qualify_subkey(LEDR_URI_SUBKEY)
+    }
+
+    pub fn aumid_subkey(&self) -> String {
+        self.qualify_subkey(LEDR_AUMID_SUBKEY)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserRegistrationOutcome {
+    pub browser: BrowserKind,
+    pub registry_key: String,
+    pub manifest_path: String,
+    pub updated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetupOutcome {
+    pub scope: Scope,
+    pub manifest_path: String,
+    pub manifest_written: bool,
+    pub bridge_exe: String,
+    pub ui_exe: String,
+    pub extension_id: String,
+    pub browsers: Vec<BrowserRegistrationOutcome>,
+    pub uri_registered: bool,
+    pub uri_updated: bool,
+    pub aumid_updated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserUnregisterOutcome {
+    pub browser: BrowserKind,
+    pub registry_key: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnregisterOutcome {
+    pub scope: Scope,
+    pub manifest_path: String,
+    pub manifest_removed: bool,
+    pub browsers: Vec<BrowserUnregisterOutcome>,
+    pub uri_removed: bool,
+    pub aumid_removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserStatusEntry {
+    pub browser: BrowserKind,
+    pub registry_key: String,
+    pub registered: bool,
+    pub manifest_path: Option<String>,
+    pub manifest: Option<ManifestValidation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScopeStatusReport {
+    pub scope: Scope,
+    pub default_manifest_path: String,
+    pub browsers: Vec<BrowserStatusEntry>,
+    pub uri_registered: bool,
+    pub uri_command: Option<String>,
+    pub aumid_registered: bool,
+    pub aumid_display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaemonPingStatus {
+    pub pipe_name: String,
+    pub online: bool,
+    pub daemon_version: Option<String>,
+    pub protocol_version: Option<u32>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StatusReport {
+    pub expected_extension_id: String,
+    pub scopes: Vec<ScopeStatusReport>,
+    pub daemon_ping: Option<DaemonPingStatus>,
+}
+
+/// Formats `ledr://` protocol shell command matching `apps/ledr-ui/src/uri_reg.rs`.
+pub fn format_ledr_uri_command(ui_exe: &Path) -> String {
+    let normalized = normalize_display_path(ui_exe);
+    format!("\"{normalized}\" \"%1\"")
+}
+
+/// Resolves the Native Messaging manifest directory for `scope`.
+pub fn resolve_manifest_dir(scope: Scope, override_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = override_dir {
+        return Ok(dir.to_path_buf());
+    }
+    match scope {
+        Scope::User => {
+            let local_app_data = std::env::var_os("LOCALAPPDATA")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "LOCALAPPDATA environment variable is unset; pass --manifest-dir explicitly"
+                    )
+                })?;
+            Ok(local_app_data.join("LocalEDR").join("native-messaging"))
+        }
+        Scope::Machine => Ok(PathBuf::from(PROGRAM_DATA_DIR).join("native-messaging")),
+    }
+}
+
+/// Resolves the `ledr-bridge-nm.exe` path for manifest generation.
+pub fn resolve_bridge_exe(scope: Scope, override_exe: Option<&Path>) -> PathBuf {
+    if let Some(exe) = override_exe {
+        return exe.to_path_buf();
+    }
+    match scope {
+        Scope::Machine => PathBuf::from(AUTHORIZED_BRIDGE_EXE_PATH),
+        Scope::User => std::env::current_exe()
+            .ok()
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| PathBuf::from(AUTHORIZED_BRIDGE_EXE_PATH)),
+    }
+}
+
+/// Resolves the `ledr-ui.exe` path for `ledr://` URI scheme registration.
+pub fn resolve_ui_exe(scope: Scope, bridge_exe: &Path, override_exe: Option<&Path>) -> PathBuf {
+    if let Some(exe) = override_exe {
+        return exe.to_path_buf();
+    }
+    match scope {
+        Scope::Machine => PathBuf::from(AUTHORIZED_UI_EXE_PATH),
+        Scope::User => {
+            if let Some(sibling) = bridge_exe.parent().map(|dir| dir.join("ledr-ui.exe")) {
+                if sibling.is_file() {
+                    return sibling;
+                }
+            }
+            PathBuf::from(AUTHORIZED_UI_EXE_PATH)
+        }
+    }
+}
+
+#[cfg(windows)]
+mod win_reg_ops {
+    use super::{
+        format_ledr_uri_command, BrowserKind, RegistryTarget, Scope, LEDR_AUMID_DISPLAY_NAME,
+        LEDR_URI_DESCRIPTION,
+    };
+    use anyhow::{Context, Result};
+    use std::io::ErrorKind;
+    use std::path::Path;
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    fn root_key(scope: Scope) -> RegKey {
+        match scope {
+            Scope::User => RegKey::predef(HKEY_CURRENT_USER),
+            Scope::Machine => RegKey::predef(HKEY_LOCAL_MACHINE),
+        }
+    }
+
+    fn annotate_reg_err(scope: Scope, key_display: &str, err: std::io::Error) -> anyhow::Error {
+        if scope == Scope::Machine && err.kind() == ErrorKind::PermissionDenied {
+            anyhow::anyhow!(
+                "access denied writing '{key_display}': Administrator elevation is required for --scope machine (or use --scope user): {err}"
+            )
+        } else {
+            anyhow::Error::new(err).context(format!("registry write failed for '{key_display}'"))
+        }
+    }
+
+    pub(crate) fn ensure_default_sz(
+        target: &RegistryTarget,
+        subkey: &str,
+        expected: &str,
+    ) -> Result<bool> {
+        let root = root_key(target.scope);
+        let key_display = format!(r"{}\{subkey}", target.hive_name());
+
+        if let Ok(existing_key) = root.open_subkey_with_flags(subkey, KEY_READ) {
+            if let Ok(current) = existing_key.get_value::<String, _>("") {
+                if current == expected {
+                    return Ok(false);
+                }
+            }
+        }
+
+        let (key, _) = root
+            .create_subkey(subkey)
+            .map_err(|err| annotate_reg_err(target.scope, &key_display, err))?;
+        key.set_value("", &expected)
+            .map_err(|err| annotate_reg_err(target.scope, &key_display, err))?;
+        Ok(true)
+    }
+
+    pub(crate) fn ensure_uri_registered(
+        target: &RegistryTarget,
+        ui_exe: &Path,
+    ) -> Result<bool> {
+        let base_subkey = target.uri_subkey();
+        let cmd_subkey = format!(r"{base_subkey}\shell\open\command");
+        let expected_cmd = format_ledr_uri_command(ui_exe);
+        let root = root_key(target.scope);
+        let key_display = format!(r"{}\{base_subkey}", target.hive_name());
+
+        if let (Ok(base_key), Ok(cmd_key)) = (
+            root.open_subkey_with_flags(&base_subkey, KEY_READ),
+            root.open_subkey_with_flags(&cmd_subkey, KEY_READ),
+        ) {
+            let desc_ok = base_key.get_value::<String, _>("").ok().as_deref()
+                == Some(LEDR_URI_DESCRIPTION);
+            let proto_ok =
+                base_key.get_value::<String, _>("URL Protocol").ok().as_deref() == Some("");
+            let cmd_ok =
+                cmd_key.get_value::<String, _>("").ok().as_deref() == Some(expected_cmd.as_str());
+            if desc_ok && proto_ok && cmd_ok {
+                return Ok(false);
+            }
+        }
+
+        let (base_key, _) = root
+            .create_subkey(&base_subkey)
+            .map_err(|err| annotate_reg_err(target.scope, &key_display, err))?;
+        base_key
+            .set_value("", &LEDR_URI_DESCRIPTION)
+            .map_err(|err| annotate_reg_err(target.scope, &key_display, err))?;
+        base_key
+            .set_value("URL Protocol", &"")
+            .map_err(|err| annotate_reg_err(target.scope, &key_display, err))?;
+
+        let cmd_display = format!(r"{}\{cmd_subkey}", target.hive_name());
+        let (cmd_key, _) = root
+            .create_subkey(&cmd_subkey)
+            .map_err(|err| annotate_reg_err(target.scope, &cmd_display, err))?;
+        cmd_key
+            .set_value("", &expected_cmd)
+            .map_err(|err| annotate_reg_err(target.scope, &cmd_display, err))?;
+
+        Ok(true)
+    }
+
+    pub(crate) fn ensure_aumid_registered(target: &RegistryTarget) -> Result<bool> {
+        let subkey = target.aumid_subkey();
+        let root = root_key(target.scope);
+        let key_display = format!(r"{}\{subkey}", target.hive_name());
+
+        if let Ok(base_key) = root.open_subkey_with_flags(&subkey, KEY_READ) {
+            if base_key
+                .get_value::<String, _>("DisplayName")
+                .ok()
+                .as_deref()
+                == Some(LEDR_AUMID_DISPLAY_NAME)
+            {
+                return Ok(false);
+            }
+        }
+
+        let (base_key, _) = root
+            .create_subkey(&subkey)
+            .map_err(|err| annotate_reg_err(target.scope, &key_display, err))?;
+        base_key
+            .set_value("DisplayName", &LEDR_AUMID_DISPLAY_NAME)
+            .map_err(|err| annotate_reg_err(target.scope, &key_display, err))?;
+        Ok(true)
+    }
+
+    pub(crate) fn delete_subkey_tree_idempotent(
+        target: &RegistryTarget,
+        subkey: &str,
+    ) -> Result<bool> {
+        let root = root_key(target.scope);
+        let key_display = format!(r"{}\{subkey}", target.hive_name());
+        match root.delete_subkey_all(subkey) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(annotate_reg_err(target.scope, &key_display, err)),
+        }
+    }
+
+    pub(crate) fn read_default_sz(target: &RegistryTarget, subkey: &str) -> Result<Option<String>> {
+        let root = root_key(target.scope);
+        match root.open_subkey_with_flags(subkey, KEY_READ) {
+            Ok(key) => Ok(key.get_value::<String, _>("").ok()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => {
+                Err(err).with_context(|| format!(r"failed to read {}\{subkey}", target.hive_name()))
+            }
+        }
+    }
+
+    pub(crate) fn read_uri_status(target: &RegistryTarget) -> (bool, Option<String>) {
+        let root = root_key(target.scope);
+        let base_subkey = target.uri_subkey();
+        let cmd_subkey = format!(r"{base_subkey}\shell\open\command");
+        let Ok(base_key) = root.open_subkey_with_flags(&base_subkey, KEY_READ) else {
+            return (false, None);
+        };
+        let Ok(cmd_key) = root.open_subkey_with_flags(&cmd_subkey, KEY_READ) else {
+            return (false, None);
+        };
+        let has_proto = base_key.get_value::<String, _>("URL Protocol").is_ok();
+        let cmd = cmd_key.get_value::<String, _>("").ok();
+        (has_proto && cmd.is_some(), cmd)
+    }
+
+    pub(crate) fn read_aumid_status(target: &RegistryTarget) -> (bool, Option<String>) {
+        let root = root_key(target.scope);
+        let subkey = target.aumid_subkey();
+        let Ok(key) = root.open_subkey_with_flags(&subkey, KEY_READ) else {
+            return (false, None);
+        };
+        let name = key.get_value::<String, _>("DisplayName").ok();
+        (name.is_some(), name)
+    }
+
+    pub(crate) fn any_browser_references_manifest(
+        target: &RegistryTarget,
+        manifest_display_path: &str,
+    ) -> Result<bool> {
+        for browser in [BrowserKind::Chrome, BrowserKind::Edge, BrowserKind::Brave] {
+            let subkey = target.browser_subkey(browser);
+            if let Some(existing) = read_default_sz(target, &subkey)? {
+                if existing.eq_ignore_ascii_case(manifest_display_path) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+#[cfg(not(windows))]
+mod win_reg_ops {
+    use super::RegistryTarget;
+    use anyhow::{bail, Result};
+    use std::path::Path;
+
+    pub(crate) fn ensure_default_sz(
+        _target: &RegistryTarget,
+        _subkey: &str,
+        _expected: &str,
+    ) -> Result<bool> {
+        bail!("Windows Registry setup is only supported on Windows")
+    }
+
+    pub(crate) fn ensure_uri_registered(
+        _target: &RegistryTarget,
+        _ui_exe: &Path,
+    ) -> Result<bool> {
+        bail!("Windows Registry setup is only supported on Windows")
+    }
+
+    pub(crate) fn ensure_aumid_registered(_target: &RegistryTarget) -> Result<bool> {
+        bail!("Windows Registry setup is only supported on Windows")
+    }
+
+    pub(crate) fn delete_subkey_tree_idempotent(
+        _target: &RegistryTarget,
+        _subkey: &str,
+    ) -> Result<bool> {
+        bail!("Windows Registry unregister is only supported on Windows")
+    }
+
+    pub(crate) fn read_default_sz(
+        _target: &RegistryTarget,
+        _subkey: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    pub(crate) fn read_uri_status(_target: &RegistryTarget) -> (bool, Option<String>) {
+        (false, None)
+    }
+
+    pub(crate) fn read_aumid_status(_target: &RegistryTarget) -> (bool, Option<String>) {
+        (false, None)
+    }
+
+    pub(crate) fn any_browser_references_manifest(
+        _target: &RegistryTarget,
+        _manifest_display_path: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+/// Runs `ledr-bridge-nm setup` against the standard `HKCU` / `HKLM` registry keys.
+pub fn run_setup(args: &SetupArgs) -> Result<SetupOutcome> {
+    run_setup_with(args, &RegistryTarget::for_scope(args.scope))
+}
+
+/// Runs `setup` against an explicit [`RegistryTarget`] (allowing isolated unit-test prefixes).
+pub fn run_setup_with(args: &SetupArgs, target: &RegistryTarget) -> Result<SetupOutcome> {
+    if args.browsers.is_empty() {
+        bail!("at least one browser must be specified");
+    }
+    let manifest_dir = resolve_manifest_dir(args.scope, args.manifest_dir.as_deref())?;
+    let manifest_path = manifest_dir.join(MANIFEST_FILENAME);
+    let manifest_display = normalize_display_path(&manifest_path);
+
+    let bridge_exe = resolve_bridge_exe(args.scope, args.bridge_exe.as_deref());
+    let ui_exe = resolve_ui_exe(args.scope, &bridge_exe, args.ui_exe.as_deref());
+
+    let manifest = build_manifest(&bridge_exe, &args.extension_id)?;
+    let manifest_written = write_manifest_atomic(&manifest_path, &manifest)?;
+
+    let mut browser_outcomes = Vec::with_capacity(args.browsers.len());
+    for &browser in &args.browsers {
+        let subkey = target.browser_subkey(browser);
+        let updated = win_reg_ops::ensure_default_sz(target, &subkey, &manifest_display)?;
+        browser_outcomes.push(BrowserRegistrationOutcome {
+            browser,
+            registry_key: format!(r"{}\{subkey}", target.hive_name()),
+            manifest_path: manifest_display.clone(),
+            updated,
+        });
+    }
+
+    let (uri_registered, uri_updated, aumid_updated) = if args.skip_uri {
+        (false, false, false)
+    } else {
+        let u_upd = win_reg_ops::ensure_uri_registered(target, &ui_exe)?;
+        let a_upd = win_reg_ops::ensure_aumid_registered(target)?;
+        (true, u_upd, a_upd)
+    };
+
+    Ok(SetupOutcome {
+        scope: args.scope,
+        manifest_path: manifest_display,
+        manifest_written,
+        bridge_exe: normalize_display_path(&bridge_exe),
+        ui_exe: normalize_display_path(&ui_exe),
+        extension_id: args.extension_id.clone(),
+        browsers: browser_outcomes,
+        uri_registered,
+        uri_updated,
+        aumid_updated,
+    })
+}
+
+/// Runs `ledr-bridge-nm unregister` against the standard `HKCU` / `HKLM` registry keys.
+pub fn run_unregister(args: &UnregisterArgs) -> Result<UnregisterOutcome> {
+    run_unregister_with(args, &RegistryTarget::for_scope(args.scope))
+}
+
+/// Runs `unregister` against an explicit [`RegistryTarget`].
+pub fn run_unregister_with(
+    args: &UnregisterArgs,
+    target: &RegistryTarget,
+) -> Result<UnregisterOutcome> {
+    let manifest_dir = resolve_manifest_dir(args.scope, args.manifest_dir.as_deref())?;
+    let manifest_path = manifest_dir.join(MANIFEST_FILENAME);
+    let manifest_display = normalize_display_path(&manifest_path);
+
+    let mut browser_outcomes = Vec::with_capacity(args.browsers.len());
+    for &browser in &args.browsers {
+        let subkey = target.browser_subkey(browser);
+        let removed = win_reg_ops::delete_subkey_tree_idempotent(target, &subkey)?;
+        browser_outcomes.push(BrowserUnregisterOutcome {
+            browser,
+            registry_key: format!(r"{}\{subkey}", target.hive_name()),
+            removed,
+        });
+    }
+
+    let (uri_removed, aumid_removed) = if args.keep_uri {
+        (false, false)
+    } else {
+        let u_rem = win_reg_ops::delete_subkey_tree_idempotent(target, &target.uri_subkey())?;
+        let a_rem = win_reg_ops::delete_subkey_tree_idempotent(target, &target.aumid_subkey())?;
+        (u_rem, a_rem)
+    };
+
+    let still_referenced =
+        win_reg_ops::any_browser_references_manifest(target, &manifest_display)?;
+    let manifest_removed = if !still_referenced && manifest_path.is_file() {
+        std::fs::remove_file(&manifest_path).with_context(|| {
+            format!(
+                "failed to remove Native Messaging manifest '{}'",
+                manifest_path.display()
+            )
+        })?;
+        true
+    } else {
+        false
+    };
+
+    Ok(UnregisterOutcome {
+        scope: args.scope,
+        manifest_path: manifest_display,
+        manifest_removed,
+        browsers: browser_outcomes,
+        uri_removed,
+        aumid_removed,
+    })
+}
+
+/// Runs `ledr-bridge-nm status` against the standard `HKCU` / `HKLM` registry keys.
+pub fn run_status(args: &StatusArgs) -> Result<StatusReport> {
+    let targets = match args.scope {
+        StatusScope::All => vec![
+            RegistryTarget::for_scope(Scope::User),
+            RegistryTarget::for_scope(Scope::Machine),
+        ],
+        StatusScope::User => vec![RegistryTarget::for_scope(Scope::User)],
+        StatusScope::Machine => vec![RegistryTarget::for_scope(Scope::Machine)],
+    };
+    run_status_with(args, &targets, None)
+}
+
+/// Runs `status` against explicit [`RegistryTarget`] entries (allowing isolated tests).
+pub fn run_status_with(
+    args: &StatusArgs,
+    targets: &[RegistryTarget],
+    manifest_dir_override: Option<&Path>,
+) -> Result<StatusReport> {
+    let expected_extension_id = DEFAULT_CHROME_EXTENSION_ID.to_string();
+    let mut scopes = Vec::with_capacity(targets.len());
+
+    for target in targets {
+        let default_manifest_path = resolve_manifest_dir(target.scope, manifest_dir_override)
+            .map(|d| normalize_display_path(&d.join(MANIFEST_FILENAME)))
+            .unwrap_or_else(|_| MANIFEST_FILENAME.to_string());
+
+        let mut browsers = Vec::with_capacity(3);
+        for browser in [BrowserKind::Chrome, BrowserKind::Edge, BrowserKind::Brave] {
+            let subkey = target.browser_subkey(browser);
+            let reg_val = win_reg_ops::read_default_sz(target, &subkey)?;
+            let manifest = reg_val
+                .as_deref()
+                .map(|p| validate_manifest_file(Path::new(p), &expected_extension_id));
+            browsers.push(BrowserStatusEntry {
+                browser,
+                registry_key: format!(r"{}\{subkey}", target.hive_name()),
+                registered: reg_val.is_some(),
+                manifest_path: reg_val,
+                manifest,
+            });
+        }
+
+        let (uri_registered, uri_command) = win_reg_ops::read_uri_status(target);
+        let (aumid_registered, aumid_display_name) = win_reg_ops::read_aumid_status(target);
+
+        scopes.push(ScopeStatusReport {
+            scope: target.scope,
+            default_manifest_path,
+            browsers,
+            uri_registered,
+            uri_command,
+            aumid_registered,
+            aumid_display_name,
+        });
+    }
+
+    let daemon_ping = if args.ping {
+        let client = PipeClient::new(&args.pipe_name);
+        Some(match client.ping() {
+            Ok((daemon_version, protocol_version)) => DaemonPingStatus {
+                pipe_name: args.pipe_name.clone(),
+                online: true,
+                daemon_version: Some(daemon_version),
+                protocol_version: Some(protocol_version),
+                error: None,
+            },
+            Err(err) => DaemonPingStatus {
+                pipe_name: args.pipe_name.clone(),
+                online: false,
+                daemon_version: None,
+                protocol_version: None,
+                error: Some(err.to_string()),
+            },
+        })
+    } else {
+        None
+    };
+
+    Ok(StatusReport {
+        expected_extension_id,
+        scopes,
+        daemon_ping,
+    })
+}
+
+/// Formats `SetupOutcome` for human-readable CLI output.
+pub fn format_setup_text(outcome: &SetupOutcome) -> String {
+    let mut lines = vec![
+        format!("LocalEDR Native Messaging setup ({})", outcome.scope.as_str()),
+        format!(
+            "  Manifest: {} ({})",
+            outcome.manifest_path,
+            if outcome.manifest_written {
+                "written"
+            } else {
+                "unchanged"
+            }
+        ),
+        format!("  Extension ID: {}", outcome.extension_id),
+        format!("  Bridge EXE: {}", outcome.bridge_exe),
+    ];
+    for b in &outcome.browsers {
+        lines.push(format!(
+            "  {}: {} ({})",
+            b.browser.display_name(),
+            b.registry_key,
+            if b.updated { "updated" } else { "unchanged" }
+        ));
+    }
+    if outcome.uri_registered {
+        lines.push(format!(
+            "  ledr:// URI: {} (UI: {}, AUMID: {})",
+            if outcome.uri_updated {
+                "updated"
+            } else {
+                "unchanged"
+            },
+            outcome.ui_exe,
+            if outcome.aumid_updated {
+                "updated"
+            } else {
+                "unchanged"
+            }
+        ));
+    } else {
+        lines.push("  ledr:// URI: skipped (--skip-uri)".to_string());
+    }
+    lines.join("\n")
+}
+
+/// Formats `UnregisterOutcome` for human-readable CLI output.
+pub fn format_unregister_text(outcome: &UnregisterOutcome) -> String {
+    let mut lines = vec![format!(
+        "LocalEDR Native Messaging unregister ({})",
+        outcome.scope.as_str()
+    )];
+    for b in &outcome.browsers {
+        lines.push(format!(
+            "  {}: {} ({})",
+            b.browser.display_name(),
+            b.registry_key,
+            if b.removed { "removed" } else { "absent" }
+        ));
+    }
+    lines.push(format!(
+        "  Manifest: {} ({})",
+        outcome.manifest_path,
+        if outcome.manifest_removed {
+            "removed"
+        } else {
+            "kept/absent"
+        }
+    ));
+    lines.push(format!(
+        "  ledr:// URI: {}, AUMID: {}",
+        if outcome.uri_removed { "removed" } else { "kept/absent" },
+        if outcome.aumid_removed {
+            "removed"
+        } else {
+            "kept/absent"
+        }
+    ));
+    lines.join("\n")
+}
+
+/// Formats `StatusReport` for human-readable CLI output.
+pub fn format_status_text(report: &StatusReport) -> String {
+    let mut lines = vec![format!(
+        "LocalEDR Native Messaging status (expected extension ID: {})",
+        report.expected_extension_id
+    )];
+    for scope in &report.scopes {
+        lines.push(format!("Scope [{}]:", scope.scope.as_str()));
+        for b in &scope.browsers {
+            let state = match (&b.registered, &b.manifest) {
+                (false, _) => "not registered".to_string(),
+                (true, Some(m)) if m.valid => format!("registered & valid ({})", m.path),
+                (true, Some(m)) => format!(
+                    "registered but INVALID ({}): {}",
+                    m.path,
+                    m.error.as_deref().unwrap_or("unknown error")
+                ),
+                (true, None) => "registered".to_string(),
+            };
+            lines.push(format!("  {}: {state}", b.browser.display_name()));
+        }
+        lines.push(format!(
+            "  ledr:// URI: {}",
+            if scope.uri_registered {
+                scope
+                    .uri_command
+                    .as_deref()
+                    .unwrap_or("registered")
+                    .to_string()
+            } else {
+                "not registered".to_string()
+            }
+        ));
+        lines.push(format!(
+            "  AUMID: {}",
+            if scope.aumid_registered {
+                scope
+                    .aumid_display_name
+                    .as_deref()
+                    .unwrap_or("registered")
+                    .to_string()
+            } else {
+                "not registered".to_string()
+            }
+        ));
+    }
+    if let Some(ping) = &report.daemon_ping {
+        if ping.online {
+            lines.push(format!(
+                "Daemon Ping ({}): online (v{}, proto v{})",
+                ping.pipe_name,
+                ping.daemon_version.as_deref().unwrap_or("?"),
+                ping.protocol_version.unwrap_or(0)
+            ));
+        } else {
+            lines.push(format!(
+                "Daemon Ping ({}): offline ({})",
+                ping.pipe_name,
+                ping.error.as_deref().unwrap_or("unreachable")
+            ));
+        }
+    }
+    lines.join("\n")
+}

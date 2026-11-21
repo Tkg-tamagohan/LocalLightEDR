@@ -1661,6 +1661,14 @@
     if (state.lastSyncedAlertId !== alert.alert_id) {
       state.lastSyncedAlertId = alert.alert_id;
       state.triageValidationFeedback = null;
+      if (
+        state.triageFeedback &&
+        state.triageFeedback.alertId !== null &&
+        state.triageFeedback.alertId !== undefined &&
+        state.triageFeedback.alertId !== alert.alert_id
+      ) {
+        state.triageFeedback = null;
+      }
       el.optAddBlockRule.checked = true;
       el.optUseSigner.checked = hasSigner;
       el.optAllowDest.value = "";
@@ -2615,9 +2623,16 @@
           .catch((err) => ({ ok: false, error: String(err) })),
       ]);
 
+      const wasSamplePreview = state.isSamplePreview;
       state.localDefenseStatus = localStatus;
       state.isDaemonOnline = true;
       state.isSamplePreview = false;
+      if (wasSamplePreview) {
+        state.lastSyncedAlertId = null;
+        state.triageFeedback = null;
+        state.triageFeedbackByAlert.clear();
+        state.triageValidationFeedback = null;
+      }
       state.snapshot = snapshot;
       state.metrics = metrics;
       if (alertsRes.ok) {
@@ -2636,8 +2651,10 @@
         }
         if (
           state.triageFeedback &&
-          state.triageFeedback.alertId === null &&
-          !state.triageFeedback.ok
+          ((state.triageFeedback.alertId === null && !state.triageFeedback.ok) ||
+            (state.triageFeedback.alertId !== null &&
+              state.triageFeedback.alertId !== undefined &&
+              !liveAlertIds.has(state.triageFeedback.alertId)))
         ) {
           state.triageFeedback = null;
         }
@@ -2646,11 +2663,7 @@
           ? resolvePersistedDetailTriageFeedback(state.selectedAlertId)
           : state.triageFeedback;
         if (!(persistedVisibleFeedback && !persistedVisibleFeedback.ok)) {
-          state.triageFeedback = {
-            ok: false,
-            message: `Failed to refresh alerts: ${alertsRes.error}`,
-            alertId: null,
-          };
+          setAlertTriageFeedback(null, false, `Failed to refresh alerts: ${alertsRes.error}`);
         }
       }
       if (rulesRes.ok) {

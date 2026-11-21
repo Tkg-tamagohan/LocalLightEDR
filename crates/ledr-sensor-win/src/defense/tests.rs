@@ -973,7 +973,7 @@ fn sens_p2_rundown_01_zombie_process_liveness_and_terminate_accept_exited_rundow
     let root_ident = ProcessIdentity::new(root_pid, root_ct);
 
     // Wait briefly (bounded) for `cmd.exe` to spawn its `findstr.exe` child before suspending.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         let has_child = snapshot_process_entries()
             .unwrap_or_default()
@@ -993,6 +993,10 @@ fn sens_p2_rundown_01_zombie_process_liveness_and_terminate_accept_exited_rundow
         .terminate_process(&root_ident, true)
         .expect("terminate suspended tree");
 
+    assert!(
+        !recorded_kids.is_empty(),
+        "cmd.exe tree root must have at least one recorded suspended descendant before termination"
+    );
     assert_eq!(
         process_liveness(root_pid),
         ProcessLiveness::Gone,

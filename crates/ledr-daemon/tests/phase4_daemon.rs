@@ -2390,6 +2390,13 @@ async fn daemon_p4_16_blocked_motw_io_does_not_stall_pipeline_late_backfill_and_
     );
 
     engine.shutdown_and_flush().await.expect("shutdown engine1");
+    assert!(
+        !defense
+            .added_wfp()
+            .iter()
+            .any(|c| c.exe_path.ends_with("exited_slow.exe")),
+        "already-exited process must still have zero WFP blocks after full pipeline drain"
+    );
 
     // Part 2: Verify `shutdown_and_flush` detaches a permanently wedged raw-OS MOTW worker thread
     // within `shutdown_flush_timeout_ms` without hanging Tokio `Runtime::drop`.
@@ -4725,6 +4732,25 @@ async fn daemon_p4_24_short_lived_process_during_saturated_pending_late_backfill
         .await
         .expect("wait gate1 entered");
 
+    async fn wait_motw_pool_counts(
+        engine: &DaemonEngine,
+        expected: (usize, usize, usize, usize, usize, usize),
+        label: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let actual = engine.motw_pool_queue_counts();
+            if actual == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for MOTW pool state [{label}]: expected={expected:?} actual={actual:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
     assert_eq!(
         engine.seed_processes(seed_events).expect("seed 64 MOTW groups"),
         SEED_COUNT
@@ -4733,6 +4759,7 @@ async fn daemon_p4_24_short_lived_process_during_saturated_pending_late_backfill
     tokio::task::spawn_blocking(move || wait_count_reached(&seed_wait, SEED_COUNT))
         .await
         .expect("wait 64 seeds resolved into motw_result_tx");
+    wait_motw_pool_counts(&engine, (0, 0, 0, 0, 0, 0), "seeds_idle").await;
 
     // 2. Wave 1 (2 slow probes + 46 fills = 48 ProcessStarts + Gate 2 canary):
     //    `slow_probe_0` and `slow_probe_1` exceed the 20 ms sync wait budget while wedged at
@@ -4769,6 +4796,7 @@ async fn daemon_p4_24_short_lived_process_during_saturated_pending_late_backfill
     tokio::task::spawn_blocking(move || wait_count_reached(&fill_wait_48, WAVE1_TOTAL))
         .await
         .expect("wait wave1 48 fill MOTW resolutions");
+    wait_motw_pool_counts(&engine, (45, 0, 0, 0, 0, 0), "wave1_idle").await;
 
     // 3. Wave 2 (2 slow probes + 20 fills = 22 ProcessStarts + Gate 3 canary):
     //    Exactly 1 Tier 1b drain occurs across the 22 events. Releasing `slow_gate_b` fills
@@ -4804,6 +4832,14 @@ async fn daemon_p4_24_short_lived_process_during_saturated_pending_late_backfill
     tokio::task::spawn_blocking(move || wait_count_reached(&fill_wait_70, FILL_TOTAL))
         .await
         .expect("wait wave2 70 total fill MOTW resolutions");
+    // Deterministically confirm `pending_late` 66/66 full, queues empty, `reserved_late_slots == 0`,
+    // and `busy_workers == 0` BEFORE releasing Gate 3 so Wave 3 defers solely via `has_late_slot == false`.
+    wait_motw_pool_counts(&engine, (66, 0, 0, 0, 0, 0), "wave2_saturated_idle").await;
+    assert_eq!(
+        engine.motw_pool_queue_counts(),
+        (66, 0, 0, 0, 0, 0),
+        "precondition failed: pending_late must be 66/66 full with queues empty and workers idle"
+    );
 
     // 4. Wave 3: While `pending_late` is 66/66 full and `process_queue` is empty, launch and
     //    immediately stop two short-lived processes (`preexisting_exited.exe` and
@@ -4886,6 +4922,11 @@ async fn daemon_p4_24_short_lived_process_during_saturated_pending_late_backfill
 
     // Verify full `pending_late` deferred synchronous MOTW wait even with `motw_sync_wait_budget_ms > 0`,
     // and both short-lived processes have already exited in SQLite with `origin_url == None`.
+    assert_eq!(
+        engine.motw_pool_queue_counts(),
+        (66, 4, 0, 0, 0, 0),
+        "all 4 Wave 3 processes must remain queued behind saturated pending_late with idle workers"
+    );
     assert_eq!(
         *short_lived_calls
             .0
@@ -4975,16 +5016,43 @@ async fn daemon_p4_24_short_lived_process_during_saturated_pending_late_backfill
                     .is_some_and(|exp| p.origin_url.as_deref() == Some(exp.as_str()))
             })
             .count();
-        if matched == EXPECTED_TOTAL {
+        let wfp_calls = defense.added_wfp();
+        let active_wfp_applied = wfp_calls
+            .iter()
+            .any(|c| c.exe_path.ends_with("tail_active_1.exe"))
+            && wfp_calls
+                .iter()
+                .any(|c| c.exe_path.ends_with("tail_active_2.exe"))
+            && wfp_calls.iter().any(|c| c.exe_path.ends_with("seed_00.exe"))
+            && wfp_calls.iter().any(|c| c.exe_path.ends_with("fill_00.exe"));
+        let pool_idle = engine.motw_pool_queue_counts() == (0, 0, 0, 0, 0, 0);
+        if matched == EXPECTED_TOTAL && active_wfp_applied && pool_idle {
             break;
         }
         assert!(
             Instant::now() < persist_deadline,
-            "timed out waiting for all {EXPECTED_TOTAL} MOTW origin_urls (matched={matched})"
+            "timed out waiting for all {EXPECTED_TOTAL} MOTW origin_urls, active WFP blocks, and idle pool (matched={matched}, active_wfp_applied={active_wfp_applied}, pool={:?})",
+            engine.motw_pool_queue_counts()
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
+    assert_eq!(engine.high_priority_dropped(), 0);
+
+    let shutdown_t0 = Instant::now();
+    engine
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown_and_flush must complete cleanly within budget");
+    assert!(
+        shutdown_t0.elapsed() < Duration::from_secs(3),
+        "shutdown_and_flush exceeded 3s budget: {:?}",
+        shutdown_t0.elapsed()
+    );
+
+    // Verify all history, COALESCE preservation, and negative/positive WFP invariants AFTER
+    // `shutdown_and_flush` guarantees `motw_result_rx` (including `preexisting_exited.exe`)
+    // has completely drained through `apply_late_motw_attribution`.
     let post_short_snap = store
         .query_flight_recorder(10, Some(&short_lived_ident.instance_id()))
         .expect("query short_lived_tool after drain");
@@ -5029,18 +5097,6 @@ async fn daemon_p4_24_short_lived_process_during_saturated_pending_late_backfill
             && wfp_calls.iter().any(|c| c.exe_path.ends_with("seed_00.exe"))
             && wfp_calls.iter().any(|c| c.exe_path.ends_with("fill_00.exe")),
         "active MOTW processes must still receive L-18 pre-emptive WFP blocks"
-    );
-    assert_eq!(engine.high_priority_dropped(), 0);
-
-    let shutdown_t0 = Instant::now();
-    engine
-        .shutdown_and_flush()
-        .await
-        .expect("shutdown_and_flush must complete cleanly within budget");
-    assert!(
-        shutdown_t0.elapsed() < Duration::from_secs(3),
-        "shutdown_and_flush exceeded 3s budget: {:?}",
-        shutdown_t0.elapsed()
     );
 
     let final_snap = store

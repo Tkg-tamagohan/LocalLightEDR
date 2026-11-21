@@ -1399,3 +1399,321 @@ fn canary_alert_title(category: CanaryCategory, target_path: &str) -> String {
         .unwrap_or(target_path);
     format!("{label}: {name}")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::IpAddr;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use ledr_proto::{ActiveDefenseController, AlertRecord, ProcessIdentity, SensorEvent};
+    use ledr_rules::{BinaryIdentity, EarlyPruner, SigmaEngine};
+    use ledr_store::LedrStore;
+
+    use super::super::motw::{LateMotwAttribution, MotwAttribution, MotwMatchStage};
+    use super::super::{
+        BinaryInspector, DaemonConfig, DaemonEngine, NotificationDispatcher,
+        OutboundEnforcementMode,
+    };
+
+    struct RecordingWfpDefense {
+        next_handle: AtomicU64,
+        added_wfp: Mutex<Vec<String>>,
+    }
+
+    impl RecordingWfpDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(1),
+                added_wfp: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn added_wfp(&self) -> Vec<String> {
+            self.added_wfp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    impl ActiveDefenseController for RecordingWfpDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(&self, exe: &Path, _: Option<IpAddr>, _: bool) -> Result<u64, String> {
+            self.added_wfp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(exe.display().to_string());
+            Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
+        }
+        fn remove_wfp_rule(&self, _: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct NoopNotifier;
+    impl NotificationDispatcher for NoopNotifier {
+        fn notify_alert(&self, _: &AlertRecord) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct EmptyInspector;
+    impl BinaryInspector for EmptyInspector {
+        fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+            BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: None,
+                authenticode: None,
+            }
+        }
+    }
+
+    /// `MOTW-LATE-01`: `apply_late_motw_attribution` must separate SQLite `COALESCE` backfill
+    /// from active-only WFP/outbound-classifier updates across active, exited, pre-populated,
+    /// and `process_table`-evicted instances, including PID-reuse protection on `outbound_classifier`.
+    #[tokio::test]
+    async fn motw_late_01_separates_sqlite_backfill_from_active_defense_across_active_exited_and_evicted(
+    ) {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(RecordingWfpDefense::new());
+        let engine = DaemonEngine::start_with_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                outbound_firewall_enabled: true,
+                outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+                motw_sync_wait_budget_ms: 0,
+                ..DaemonConfig::default()
+            },
+            defense.clone(),
+            Arc::new(NoopNotifier),
+            Arc::new(EmptyInspector),
+        );
+        engine.shutdown_and_flush().await.expect("stop pipeline");
+
+        let base_ft = 134_000_000_000_000_000u64;
+        let base_ms = 1_760_025_000_000i64;
+        let prior_url = "https://prior.example.invalid/orig.exe";
+        let prior_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let late_url = "https://late.example.invalid/new.exe";
+        let late_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let active_unset_id = ProcessIdentity::new(61_001, base_ft + 1);
+        let active_preset_id = ProcessIdentity::new(61_002, base_ft + 2);
+        let exited_unset_id = ProcessIdentity::new(61_003, base_ft + 3);
+        let exited_preset_id = ProcessIdentity::new(61_004, base_ft + 4);
+        let evicted_unset_id = ProcessIdentity::new(61_005, base_ft + 5);
+        let evicted_preset_id = ProcessIdentity::new(61_006, base_ft + 6);
+
+        let specs = [
+            (
+                active_unset_id,
+                r"C:\Late01\active_unset.exe",
+                true,
+                false,
+                None,
+                None,
+            ),
+            (
+                active_preset_id,
+                r"C:\Late01\active_preset.exe",
+                true,
+                false,
+                Some(prior_url),
+                None,
+            ),
+            (
+                exited_unset_id,
+                r"C:\Late01\exited_unset.exe",
+                true,
+                true,
+                None,
+                None,
+            ),
+            (
+                exited_preset_id,
+                r"C:\Late01\exited_preset.exe",
+                true,
+                true,
+                Some(prior_url),
+                None,
+            ),
+            (
+                evicted_unset_id,
+                r"C:\Late01\evicted_unset.exe",
+                false,
+                true,
+                None,
+                None,
+            ),
+            (
+                evicted_preset_id,
+                r"C:\Late01\evicted_preset.exe",
+                false,
+                true,
+                Some(prior_url),
+                Some(prior_sha),
+            ),
+        ];
+
+        for (ident, exe, in_table, exited, init_url, init_sha) in specs {
+            let start_ev = SensorEvent::ProcessStart {
+                identity: ident,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            };
+            store
+                .ingest_event_with_process_metadata(
+                    &start_ev,
+                    None,
+                    exited.then_some(base_ms + 50),
+                    None,
+                    init_url,
+                    init_sha,
+                    false,
+                    "OBSERVED",
+                )
+                .expect("ingest process row");
+            if in_table {
+                let mut table = engine
+                    .process_table
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let res = table.on_process_start(
+                    ident,
+                    4,
+                    exe.to_string(),
+                    exe.to_string(),
+                    None,
+                    base_ms,
+                );
+                if let Some(url) = init_url {
+                    assert!(table.set_motw_metadata(
+                        &res.instance_id,
+                        url.to_string(),
+                        "zone_identifier_ads".to_string(),
+                        None,
+                        None,
+                        Some(3),
+                    ));
+                }
+                if exited {
+                    assert_eq!(
+                        table.on_process_stop(ident.pid, base_ms + 50),
+                        Some(res.instance_id)
+                    );
+                }
+            }
+        }
+        store.flush_batch().expect("flush initial rows");
+
+        // Mark PIDs steady in `outbound_classifier`: active_unset must be cleared, while
+        // active_preset and PID-reused exited/evicted PIDs must remain untouched.
+        for pid in [61_001, 61_002, 61_003, 61_005] {
+            engine.outbound_classifier.mark_steady(pid);
+        }
+
+        engine.apply_late_motw_attribution(LateMotwAttribution {
+            instance_ids: vec![
+                active_unset_id.instance_id(),
+                active_preset_id.instance_id(),
+                exited_unset_id.instance_id(),
+                exited_preset_id.instance_id(),
+                evicted_unset_id.instance_id(),
+                evicted_preset_id.instance_id(),
+            ],
+            attribution: MotwAttribution {
+                origin_url: late_url.to_string(),
+                referrer_url: None,
+                frame_url: None,
+                sha256: Some(late_sha.to_string()),
+                zone_id: Some(3),
+                stage: MotwMatchStage::DownloadSha256,
+            },
+        });
+
+        let query_row = |ident: ProcessIdentity| {
+            let snap = store
+                .query_flight_recorder(10, Some(&ident.instance_id()))
+                .expect("query process row");
+            assert_eq!(snap.processes.len(), 1);
+            snap.processes.into_iter().next().unwrap()
+        };
+
+        // 1. Active without prior URL -> table + SQLite updated, classifier cleared, WFP added.
+        let r_active_unset = query_row(active_unset_id);
+        assert_eq!(r_active_unset.origin_url.as_deref(), Some(late_url));
+        assert_eq!(r_active_unset.sha256.as_deref(), Some(late_sha));
+        assert!(!engine.outbound_classifier.is_steady_pid(61_001));
+
+        // 2. Active with prior URL -> skipped (non-overwrite, classifier/WFP untouched).
+        let r_active_preset = query_row(active_preset_id);
+        assert_eq!(r_active_preset.origin_url.as_deref(), Some(prior_url));
+        assert_eq!(r_active_preset.sha256, None);
+        assert!(engine.outbound_classifier.is_steady_pid(61_002));
+
+        // 3. Exited without prior URL -> SQLite backfilled, table unchanged, classifier/WFP untouched.
+        let r_exited_unset = query_row(exited_unset_id);
+        assert_eq!(r_exited_unset.origin_url.as_deref(), Some(late_url));
+        assert_eq!(r_exited_unset.sha256.as_deref(), Some(late_sha));
+        assert!(r_exited_unset.exited_at_ms.is_some());
+        assert!(engine.outbound_classifier.is_steady_pid(61_003));
+        {
+            let table = engine
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                table
+                    .get_by_instance_id(&active_unset_id.instance_id())
+                    .and_then(|e| e.origin_url.as_deref()),
+                Some(late_url)
+            );
+            assert_eq!(
+                table
+                    .get_by_instance_id(&exited_unset_id.instance_id())
+                    .and_then(|e| e.origin_url.as_deref()),
+                None,
+                "exited process_table entry must remain immutable in memory"
+            );
+            assert!(table
+                .get_by_instance_id(&evicted_unset_id.instance_id())
+                .is_none());
+        }
+
+        // 4. Exited with prior URL -> skipped.
+        let r_exited_preset = query_row(exited_preset_id);
+        assert_eq!(r_exited_preset.origin_url.as_deref(), Some(prior_url));
+        assert_eq!(r_exited_preset.sha256, None);
+
+        // 5. Evicted from process_table without prior URL -> SQLite backfilled, classifier/WFP untouched.
+        let r_evicted_unset = query_row(evicted_unset_id);
+        assert_eq!(r_evicted_unset.origin_url.as_deref(), Some(late_url));
+        assert_eq!(r_evicted_unset.sha256.as_deref(), Some(late_sha));
+        assert!(r_evicted_unset.exited_at_ms.is_some());
+        assert!(engine.outbound_classifier.is_steady_pid(61_005));
+
+        // 6. Evicted from process_table with prior URL/SHA -> COALESCE preserves both.
+        let r_evicted_preset = query_row(evicted_preset_id);
+        assert_eq!(r_evicted_preset.origin_url.as_deref(), Some(prior_url));
+        assert_eq!(r_evicted_preset.sha256.as_deref(), Some(prior_sha));
+
+        // Only `active_unset.exe` must receive an L-18 pre-emptive WFP block.
+        let wfp = defense.added_wfp();
+        assert_eq!(wfp.len(), 1, "unexpected WFP calls: {wfp:?}");
+        assert!(wfp[0].ends_with("active_unset.exe"));
+    }
+}

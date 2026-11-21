@@ -1104,6 +1104,22 @@ impl MotwIoWorkerPool {
         SubmitDownloadIoOutcome::Await(rx)
     }
 
+    pub(super) fn queue_counts(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let state = self
+            .queue_pair
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (
+            state.pending_late.len(),
+            state.process_queue.len(),
+            state.download_queue.len(),
+            state.reserved_late_slots,
+            self.busy_workers.load(Ordering::Acquire),
+            state.seed_backlog.len(),
+        )
+    }
+
     pub(super) fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
         if let Ok(guard) = self.active_cancels.lock() {
@@ -1536,6 +1552,13 @@ impl DaemonEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .hits()
+    }
+
+    /// Returns a diagnostic snapshot of the `MotwIoWorkerPool` queue depths and worker occupancy:
+    /// `(pending_late, process_queue, download_queue, reserved_late_slots, busy_workers, seed_backlog)`.
+    #[doc(hidden)]
+    pub fn motw_pool_queue_counts(&self) -> (usize, usize, usize, usize, usize, usize) {
+        self.motw_pool.queue_counts()
     }
 
     /// Synchronously records a completed browser download's origin metadata (`ReportDownloadOrigin`),

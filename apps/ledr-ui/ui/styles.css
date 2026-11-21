@@ -1081,6 +1081,33 @@ body {
   cursor: help;
 }
 
+.badge-motw {
+  background: rgba(20, 184, 166, 0.16);
+  border-color: rgba(20, 184, 166, 0.4);
+  color: #5eead4;
+}
+
+.badge-browser {
+  background: rgba(168, 85, 247, 0.16);
+  border-color: rgba(168, 85, 247, 0.4);
+  color: #d8b4fe;
+}
+
+.browser-detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.browser-detail-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+}
+
 .inspector-card {
   padding: 10px 12px;
   border-bottom: 1px solid var(--border);

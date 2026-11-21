@@ -1,7 +1,7 @@
 # LocalEDR 申し送り事項と実機検証計画
 
 本書は LocalEDR の各 Phase を `main` ブランチへマージした後に残した副次的な改善余地と、合成自動テストでは検証済みと扱わない実機 E2E 検証の対象を管理する。
-仕様の正は [implementation-plan.md](implementation-plan.md)、[decision-records.md](decision-records.md)（L-01 から L-16）、および凍結済みの [crates/ledr-proto/src/lib.rs](../crates/ledr-proto/src/lib.rs) に置き、本書では後続作業へ引き継ぐ個別項目を ID ごとに記録する。
+仕様の正は [implementation-plan.md](implementation-plan.md)、[decision-records.md](decision-records.md)（L-01 から L-21）、および凍結済みの [crates/ledr-proto/src/lib.rs](../crates/ledr-proto/src/lib.rs) に置き、本書では後続作業へ引き継ぐ個別項目を ID ごとに記録する。
 
 ## 項目一覧
 
@@ -9,6 +9,7 @@
 | :--- | :--- | :--- | :--- | :--- |
 | `FU-P3-01` | 副次最適化 | Phase 3 | `merge_domain_hints_prioritized` の満杯 32 件時に起きる非許可同居ヒントの再挿入抑制 | 次回 `crates/ledr-daemon/src/firewall/` 改修または後続整備 PR |
 | `FU-E2E-01` | 実機 E2E 検証 | Phase 2、Phase 3 | Windows 10 および Windows 11 クライアント SKU 管理者環境での実機検証 | 独立した実機 E2E 検証 PR |
+| `FU-E2E-02` | 実機 E2E 検証 | Phase 4 | Windows 10 および Windows 11 クライアント SKU 上での Chrome 拡張、Native Messaging、MOTW、および UI 終了の実機検証 | PR 4C マージ後の独立した実機 E2E 検証 PR |
 
 ## FU-P3-01 満杯 32 件時の非許可同居ヒント再挿入の抑制
 
@@ -105,3 +106,35 @@ Windows Server SKU で代替検証を行う場合は、クライアント SKU �
 ### 対応予定タイミング
 
 Phase 2 と Phase 3 の実機検証をまとめて扱う独立した別 PR で実施し、確認結果と必要に応じた調整を記録したうえで [implementation-plan.md](implementation-plan.md) の該当する実機 E2E 受け入れ検証項目を `[x]` へ更新して完了とする。
+
+## FU-E2E-02 Windows 10 および Windows 11 クライアント SKU での Phase 4 実機 Chrome E2E 検証
+
+### 対象ファイルと手順書
+
+- 実機検証手順書：[phase4-e2e-runbook.md](phase4-e2e-runbook.md)
+- ローカル検証用 HTML フィクスチャ：[phase4-browser-test.html](fixtures/phase4-browser-test.html)
+- 対象コンポーネント：[crates/ledr-bridge-nm](../crates/ledr-bridge-nm/src/main.rs)、[extensions/ledr-chrome-mv3](../extensions/ledr-chrome-mv3/manifest.json)、[crates/ledr-daemon/src/engine/motw.rs](../crates/ledr-daemon/src/engine/motw.rs)、[apps/ledr-ui/src/defense_status.rs](../apps/ledr-ui/src/defense_status.rs)、および [apps/ledr-ui/ui/app.js](../apps/ledr-ui/ui/app.js)
+
+### 背景と出典
+
+Phase 4 は [decision-records.md](decision-records.md) の `L-17` に従い、PR 4A（PR #25、`cf7e866`）、PR 4B（PR #26、`6bb8bd3`）、および PR 4C（`apps/ledr-ui` View 1〜3 統合、検証用フィクスチャと手順書、文書同期）の 3 本へ分割した。
+実ブラウザ上での Chrome 拡張ロード、実際の Windows レジストリ経由による Native Messaging ホスト起動、実ダウンロードの `:Zone.Identifier` 付与とフォルダ移動後起動の 3 段階紐付け、および WebView2 ウィンドウ閉鎖後の完全終了は、合成ユニットテストでは検証済みとみなさない。
+
+### 現行の保証範囲
+
+#### 確認済み事項
+
+- PR 4A の MOTW 解析（`:Zone.Identifier`）、3 段階紐付け、事前 WFP ブロック、`ReportBrowserEvent`、および `ledr-sim motw-download` の合成テストとワークスペース負荷および TTL 回帰は `main` 上で合格済みである。
+- PR 4B の `ledr-bridge-nm`（ゼロパース中継、`SEC_0003` 検証、`setup`、`status`、`unregister`）と `extensions/ledr-chrome-mv3`（固定拡張 ID `ecelachfiiiiiibpjeomfncgpegbpanh`、ClickFix、NRD とホモグラフ判定、`storage.session` ダウンロード追跡）の Rust および Node テストは `main` 上で合格済みである。
+- PR 4C の `apps/ledr-ui`（`HKCU` と `HKLM` 両プローブ、マニフェスト検証、View 1〜3 の表示と操作制約）は Rust 単体テスト（`UI-P4-01` から `UI-P4-04`）と Node モック DOM テスト（`UI-P4-05` から `UI-P4-08`）で検証対象とする。
+
+#### 未検証の残存範囲
+
+- 実 Windows 10 または 11（x86_64）クライアント SKU での `--scope user` および管理者昇格 `--scope machine` 登録と `ledr-ui` View 3 表示の一致。
+- Chrome の `chrome://extensions` デベロッパーモード読み込み時の固定拡張 ID 一致、ポップアップからの `Ping` 往復、および実ブラウザ内 Shadow DOM 警告描画。
+- `--host-resolver-rules="MAP *.localedr.invalid 127.0.0.1"` 下での ClickFix、Pastejacking、通常コピー非発火、NRD とホモグラフのパスワード警告、および DNR 遮断の実動作。
+- Chrome 実ダウンロード完了後の `:Zone.Identifier` 付与、別フォルダ移動後の実行における 3 段階 MOTW 紐付け（View 1 と View 2 表示）、および `ledr-ui` 閉鎖時の `ledr-ui` と WebView2 プロセス 0 件終了（`L-08`）。
+
+### 対応予定タイミング
+
+PR 4C の `main` マージ後、独立した実機 E2E 検証作業として [phase4-e2e-runbook.md](phase4-e2e-runbook.md) を実施し、合否記録をまとめて [implementation-plan.md](implementation-plan.md) の Phase 4 実機 Chrome E2E 検証項目を `[x]` へ更新する。

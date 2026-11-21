@@ -87,7 +87,9 @@
     triageActionStatus: document.getElementById("triage-action-status"),
     btnTerminateBlock: document.getElementById("btn-terminate-block"),
     optAddBlockRule: document.getElementById("opt-add-block-rule"),
+    terminateConstraintNote: document.getElementById("terminate-constraint-note"),
     btnAllowOnce: document.getElementById("btn-allow-once"),
+    allowOnceConstraintNote: document.getElementById("allow-once-constraint-note"),
     btnAllowPermanent: document.getElementById("btn-allow-permanent"),
     optUseSigner: document.getElementById("opt-use-signer"),
     signerConstraintNote: document.getElementById("signer-constraint-note"),
@@ -261,6 +263,138 @@
       return err.message;
     }
     return String(err ?? "Unknown error");
+  }
+
+  function normalizeWindowsPath(value) {
+    if (typeof value !== "string") return "";
+    let s = value.trim().replaceAll("/", "\\");
+    if (!s) return "";
+    let prefix = "";
+    if (/^\\\\\?\\unc\\/i.test(s)) {
+      s = "\\\\" + s.slice(8);
+    } else if (/^\\\\\?\\[a-z]:\\/i.test(s)) {
+      s = s.slice(4);
+    } else if (/^\\\\\?\\volume\{/i.test(s)) {
+      prefix = "\\\\?\\";
+      s = s.slice(4);
+    }
+    if (!prefix && s.startsWith("\\\\")) {
+      prefix = "\\\\";
+      s = s.replace(/^\\+/, "");
+    }
+    s = s.replace(/\\{2,}/g, "\\");
+    let out = prefix + s;
+    if (out.length > 1 && !/^(?:[a-z]:\\|\\\\)$/i.test(out)) {
+      out = out.replace(/\\+$/, "");
+    }
+    return out.toLowerCase();
+  }
+
+  function formatShortSha256(hex) {
+    if (typeof hex !== "string") return null;
+    const clean = hex.trim().toLowerCase();
+    if (!clean) return null;
+    return clean.length <= 12 ? clean : `${clean.slice(0, 12)}...`;
+  }
+
+  function formatMotwSourceLabel(source) {
+    if (typeof source !== "string") return null;
+    const clean = source.trim();
+    if (!clean) return null;
+    if (clean === "download_path") return "Path";
+    if (clean === "download_sha256") return "SHA-256";
+    if (clean === "zone_identifier_ads") return "Zone.Identifier";
+    return clean;
+  }
+
+  function formatMotwZoneLabel(zoneId) {
+    if (!Number.isInteger(zoneId) || zoneId < 0) return null;
+    if (zoneId === 0) return "Zone 0 (Local Machine)";
+    if (zoneId === 1) return "Zone 1 (Local Intranet)";
+    if (zoneId === 2) return "Zone 2 (Trusted Sites)";
+    if (zoneId === 3) return "Zone 3 (Internet)";
+    if (zoneId === 4) return "Zone 4 (Restricted Sites)";
+    return `Zone ${zoneId}`;
+  }
+
+  function matchDownloadOriginsForProcess(proc, downloadOrigins) {
+    if (!proc || !Array.isArray(downloadOrigins) || downloadOrigins.length === 0) {
+      return [];
+    }
+    const procSha =
+      typeof proc.sha256 === "string" ? proc.sha256.trim().toLowerCase() : "";
+    const procPath = normalizeWindowsPath(proc.exe_path);
+    const procOrigin =
+      typeof proc.origin_url === "string" ? proc.origin_url.trim() : "";
+
+    const primaryMatches = downloadOrigins.filter((d) => {
+      if (!d) return false;
+      const dSha = typeof d.sha256 === "string" ? d.sha256.trim().toLowerCase() : "";
+      if (procSha && dSha && procSha === dSha) return true;
+      const dPath = normalizeWindowsPath(d.file_path);
+      if (procPath && dPath && procPath === dPath) return true;
+      return false;
+    });
+    if (primaryMatches.length > 0) {
+      return primaryMatches;
+    }
+    if (!procOrigin) {
+      return [];
+    }
+    return downloadOrigins.filter((d) => {
+      if (!d) return false;
+      const dTab = typeof d.tab_url === "string" ? d.tab_url.trim() : "";
+      if (!dTab || dTab !== procOrigin) return false;
+      const dSha = typeof d.sha256 === "string" ? d.sha256.trim().toLowerCase() : "";
+      if (procSha && dSha && procSha !== dSha) return false;
+      return true;
+    });
+  }
+
+  function getBrowserAlertResolutionPolicy(alert, details) {
+    const isBrowser = Boolean(
+      details?.isBrowserAlert ?? alert?.source_layer === "LAYER_4_BROWSER",
+    );
+    const hasProc = Boolean(details?.processInstanceId ?? alert?.process_instance_id);
+    const isProcesslessBrowser = isBrowser && !hasProc;
+    if (isProcesslessBrowser) {
+      return {
+        isProcesslessBrowser: true,
+        allowOnceLabel: "Acknowledge",
+        allowOnceConstraint: "Resolves browser alert",
+        terminateDisabled: true,
+        terminateConstraint: "No local process attached",
+        addBlockRuleDisabled: true,
+        allowPermanentDisabled: true,
+        allowPermanentConstraint: "No local process attached",
+      };
+    }
+    return {
+      isProcesslessBrowser: false,
+      allowOnceLabel: "Allow Once",
+      allowOnceConstraint: "Resumes process without rule",
+      terminateDisabled: false,
+      terminateConstraint: "Terminates process tree and applies dynamic WFP block",
+      addBlockRuleDisabled: false,
+      allowPermanentDisabled: false,
+      allowPermanentConstraint: "",
+    };
+  }
+
+  function computeBrowserShieldStats(alerts, snapshot) {
+    const list = Array.isArray(alerts) ? alerts : [];
+    const browserAlerts = list.filter((a) => a && a.source_layer === "LAYER_4_BROWSER");
+    const browserAlertsUnresolved = browserAlerts.filter((a) =>
+      isUnresolvedAlert(a),
+    ).length;
+    const trackedDownloadsCount = Array.isArray(snapshot?.download_origins)
+      ? snapshot.download_origins.length
+      : 0;
+    return {
+      browserAlertsTotal: browserAlerts.length,
+      browserAlertsUnresolved,
+      trackedDownloadsCount,
+    };
   }
 
   function buildSampleData() {
@@ -493,6 +627,11 @@
           sha256: stealerSha,
           signer_subject: null,
           root_thumbprint: null,
+          origin_url: "https://cdn-drop.nrd-sample.invalid/tools/cred-audit.zip",
+          motw_source: "download_sha256",
+          motw_zone_id: 3,
+          motw_referrer: "https://search-portal.invalid/",
+          motw_frame_url: "https://cdn-drop.nrd-sample.invalid/embed/dl",
         }),
         resolved_at_ms: null,
       },
@@ -553,6 +692,29 @@
           sha256: stealerSha,
           signer_subject: null,
           root_thumbprint: null,
+          origin_url: "https://cdn-drop.nrd-sample.invalid/tools/cred-audit.zip",
+          motw_source: "download_sha256",
+          motw_zone_id: 3,
+          motw_referrer: "https://search-portal.invalid/",
+          motw_frame_url: "https://cdn-drop.nrd-sample.invalid/embed/dl",
+        }),
+        resolved_at_ms: null,
+      },
+      {
+        alert_id: "sample-browser-004",
+        timestamp_ms: now - 8_000,
+        severity: "High",
+        source_layer: "LAYER_4_BROWSER",
+        rule_id: "BROWSER-ClickFixPastejacking",
+        title: "Browser ClickFix / Pastejacking Detected",
+        process_instance_id: null,
+        process_suspended: false,
+        status: "Pending",
+        context_json: JSON.stringify({
+          event_type: "ClickFixPastejacking",
+          url: "https://verify-human.localedr.invalid/captcha",
+          details: "Clipboard writeText matched LOTL pattern (powershell -EncodedCommand)",
+          details_truncated: false,
         }),
         resolved_at_ms: null,
       },
@@ -677,6 +839,45 @@
         bridge_binary_present: true,
         native_host_registered: true,
         uri_scheme_registered: true,
+        native_host_scope: "HKCU",
+        registered_browsers: ["Chrome", "Edge"],
+        manifest_path:
+          "C:\\Users\\user\\AppData\\Local\\LocalEDR\\native-messaging\\com.localedr.bridge.user.chrome.json",
+        manifest_valid: true,
+        manifest_error: null,
+        uri_scheme_scope: "HKCU",
+        expected_extension_id: "ecelachfiiiiiibpjeomfncgpegbpanh",
+        browsers: [
+          {
+            browser: "Chrome",
+            effective_scope: "HKCU",
+            hkcu_registered: true,
+            hklm_registered: false,
+            manifest_path:
+              "C:\\Users\\user\\AppData\\Local\\LocalEDR\\native-messaging\\com.localedr.bridge.user.chrome.json",
+            manifest_valid: true,
+            manifest_error: null,
+          },
+          {
+            browser: "Edge",
+            effective_scope: "HKCU",
+            hkcu_registered: true,
+            hklm_registered: false,
+            manifest_path:
+              "C:\\Users\\user\\AppData\\Local\\LocalEDR\\native-messaging\\com.localedr.bridge.user.edge.json",
+            manifest_valid: true,
+            manifest_error: null,
+          },
+          {
+            browser: "Brave",
+            effective_scope: null,
+            hkcu_registered: false,
+            hklm_registered: false,
+            manifest_path: null,
+            manifest_valid: false,
+            manifest_error: null,
+          },
+        ],
       },
     };
 
@@ -815,6 +1016,11 @@
     );
 
     const netEvt = ctx.event?.NetworkConnect || null;
+    const isBrowserAlert = alert.source_layer === "LAYER_4_BROWSER";
+    const browserEventType = typeof ctx.event_type === "string" ? ctx.event_type : null;
+    const browserUrl = typeof ctx.url === "string" ? ctx.url : null;
+    const browserDetails = typeof ctx.details === "string" ? ctx.details : null;
+    const browserDetailsTruncated = Boolean(ctx.details_truncated);
     const isNetworkAlert =
       alert.source_layer === "LAYER_3_NETWORK" || Boolean(netEvt) || Boolean(ctx.dst_ip);
     const dstIp = ctx.dst_ip || netEvt?.dst_ip || null;
@@ -902,14 +1108,17 @@
       ctx.parent_command_line || parentProc?.command_line || null;
 
     const originUrl = ctx.origin_url || proc?.origin_url || null;
-    const exeLower = exePath ? exePath.toLowerCase() : null;
-    const shaLower = sha256 ? sha256.toLowerCase() : null;
-    const downloadOrigins = (state.snapshot.download_origins || []).filter((d) => {
-      if (shaLower && d.sha256 && d.sha256.toLowerCase() === shaLower) return true;
-      if (exeLower && d.file_path && d.file_path.toLowerCase() === exeLower) return true;
-      if (originUrl && d.tab_url === originUrl) return true;
-      return false;
-    });
+    const motwSource = typeof ctx.motw_source === "string" ? ctx.motw_source : null;
+    const motwReferrer = typeof ctx.motw_referrer === "string" ? ctx.motw_referrer : null;
+    const motwFrameUrl = typeof ctx.motw_frame_url === "string" ? ctx.motw_frame_url : null;
+    const motwZoneId =
+      Number.isInteger(ctx.motw_zone_id) && ctx.motw_zone_id >= 0
+        ? ctx.motw_zone_id
+        : null;
+    const downloadOrigins = matchDownloadOriginsForProcess(
+      { exe_path: exePath, sha256, origin_url: originUrl },
+      state.snapshot.download_origins,
+    );
 
     const dnsQueries = [
       ...(Array.isArray(ctx.recent_dns) ? ctx.recent_dns : []),
@@ -926,6 +1135,11 @@
     ];
 
     return {
+      isBrowserAlert,
+      browserEventType,
+      browserUrl,
+      browserDetails,
+      browserDetailsTruncated,
       isNetworkAlert,
       dstIp,
       dstPort,
@@ -957,6 +1171,10 @@
       parentExePath,
       parentCommandLine,
       originUrl,
+      motwSource,
+      motwReferrer,
+      motwFrameUrl,
+      motwZoneId,
       downloadOrigins,
       dnsQueries,
       networkEvents,
@@ -1145,6 +1363,11 @@
             d.targetPath || "",
             d.exePath || "",
             d.category || "",
+            d.browserUrl || "",
+            d.browserEventType || "",
+            d.browserDetails || "",
+            d.originUrl || "",
+            d.motwReferrer || "",
           ].some((v) => String(v).toLowerCase().includes(query));
         })
       : baseList;
@@ -1324,11 +1547,13 @@
         }
       } else {
         subline =
-          details.attribution === "app_level_ambiguous"
-            ? "Dynamic WFP block active (multi-instance PID ambiguous — no process suspended)"
-            : details.wfpBlocked
-              ? "Dynamic WFP outbound block active — awaiting decision"
-              : "Active alert — process not suspended";
+          details.isBrowserAlert && !details.processInstanceId
+            ? "Browser shield event — no local process attached"
+            : details.attribution === "app_level_ambiguous"
+              ? "Dynamic WFP block active (multi-instance PID ambiguous — no process suspended)"
+              : details.wfpBlocked
+                ? "Dynamic WFP outbound block active — awaiting decision"
+                : "Active alert — process not suspended";
       }
     } else if (alert.status === "TerminatedBlocked") {
       bannerClass += " is-terminated";
@@ -1413,6 +1638,26 @@
       return;
     }
 
+    if (details.isBrowserAlert) {
+      const eventBadge = `<span class="badge badge-browser">${escapeHtml(
+        details.browserEventType || details.category || "BrowserEvent",
+      )}</span>`;
+      const truncBadge = details.browserDetailsTruncated
+        ? ` <span class="badge badge-unsigned">Truncated</span>`
+        : "";
+      el.triageDetectionDl.innerHTML = `
+        <dt>Event Type</dt>
+        <dd>${eventBadge}</dd>
+        <dt>Target URL</dt>
+        <dd class="mono-wrap">${escapeHtml(details.browserUrl || details.targetPath || "-")}</dd>
+        <dt>Details</dt>
+        <dd class="mono-wrap">${escapeHtml(details.browserDetails || "-")}${truncBadge}</dd>
+        <dt>Rule ID</dt>
+        <dd class="mono-wrap">${escapeHtml(alert.rule_id)}</dd>
+      `;
+      return;
+    }
+
     const opBadge =
       details.isWriteOrDelete === true
         ? `<span class="badge badge-nrd">Write / Delete</span>`
@@ -1436,6 +1681,20 @@
   }
 
   function renderLineageCard(alert, details, byId) {
+    if (details.isBrowserAlert && !details.processInstanceId) {
+      el.inspectInView2Btn.classList.add("hidden");
+      el.inspectInView2Btn.dataset.procId = "";
+      el.triageLineageDl.innerHTML = `
+        <dt>Source Layer</dt>
+        <dd><span class="badge badge-browser">${escapeHtml(alert.source_layer)}</span></dd>
+        <dt>Process</dt>
+        <dd class="mono-wrap">None (browser extension event)</dd>
+        <dt>Origin URL</dt>
+        <dd class="mono-wrap">${escapeHtml(details.browserUrl || "-")}</dd>
+      `;
+      return;
+    }
+
     const hasProcInTree = Boolean(
       details.processInstanceId && byId.has(details.processInstanceId),
     );
@@ -1479,39 +1738,90 @@
 
   function renderMotwCard(details) {
     const origins = details.downloadOrigins || [];
-    if (!details.originUrl && origins.length === 0) {
+    const sourceLabel = formatMotwSourceLabel(details.motwSource);
+    const zoneLabel = formatMotwZoneLabel(details.motwZoneId);
+    const hasSummary = Boolean(
+      sourceLabel ||
+        zoneLabel ||
+        details.originUrl ||
+        details.motwReferrer ||
+        details.motwFrameUrl,
+    );
+
+    if (!hasSummary && origins.length === 0) {
       el.triageMotwBody.innerHTML = `<span class="panel-meta">None recorded</span>`;
       return;
     }
 
     const items = [];
-    if (details.originUrl && origins.length === 0) {
-      items.push(`
-        <dl class="kv-list">
-          <dt>Origin URL</dt>
-          <dd class="mono-wrap">${escapeHtml(details.originUrl)}</dd>
-        </dl>
-      `);
+    if (hasSummary) {
+      const summaryRows = [];
+      if (sourceLabel) {
+        summaryRows.push(
+          `<dt>Source</dt><dd><span class="badge badge-motw">${escapeHtml(sourceLabel)}</span></dd>`,
+        );
+      }
+      if (zoneLabel) {
+        summaryRows.push(
+          `<dt>Zone</dt><dd><span class="badge badge-metric">${escapeHtml(zoneLabel)}</span></dd>`,
+        );
+      }
+      if (details.originUrl) {
+        summaryRows.push(
+          `<dt>Origin URL</dt><dd class="mono-wrap">${escapeHtml(details.originUrl)}</dd>`,
+        );
+      }
+      if (details.motwReferrer) {
+        summaryRows.push(
+          `<dt>Referrer</dt><dd class="mono-wrap">${escapeHtml(details.motwReferrer)}</dd>`,
+        );
+      }
+      if (details.motwFrameUrl) {
+        summaryRows.push(
+          `<dt>Frame URL</dt><dd class="mono-wrap">${escapeHtml(details.motwFrameUrl)}</dd>`,
+        );
+      }
+      items.push(`<dl class="kv-list">${summaryRows.join("")}</dl>`);
     }
+
     for (const d of origins) {
-      items.push(`
-        <dl class="kv-list">
-          <dt>Tab URL</dt>
-          <dd class="mono-wrap">${escapeHtml(d.tab_url)}</dd>
-          ${
-            d.referrer_url
-              ? `<dt>Referrer</dt><dd class="mono-wrap">${escapeHtml(d.referrer_url)}</dd>`
-              : ""
-          }
-          ${
-            d.frame_url
-              ? `<dt>Frame URL</dt><dd class="mono-wrap">${escapeHtml(d.frame_url)}</dd>`
-              : ""
-          }
-          <dt>Downloaded</dt>
-          <dd class="mono">${escapeHtml(formatTime(d.downloaded_at_ms))}</dd>
-        </dl>
-      `);
+      const dlRows = [];
+      const showTabUrl =
+        d.tab_url && (origins.length > 1 || d.tab_url !== details.originUrl);
+      const showReferrer =
+        d.referrer_url &&
+        (origins.length > 1 || d.referrer_url !== details.motwReferrer);
+      const showFrameUrl =
+        d.frame_url && (origins.length > 1 || d.frame_url !== details.motwFrameUrl);
+
+      if (showTabUrl) {
+        dlRows.push(`<dt>Tab URL</dt><dd class="mono-wrap">${escapeHtml(d.tab_url)}</dd>`);
+      }
+      if (showReferrer) {
+        dlRows.push(
+          `<dt>Referrer</dt><dd class="mono-wrap">${escapeHtml(d.referrer_url)}</dd>`,
+        );
+      }
+      if (showFrameUrl) {
+        dlRows.push(
+          `<dt>Frame URL</dt><dd class="mono-wrap">${escapeHtml(d.frame_url)}</dd>`,
+        );
+      }
+      if (d.file_path) {
+        dlRows.push(
+          `<dt>File Path</dt><dd class="mono-wrap">${escapeHtml(d.file_path)}</dd>`,
+        );
+      }
+      const shortSha = formatShortSha256(d.sha256);
+      if (shortSha) {
+        dlRows.push(
+          `<dt>SHA-256</dt><dd class="mono-wrap" title="${escapeHtml(d.sha256)}">${escapeHtml(shortSha)}</dd>`,
+        );
+      }
+      dlRows.push(
+        `<dt>Downloaded</dt><dd class="mono">${escapeHtml(formatTime(d.downloaded_at_ms))}</dd>`,
+      );
+      items.push(`<dl class="kv-list">${dlRows.join("")}</dl>`);
     }
     el.triageMotwBody.innerHTML = items.join("");
   }
@@ -1656,6 +1966,7 @@
   function syncResolutionControls(alert, details) {
     const unresolved = isUnresolvedAlert(alert);
     const hasSigner = Boolean(details.signerSubject);
+    const policy = getBrowserAlertResolutionPolicy(alert, details);
     state.selectedAlertIsNetwork = Boolean(details.isNetworkAlert);
 
     if (state.lastSyncedAlertId !== alert.alert_id) {
@@ -1669,8 +1980,8 @@
       ) {
         state.triageFeedback = null;
       }
-      el.optAddBlockRule.checked = true;
-      el.optUseSigner.checked = hasSigner;
+      el.optAddBlockRule.checked = !policy.addBlockRuleDisabled;
+      el.optUseSigner.checked = !policy.allowPermanentDisabled && hasSigner;
       el.optAllowDest.value = "";
     }
     if (
@@ -1679,6 +1990,29 @@
       state.triageValidationFeedback.alertId === alert.alert_id
     ) {
       state.triageValidationFeedback = null;
+    }
+
+    el.btnAllowOnce.textContent = policy.allowOnceLabel;
+    if (el.allowOnceConstraintNote) {
+      el.allowOnceConstraintNote.textContent = policy.allowOnceConstraint;
+    }
+    if (el.terminateConstraintNote) {
+      el.terminateConstraintNote.textContent = policy.terminateConstraint;
+    }
+
+    if (policy.isProcesslessBrowser) {
+      el.optAddBlockRule.checked = false;
+      el.optAddBlockRule.disabled = true;
+      el.btnTerminateBlock.disabled = true;
+      el.optUseSigner.checked = false;
+      el.optUseSigner.disabled = true;
+      el.optAllowDest.disabled = true;
+      el.btnAllowPermanent.disabled = true;
+      el.signerConstraintNote.textContent = policy.allowPermanentConstraint;
+      el.targetScopeNote.classList.add("hidden");
+      el.btnAllowOnce.disabled = !unresolved || state.isResolvingAlert;
+      renderDetailTriageFeedback(alert.alert_id);
+      return;
     }
 
     el.optUseSigner.disabled = !unresolved || !hasSigner || state.isResolvingAlert;
@@ -1713,6 +2047,11 @@
     if (!alert || !isUnresolvedAlert(alert) || state.isResolvingAlert) {
       return;
     }
+    const details = extractAlertDetails(alert, buildHierarchy(state.snapshot).byId);
+    const policy = getBrowserAlertResolutionPolicy(alert, details);
+    if (policy.isProcesslessBrowser && kind !== "allow_once") {
+      return;
+    }
 
     let decision;
     let previewStatus;
@@ -1728,7 +2067,6 @@
       decision = "AllowOnce";
       previewStatus = "ApprovedOnce";
     } else {
-      const details = extractAlertDetails(alert, buildHierarchy(state.snapshot).byId);
       const allowDestRaw = el.optAllowDest.value.trim();
       if (details.isNetworkAlert && allowDestRaw.includes("/") && !isLiteralIpOrCidr(allowDestRaw)) {
         setTransientTriageFeedback(
@@ -1759,7 +2097,9 @@
                 ? "NetworkBlock rule saved & WFP dynamic block active"
                 : "no NetworkBlock rule saved"
             }`
-          : `Preview: ${alert.alert_id} → ${previewStatus}`;
+          : `Preview: ${alert.alert_id} → ${previewStatus}${
+              policy.isProcesslessBrowser ? " (acknowledged)" : ""
+            }`;
       setAlertTriageFeedback(alert.alert_id, true, previewMessage);
       renderTriageView();
       return;
@@ -1806,6 +2146,7 @@
       proc.command_line || "",
       proc.signer_subject || "",
       proc.process_instance_id,
+      proc.origin_url || "",
     ];
     return fields.some((f) => f.toLowerCase().includes(query));
   }
@@ -1868,6 +2209,12 @@
       if (node.canary_count > 0) {
         badges.push(`<span class="badge badge-nrd">CANARY ${node.canary_count}</span>`);
       }
+      const hasMotw =
+        Boolean(p.origin_url) ||
+        matchDownloadOriginsForProcess(p, state.snapshot.download_origins).length > 0;
+      if (hasMotw) {
+        badges.push(`<span class="badge badge-motw">MOTW</span>`);
+      }
 
       const subline = p.command_line || p.exe_path;
       const toggleChar = hasChildren ? (isCollapsed ? "▶" : "▼") : "•";
@@ -1924,6 +2271,17 @@
     const signer = p.is_trusted_os
       ? `${p.signer_subject || "Windows"} (Trusted OS)`
       : p.signer_subject || "Unsigned";
+    const matchedDownloads = matchDownloadOriginsForProcess(
+      p,
+      state.snapshot.download_origins,
+    );
+    const primaryDl = matchedDownloads[0] || null;
+    const effectiveOrigin = p.origin_url || primaryDl?.tab_url || null;
+    const effectiveReferrer = primaryDl?.referrer_url || null;
+    const effectiveFrameUrl = primaryDl?.frame_url || null;
+    const effectiveSha = p.sha256 || primaryDl?.sha256 || null;
+    const shortSha = formatShortSha256(effectiveSha);
+
     el.scopeIndicator.textContent = `Scope: ${baseName(p.exe_path)} (${p.process_instance_id})`;
     el.processInspector.innerHTML = `
       <div class="inspector-grid">
@@ -1948,10 +2306,34 @@
           <div class="inspector-val">${escapeHtml(p.command_line || "-")}</div>
         </div>
         ${
-          p.origin_url
+          shortSha
+            ? `<div class="inspector-item">
+                 <div class="inspector-label">SHA-256</div>
+                 <div class="inspector-val" title="${escapeHtml(effectiveSha)}">${escapeHtml(shortSha)}</div>
+               </div>`
+            : ""
+        }
+        ${
+          effectiveOrigin
             ? `<div class="inspector-item span-full">
                  <div class="inspector-label">Origin URL (MOTW)</div>
-                 <div class="inspector-val">${escapeHtml(p.origin_url)}</div>
+                 <div class="inspector-val">${escapeHtml(effectiveOrigin)}</div>
+               </div>`
+            : ""
+        }
+        ${
+          effectiveReferrer
+            ? `<div class="inspector-item span-full">
+                 <div class="inspector-label">Referrer URL</div>
+                 <div class="inspector-val">${escapeHtml(effectiveReferrer)}</div>
+               </div>`
+            : ""
+        }
+        ${
+          effectiveFrameUrl
+            ? `<div class="inspector-item span-full">
+                 <div class="inspector-label">Frame URL</div>
+                 <div class="inspector-val">${escapeHtml(effectiveFrameUrl)}</div>
                </div>`
             : ""
         }
@@ -1966,7 +2348,10 @@
     const dns = (state.snapshot.dns_queries || []).filter(filterProc);
     const net = (state.snapshot.network_events || []).filter(filterProc);
     const canary = (state.snapshot.file_canary_events || []).filter(filterProc);
-    const downloads = scopeId ? [] : state.snapshot.download_origins || [];
+    const scopedProc = scopeId ? byId.get(scopeId) || null : null;
+    const downloads = scopeId
+      ? matchDownloadOriginsForProcess(scopedProc, state.snapshot.download_origins)
+      : state.snapshot.download_origins || [];
 
     el.countDns.textContent = String(dns.length);
     el.countNetwork.textContent = String(net.length);
@@ -2040,15 +2425,25 @@
         });
       }
       for (const d of downloads) {
+        const shortSha = formatShortSha256(d.sha256);
+        const detailParts = [escapeHtml(d.tab_url)];
+        if (d.referrer_url) {
+          detailParts.push(`ref: ${escapeHtml(d.referrer_url)}`);
+        }
+        if (shortSha) {
+          detailParts.push(
+            `<span title="${escapeHtml(d.sha256)}">sha256: ${escapeHtml(shortSha)}</span>`,
+          );
+        }
         rows.push({
           ts: d.downloaded_at_ms,
           html: `
             <tr>
               <td class="mono">${escapeHtml(formatTime(d.downloaded_at_ms))}</td>
-              <td><span class="badge badge-unsigned">MOTW</span></td>
+              <td><span class="badge badge-motw">MOTW</span></td>
               <td class="mono">Browser Download</td>
               <td class="mono">${escapeHtml(d.file_path)}</td>
-              <td class="mono">${escapeHtml(d.tab_url)}</td>
+              <td class="mono">${detailParts.join(" | ")}</td>
               <td><span class="badge badge-orphan">ORIGIN</span></td>
             </tr>
           `,
@@ -2276,10 +2671,67 @@
 
     // Right column 2: Browser Shield & Domain Risk Check
     const shield = localStatus?.browser_shield || null;
+    const shieldStats = computeBrowserShieldStats(state.alerts, state.snapshot);
     const statusPill = (ok, yesText, noText) =>
       ok
         ? `<span class="badge badge-action-allow">${escapeHtml(yesText)}</span>`
         : `<span class="badge badge-unsigned">${escapeHtml(noText)}</span>`;
+
+    const nativeHostHtml = (() => {
+      if (!shield) return `<span class="panel-meta">Unknown</span>`;
+      if (!shield.native_host_registered) {
+        return statusPill(false, "Registered", "Not Registered");
+      }
+      const scopeLabel = shield.native_host_scope || "HKCU";
+      const browserBadges = (shield.registered_browsers || [])
+        .map((b) => `<span class="badge badge-metric">${escapeHtml(b)}</span>`)
+        .join(" ");
+      return `${statusPill(true, `Registered (${scopeLabel})`, "Not Registered")} ${browserBadges}`;
+    })();
+
+    const manifestHtml = (() => {
+      if (!shield) return `<span class="panel-meta">Unknown</span>`;
+      if (!shield.native_host_registered) {
+        return `<span class="badge badge-orphan">Not Registered</span>`;
+      }
+      const badge = shield.manifest_valid
+        ? `<span class="badge badge-action-allow">Valid</span>`
+        : `<span class="badge badge-action-block">Invalid</span>`;
+      const pathHtml = shield.manifest_path
+        ? ` <span class="mono-wrap">${escapeHtml(shield.manifest_path)}</span>`
+        : "";
+      const errHtml =
+        !shield.manifest_valid && shield.manifest_error
+          ? `<div class="mono-wrap">${escapeHtml(shield.manifest_error)}</div>`
+          : "";
+      const registeredDetails = (shield.browsers || []).filter(
+        (b) => b.hkcu_registered || b.hklm_registered,
+      );
+      const detailRows =
+        registeredDetails.length > 0
+          ? `<div class="browser-detail-list">${registeredDetails
+              .map((b) => {
+                const bBadge = b.manifest_valid
+                  ? `<span class="badge badge-action-allow">${escapeHtml(b.effective_scope || "")} Valid</span>`
+                  : `<span class="badge badge-action-block">${escapeHtml(b.effective_scope || "")} Invalid</span>`;
+                const bErr =
+                  !b.manifest_valid && b.manifest_error
+                    ? ` <span class="mono-wrap">${escapeHtml(b.manifest_error)}</span>`
+                    : b.manifest_path
+                      ? ` <span class="mono-wrap">${escapeHtml(b.manifest_path)}</span>`
+                      : "";
+                return `<div class="browser-detail-row"><span class="badge badge-metric">${escapeHtml(
+                  b.browser,
+                )}</span> ${bBadge}${bErr}</div>`;
+              })
+              .join("")}</div>`
+          : "";
+      return `${badge}${pathHtml}${errHtml}${detailRows}`;
+    })();
+
+    const uriScopeLabel = shield?.uri_scheme_scope || "HKCU";
+    const expectedExtId =
+      shield?.expected_extension_id || "ecelachfiiiiiibpjeomfncgpegbpanh";
 
     el.browserShieldDl.innerHTML = `
       <dt>Daemon IPC</dt>
@@ -2299,17 +2751,25 @@
           : `<span class="panel-meta">Unknown</span>`
       }</dd>
       <dt>Native Messaging</dt>
-      <dd>${
-        shield
-          ? statusPill(shield.native_host_registered, "Registered (HKCU)", "Not Registered")
-          : `<span class="panel-meta">Unknown</span>`
-      }</dd>
+      <dd>${nativeHostHtml}</dd>
+      <dt>Manifest</dt>
+      <dd>${manifestHtml}</dd>
+      <dt>Extension ID</dt>
+      <dd class="mono-wrap">${escapeHtml(expectedExtId)}</dd>
       <dt>URI Protocol</dt>
       <dd>${
         shield
-          ? statusPill(shield.uri_scheme_registered, "ledr:// Registered", "Not Registered")
+          ? statusPill(
+              shield.uri_scheme_registered,
+              `ledr:// (${uriScopeLabel})`,
+              "Not Registered",
+            )
           : `<span class="panel-meta">Unknown</span>`
       }</dd>
+      <dt>Browser Alerts</dt>
+      <dd class="mono">${shieldStats.browserAlertsTotal} (${shieldStats.browserAlertsUnresolved} unresolved)</dd>
+      <dt>Tracked Downloads</dt>
+      <dd class="mono">${shieldStats.trackedDownloadsCount}</dd>
     `;
 
     el.domainCheckBtn.disabled = state.isCheckingDomain;
@@ -2914,9 +3374,39 @@
     });
   });
 
-  document.addEventListener("DOMContentLoaded", async () => {
-    syncPolicyFormHints();
-    await loadLaunchMode();
-    await refreshAll();
-  });
+  if (typeof globalThis !== "undefined" && globalThis.__LEDR_UI_TEST_MODE__) {
+    globalThis.__LEDR_UI_EXPORTS__ = {
+      normalizeWindowsPath,
+      formatShortSha256,
+      formatMotwSourceLabel,
+      formatMotwZoneLabel,
+      matchDownloadOriginsForProcess,
+      getBrowserAlertResolutionPolicy,
+      computeBrowserShieldStats,
+      extractAlertDetails,
+      buildSampleData,
+      matchesFilter,
+      buildHierarchy,
+      renderDetectionCard,
+      renderLineageCard,
+      renderMotwCard,
+      renderSuspendBanner,
+      syncResolutionControls,
+      handleResolveAlert,
+      renderTree,
+      renderInspector,
+      renderTelemetry,
+      renderPolicyView,
+      refreshAll,
+      loadSamplePreview,
+      state,
+      el,
+    };
+  } else {
+    document.addEventListener("DOMContentLoaded", async () => {
+      syncPolicyFormHints();
+      await loadLaunchMode();
+      await refreshAll();
+    });
+  }
 })();

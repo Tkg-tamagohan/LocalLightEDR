@@ -4,7 +4,7 @@
 
 ## 仕様の正と進行規則
 
-- 仕様の正は `docs/implementation-plan.md`、`docs/decision-records.md`（L-01 から L-16）、および凍結済みの `crates/ledr-proto/src/lib.rs` に置く。
+- 仕様の正は `docs/implementation-plan.md`、`docs/decision-records.md`（L-01 から L-21）、および凍結済みの `crates/ledr-proto/src/lib.rs` に置く。
 - 作業は Phase 単位（1 Phase 1 PR）で進め、`docs/implementation-plan.md` のチェックリスト `[x]` は `main` へのマージ完了後にのみ更新する。
 - `crates/ledr-proto` の既存公開型とシグネチャは後方互換なく変更しない。
 
@@ -45,6 +45,17 @@
   ファイル形式 NRD は `read_bounded_reader_cancellable`（`NRD_FILE_READ_CHUNK_BYTES = 64 * 1024`）で各チャンク前後および `ErrorKind::Interrupted` 再試行前にキャンセルを確認し、`NrdCancelToken::enter_blocking_read()` によりブロッキング読み取り突入を壁時計スリープなしで観測可能に保つ。
 - 統合テストでは優先度レーン分離をまたぐ異レーン完了バリアおよび終了済み込み `active_process_table_len()` による同期を禁止し、`GateBinaryInspector` のようなマルチスレッド Tokio 上の同期ブロッキングモックには `RuntimeFlavor::MultiThread` ガード付き `block_in_place` を使う。
 - 実 BFE カーネル WFP フィルタ登録、`FwpmNetEventSubscribe1` 実イベント捕捉、実 ETW `DNS-Client`、および応答しない実 UNC/SMB 共有での NRD 挙動は合成テストでは検証済みと扱わず、Windows 10/11 クライアント SKU の実機 E2E 対象として残す。
+
+## Phase 4 で確立した不変条件
+
+- MOTW 帰属はパス一致、`<= 128 MiB` の SHA-256 一致、`:Zone.Identifier` ADS 読み取り（`ZoneId >= 3`）の 3 段階評価を専用 OS スレッド MOTW I/O ワーカープール経由で実行し、遅延 MOTW バックフィルは既存の `origin_url` を上書きしない。
+- Stage 2 または Stage 3 で MOTW が確認された未許可バイナリ（`ProtectedOs` および既存 `NetworkAllow` 一致を除く）には、フォルダ移動による回避を防ぐため `HighRiskPath` と同じく起動時事前 WFP ブロックを適用する（`outbound_enforcement_mode != Audit` 時、`L-18`）。
+- `LAYER_4_BROWSER` イベント記録（`record_browser_event`）は非空 URL 検証、`details` の 8 KiB 切詰め、30 秒かつ上限 256 件の有界重複抑止を行い、既定では OS トーストを発火しない（`L-19`）。
+  プロセス紐付きのない `LAYER_4_BROWSER` アラートは `AllowOnce`（UI では `Acknowledge`）および `TerminateAndBlock { add_block_rule: false }` のみ許可し、`AllowPermanent` 等は拒否する。
+- `ledr-bridge-nm` は 4 バイト LE ゼロパース中継（上限 1 MiB）、1 リクエスト 1 Named Pipe 接続、`GetNamedPipeServerProcessId` によるサーバーバイナリ検証（`SEC_0003`）、`stderr` 専用ログ（`stdout` 汚染禁止）を維持し、固定公開鍵由来の拡張 ID `ecelachfiiiiiibpjeomfncgpegbpanh` のみを `allowed_origins` に許可する（`L-20`）。
+- Chrome MV3 拡張（`extensions/ledr-chrome-mv3`）はグローバル変数へ状態を保持せず `chrome.storage.session` と `chrome.storage.local` を使い、NRD とホモグラフ判定で閲覧ドメインを外部へ送信せず、ClickFix 観測は `"world": "MAIN"` の `content_main.js` から `ISOLATED` world へ受け渡す（`L-21`）。
+- `apps/ledr-ui/src/defense_status.rs` はユーザーの機密ファイル（`Cookies`、`.ssh` 等）へ一切アクセスせず、おとりファイル、ブリッジバイナリ、`HKCU` および `HKLM` の読み取り専用レジストリ参照とマニフェスト検証のみを行い、ウィンドウ閉鎖時は `ledr-ui` と WebView2 を 0 プロセスで終了する（`L-08`）。
+- 実 Chrome 拡張ロード、実 Native Messaging ホスト起動、実ダウンロードの `:Zone.Identifier` 付与と移動後紐付け、および実 WebView2 終了計測は合成テストでは検証済みと扱わず、Windows 10/11 クライアント SKU の実機 E2E（`FU-E2E-02`）対象として残す。
 
 ## 標準検証コマンド
 

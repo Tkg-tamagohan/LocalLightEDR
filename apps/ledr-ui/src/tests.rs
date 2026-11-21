@@ -1,6 +1,10 @@
 use super::*;
 use cli::parse_launch_mode;
-use defense_status::{HONEYPOT_FILENAME, collect_local_defense_status_with};
+use defense_status::{
+    BrowserRegistryProbe, BrowserShieldProbe, EXPECTED_CHROME_EXTENSION_ID, HONEYPOT_FILENAME,
+    MAX_MANIFEST_BYTES, NATIVE_HOST_NAME, RegistryStringProbe, collect_local_defense_status_with,
+    collect_local_defense_status_with_probe, validate_manifest_file,
+};
 use ipc::{
     parse_ack_response, parse_alerts_response, parse_flight_recorder_response,
     parse_metrics_response, parse_ping_response, parse_rules_response,
@@ -18,7 +22,7 @@ use notify::{
 use std::io::{self, Read, Write};
 use tree::build_process_tree;
 #[cfg(windows)]
-use uri_reg::{LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, win_uri_reg};
+use uri_reg::{LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, RegDefaultSzProbe, win_uri_reg};
 use uri_reg::{
     LEDR_URI_REG_SUBKEY, UriRegistrationOutcome, build_register_uri_event, format_ledr_uri_command,
 };
@@ -1086,4 +1090,431 @@ fn ui_p3_04_toast_os_setting_suppression_and_aumid_registration() {
                 .expect("idempotent AUMID check");
         assert!(!second, "second AUMID registration must be idempotent");
     }
+}
+
+struct TempTestDir(std::path::PathBuf);
+
+impl TempTestDir {
+    fn new(prefix: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        Self(dir)
+    }
+}
+
+impl Drop for TempTestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_test_manifest(
+    manifest_path: &std::path::Path,
+    name: &str,
+    host_type: &str,
+    bridge_path: &str,
+    allowed_origins: &[&str],
+) {
+    let doc = serde_json::json!({
+        "name": name,
+        "description": "LocalEDR Browser Shield Native Messaging Bridge",
+        "path": bridge_path,
+        "type": host_type,
+        "allowed_origins": allowed_origins,
+    });
+    std::fs::write(
+        manifest_path,
+        serde_json::to_vec_pretty(&doc).expect("serialize test manifest"),
+    )
+    .expect("write test manifest");
+}
+
+#[test]
+fn ui_p4_01_hkcu_hklm_dual_probe_and_browser_aggregation() {
+    let tmp = TempTestDir::new("ledr-ui-p4-01");
+    let bridge_exe = tmp.0.join("ledr-bridge-nm.exe");
+    std::fs::write(&bridge_exe, b"stub-bridge").expect("write bridge stub");
+    let bridge_str = bridge_exe.to_string_lossy().into_owned();
+    let expected_origin = format!("chrome-extension://{EXPECTED_CHROME_EXTENSION_ID}/");
+
+    let chrome_hkcu = tmp.0.join("chrome_hkcu.json");
+    let chrome_hklm = tmp.0.join("chrome_hklm.json");
+    let edge_hklm = tmp.0.join("edge_hklm.json");
+    let brave_hklm = tmp.0.join("brave_hklm.json");
+    for p in [&chrome_hkcu, &chrome_hklm, &edge_hklm, &brave_hklm] {
+        write_test_manifest(p, NATIVE_HOST_NAME, "stdio", &bridge_str, &[&expected_origin]);
+    }
+
+    // 1. HKCU only (Chrome + Edge), URI HKCU only
+    let hkcu_only = collect_local_defense_status_with_probe(
+        Some(&tmp.0),
+        &bridge_exe,
+        &BrowserShieldProbe {
+            browsers: vec![
+                BrowserRegistryProbe {
+                    browser: "Edge".to_string(),
+                    hkcu: RegistryStringProbe::Present(edge_hklm.to_string_lossy().into_owned()),
+                    hklm: RegistryStringProbe::Absent,
+                },
+                BrowserRegistryProbe {
+                    browser: "Chrome".to_string(),
+                    hkcu: RegistryStringProbe::Present(chrome_hkcu.to_string_lossy().into_owned()),
+                    hklm: RegistryStringProbe::Absent,
+                },
+            ],
+            uri_hkcu: true,
+            uri_hklm: false,
+        },
+    );
+    assert!(hkcu_only.browser_shield.native_host_registered);
+    assert_eq!(hkcu_only.browser_shield.native_host_scope.as_deref(), Some("HKCU"));
+    assert_eq!(hkcu_only.browser_shield.registered_browsers, vec!["Chrome", "Edge"]);
+    assert!(hkcu_only.browser_shield.manifest_valid);
+    assert_eq!(hkcu_only.browser_shield.uri_scheme_scope.as_deref(), Some("HKCU"));
+    assert_eq!(hkcu_only.browser_shield.expected_extension_id, EXPECTED_CHROME_EXTENSION_ID);
+
+    // 2. HKLM only (Brave), URI HKLM only
+    let hklm_only = collect_local_defense_status_with_probe(
+        Some(&tmp.0),
+        &bridge_exe,
+        &BrowserShieldProbe {
+            browsers: vec![BrowserRegistryProbe {
+                browser: "Brave".to_string(),
+                hkcu: RegistryStringProbe::Absent,
+                hklm: RegistryStringProbe::Present(brave_hklm.to_string_lossy().into_owned()),
+            }],
+            uri_hkcu: false,
+            uri_hklm: true,
+        },
+    );
+    assert_eq!(hklm_only.browser_shield.native_host_scope.as_deref(), Some("HKLM"));
+    assert_eq!(hklm_only.browser_shield.registered_browsers, vec!["Brave"]);
+    assert!(hklm_only.browser_shield.manifest_valid);
+    assert_eq!(hklm_only.browser_shield.uri_scheme_scope.as_deref(), Some("HKLM"));
+
+    // 3. HKCU + HKLM combined: Chrome HKCU shadows broken HKLM; Edge HKLM only; Brave absent
+    let broken_hklm = tmp.0.join("missing_shadowed.json");
+    let both = collect_local_defense_status_with_probe(
+        Some(&tmp.0),
+        &bridge_exe,
+        &BrowserShieldProbe {
+            browsers: vec![
+                BrowserRegistryProbe {
+                    browser: "Brave".to_string(),
+                    hkcu: RegistryStringProbe::Absent,
+                    hklm: RegistryStringProbe::Absent,
+                },
+                BrowserRegistryProbe {
+                    browser: "Chrome".to_string(),
+                    hkcu: RegistryStringProbe::Present(chrome_hkcu.to_string_lossy().into_owned()),
+                    hklm: RegistryStringProbe::Present(broken_hklm.to_string_lossy().into_owned()),
+                },
+                BrowserRegistryProbe {
+                    browser: "Edge".to_string(),
+                    hkcu: RegistryStringProbe::Absent,
+                    hklm: RegistryStringProbe::Present(edge_hklm.to_string_lossy().into_owned()),
+                },
+            ],
+            uri_hkcu: true,
+            uri_hklm: true,
+        },
+    );
+    assert_eq!(both.browser_shield.native_host_scope.as_deref(), Some("HKCU+HKLM"));
+    assert_eq!(both.browser_shield.uri_scheme_scope.as_deref(), Some("HKCU+HKLM"));
+    assert_eq!(both.browser_shield.registered_browsers, vec!["Chrome", "Edge"]);
+    assert!(both.browser_shield.manifest_valid);
+    assert_eq!(both.browser_shield.browsers[0].browser, "Chrome");
+    assert_eq!(both.browser_shield.browsers[0].effective_scope.as_deref(), Some("HKCU"));
+    assert!(both.browser_shield.browsers[0].hkcu_registered);
+    assert!(both.browser_shield.browsers[0].hklm_registered);
+    assert_eq!(both.browser_shield.browsers[1].browser, "Edge");
+    assert_eq!(both.browser_shield.browsers[1].effective_scope.as_deref(), Some("HKLM"));
+    assert_eq!(both.browser_shield.browsers[2].browser, "Brave");
+    assert_eq!(both.browser_shield.browsers[2].effective_scope, None);
+
+    #[cfg(windows)]
+    {
+        struct TestKeyCleanup(String);
+        impl Drop for TestKeyCleanup {
+            fn drop(&mut self) {
+                win_uri_reg::reg_delete_hkcu_tree(&self.0);
+            }
+        }
+
+        let root = format!(r"Software\LocalEDRTest\ui-p4-01-{}", std::process::id());
+        let _guard = TestKeyCleanup(root.clone());
+
+        // Absent subkey in HKCU & HKLM
+        let absent_subkey = format!(r"{root}\MissingKey");
+        assert_eq!(
+            win_uri_reg::reg_query_default_sz_in_hive(false, &absent_subkey).expect("probe absent HKCU"),
+            RegDefaultSzProbe::Absent
+        );
+        assert_eq!(
+            win_uri_reg::reg_query_default_sz_in_hive(true, &absent_subkey).expect("probe absent HKLM"),
+            RegDefaultSzProbe::Absent
+        );
+
+        // Present non-empty default value via ensure_hkcu_uri_registered_at
+        let uri_base = format!(r"{root}\ledr");
+        win_uri_reg::ensure_hkcu_uri_registered_at(&uri_base, &bridge_exe).expect("write test uri key");
+        let cmd_subkey = format!(r"{uri_base}\shell\open\command");
+        assert_eq!(
+            win_uri_reg::reg_query_default_sz_in_hive(false, &cmd_subkey).expect("probe present HKCU"),
+            RegDefaultSzProbe::Present(format_ledr_uri_command(&bridge_exe))
+        );
+
+        // Existing key with empty default value (`EmptyOrInvalidType`)
+        let empty_aumid = format!(r"{root}\EmptyDefault");
+        win_uri_reg::ensure_hkcu_aumid_registered_at(&empty_aumid, "LocalEDR").expect("create test key");
+        assert_eq!(
+            win_uri_reg::reg_query_default_sz_in_hive(false, &empty_aumid).expect("probe empty default"),
+            RegDefaultSzProbe::EmptyOrInvalidType
+        );
+    }
+}
+
+#[test]
+fn ui_p4_02_manifest_validation_matrix() {
+    let tmp = TempTestDir::new("ledr-ui-p4-02");
+    let bridge_exe = tmp.0.join("ledr-bridge-nm.exe");
+    std::fs::write(&bridge_exe, b"stub-bridge").expect("write bridge stub");
+    let bridge_str = bridge_exe.to_string_lossy().into_owned();
+    let expected_origin_upper =
+        format!("CHROME-EXTENSION://{}/", EXPECTED_CHROME_EXTENSION_ID.to_ascii_uppercase());
+
+    // 1. Valid manifest (case-insensitive allowed_origins)
+    let valid_path = tmp.0.join("valid.json");
+    write_test_manifest(&valid_path, NATIVE_HOST_NAME, "stdio", &bridge_str, &[&expected_origin_upper]);
+    assert_eq!(validate_manifest_file(&valid_path, EXPECTED_CHROME_EXTENSION_ID), Ok(()));
+
+    // 2. Missing manifest file
+    let missing_path = tmp.0.join("nonexistent.json");
+    let err = validate_manifest_file(&missing_path, EXPECTED_CHROME_EXTENSION_ID).unwrap_err();
+    assert!(err.contains("does not exist"), "unexpected error: {err}");
+
+    // 3. Path points to directory instead of regular file
+    let dir_path = tmp.0.join("subdir");
+    std::fs::create_dir_all(&dir_path).expect("create subdir");
+    let err = validate_manifest_file(&dir_path, EXPECTED_CHROME_EXTENSION_ID).unwrap_err();
+    assert!(err.contains("not a regular file"), "unexpected error: {err}");
+
+    // 4. Malformed JSON
+    let bad_json = tmp.0.join("bad.json");
+    std::fs::write(&bad_json, b"{not valid json").expect("write bad json");
+    let err = validate_manifest_file(&bad_json, EXPECTED_CHROME_EXTENSION_ID).unwrap_err();
+    assert!(err.contains("invalid manifest JSON"), "unexpected error: {err}");
+
+    // 5. Missing bridge exe, wrong type, wrong name, wrong allowed_origins
+    let missing_exe = tmp.0.join("missing_exe.json");
+    let absent_exe = tmp.0.join("absent-bridge.exe").to_string_lossy().into_owned();
+    write_test_manifest(
+        &missing_exe,
+        "com.wrong.host",
+        "pipe",
+        &absent_exe,
+        &["chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"],
+    );
+    let err = validate_manifest_file(&missing_exe, EXPECTED_CHROME_EXTENSION_ID).unwrap_err();
+    assert!(err.contains("manifest 'name'"), "unexpected error: {err}");
+    assert!(err.contains("manifest 'type'"), "unexpected error: {err}");
+    assert!(err.contains("not found"), "unexpected error: {err}");
+    assert!(err.contains("allowed_origins"), "unexpected error: {err}");
+
+    // 6. Relative path & directory path for bridge executable
+    let rel_exe = tmp.0.join("rel_exe.json");
+    write_test_manifest(
+        &rel_exe,
+        NATIVE_HOST_NAME,
+        "stdio",
+        "ledr-bridge-nm.exe",
+        &[&format!("chrome-extension://{EXPECTED_CHROME_EXTENSION_ID}/")],
+    );
+    let err = validate_manifest_file(&rel_exe, EXPECTED_CHROME_EXTENSION_ID).unwrap_err();
+    assert!(err.contains("must be absolute"), "unexpected error: {err}");
+
+    // 7. Missing trailing slash in allowed_origins
+    let no_slash = tmp.0.join("no_slash.json");
+    write_test_manifest(
+        &no_slash,
+        NATIVE_HOST_NAME,
+        "stdio",
+        &bridge_str,
+        &[&format!("chrome-extension://{EXPECTED_CHROME_EXTENSION_ID}")],
+    );
+    let err = validate_manifest_file(&no_slash, EXPECTED_CHROME_EXTENSION_ID).unwrap_err();
+    assert!(err.contains("allowed_origins"), "unexpected error: {err}");
+
+    // 8. Size limit boundary: exact 64 KiB passes, 64 KiB + 1 byte fails
+    let base_json = serde_json::to_string(&serde_json::json!({
+        "name": NATIVE_HOST_NAME,
+        "description": "",
+        "path": bridge_str,
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{EXPECTED_CHROME_EXTENSION_ID}/")],
+    }))
+    .expect("serialize base");
+    let exact_limit = MAX_MANIFEST_BYTES as usize;
+    assert!(base_json.len() < exact_limit);
+    let padded_exact = format!("{base_json}{}", " ".repeat(exact_limit - base_json.len()));
+    assert_eq!(padded_exact.len(), exact_limit);
+    let exact_path = tmp.0.join("exact64k.json");
+    std::fs::write(&exact_path, padded_exact.as_bytes()).expect("write 64KiB manifest");
+    assert_eq!(validate_manifest_file(&exact_path, EXPECTED_CHROME_EXTENSION_ID), Ok(()));
+
+    let over_limit = format!("{padded_exact} ");
+    assert_eq!(over_limit.len(), exact_limit + 1);
+    let over_path = tmp.0.join("over64k.json");
+    std::fs::write(&over_path, over_limit.as_bytes()).expect("write 64KiB+1 manifest");
+    let err = validate_manifest_file(&over_path, EXPECTED_CHROME_EXTENSION_ID).unwrap_err();
+    assert!(err.contains("64 KiB limit"), "unexpected error: {err}");
+}
+
+#[test]
+fn ui_p4_03_multi_browser_partial_failure_and_empty_registry_value() {
+    let tmp = TempTestDir::new("ledr-ui-p4-03");
+    let bridge_exe = tmp.0.join("ledr-bridge-nm.exe");
+    std::fs::write(&bridge_exe, b"stub-bridge").expect("write bridge stub");
+    let bridge_str = bridge_exe.to_string_lossy().into_owned();
+    let expected_origin = format!("chrome-extension://{EXPECTED_CHROME_EXTENSION_ID}/");
+
+    let chrome_valid = tmp.0.join("chrome_valid.json");
+    write_test_manifest(&chrome_valid, NATIVE_HOST_NAME, "stdio", &bridge_str, &[&expected_origin]);
+    let edge_bad = tmp.0.join("edge_bad.json");
+    std::fs::write(&edge_bad, b"{corrupt").expect("write corrupt manifest");
+
+    // Partial failure: Chrome valid, Edge corrupt -> overall manifest_valid must be false
+    let partial = collect_local_defense_status_with_probe(
+        Some(&tmp.0),
+        &bridge_exe,
+        &BrowserShieldProbe {
+            browsers: vec![
+                BrowserRegistryProbe {
+                    browser: "Chrome".to_string(),
+                    hkcu: RegistryStringProbe::Present(chrome_valid.to_string_lossy().into_owned()),
+                    hklm: RegistryStringProbe::Absent,
+                },
+                BrowserRegistryProbe {
+                    browser: "Edge".to_string(),
+                    hkcu: RegistryStringProbe::Present(edge_bad.to_string_lossy().into_owned()),
+                    hklm: RegistryStringProbe::Absent,
+                },
+            ],
+            uri_hkcu: true,
+            uri_hklm: false,
+        },
+    );
+    assert!(partial.browser_shield.native_host_registered);
+    assert!(!partial.browser_shield.manifest_valid);
+    assert_eq!(
+        partial.browser_shield.manifest_path.as_deref(),
+        Some(edge_bad.to_string_lossy().as_ref())
+    );
+    let err = partial.browser_shield.manifest_error.as_deref().expect("manifest_error");
+    assert!(err.contains("Edge:"), "expected Edge error, got: {err}");
+    assert!(partial.browser_shield.browsers[0].manifest_valid);
+    assert!(!partial.browser_shield.browsers[1].manifest_valid);
+
+    // Empty REG_SZ / AccessError must surface as registered + invalid, never hidden as unregistered
+    let empty_reg = collect_local_defense_status_with_probe(
+        Some(&tmp.0),
+        &bridge_exe,
+        &BrowserShieldProbe {
+            browsers: vec![
+                BrowserRegistryProbe {
+                    browser: "Chrome".to_string(),
+                    hkcu: RegistryStringProbe::EmptyOrInvalidType,
+                    hklm: RegistryStringProbe::Absent,
+                },
+                BrowserRegistryProbe {
+                    browser: "Edge".to_string(),
+                    hkcu: RegistryStringProbe::Absent,
+                    hklm: RegistryStringProbe::AccessError("OS status 5".to_string()),
+                },
+            ],
+            uri_hkcu: false,
+            uri_hklm: false,
+        },
+    );
+    assert!(empty_reg.browser_shield.native_host_registered);
+    assert_eq!(empty_reg.browser_shield.registered_browsers, vec!["Chrome", "Edge"]);
+    assert!(!empty_reg.browser_shield.manifest_valid);
+    let err = empty_reg.browser_shield.manifest_error.as_deref().expect("error");
+    assert!(err.contains("Chrome: registry default value is empty"), "got: {err}");
+    assert!(err.contains("Edge: OS status 5"), "got: {err}");
+}
+
+#[test]
+fn ui_p4_04_sensitive_user_files_never_opened() {
+    let tmp = TempTestDir::new("ledr-ui-p4-04");
+    let cookies_dir = tmp
+        .0
+        .join("AppData")
+        .join("Local")
+        .join("Google")
+        .join("Chrome")
+        .join("User Data")
+        .join("Default");
+    let ssh_dir = tmp.0.join(".ssh");
+    std::fs::create_dir_all(&cookies_dir).expect("create Chrome dir");
+    std::fs::create_dir_all(&ssh_dir).expect("create .ssh dir");
+
+    let cookies_path = cookies_dir.join("Cookies");
+    let ssh_key_path = ssh_dir.join("id_rsa");
+    std::fs::write(&cookies_path, b"secret-cookie-db").expect("write Cookies");
+    std::fs::write(&ssh_key_path, b"secret-ssh-key").expect("write id_rsa");
+
+    // Hold exclusive locks (share_mode = 0 on Windows) so any file open attempt would fail.
+    #[cfg(windows)]
+    let (_cookies_lock, _ssh_lock) = {
+        use std::os::windows::fs::OpenOptionsExt;
+        let c = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&cookies_path)
+            .expect("lock Cookies");
+        let s = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&ssh_key_path)
+            .expect("lock id_rsa");
+        (c, s)
+    };
+
+    let docs = tmp.0.join("Documents");
+    std::fs::create_dir_all(&docs).expect("create Documents");
+    std::fs::write(docs.join(HONEYPOT_FILENAME), b"decoy").expect("write honeypot");
+
+    let bridge_exe = tmp.0.join("ledr-bridge-nm.exe");
+    std::fs::write(&bridge_exe, b"stub-bridge").expect("write bridge");
+    let manifest_path = tmp.0.join("manifest.json");
+    write_test_manifest(
+        &manifest_path,
+        NATIVE_HOST_NAME,
+        "stdio",
+        bridge_exe.to_string_lossy().as_ref(),
+        &[&format!("chrome-extension://{EXPECTED_CHROME_EXTENSION_ID}/")],
+    );
+
+    let status = collect_local_defense_status_with_probe(
+        Some(&tmp.0),
+        &bridge_exe,
+        &BrowserShieldProbe {
+            browsers: vec![BrowserRegistryProbe {
+                browser: "Chrome".to_string(),
+                hkcu: RegistryStringProbe::Present(manifest_path.to_string_lossy().into_owned()),
+                hklm: RegistryStringProbe::Absent,
+            }],
+            uri_hkcu: true,
+            uri_hklm: false,
+        },
+    );
+
+    assert!(status.honeypots.iter().any(|h| h.folder == "Documents" && h.deployed));
+    assert!(status.browser_shield.bridge_binary_present);
+    assert!(status.browser_shield.manifest_valid);
+    assert_eq!(std::fs::read(&cookies_path).ok().as_deref(), None.or(cfg!(not(windows)).then_some(b"secret-cookie-db".as_slice())));
 }

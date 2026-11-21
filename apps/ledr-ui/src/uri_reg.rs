@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RegDefaultSzProbe {
+    Absent,
+    Present(String),
+    EmptyOrInvalidType,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UriRegistrationOutcome {
     pub(crate) registry_key: String,
@@ -43,12 +51,15 @@ pub(crate) fn format_ledr_uri_command(exe_path: &std::path::Path) -> String {
 
 #[cfg(windows)]
 pub(crate) mod win_uri_reg {
-    use super::{LEDR_URI_DESCRIPTION, UriRegistrationOutcome, format_ledr_uri_command};
+    use super::{
+        LEDR_URI_DESCRIPTION, RegDefaultSzProbe, UriRegistrationOutcome, format_ledr_uri_command,
+    };
     use std::ffi::c_void;
     use std::path::Path;
     use std::ptr;
 
     const HKEY_CURRENT_USER: isize = 0x8000_0001_u32 as i32 as isize;
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
     const KEY_QUERY_VALUE: u32 = 0x0001;
     const KEY_SET_VALUE: u32 = 0x0002;
     const KEY_CREATE_SUB_KEY: u32 = 0x0004;
@@ -116,18 +127,53 @@ pub(crate) mod win_uri_reg {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    pub(crate) fn reg_open_hkcu(subkey: &str, access: u32) -> Result<Option<OwnedRegKey>, String> {
+    fn reg_open_hive(
+        hive: isize,
+        hive_name: &str,
+        subkey: &str,
+        access: u32,
+    ) -> Result<Option<OwnedRegKey>, String> {
         let subkey_w = to_utf16_nul(subkey);
         let mut handle: isize = 0;
         // SAFETY: `subkey_w` is NUL-terminated UTF-16 and `handle` is valid out-pointer storage.
-        let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey_w.as_ptr(), 0, access, &mut handle) };
+        let status = unsafe { RegOpenKeyExW(hive, subkey_w.as_ptr(), 0, access, &mut handle) };
         if status == ERROR_FILE_NOT_FOUND {
             return Ok(None);
         }
         if status != ERROR_SUCCESS {
-            return Err(format!("RegOpenKeyExW('HKCU\\{subkey}') failed: OS status {status}"));
+            return Err(format!(
+                "RegOpenKeyExW('{hive_name}\\{subkey}') failed: OS status {status}"
+            ));
         }
         Ok(Some(OwnedRegKey(handle)))
+    }
+
+    pub(crate) fn reg_open_hkcu(subkey: &str, access: u32) -> Result<Option<OwnedRegKey>, String> {
+        reg_open_hive(HKEY_CURRENT_USER, "HKCU", subkey, access)
+    }
+
+    pub(crate) fn reg_open_hklm(subkey: &str, access: u32) -> Result<Option<OwnedRegKey>, String> {
+        reg_open_hive(HKEY_LOCAL_MACHINE, "HKLM", subkey, access)
+    }
+
+    pub(crate) fn reg_query_default_sz_in_hive(
+        is_hklm: bool,
+        subkey: &str,
+    ) -> Result<RegDefaultSzProbe, String> {
+        let key = if is_hklm {
+            reg_open_hklm(subkey, KEY_QUERY_VALUE)?
+        } else {
+            reg_open_hkcu(subkey, KEY_QUERY_VALUE)?
+        };
+        let Some(key) = key else {
+            return Ok(RegDefaultSzProbe::Absent);
+        };
+        match reg_query_sz(&key, None)? {
+            Some(val) if !val.trim().is_empty() => {
+                Ok(RegDefaultSzProbe::Present(val.trim().to_string()))
+            }
+            Some(_) | None => Ok(RegDefaultSzProbe::EmptyOrInvalidType),
+        }
     }
 
     fn reg_create_hkcu(subkey: &str, access: u32) -> Result<OwnedRegKey, String> {

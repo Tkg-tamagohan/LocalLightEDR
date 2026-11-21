@@ -10,7 +10,7 @@
 | `FU-P3-01` | 副次最適化 | Phase 3 | `merge_domain_hints_prioritized` の満杯 32 件時に起きる非許可同居ヒントの再挿入抑制 | 次回 `crates/ledr-daemon/src/firewall/` 改修または後続整備 PR |
 | `FU-P4-01` | 副次改善 | Phase 4 | `ledr-bridge-nm` の `HKLM` 登録および確認における 32 ビットレジストリビュー（`KEY_WOW64_32KEY`）対応 | 次回 `crates/ledr-bridge-nm/` 改修または後続整備 PR |
 | `FU-E2E-01` | 実機 E2E 検証 | Phase 2、Phase 3 | Windows 10 および Windows 11 クライアント SKU 管理者環境での実機検証 | 独立した実機 E2E 検証 PR |
-| `FU-E2E-02` | 実機 E2E 検証 | Phase 4 | Windows 10 および Windows 11 クライアント SKU 上での Chrome 拡張、Native Messaging、MOTW、および UI 終了の実機検証 | PR 4C マージ後の独立した実機 E2E 検証 PR |
+| `FU-E2E-02` | 実機 E2E 検証 | Phase 4 | Windows 10 および Windows 11 クライアント SKU 上での Chrome 拡張、Native Messaging、MOTW、および UI 終了の実機検証 | 独立した実機 E2E 検証 PR |
 
 ## FU-P3-01 満杯 32 件時の非許可同居ヒント再挿入の抑制
 
@@ -118,7 +118,7 @@ Phase 2 と Phase 3 の実機検証をまとめて扱う独立した別 PR で�
 
 ### 背景と出典
 
-Phase 4 は [decision-records.md](decision-records.md) の `L-17` に従い、PR 4A（PR #25、`cf7e866`）、PR 4B（PR #26、`6bb8bd3`）、および PR 4C（`apps/ledr-ui` View 1〜3 統合、検証用フィクスチャと手順書、文書同期）の 3 本へ分割した。
+Phase 4 は [decision-records.md](decision-records.md) の `L-17` に従い、PR 4A（PR #25、`cf7e866`）、PR 4B（PR #26、`6bb8bd3`）、および PR 4C（PR #28、`331602d`、`apps/ledr-ui` View 1〜3 統合、検証用フィクスチャと手順書、文書同期）の 3 本へ分割した。
 実ブラウザ上での Chrome 拡張ロード、実際の Windows レジストリ経由による Native Messaging ホスト起動、実ダウンロードの `:Zone.Identifier` 付与とフォルダ移動後起動の 3 段階紐付け、および WebView2 ウィンドウ閉鎖後の完全終了は、合成ユニットテストでは検証済みとみなさない。
 
 ### 現行の保証範囲
@@ -127,7 +127,7 @@ Phase 4 は [decision-records.md](decision-records.md) の `L-17` に従い、PR
 
 - PR 4A の MOTW 解析（`:Zone.Identifier`）、3 段階紐付け、事前 WFP ブロック、`ReportBrowserEvent`、および `ledr-sim motw-download` の合成テストとワークスペース負荷および TTL 回帰は `main` 上で合格済みである。
 - PR 4B の `ledr-bridge-nm`（ゼロパース中継、`SEC_0003` 検証、`setup`、`status`、`unregister`）と `extensions/ledr-chrome-mv3`（固定拡張 ID `ecelachfiiiiiibpjeomfncgpegbpanh`、ClickFix、NRD とホモグラフ判定、`storage.session` ダウンロード追跡）の Rust および Node テストは `main` 上で合格済みである。
-- PR 4C の `apps/ledr-ui`（`HKCU` と `HKLM` 両プローブ、マニフェスト検証、View 1〜3 の表示と操作制約）は Rust 単体テスト（`UI-P4-01` から `UI-P4-04`）と Node モック DOM テスト（`UI-P4-05` から `UI-P4-08`）で検証対象とする。
+- PR 4C の `apps/ledr-ui`（`HKCU` と `HKLM` 両プローブ、WOW64 32 ビット優先探索、ホワイトリストによるマニフェスト検証、View 1〜3 の表示と操作制約）の Rust 単体テスト（`UI-P4-01` から `UI-P4-04`、`UI-P4-11` から `UI-P4-13`）および Node モック DOM テスト（`UI-P4-05` から `UI-P4-10`）は `main` 上で合格済みである。
 
 #### 未検証の残存範囲
 
@@ -138,7 +138,7 @@ Phase 4 は [decision-records.md](decision-records.md) の `L-17` に従い、PR
 
 ### 対応予定タイミング
 
-PR 4C の `main` マージ後、独立した実機 E2E 検証作業として [phase4-e2e-runbook.md](phase4-e2e-runbook.md) を実施し、合否記録をまとめて [implementation-plan.md](implementation-plan.md) の Phase 4 実機 Chrome E2E 検証項目を `[x]` へ更新する。
+PR 4C は PR #28（`331602d`）で `main` へマージ済みのため、独立した実機 E2E 検証作業として [phase4-e2e-runbook.md](phase4-e2e-runbook.md) を実施し、合否記録をまとめて [implementation-plan.md](implementation-plan.md) の Phase 4 実機 Chrome E2E 検証項目を `[x]` へ更新する。
 
 ## FU-P4-01 crates/ledr-bridge-nm の HKLM 登録と確認における 32 ビットビュー対応
 

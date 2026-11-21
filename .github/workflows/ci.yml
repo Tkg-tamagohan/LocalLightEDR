@@ -98,7 +98,10 @@ jobs:
 
                   if (
                       path.startswith("crates/")
-                      or (path.startswith("apps/ledr-ui/") and not path.startswith("apps/ledr-ui/ui/"))
+                      or (
+                          path.startswith("apps/ledr-ui/")
+                          and not path.startswith(("apps/ledr-ui/ui/", "apps/ledr-ui/js-tests/"))
+                      )
                       or path.startswith("rules/")
                       or path in {"rust-toolchain", "rust-toolchain.toml"}
                       or path.startswith(".cargo/")
@@ -181,7 +184,30 @@ jobs:
           print(f"JS syntax checks passed ({len(js_files)} files).")
           EOF
       - name: Run Chrome MV3 extension unit tests (Node 22)
-        run: node --test extensions/ledr-chrome-mv3/tests/*.test.mjs
+        shell: bash
+        run: |
+          shopt -s nullglob
+          test_files=(extensions/ledr-chrome-mv3/tests/*.test.mjs)
+          if [ "${#test_files[@]}" -eq 0 ]; then
+            echo "No Chrome MV3 extension test files matched extensions/ledr-chrome-mv3/tests/*.test.mjs" >&2
+            exit 1
+          fi
+          node --test "${test_files[@]}"
+      - name: Run Tauri UI mock DOM unit tests (Node 22)
+        shell: bash
+        run: |
+          shopt -s nullglob
+          required_file="apps/ledr-ui/js-tests/phase4_ui.test.mjs"
+          if [ ! -f "$required_file" ]; then
+            echo "Missing required UI test file: $required_file" >&2
+            exit 1
+          fi
+          test_files=(apps/ledr-ui/js-tests/*.test.mjs)
+          if [ "${#test_files[@]}" -eq 0 ]; then
+            echo "No UI test files matched apps/ledr-ui/js-tests/*.test.mjs" >&2
+            exit 1
+          fi
+          node --test "${test_files[@]}"
       - name: Verify manifest.json public key matches DEFAULT_CHROME_EXTENSION_ID
         run: |
           python3 - <<'EOF'

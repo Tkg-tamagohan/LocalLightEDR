@@ -481,3 +481,226 @@ test("EXT-17: real DownloadItem without tabId resolves click hints, expires stal
   ];
   assert.deepEqual(afterPrune, []);
 });
+
+test("EXT-19: click hints enforce referrer origin consistency, iframe frameUrl matching, and completion-time correction (BUG_0001)", async () => {
+  const sessionStorage = createMemoryStorageArea();
+  const targetUrl = "https://cdn.localedr.invalid/release/app.exe";
+
+  // 1. Stale click hint from docs tab is rejected when download starts with a contradicting referrer from portal tab.
+  await recordDownloadClickHint(
+    {
+      targetUrl,
+      tabUrl: "https://docs.localedr.invalid/guide",
+    },
+    { storageSession: sessionStorage, nowFn: () => 100_000 }
+  );
+
+  const portalEntry = await handleDownloadCreated(
+    {
+      id: 301,
+      url: targetUrl,
+      finalUrl: targetUrl,
+      referrer: "https://portal.localedr.invalid/",
+    },
+    {
+      storageSession: sessionStorage,
+      tabsApi: {
+        async query() {
+          return [{ url: "https://portal.localedr.invalid/downloads/latest" }];
+        },
+      },
+      nowFn: () => 102_000,
+    }
+  );
+  assert.equal(portalEntry.tabUrl, "https://portal.localedr.invalid/downloads/latest");
+  assert.equal(portalEntry.tabUrlSource, "active_tab_referrer");
+
+  const portalReq = await handleDownloadChanged(
+    { id: 301, state: { current: "complete" } },
+    {
+      storageSession: sessionStorage,
+      downloadsApi: {
+        async search() {
+          return [
+            {
+              id: 301,
+              filename: "C:\\Users\\alice\\Downloads\\app.exe",
+              url: targetUrl,
+              finalUrl: targetUrl,
+              referrer: "https://portal.localedr.invalid/",
+              endTime: "2026-11-21T02:00:00.000Z",
+            },
+          ];
+        },
+      },
+    }
+  );
+  assert.deepEqual(portalReq, {
+    type: "ReportDownloadOrigin",
+    payload: {
+      file_path: "C:\\Users\\alice\\Downloads\\app.exe",
+      tab_url: "https://portal.localedr.invalid/downloads/latest",
+      frame_url: targetUrl,
+      referrer_url: "https://portal.localedr.invalid/",
+      downloaded_at_ms: Date.parse("2026-11-21T02:00:00.000Z"),
+    },
+  });
+
+  // 2. Cross-origin iframe click hint matches referrer against frameUrl and preserves top-level tabUrl.
+  const iframeStorage = createMemoryStorageArea();
+  await recordDownloadClickHint(
+    {
+      targetUrl,
+      tabUrl: "https://portal.localedr.invalid/product-page",
+      frameUrl: "https://embed.localedr.invalid/download-widget",
+    },
+    { storageSession: iframeStorage, nowFn: () => 200_000 }
+  );
+  // Newer click on another tab with contradicting origin must be skipped in favor of matching iframe hint.
+  await recordDownloadClickHint(
+    {
+      targetUrl,
+      tabUrl: "https://docs.localedr.invalid/unrelated",
+      frameUrl: "https://docs.localedr.invalid/unrelated",
+    },
+    { storageSession: iframeStorage, nowFn: () => 201_000 }
+  );
+
+  const iframeEntry = await handleDownloadCreated(
+    {
+      id: 302,
+      url: targetUrl,
+      finalUrl: targetUrl,
+      referrer: "https://embed.localedr.invalid/",
+    },
+    {
+      storageSession: iframeStorage,
+      tabsApi: {
+        async query() {
+          return [{ url: "https://other-tab.localedr.invalid/mail" }];
+        },
+      },
+      nowFn: () => 202_000,
+    }
+  );
+  assert.equal(iframeEntry.tabUrl, "https://portal.localedr.invalid/product-page");
+  assert.equal(iframeEntry.tabUrlSource, "click_hint");
+  assert.equal(iframeEntry.clickHintFrameUrl, "https://embed.localedr.invalid/download-widget");
+
+  const iframeReq = await handleDownloadChanged(
+    { id: 302, state: { current: "complete" } },
+    {
+      storageSession: iframeStorage,
+      downloadsApi: {
+        async search() {
+          return [
+            {
+              id: 302,
+              filename: "C:\\Users\\alice\\Downloads\\app-iframe.exe",
+              url: targetUrl,
+              finalUrl: targetUrl,
+              referrer: "https://embed.localedr.invalid/",
+              endTime: "2026-11-21T02:01:00.000Z",
+            },
+          ];
+        },
+      },
+    }
+  );
+  assert.deepEqual(iframeReq, {
+    type: "ReportDownloadOrigin",
+    payload: {
+      file_path: "C:\\Users\\alice\\Downloads\\app-iframe.exe",
+      tab_url: "https://portal.localedr.invalid/product-page",
+      frame_url: targetUrl,
+      referrer_url: "https://embed.localedr.invalid/",
+      downloaded_at_ms: Date.parse("2026-11-21T02:01:00.000Z"),
+    },
+  });
+
+  // 3. onCreated had empty referrer (adopted click hint), but onChanged(complete) reveals a contradicting
+  // item.referrer: completion handler must discard the click-hint tabUrl and use referrerUrl instead.
+  const lateRefStorage = createMemoryStorageArea();
+  await recordDownloadClickHint(
+    {
+      targetUrl,
+      tabUrl: "https://docs.localedr.invalid/guide",
+    },
+    { storageSession: lateRefStorage, nowFn: () => 300_000 }
+  );
+
+  const tentativeEntry = await handleDownloadCreated(
+    {
+      id: 303,
+      url: targetUrl,
+      finalUrl: targetUrl,
+      referrer: "",
+    },
+    {
+      storageSession: lateRefStorage,
+      tabsApi: {
+        async query() {
+          return [{ url: "https://other.localedr.invalid/" }];
+        },
+      },
+      nowFn: () => 301_000,
+    }
+  );
+  assert.equal(tentativeEntry.tabUrl, "https://docs.localedr.invalid/guide");
+  assert.equal(tentativeEntry.tabUrlSource, "click_hint");
+
+  const correctedReq = await handleDownloadChanged(
+    { id: 303, state: { current: "complete" } },
+    {
+      storageSession: lateRefStorage,
+      downloadsApi: {
+        async search() {
+          return [
+            {
+              id: 303,
+              filename: "C:\\Users\\alice\\Downloads\\app-corrected.exe",
+              url: targetUrl,
+              finalUrl: targetUrl,
+              referrer: "https://portal.localedr.invalid/releases",
+              endTime: "2026-11-21T02:02:00.000Z",
+            },
+          ];
+        },
+      },
+    }
+  );
+  assert.deepEqual(correctedReq, {
+    type: "ReportDownloadOrigin",
+    payload: {
+      file_path: "C:\\Users\\alice\\Downloads\\app-corrected.exe",
+      tab_url: "https://portal.localedr.invalid/releases",
+      frame_url: targetUrl,
+      referrer_url: "https://portal.localedr.invalid/releases",
+      downloaded_at_ms: Date.parse("2026-11-21T02:02:00.000Z"),
+    },
+  });
+
+  // 4. Non-HTTP(S) referrer must not adopt an HTTP(S) click hint.
+  const nonHttpEntry = await handleDownloadCreated(
+    {
+      id: 304,
+      url: targetUrl,
+      finalUrl: targetUrl,
+      referrer: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/downloader.html",
+    },
+    {
+      storageSession: lateRefStorage,
+      tabsApi: {
+        async query() {
+          return [{ url: "https://docs.localedr.invalid/guide" }];
+        },
+      },
+      nowFn: () => 302_000,
+    }
+  );
+  assert.equal(
+    nonHttpEntry.tabUrl,
+    "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/downloader.html"
+  );
+  assert.equal(nonHttpEntry.tabUrlSource, "referrer");
+});

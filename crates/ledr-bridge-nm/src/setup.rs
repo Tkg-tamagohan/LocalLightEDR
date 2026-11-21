@@ -277,17 +277,228 @@ pub fn resolve_ui_exe(
     )
 }
 
+pub(crate) const DRIVE_REMOVABLE: u32 = 2;
+pub(crate) const DRIVE_FIXED: u32 = 3;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const DRIVE_REMOTE: u32 = 4;
+pub(crate) const DRIVE_RAMDISK: u32 = 6;
+
+pub(crate) const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+pub(crate) const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+pub(crate) const SYMLINK_FLAG_RELATIVE: u32 = 0x0000_0001;
+
+pub(crate) fn is_local_drive_type(drive_type: u32) -> bool {
+    matches!(drive_type, DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_RAMDISK)
+}
+
+fn parse_local_drive_path(path: &Path) -> Option<(char, Vec<String>, bool)> {
+    let raw = path.to_str()?;
+    if raw.is_empty() || raw.contains('\0') {
+        return None;
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'\\'
+        {
+            return None;
+        }
+        let drive = (bytes[0] as char).to_ascii_uppercase();
+        let mut segments = Vec::new();
+        for seg in rest[3..].split('\\') {
+            if seg.is_empty() {
+                continue;
+            }
+            if seg == "." || seg == ".." {
+                return None;
+            }
+            segments.push(seg.to_string());
+        }
+        return Some((drive, segments, true));
+    }
+
+    let bytes = raw.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || (bytes[2] != b'\\' && bytes[2] != b'/')
+    {
+        return None;
+    }
+    let drive = (bytes[0] as char).to_ascii_uppercase();
+    let mut segments = Vec::new();
+    for seg in raw[3..].split(['\\', '/']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other.to_string()),
+        }
+    }
+    Some((drive, segments, false))
+}
+
+fn build_drive_path(drive: char, segments: &[String], force_verbatim: bool) -> PathBuf {
+    let mut s = String::new();
+    if force_verbatim {
+        s.push_str(r"\\?\");
+    }
+    s.push(drive.to_ascii_uppercase());
+    s.push_str(":\\");
+    for (idx, seg) in segments.iter().enumerate() {
+        if idx > 0 {
+            s.push('\\');
+        }
+        s.push_str(seg);
+    }
+    if !force_verbatim && s.len() >= 248 {
+        PathBuf::from(format!(r"\\?\{s}"))
+    } else {
+        PathBuf::from(s)
+    }
+}
+
+/// Extracts the uppercase local drive letter (`A`..=`Z`) from an absolute drive path (`X:\...` or
+/// `\\?\X:\...`), rejecting UNC (`\\...`, `//...`, `\\?\UNC\...`), device (`\\.\...`), NT
+/// (`\??\...`), volume GUID, and relative paths (`SEC_0001`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn extract_local_drive_letter(path: &Path) -> Option<char> {
+    parse_local_drive_path(path).map(|(drive, _, _)| drive)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedReparseTarget {
+    pub tag: u32,
+    pub substitute_name: String,
+    pub is_relative: bool,
+}
+
+/// Parses `IO_REPARSE_TAG_SYMLINK` or `IO_REPARSE_TAG_MOUNT_POINT` from a raw `REPARSE_DATA_BUFFER`.
+pub(crate) fn parse_reparse_data_buffer(buf: &[u8]) -> Option<ParsedReparseTarget> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let tag = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let data_len = usize::from(u16::from_le_bytes([buf[4], buf[5]]));
+    let total_end = 8usize.checked_add(data_len)?;
+    if total_end > buf.len() {
+        return None;
+    }
+    let (sub_offset, sub_len, is_relative, path_buf_start) = match tag {
+        IO_REPARSE_TAG_SYMLINK => {
+            if total_end < 20 {
+                return None;
+            }
+            let sub_off = usize::from(u16::from_le_bytes([buf[8], buf[9]]));
+            let sub_len = usize::from(u16::from_le_bytes([buf[10], buf[11]]));
+            let flags = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+            (sub_off, sub_len, (flags & SYMLINK_FLAG_RELATIVE) != 0, 20usize)
+        }
+        IO_REPARSE_TAG_MOUNT_POINT => {
+            if total_end < 16 {
+                return None;
+            }
+            let sub_off = usize::from(u16::from_le_bytes([buf[8], buf[9]]));
+            let sub_len = usize::from(u16::from_le_bytes([buf[10], buf[11]]));
+            (sub_off, sub_len, false, 16usize)
+        }
+        _ => return None,
+    };
+    if sub_offset % 2 != 0 || sub_len % 2 != 0 || sub_len == 0 {
+        return None;
+    }
+    let path_buf = &buf[path_buf_start..total_end];
+    let sub_end = sub_offset.checked_add(sub_len)?;
+    if sub_end > path_buf.len() {
+        return None;
+    }
+    let sub_bytes = &path_buf[sub_offset..sub_end];
+    let wide: Vec<u16> = (0..sub_bytes.len())
+        .step_by(2)
+        .map(|i| u16::from_le_bytes([sub_bytes[i], sub_bytes[i + 1]]))
+        .collect();
+    let substitute_name = String::from_utf16(&wide).ok()?;
+    Some(ParsedReparseTarget {
+        tag,
+        substitute_name,
+        is_relative,
+    })
+}
+
+/// Validates that a reparse point's `SubstituteName` stays on a local drive path rather than
+/// pointing to UNC (`\??\UNC\`, `\\`), network redirectors (`\Device\Mup\`,
+/// `\Device\LanmanRedirector\`), or non-drive device paths (`SEC_0001`).
+pub(crate) fn resolve_local_reparse_target(
+    substitute_name: &str,
+    is_relative: bool,
+    link_path: &Path,
+) -> Option<PathBuf> {
+    if substitute_name.is_empty() || substitute_name.contains('\0') {
+        return None;
+    }
+    let normalized_lower = substitute_name.replace('/', "\\").to_ascii_lowercase();
+    if normalized_lower.starts_with(r"\??\unc\")
+        || normalized_lower.starts_with(r"\\?\unc\")
+        || normalized_lower.starts_with(r"\\")
+        || normalized_lower.starts_with(r"\device\mup\")
+        || normalized_lower == r"\device\mup"
+        || normalized_lower.starts_with(r"device\mup\")
+        || normalized_lower.starts_with(r"\device\lanmanredirector\")
+        || normalized_lower == r"\device\lanmanredirector"
+        || normalized_lower.starts_with(r"device\lanmanredirector\")
+        || normalized_lower.starts_with(r"\device\")
+        || normalized_lower.starts_with(r"device\")
+        || normalized_lower.starts_with(r"\??\globalroot\")
+        || normalized_lower.starts_with(r"\\?\globalroot\")
+    {
+        return None;
+    }
+
+    if is_relative {
+        if substitute_name.starts_with('\\')
+            || substitute_name.starts_with('/')
+            || substitute_name.as_bytes().get(1) == Some(&b':')
+        {
+            return None;
+        }
+        let parent = link_path.parent()?;
+        let joined = parent.join(substitute_name);
+        let (drive, segments, _) = parse_local_drive_path(&joined)?;
+        return Some(build_drive_path(drive, &segments, false));
+    }
+
+    let stripped = substitute_name
+        .strip_prefix(r"\??\")
+        .or_else(|| substitute_name.strip_prefix(r"\\?\"))
+        .unwrap_or(substitute_name);
+    let candidate = if stripped.len() == 2
+        && stripped.as_bytes()[0].is_ascii_alphabetic()
+        && stripped.as_bytes()[1] == b':'
+    {
+        format!("{}:\\", (stripped.as_bytes()[0] as char).to_ascii_uppercase())
+    } else {
+        stripped.to_string()
+    };
+    let (drive, segments, _) = parse_local_drive_path(Path::new(&candidate))?;
+    Some(build_drive_path(drive, &segments, false))
+}
+
 #[cfg(windows)]
 mod win_reg_ops {
     use super::{
-        format_ledr_uri_command, normalize_display_path, BrowserKind, RegistryTarget, Scope,
-        LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
+        build_drive_path, format_ledr_uri_command, is_local_drive_type, normalize_display_path,
+        parse_local_drive_path, parse_reparse_data_buffer, resolve_local_reparse_target,
+        BrowserKind, RegistryTarget, Scope, LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION,
+        NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
     };
     use anyhow::{Context, Result};
     use std::ffi::c_void;
     use std::io::ErrorKind;
     use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::ptr;
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
     use winreg::RegKey;
@@ -297,7 +508,13 @@ mod win_reg_ops {
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     const FILE_SHARE_DELETE: u32 = 0x0000_0004;
     const OPEN_EXISTING: u32 = 3;
-    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+    const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
+    const MAX_REPARSE_HOPS: usize = 16;
     const INVALID_HANDLE_VALUE: isize = -1;
 
     #[repr(C)]
@@ -317,6 +534,8 @@ mod win_reg_ops {
 
     #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
     extern "system" {
+        fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+        fn GetFileAttributesW(lp_file_name: *const u16) -> u32;
         fn CreateFileW(
             lp_file_name: *const u16,
             dw_desired_access: u32,
@@ -326,6 +545,16 @@ mod win_reg_ops {
             dw_flags_and_attributes: u32,
             h_template_file: *mut c_void,
         ) -> *mut c_void;
+        fn DeviceIoControl(
+            h_device: *mut c_void,
+            dw_io_control_code: u32,
+            lp_in_buffer: *const c_void,
+            n_in_buffer_size: u32,
+            lp_out_buffer: *mut c_void,
+            n_out_buffer_size: u32,
+            lp_bytes_returned: *mut u32,
+            lp_overlapped: *mut c_void,
+        ) -> i32;
         fn GetFileInformationByHandle(
             h_file: *mut c_void,
             lp_file_information: *mut ByHandleFileInformation,
@@ -357,18 +586,33 @@ mod win_reg_ops {
     enum FileIdentityLookup {
         Found(FileIdentity),
         NotFound,
+        NonLocal,
         Indeterminate,
     }
 
-    fn query_file_identity(path: &Path) -> FileIdentityLookup {
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    enum PathLocality {
+        Local(PathBuf),
+        NonLocal,
+        NotFound,
+        Indeterminate,
+    }
+
+    fn is_local_drive(drive: char) -> bool {
+        let root_wide = [drive.to_ascii_uppercase() as u16, b':' as u16, b'\\' as u16, 0];
+        // SAFETY: `root_wide` is a NUL-terminated UTF-16 drive root string (`X:\`).
+        let drive_type = unsafe { GetDriveTypeW(root_wide.as_ptr()) };
+        is_local_drive_type(drive_type)
+    }
+
+    fn inspect_reparse_point_target(current: &Path) -> Result<Option<PathBuf>, PathLocality> {
+        let mut wide: Vec<u16> = current.as_os_str().encode_wide().collect();
         if wide.is_empty() || wide.contains(&0) {
-            return FileIdentityLookup::Indeterminate;
+            return Err(PathLocality::Indeterminate);
         }
         wide.push(0);
 
-        // SAFETY: `wide` is NUL-terminated UTF-16; `OPEN_EXISTING` without `FILE_FLAG_OPEN_REPARSE_POINT`
-        // resolves junctions/symlinks so aliases to the same underlying file yield the same file ID.
+        // SAFETY: `wide` is NUL-terminated UTF-16; `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`
+        // opens the reparse point itself (directory or file) without traversing to its target.
         let raw = unsafe {
             CreateFileW(
                 wide.as_ptr(),
@@ -376,7 +620,126 @@ mod win_reg_ops {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 ptr::null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            )
+        };
+        if raw.is_null() || raw as isize == INVALID_HANDLE_VALUE {
+            let err = std::io::Error::last_os_error();
+            return Err(if err.kind() == ErrorKind::NotFound {
+                PathLocality::NotFound
+            } else {
+                PathLocality::Indeterminate
+            });
+        }
+        let handle = OwnedFileHandle(raw);
+
+        let mut buf = vec![0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+        let mut bytes_returned: u32 = 0;
+        // SAFETY: `handle.0` is an open reparse-point handle and `buf` holds `MAXIMUM_REPARSE_DATA_BUFFER_SIZE` bytes.
+        let ok = unsafe {
+            DeviceIoControl(
+                handle.0,
+                FSCTL_GET_REPARSE_POINT,
+                ptr::null(),
+                0,
+                buf.as_mut_ptr().cast::<c_void>(),
+                u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                &mut bytes_returned,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(PathLocality::NonLocal);
+        }
+        let used = usize::try_from(bytes_returned)
+            .unwrap_or(0)
+            .min(buf.len());
+        let Some(parsed) = parse_reparse_data_buffer(&buf[..used]) else {
+            return Ok(None);
+        };
+        Ok(resolve_local_reparse_target(
+            &parsed.substitute_name,
+            parsed.is_relative,
+            current,
+        ))
+    }
+
+    fn verify_local_path_recursive(path: &Path, remaining_depth: usize) -> PathLocality {
+        if remaining_depth == 0 {
+            return PathLocality::NonLocal;
+        }
+        // Layer 1: syntactic local drive absolute path only (reject UNC, device, relative).
+        let Some((drive, segments, verbatim)) = parse_local_drive_path(path) else {
+            return PathLocality::NonLocal;
+        };
+        // Layer 2: OS drive-type check (allow only fixed, removable, or RAM disk volumes).
+        if !is_local_drive(drive) {
+            return PathLocality::NonLocal;
+        }
+
+        // Layer 3: walk from `X:\` down to the target, inspecting reparse points without traversal.
+        for prefix_len in 0..=segments.len() {
+            let current = build_drive_path(drive, &segments[..prefix_len], verbatim);
+            let mut wide: Vec<u16> = current.as_os_str().encode_wide().collect();
+            if wide.is_empty() || wide.contains(&0) {
+                return PathLocality::Indeterminate;
+            }
+            wide.push(0);
+
+            // SAFETY: `wide` is NUL-terminated UTF-16; `GetFileAttributesW` inspects the last
+            // component directly without traversing it when it is a reparse point.
+            let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+            if attrs == INVALID_FILE_ATTRIBUTES {
+                let err = std::io::Error::last_os_error();
+                return if err.kind() == ErrorKind::NotFound {
+                    PathLocality::NotFound
+                } else {
+                    PathLocality::Indeterminate
+                };
+            }
+
+            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                let target_base = match inspect_reparse_point_target(&current) {
+                    Ok(Some(local_target)) => local_target,
+                    Ok(None) => return PathLocality::NonLocal,
+                    Err(status) => return status,
+                };
+                let mut rewritten = target_base;
+                for rest in &segments[prefix_len..] {
+                    rewritten.push(rest);
+                }
+                return verify_local_path_recursive(&rewritten, remaining_depth - 1);
+            }
+        }
+
+        PathLocality::Local(build_drive_path(drive, &segments, verbatim))
+    }
+
+    fn query_file_identity(path: &Path) -> FileIdentityLookup {
+        let resolved_local = match verify_local_path_recursive(path, MAX_REPARSE_HOPS) {
+            PathLocality::Local(p) => p,
+            PathLocality::NonLocal => return FileIdentityLookup::NonLocal,
+            PathLocality::NotFound => return FileIdentityLookup::NotFound,
+            PathLocality::Indeterminate => return FileIdentityLookup::Indeterminate,
+        };
+
+        let mut wide: Vec<u16> = resolved_local.as_os_str().encode_wide().collect();
+        if wide.is_empty() || wide.contains(&0) {
+            return FileIdentityLookup::Indeterminate;
+        }
+        wide.push(0);
+
+        // SAFETY: `wide` is NUL-terminated UTF-16 pointing to a verified local non-reparse target;
+        // `FILE_FLAG_OPEN_REPARSE_POINT` prevents following a leaf symlink swapped in via TOCTOU.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
                 ptr::null_mut(),
             )
         };
@@ -395,6 +758,9 @@ mod win_reg_ops {
         let ok = unsafe { GetFileInformationByHandle(handle.0, &mut info) };
         if ok == 0 {
             return FileIdentityLookup::Indeterminate;
+        }
+        if (info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return FileIdentityLookup::NonLocal;
         }
         FileIdentityLookup::Found(FileIdentity {
             volume_serial_number: info.dw_volume_serial_number,
@@ -601,7 +967,7 @@ mod win_reg_ops {
         let candidate_id = match query_file_identity(Path::new(manifest_display_path)) {
             FileIdentityLookup::Found(id) => id,
             FileIdentityLookup::NotFound => return Ok(false),
-            FileIdentityLookup::Indeterminate => return Ok(true),
+            FileIdentityLookup::NonLocal | FileIdentityLookup::Indeterminate => return Ok(true),
         };
 
         for existing in &remaining_existing {
@@ -609,7 +975,9 @@ mod win_reg_ops {
                 FileIdentityLookup::Found(existing_id) if existing_id == candidate_id => {
                     return Ok(true);
                 }
-                FileIdentityLookup::Found(_) | FileIdentityLookup::NotFound => {}
+                FileIdentityLookup::Found(_)
+                | FileIdentityLookup::NotFound
+                | FileIdentityLookup::NonLocal => {}
                 FileIdentityLookup::Indeterminate => return Ok(true),
             }
         }

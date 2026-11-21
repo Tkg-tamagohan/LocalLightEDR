@@ -599,4 +599,64 @@ test("EXT-18: content.js records download click hints for normal and Shadow DOM 
       pageUrl: "https://portal.localedr.invalid/releases/index.html",
     },
   ]);
+
+  // 5. <base href> resolution via anchor.baseURI and document.baseURI (BUG_0002)
+  const baseHrefMessages = [];
+  const baseEnv = createDomSandbox({
+    url: "https://portal.localedr.invalid/app/download.html",
+    hostname: "portal.localedr.invalid",
+    onRuntimeMessage: async (msg) => {
+      if (msg.type === "RECORD_DOWNLOAD_CLICK_HINT") {
+        baseHrefMessages.push({
+          type: msg.type,
+          targetUrl: msg.targetUrl,
+          pageUrl: msg.pageUrl,
+        });
+      }
+      return { ok: true };
+    },
+  });
+
+  // 5a. anchor.baseURI takes precedence over document.baseURI and window.location.href
+  baseEnv.doc.baseURI = "https://doc-base.localedr.invalid/releases/";
+  const anchorWithBase = new baseEnv.MockElement("a");
+  anchorWithBase.baseURI = "https://cdn.localedr.invalid/base/v2/";
+  anchorWithBase.setAttribute("href", "pkg/installer.exe#sha256");
+  await baseEnv.doc.dispatchEventAsync({
+    type: "click",
+    target: anchorWithBase,
+    composedPath: () => [
+      anchorWithBase,
+      baseEnv.doc.body,
+      baseEnv.doc.documentElement,
+      baseEnv.doc,
+    ],
+  });
+
+  // 5b. document.baseURI is used when anchor.baseURI is absent
+  const anchorDocBase = new baseEnv.MockElement("a");
+  anchorDocBase.setAttribute("href", "builds/tool.msi");
+  await baseEnv.doc.dispatchEventAsync({
+    type: "click",
+    target: anchorDocBase,
+    composedPath: () => [
+      anchorDocBase,
+      baseEnv.doc.body,
+      baseEnv.doc.documentElement,
+      baseEnv.doc,
+    ],
+  });
+
+  assert.deepEqual(baseHrefMessages, [
+    {
+      type: "RECORD_DOWNLOAD_CLICK_HINT",
+      targetUrl: "https://cdn.localedr.invalid/base/v2/pkg/installer.exe",
+      pageUrl: "https://portal.localedr.invalid/app/download.html",
+    },
+    {
+      type: "RECORD_DOWNLOAD_CLICK_HINT",
+      targetUrl: "https://doc-base.localedr.invalid/releases/builds/tool.msi",
+      pageUrl: "https://portal.localedr.invalid/app/download.html",
+    },
+  ]);
 });

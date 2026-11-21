@@ -200,6 +200,7 @@ mod win_pipe_test_helpers {
     pub const SDDL_REVISION_1: u32 = 1;
     pub const ERROR_NO_DATA: i32 = 232;
     pub const ERROR_PIPE_CONNECTED: i32 = 535;
+    pub const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
     pub const SERVICE_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)";
 
     #[repr(C)]
@@ -235,6 +236,17 @@ mod win_pipe_test_helpers {
         pub fn ConnectNamedPipe(pipe: *mut c_void, overlapped: *mut c_void) -> i32;
         pub fn DisconnectNamedPipe(pipe: *mut c_void) -> i32;
         pub fn FlushFileBuffers(pipe: *mut c_void) -> i32;
+        pub fn CreatePipe(
+            h_read_pipe: *mut *mut c_void,
+            h_write_pipe: *mut *mut c_void,
+            lp_pipe_attributes: *const SecurityAttributes,
+            n_size: u32,
+        ) -> i32;
+        pub fn SetHandleInformation(
+            h_object: *mut c_void,
+            dw_mask: u32,
+            dw_flags: u32,
+        ) -> i32;
         pub fn CloseHandle(object: *mut c_void) -> i32;
         pub fn ReadFile(
             h_file: *mut c_void,
@@ -1336,6 +1348,70 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
     // Remove junction reparse point cleanly before continuing.
     fs::remove_dir(&junction_dir).expect("remove junction reparse point");
 
+    // 1b. Chained 2-hop local junction (hop2 -> hop1 -> real) and extended verbatim path (\\?\C:\...)
+    // must both resolve locally and preserve the shared manifest.
+    let hop1_dir = temp.path().join("hop1");
+    let hop2_dir = temp.path().join("hop2");
+    let mk_hop1 = Command::new("cmd.exe")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &hop1_dir.to_string_lossy(),
+            &real_dir.to_string_lossy(),
+        ])
+        .output()
+        .expect("run mklink /J hop1");
+    assert!(mk_hop1.status.success());
+    let mk_hop2 = Command::new("cmd.exe")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &hop2_dir.to_string_lossy(),
+            &hop1_dir.to_string_lossy(),
+        ])
+        .output()
+        .expect("run mklink /J hop2");
+    assert!(mk_hop2.status.success());
+
+    let chained_real_manifest = real_dir.join("com.localedr.bridge.chained.json");
+    let chained_hop2_manifest = hop2_dir.join("com.localedr.bridge.chained.json");
+    write_manifest_atomic(&chained_real_manifest, &manifest).unwrap();
+    let verbatim_real = format!(r"\\?\{}", chained_real_manifest.display());
+
+    let (u_key1b, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key1b
+        .set_value("", &chained_hop2_manifest.to_string_lossy().into_owned())
+        .unwrap();
+    let (p_key1b, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key1b.set_value("", &verbatim_real).unwrap();
+
+    let res_chained = run_unregister_with(
+        &UnregisterArgs {
+            scope: Scope::User,
+            browsers: vec![BrowserKind::Chrome],
+            manifest_dir: Some(hop2_dir.clone()),
+            keep_uri: true,
+            json: false,
+        },
+        &user_target,
+        Some(&peer_target),
+    )
+    .expect("unreg chained junction user");
+    assert!(
+        !res_chained.manifest_removed,
+        "2-hop local junction and \\\\?\\ verbatim peer reference must preserve shared manifest"
+    );
+    assert!(chained_real_manifest.is_file());
+    let _ = fs::remove_file(&chained_real_manifest);
+    fs::remove_dir(&hop2_dir).expect("remove hop2 junction");
+    fs::remove_dir(&hop1_dir).expect("remove hop1 junction");
+
     // 2. Hard link alias: distinct paths sharing the same NTFS file index must protect the manifest.
     let orig_manifest = real_dir.join("com.localedr.bridge.hardorig.json");
     let hardlink_manifest = temp.path().join("com.localedr.bridge.hardalias.json");
@@ -1435,6 +1511,169 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
     assert!(res_distinct.manifest_removed);
     assert!(!protected_manifest.exists());
     assert!(other_manifest.is_file());
+
+    // 5. Non-local peer registry entries (UNC, extended UNC, device, relative) must be skipped
+    // without invoking CreateFileW or touching SMB, allowing local manifest removal (SEC_0001).
+    let non_local_peer_entries = [
+        r"\\attacker.invalid\share\com.localedr.bridge.json",
+        "//attacker.invalid/share/com.localedr.bridge.json",
+        r"\\?\UNC\attacker.invalid\share\com.localedr.bridge.json",
+        r"\\.\pipe\localedr-nonlocal-probe",
+        r"relative\com.localedr.bridge.json",
+    ];
+    for (idx, non_local_entry) in non_local_peer_entries.iter().enumerate() {
+        let local_manifest = real_dir.join(format!("com.localedr.bridge.nonlocal-{idx}.json"));
+        write_manifest_atomic(&local_manifest, &manifest).unwrap();
+        let (u_key_nl, _) = hkcu
+            .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+            .unwrap();
+        u_key_nl
+            .set_value("", &local_manifest.to_string_lossy().into_owned())
+            .unwrap();
+        let (p_key_nl, _) = hkcu
+            .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+            .unwrap();
+        p_key_nl.set_value("", non_local_entry).unwrap();
+
+        let res_nl = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+            .expect("unreg with non-local peer entry");
+        assert!(
+            res_nl.manifest_removed,
+            "non-local peer entry '{non_local_entry}' must be skipped without blocking local unregister"
+        );
+        assert!(!local_manifest.exists());
+    }
+
+    // 6. Boundary checks for Layer 1 path parsing, Layer 2 drive types, and Layer 3 reparse targets.
+    use crate::setup::{
+        extract_local_drive_letter, is_local_drive_type, parse_reparse_data_buffer,
+        resolve_local_reparse_target, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
+        IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK, SYMLINK_FLAG_RELATIVE,
+    };
+
+    assert_eq!(
+        extract_local_drive_letter(Path::new(r"C:\ProgramData\LocalEDR\com.localedr.bridge.json")),
+        Some('C')
+    );
+    assert_eq!(
+        extract_local_drive_letter(Path::new("d:/LocalEDR/com.localedr.bridge.json")),
+        Some('D')
+    );
+    assert_eq!(
+        extract_local_drive_letter(Path::new(r"\\?\c:\LocalEDR\com.localedr.bridge.json")),
+        Some('C')
+    );
+    for rejected in [
+        r"\\server\share\com.localedr.bridge.json",
+        "//server/share/com.localedr.bridge.json",
+        r"\\?\UNC\server\share\com.localedr.bridge.json",
+        r"\\.\C:\com.localedr.bridge.json",
+        r"\\.\pipe\localedr-ipc",
+        r"\??\C:\com.localedr.bridge.json",
+        r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\com.localedr.bridge.json",
+        r"C:relative.json",
+        r"\root-relative\com.localedr.bridge.json",
+        r"relative\com.localedr.bridge.json",
+        r"\\?\C:\dir\..\com.localedr.bridge.json",
+        r"\\?\C:/slash/com.localedr.bridge.json",
+        "",
+    ] {
+        assert_eq!(
+            extract_local_drive_letter(Path::new(rejected)),
+            None,
+            "path must be rejected as non-local: '{rejected}'"
+        );
+    }
+
+    assert!(is_local_drive_type(DRIVE_REMOVABLE));
+    assert!(is_local_drive_type(DRIVE_FIXED));
+    assert!(is_local_drive_type(DRIVE_RAMDISK));
+    assert!(!is_local_drive_type(0)); // DRIVE_UNKNOWN
+    assert!(!is_local_drive_type(1)); // DRIVE_NO_ROOT_DIR
+    assert!(!is_local_drive_type(DRIVE_REMOTE));
+    assert!(!is_local_drive_type(5)); // DRIVE_CDROM
+
+    let build_reparse_buf = |tag: u32, sub_name: &str, flags: Option<u32>| -> Vec<u8> {
+        let wide_bytes: Vec<u8> = sub_name
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let sub_len = u16::try_from(wide_bytes.len()).unwrap();
+        let header_extra = if flags.is_some() { 12usize } else { 8usize };
+        let data_len = u16::try_from(header_extra + wide_bytes.len()).unwrap();
+        let mut buf = Vec::with_capacity(8 + usize::from(data_len));
+        buf.extend_from_slice(&tag.to_le_bytes());
+        buf.extend_from_slice(&data_len.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+        buf.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+        buf.extend_from_slice(&sub_len.to_le_bytes()); // SubstituteNameLength
+        buf.extend_from_slice(&0u16.to_le_bytes()); // PrintNameOffset
+        buf.extend_from_slice(&0u16.to_le_bytes()); // PrintNameLength
+        if let Some(f) = flags {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        buf.extend_from_slice(&wide_bytes);
+        buf
+    };
+
+    let link_path = Path::new(r"C:\Temp\links\alias");
+    let mp_local = build_reparse_buf(IO_REPARSE_TAG_MOUNT_POINT, r"\??\C:\Temp\real", None);
+    let parsed_mp = parse_reparse_data_buffer(&mp_local).expect("parse local mount point");
+    assert_eq!(parsed_mp.tag, IO_REPARSE_TAG_MOUNT_POINT);
+    assert!(!parsed_mp.is_relative);
+    assert_eq!(
+        resolve_local_reparse_target(&parsed_mp.substitute_name, parsed_mp.is_relative, link_path),
+        Some(PathBuf::from(r"C:\Temp\real"))
+    );
+
+    let sym_rel = build_reparse_buf(
+        IO_REPARSE_TAG_SYMLINK,
+        r"..\real\com.localedr.bridge.json",
+        Some(SYMLINK_FLAG_RELATIVE),
+    );
+    let parsed_rel = parse_reparse_data_buffer(&sym_rel).expect("parse relative symlink");
+    assert!(parsed_rel.is_relative);
+    assert_eq!(
+        resolve_local_reparse_target(
+            &parsed_rel.substitute_name,
+            parsed_rel.is_relative,
+            Path::new(r"C:\Temp\links\alias.json")
+        ),
+        Some(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
+    );
+
+    for (tag, target, flags) in [
+        (IO_REPARSE_TAG_SYMLINK, r"\??\UNC\evil.invalid\share\a.json", Some(0)),
+        (IO_REPARSE_TAG_SYMLINK, r"\\evil.invalid\share\a.json", Some(0)),
+        (IO_REPARSE_TAG_SYMLINK, r"\Device\Mup\evil.invalid\share", Some(0)),
+        (IO_REPARSE_TAG_SYMLINK, r"Device\Mup\evil.invalid\share", Some(0)),
+        (IO_REPARSE_TAG_SYMLINK, r"\Device\LanmanRedirector\evil.invalid\share", Some(0)),
+        (IO_REPARSE_TAG_SYMLINK, r"Device\LanmanRedirector\evil.invalid\share", Some(0)),
+        (
+            IO_REPARSE_TAG_SYMLINK,
+            r"\??\Volume{01234567-89ab-cdef-0123-456789abcdef}\a",
+            Some(0),
+        ),
+        (
+            IO_REPARSE_TAG_SYMLINK,
+            r"\\evil.invalid\share\a.json",
+            Some(SYMLINK_FLAG_RELATIVE),
+        ),
+        (IO_REPARSE_TAG_MOUNT_POINT, r"\??\UNC\evil.invalid\share", None),
+        (IO_REPARSE_TAG_MOUNT_POINT, r"\Device\Mup\evil.invalid\share", None),
+    ] {
+        let buf = build_reparse_buf(tag, target, flags);
+        let parsed = parse_reparse_data_buffer(&buf).expect("parse remote reparse buffer");
+        assert_eq!(
+            resolve_local_reparse_target(&parsed.substitute_name, parsed.is_relative, link_path),
+            None,
+            "remote/non-local reparse substitute target must be rejected: '{target}'"
+        );
+    }
+
+    // Unsupported/network reparse tag (e.g. IO_REPARSE_TAG_DFS = 0x8000_000A) must be rejected.
+    let dfs_buf = build_reparse_buf(0x8000_000A, r"\??\C:\Temp\real", None);
+    assert!(parse_reparse_data_buffer(&dfs_buf).is_none());
 }
 
 #[cfg(windows)]
@@ -1447,9 +1686,32 @@ fn bridge_16_known_folder_roots_ignore_poisoned_env_vars() {
     use std::process::Command;
 
     let assert_known_folders_clean = || {
-        let local_app_data =
-            win_pipe_auth::resolve_known_folder_path(&win_pipe_auth::FOLDERID_LOCAL_APP_DATA)
-                .expect("FOLDERID_LocalAppData must resolve even with poisoned env vars");
+        // 1. All 5 machine-wide Known Folders resolve with hToken = NULL and ignore poisoned env vars.
+        for (label, folder_id) in [
+            ("ProgramFiles", &win_pipe_auth::FOLDERID_PROGRAM_FILES),
+            ("ProgramFilesX64", &win_pipe_auth::FOLDERID_PROGRAM_FILES_X64),
+            ("ProgramFilesX86", &win_pipe_auth::FOLDERID_PROGRAM_FILES_X86),
+            ("System", &win_pipe_auth::FOLDERID_SYSTEM),
+            ("SystemX86", &win_pipe_auth::FOLDERID_SYSTEM_X86),
+        ] {
+            let resolved = win_pipe_auth::resolve_machine_known_folder_path(folder_id)
+                .unwrap_or_else(|| panic!("FOLDERID_{label} must resolve with hToken = NULL"));
+            assert!(
+                resolved.is_absolute(),
+                "FOLDERID_{label} must be absolute: {resolved:?}"
+            );
+            assert!(
+                !resolved
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("evilspoof"),
+                "FOLDERID_{label} must ignore poisoned env vars: {resolved:?}"
+            );
+        }
+
+        // 2. Per-user FOLDERID_LocalAppData resolves with TOKEN_QUERY | TOKEN_IMPERSONATE.
+        let local_app_data = win_pipe_auth::resolve_user_local_app_data_path()
+            .expect("FOLDERID_LocalAppData must resolve even with poisoned env vars");
         let local_lower = local_app_data.to_string_lossy().to_ascii_lowercase();
         assert!(
             local_lower.ends_with(r"\appdata\local"),
@@ -1459,14 +1721,25 @@ fn bridge_16_known_folder_roots_ignore_poisoned_env_vars() {
             !local_lower.contains("evilspoof"),
             "FOLDERID_LocalAppData must ignore poisoned USERPROFILE/LOCALAPPDATA: {local_app_data:?}"
         );
+
+        // 3. GetUserProfileDirectoryW (TOKEN_QUERY-only) fallback resolves cleanly without env vars.
+        let fallback_local_app_data =
+            win_pipe_auth::resolve_local_app_data_via_user_profile_dir()
+                .expect("GetUserProfileDirectoryW fallback must resolve without env vars");
+        let fallback_lower = fallback_local_app_data
+            .to_string_lossy()
+            .to_ascii_lowercase();
         assert!(
-            win_pipe_auth::resolve_known_folder_path(&win_pipe_auth::FOLDERID_PROGRAM_FILES)
-                .is_some(),
-            "FOLDERID_ProgramFiles must resolve"
+            fallback_lower.ends_with(r"\appdata\local"),
+            "unexpected GetUserProfileDirectoryW LocalAppData path: {fallback_local_app_data:?}"
         );
         assert!(
-            win_pipe_auth::resolve_known_folder_path(&win_pipe_auth::FOLDERID_SYSTEM).is_some(),
-            "FOLDERID_System must resolve"
+            !fallback_lower.contains("evilspoof"),
+            "GetUserProfileDirectoryW fallback must ignore poisoned env vars: {fallback_local_app_data:?}"
+        );
+        assert_eq!(
+            fallback_lower, local_lower,
+            "GetUserProfileDirectoryW fallback must agree with SHGetKnownFolderPath(LocalAppData)"
         );
 
         let roots = standard_browser_install_roots();
@@ -1517,7 +1790,7 @@ fn bridge_16_known_folder_roots_ignore_poisoned_env_vars() {
             data3: 0,
             data4: [0; 8],
         };
-        assert!(win_pipe_auth::resolve_known_folder_path(&invalid_guid).is_none());
+        assert!(win_pipe_auth::resolve_machine_known_folder_path(&invalid_guid).is_none());
     };
 
     if std::env::var_os("LEDR_TEST_BRIDGE16_CHILD").is_some() {
@@ -1770,4 +2043,165 @@ fn bridge_17_caller_chain_direct_cmd_mediated_rejections_and_status_policy() {
         assert!(text_present.contains("NativeHostsExecutablesLaunchDirectly=0 (cmd.exe mediated)"));
         assert!(text_present.contains("NativeHostsExecutablesLaunchDirectly=1 (direct)"));
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_18_cmd_mediated_pipe_inheritance_real_kernel() {
+    use crate::pipe_client::{standard_system_cmd_exe_paths, win_pipe_auth, StdHandleTransport};
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    if let Ok(gp_pid_str) = std::env::var("LEDR_TEST_BRIDGE18_GRANDPARENT_PID") {
+        let expected_gp_pid: u32 = gp_pid_str
+            .parse()
+            .expect("LEDR_TEST_BRIDGE18_GRANDPARENT_PID must be u32");
+        let stdin_transport =
+            win_pipe_auth::inspect_std_handle_transport(win_pipe_auth::STD_INPUT_HANDLE);
+        let stdout_transport =
+            win_pipe_auth::inspect_std_handle_transport(win_pipe_auth::STD_OUTPUT_HANDLE);
+
+        match stdin_transport {
+            StdHandleTransport::Pipe { pipe_server_pid } => {
+                if let Some(server_pid) = pipe_server_pid {
+                    assert_eq!(
+                        server_pid, expected_gp_pid,
+                        "stdin pipe server PID must match grandparent PID"
+                    );
+                }
+            }
+            StdHandleTransport::NonPipe => {
+                panic!("expected inherited STD_INPUT_HANDLE to be StdHandleTransport::Pipe");
+            }
+        }
+
+        match stdout_transport {
+            StdHandleTransport::Pipe { pipe_server_pid } => {
+                if let Some(server_pid) = pipe_server_pid {
+                    assert_eq!(
+                        server_pid, expected_gp_pid,
+                        "stdout pipe server PID must match grandparent PID"
+                    );
+                }
+            }
+            StdHandleTransport::NonPipe => {
+                panic!("expected inherited STD_OUTPUT_HANDLE to be StdHandleTransport::Pipe");
+            }
+        }
+
+        // Grandparent is the test binary (not Chrome/Edge/Brave), so production caller verification must fail closed.
+        assert!(
+            win_pipe_auth::verify_browser_parent_process().is_err(),
+            "cmd.exe mediated launch from non-browser grandparent must still be rejected"
+        );
+
+        println!(
+            "BRIDGE18_OK gp_pid={expected_gp_pid} stdin={stdin_transport:?} stdout={stdout_transport:?}"
+        );
+        return;
+    }
+
+    let cmd_exe = standard_system_cmd_exe_paths()
+        .into_iter()
+        .find(|p| p.is_file())
+        .expect("system cmd.exe must exist");
+    let test_exe = std::env::current_exe().expect("current test binary");
+    let gp_pid = std::process::id();
+
+    let create_inheritable_pipe = || -> (*mut c_void, *mut c_void) {
+        let sa = win_pipe_test_helpers::SecurityAttributes {
+            n_length: u32::try_from(std::mem::size_of::<win_pipe_test_helpers::SecurityAttributes>())
+                .unwrap(),
+            lp_security_descriptor: std::ptr::null_mut(),
+            b_inherit_handle: 1,
+        };
+        let mut read_h: *mut c_void = std::ptr::null_mut();
+        let mut write_h: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `read_h`, `write_h`, and `sa` are valid stack locals.
+        let ok = unsafe { win_pipe_test_helpers::CreatePipe(&mut read_h, &mut write_h, &sa, 0) };
+        assert_ne!(
+            ok,
+            0,
+            "CreatePipe failed: {}",
+            std::io::Error::last_os_error()
+        );
+        (read_h, write_h)
+    };
+
+    // Stdin pipe: child inherits read end; grandparent retains non-inheritable write end.
+    let (stdin_read_h, stdin_write_h) = create_inheritable_pipe();
+    // SAFETY: Both handles were freshly created by `CreatePipe`.
+    let stdin_child = unsafe { Stdio::from_raw_handle(stdin_read_h) };
+    // SAFETY: Owned handle retained by grandparent until child exits.
+    let stdin_parent_write = unsafe { File::from_raw_handle(stdin_write_h) };
+    // SAFETY: Clearing HANDLE_FLAG_INHERIT on a valid owned pipe handle.
+    let clear_in_ok = unsafe {
+        win_pipe_test_helpers::SetHandleInformation(
+            stdin_parent_write.as_raw_handle(),
+            win_pipe_test_helpers::HANDLE_FLAG_INHERIT,
+            0,
+        )
+    };
+    assert_ne!(clear_in_ok, 0, "SetHandleInformation(stdin_write) failed");
+
+    // Stdout pipe: child inherits write end; grandparent retains non-inheritable read end.
+    let (stdout_read_h, stdout_write_h) = create_inheritable_pipe();
+    // SAFETY: Both handles were freshly created by `CreatePipe`.
+    let mut stdout_parent_read = unsafe { File::from_raw_handle(stdout_read_h) };
+    // SAFETY: Owned handle transferred to `Stdio` for child inheritance.
+    let stdout_child = unsafe { Stdio::from_raw_handle(stdout_write_h) };
+    // SAFETY: Clearing HANDLE_FLAG_INHERIT on a valid owned pipe handle.
+    let clear_out_ok = unsafe {
+        win_pipe_test_helpers::SetHandleInformation(
+            stdout_parent_read.as_raw_handle(),
+            win_pipe_test_helpers::HANDLE_FLAG_INHERIT,
+            0,
+        )
+    };
+    assert_ne!(clear_out_ok, 0, "SetHandleInformation(stdout_read) failed");
+
+    let raw_cmd = format!(
+        "/D /C \"\"{}\" --exact tests::bridge_18_cmd_mediated_pipe_inheritance_real_kernel --nocapture\"",
+        test_exe.display()
+    );
+    let mut child = Command::new(&cmd_exe)
+        .raw_arg(&raw_cmd)
+        .env("LEDR_TEST_BRIDGE18_GRANDPARENT_PID", gp_pid.to_string())
+        .stdin(stdin_child)
+        .stdout(stdout_child)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cmd.exe /D /C grandchild");
+
+    let mut stderr_pipe = child.stderr.take().expect("captured stderr");
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let mut stdout_buf = Vec::new();
+    stdout_parent_read
+        .read_to_end(&mut stdout_buf)
+        .expect("read grandchild stdout pipe");
+    // Keep grandparent's stdin write handle open until grandchild completes and closes stdout.
+    drop(stdin_parent_write);
+
+    let status = child.wait().expect("wait cmd.exe child");
+    let stderr_text = stderr_thread.join().expect("join stderr reader");
+    let stdout_text = String::from_utf8_lossy(&stdout_buf);
+
+    assert!(
+        status.success(),
+        "cmd.exe mediated grandchild failed (status={status}):\nstdout: {stdout_text}\nstderr: {stderr_text}"
+    );
+    assert!(
+        stdout_text.contains("BRIDGE18_OK"),
+        "missing BRIDGE18_OK marker in grandchild stdout:\nstdout: {stdout_text}\nstderr: {stderr_text}"
+    );
+    println!("{stdout_text}");
 }

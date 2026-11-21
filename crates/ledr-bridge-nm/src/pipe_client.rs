@@ -448,9 +448,10 @@ pub(crate) mod win_pipe_auth {
     const KF_FLAG_DEFAULT_PATH: u32 = 0x0000_0400;
     const KF_FLAG_NO_ALIAS: u32 = 0x0000_1000;
     const KF_FLAG_DONT_VERIFY: u32 = 0x0000_4000;
+    const TOKEN_IMPERSONATE: u32 = 0x0004;
     const TOKEN_QUERY: u32 = 0x0008;
-    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
-    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    pub(crate) const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    pub(crate) const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
     const FILE_TYPE_PIPE: u32 = 0x0003;
     const INVALID_HANDLE_VALUE: isize = -1;
 
@@ -608,12 +609,21 @@ pub(crate) mod win_pipe_auth {
         fn CoTaskMemFree(pv: *mut c_void);
     }
 
+    #[link(name = "userenv.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    extern "system" {
+        fn GetUserProfileDirectoryW(
+            h_token: *mut c_void,
+            lp_profile_dir: *mut u16,
+            lpcch_size: *mut u32,
+        ) -> i32;
+    }
+
     struct OwnedWinHandle(*mut c_void);
 
     impl Drop for OwnedWinHandle {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                // SAFETY: `self.0` was returned by `OpenProcess` and is closed once on drop.
+                // SAFETY: `self.0` was returned by `OpenProcess` or `OpenProcessToken` and is closed once on drop.
                 unsafe {
                     let _ = CloseHandle(self.0);
                 }
@@ -634,26 +644,30 @@ pub(crate) mod win_pipe_auth {
         }
     }
 
-    pub(crate) fn resolve_known_folder_path(folder_id: &Guid) -> Option<PathBuf> {
+    fn open_current_process_token(desired_access: u32) -> Option<OwnedWinHandle> {
         let mut raw_token: *mut c_void = std::ptr::null_mut();
         // SAFETY: `GetCurrentProcess` returns the current process pseudo-handle; `raw_token` is a stack out-pointer.
         let token_ok =
-            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
+            unsafe { OpenProcessToken(GetCurrentProcess(), desired_access, &mut raw_token) };
         if token_ok == 0 || raw_token.is_null() {
             return None;
         }
-        let token_guard = OwnedWinHandle(raw_token);
+        Some(OwnedWinHandle(raw_token))
+    }
 
+    fn sh_get_known_folder_path_with_token(
+        folder_id: &Guid,
+        h_token: *mut c_void,
+    ) -> Option<PathBuf> {
         let mut raw_ptr: *mut u16 = std::ptr::null_mut();
-        // SAFETY: `folder_id` is a valid `KNOWNFOLDERID`, `token_guard.0` is a valid `TOKEN_QUERY` handle,
-        // and `raw_ptr` is a valid out-pointer. Passing the process token + `KF_FLAG_DEFAULT_PATH`
-        // resolves per-user folders from the OS profile database rather than `%USERPROFILE%` env vars or
-        // HKCU User Shell Folders redirection.
+        // SAFETY: `folder_id` is a valid `KNOWNFOLDERID`, `h_token` is either NULL (for machine-wide
+        // folders) or a valid process token handle with `TOKEN_QUERY | TOKEN_IMPERSONATE` (for
+        // per-user folders), and `raw_ptr` is a valid out-pointer.
         let hr = unsafe {
             SHGetKnownFolderPath(
                 folder_id as *const Guid,
                 KF_FLAG_DEFAULT_PATH | KF_FLAG_NO_ALIAS | KF_FLAG_DONT_VERIFY,
-                token_guard.0,
+                h_token,
                 &mut raw_ptr,
             )
         };
@@ -676,22 +690,80 @@ pub(crate) mod win_pipe_auth {
         Some(PathBuf::from(OsString::from_wide(wide)))
     }
 
+    /// Resolves machine-wide Known Folders (`ProgramFiles*`, `System*`) with `hToken = NULL` so
+    /// standard users and restricted tokens never require `TOKEN_IMPERSONATE` for fixed OS paths.
+    pub(crate) fn resolve_machine_known_folder_path(folder_id: &Guid) -> Option<PathBuf> {
+        sh_get_known_folder_path_with_token(folder_id, std::ptr::null_mut())
+    }
+
+    /// Fallback for `FOLDERID_LocalAppData` when `SHGetKnownFolderPath` with an explicit token fails
+    /// (e.g., under a restricted token without `TOKEN_IMPERSONATE`). Uses `GetUserProfileDirectoryW`
+    /// with a `TOKEN_QUERY`-only handle and never reads process environment variables.
+    pub(crate) fn resolve_local_app_data_via_user_profile_dir() -> Option<PathBuf> {
+        let token = open_current_process_token(TOKEN_QUERY)?;
+        let mut cap: u32 = 512;
+        for _ in 0..2 {
+            let mut buf = vec![0u16; cap as usize];
+            let mut size = cap;
+            // SAFETY: `token.0` is a valid `TOKEN_QUERY` handle and `buf` holds `size` writable `u16` units.
+            let ok = unsafe { GetUserProfileDirectoryW(token.0, buf.as_mut_ptr(), &mut size) };
+            if ok != 0 {
+                let used = usize::try_from(size).unwrap_or(buf.len()).min(buf.len());
+                let slice = &buf[..used];
+                let str_len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+                if str_len == 0 {
+                    return None;
+                }
+                let profile_dir = PathBuf::from(OsString::from_wide(&slice[..str_len]));
+                return Some(profile_dir.join("AppData").join("Local"));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER)
+                && size > cap
+                && size <= 32_768
+            {
+                cap = size;
+                continue;
+            }
+            return None;
+        }
+        None
+    }
+
+    /// Resolves per-user `FOLDERID_LocalAppData` using `TOKEN_QUERY | TOKEN_IMPERSONATE` (as
+    /// required by `SHGetKnownFolderPath` for explicit token handles), falling back to
+    /// `GetUserProfileDirectoryW` with `TOKEN_QUERY` rather than `hToken = NULL` (which expands
+    /// `%USERPROFILE%`).
+    pub(crate) fn resolve_user_local_app_data_path() -> Option<PathBuf> {
+        if let Some(token) = open_current_process_token(TOKEN_QUERY | TOKEN_IMPERSONATE) {
+            if let Some(path) =
+                sh_get_known_folder_path_with_token(&FOLDERID_LOCAL_APP_DATA, token.0)
+            {
+                return Some(path);
+            }
+        }
+        resolve_local_app_data_via_user_profile_dir()
+    }
+
     pub(crate) fn resolve_known_browser_roots() -> Vec<PathBuf> {
-        [
+        let mut roots: Vec<PathBuf> = [
             &FOLDERID_PROGRAM_FILES,
             &FOLDERID_PROGRAM_FILES_X64,
             &FOLDERID_PROGRAM_FILES_X86,
-            &FOLDERID_LOCAL_APP_DATA,
         ]
         .into_iter()
-        .filter_map(resolve_known_folder_path)
-        .collect()
+        .filter_map(resolve_machine_known_folder_path)
+        .collect();
+        if let Some(local_app_data) = resolve_user_local_app_data_path() {
+            roots.push(local_app_data);
+        }
+        roots
     }
 
     pub(crate) fn resolve_known_system_dirs() -> Vec<PathBuf> {
         [&FOLDERID_SYSTEM, &FOLDERID_SYSTEM_X86]
             .into_iter()
-            .filter_map(resolve_known_folder_path)
+            .filter_map(resolve_machine_known_folder_path)
             .collect()
     }
 
@@ -891,7 +963,7 @@ pub(crate) mod win_pipe_auth {
             })
     }
 
-    fn inspect_std_handle_transport(std_handle_id: u32) -> StdHandleTransport {
+    pub(crate) fn inspect_std_handle_transport(std_handle_id: u32) -> StdHandleTransport {
         // SAFETY: `GetStdHandle` returns a process-owned pseudo/standard handle (must not be closed).
         let handle = unsafe { GetStdHandle(std_handle_id) };
         if handle.is_null() || handle as isize == INVALID_HANDLE_VALUE {

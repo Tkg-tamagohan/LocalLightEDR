@@ -95,7 +95,7 @@ async function queryActiveTabUrl(tabsApi) {
   return null;
 }
 
-function findMatchingClickHint(hints, candidateUrls, now) {
+function findMatchingClickHint(hints, candidateUrls, referrer, now) {
   const targets = new Set();
   for (const raw of candidateUrls) {
     const norm = normalizeHttpUrl(raw, { stripHash: true });
@@ -104,6 +104,11 @@ function findMatchingClickHint(hints, candidateUrls, now) {
     }
   }
   if (targets.size === 0 || !Array.isArray(hints) || hints.length === 0) {
+    return null;
+  }
+  const normalizedReferrer = nonEmptyString(referrer);
+  const referrerOrigin = normalizedReferrer ? extractOrigin(normalizedReferrer) : null;
+  if (normalizedReferrer && !referrerOrigin) {
     return null;
   }
   for (let i = hints.length - 1; i >= 0; i--) {
@@ -117,22 +122,36 @@ function findMatchingClickHint(hints, candidateUrls, now) {
     }
     const hintTarget = normalizeHttpUrl(hint.targetUrl, { stripHash: true });
     const hintTab = normalizeHttpUrl(hint.tabUrl);
-    if (hintTarget && hintTab && targets.has(hintTarget)) {
-      return hintTab;
+    if (!hintTarget || !hintTab || !targets.has(hintTarget)) {
+      continue;
     }
+    const hintFrame = normalizeHttpUrl(hint.frameUrl) || hintTab;
+    if (referrerOrigin) {
+      const hintOrigin = extractOrigin(hintFrame);
+      if (!hintOrigin || hintOrigin !== referrerOrigin) {
+        continue;
+      }
+    }
+    return {
+      tabUrl: hintTab,
+      frameUrl: hintFrame,
+    };
   }
   return null;
 }
 
 /**
  * Records a short-TTL `<a href>` click hint into `chrome.storage.session` (15s TTL, capped at 32).
+ * Keeps top-level `tabUrl` separate from clicking `frameUrl` (defaults to `tabUrl` when omitted)
+ * so cross-origin iframe clicks can still match `DownloadItem.referrer` against `frameUrl`.
  */
-export async function recordDownloadClickHint({ targetUrl, tabUrl }, deps) {
+export async function recordDownloadClickHint({ targetUrl, tabUrl, frameUrl }, deps) {
   const normTarget = normalizeHttpUrl(targetUrl, { stripHash: true });
   const normTab = normalizeHttpUrl(tabUrl);
   if (!normTarget || !normTab) {
     return null;
   }
+  const normFrame = normalizeHttpUrl(frameUrl) || normTab;
   const { storageSession, nowFn = () => Date.now() } = deps;
   const now = nowFn();
   const existing = await readClickHintList(storageSession);
@@ -145,6 +164,7 @@ export async function recordDownloadClickHint({ targetUrl, tabUrl }, deps) {
   const entry = {
     targetUrl: normTarget,
     tabUrl: normTab,
+    frameUrl: normFrame,
     clickedAtMs: now,
   };
   fresh.push(entry);
@@ -175,7 +195,8 @@ export async function pruneStaleDownloadClickHints(
  * Records download creation metadata into `chrome.storage.session` (FIFO capped at 512).
  *
  * Resolves `tabUrl` without assuming `DownloadItem.tabId`:
- * 1. Fresh `<a href>` click hint matching `url` or `finalUrl` (15s TTL)
+ * 1. Fresh `<a href>` click hint matching `url` or `finalUrl` (15s TTL) whose clicking frame
+ *    origin is consistent with `referrer` when `referrer` is present
  * 2. `referrer` (enriched with active tab URL if same origin)
  * 3. Active tab URL if same origin as the download URL
  * 4. Empty string `""` when cross-origin initiation tab cannot be determined
@@ -192,22 +213,32 @@ export async function handleDownloadCreated(downloadItem, deps) {
   const downloadSourceUrl = finalUrl || url;
 
   const clickHints = await readClickHintList(storageSession);
-  let tabUrl = findMatchingClickHint(clickHints, [url, finalUrl], now) || "";
+  const matchedHint = findMatchingClickHint(clickHints, [url, finalUrl], referrer, now);
+  let tabUrl = "";
+  let tabUrlSource = "none";
+  let clickHintFrameUrl = null;
 
-  if (!tabUrl) {
+  if (matchedHint) {
+    tabUrl = matchedHint.tabUrl;
+    tabUrlSource = "click_hint";
+    clickHintFrameUrl = matchedHint.frameUrl;
+  } else {
     const activeTabUrl = await queryActiveTabUrl(tabsApi);
     const activeOrigin = extractOrigin(activeTabUrl);
     if (referrer) {
       const referrerOrigin = extractOrigin(referrer);
       if (activeTabUrl && activeOrigin && referrerOrigin && activeOrigin === referrerOrigin) {
         tabUrl = activeTabUrl;
+        tabUrlSource = "active_tab_referrer";
       } else {
         tabUrl = referrer;
+        tabUrlSource = "referrer";
       }
     } else if (activeTabUrl && activeOrigin) {
       const sourceOrigin = extractOrigin(downloadSourceUrl);
       if (sourceOrigin && activeOrigin === sourceOrigin) {
         tabUrl = activeTabUrl;
+        tabUrlSource = "active_tab_source";
       }
     }
   }
@@ -218,6 +249,8 @@ export async function handleDownloadCreated(downloadItem, deps) {
     finalUrl,
     referrer,
     tabUrl,
+    tabUrlSource,
+    clickHintFrameUrl,
     createdAtMs: now,
   };
 
@@ -261,7 +294,16 @@ export async function handleDownloadChanged(delta, deps) {
     nonEmptyString(item?.url) ||
     nonEmptyString(pending?.finalUrl) ||
     nonEmptyString(pending?.url);
-  const tabUrl = nonEmptyString(pending?.tabUrl) || referrerUrl || "";
+  let tabUrl = nonEmptyString(pending?.tabUrl) || referrerUrl || "";
+  if (pending?.tabUrlSource === "click_hint" && referrerUrl) {
+    const referrerOrigin = extractOrigin(referrerUrl);
+    const hintOrigin = extractOrigin(
+      nonEmptyString(pending?.clickHintFrameUrl) || nonEmptyString(pending?.tabUrl)
+    );
+    if (!referrerOrigin || !hintOrigin || referrerOrigin !== hintOrigin) {
+      tabUrl = referrerUrl;
+    }
+  }
   if (!tabUrl && !downloadSourceUrl) {
     return null;
   }

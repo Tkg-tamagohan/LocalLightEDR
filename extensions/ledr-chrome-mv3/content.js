@@ -600,7 +600,11 @@
       return null;
     }
     try {
-      const parsed = new URL(rawHref, window.location.href);
+      const baseUrl =
+        (typeof anchor.baseURI === "string" && anchor.baseURI.trim()) ||
+        (typeof document.baseURI === "string" && document.baseURI.trim()) ||
+        window.location.href;
+      const parsed = new URL(rawHref, baseUrl);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         return null;
       }

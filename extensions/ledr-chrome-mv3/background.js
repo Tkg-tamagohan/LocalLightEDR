@@ -325,10 +325,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               : typeof message.pageUrl === "string"
                 ? message.pageUrl.trim()
                 : "";
+          const senderFrameUrl =
+            typeof sender?.url === "string" && sender.url.trim()
+              ? sender.url.trim()
+              : typeof message.pageUrl === "string" && message.pageUrl.trim()
+                ? message.pageUrl.trim()
+                : senderTabUrl;
           const recorded = await recordDownloadClickHint(
             {
               targetUrl: message.targetUrl,
               tabUrl: senderTabUrl,
+              frameUrl: senderFrameUrl,
             },
             { storageSession: chrome.storage.session }
           );

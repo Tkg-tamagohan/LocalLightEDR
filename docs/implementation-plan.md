@@ -549,10 +549,11 @@ Phase 3 の実装項目 4 件は合成自動テストに合格して `main` へ�
 - [x] `crates/ledr-bridge-nm` に Native Messaging ブリッジ CLI とマニフェスト、レジストリ、`ledr://` URI スキームの自動登録コマンドを実装する（PR #26、`6bb8bd3` にて `main` マージ済み）
 - [x] `extensions/ledr-chrome-mv3` に固定公開鍵 ID、DNR ブロックルール、ClickFix と Pastejacking の検知、NRD やホモグラフ URL 上のパスワード入力警告、および `downloads.onCreated` と `onChanged` の連携を実装する（PR #26、`6bb8bd3` にて `main` マージ済み）
 - [x] `crates/ledr-sensor-win`、`crates/ledr-daemon`、`crates/ledr-store` に `:Zone.Identifier` 読み取り、`download_origins` 保存、および 3 段階 MOTW 紐付けを実装する（PR #25、`cf7e866` にて `main` マージ済み）
-- [ ] `apps/ledr-ui` の View 1〜3 へブラウザ由来のダウンロード元 URL、リファラ、および拡張ステータス表示を統合する
+- [x] `apps/ledr-ui` の View 1〜3 へブラウザ由来のダウンロード元 URL、リファラ、および拡張ステータス表示を統合する（PR #28、`331602d` にて `main` マージ済み）
 - [ ] 実機 Chrome E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[phase4-e2e-runbook.md](phase4-e2e-runbook.md) および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-02` 参照）
 
 受け入れ条件として、ローカルテストページでの疑似 ClickFix コピー試行および NRD パスワード入力時にブラウザ内警告とデーモン記録が動作すること、また Chrome でダウンロードしたテストバイナリの起動時にダウンロード元 URL とリファラが自動紐付けされて UI へ表示されることを確認する。
+Phase 4 の実装項目 4 件は合成自動テストに合格して `main` へマージ済み（PR #25 `cf7e866`、PR #26 `6bb8bd3`、PR #28 `331602d`）であり、実機依存の受け入れ検証項目のみ未完了（`[ ]`）として独立した実機 E2E 検証 PR で実施する予定である（[phase4-e2e-runbook.md](phase4-e2e-runbook.md) および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-02`、副次申し送り `FU-P4-01` 参照）。
 
 ## 検証計画
 
@@ -580,7 +581,7 @@ cargo test -p ledr-store --test ttl_purge_lineage --locked
 
 ## 引き継ぎと次セッションへの移行手順
 
-Phase 0 から Phase 3 までの実装、ならびに Phase 4 のコア追跡基盤（PR #25）とブリッジおよび拡張（PR #26）は `main` ブランチへマージ済みであり、残作業は Phase 4 UI 統合（PR 4C）のマージと実機 E2E 検証（`FU-E2E-01`、`FU-E2E-02`）に分かれる。
+Phase 0 から Phase 4 までの全実装項目（Phase 4 は PR #25、PR #26、PR #28）は `main` ブランチへマージ済みであり、残作業は実機 E2E 検証（`FU-E2E-01`、`FU-E2E-02`）と副次申し送り（`FU-P3-01`、`FU-P4-01`）である。
 後続の作業はいずれも新しいセッションで開始する。
 
 ### 現在地の確認方法

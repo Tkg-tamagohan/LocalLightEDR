@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle as ThreadJoinHandle;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ledr_proto::{
     AlertRecord, AlertSeverity, AlertStatus, BrowserSecurityEventType, DownloadOriginRecord,
@@ -18,8 +18,6 @@ use ledr_sensor_win::MotwZoneInfo;
 use ledr_store::{LedrStore, StoreError};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
-
-use crate::firewall::WfpRuleManager;
 
 use super::{current_unix_ms, BinaryInspector, DaemonEngine};
 
@@ -152,53 +150,76 @@ pub(super) fn refresh_download_origins_after_purge(
     state: &AtomicU64,
     store: &LedrStore,
     before_state: u64,
+    downloads_deleted: usize,
 ) {
-    if !download_origin_has_any(before_state) {
+    if downloads_deleted == 0 && !download_origin_has_any(before_state) {
         return;
     }
-    match store.has_any_download_origins() {
-        Ok(false) => {
-            // Clear bit 0 only if no concurrent download incremented `generation`.
-            let _ = state.compare_exchange(
-                before_state,
-                before_state & !1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
-        Ok(true) => {}
+    let table_now_empty = match store.has_any_download_origins() {
+        Ok(false) => true,
+        Ok(true) => false,
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 "failed checking download_origins existence after TTL purge"
             );
+            false
         }
+    };
+    if downloads_deleted > 0 {
+        // Atomically advance `generation` whenever at least one download row was purged so Stage 2
+        // lookup entries for removed rows are immediately invalidated even if other rows remain.
+        // Only clear the presence bit when SQLite is confirmed empty and no concurrent download
+        // updated `state` since `before_state`.
+        let mut cur = state.load(Ordering::Acquire);
+        loop {
+            let next_gen = (cur >> 1).wrapping_add(1);
+            let next_has_bit = if table_now_empty && cur == before_state {
+                0
+            } else {
+                cur & 1
+            };
+            let next = (next_gen << 1) | next_has_bit;
+            match state.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    } else if table_now_empty {
+        // Clear bit 0 only if no concurrent download incremented `generation`.
+        let _ = state.compare_exchange(
+            before_state,
+            before_state & !1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Stage2CacheKey {
-    exe_key: String,
-    file_size: u64,
-    mtime_ns: u128,
+    sha256: String,
     generation: u64,
 }
 
 #[derive(Debug, Clone)]
 struct Stage2CacheEntry {
-    sha256: String,
     record: Option<DownloadOriginRecord>,
     cached_at: Instant,
 }
 
-/// Bounded cache storing per-binary Stage 2 SHA-256 and `download_origins` lookup outcomes
-/// keyed by `(exe_key, file_size, mtime_ns, download_origin_generation)`.
+/// Bounded cache storing Stage 2 `download_origins` lookup outcomes keyed by
+/// `(sha256, download_origin_generation)`.
+///
+/// The binary SHA-256 is always recomputed from current file contents (`BinaryInspector::compute_sha256`)
+/// so same-size, same-mtime binary replacements never reuse stale hashes or download origins.
 #[derive(Debug)]
 pub(super) struct MotwStage2Cache {
     capacity: usize,
     ttl: Duration,
     entries: HashMap<Stage2CacheKey, Stage2CacheEntry>,
     fifo: VecDeque<Stage2CacheKey>,
+    hits: u64,
 }
 
 impl MotwStage2Cache {
@@ -208,10 +229,11 @@ impl MotwStage2Cache {
             ttl: Duration::from_secs(ttl_secs.max(1)),
             entries: HashMap::new(),
             fifo: VecDeque::new(),
+            hits: 0,
         }
     }
 
-    fn get(&mut self, key: &Stage2CacheKey) -> Option<(String, Option<DownloadOriginRecord>)> {
+    fn get(&mut self, key: &Stage2CacheKey) -> Option<Option<DownloadOriginRecord>> {
         let expired = self
             .entries
             .get(key)
@@ -220,12 +242,14 @@ impl MotwStage2Cache {
             self.entries.remove(key);
             return None;
         }
-        self.entries
-            .get(key)
-            .map(|entry| (entry.sha256.clone(), entry.record.clone()))
+        if let Some(entry) = self.entries.get(key) {
+            self.hits = self.hits.saturating_add(1);
+            return Some(entry.record.clone());
+        }
+        None
     }
 
-    fn insert(&mut self, key: Stage2CacheKey, sha256: String, record: Option<DownloadOriginRecord>) {
+    fn insert(&mut self, key: Stage2CacheKey, record: Option<DownloadOriginRecord>) {
         if !self.entries.contains_key(&key) {
             while self.entries.len() >= self.capacity {
                 let Some(oldest) = self.fifo.pop_front() else {
@@ -243,20 +267,30 @@ impl MotwStage2Cache {
         self.entries.insert(
             key,
             Stage2CacheEntry {
-                sha256,
                 record,
                 cached_at: Instant::now(),
             },
         );
     }
+
+    fn hits(&self) -> u64 {
+        self.hits
+    }
 }
 
-/// Delayed MOTW attribution sent from the worker pool when synchronous wait budget expired or
-/// workers were saturated.
+/// Delayed MOTW attribution sent from the worker pool when synchronous wait budget expired,
+/// workers were saturated, or a startup seed executable group completed background lookup.
 #[derive(Debug, Clone)]
 pub(super) struct LateMotwAttribution {
-    pub(super) instance_id: String,
+    pub(super) instance_ids: Vec<String>,
     pub(super) attribution: MotwAttribution,
+}
+
+/// Deduplicated startup seed group sharing one normalized executable path (`WfpRuleManager::exe_key`).
+#[derive(Debug, Clone)]
+pub(super) struct SeedMotwGroup {
+    pub(super) exe_path: String,
+    pub(super) instance_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +318,10 @@ enum MotwIoJob {
         exe_path: String,
         reply: Option<oneshot::Sender<Option<MotwAttribution>>>,
     },
+    ResolveSeedGroup {
+        exe_path: String,
+        instance_ids: Vec<String>,
+    },
     InspectDownloadFile {
         normalized_path: String,
         max_hash_bytes: u64,
@@ -294,6 +332,8 @@ enum MotwIoJob {
 
 struct MotwIoQueueState {
     queue: VecDeque<MotwIoJob>,
+    seed_backlog: VecDeque<SeedMotwGroup>,
+    seed_backlog_capacity: usize,
     closed: bool,
 }
 
@@ -308,9 +348,56 @@ struct MotwWorkerHandle {
 pub(super) struct MotwIoWorkerPool {
     queue_pair: Arc<(Mutex<MotwIoQueueState>, Condvar)>,
     busy_workers: Arc<AtomicUsize>,
+    late_send_waiters: Arc<AtomicUsize>,
     active_cancels: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
     shutdown_requested: Arc<AtomicBool>,
     workers: Mutex<Vec<MotwWorkerHandle>>,
+}
+
+struct LateWaiterGuard<'a>(&'a AtomicUsize);
+
+impl Drop for LateWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn send_late_attribution_cancellable(
+    late_tx: &mpsc::Sender<LateMotwAttribution>,
+    mut item: LateMotwAttribution,
+    shutdown_flag: &AtomicBool,
+    queue_pair: &(Mutex<MotwIoQueueState>, Condvar),
+    late_send_waiters: &AtomicUsize,
+) {
+    const RETRY_SLICE: Duration = Duration::from_millis(5);
+    if shutdown_flag.load(Ordering::Acquire) {
+        return;
+    }
+    match late_tx.try_send(item) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+        Err(mpsc::error::TrySendError::Full(returned)) => {
+            item = returned;
+        }
+    }
+    late_send_waiters.fetch_add(1, Ordering::AcqRel);
+    let _waiter_guard = LateWaiterGuard(late_send_waiters);
+    loop {
+        if shutdown_flag.load(Ordering::Acquire) {
+            return;
+        }
+        match late_tx.try_send(item) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                item = returned;
+                let (lock, cvar) = queue_pair;
+                let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if state.closed || shutdown_flag.load(Ordering::Acquire) {
+                    return;
+                }
+                let _ = cvar.wait_timeout(state, RETRY_SLICE);
+            }
+        }
+    }
 }
 
 struct InFlightWorkerGuard {
@@ -381,16 +468,20 @@ impl MotwIoWorkerPool {
         download_origin_state: Arc<AtomicU64>,
         stage2_cache: Arc<Mutex<MotwStage2Cache>>,
         download_hash_max_bytes: u64,
+        seed_backlog_capacity: usize,
         late_tx: mpsc::Sender<LateMotwAttribution>,
     ) -> Self {
         let queue_pair = Arc::new((
             Mutex::new(MotwIoQueueState {
                 queue: VecDeque::new(),
+                seed_backlog: VecDeque::new(),
+                seed_backlog_capacity: seed_backlog_capacity.max(256),
                 closed: false,
             }),
             Condvar::new(),
         ));
         let busy_workers = Arc::new(AtomicUsize::new(0));
+        let late_send_waiters = Arc::new(AtomicUsize::new(0));
         let active_cancels = Arc::new(Mutex::new(Vec::<Arc<AtomicBool>>::new()));
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::with_capacity(MOTW_IO_WORKERS);
@@ -398,6 +489,7 @@ impl MotwIoWorkerPool {
         for idx in 0..MOTW_IO_WORKERS {
             let qp = Arc::clone(&queue_pair);
             let busy = Arc::clone(&busy_workers);
+            let late_waiters = Arc::clone(&late_send_waiters);
             let cancels = Arc::clone(&active_cancels);
             let shutdown_flag = Arc::clone(&shutdown_requested);
             let w_store = store.clone();
@@ -419,6 +511,7 @@ impl MotwIoWorkerPool {
                     let (
                         qp,
                         busy,
+                        late_waiters,
                         cancels,
                         shutdown_flag,
                         w_store,
@@ -430,6 +523,7 @@ impl MotwIoWorkerPool {
                     ) = (
                         qp,
                         busy,
+                        late_waiters,
                         cancels,
                         shutdown_flag,
                         w_store,
@@ -450,6 +544,13 @@ impl MotwIoWorkerPool {
                                     // `busy_workers + queue.len()` never undercounts popped work.
                                     busy.fetch_add(1, Ordering::AcqRel);
                                     break Some(job);
+                                }
+                                if let Some(seed_group) = state.seed_backlog.pop_front() {
+                                    busy.fetch_add(1, Ordering::AcqRel);
+                                    break Some(MotwIoJob::ResolveSeedGroup {
+                                        exe_path: seed_group.exe_path,
+                                        instance_ids: seed_group.instance_ids,
+                                    });
                                 }
                                 if state.closed || shutdown_flag.load(Ordering::Acquire) {
                                     break None;
@@ -485,20 +586,64 @@ impl MotwIoWorkerPool {
                                 match reply {
                                     Some(tx) => {
                                         if let Err(Some(late_attr)) = tx.send(attr) {
-                                            let _ = w_late_tx.try_send(LateMotwAttribution {
-                                                instance_id,
-                                                attribution: late_attr,
-                                            });
+                                            if !instance_id.is_empty() {
+                                                send_late_attribution_cancellable(
+                                                    &w_late_tx,
+                                                    LateMotwAttribution {
+                                                        instance_ids: vec![instance_id],
+                                                        attribution: late_attr,
+                                                    },
+                                                    &shutdown_flag,
+                                                    &qp,
+                                                    &late_waiters,
+                                                );
+                                            }
                                         }
                                     }
                                     None => {
                                         if let Some(late_attr) = attr {
-                                            let _ = w_late_tx.try_send(LateMotwAttribution {
-                                                instance_id,
-                                                attribution: late_attr,
-                                            });
+                                            if !instance_id.is_empty() {
+                                                send_late_attribution_cancellable(
+                                                    &w_late_tx,
+                                                    LateMotwAttribution {
+                                                        instance_ids: vec![instance_id],
+                                                        attribution: late_attr,
+                                                    },
+                                                    &shutdown_flag,
+                                                    &qp,
+                                                    &late_waiters,
+                                                );
+                                            }
                                         }
                                     }
+                                }
+                            }
+                            MotwIoJob::ResolveSeedGroup {
+                                exe_path,
+                                instance_ids,
+                            } => {
+                                let attr = resolve_process_motw_core(
+                                    &w_store,
+                                    &*w_inspector,
+                                    &*w_motw,
+                                    &w_dl_state,
+                                    &w_cache,
+                                    download_hash_max_bytes,
+                                    &exe_path,
+                                    None,
+                                    false,
+                                );
+                                if let Some(late_attr) = attr {
+                                    send_late_attribution_cancellable(
+                                        &w_late_tx,
+                                        LateMotwAttribution {
+                                            instance_ids,
+                                            attribution: late_attr,
+                                        },
+                                        &shutdown_flag,
+                                        &qp,
+                                        &late_waiters,
+                                    );
                                 }
                             }
                             MotwIoJob::InspectDownloadFile {
@@ -590,10 +735,55 @@ impl MotwIoWorkerPool {
         Self {
             queue_pair,
             busy_workers,
+            late_send_waiters,
             active_cancels,
             shutdown_requested,
             workers: Mutex::new(workers),
         }
+    }
+
+    pub(super) fn notify_late_result_consumed(&self) {
+        if self.late_send_waiters.load(Ordering::Acquire) > 0 {
+            let (lock, cvar) = &*self.queue_pair;
+            let _state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            cvar.notify_all();
+        }
+    }
+
+    pub(super) fn submit_seed_motw_groups(&self, groups: Vec<SeedMotwGroup>) -> usize {
+        if groups.is_empty() || self.shutdown_requested.load(Ordering::Acquire) {
+            return 0;
+        }
+        let (lock, cvar) = &*self.queue_pair;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut accepted = 0usize;
+        let mut skipped = 0usize;
+        for group in groups {
+            if group.instance_ids.is_empty() || group.exe_path.is_empty() {
+                continue;
+            }
+            if state.seed_backlog.len() >= state.seed_backlog_capacity {
+                skipped += 1;
+                continue;
+            }
+            state.seed_backlog.push_back(group);
+            accepted += 1;
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                accepted,
+                skipped,
+                seed_backlog_capacity = state.seed_backlog_capacity,
+                "MOTW seed backlog reached capacity; skipping excess startup groups"
+            );
+        }
+        if accepted > 0 {
+            cvar.notify_all();
+        }
+        accepted
     }
 
     pub(super) fn submit_process_motw(
@@ -683,6 +873,7 @@ impl MotwIoWorkerPool {
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
         state.queue.clear();
+        state.seed_backlog.clear();
         cvar.notify_all();
     }
 
@@ -903,14 +1094,6 @@ fn persist_download_origin_idempotent(
     Ok(record)
 }
 
-fn mtime_unix_ns(meta: &std::fs::Metadata) -> Option<u128> {
-    meta.modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_nanos())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_process_motw_core(
     store: &LedrStore,
@@ -1015,45 +1198,32 @@ pub(super) fn resolve_process_motw_core(
         }
 
         if stage2_allowed_after_stage1 {
-            let cache_key = if precomputed_stage2_sha.is_none() {
-                meta_res.as_ref().ok().and_then(|meta| {
-                    mtime_unix_ns(meta).map(|mtime_ns| Stage2CacheKey {
-                        exe_key: WfpRuleManager::exe_key(&normalized_exe),
-                        file_size: meta.len(),
-                        mtime_ns,
-                        generation,
-                    })
-                })
-            } else {
-                None
-            };
-
-            let cached_stage2 = cache_key.as_ref().and_then(|key| {
-                stage2_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(key)
+            let computed = precomputed_stage2_sha.or_else(|| {
+                inspector
+                    .compute_sha256(&normalized_exe)
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
             });
 
             let matched_stage2: Option<(String, DownloadOriginRecord)> =
-                if let Some((cached_hash, cached_rec)) = cached_stage2 {
-                    cached_rec.map(|rec| (cached_hash, rec))
-                } else {
-                    let computed = precomputed_stage2_sha.or_else(|| {
-                        inspector
-                            .compute_sha256(&normalized_exe)
-                            .map(|h| h.trim().to_ascii_lowercase())
-                            .filter(|h| !h.is_empty())
-                    });
-                    if let Some(clean_hash) = computed {
+                if let Some(clean_hash) = computed {
+                    let cache_key = Stage2CacheKey {
+                        sha256: clean_hash.clone(),
+                        generation,
+                    };
+                    let cached_stage2 = stage2_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&cache_key);
+                    if let Some(cached_rec) = cached_stage2 {
+                        cached_rec.map(|rec| (clean_hash, rec))
+                    } else {
                         match store.find_download_origin_by_sha256(&clean_hash) {
                             Ok(rec_opt) => {
-                                if let Some(key) = cache_key {
-                                    stage2_cache
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .insert(key, clean_hash.clone(), rec_opt.clone());
-                                }
+                                stage2_cache
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(cache_key, rec_opt.clone());
                                 rec_opt.map(|rec| (clean_hash, rec))
                             }
                             Err(err) => {
@@ -1065,9 +1235,9 @@ pub(super) fn resolve_process_motw_core(
                                 None
                             }
                         }
-                    } else {
-                        None
                     }
+                } else {
+                    None
                 };
 
             if let Some((clean_hash, rec)) = matched_stage2 {
@@ -1113,6 +1283,15 @@ impl DaemonEngine {
     #[doc(hidden)]
     pub fn has_download_origins_cached(&self) -> bool {
         download_origin_has_any(self.download_origin_state.load(Ordering::Acquire))
+    }
+
+    /// Returns cumulative Stage 2 `(sha256, generation)` SQLite lookup cache hits.
+    #[doc(hidden)]
+    pub fn motw_stage2_cache_hits(&self) -> u64 {
+        self.motw_stage2_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hits()
     }
 
     /// Synchronously records a completed browser download's origin metadata (`ReportDownloadOrigin`),
@@ -1263,7 +1442,8 @@ impl DaemonEngine {
 
     /// Resolves MOTW provenance for a starting process in 3 stages:
     /// 1. Case-insensitive `download_origins.file_path` with current-binary SHA-256 verification
-    /// 2. `download_origins.sha256` (when file size `<= download_hash_max_bytes`, cached per binary/generation)
+    /// 2. `download_origins.sha256` (when file size `<= download_hash_max_bytes`, computing fresh
+    ///    SHA-256 and caching SQLite lookup results by `(sha256, generation)`)
     /// 3. NTFS `:Zone.Identifier` ADS (`ZoneId >= 3`)
     ///
     /// Skips exited snapshots, `skip_store_ingest` absorbs, empty paths, and `ProtectedOs` binaries.
@@ -1335,21 +1515,8 @@ impl DaemonEngine {
         }
     }
 
-    pub(super) fn submit_process_motw_nonblocking(
-        &self,
-        instance_id: &str,
-        exe_path: &str,
-        exited_at_ms: Option<i64>,
-        skip_store_ingest: bool,
-    ) {
-        let Some(normalized_exe) =
-            Self::should_schedule_process_motw(exe_path, exited_at_ms, skip_store_ingest)
-        else {
-            return;
-        };
-        let _ = self
-            .motw_pool
-            .submit_process_motw(instance_id.to_string(), normalized_exe, false);
+    pub(super) fn submit_seed_motw_groups(&self, groups: Vec<SeedMotwGroup>) -> usize {
+        self.motw_pool.submit_seed_motw_groups(groups)
     }
 
     /// Validates, deduplicates (30 s window, max 256 entries), and persists a `LAYER_4_BROWSER`

@@ -24,6 +24,13 @@ use super::domain_policy::{
 use super::events::ResolvedProcessContext;
 use super::DaemonEngine;
 
+/// Per-process alert deduplication key for enforced (suspension/WFP-containment) outbound alerts.
+pub(super) const NET_OUTBOUND_ENFORCE_DEDUP_KEY: &str = "NET_OUTBOUND";
+
+/// Per-process alert deduplication key for observe-only outbound alerts (e.g. `Audit` mode or
+/// non-MOTW `GeneralUnknown` processes in `PreemptiveOnly` mode before delayed MOTW elevation).
+pub(super) const NET_OUTBOUND_OBSERVE_DEDUP_KEY: &str = "NET_OUTBOUND_OBSERVE";
+
 impl DaemonEngine {
     pub(super) fn resolve_effective_domain_candidates(
         &self,
@@ -292,10 +299,25 @@ impl DaemonEngine {
             risk
         };
 
+        let should_enforce_for_path = match self.config.outbound_enforcement_mode {
+            OutboundEnforcementMode::Enforce => true,
+            OutboundEnforcementMode::PreemptiveOnly => {
+                matches!(
+                    effective_risk,
+                    OutboundRiskClass::HighRiskPath | OutboundRiskClass::ScriptInterpreter
+                )
+            }
+            OutboundEnforcementMode::Audit => false,
+        };
+        let path_dedup_key = if should_enforce_for_path {
+            NET_OUTBOUND_ENFORCE_DEDUP_KEY
+        } else {
+            NET_OUTBOUND_OBSERVE_DEDUP_KEY
+        };
         let already_outbound_alerted = proc_ctx
             .proc_instance_id
             .as_deref()
-            .is_some_and(|inst_id| self.has_rule_alert_emitted(inst_id, "NET_OUTBOUND"));
+            .is_some_and(|inst_id| self.has_rule_alert_emitted(inst_id, path_dedup_key));
         let (rules, rules_loaded) = match self.store.list_network_rules() {
             Ok(rules) => (rules, true),
             Err(err) => {
@@ -666,6 +688,11 @@ impl DaemonEngine {
                     }
                     OutboundEnforcementMode::Audit => false,
                 };
+                let outbound_dedup_key = if should_enforce {
+                    NET_OUTBOUND_ENFORCE_DEDUP_KEY
+                } else {
+                    NET_OUTBOUND_OBSERVE_DEDUP_KEY
+                };
                 // Respect per-process AllowOnce grant (only when no NetworkBlock matched above).
                 if let Some(inst_id) = proc_ctx.proc_instance_id.as_deref() {
                     if self
@@ -695,10 +722,15 @@ impl DaemonEngine {
                     return ("ALLOWED", false);
                 }
                 if let Some(inst_id) = proc_ctx.proc_instance_id.as_deref() {
-                    if already_outbound_alerted {
+                    let already_alerted_for_mode = if outbound_dedup_key == path_dedup_key {
+                        already_outbound_alerted
+                    } else {
+                        self.has_rule_alert_emitted(inst_id, outbound_dedup_key)
+                    };
+                    if already_alerted_for_mode {
                         return ("DEDUP_SUPPRESSED", false);
                     }
-                    let _ = self.is_new_rule_alert(inst_id, "NET_OUTBOUND");
+                    let _ = self.is_new_rule_alert(inst_id, outbound_dedup_key);
                 }
 
                 // Security #8: If a stale WFP Permit filter remains in `firewall` (e.g., binary
@@ -998,7 +1030,7 @@ impl DaemonEngine {
                             .unbind_alert(&alert_id);
                     }
                     if let Some(ref inst_id) = proc_ctx.proc_instance_id {
-                        self.clear_rule_alert(inst_id, "NET_OUTBOUND");
+                        self.clear_rule_alert(inst_id, outbound_dedup_key);
                     }
                     return ("ALERT_RECORD_FAILED", false);
                 }

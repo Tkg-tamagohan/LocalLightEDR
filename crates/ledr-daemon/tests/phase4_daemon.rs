@@ -1,7 +1,9 @@
-//! Phase 4A integration tests for `ledr-daemon` (`DAEMON-P4-01`..`DAEMON-P4-14`):
+//! Phase 4A integration tests for `ledr-daemon` (`DAEMON-P4-01`..`DAEMON-P4-21`):
 //! `ReportDownloadOrigin`, 3-stage MOTW attribution, `L-18` pre-emptive WFP restrictions,
 //! `ReportBrowserEvent` severity/dedup/`L-19` notification suppression, `LAYER_4_BROWSER`
-//! alert resolution, bridge IPC auth, `spawn_blocking` responsiveness, and burst budget.
+//! alert resolution, bridge IPC auth, `spawn_blocking` responsiveness, burst budget,
+//! delayed MOTW observe-to-enforce escalation, startup seed MOTW backlog deduplication,
+//! Stage 2 `(sha256, generation)` cache invalidation, and default cancellable SHA-256 contract.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -28,7 +30,7 @@ use ledr_rules::{
     compute_file_sha256_hex, BinaryIdentity, EarlyPruner, SigmaEngine,
 };
 use ledr_sensor_win::etw::LiveProcessInfo;
-use ledr_sensor_win::{write_zone_identifier, MotwZoneInfo};
+use ledr_sensor_win::{write_zone_identifier, MotwZoneInfo, WfpDropEvent};
 use ledr_store::LedrStore;
 
 static PIPE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -2477,6 +2479,7 @@ async fn daemon_p4_17_stage2_cache_generation_invalidation_and_ttl_purge_flag_re
     assert!(engine.has_download_origins_cached());
 
     let tool_str = tool_path.display().to_string();
+    assert_eq!(engine.motw_stage2_cache_hits(), 0);
     assert_eq!(engine.resolve_process_motw(&tool_str, None, false), None);
     assert_eq!(counting_insp.sha256_calls(), 1);
     assert_eq!(
@@ -2484,12 +2487,16 @@ async fn daemon_p4_17_stage2_cache_generation_invalidation_and_ttl_purge_flag_re
         0,
         "MOTW hot path must use lightweight compute_sha256 without Authenticode inspect()"
     );
+    assert_eq!(engine.motw_stage2_cache_hits(), 0);
 
-    // Repeat launch of unchanged binary must hit bounded Stage 2 cache (no re-hash).
+    // Repeat launch of unchanged binary recomputes lightweight SHA-256 (no Authenticode)
+    // and hits the bounded Stage 2 `(sha256, generation)` SQLite lookup cache.
     assert_eq!(engine.resolve_process_motw(&tool_str, None, false), None);
-    assert_eq!(counting_insp.sha256_calls(), 1);
+    assert_eq!(counting_insp.sha256_calls(), 2);
+    assert_eq!(counting_insp.inspect_calls(), 0);
+    assert_eq!(engine.motw_stage2_cache_hits(), 1);
 
-    // New download increments generation and invalidates the Stage 2 cache.
+    // New download increments generation and invalidates the Stage 2 lookup cache.
     engine
         .record_browser_download_origin(
             &expired_dl_2.display().to_string(),
@@ -2500,7 +2507,16 @@ async fn daemon_p4_17_stage2_cache_generation_invalidation_and_ttl_purge_flag_re
         )
         .expect("record expired download 2");
     assert_eq!(engine.resolve_process_motw(&tool_str, None, false), None);
-    assert_eq!(counting_insp.sha256_calls(), 2);
+    assert_eq!(counting_insp.sha256_calls(), 3);
+    assert_eq!(
+        engine.motw_stage2_cache_hits(),
+        1,
+        "new download generation must miss previous Stage 2 cache entry"
+    );
+    // Next launch under the new generation populates and hits the cache again.
+    assert_eq!(engine.resolve_process_motw(&tool_str, None, false), None);
+    assert_eq!(counting_insp.sha256_calls(), 4);
+    assert_eq!(engine.motw_stage2_cache_hits(), 2);
 
     // TTL purge removing all download_origins rows resets `has_download_origins_cached` to false.
     let purged = engine.run_ttl_purge_once().expect("run TTL purge");
@@ -2515,7 +2531,7 @@ async fn daemon_p4_17_stage2_cache_generation_invalidation_and_ttl_purge_flag_re
         engine.resolve_process_motw(&after_purge_path.display().to_string(), None, false),
         None
     );
-    assert_eq!(counting_insp.sha256_calls(), 2);
+    assert_eq!(counting_insp.sha256_calls(), 4);
 
     // Direct smoke check of `WindowsBinaryInspector::compute_sha256`.
     let expected_tool_sha = compute_file_sha256_hex(&tool_path).expect("expected sha");
@@ -2678,4 +2694,731 @@ async fn daemon_p4_18_ipc_download_timeout_cancels_write_and_retry_is_idempotent
         1,
         "identical download retry must deduplicate instead of inserting duplicate rows"
     );
+}
+
+#[tokio::test]
+async fn daemon_p4_19_late_motw_escalates_observed_process_to_enforced_containment_once() {
+    let entered = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let completed = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let _release_guard = GateReleaseGuard(Arc::clone(&released));
+
+    let exe_path = r"C:\Tools\portable.exe";
+    let gated_motw = Arc::new(BlockingGateMotwInspector {
+        entered: Arc::clone(&entered),
+        released: Arc::clone(&released),
+        completed: Arc::clone(&completed),
+        target_substring: Some("portable.exe".to_string()),
+        return_zone: Some(MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some("https://late-escalate.example.invalid/portable.exe".to_string()),
+            referrer_url: Some("https://ref-escalate.example.invalid/".to_string()),
+        }),
+    });
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let notifier = Arc::new(RecordingNotifier::default());
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::PreemptiveOnly,
+            motw_sync_wait_budget_ms: 20,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier.clone(),
+        Arc::new(MapBinaryInspector::default()),
+        Arc::new(NullLiveProcessInspector),
+        gated_motw,
+    );
+
+    let sender = engine.classified_sender();
+    let t0_ms = 1_760_019_000_000i64;
+    let ident = ProcessIdentity::new(9101, unix_ms_to_filetime(t0_ms));
+
+    // 1. Start a GeneralUnknown executable while its MOTW lookup is blocked past the sync budget.
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe_path.to_string(),
+            command_line: "portable.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send ProcessStart");
+    wait_high_priority_processed(&engine, 1, "portable ProcessStart").await;
+
+    let entered_wait = Arc::clone(&entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&entered_wait, 1))
+        .await
+        .expect("wait worker in MOTW gate");
+    assert!(
+        defense.added_wfp().is_empty(),
+        "GeneralUnknown binary must not have WFP block before MOTW resolves"
+    );
+
+    // 2. First outbound connect BEFORE MOTW resolves records an observe-only alert (`NET_OUTBOUND_OBSERVE`).
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: ident.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 71)),
+            dst_port: 443,
+            domain_hint: Some("obs1.example.invalid".to_string()),
+            timestamp_ms: t0_ms + 100,
+        })
+        .await
+        .expect("send first observe NetworkConnect");
+    wait_high_priority_processed(&engine, 2, "first observe NetworkConnect").await;
+
+    let pre_alerts = store.list_alerts(None, 10).expect("list pre-MOTW alerts");
+    assert_eq!(pre_alerts.len(), 1, "expected 1 observe-only alert");
+    assert!(
+        !pre_alerts[0].process_suspended,
+        "observe-only alert must not suspend process"
+    );
+    assert!(defense.suspends().is_empty());
+    assert!(
+        notifier.alerts().is_empty(),
+        "observe-only alert must not dispatch toast notification"
+    );
+
+    // 3. Second outbound connect BEFORE MOTW resolves hits fast-path observe dedup and marks PID steady.
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: ident.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 72)),
+            dst_port: 443,
+            domain_hint: Some("obs2.example.invalid".to_string()),
+            timestamp_ms: t0_ms + 200,
+        })
+        .await
+        .expect("send second observe NetworkConnect");
+    wait_high_priority_processed(&engine, 3, "second observe NetworkConnect").await;
+    assert_eq!(
+        store.list_alerts(None, 10).expect("list alerts after 2nd connect").len(),
+        1,
+        "duplicate observe-only connect must be suppressed by NET_OUTBOUND_OBSERVE"
+    );
+
+    // Confirm third pre-MOTW connect is now classified onto the Telemetry lane as steady.
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: ident.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 73)),
+            dst_port: 443,
+            domain_hint: Some("obs3.example.invalid".to_string()),
+            timestamp_ms: t0_ms + 300,
+        })
+        .await
+        .expect("send steady pre-MOTW NetworkConnect");
+    let telem_deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().telemetry_processed < 1 {
+        assert!(
+            Instant::now() < telem_deadline,
+            "timed out waiting for steady pre-MOTW connect on telemetry lane"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // 4. Release the MOTW gate: delayed MOTW attribution backfills SQLite, clears steady PID
+    //    classification, and installs the L-18 pre-emptive WFP block.
+    {
+        let (lock, cvar) = &*released;
+        let mut flag = lock.lock().expect("lock released");
+        *flag = true;
+        cvar.notify_all();
+    }
+
+    let motw_deadline = Instant::now() + Duration::from_secs(2);
+    let wfp_handle = loop {
+        let _ = store.flush_batch();
+        let snap = store
+            .query_flight_recorder(10, Some(&ident.instance_id()))
+            .expect("query process");
+        let origin_ready = snap
+            .processes
+            .first()
+            .and_then(|p| p.origin_url.as_deref())
+            == Some("https://late-escalate.example.invalid/portable.exe");
+        let block_handle = defense
+            .added_wfp()
+            .into_iter()
+            .find(|c| !c.allow && c.exe_path.eq_ignore_ascii_case(exe_path))
+            .map(|c| c.handle);
+        if origin_ready {
+            if let Some(handle) = block_handle {
+                break handle;
+            }
+        }
+        assert!(
+            Instant::now() < motw_deadline,
+            "timed out waiting for delayed MOTW backfill and L-18 WFP block"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+
+    // 5. First WFP drop after MOTW elevation must suspend the process, emit the enforced alert,
+    //    and dispatch toast notification (NOT suppressed by prior NET_OUTBOUND_OBSERVE).
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: wfp_handle,
+        rule_handle: wfp_handle,
+        exe_path: exe_path.to_string(),
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77)),
+        dst_port: 443,
+        timestamp_ms: t0_ms + 500,
+    }));
+
+    let enforce_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if defense.suspends().len() == 1
+            && notifier.alerts().len() == 1
+            && store.list_alerts(None, 10).expect("list alerts").len() == 2
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < enforce_deadline,
+            "timed out waiting for enforced suspension, toast, and alert after MOTW elevation"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let alerts_after_first_drop = store.list_alerts(None, 10).expect("list alerts");
+    let enforced_alert = alerts_after_first_drop
+        .iter()
+        .find(|a| a.process_suspended)
+        .expect("enforced alert must be recorded with process_suspended=true");
+    assert_eq!(enforced_alert.rule_id, "LEDR-NET-HIGH-RISK-PATH");
+    let enforced_ctx: serde_json::Value =
+        serde_json::from_str(&enforced_alert.context_json).expect("enforced alert context_json");
+    assert_eq!(
+        enforced_ctx.get("wfp_blocked").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        enforced_ctx.get("origin_url").and_then(|v| v.as_str()),
+        Some("https://late-escalate.example.invalid/portable.exe")
+    );
+    assert_eq!(notifier.alerts()[0].alert_id, enforced_alert.alert_id);
+
+    // 6. Verify `apply_late_motw_attribution` cleared steady-PID classification so a subsequent
+    //    classified NetworkConnect re-enters the HighPriority lane (not Telemetry), while still
+    //    being deduplicated by `NET_OUTBOUND`.
+    sender
+        .send(SensorEvent::NetworkConnect {
+            pid: ident.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 78)),
+            dst_port: 443,
+            domain_hint: Some("post-motw.example.invalid".to_string()),
+            timestamp_ms: t0_ms + 1_200,
+        })
+        .await
+        .expect("send post-MOTW NetworkConnect");
+    wait_high_priority_processed(&engine, 4, "post-MOTW NetworkConnect on high-priority lane")
+        .await;
+    assert_eq!(
+        engine.metrics().telemetry_processed,
+        1,
+        "post-MOTW connect must route to HighPriority lane after remove_pid(pid)"
+    );
+
+    // 7. Second WFP drop past the 250 ms WfpDropDedupCache window must be suppressed by
+    //    `NET_OUTBOUND` so suspend, toast, and enforced alert each happen exactly once.
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: wfp_handle,
+        rule_handle: wfp_handle,
+        exe_path: exe_path.to_string(),
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 79)),
+        dst_port: 8443,
+        timestamp_ms: t0_ms + 1_500,
+    }));
+
+    // Shutdown drains every remaining queued WFP drop deterministically without cross-lane barriers.
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    assert_eq!(
+        defense.suspends(),
+        vec![ident],
+        "process must be suspended exactly once"
+    );
+    assert_eq!(
+        notifier.alerts().len(),
+        1,
+        "toast notification must be dispatched exactly once"
+    );
+    assert_eq!(
+        store.list_alerts(None, 20).expect("final alerts").len(),
+        2,
+        "expected exactly 1 observe alert + 1 enforced alert (second drop suppressed)"
+    );
+}
+
+#[tokio::test]
+async fn daemon_p4_20_seed_processes_deduplicates_motw_groups_beyond_realtime_queue_cap_without_persistence_race()
+{
+    let motw = Arc::new(MapMotwInspector::default());
+    let distinct_motw_exes = 70usize; // Strictly exceeds MOTW_IO_QUEUE_CAPACITY (64)
+    let duplicate_instances = 50usize; // Extra instances sharing exe_key variants (total 120 MOTW procs)
+    let protected_os_instances = 10usize;
+
+    let mut expected_origins: HashMap<String, String> = HashMap::new();
+    let mut snapshots: Vec<SensorEvent> =
+        Vec::with_capacity(distinct_motw_exes + duplicate_instances + protected_os_instances);
+    let base_ms = 1_760_020_000_000i64;
+    let mut next_pid = 20_000u32;
+
+    for i in 0..distinct_motw_exes {
+        let canonical_exe = format!(r"C:\Apps\SeedTool{i:02}\tool{i:02}.exe");
+        let origin_url = format!("https://seed-origin.example.invalid/tool{i:02}.exe");
+        motw.insert(
+            &canonical_exe,
+            MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(origin_url.clone()),
+                referrer_url: Some("https://seed-ref.example.invalid/".to_string()),
+            },
+        );
+        let ident = ProcessIdentity::new(next_pid, unix_ms_to_filetime(base_ms + i as i64));
+        next_pid += 1;
+        expected_origins.insert(ident.instance_id(), origin_url);
+        snapshots.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: canonical_exe,
+            command_line: format!("tool{i:02}.exe --primary"),
+            user_sid: None,
+        });
+    }
+
+    for i in 0..duplicate_instances {
+        let variant_exe = match i % 3 {
+            0 => format!(r"c:\apps\seedtool{i:02}\TOOL{i:02}.EXE"),
+            1 => format!("C:/Apps/SeedTool{i:02}/tool{i:02}.exe"),
+            _ => format!(r"\\?\C:\Apps\SeedTool{i:02}\tool{i:02}.exe"),
+        };
+        let origin_url = format!("https://seed-origin.example.invalid/tool{i:02}.exe");
+        let ident = ProcessIdentity::new(
+            next_pid,
+            unix_ms_to_filetime(base_ms + 1_000 + i as i64),
+        );
+        next_pid += 1;
+        expected_origins.insert(ident.instance_id(), origin_url);
+        snapshots.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: variant_exe,
+            command_line: format!("tool{i:02}.exe --worker"),
+            user_sid: None,
+        });
+    }
+
+    let mut protected_ids: Vec<String> = Vec::with_capacity(protected_os_instances);
+    for i in 0..protected_os_instances {
+        let ident = ProcessIdentity::new(
+            next_pid,
+            unix_ms_to_filetime(base_ms + 2_000 + i as i64),
+        );
+        next_pid += 1;
+        protected_ids.push(ident.instance_id());
+        snapshots.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\svchost.exe".to_string(),
+            command_line: format!("svchost.exe -k netsvcs -i {i}"),
+            user_sid: None,
+        });
+    }
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::PreemptiveOnly,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(MapBinaryInspector::default()),
+        Arc::new(NullLiveProcessInspector),
+        motw.clone(),
+    );
+
+    let total_seeded = engine.seed_processes(snapshots).expect("seed_processes");
+    assert_eq!(
+        total_seeded,
+        distinct_motw_exes + duplicate_instances + protected_os_instances
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = store.query_flight_recorder(256, None).expect("query store");
+        let matched_count = snap
+            .processes
+            .iter()
+            .filter(|p| {
+                expected_origins
+                    .get(&p.process_instance_id)
+                    .is_some_and(|exp| p.origin_url.as_deref() == Some(exp.as_str()))
+            })
+            .count();
+        let wfp_blocks = defense.added_wfp().iter().filter(|c| !c.allow).count();
+        if matched_count == expected_origins.len() && wfp_blocks == distinct_motw_exes {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for seed MOTW backfill: matched={matched_count}/{}, wfp_blocks={wfp_blocks}/{distinct_motw_exes}",
+            expected_origins.len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Deduplication by `WfpRuleManager::exe_key` must reduce MOTW I/O from 120 down to 70
+    // (and skip all 10 ProtectedOs `svchost.exe` processes).
+    assert_eq!(
+        motw.calls().len(),
+        distinct_motw_exes,
+        "expected exactly one MOTW lookup per deduplicated non-ProtectedOs executable group"
+    );
+
+    let final_snap = store.query_flight_recorder(256, None).expect("query final store");
+    assert_eq!(final_snap.processes.len(), total_seeded);
+    for proc_row in &final_snap.processes {
+        if let Some(expected_url) = expected_origins.get(&proc_row.process_instance_id) {
+            assert_eq!(
+                proc_row.origin_url.as_deref(),
+                Some(expected_url.as_str()),
+                "seeded process {} missing expected MOTW origin_url in SQLite",
+                proc_row.process_instance_id
+            );
+        } else {
+            assert!(protected_ids.contains(&proc_row.process_instance_id));
+            assert_eq!(proc_row.origin_url, None);
+        }
+    }
+
+    let added_wfp = defense.added_wfp();
+    assert_eq!(added_wfp.len(), distinct_motw_exes);
+    assert!(
+        added_wfp
+            .iter()
+            .all(|c| !c.allow && !c.exe_path.to_ascii_lowercase().ends_with("svchost.exe")),
+        "only the 70 distinct MOTW executables must receive L-18 pre-emptive WFP blocks"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_p4_21_stage2_same_size_mtime_replacement_partial_purge_invalidation_and_default_cancellable_sha256()
+{
+    let dir = TestTempDir::new("p4-21");
+
+    // --- Part A: Same-size, same-mtime binary replacement must NOT reuse stale Stage 2 SHA-256 / URL ---
+    let orig_dl_path = dir.0.join("dl_orig_a.exe");
+    let moved_path = dir.0.join("moved_tool.exe");
+    let payload_a = b"download-payload-AAAA-1234567890";
+    let payload_clean_same_len = b"clean-build-BBBB-0987654321-xxxx";
+    assert_eq!(payload_a.len(), payload_clean_same_len.len());
+    std::fs::write(&orig_dl_path, payload_a).expect("write dl_orig_a");
+    std::fs::write(&moved_path, payload_a).expect("write moved_tool");
+    let expected_sha_a = compute_file_sha256_hex(&orig_dl_path).expect("hash payload_a");
+
+    let orig_meta = std::fs::metadata(&moved_path).expect("stat moved_tool");
+    let orig_len = orig_meta.len();
+    let orig_mtime = orig_meta.modified().expect("read orig mtime");
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockDefense::new()),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(WindowsBinaryInspector::new()),
+        Arc::new(NullLiveProcessInspector),
+        Arc::new(WindowsMotwInspector::new()),
+    );
+
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_millis(),
+    )
+    .expect("i64 ms");
+    let expired_ts = now_ms - 40 * 86_400_000;
+
+    engine
+        .record_browser_download_origin(
+            &orig_dl_path.display().to_string(),
+            "https://orig-a.example.invalid/a.exe",
+            None,
+            None,
+            expired_ts,
+        )
+        .expect("record expired download A");
+
+    let moved_str = moved_path.display().to_string();
+    let first_a = engine
+        .resolve_process_motw(&moved_str, None, false)
+        .expect("Stage 2 match for payload_a");
+    assert_eq!(first_a.stage, MotwMatchStage::DownloadSha256);
+    assert_eq!(first_a.origin_url, "https://orig-a.example.invalid/a.exe");
+    assert_eq!(first_a.sha256.as_deref(), Some(expected_sha_a.as_str()));
+
+    let hits_before = engine.motw_stage2_cache_hits();
+    let second_a = engine
+        .resolve_process_motw(&moved_str, None, false)
+        .expect("Stage 2 cache hit for payload_a");
+    assert_eq!(second_a.origin_url, "https://orig-a.example.invalid/a.exe");
+    assert_eq!(engine.motw_stage2_cache_hits(), hits_before + 1);
+
+    // Replace `moved_tool.exe` with different bytes of the EXACT same length and restore `orig_mtime`.
+    std::fs::write(&moved_path, payload_clean_same_len).expect("overwrite moved_tool");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&moved_path)
+        .expect("open moved_tool for set_modified")
+        .set_modified(orig_mtime)
+        .expect("restore original mtime");
+    let replaced_meta = std::fs::metadata(&moved_path).expect("stat replaced moved_tool");
+    assert_eq!(replaced_meta.len(), orig_len);
+    assert_eq!(
+        replaced_meta.modified().expect("read replaced mtime"),
+        orig_mtime
+    );
+
+    assert_eq!(
+        engine.resolve_process_motw(&moved_str, None, false),
+        None,
+        "same-size, same-mtime replacement must compute fresh SHA-256 and never reuse stale Stage 2 URL/hash"
+    );
+
+    // --- Part B: Partial TTL purge (expired A + valid B) immediately invalidates A's Stage 2 cache
+    //     while preserving `has_download_origins_cached() == true` and continuing to resolve B ---
+    let moved_a_path = dir.0.join("moved_expired_a.exe");
+    let orig_dl_b_path = dir.0.join("dl_valid_b.exe");
+    let moved_b_path = dir.0.join("moved_valid_b.exe");
+    let payload_b = b"valid-recent-download-payload-BBBB-99999";
+    std::fs::write(&moved_a_path, payload_a).expect("write moved_expired_a");
+    std::fs::write(&orig_dl_b_path, payload_b).expect("write dl_valid_b");
+    std::fs::write(&moved_b_path, payload_b).expect("write moved_valid_b");
+    let expected_sha_b = compute_file_sha256_hex(&orig_dl_b_path).expect("hash payload_b");
+
+    engine
+        .record_browser_download_origin(
+            &orig_dl_b_path.display().to_string(),
+            "https://valid-b.example.invalid/b.exe",
+            None,
+            None,
+            now_ms,
+        )
+        .expect("record valid download B");
+
+    let moved_a_str = moved_a_path.display().to_string();
+    let moved_b_str = moved_b_path.display().to_string();
+    // Warm Stage 2 cache for both A and B under the current generation.
+    assert_eq!(
+        engine
+            .resolve_process_motw(&moved_a_str, None, false)
+            .map(|m| m.origin_url),
+        Some("https://orig-a.example.invalid/a.exe".to_string())
+    );
+    assert_eq!(
+        engine
+            .resolve_process_motw(&moved_b_str, None, false)
+            .map(|m| m.origin_url),
+        Some("https://valid-b.example.invalid/b.exe".to_string())
+    );
+    let hits_pre_purge = engine.motw_stage2_cache_hits();
+    assert!(engine.resolve_process_motw(&moved_a_str, None, false).is_some());
+    assert!(engine.resolve_process_motw(&moved_b_str, None, false).is_some());
+    assert_eq!(engine.motw_stage2_cache_hits(), hits_pre_purge + 2);
+
+    // Purge expired A while valid B remains.
+    let purge_stats = engine.run_ttl_purge_once().expect("run partial TTL purge");
+    assert_eq!(purge_stats.downloads_deleted, 1);
+    assert!(
+        engine.has_download_origins_cached(),
+        "has_download_origins_cached must remain true while valid download B still exists"
+    );
+
+    let hits_post_purge = engine.motw_stage2_cache_hits();
+    assert_eq!(
+        engine.resolve_process_motw(&moved_a_str, None, false),
+        None,
+        "expired download A's Stage 2 cache entry must be invalidated immediately after partial purge"
+    );
+    let resolved_b = engine
+        .resolve_process_motw(&moved_b_str, None, false)
+        .expect("valid download B must continue resolving after partial purge");
+    assert_eq!(resolved_b.stage, MotwMatchStage::DownloadSha256);
+    assert_eq!(resolved_b.origin_url, "https://valid-b.example.invalid/b.exe");
+    assert_eq!(resolved_b.sha256.as_deref(), Some(expected_sha_b.as_str()));
+    assert_eq!(
+        engine.motw_stage2_cache_hits(),
+        hits_post_purge,
+        "first post-purge lookups must miss old generation before repopulating new generation"
+    );
+    assert!(engine.resolve_process_motw(&moved_b_str, None, false).is_some());
+    assert_eq!(engine.motw_stage2_cache_hits(), hits_post_purge + 1);
+
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+
+    // Verify periodic `pipeline.rs` TTL purge also advances generation when rows remain.
+    let periodic_engine = DaemonEngine::start_with_motw_inspector(
+        LedrStore::open_in_memory().expect("open periodic store"),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ttl_purge_interval_ms: 50,
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockDefense::new()),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(WindowsBinaryInspector::new()),
+        Arc::new(NullLiveProcessInspector),
+        Arc::new(WindowsMotwInspector::new()),
+    );
+    periodic_engine
+        .record_browser_download_origin(
+            &orig_dl_path.display().to_string(),
+            "https://periodic-expired.example.invalid/a.exe",
+            None,
+            None,
+            expired_ts,
+        )
+        .expect("record periodic expired A");
+    periodic_engine
+        .record_browser_download_origin(
+            &orig_dl_b_path.display().to_string(),
+            "https://periodic-valid.example.invalid/b.exe",
+            None,
+            None,
+            now_ms,
+        )
+        .expect("record periodic valid B");
+    assert!(periodic_engine
+        .resolve_process_motw(&moved_a_str, None, false)
+        .is_some());
+    let periodic_deadline = Instant::now() + Duration::from_secs(2);
+    while periodic_engine
+        .resolve_process_motw(&moved_a_str, None, false)
+        .is_some()
+    {
+        assert!(
+            Instant::now() < periodic_deadline,
+            "periodic pipeline TTL purge failed to invalidate expired Stage 2 cache entry"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(periodic_engine.has_download_origins_cached());
+    assert_eq!(
+        periodic_engine
+            .resolve_process_motw(&moved_b_str, None, false)
+            .map(|m| m.origin_url),
+        Some("https://periodic-valid.example.invalid/b.exe".to_string())
+    );
+    periodic_engine
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown periodic engine");
+
+    // --- Part C: Default `BinaryInspector::compute_sha256_cancellable` size cap & cancel contract ---
+    struct DefaultCancellableMock {
+        inspect_calls: AtomicU64,
+        cancel_during_inspect: Option<Arc<AtomicBool>>,
+    }
+
+    impl BinaryInspector for DefaultCancellableMock {
+        fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+            self.inspect_calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(flag) = &self.cancel_during_inspect {
+                flag.store(true, Ordering::Release);
+            }
+            BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                ),
+                authenticode: None,
+            }
+        }
+    }
+
+    let sized_file = dir.0.join("default_cap_probe.bin");
+    std::fs::write(&sized_file, vec![b'Z'; 64]).expect("write 64-byte probe file");
+    let sized_str = sized_file.display().to_string();
+
+    let mock_insp = DefaultCancellableMock {
+        inspect_calls: AtomicU64::new(0),
+        cancel_during_inspect: None,
+    };
+    let cancel_false = AtomicBool::new(false);
+
+    // Real file > max_bytes returns Ok(None) without invoking `inspect()`.
+    assert_eq!(
+        mock_insp
+            .compute_sha256_cancellable(&sized_str, 16, &cancel_false)
+            .expect("oversized default check"),
+        None
+    );
+    assert_eq!(mock_insp.inspect_calls.load(Ordering::Acquire), 0);
+
+    // Real file <= max_bytes delegates to `compute_sha256()`.
+    assert!(mock_insp
+        .compute_sha256_cancellable(&sized_str, 64, &cancel_false)
+        .expect("within limit")
+        .is_some());
+    assert_eq!(mock_insp.inspect_calls.load(Ordering::Acquire), 1);
+
+    // Non-existent path (`ErrorKind::NotFound`) passes through for in-memory mocks.
+    assert!(mock_insp
+        .compute_sha256_cancellable(r"C:\NonExistent\mock_only.exe", 16, &cancel_false)
+        .expect("NotFound mock passthrough")
+        .is_some());
+    assert_eq!(mock_insp.inspect_calls.load(Ordering::Acquire), 2);
+
+    // Pre-cancelled token returns Err(Interrupted) without calling `inspect()`.
+    let cancel_true = AtomicBool::new(true);
+    let pre_err = mock_insp
+        .compute_sha256_cancellable(&sized_str, 64, &cancel_true)
+        .expect_err("pre-cancelled must fail");
+    assert_eq!(pre_err.kind(), ErrorKind::Interrupted);
+    assert_eq!(mock_insp.inspect_calls.load(Ordering::Acquire), 2);
+
+    // Mid-call cancellation is caught by the post-execution recheck.
+    let cancel_mid = Arc::new(AtomicBool::new(false));
+    let mid_mock = DefaultCancellableMock {
+        inspect_calls: AtomicU64::new(0),
+        cancel_during_inspect: Some(Arc::clone(&cancel_mid)),
+    };
+    let post_err = mid_mock
+        .compute_sha256_cancellable(&sized_str, 64, &cancel_mid)
+        .expect_err("post-call cancel recheck must fail");
+    assert_eq!(post_err.kind(), ErrorKind::Interrupted);
+    assert_eq!(mid_mock.inspect_calls.load(Ordering::Acquire), 1);
 }

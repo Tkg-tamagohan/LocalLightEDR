@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -22,6 +23,11 @@ pub(super) struct DnsCorrelationUpdate {
     pub(super) instance_id: String,
     pub(super) exe_key: String,
     pub(super) accepted_ips: Vec<IpAddr>,
+}
+
+pub(super) struct SeedProcessStartOutcome {
+    pub(super) resolved_active_id: Option<String>,
+    pub(super) motw_candidate: Option<(String, String)>,
 }
 
 struct PreparedCanaryBackfill {
@@ -63,78 +69,113 @@ impl DaemonEngine {
     }
 
     pub(super) fn apply_late_motw_attribution(&self, late: super::motw::LateMotwAttribution) {
-        let exe_path = {
+        let mut applied_instances: Vec<(String, String, u32)> = Vec::new();
+        {
             let mut table = self
                 .process_table
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            table.set_motw_metadata_if_active(
-                &late.instance_id,
-                late.attribution.origin_url.clone(),
-                late.attribution.stage.as_str().to_string(),
-                late.attribution.referrer_url.clone(),
-                late.attribution.frame_url.clone(),
-                late.attribution.zone_id,
-            )
-        };
-        let Some(exe_path) = exe_path else {
+            for inst_id in &late.instance_ids {
+                if let Some((exe_path, pid)) = table.set_motw_metadata_if_active(
+                    inst_id,
+                    late.attribution.origin_url.clone(),
+                    late.attribution.stage.as_str().to_string(),
+                    late.attribution.referrer_url.clone(),
+                    late.attribution.frame_url.clone(),
+                    late.attribution.zone_id,
+                ) {
+                    applied_instances.push((inst_id.clone(), exe_path, pid));
+                }
+            }
+        }
+        if applied_instances.is_empty() {
             return;
-        };
-
-        if let Err(err) = self.store.update_process_motw_metadata(
-            &late.instance_id,
-            Some(&late.attribution.origin_url),
-            late.attribution.sha256.as_deref(),
-        ) {
-            tracing::warn!(
-                process_instance_id = %late.instance_id,
-                error = %err,
-                "failed backfilling delayed MOTW metadata into SQLite store"
-            );
         }
 
-        if self.config.outbound_firewall_enabled {
-            self.maybe_apply_preemptive_wfp_block_with_motw(&exe_path, true);
+        let mut promoted_exe_keys: HashSet<String> = HashSet::new();
+        for (inst_id, exe_path, pid) in applied_instances {
+            // Clear any pre-MOTW steady-state outbound classification so subsequent connects
+            // re-enter the high-priority enforcement path rather than staying on telemetry.
+            self.outbound_classifier.remove_pid(pid);
+
+            match self.store.update_process_motw_metadata(
+                &inst_id,
+                Some(&late.attribution.origin_url),
+                late.attribution.sha256.as_deref(),
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        process_instance_id = %inst_id,
+                        "delayed MOTW backfill found no matching process row in SQLite store"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        process_instance_id = %inst_id,
+                        error = %err,
+                        "failed backfilling delayed MOTW metadata into SQLite store"
+                    );
+                }
+            }
+
+            if self.config.outbound_firewall_enabled {
+                let exe_key = WfpRuleManager::exe_key(&exe_path);
+                if promoted_exe_keys.insert(exe_key) {
+                    self.maybe_apply_preemptive_wfp_block_with_motw(&exe_path, true);
+                }
+            }
         }
     }
 
-    pub(super) fn process_seed_process_start(&self, event: &SensorEvent) -> Option<String> {
+    pub(super) fn process_seed_process_start(&self, event: &SensorEvent) -> SeedProcessStartOutcome {
         let now_ms = current_unix_ms();
         let event_ts_ms = event_timestamp_ms(event, now_ms);
         let proc_ctx = self.resolve_process_context(event, event_ts_ms);
 
-        if matches!(event, SensorEvent::ProcessStart { .. })
+        let motw_candidate = if matches!(event, SensorEvent::ProcessStart { .. })
             && proc_ctx.origin_url.is_none()
             && proc_ctx.exited_at_ms.is_none()
             && !proc_ctx.skip_store_ingest
         {
-            if let (Some(inst_id), Some(effective_exe)) = (
+            match (
                 proc_ctx.proc_instance_id.as_deref(),
                 proc_ctx.proc_exe_path.as_deref(),
             ) {
-                self.submit_process_motw_nonblocking(
-                    inst_id,
+                (Some(inst_id), Some(effective_exe)) => Self::should_schedule_process_motw(
                     effective_exe,
                     proc_ctx.exited_at_ms,
                     proc_ctx.skip_store_ingest,
-                );
+                )
+                .map(|normalized_exe| (inst_id.to_string(), normalized_exe)),
+                _ => None,
             }
-        }
+        } else {
+            None
+        };
 
         let _ = self.finish_event_processing(event, event.default_lane(), event_ts_ms, proc_ctx);
-        if let SensorEvent::ProcessStart { identity, .. } = event {
+        let resolved_active_id = if let SensorEvent::ProcessStart { identity, .. } = event {
             let table = self
                 .process_table
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = table.lookup_by_pid(identity.pid) {
                 if entry.exited_at_ms.is_none() {
-                    return Some(entry.instance_id.clone());
+                    Some(entry.instance_id.clone())
+                } else {
+                    Some(identity.instance_id())
                 }
+            } else {
+                Some(identity.instance_id())
             }
-            return Some(identity.instance_id());
+        } else {
+            None
+        };
+        SeedProcessStartOutcome {
+            resolved_active_id,
+            motw_candidate,
         }
-        None
     }
 
     pub(super) async fn process_event_with_lane_async(

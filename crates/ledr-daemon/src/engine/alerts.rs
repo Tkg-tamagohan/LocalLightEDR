@@ -1229,7 +1229,8 @@ impl DaemonEngine {
             self.clear_rule_alert(instance_id, &dedup_key);
         }
         if source_layer == "LAYER_3_NETWORK" || ctx_val.pointer("/event/NetworkConnect").is_some() {
-            self.clear_rule_alert(instance_id, "NET_OUTBOUND");
+            self.clear_rule_alert(instance_id, super::outbound::NET_OUTBOUND_ENFORCE_DEDUP_KEY);
+            self.clear_rule_alert(instance_id, super::outbound::NET_OUTBOUND_OBSERVE_DEDUP_KEY);
             self.clear_rule_alert(instance_id, "NET_POLICY_BLOCK");
         }
     }

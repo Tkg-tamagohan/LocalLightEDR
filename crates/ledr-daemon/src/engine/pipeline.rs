@@ -77,6 +77,7 @@ impl DaemonEngine {
                     Ok(late_motw) => {
                         sync_telemetry_streak = 0;
                         self.apply_late_motw_attribution(late_motw);
+                        self.motw_pool.notify_late_result_consumed();
                         continue;
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -175,6 +176,7 @@ impl DaemonEngine {
                     match maybe_late {
                         Some(late_motw) => {
                             self.apply_late_motw_attribution(late_motw);
+                            self.motw_pool.notify_late_result_consumed();
                         }
                         None => motw_result_rx_closed = true,
                     }
@@ -219,11 +221,12 @@ impl DaemonEngine {
                         purge_in_flight = Some(tokio::task::spawn_blocking(move || {
                             let now_ms = current_unix_ms();
                             match store.purge_expired(now_ms, retention_days) {
-                                Ok(_) => {
+                                Ok(stats) => {
                                     refresh_download_origins_after_purge(
                                         &dl_state,
                                         &store,
                                         before_state,
+                                        stats.downloads_deleted,
                                     );
                                 }
                                 Err(err) => {
@@ -341,6 +344,8 @@ impl DaemonEngine {
         while let Ok(late_motw) = motw_result_rx.try_recv() {
             self.apply_late_motw_attribution(late_motw);
         }
+        drop(motw_result_rx);
+        self.motw_pool.notify_late_result_consumed();
         while let Ok(drop_item) = wfp_drop_rx.try_recv() {
             self.handle_wfp_drop_event_now(&drop_item);
         }

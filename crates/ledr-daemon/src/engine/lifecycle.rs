@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ use crate::process_table::ActiveProcessTable;
 use super::dns_history::ProcessDnsHistory;
 use super::motw::{
     initial_download_origin_state, refresh_download_origins_after_purge, BrowserEventDedupCache,
-    MotwInspector, MotwIoWorkerPool, MotwStage2Cache, WindowsMotwInspector,
+    MotwInspector, MotwIoWorkerPool, MotwStage2Cache, SeedMotwGroup, WindowsMotwInspector,
     BROWSER_EVENT_DEDUP_CAPACITY, BROWSER_EVENT_DEDUP_WINDOW_MS, MOTW_IO_QUEUE_CAPACITY,
     MOTW_STAGE2_CACHE_CAPACITY, MOTW_STAGE2_CACHE_TTL_SECS,
 };
@@ -197,6 +197,7 @@ impl DaemonEngine {
             Arc::clone(&download_origin_state),
             Arc::clone(&motw_stage2_cache),
             config.download_hash_max_bytes,
+            config.active_process_capacity.max(256),
             motw_result_tx,
         );
 
@@ -277,10 +278,29 @@ impl DaemonEngine {
     pub fn seed_processes(&self, snapshots: Vec<SensorEvent>) -> Result<usize, anyhow::Error> {
         let mut count = 0usize;
         let mut active_id_set = HashSet::with_capacity(snapshots.len());
+        let mut motw_group_indices: HashMap<String, usize> = HashMap::new();
+        let mut motw_groups: Vec<SeedMotwGroup> = Vec::new();
         for ev in snapshots {
             if matches!(&ev, SensorEvent::ProcessStart { .. }) {
-                if let Some(resolved_id) = self.process_seed_process_start(&ev) {
+                let outcome = self.process_seed_process_start(&ev);
+                if let Some(resolved_id) = outcome.resolved_active_id {
                     active_id_set.insert(resolved_id);
+                }
+                if let Some((inst_id, normalized_exe)) = outcome.motw_candidate {
+                    let exe_k = WfpRuleManager::exe_key(&normalized_exe);
+                    if let Some(&idx) = motw_group_indices.get(&exe_k) {
+                        let ids = &mut motw_groups[idx].instance_ids;
+                        if !ids.iter().any(|existing| existing == &inst_id) {
+                            ids.push(inst_id);
+                        }
+                    } else {
+                        let idx = motw_groups.len();
+                        motw_group_indices.insert(exe_k, idx);
+                        motw_groups.push(SeedMotwGroup {
+                            exe_path: normalized_exe,
+                            instance_ids: vec![inst_id],
+                        });
+                    }
                 }
                 count += 1;
             }
@@ -320,11 +340,18 @@ impl DaemonEngine {
                 "reconciled stale running processes from prior session"
             );
         }
+        // Submit deduplicated seed MOTW groups ONLY after all seeded rows are flushed to SQLite,
+        // preventing any late-backfill race against unpersisted process rows and avoiding real-time
+        // queue saturation (`PRRT_kwDOVyjVyM66PomN`, `PRRT_kwDOVyjVyM66Ponf`).
+        if !motw_groups.is_empty() {
+            self.submit_seed_motw_groups(motw_groups);
+        }
         Ok(count)
     }
 
     /// Executes a single SQLite TTL purge pass using the configured retention window (`L-11`),
-    /// resetting cached `has_download_origins` to `false` when no rows remain (generation-guarded).
+    /// advancing the Stage 2 generation whenever any download row was deleted and resetting cached
+    /// `has_download_origins` to `false` when no rows remain (generation-guarded).
     pub fn run_ttl_purge_once(&self) -> Result<PurgeStats, StoreError> {
         let before_state = self
             .download_origin_state
@@ -332,7 +359,12 @@ impl DaemonEngine {
         let stats = self
             .store
             .purge_expired(current_unix_ms(), self.config.ttl_retention_days)?;
-        refresh_download_origins_after_purge(&self.download_origin_state, &self.store, before_state);
+        refresh_download_origins_after_purge(
+            &self.download_origin_state,
+            &self.store,
+            before_state,
+            stats.downloads_deleted,
+        );
         Ok(stats)
     }
 

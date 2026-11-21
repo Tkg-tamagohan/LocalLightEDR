@@ -677,16 +677,16 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             ),
             (
                 "apps/ledr-ui/src/uri_reg.rs",
-                "@@ -191,2 +191,2 @@",
-                "             RegWow64View::Default => 0,",
-                "-            RegWow64View::View32 => KEY_WOW64_32KEY,\n+            RegWow64View::View32 => KEY_WOW64_64KEY,",
+                "@@ -189,1 +189,2 @@",
+                "     fn wow64_access_flag(view: RegWow64View) -> u32 {",
+                "+        // Verify dry-run custom rule selection for uri_reg.rs.",
                 {"phase4_ui_manifest_allowlist_and_wow64"},
             ),
             (
                 "apps/ledr-ui/ui/app.js",
-                "@@ -2776,3 +2776,3 @@",
-                "                 return `<div class=\"browser-detail-row\"><span class=\"badge badge-metric\">${escapeHtml(",
-                "                   b.browser,\n-                )}</span> ${bBadge}${bPath}${bErr}</div>`;\n+                )}</span> ${bBadge}${bPath}</div>`;",
+                "@@ -2776,1 +2776,2 @@",
+                "                 const bPath = b.manifest_path",
+                "+                  // Verify dry-run custom rule selection for app.js.",
                 {"phase4_ui_manifest_allowlist_and_wow64"},
             ),
             (

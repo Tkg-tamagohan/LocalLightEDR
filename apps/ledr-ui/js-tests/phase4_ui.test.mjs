@@ -548,7 +548,11 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
     "Chrome valid detail row should include Chrome manifest_path",
   );
   assert.ok(
-    !initialChromeRow.includes("invalid manifest JSON"),
+    !initialChromeRow.includes(escapeHtmlText(edgeDefaultPath)),
+    "Chrome valid detail row should not include Edge manifest_path",
+  );
+  assert.ok(
+    !initialChromeRow.includes(escapeHtmlText("invalid manifest JSON")),
     "Chrome valid detail row should not include Edge diagnostic",
   );
   assert.match(initialEdgeRow, /badge-action-block">HKLM Invalid</);
@@ -565,7 +569,7 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
     "Edge invalid detail row should include its diagnostic message",
   );
   assert.ok(
-    !initialEdgeRow.includes(chromeDefaultPath),
+    !initialEdgeRow.includes(escapeHtmlText(chromeDefaultPath)),
     "Edge invalid detail row should not include Chrome manifest_path",
   );
 
@@ -610,7 +614,7 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
   assert.match(unverifiedChromeRow, /ledr-bridge-nm status/);
   assert.match(unverifiedChromeRow, /WOW64 32-bit/);
   assert.ok(
-    !unverifiedChromeRow.includes(edgeCustomPath),
+    !unverifiedChromeRow.includes(escapeHtmlText(edgeCustomPath)),
     "Chrome unverified detail row must not include Edge manifest_path",
   );
 
@@ -628,8 +632,69 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
   assert.match(unverifiedEdgeRow, /ledr-bridge-nm status/);
   assert.match(unverifiedEdgeRow, /WOW64 32-bit/);
   assert.ok(
-    !unverifiedEdgeRow.includes(chromeCustomPath),
+    !unverifiedEdgeRow.includes(escapeHtmlText(chromeCustomPath)),
     "Edge unverified detail row must not include Chrome manifest_path",
+  );
+
+  // Mixed state (Chrome `Unverified` + Edge `Invalid` -> overall `Invalid`) verifies per-browser
+  // status badge and distinct diagnostic/path isolation across non-valid rows.
+  const edgeInvalidDiagnostic = "manifest 'description' missing";
+  ui.state.localDefenseStatus.browser_shield.manifest_path = edgeDefaultPath;
+  ui.state.localDefenseStatus.browser_shield.manifest_status = "invalid";
+  ui.state.localDefenseStatus.browser_shield.manifest_valid = false;
+  ui.state.localDefenseStatus.browser_shield.manifest_error = `Chrome: ${customUnverifiedNote}; Edge: ${edgeInvalidDiagnostic}`;
+  ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_path = edgeDefaultPath;
+  ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_valid = false;
+  ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_status = "invalid";
+  ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_error = edgeInvalidDiagnostic;
+  ui.renderPolicyView();
+  const mixedHtml = ui.el.browserShieldDl.innerHTML;
+  assert.match(mixedHtml, /badge-action-block">Invalid</);
+
+  const mixedRows = getBrowserDetailRows(mixedHtml);
+  assert.equal(mixedRows.length, 2);
+  const mixedChromeRow = findBrowserDetailRow(mixedRows, "Chrome");
+  const mixedEdgeRow = findBrowserDetailRow(mixedRows, "Edge");
+  const escapedEdgeInvalidSpan = `<span class="mono-wrap">${escapeHtmlText(edgeInvalidDiagnostic)}</span>`;
+
+  assert.match(mixedChromeRow, /badge-unsigned">HKCU Unverified</);
+  assert.ok(
+    mixedChromeRow.includes(
+      `<span class="mono-wrap">${escapeHtmlText(chromeCustomPath)}</span>`,
+    ),
+    "Chrome mixed detail row must include Chrome manifest_path",
+  );
+  assert.ok(
+    mixedChromeRow.includes(escapedUnverifiedNoteSpan),
+    "Chrome mixed detail row must include Chrome unverified diagnostic",
+  );
+  assert.ok(
+    !mixedChromeRow.includes(escapeHtmlText(edgeDefaultPath)),
+    "Chrome mixed detail row must not include Edge manifest_path",
+  );
+  assert.ok(
+    !mixedChromeRow.includes(escapeHtmlText(edgeInvalidDiagnostic)),
+    "Chrome mixed detail row must not include Edge invalid diagnostic",
+  );
+
+  assert.match(mixedEdgeRow, /badge-action-block">HKLM Invalid</);
+  assert.ok(
+    mixedEdgeRow.includes(
+      `<span class="mono-wrap">${escapeHtmlText(edgeDefaultPath)}</span>`,
+    ),
+    "Edge mixed detail row must include Edge manifest_path (not only summary field)",
+  );
+  assert.ok(
+    mixedEdgeRow.includes(escapedEdgeInvalidSpan),
+    "Edge mixed detail row must include Edge invalid diagnostic",
+  );
+  assert.ok(
+    !mixedEdgeRow.includes(escapeHtmlText(chromeCustomPath)),
+    "Edge mixed detail row must not include Chrome manifest_path",
+  );
+  assert.ok(
+    !mixedEdgeRow.includes(escapeHtmlText(customUnverifiedNote)),
+    "Edge mixed detail row must not include Chrome unverified diagnostic",
   );
 });
 

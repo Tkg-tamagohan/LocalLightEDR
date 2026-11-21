@@ -331,6 +331,7 @@ fn parse_local_drive_path(path: &Path) -> Option<(char, Vec<String>, bool)> {
         return None;
     }
     let drive = (bytes[0] as char).to_ascii_uppercase();
+    let has_trailing_sep = raw.ends_with('\\') || raw.ends_with('/');
     let mut segments = Vec::new();
     for seg in raw[3..].split(['\\', '/']) {
         match seg {
@@ -339,6 +340,24 @@ fn parse_local_drive_path(path: &Path) -> Option<(char, Vec<String>, bool)> {
                 segments.pop();
             }
             other => segments.push(other.to_string()),
+        }
+    }
+    // Apply Win32 non-verbatim path normalization before traversing reparse points so rewriting a
+    // non-verbatim path onto a verbatim `\\?\` target (e.g. via a Volume GUID mount point or long
+    // path) matches the exact file Win32 opens (stripping trailing `.` on intermediate segments
+    // and trailing `.`/` ` on the final segment).
+    let last_idx = segments.len().saturating_sub(1);
+    for (idx, seg) in segments.iter_mut().enumerate() {
+        let trimmed = if idx == last_idx && !has_trailing_sep {
+            seg.trim_end_matches(['.', ' '])
+        } else {
+            seg.trim_end_matches('.')
+        };
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.len() != seg.len() {
+            *seg = trimmed.to_string();
         }
     }
     Some((drive, segments, false))

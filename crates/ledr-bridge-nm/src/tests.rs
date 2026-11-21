@@ -1792,6 +1792,48 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
     );
     assert!(!dot_manifest_verbatim.exists());
     let _ = fs::remove_dir(&dot_dir_verbatim);
+
+    // Non-verbatim Win32 path with trailing dot through a reparse point (junction) must normalize
+    // per Win32 rules before reparse rewriting so it matches the underlying shared manifest (BUG_0001).
+    let trail_manifest = real_dir.join("com.localedr.bridge.dottrail.json");
+    write_manifest_atomic(&trail_manifest, &manifest).unwrap();
+    let trail_junction = temp.path().join("trail_junc");
+    let mk_trail = Command::new("cmd.exe")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &trail_junction.to_string_lossy(),
+            &real_dir.to_string_lossy(),
+        ])
+        .output()
+        .expect("run mklink /J trail_junc");
+    assert!(mk_trail.status.success());
+    let non_verbatim_trailing_dot = format!(
+        r"{}\com.localedr.bridge.dottrail.json.",
+        trail_junction.display()
+    );
+    let (u_key_td, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key_td
+        .set_value("", &trail_manifest.to_string_lossy().into_owned())
+        .unwrap();
+    let (p_key_td, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key_td
+        .set_value("", &non_verbatim_trailing_dot)
+        .unwrap();
+    let res_td = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg with trailing-dot non-verbatim junction peer");
+    assert!(
+        !res_td.manifest_removed,
+        "non-verbatim trailing-dot path through reparse point must still match shared manifest"
+    );
+    assert!(trail_manifest.is_file());
+    let _ = fs::remove_file(&trail_manifest);
+    fs::remove_dir(&trail_junction).expect("remove trail_junc");
     let _ = fs::remove_file(&vol_other);
 
     // 6. Boundary checks for Layer 1 path parsing, Layer 2 DOS device / drive types, and Layer 3 reparse targets.

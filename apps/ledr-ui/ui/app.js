@@ -330,7 +330,7 @@
     const primaryMatches = downloadOrigins.filter((d) => {
       if (!d) return false;
       const dSha = typeof d.sha256 === "string" ? d.sha256.trim().toLowerCase() : "";
-      if (procSha && dSha && procSha === dSha) return true;
+      if (procSha && dSha) return procSha === dSha;
       const dPath = normalizeWindowsPath(d.file_path);
       if (procPath && dPath && procPath === dPath) return true;
       return false;
@@ -349,6 +349,34 @@
       if (procSha && dSha && procSha !== dSha) return false;
       return true;
     });
+  }
+
+  function selectPrimaryDownloadOrigin(proc, matchedDownloads) {
+    if (!Array.isArray(matchedDownloads) || matchedDownloads.length === 0) {
+      return null;
+    }
+    const procOrigin =
+      typeof proc?.origin_url === "string" ? proc.origin_url.trim() : "";
+    if (!procOrigin) {
+      return matchedDownloads[0] || null;
+    }
+    const originMatches = matchedDownloads.filter((d) => {
+      const dTab = typeof d?.tab_url === "string" ? d.tab_url.trim() : "";
+      return dTab !== "" && dTab === procOrigin;
+    });
+    if (originMatches.length === 0) {
+      return null;
+    }
+    const procPath = normalizeWindowsPath(proc?.exe_path);
+    if (procPath) {
+      const pathMatch = originMatches.find(
+        (d) => normalizeWindowsPath(d?.file_path) === procPath,
+      );
+      if (pathMatch) {
+        return pathMatch;
+      }
+    }
+    return originMatches[0];
   }
 
   function getBrowserAlertResolutionPolicy(alert, details) {
@@ -2275,8 +2303,10 @@
       p,
       state.snapshot.download_origins,
     );
-    const primaryDl = matchedDownloads[0] || null;
-    const effectiveOrigin = p.origin_url || primaryDl?.tab_url || null;
+    const primaryDl = selectPrimaryDownloadOrigin(p, matchedDownloads);
+    const procOrigin =
+      typeof p.origin_url === "string" ? p.origin_url.trim() : "";
+    const effectiveOrigin = procOrigin || primaryDl?.tab_url || null;
     const effectiveReferrer = primaryDl?.referrer_url || null;
     const effectiveFrameUrl = primaryDl?.frame_url || null;
     const effectiveSha = p.sha256 || primaryDl?.sha256 || null;
@@ -3381,6 +3411,7 @@
       formatMotwSourceLabel,
       formatMotwZoneLabel,
       matchDownloadOriginsForProcess,
+      selectPrimaryDownloadOrigin,
       getBrowserAlertResolutionPolicy,
       computeBrowserShieldStats,
       extractAlertDetails,

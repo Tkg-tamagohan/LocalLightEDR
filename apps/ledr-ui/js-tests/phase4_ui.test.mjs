@@ -508,6 +508,170 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
   assert.match(html, /<dd class="mono">3<\/dd>/);
 });
 
+test("UI-P4-09: Same-path download with different SHA-256 is excluded without path fallback", () => {
+  const ui = loadAppHarness();
+  const shaV1 = "a".repeat(64);
+  const shaV2 = "b".repeat(64);
+  const sharedPath = "C:\\Users\\Alice\\Downloads\\tool.exe";
+
+  const procV1 = {
+    process_instance_id: "300:1",
+    pid: 300,
+    ppid: 4,
+    exe_path: sharedPath,
+    command_line: "tool.exe",
+    created_at_ms: 1_732_000_000_000,
+    exited_at_ms: null,
+    is_trusted_os: false,
+    signer_subject: null,
+    sha256: shaV1,
+    origin_url: null,
+  };
+  const dlV2SamePath = {
+    id: 10,
+    file_path: sharedPath,
+    sha256: shaV2,
+    tab_url: "https://mirror-v2.localedr.invalid/dl",
+    frame_url: "https://mirror-v2.localedr.invalid/frame",
+    referrer_url: "https://mirror-v2.localedr.invalid/ref",
+    downloaded_at_ms: 1_732_000_005_000,
+  };
+  const dlNoShaSamePath = {
+    id: 11,
+    file_path: sharedPath,
+    sha256: "",
+    tab_url: "https://unhashed.localedr.invalid/dl",
+    frame_url: null,
+    referrer_url: null,
+    downloaded_at_ms: 1_732_000_001_000,
+  };
+  const dlV1MovedOrig = {
+    id: 12,
+    file_path: "C:\\Users\\Alice\\Downloads\\tool-orig.exe",
+    sha256: shaV1,
+    tab_url: "https://orig-v1.localedr.invalid/dl",
+    frame_url: null,
+    referrer_url: null,
+    downloaded_at_ms: 1_732_000_000_500,
+  };
+
+  // Both SHA-256 present and unequal -> must NOT fall back to path match
+  assert.deepEqual(Array.from(ui.matchDownloadOriginsForProcess(procV1, [dlV2SamePath])), []);
+
+  // Missing SHA-256 on either side -> path match fallback remains allowed
+  assert.deepEqual(
+    Array.from(ui.matchDownloadOriginsForProcess({ ...procV1, sha256: null }, [dlV2SamePath]), (d) => d.id),
+    [dlV2SamePath.id],
+  );
+  assert.deepEqual(
+    Array.from(ui.matchDownloadOriginsForProcess(procV1, [dlNoShaSamePath]), (d) => d.id),
+    [dlNoShaSamePath.id],
+  );
+
+  // Equal SHA-256 after move -> matches regardless of path difference
+  assert.deepEqual(
+    Array.from(ui.matchDownloadOriginsForProcess(procV1, [dlV2SamePath, dlV1MovedOrig]), (d) => d.id),
+    [dlV1MovedOrig.id],
+  );
+
+  // View 2 must not attach MOTW badge or v2 download telemetry to v1 process
+  ui.state.snapshot = {
+    processes: [procV1],
+    dns_queries: [],
+    network_events: [],
+    file_canary_events: [],
+    download_origins: [dlV2SamePath],
+  };
+  ui.state.selectedProcessId = procV1.process_instance_id;
+  ui.state.activeTab = "all";
+  ui.renderTree();
+  assert.doesNotMatch(ui.el.processTree.innerHTML, /badge-motw">MOTW</);
+  assert.doesNotMatch(ui.el.processInspector.innerHTML, /mirror-v2\.localedr\.invalid/);
+  assert.match(ui.el.telemetryBody.innerHTML, /No telemetry recorded for this scope/);
+});
+
+test("UI-P4-10: Process inspector prevents cross-site origin/referrer/frame mixing for identical SHA-256", () => {
+  const ui = loadAppHarness();
+  const shaSame = "c".repeat(64);
+
+  const procSiteA = {
+    process_instance_id: "400:1",
+    pid: 400,
+    ppid: 4,
+    exe_path: "C:\\Users\\Alice\\Downloads\\tool-a.exe",
+    command_line: "tool-a.exe",
+    created_at_ms: 1_732_000_000_000,
+    exited_at_ms: null,
+    is_trusted_os: false,
+    signer_subject: null,
+    sha256: shaSame,
+    origin_url: "https://site-a.localedr.invalid/release",
+  };
+  const dlSiteBNewer = {
+    id: 22,
+    file_path: "C:\\Users\\Alice\\Downloads\\tool-b.exe",
+    sha256: shaSame,
+    tab_url: "https://site-b.localedr.invalid/mirror",
+    frame_url: "https://frame-b.localedr.invalid/embed",
+    referrer_url: "https://ref-b.localedr.invalid/landing",
+    downloaded_at_ms: 1_732_000_010_000,
+  };
+  const dlSiteAOlder = {
+    id: 21,
+    file_path: "C:\\Users\\Alice\\Downloads\\tool-a.exe",
+    sha256: shaSame,
+    tab_url: "https://site-a.localedr.invalid/release",
+    frame_url: "https://frame-a.localedr.invalid/embed",
+    referrer_url: "https://ref-a.localedr.invalid/landing",
+    downloaded_at_ms: 1_732_000_001_000,
+  };
+
+  // Case 1: Both Site B (newest) and Site A (older) match by SHA-256 -> inspector must enrich from Site A only
+  ui.state.snapshot = {
+    processes: [procSiteA],
+    dns_queries: [],
+    network_events: [],
+    file_canary_events: [],
+    download_origins: [dlSiteBNewer, dlSiteAOlder],
+  };
+  ui.state.selectedProcessId = procSiteA.process_instance_id;
+  const matchedBoth = ui.matchDownloadOriginsForProcess(
+    procSiteA,
+    ui.state.snapshot.download_origins,
+  );
+  assert.equal(ui.selectPrimaryDownloadOrigin(procSiteA, matchedBoth)?.id, dlSiteAOlder.id);
+  ui.renderTree();
+  assert.match(ui.el.processInspector.innerHTML, /site-a\.localedr\.invalid\/release/);
+  assert.match(ui.el.processInspector.innerHTML, /ref-a\.localedr\.invalid\/landing/);
+  assert.match(ui.el.processInspector.innerHTML, /frame-a\.localedr\.invalid\/embed/);
+  assert.doesNotMatch(ui.el.processInspector.innerHTML, /ref-b\.localedr\.invalid/);
+  assert.doesNotMatch(ui.el.processInspector.innerHTML, /frame-b\.localedr\.invalid/);
+
+  // Case 2: Only Site B row exists in snapshot while procSiteA.origin_url is Site A -> do NOT borrow Site B referrer/frame
+  ui.state.snapshot.download_origins = [dlSiteBNewer];
+  const matchedBOnly = ui.matchDownloadOriginsForProcess(
+    procSiteA,
+    ui.state.snapshot.download_origins,
+  );
+  assert.equal(ui.selectPrimaryDownloadOrigin(procSiteA, matchedBOnly), null);
+  ui.renderTree();
+  assert.match(ui.el.processInspector.innerHTML, /site-a\.localedr\.invalid\/release/);
+  assert.doesNotMatch(ui.el.processInspector.innerHTML, /Referrer URL/);
+  assert.doesNotMatch(ui.el.processInspector.innerHTML, /Frame URL/);
+  assert.doesNotMatch(ui.el.processInspector.innerHTML, /ref-b\.localedr\.invalid/);
+  assert.doesNotMatch(ui.el.processInspector.innerHTML, /frame-b\.localedr\.invalid/);
+
+  // Case 3: When proc.origin_url is unset, fallback to newest matched download row remains active
+  const procNoOrigin = { ...procSiteA, process_instance_id: "400:2", origin_url: null };
+  ui.state.snapshot.processes = [procNoOrigin];
+  ui.state.selectedProcessId = procNoOrigin.process_instance_id;
+  assert.equal(ui.selectPrimaryDownloadOrigin(procNoOrigin, matchedBOnly)?.id, dlSiteBNewer.id);
+  ui.renderTree();
+  assert.match(ui.el.processInspector.innerHTML, /site-b\.localedr\.invalid\/mirror/);
+  assert.match(ui.el.processInspector.innerHTML, /ref-b\.localedr\.invalid\/landing/);
+  assert.match(ui.el.processInspector.innerHTML, /frame-b\.localedr\.invalid\/embed/);
+});
+
 test("PR27-REG-01: Sample Preview partial recovery clears synthetic state and preserves live feedback", async () => {
   const ui = loadAppHarness(async (cmd) => {
     if (cmd === "fetch_local_defense_status") {

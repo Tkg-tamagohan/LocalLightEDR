@@ -8,6 +8,14 @@ pub(crate) enum RegDefaultSzProbe {
     EmptyOrInvalidType,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegWow64View {
+    Default,
+    View32,
+    View64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UriRegistrationOutcome {
     pub(crate) registry_key: String,
@@ -52,7 +60,8 @@ pub(crate) fn format_ledr_uri_command(exe_path: &std::path::Path) -> String {
 #[cfg(windows)]
 pub(crate) mod win_uri_reg {
     use super::{
-        LEDR_URI_DESCRIPTION, RegDefaultSzProbe, UriRegistrationOutcome, format_ledr_uri_command,
+        LEDR_URI_DESCRIPTION, RegDefaultSzProbe, RegWow64View, UriRegistrationOutcome,
+        format_ledr_uri_command,
     };
     use std::ffi::c_void;
     use std::path::Path;
@@ -63,6 +72,12 @@ pub(crate) mod win_uri_reg {
     const KEY_QUERY_VALUE: u32 = 0x0001;
     const KEY_SET_VALUE: u32 = 0x0002;
     const KEY_CREATE_SUB_KEY: u32 = 0x0004;
+    #[cfg(test)]
+    const KEY_ENUMERATE_SUB_KEYS: u32 = 0x0008;
+    #[cfg(test)]
+    const DELETE: u32 = 0x0001_0000;
+    pub(crate) const KEY_WOW64_64KEY: u32 = 0x0100;
+    pub(crate) const KEY_WOW64_32KEY: u32 = 0x0200;
     const REG_OPTION_NON_VOLATILE: u32 = 0;
     const REG_SZ: u32 = 1;
     const ERROR_SUCCESS: i32 = 0;
@@ -156,14 +171,24 @@ pub(crate) mod win_uri_reg {
         reg_open_hive(HKEY_LOCAL_MACHINE, "HKLM", subkey, access)
     }
 
-    pub(crate) fn reg_query_default_sz_in_hive(
+    fn wow64_access_flag(view: RegWow64View) -> u32 {
+        match view {
+            RegWow64View::Default => 0,
+            RegWow64View::View32 => KEY_WOW64_32KEY,
+            RegWow64View::View64 => KEY_WOW64_64KEY,
+        }
+    }
+
+    pub(crate) fn reg_query_default_sz_in_hive_with_view(
         is_hklm: bool,
         subkey: &str,
+        view: RegWow64View,
     ) -> Result<RegDefaultSzProbe, String> {
+        let access = KEY_QUERY_VALUE | wow64_access_flag(view);
         let key = if is_hklm {
-            reg_open_hklm(subkey, KEY_QUERY_VALUE)?
+            reg_open_hklm(subkey, access)?
         } else {
-            reg_open_hkcu(subkey, KEY_QUERY_VALUE)?
+            reg_open_hkcu(subkey, access)?
         };
         let Some(key) = key else {
             return Ok(RegDefaultSzProbe::Absent);
@@ -174,6 +199,13 @@ pub(crate) mod win_uri_reg {
             }
             Some(_) | None => Ok(RegDefaultSzProbe::EmptyOrInvalidType),
         }
+    }
+
+    pub(crate) fn reg_query_default_sz_in_hive(
+        is_hklm: bool,
+        subkey: &str,
+    ) -> Result<RegDefaultSzProbe, String> {
+        reg_query_default_sz_in_hive_with_view(is_hklm, subkey, RegWow64View::Default)
     }
 
     fn reg_create_hkcu(subkey: &str, access: u32) -> Result<OwnedRegKey, String> {
@@ -340,6 +372,36 @@ pub(crate) mod win_uri_reg {
         let base_key = reg_create_hkcu(base_subkey, KEY_SET_VALUE | KEY_CREATE_SUB_KEY)?;
         reg_set_sz(&base_key, Some("DisplayName"), display_name)?;
         Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reg_set_hkcu_default_sz_with_view(
+        subkey: &str,
+        value: &str,
+        view: RegWow64View,
+    ) -> Result<(), String> {
+        let key = reg_create_hkcu(
+            subkey,
+            KEY_SET_VALUE | KEY_CREATE_SUB_KEY | wow64_access_flag(view),
+        )?;
+        reg_set_sz(&key, None, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reg_delete_hkcu_tree_in_view(
+        parent_subkey: &str,
+        child_subkey: &str,
+        view: RegWow64View,
+    ) {
+        let access =
+            KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_SET_VALUE | DELETE | wow64_access_flag(view);
+        if let Ok(Some(parent)) = reg_open_hkcu(parent_subkey, access) {
+            let child_w = to_utf16_nul(child_subkey);
+            // SAFETY: `parent.0` is an open HKEY in the requested WOW64 view and `child_w` is NUL-terminated UTF-16.
+            unsafe {
+                let _ = RegDeleteTreeW(parent.0, child_w.as_ptr());
+            }
+        }
     }
 
     #[cfg(test)]

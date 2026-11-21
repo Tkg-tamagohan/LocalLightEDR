@@ -108,6 +108,16 @@ EXPECTED_QUESTIONS: dict[str, tuple[list[str], float, float]] = {
         0.70,
         0.40,
     ),
+    "phase4_ui_manifest_allowlist_and_wow64": (
+        [
+            "apps/ledr-ui/src/defense_status.rs",
+            "apps/ledr-ui/src/uri_reg.rs",
+            "apps/ledr-ui/ui/app.js",
+            "apps/ledr-ui/js-tests/phase4_ui.test.mjs",
+        ],
+        0.65,
+        0.40,
+    ),
 }
 
 
@@ -123,6 +133,37 @@ def _extract_flag_values(cmd: list[str], flag: str) -> list[str]:
 
 def _reject_nonstandard_json_constant(token: str) -> None:
     raise ValueError(f"Non-standard JSON constant is not allowed: {token!r}")
+
+
+def _posix_glob_match(path_str: str, pattern: str) -> bool:
+    """Match a POSIX relative path against a glob pattern supporting '**'."""
+    norm = path_str.replace("\\", "/").strip()
+    if norm.startswith("./"):
+        norm = norm[2:]
+    pat = pattern.replace("\\", "/").strip()
+    if pat.startswith("./"):
+        pat = pat[2:]
+    i = 0
+    n = len(pat)
+    parts: list[str] = ["^"]
+    while i < n:
+        if pat[i : i + 3] == "**/":
+            parts.append("(?:.*/)?")
+            i += 3
+        elif pat[i : i + 2] == "**":
+            parts.append(".*")
+            i += 2
+        elif pat[i] == "*":
+            parts.append("[^/]*")
+            i += 1
+        elif pat[i] == "?":
+            parts.append("[^/]")
+            i += 1
+        else:
+            parts.append(re.escape(pat[i]))
+            i += 1
+    parts.append("$")
+    return bool(re.match("".join(parts), norm))
 
 
 def _load_gate_module(gate_script: Path):
@@ -314,7 +355,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.skipTest(f"Global invariant gate script not installed: {exc}")
 
     def test_T1_05_invariants_json_strict_schema_and_gate_loader(self) -> None:
-        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 10 keys and load_custom_questions."""
+        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 11 keys and load_custom_questions."""
         invariants_path = REPO_ROOT / ".agents" / "invariants.json"
         self.assertTrue(invariants_path.is_file(), f"Missing {invariants_path}")
 
@@ -390,6 +431,109 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
         ):
             self.assertIn("64 KiB", text_field)
             self.assertIn("NRD_FILE_READ_CHUNK_BYTES", text_field)
+
+        phase4_ui = questions["phase4_ui_manifest_allowlist_and_wow64"]
+        self.assertIn("View 3", phase4_ui["instructions"])
+        self.assertIn("KEY_WOW64_32KEY", phase4_ui["instructions"])
+        self.assertIn("KEY_WOW64_64KEY", phase4_ui["instructions"])
+        self.assertIn("apps/ledr-ui/src/defense_status.rs", phase4_ui["instructions"])
+        self.assertIn("apps/ledr-ui/src/uri_reg.rs", phase4_ui["instructions"])
+        for handle_kw in (
+            "FILE_FLAG_OPEN_REPARSE_POINT",
+            "FILE_READ_ATTRIBUTES",
+            "nNumberOfLinks == 1",
+            "GetFinalPathNameByHandleW",
+            "ReOpenFile",
+            "description",
+        ):
+            self.assertIn(handle_kw, phase4_ui["instructions"])
+        self.assertIn(
+            "conflates unverified with verified or invalid",
+            phase4_ui["criteria"]["true_description"],
+        )
+        self.assertIn(
+            "removing non-contamination assertions alone",
+            phase4_ui["criteria"]["true_description"],
+        )
+        for text_field in (
+            phase4_ui["instructions"],
+            phase4_ui["criteria"]["true_description"],
+            phase4_ui["criteria"]["false_description"],
+        ):
+            self.assertIn("unverified", text_field)
+            self.assertIn("EmptyString", text_field)
+            self.assertIn(".browser-detail-row", text_field)
+            self.assertIn("manifest_path", text_field)
+            self.assertIn("diagnostic", text_field.lower())
+            self.assertIn("UI-P4-08", text_field)
+            self.assertIn("non-contamination", text_field)
+
+        # Verify offline (even when the global plugin script is not installed) that
+        # every path_glob in .agents/invariants.json is reachable through
+        # check_invariants.DEFAULT_PATHS:
+        # - Literal file paths must exist in the repository and match DEFAULT_PATHS.
+        # - Wildcard patterns must match at least one tracked file covered by
+        #   DEFAULT_PATHS; intentional exclusions outside DEFAULT_PATHS are limited
+        #   to crate manifests (crates/*/Cargo.toml) and opt-in integration tests
+        #   (check_invariants.TEST_PATHS, enabled via --include-tests).
+        ls_proc = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(ls_proc.returncode, 0, msg=ls_proc.stderr.decode("utf-8", errors="replace"))
+        tracked_files = [
+            p for p in ls_proc.stdout.decode("utf-8", errors="strict").split("\0") if p
+        ]
+        allowed_non_default_patterns = ("crates/*/Cargo.toml", *check_invariants.TEST_PATHS)
+        for key, (exp_globs, _, _) in EXPECTED_QUESTIONS.items():
+            for pat in exp_globs:
+                is_literal = not any(ch in pat for ch in "*?[")
+                if is_literal:
+                    self.assertTrue(
+                        (REPO_ROOT / pat).is_file(),
+                        f"{key}.path_globs literal path does not exist: {pat}",
+                    )
+                    self.assertTrue(
+                        any(
+                            _posix_glob_match(pat, default_pat)
+                            for default_pat in check_invariants.DEFAULT_PATHS
+                        ),
+                        f"{key}.path_globs literal path {pat!r} is not covered by check_invariants.DEFAULT_PATHS",
+                    )
+                else:
+                    matched_tracked = [f for f in tracked_files if _posix_glob_match(f, pat)]
+                    self.assertTrue(
+                        matched_tracked,
+                        f"{key}.path_globs pattern {pat!r} matches no tracked repository files",
+                    )
+                    covered = [
+                        f
+                        for f in matched_tracked
+                        if any(
+                            _posix_glob_match(f, default_pat)
+                            for default_pat in check_invariants.DEFAULT_PATHS
+                        )
+                    ]
+                    self.assertTrue(
+                        covered,
+                        f"{key}.path_globs pattern {pat!r} has no tracked files covered by check_invariants.DEFAULT_PATHS",
+                    )
+                    unexpected_uncovered = [
+                        f
+                        for f in matched_tracked
+                        if f not in covered
+                        and not any(
+                            _posix_glob_match(f, exc_pat)
+                            for exc_pat in allowed_non_default_patterns
+                        )
+                    ]
+                    self.assertEqual(
+                        unexpected_uncovered,
+                        [],
+                        f"{key}.path_globs pattern {pat!r} has tracked files unexpectedly excluded from check_invariants.DEFAULT_PATHS: {unexpected_uncovered}",
+                    )
 
         gate_script = self._require_gate_script()
 
@@ -543,6 +687,39 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                 " use super::cancel::NrdCancelToken;",
                 "-pub(crate) const NRD_FILE_READ_CHUNK_BYTES: usize = 64 * 1024;\n+pub(crate) const NRD_FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;",
                 {"nrd_shutdown_nonblocking_and_checkpoint"},
+            ),
+            (
+                "apps/ledr-ui/src/defense_status.rs",
+                "@@ -1344,2 +1344,2 @@",
+                "         view32,",
+                "-        RegistryStringProbe::Present(_) | RegistryStringProbe::EmptyString\n+        RegistryStringProbe::Present(_)",
+                {"phase4_ui_manifest_allowlist_and_wow64"},
+            ),
+            (
+                "apps/ledr-ui/src/uri_reg.rs",
+                "@@ -189,1 +189,2 @@",
+                "     fn wow64_access_flag(view: RegWow64View) -> u32 {",
+                "+        // Verify dry-run custom rule selection for uri_reg.rs.",
+                {"phase4_ui_manifest_allowlist_and_wow64"},
+            ),
+            (
+                "apps/ledr-ui/ui/app.js",
+                "@@ -2776,1 +2776,2 @@",
+                "                 const bPath = b.manifest_path",
+                "+                  // Verify dry-run custom rule selection for app.js.",
+                {"phase4_ui_manifest_allowlist_and_wow64"},
+            ),
+            (
+                "apps/ledr-ui/js-tests/phase4_ui.test.mjs",
+                "@@ -549,5 +549,1 @@",
+                "   );",
+                (
+                    "-  assert.ok(\n"
+                    "-    !initialChromeRow.includes(escapeHtmlText(edgeDefaultPath)),\n"
+                    '-    "Chrome valid detail row should not include Edge manifest_path",\n'
+                    "-  );"
+                ),
+                {"phase4_ui_manifest_allowlist_and_wow64"},
             ),
         ]
 

@@ -2628,10 +2628,14 @@
       state.isDaemonOnline = true;
       state.isSamplePreview = false;
       if (wasSamplePreview) {
+        state.selectedAlertId = null;
         state.lastSyncedAlertId = null;
         state.triageFeedback = null;
         state.triageFeedbackByAlert.clear();
         state.triageValidationFeedback = null;
+        state.alerts = [];
+        state.rules = [];
+        state.policyFeedback = null;
       }
       state.snapshot = snapshot;
       state.metrics = metrics;

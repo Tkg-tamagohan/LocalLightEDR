@@ -730,19 +730,25 @@ pub(crate) mod win_pipe_auth {
         None
     }
 
+    /// Resolves per-user `FOLDERID_LocalAppData` directly via `SHGetKnownFolderPath` using
+    /// `TOKEN_QUERY | TOKEN_IMPERSONATE`.
+    pub(crate) fn resolve_user_local_app_data_via_known_folder() -> Option<PathBuf> {
+        let token = open_current_process_token(TOKEN_QUERY | TOKEN_IMPERSONATE)?;
+        sh_get_known_folder_path_with_token(&FOLDERID_LOCAL_APP_DATA, token.0)
+    }
+
+    pub(crate) fn resolve_user_local_app_data_path_with(
+        primary: impl FnOnce() -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        primary().or_else(resolve_local_app_data_via_user_profile_dir)
+    }
+
     /// Resolves per-user `FOLDERID_LocalAppData` using `TOKEN_QUERY | TOKEN_IMPERSONATE` (as
     /// required by `SHGetKnownFolderPath` for explicit token handles), falling back to
     /// `GetUserProfileDirectoryW` with `TOKEN_QUERY` rather than `hToken = NULL` (which expands
     /// `%USERPROFILE%`).
     pub(crate) fn resolve_user_local_app_data_path() -> Option<PathBuf> {
-        if let Some(token) = open_current_process_token(TOKEN_QUERY | TOKEN_IMPERSONATE) {
-            if let Some(path) =
-                sh_get_known_folder_path_with_token(&FOLDERID_LOCAL_APP_DATA, token.0)
-            {
-                return Some(path);
-            }
-        }
-        resolve_local_app_data_via_user_profile_dir()
+        resolve_user_local_app_data_path_with(resolve_user_local_app_data_via_known_folder)
     }
 
     pub(crate) fn resolve_known_browser_roots() -> Vec<PathBuf> {

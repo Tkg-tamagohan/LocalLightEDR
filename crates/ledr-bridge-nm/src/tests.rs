@@ -1512,6 +1512,31 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
     assert!(!protected_manifest.exists());
     assert!(other_manifest.is_file());
 
+    // 4b. Existing local directory on peer scope (e.g. `real_dir` or `C:\Windows`) must open via
+    // `FILE_FLAG_BACKUP_SEMANTICS`, yield a distinct identity (not `Indeterminate`), and not block removal.
+    for local_dir_peer in [real_dir.to_string_lossy().into_owned(), r"C:\Windows".to_string()] {
+        let dir_peer_manifest = real_dir.join("com.localedr.bridge.dirpeer.json");
+        write_manifest_atomic(&dir_peer_manifest, &manifest).unwrap();
+        let (u_key_dp, _) = hkcu
+            .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+            .unwrap();
+        u_key_dp
+            .set_value("", &dir_peer_manifest.to_string_lossy().into_owned())
+            .unwrap();
+        let (p_key_dp, _) = hkcu
+            .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+            .unwrap();
+        p_key_dp.set_value("", &local_dir_peer).unwrap();
+
+        let res_dp = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+            .expect("unreg with local directory peer entry");
+        assert!(
+            res_dp.manifest_removed,
+            "local directory peer entry '{local_dir_peer}' must not yield Indeterminate and block local manifest deletion"
+        );
+        assert!(!dir_peer_manifest.exists());
+    }
+
     // 5. Non-local peer registry entries (UNC, extended UNC, device, relative) must be skipped
     // without invoking CreateFileW or touching SMB, allowing local manifest removal (SEC_0001).
     let non_local_peer_entries = [
@@ -1544,11 +1569,39 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
         assert!(!local_manifest.exists());
     }
 
-    // 6. Boundary checks for Layer 1 path parsing, Layer 2 drive types, and Layer 3 reparse targets.
+    // 5b. Non-local target registry entries (when no peer exists) must remove the registry key and
+    // skip `remove_file` without touching SMB or device paths (SEC_0001).
+    let _ = hkcu.delete_subkey_all(peer_target.browser_subkey(BrowserKind::Chrome));
+    for non_local_target in [
+        r"\\attacker.invalid\share\com.localedr.bridge.json",
+        "//attacker.invalid/share/com.localedr.bridge.json",
+        r"\\?\UNC\attacker.invalid\share\com.localedr.bridge.json",
+        r"\\.\pipe\com.localedr.bridge.json",
+        r"relative\com.localedr.bridge.json",
+    ] {
+        let (u_key_nlt, _) = hkcu
+            .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+            .unwrap();
+        u_key_nlt.set_value("", &non_local_target).unwrap();
+
+        let res_nlt = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+            .expect("unreg with non-local target entry");
+        assert!(
+            res_nlt.browsers[0].removed,
+            "registry key for non-local target '{non_local_target}' must still be removed"
+        );
+        assert!(
+            !res_nlt.manifest_removed,
+            "non-local target entry '{non_local_target}' must never invoke remove_file"
+        );
+    }
+
+    // 6. Boundary checks for Layer 1 path parsing, Layer 2 DOS device / drive types, and Layer 3 reparse targets.
     use crate::setup::{
-        extract_local_drive_letter, is_local_drive_type, parse_reparse_data_buffer,
-        resolve_local_reparse_target, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
-        IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK, SYMLINK_FLAG_RELATIVE,
+        classify_dos_device_target, extract_local_drive_letter, is_local_drive_type,
+        parse_reparse_data_buffer, resolve_local_reparse_target, DosDeviceTarget, DRIVE_FIXED,
+        DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE, IO_REPARSE_TAG_MOUNT_POINT,
+        IO_REPARSE_TAG_SYMLINK, SYMLINK_FLAG_RELATIVE,
     };
 
     assert_eq!(
@@ -1576,6 +1629,7 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
         r"relative\com.localedr.bridge.json",
         r"\\?\C:\dir\..\com.localedr.bridge.json",
         r"\\?\C:/slash/com.localedr.bridge.json",
+        r"\\?\C:\dir/sub\com.localedr.bridge.json",
         "",
     ] {
         assert_eq!(
@@ -1592,6 +1646,43 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
     assert!(!is_local_drive_type(1)); // DRIVE_NO_ROOT_DIR
     assert!(!is_local_drive_type(DRIVE_REMOTE));
     assert!(!is_local_drive_type(5)); // DRIVE_CDROM
+
+    assert_eq!(
+        classify_dos_device_target(r"\Device\HarddiskVolume3"),
+        DosDeviceTarget::VolumeDevice
+    );
+    assert_eq!(
+        classify_dos_device_target(r"\??\C:\Users\alice\links"),
+        DosDeviceTarget::Subst(PathBuf::from(r"C:\Users\alice\links"))
+    );
+    assert_eq!(
+        classify_dos_device_target(r"\GLOBAL??\D:\LocalEDR"),
+        DosDeviceTarget::Subst(PathBuf::from(r"D:\LocalEDR"))
+    );
+    assert_eq!(
+        classify_dos_device_target(r"\DosDevices\c:"),
+        DosDeviceTarget::Subst(PathBuf::from(r"C:\"))
+    );
+    for non_local_dos in [
+        r"\??\UNC\attacker.invalid\share",
+        r"\GLOBAL??\UNC\attacker.invalid\share",
+        r"\DosDevices\UNC\attacker.invalid\share",
+        r"\Device\LanmanRedirector\;Z:0000000000012345\attacker.invalid\share",
+        r"\Device\Mup\;LanmanRedirector\attacker.invalid\share",
+        r"\Device\Mup",
+        r"\Device\WebDavRedirector\attacker.invalid@SSL\DavWWWRoot",
+        r"\Device\RdpDr\;Z:0000000000012345\tsclient\share",
+        r"\Device\HGFS\shared",
+        r"\Device\VBoxMiniRdr\shared",
+        r"\\attacker.invalid\share",
+        "",
+    ] {
+        assert_eq!(
+            classify_dos_device_target(non_local_dos),
+            DosDeviceTarget::NonLocal,
+            "DOS device target must be rejected as non-local: '{non_local_dos}'"
+        );
+    }
 
     let build_reparse_buf = |tag: u32, sub_name: &str, flags: Option<u32>| -> Vec<u8> {
         let wide_bytes: Vec<u8> = sub_name
@@ -1625,6 +1716,19 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
         resolve_local_reparse_target(&parsed_mp.substitute_name, parsed_mp.is_relative, link_path),
         Some(PathBuf::from(r"C:\Temp\real"))
     );
+    // Verbatim `\\?\X:\...` absolute reparse target must resolve locally while rejecting `\\?\X:\..\...`.
+    assert_eq!(
+        resolve_local_reparse_target(r"\\?\C:\Temp\real", false, link_path),
+        Some(PathBuf::from(r"C:\Temp\real"))
+    );
+    assert_eq!(
+        resolve_local_reparse_target(r"\\?\C:", false, link_path),
+        Some(PathBuf::from(r"C:\"))
+    );
+    assert_eq!(
+        resolve_local_reparse_target(r"\\?\C:\Temp\..\real", false, link_path),
+        None
+    );
 
     let sym_rel = build_reparse_buf(
         IO_REPARSE_TAG_SYMLINK,
@@ -1640,6 +1744,27 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
             Path::new(r"C:\Temp\links\alias.json")
         ),
         Some(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
+    );
+    // Relative symlink under a `\\?\` verbatim (or >=248-byte) `link_path` must also resolve cleanly.
+    assert_eq!(
+        resolve_local_reparse_target(
+            r"..\real\com.localedr.bridge.json",
+            true,
+            Path::new(r"\\?\C:\Temp\links\alias.json")
+        ),
+        Some(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
+    );
+    assert_eq!(
+        resolve_local_reparse_target(
+            "../real/com.localedr.bridge.json",
+            true,
+            Path::new(r"\\?\C:\Temp\links\alias.json")
+        ),
+        Some(PathBuf::from(r"C:\Temp\real\com.localedr.bridge.json"))
+    );
+    assert_eq!(
+        resolve_local_reparse_target(r"..\real\a.json", true, Path::new(r"C:\")),
+        None
     );
 
     for (tag, target, flags) in [
@@ -1709,9 +1834,15 @@ fn bridge_16_known_folder_roots_ignore_poisoned_env_vars() {
             );
         }
 
-        // 2. Per-user FOLDERID_LocalAppData resolves with TOKEN_QUERY | TOKEN_IMPERSONATE.
+        // 2. Per-user FOLDERID_LocalAppData resolves directly with TOKEN_QUERY | TOKEN_IMPERSONATE.
+        let primary_local_app_data = win_pipe_auth::resolve_user_local_app_data_via_known_folder()
+            .expect("SHGetKnownFolderPath(LocalAppData, TOKEN_QUERY|TOKEN_IMPERSONATE) must succeed directly");
         let local_app_data = win_pipe_auth::resolve_user_local_app_data_path()
             .expect("FOLDERID_LocalAppData must resolve even with poisoned env vars");
+        assert_eq!(
+            primary_local_app_data.to_string_lossy().to_ascii_lowercase(),
+            local_app_data.to_string_lossy().to_ascii_lowercase()
+        );
         let local_lower = local_app_data.to_string_lossy().to_ascii_lowercase();
         assert!(
             local_lower.ends_with(r"\appdata\local"),
@@ -1722,10 +1853,14 @@ fn bridge_16_known_folder_roots_ignore_poisoned_env_vars() {
             "FOLDERID_LocalAppData must ignore poisoned USERPROFILE/LOCALAPPDATA: {local_app_data:?}"
         );
 
-        // 3. GetUserProfileDirectoryW (TOKEN_QUERY-only) fallback resolves cleanly without env vars.
+        // 3. GetUserProfileDirectoryW (TOKEN_QUERY-only) fallback resolves cleanly without env vars
+        // and is dispatched automatically when the primary Known Folder lookup fails.
         let fallback_local_app_data =
-            win_pipe_auth::resolve_local_app_data_via_user_profile_dir()
-                .expect("GetUserProfileDirectoryW fallback must resolve without env vars");
+            win_pipe_auth::resolve_user_local_app_data_path_with(|| None)
+                .expect("GetUserProfileDirectoryW fallback must trigger when primary fails");
+        let fallback_direct = win_pipe_auth::resolve_local_app_data_via_user_profile_dir()
+            .expect("GetUserProfileDirectoryW direct call must resolve without env vars");
+        assert_eq!(fallback_local_app_data, fallback_direct);
         let fallback_lower = fallback_local_app_data
             .to_string_lossy()
             .to_ascii_lowercase();
@@ -2093,10 +2228,16 @@ fn bridge_18_cmd_mediated_pipe_inheritance_real_kernel() {
             }
         }
 
-        // Grandparent is the test binary (not Chrome/Edge/Brave), so production caller verification must fail closed.
+        // Grandparent is the test binary (not Chrome/Edge/Brave), so production caller verification
+        // must successfully traverse self -> System cmd.exe -> grandparent and fail closed specifically
+        // at the grandparent browser allowlist check.
+        let verify_err = win_pipe_auth::verify_browser_parent_process()
+            .expect_err("cmd.exe mediated launch from non-browser grandparent must still be rejected");
+        let verify_err_msg = verify_err.to_string();
         assert!(
-            win_pipe_auth::verify_browser_parent_process().is_err(),
-            "cmd.exe mediated launch from non-browser grandparent must still be rejected"
+            verify_err_msg.contains("via cmd.exe PID ")
+                && verify_err_msg.contains(&format!("from untrusted grandparent PID {expected_gp_pid}")),
+            "expected cmd.exe -> grandparent rejection for PID {expected_gp_pid}, got: {verify_err_msg}"
         );
 
         println!(

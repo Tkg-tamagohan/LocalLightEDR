@@ -311,7 +311,7 @@ fn parse_local_drive_path(path: &Path) -> Option<(char, Vec<String>, bool)> {
             if seg.is_empty() {
                 continue;
             }
-            if seg == "." || seg == ".." {
+            if seg == "." || seg == ".." || seg.contains('/') {
                 return None;
             }
             segments.push(seg.to_string());
@@ -428,6 +428,68 @@ pub(crate) fn parse_reparse_data_buffer(buf: &[u8]) -> Option<ParsedReparseTarge
     })
 }
 
+/// Classification of a Win32 `QueryDosDeviceW("X:")` target before calling `GetDriveTypeW` or
+/// traversing the filesystem (`SEC_0001`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DosDeviceTarget {
+    VolumeDevice,
+    Subst(PathBuf),
+    NonLocal,
+}
+
+/// Classifies a Win32 `QueryDosDeviceW("X:")` target so `SUBST` / DOS device aliases (`\??\...`,
+/// `\GLOBAL??\...`, `\DosDevices\...`) are expanded and recursively validated from their real
+/// root, while network redirectors (`LanmanRedirector`, `Mup`, `WebDavRedirector`, etc.) are
+/// rejected before any filesystem or SMB call (`SEC_0001`).
+pub(crate) fn classify_dos_device_target(target: &str) -> DosDeviceTarget {
+    if target.is_empty() || target.contains('\0') {
+        return DosDeviceTarget::NonLocal;
+    }
+    let normalized_lower = target.replace('/', "\\").to_ascii_lowercase();
+    let dos_prefix_len = if normalized_lower.starts_with(r"\??\") {
+        Some(4usize)
+    } else if normalized_lower.starts_with(r"\global??\") {
+        Some(10usize)
+    } else if normalized_lower.starts_with(r"\dosdevices\") {
+        Some(12usize)
+    } else {
+        None
+    };
+    if let Some(prefix_len) = dos_prefix_len {
+        let Some(rest) = target.get(prefix_len..) else {
+            return DosDeviceTarget::NonLocal;
+        };
+        let synthetic = format!(r"\??\{rest}");
+        return match resolve_local_reparse_target(&synthetic, false, Path::new(r"C:\")) {
+            Some(local_base) => DosDeviceTarget::Subst(local_base),
+            None => DosDeviceTarget::NonLocal,
+        };
+    }
+
+    if normalized_lower.starts_with(r"\\")
+        || normalized_lower == r"\device\mup"
+        || normalized_lower.starts_with(r"\device\mup\")
+        || normalized_lower == r"\device\lanmanredirector"
+        || normalized_lower.starts_with(r"\device\lanmanredirector\")
+        || normalized_lower == r"\device\webdavredirector"
+        || normalized_lower.starts_with(r"\device\webdavredirector\")
+        || normalized_lower == r"\device\rdpdr"
+        || normalized_lower.starts_with(r"\device\rdpdr\")
+        || normalized_lower == r"\device\hgfs"
+        || normalized_lower.starts_with(r"\device\hgfs\")
+        || normalized_lower == r"\device\vboxminirdr"
+        || normalized_lower.starts_with(r"\device\vboxminirdr\")
+    {
+        return DosDeviceTarget::NonLocal;
+    }
+
+    if normalized_lower.starts_with(r"\device\") {
+        DosDeviceTarget::VolumeDevice
+    } else {
+        DosDeviceTarget::NonLocal
+    }
+}
+
 /// Validates that a reparse point's `SubstituteName` stays on a local drive path rather than
 /// pointing to UNC (`\??\UNC\`, `\\`), network redirectors (`\Device\Mup\`,
 /// `\Device\LanmanRedirector\`), or non-drive device paths (`SEC_0001`).
@@ -441,8 +503,13 @@ pub(crate) fn resolve_local_reparse_target(
     }
     let normalized_lower = substitute_name.replace('/', "\\").to_ascii_lowercase();
     if normalized_lower.starts_with(r"\??\unc\")
+        || normalized_lower == r"\??\unc"
         || normalized_lower.starts_with(r"\\?\unc\")
-        || normalized_lower.starts_with(r"\\")
+        || normalized_lower == r"\\?\unc"
+        || normalized_lower.starts_with(r"\??\globalroot\")
+        || normalized_lower.starts_with(r"\\?\globalroot\")
+        || normalized_lower.starts_with(r"\\.\")
+        || (normalized_lower.starts_with(r"\\") && !substitute_name.starts_with(r"\\?\"))
         || normalized_lower.starts_with(r"\device\mup\")
         || normalized_lower == r"\device\mup"
         || normalized_lower.starts_with(r"device\mup\")
@@ -451,8 +518,6 @@ pub(crate) fn resolve_local_reparse_target(
         || normalized_lower.starts_with(r"device\lanmanredirector\")
         || normalized_lower.starts_with(r"\device\")
         || normalized_lower.starts_with(r"device\")
-        || normalized_lower.starts_with(r"\??\globalroot\")
-        || normalized_lower.starts_with(r"\\?\globalroot\")
     {
         return None;
     }
@@ -464,16 +529,36 @@ pub(crate) fn resolve_local_reparse_target(
         {
             return None;
         }
-        let parent = link_path.parent()?;
-        let joined = parent.join(substitute_name);
-        let (drive, segments, _) = parse_local_drive_path(&joined)?;
+        // Resolve relative to `link_path`'s parent segments directly so verbatim `\\?\` or long
+        // (>= 248 byte) `link_path` values still support `.` / `..` / `/` relative symlink targets.
+        let (drive, mut segments, _) = parse_local_drive_path(link_path)?;
+        segments.pop()?;
+        for seg in substitute_name.split(['\\', '/']) {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    segments.pop();
+                }
+                other => segments.push(other.to_string()),
+            }
+        }
         return Some(build_drive_path(drive, &segments, false));
     }
 
-    let stripped = substitute_name
-        .strip_prefix(r"\??\")
-        .or_else(|| substitute_name.strip_prefix(r"\\?\"))
-        .unwrap_or(substitute_name);
+    if let Some(rest) = substitute_name.strip_prefix(r"\\?\") {
+        let candidate = if rest.len() == 2
+            && rest.as_bytes()[0].is_ascii_alphabetic()
+            && rest.as_bytes()[1] == b':'
+        {
+            format!(r"\\?\{}:\", (rest.as_bytes()[0] as char).to_ascii_uppercase())
+        } else {
+            substitute_name.to_string()
+        };
+        let (drive, segments, _) = parse_local_drive_path(Path::new(&candidate))?;
+        return Some(build_drive_path(drive, &segments, false));
+    }
+
+    let stripped = substitute_name.strip_prefix(r"\??\").unwrap_or(substitute_name);
     let candidate = if stripped.len() == 2
         && stripped.as_bytes()[0].is_ascii_alphabetic()
         && stripped.as_bytes()[1] == b':'
@@ -489,10 +574,10 @@ pub(crate) fn resolve_local_reparse_target(
 #[cfg(windows)]
 mod win_reg_ops {
     use super::{
-        build_drive_path, format_ledr_uri_command, is_local_drive_type, normalize_display_path,
-        parse_local_drive_path, parse_reparse_data_buffer, resolve_local_reparse_target,
-        BrowserKind, RegistryTarget, Scope, LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION,
-        NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
+        build_drive_path, classify_dos_device_target, format_ledr_uri_command, is_local_drive_type,
+        normalize_display_path, parse_local_drive_path, parse_reparse_data_buffer,
+        resolve_local_reparse_target, BrowserKind, DosDeviceTarget, RegistryTarget, Scope,
+        LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
     };
     use anyhow::{Context, Result};
     use std::ffi::c_void;
@@ -512,6 +597,7 @@ mod win_reg_ops {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
     const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
     const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
     const MAX_REPARSE_HOPS: usize = 16;
@@ -534,6 +620,11 @@ mod win_reg_ops {
 
     #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
     extern "system" {
+        fn QueryDosDeviceW(
+            device_name: *const u16,
+            target_path: *mut u16,
+            max_chars: u32,
+        ) -> u32;
         fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
         fn GetFileAttributesW(lp_file_name: *const u16) -> u32;
         fn CreateFileW(
@@ -665,6 +756,38 @@ mod win_reg_ops {
         ))
     }
 
+    fn query_dos_device_target(drive: char) -> Option<String> {
+        let dos_drive = [drive.to_ascii_uppercase() as u16, b':' as u16, 0];
+        let mut cap: usize = 512;
+        for _ in 0..4 {
+            let mut buf = vec![0u16; cap];
+            // SAFETY: `dos_drive` is NUL-terminated UTF-16 (`X:`) and `buf` holds `cap` writable `u16` units.
+            let copied = unsafe {
+                QueryDosDeviceW(
+                    dos_drive.as_ptr(),
+                    buf.as_mut_ptr(),
+                    u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                )
+            };
+            if copied != 0 {
+                let used = (copied as usize).min(buf.len());
+                let slice = &buf[..used];
+                let first_len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+                if first_len == 0 {
+                    return None;
+                }
+                return String::from_utf16(&slice[..first_len]).ok();
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER) && cap < 32_768 {
+                cap *= 2;
+                continue;
+            }
+            return None;
+        }
+        None
+    }
+
     fn verify_local_path_recursive(path: &Path, remaining_depth: usize) -> PathLocality {
         if remaining_depth == 0 {
             return PathLocality::NonLocal;
@@ -673,7 +796,23 @@ mod win_reg_ops {
         let Some((drive, segments, verbatim)) = parse_local_drive_path(path) else {
             return PathLocality::NonLocal;
         };
-        // Layer 2: OS drive-type check (allow only fixed, removable, or RAM disk volumes).
+        // Layer 2: inspect DOS device target (`QueryDosDeviceW`) before any filesystem call so
+        // `SUBST` aliases are expanded/verified from their real root and network redirectors are
+        // rejected without SMB I/O, then verify OS drive type (`DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_RAMDISK`).
+        let Some(dos_target) = query_dos_device_target(drive) else {
+            return PathLocality::NonLocal;
+        };
+        match classify_dos_device_target(&dos_target) {
+            DosDeviceTarget::Subst(local_base) => {
+                let mut rewritten = local_base;
+                for seg in &segments {
+                    rewritten.push(seg);
+                }
+                return verify_local_path_recursive(&rewritten, remaining_depth - 1);
+            }
+            DosDeviceTarget::NonLocal => return PathLocality::NonLocal,
+            DosDeviceTarget::VolumeDevice => {}
+        }
         if !is_local_drive(drive) {
             return PathLocality::NonLocal;
         }
@@ -716,6 +855,13 @@ mod win_reg_ops {
         PathLocality::Local(build_drive_path(drive, &segments, verbatim))
     }
 
+    pub(crate) fn verify_local_manifest_for_removal(path: &Path) -> bool {
+        matches!(
+            verify_local_path_recursive(path, MAX_REPARSE_HOPS),
+            PathLocality::Local(_)
+        )
+    }
+
     fn query_file_identity(path: &Path) -> FileIdentityLookup {
         let resolved_local = match verify_local_path_recursive(path, MAX_REPARSE_HOPS) {
             PathLocality::Local(p) => p,
@@ -731,7 +877,8 @@ mod win_reg_ops {
         wide.push(0);
 
         // SAFETY: `wide` is NUL-terminated UTF-16 pointing to a verified local non-reparse target;
-        // `FILE_FLAG_OPEN_REPARSE_POINT` prevents following a leaf symlink swapped in via TOCTOU.
+        // `FILE_FLAG_OPEN_REPARSE_POINT` prevents following a leaf symlink swapped in via TOCTOU,
+        // and `FILE_FLAG_BACKUP_SEMANTICS` allows opening local directories without `ERROR_ACCESS_DENIED`.
         let raw = unsafe {
             CreateFileW(
                 wide.as_ptr(),
@@ -739,7 +886,7 @@ mod win_reg_ops {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 ptr::null(),
                 OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
                 ptr::null_mut(),
             )
         };
@@ -1045,6 +1192,10 @@ mod win_reg_ops {
     ) -> Result<bool> {
         Ok(false)
     }
+
+    pub(crate) fn verify_local_manifest_for_removal(_path: &Path) -> bool {
+        true
+    }
 }
 
 /// Runs `ledr-bridge-nm setup` against the standard `HKCU` / `HKLM` registry keys.
@@ -1179,6 +1330,9 @@ pub fn run_unregister_with(
             None => false,
         };
         if still_in_self || still_in_peer {
+            continue;
+        }
+        if !win_reg_ops::verify_local_manifest_for_removal(candidate) {
             continue;
         }
         match std::fs::remove_file(candidate) {

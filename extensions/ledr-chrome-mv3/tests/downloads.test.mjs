@@ -703,4 +703,150 @@ test("EXT-19: click hints enforce referrer origin consistency, iframe frameUrl m
     "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/downloader.html"
   );
   assert.equal(nonHttpEntry.tabUrlSource, "referrer");
+
+  // 5. Direct background.js service-worker handler verification for RECORD_DOWNLOAD_CLICK_HINT
+  // separating top-level sender.tab.url from cross-origin iframe sender.url (BUG_0001).
+  const prevChrome = globalThis.chrome;
+  const swSession = createMemoryStorageArea();
+  const swLocal = createMemoryStorageArea();
+  const nativeRequests = [];
+  let onMessageListener = null;
+  let onCreatedListener = null;
+  let onChangedListener = null;
+  const searchResults = new Map();
+
+  globalThis.chrome = {
+    runtime: {
+      id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      getURL: (p) => `chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/${p}`,
+      onInstalled: { addListener() {} },
+      onMessage: {
+        addListener(fn) {
+          onMessageListener = fn;
+        },
+      },
+      async sendNativeMessage(_host, req) {
+        nativeRequests.push(req);
+        return { type: "Ack" };
+      },
+    },
+    alarms: {
+      create: async () => {},
+      onAlarm: { addListener() {} },
+    },
+    storage: {
+      session: swSession,
+      local: swLocal,
+    },
+    tabs: {
+      async query() {
+        return [{ url: "https://other-tab.localedr.invalid/inbox" }];
+      },
+    },
+    downloads: {
+      onCreated: {
+        addListener(fn) {
+          onCreatedListener = fn;
+        },
+      },
+      onChanged: {
+        addListener(fn) {
+          onChangedListener = fn;
+        },
+      },
+      async search({ id }) {
+        const hit = searchResults.get(id);
+        return hit ? [hit] : [];
+      },
+    },
+    declarativeNetRequest: {
+      getEnabledRulesets: async () => [],
+      getDynamicRules: async () => [],
+      updateDynamicRules: async () => {},
+    },
+  };
+
+  try {
+    await import("../background.js");
+    assert.equal(typeof onMessageListener, "function");
+    assert.equal(typeof onCreatedListener, "function");
+    assert.equal(typeof onChangedListener, "function");
+
+    const dispatchMessage = (message, sender) =>
+      new Promise((resolve) => {
+        const keepOpen = onMessageListener(message, sender, resolve);
+        assert.equal(keepOpen, true);
+      });
+
+    // 5a. Non-tab sender is rejected
+    const forbidden = await dispatchMessage(
+      { type: "RECORD_DOWNLOAD_CLICK_HINT", targetUrl, pageUrl: "https://portal.localedr.invalid/" },
+      { url: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/popup.html" }
+    );
+    assert.deepEqual(forbidden, { ok: false, error: "Forbidden sender context" });
+
+    // 5b. Cross-origin iframe sender separates top-level tabUrl (sender.tab.url) and frameUrl (sender.url)
+    const iframeHintRes = await dispatchMessage(
+      {
+        type: "RECORD_DOWNLOAD_CLICK_HINT",
+        targetUrl,
+        pageUrl: "https://embed.localedr.invalid/widget-page",
+      },
+      {
+        tab: { id: 42, url: "https://portal.localedr.invalid/product" },
+        url: "https://embed.localedr.invalid/widget-frame",
+      }
+    );
+    assert.deepEqual(iframeHintRes, { ok: true, recorded: true });
+
+    // 5c. Missing sender.tab.url falls back to message.pageUrl for tabUrl while retaining sender.url for frameUrl
+    const fallbackHintRes = await dispatchMessage(
+      {
+        type: "RECORD_DOWNLOAD_CLICK_HINT",
+        targetUrl: "https://cdn.localedr.invalid/release/other.exe",
+        pageUrl: "https://fallback-tab.localedr.invalid/page",
+      },
+      {
+        tab: { id: 43 },
+        url: "https://subframe.localedr.invalid/btn",
+      }
+    );
+    assert.deepEqual(fallbackHintRes, { ok: true, recorded: true });
+
+    const swHints = (await swSession.get([DOWNLOAD_CLICK_HINTS_STORAGE_KEY]))[
+      DOWNLOAD_CLICK_HINTS_STORAGE_KEY
+    ];
+    assert.equal(swHints.length, 2);
+    assert.equal(swHints[0].tabUrl, "https://portal.localedr.invalid/product");
+    assert.equal(swHints[0].frameUrl, "https://embed.localedr.invalid/widget-frame");
+    assert.equal(swHints[1].tabUrl, "https://fallback-tab.localedr.invalid/page");
+    assert.equal(swHints[1].frameUrl, "https://subframe.localedr.invalid/btn");
+
+    // 5d. End-to-end through background.js downloads listeners: matching iframe referrer resolves top-level tabUrl
+    searchResults.set(401, {
+      id: 401,
+      filename: "C:\\Users\\alice\\Downloads\\sw-iframe.exe",
+      url: targetUrl,
+      finalUrl: targetUrl,
+      referrer: "https://embed.localedr.invalid/",
+      endTime: "2026-11-21T02:10:00.000Z",
+    });
+    await onCreatedListener({
+      id: 401,
+      url: targetUrl,
+      finalUrl: targetUrl,
+      referrer: "https://embed.localedr.invalid/",
+    });
+    await onChangedListener({ id: 401, state: { current: "complete" } });
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(nativeRequests[0].type, "ReportDownloadOrigin");
+    assert.equal(nativeRequests[0].payload.tab_url, "https://portal.localedr.invalid/product");
+    assert.equal(nativeRequests[0].payload.referrer_url, "https://embed.localedr.invalid/");
+  } finally {
+    if (prevChrome === undefined) {
+      delete globalThis.chrome;
+    } else {
+      globalThis.chrome = prevChrome;
+    }
+  }
 });

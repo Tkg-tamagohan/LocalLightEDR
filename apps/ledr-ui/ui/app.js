@@ -1197,7 +1197,8 @@
       allAlerts.find((a) => a.alert_id === state.selectedAlertId) || null;
     if (!selected) {
       state.selectedAlertIsNetwork = false;
-      state.lastSyncedAlertId = null;
+      // Keep lastSyncedAlertId so temporary empty filter results preserve in-progress form edits
+      // when returning to the same alert; only clear transient validation feedback.
       state.triageValidationFeedback = null;
       el.triageDetail.classList.add("hidden");
       el.triageEmpty.classList.remove("hidden");

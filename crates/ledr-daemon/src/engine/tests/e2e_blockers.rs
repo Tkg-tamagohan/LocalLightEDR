@@ -3752,17 +3752,32 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
         signer_subject: String,
         root_thumbprint: String,
         gate_armed: std::sync::atomic::AtomicBool,
-        state: std::sync::Mutex<(bool, bool, bool)>, // (entered, released, worker_finished)
+        state: std::sync::Mutex<(bool, bool, bool, bool)>, // (entered, released, worker_finished, release_timed_out)
         cv: std::sync::Condvar,
     }
     impl crate::engine::BinaryInspector for GatedSignedInspector {
         fn inspect(&self, exe_path: &str) -> ledr_rules::BinaryIdentity {
             if self.gate_armed.swap(false, Ordering::AcqRel) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 guard.0 = true;
                 self.cv.notify_all();
                 while !guard.1 {
-                    guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    let Some(remaining) =
+                        deadline.checked_duration_since(std::time::Instant::now())
+                    else {
+                        guard.3 = true;
+                        break;
+                    };
+                    let (next_guard, wait_res) = self
+                        .cv
+                        .wait_timeout(guard, remaining)
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = next_guard;
+                    if !guard.1 && wait_res.timed_out() {
+                        guard.3 = true;
+                        break;
+                    }
                 }
             }
             ledr_rules::BinaryIdentity {
@@ -3814,7 +3829,7 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
         signer_subject: "CN=Google LLC".to_string(),
         root_thumbprint: "DDFB16CD4931C973A2037D3FC83A4D7D775D05E4".to_string(),
         gate_armed: std::sync::atomic::AtomicBool::new(false),
-        state: std::sync::Mutex::new((false, false, false)),
+        state: std::sync::Mutex::new((false, false, false, false)),
         cv: std::sync::Condvar::new(),
     });
     let engine_race = Arc::new(
@@ -3897,6 +3912,15 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
     // Release `inspector.inspect` and wait for the in-flight connect evaluation to finish.
     drop(release_guard);
     connect_thread.join().expect("join connect thread");
+    let release_timed_out = race_inspector
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .3;
+    assert!(
+        !release_timed_out,
+        "inspector.inspect timed out waiting for gate release (delete_policy_rule must not block on inspector.inspect)"
+    );
 
     assert!(
         !engine_race.has_active_wfp_filter(chrome_exe, None, true),

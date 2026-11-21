@@ -331,7 +331,6 @@ fn parse_local_drive_path(path: &Path) -> Option<(char, Vec<String>, bool)> {
         return None;
     }
     let drive = (bytes[0] as char).to_ascii_uppercase();
-    let has_trailing_sep = raw.ends_with('\\') || raw.ends_with('/');
     let mut segments = Vec::new();
     for seg in raw[3..].split(['\\', '/']) {
         match seg {
@@ -340,24 +339,6 @@ fn parse_local_drive_path(path: &Path) -> Option<(char, Vec<String>, bool)> {
                 segments.pop();
             }
             other => segments.push(other.to_string()),
-        }
-    }
-    // Apply Win32 non-verbatim path normalization before traversing reparse points so rewriting a
-    // non-verbatim path onto a verbatim `\\?\` target (e.g. via a Volume GUID mount point or long
-    // path) matches the exact file Win32 opens (stripping trailing `.` on intermediate segments
-    // and trailing `.`/` ` on the final segment).
-    let last_idx = segments.len().saturating_sub(1);
-    for (idx, seg) in segments.iter_mut().enumerate() {
-        let trimmed = if idx == last_idx && !has_trailing_sep {
-            seg.trim_end_matches(['.', ' '])
-        } else {
-            seg.trim_end_matches('.')
-        };
-        if trimmed.is_empty() {
-            return None;
-        }
-        if trimmed.len() != seg.len() {
-            *seg = trimmed.to_string();
         }
     }
     Some((drive, segments, false))
@@ -773,6 +754,12 @@ mod win_reg_ops {
             cch_buffer_length: u32,
             lpcch_return_length: *mut u32,
         ) -> i32;
+        fn GetFullPathNameW(
+            lp_file_name: *const u16,
+            n_buffer_length: u32,
+            lp_buffer: *mut u16,
+            lp_file_part: *mut *mut u16,
+        ) -> u32;
         fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
         fn GetFileAttributesW(lp_file_name: *const u16) -> u32;
         fn CreateFileW(
@@ -905,6 +892,43 @@ mod win_reg_ops {
         None
     }
 
+    fn normalize_win32_local_path_once(path: &Path) -> Option<PathBuf> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.is_empty() || wide.contains(&0) {
+            return None;
+        }
+        wide.push(0);
+
+        let mut cap: usize = 512;
+        for _ in 0..3 {
+            let mut buf = vec![0u16; cap];
+            // SAFETY: `wide` is NUL-terminated UTF-16 and `buf` holds `cap` writable `u16` units.
+            // `GetFullPathNameW` performs pure user-mode lexical normalization (zero filesystem/network I/O).
+            let ret = unsafe {
+                GetFullPathNameW(
+                    wide.as_ptr(),
+                    u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                    buf.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            if ret == 0 {
+                return None;
+            }
+            let needed = usize::try_from(ret).unwrap_or(0);
+            if needed < buf.len() {
+                let normalized = String::from_utf16(&buf[..needed]).ok()?;
+                return Some(PathBuf::from(normalized));
+            }
+            if needed < 32_768 {
+                cap = needed.saturating_add(1);
+                continue;
+            }
+            return None;
+        }
+        None
+    }
+
     fn resolve_volume_guid_path_locality(
         volume_root: &str,
         segments: &[String],
@@ -914,14 +938,15 @@ mod win_reg_ops {
             return PathLocality::Indeterminate;
         }
         let Some(drive) = resolve_volume_guid_to_drive_letter(volume_root) else {
-            // Local volume GUID without a drive letter (e.g. folder-only mounted volume) or
-            // unavailable MountMgr lookup: never open via CreateFileW, conservatively keep manifest.
+            // Local volume GUID without a verified matching drive letter in the current logon
+            // session (e.g. folder-only mount or session-shadowed drive): never open via
+            // CreateFileW, conservatively keep manifest.
             return PathLocality::Indeterminate;
         };
         // Preserve verbatim `\\?\X:\...` semantics because `\\?\Volume{guid}\...` and reparse
         // targets bypass Win32 trailing-dot/space stripping (e.g. `Data.\manifest.json`).
         let rewritten = build_drive_path(drive, segments, true);
-        verify_local_path_recursive(&rewritten, remaining_depth - 1)
+        verify_local_path_recursive(&rewritten, true, remaining_depth - 1)
     }
 
     fn inspect_reparse_point_target(
@@ -1029,14 +1054,34 @@ mod win_reg_ops {
         query_dos_device_by_name(&name)
     }
 
-    fn verify_local_path_recursive(path: &Path, remaining_depth: usize) -> PathLocality {
+    fn verify_local_path_recursive(
+        path: &Path,
+        already_normalized: bool,
+        remaining_depth: usize,
+    ) -> PathLocality {
         if remaining_depth == 0 {
             return PathLocality::Indeterminate;
         }
         // Layer 1: syntactic local drive absolute path only (resolve local Volume GUIDs safely via
         // MountMgr or preserve conservatively as `Indeterminate`; reject UNC, device, relative).
-        let (drive, segments, verbatim) = match parse_local_drive_path(path) {
-            Some(parsed) => parsed,
+        let (drive, segments) = match parse_local_drive_path(path) {
+            Some((drive, segments, verbatim)) => {
+                if !verbatim && !already_normalized {
+                    // Normalize non-verbatim Win32 DOS paths ONCE via `GetFullPathNameW` (exact OS
+                    // rules for trailing dots/spaces and `..`), then treat the normalized components
+                    // as verbatim `\\?\` so subsequent reparse/Volume-GUID rewrites never double-strip.
+                    let Some(norm_path) = normalize_win32_local_path_once(path) else {
+                        return PathLocality::Indeterminate;
+                    };
+                    let Some((norm_drive, norm_segments, _)) = parse_local_drive_path(&norm_path)
+                    else {
+                        return PathLocality::NonLocal;
+                    };
+                    (norm_drive, norm_segments)
+                } else {
+                    (drive, segments)
+                }
+            }
             None => {
                 if let Some((volume_root, vol_segments)) =
                     path.to_str().and_then(parse_volume_guid_path)
@@ -1062,7 +1107,7 @@ mod win_reg_ops {
                 for seg in &segments {
                     rewritten.push(seg);
                 }
-                return verify_local_path_recursive(&rewritten, remaining_depth - 1);
+                return verify_local_path_recursive(&rewritten, true, remaining_depth - 1);
             }
             DosDeviceTarget::NonLocal => return PathLocality::NonLocal,
             DosDeviceTarget::VolumeDevice => {}
@@ -1071,9 +1116,9 @@ mod win_reg_ops {
             return PathLocality::NonLocal;
         }
 
-        // Layer 3: walk from `X:\` down to the target, inspecting reparse points without traversal.
+        // Layer 3: walk from `\\?\X:\` down to the target verbatim, inspecting reparse points without traversal.
         for prefix_len in 0..=segments.len() {
-            let current = build_drive_path(drive, &segments[..prefix_len], verbatim);
+            let current = build_drive_path(drive, &segments[..prefix_len], true);
             let mut wide: Vec<u16> = current.as_os_str().encode_wide().collect();
             if wide.is_empty() || wide.contains(&0) {
                 return PathLocality::Indeterminate;
@@ -1099,7 +1144,7 @@ mod win_reg_ops {
                         for rest in &segments[prefix_len..] {
                             rewritten.push(rest);
                         }
-                        return verify_local_path_recursive(&rewritten, remaining_depth - 1);
+                        return verify_local_path_recursive(&rewritten, true, remaining_depth - 1);
                     }
                     Ok(ReparseTargetResolution::VolumeGuid {
                         volume_root,
@@ -1118,18 +1163,18 @@ mod win_reg_ops {
             }
         }
 
-        PathLocality::Local(build_drive_path(drive, &segments, verbatim))
+        PathLocality::Local(build_drive_path(drive, &segments, true))
     }
 
     pub(crate) fn verify_local_manifest_for_removal(path: &Path) -> bool {
         matches!(
-            verify_local_path_recursive(path, MAX_REPARSE_HOPS),
+            verify_local_path_recursive(path, false, MAX_REPARSE_HOPS),
             PathLocality::Local(_)
         )
     }
 
     fn query_file_identity(path: &Path) -> FileIdentityLookup {
-        let resolved_local = match verify_local_path_recursive(path, MAX_REPARSE_HOPS) {
+        let resolved_local = match verify_local_path_recursive(path, false, MAX_REPARSE_HOPS) {
             PathLocality::Local(p) => p,
             PathLocality::NonLocal => return FileIdentityLookup::NonLocal,
             PathLocality::NotFound => return FileIdentityLookup::NotFound,

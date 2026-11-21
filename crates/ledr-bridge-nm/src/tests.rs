@@ -1834,6 +1834,40 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
     assert!(trail_manifest.is_file());
     let _ = fs::remove_file(&trail_manifest);
     fs::remove_dir(&trail_junction).expect("remove trail_junc");
+
+    // Distinct `Data` and `Data..` directories: Win32 `GetFullPathNameW` preserves `Data..`
+    // (does not over-strip multiple dots to `Data`), so a non-verbatim peer referencing `Data..\...`
+    // must match a verbatim Volume GUID candidate pointing to the exact same `Data..\...` file.
+    let plain_data_dir = real_dir.join("Data");
+    let dot2_dir_verbatim = PathBuf::from(format!(r"\\?\{}\Data..", real_dir.display()));
+    let dot2_manifest_verbatim = dot2_dir_verbatim.join("com.localedr.bridge.dot2.json");
+    let dot2_non_verbatim = format!(r"{}\Data..\com.localedr.bridge.dot2.json", real_dir.display());
+    let live_vol_dot2 = format!(
+        "{live_vol_root}{}\\Data..\\com.localedr.bridge.dot2.json",
+        &real_dir.to_string_lossy()[3..]
+    );
+    fs::create_dir(&plain_data_dir).expect("create plain Data dir");
+    fs::create_dir(&dot2_dir_verbatim).expect("create verbatim Data.. dir");
+    write_manifest_atomic(&dot2_manifest_verbatim, &manifest).unwrap();
+
+    let (u_key_d2, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key_d2.set_value("", &live_vol_dot2).unwrap();
+    let (p_key_d2, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key_d2.set_value("", &dot2_non_verbatim).unwrap();
+    let res_d2 = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg Volume GUID Data.. candidate with non-verbatim Data.. peer");
+    assert!(
+        !res_d2.manifest_removed,
+        "non-verbatim Data.. peer must not over-strip to Data and must preserve shared Data.. manifest"
+    );
+    assert!(dot2_manifest_verbatim.is_file());
+    let _ = fs::remove_file(&dot2_manifest_verbatim);
+    let _ = fs::remove_dir(&dot2_dir_verbatim);
+    let _ = fs::remove_dir(&plain_data_dir);
     let _ = fs::remove_file(&vol_other);
 
     // 6. Boundary checks for Layer 1 path parsing, Layer 2 DOS device / drive types, and Layer 3 reparse targets.

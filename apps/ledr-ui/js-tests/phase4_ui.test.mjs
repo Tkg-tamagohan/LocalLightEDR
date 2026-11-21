@@ -494,6 +494,31 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
     },
   };
 
+  const escapeHtmlText = (v) =>
+    String(v)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  const getBrowserDetailRows = (dlHtml) =>
+    Array.from(
+      dlHtml.matchAll(
+        /<div class="browser-detail-row">((?:(?!<\/?div\b)[\s\S])*?)<\/div>/g,
+      ),
+      (m) => m[1],
+    );
+  const findBrowserDetailRow = (rows, browserName) => {
+    const marker = `<span class="badge badge-metric">${escapeHtmlText(browserName)}</span>`;
+    const matched = rows.filter((row) => row.includes(marker));
+    assert.equal(
+      matched.length,
+      1,
+      `expected exactly 1 browser-detail-row for ${browserName}, found ${matched.length}`,
+    );
+    return matched[0];
+  };
+
   ui.renderPolicyView();
   const html = ui.el.browserShieldDl.innerHTML;
   assert.match(html, /Registered \(HKCU\+HKLM\)/);
@@ -507,8 +532,45 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
   assert.match(html, /2 \(1 unresolved\)/);
   assert.match(html, /<dd class="mono">3<\/dd>/);
 
+  const initialRows = getBrowserDetailRows(html);
+  assert.equal(initialRows.length, 2);
+  const initialChromeRow = findBrowserDetailRow(initialRows, "Chrome");
+  const initialEdgeRow = findBrowserDetailRow(initialRows, "Edge");
+  const chromeDefaultPath =
+    "C:\\Users\\Alice\\AppData\\Local\\LocalEDR\\native-messaging\\com.localedr.bridge.user.chrome.json";
+  const edgeDefaultPath =
+    "C:\\ProgramData\\LocalEDR\\native-messaging\\com.localedr.bridge.machine.edge.json";
+  assert.match(initialChromeRow, /badge-action-allow">HKCU Valid</);
+  assert.ok(
+    initialChromeRow.includes(
+      `<span class="mono-wrap">${escapeHtmlText(chromeDefaultPath)}</span>`,
+    ),
+    "Chrome valid detail row should include Chrome manifest_path",
+  );
+  assert.ok(
+    !initialChromeRow.includes("invalid manifest JSON"),
+    "Chrome valid detail row should not include Edge diagnostic",
+  );
+  assert.match(initialEdgeRow, /badge-action-block">HKLM Invalid</);
+  assert.ok(
+    initialEdgeRow.includes(
+      `<span class="mono-wrap">${escapeHtmlText(edgeDefaultPath)}</span>`,
+    ),
+    "Edge invalid detail row should include Edge manifest_path",
+  );
+  assert.ok(
+    initialEdgeRow.includes(
+      `<span class="mono-wrap">${escapeHtmlText("invalid manifest JSON")}</span>`,
+    ),
+    "Edge invalid detail row should include its diagnostic message",
+  );
+  assert.ok(
+    !initialEdgeRow.includes(chromeDefaultPath),
+    "Edge invalid detail row should not include Chrome manifest_path",
+  );
+
   // Custom `--manifest-dir` outside default 2 directories renders as `Unverified` (distinct from red `Invalid`)
-  // and keeps each browser's manifest_path visible alongside the unverified note.
+  // and keeps each browser's manifest_path visible alongside the unverified note in its own detail row.
   const customUnverifiedNote =
     "manifest path is outside default LocalEDR manifest directories (unverified by UI; inspect the listed manifest file directly or run 'ledr-bridge-nm status' — note: CLI status checks only the 64-bit default registry view, not HKLM WOW64 32-bit view)";
   const chromeCustomPath = "D:\\CustomChrome\\com.localedr.bridge.user.chrome.json";
@@ -526,13 +588,49 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
   ui.renderPolicyView();
   const unverifiedHtml = ui.el.browserShieldDl.innerHTML;
   assert.match(unverifiedHtml, /badge-unsigned">Unverified</);
-  assert.match(unverifiedHtml, /badge-unsigned">HKCU Unverified</);
-  assert.match(unverifiedHtml, /badge-unsigned">HKLM Unverified</);
   assert.doesNotMatch(unverifiedHtml, />Invalid</);
-  assert.match(unverifiedHtml, /CustomChrome\\com\.localedr\.bridge\.user\.chrome\.json/);
-  assert.match(unverifiedHtml, /CustomEdge\\com\.localedr\.bridge\.machine\.edge\.json/);
-  assert.match(unverifiedHtml, /ledr-bridge-nm status/);
-  assert.match(unverifiedHtml, /WOW64 32-bit/);
+
+  const unverifiedRows = getBrowserDetailRows(unverifiedHtml);
+  assert.equal(unverifiedRows.length, 2);
+  const unverifiedChromeRow = findBrowserDetailRow(unverifiedRows, "Chrome");
+  const unverifiedEdgeRow = findBrowserDetailRow(unverifiedRows, "Edge");
+  const escapedUnverifiedNoteSpan = `<span class="mono-wrap">${escapeHtmlText(customUnverifiedNote)}</span>`;
+
+  assert.match(unverifiedChromeRow, /badge-unsigned">HKCU Unverified</);
+  assert.ok(
+    unverifiedChromeRow.includes(
+      `<span class="mono-wrap">${escapeHtmlText(chromeCustomPath)}</span>`,
+    ),
+    "Chrome unverified detail row must include Chrome manifest_path (not only summary field)",
+  );
+  assert.ok(
+    unverifiedChromeRow.includes(escapedUnverifiedNoteSpan),
+    "Chrome unverified detail row must include Chrome diagnostic message in the same row",
+  );
+  assert.match(unverifiedChromeRow, /ledr-bridge-nm status/);
+  assert.match(unverifiedChromeRow, /WOW64 32-bit/);
+  assert.ok(
+    !unverifiedChromeRow.includes(edgeCustomPath),
+    "Chrome unverified detail row must not include Edge manifest_path",
+  );
+
+  assert.match(unverifiedEdgeRow, /badge-unsigned">HKLM Unverified</);
+  assert.ok(
+    unverifiedEdgeRow.includes(
+      `<span class="mono-wrap">${escapeHtmlText(edgeCustomPath)}</span>`,
+    ),
+    "Edge unverified detail row must include Edge manifest_path",
+  );
+  assert.ok(
+    unverifiedEdgeRow.includes(escapedUnverifiedNoteSpan),
+    "Edge unverified detail row must include Edge diagnostic message in the same row",
+  );
+  assert.match(unverifiedEdgeRow, /ledr-bridge-nm status/);
+  assert.match(unverifiedEdgeRow, /WOW64 32-bit/);
+  assert.ok(
+    !unverifiedEdgeRow.includes(chromeCustomPath),
+    "Edge unverified detail row must not include Chrome manifest_path",
+  );
 });
 
 test("UI-P4-09: Same-path download with different SHA-256 is excluded without path fallback", () => {

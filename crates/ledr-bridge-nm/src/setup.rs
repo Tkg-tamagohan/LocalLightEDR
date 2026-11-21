@@ -577,6 +577,19 @@ pub(crate) fn classify_dos_device_target(target: &str) -> DosDeviceTarget {
     }
 }
 
+/// Verifies that a drive letter's current per-session `QueryDosDeviceW("X:")` target resolves to
+/// the exact same local volume device as `QueryDosDeviceW("Volume{guid}")` (`BUG_0001`), preventing
+/// session-local drive-letter overrides (e.g. `SUBST` or reassigned drives) from comparing against
+/// the wrong volume.
+pub(crate) fn dos_device_targets_match_volume(
+    volume_device_target: &str,
+    drive_device_target: &str,
+) -> bool {
+    classify_dos_device_target(volume_device_target) == DosDeviceTarget::VolumeDevice
+        && classify_dos_device_target(drive_device_target) == DosDeviceTarget::VolumeDevice
+        && volume_device_target.eq_ignore_ascii_case(drive_device_target)
+}
+
 /// Classifies a reparse point's `SubstituteName` into a local drive target, a local Volume GUID
 /// mount target (which must never be falsely skipped as remote), or a remote/non-local target
 /// (`\??\UNC\`, `\\`, `\Device\Mup\`, `\Device\LanmanRedirector\`, `\Device\`, `\??\GlobalRoot\`).
@@ -681,11 +694,12 @@ pub(crate) fn resolve_local_reparse_target(
 #[cfg(windows)]
 mod win_reg_ops {
     use super::{
-        build_drive_path, classify_dos_device_target, format_ledr_uri_command, is_local_drive_type,
-        normalize_display_path, parse_local_drive_path, parse_reparse_data_buffer,
-        parse_volume_guid_path, resolve_local_reparse_target, BrowserKind, DosDeviceTarget,
-        ParsedReparseBuffer, RegistryTarget, ReparseTargetResolution, Scope,
-        LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
+        build_drive_path, classify_dos_device_target, dos_device_targets_match_volume,
+        format_ledr_uri_command, is_local_drive_type, normalize_display_path,
+        parse_local_drive_path, parse_reparse_data_buffer, parse_volume_guid_path,
+        resolve_local_reparse_target, BrowserKind, DosDeviceTarget, ParsedReparseBuffer,
+        RegistryTarget, ReparseTargetResolution, Scope, LEDR_AUMID_DISPLAY_NAME,
+        LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
     };
     use anyhow::{Context, Result};
     use std::ffi::c_void;
@@ -811,6 +825,14 @@ mod win_reg_ops {
     }
 
     fn resolve_volume_guid_to_drive_letter(volume_root: &str) -> Option<char> {
+        let volume_dev_name = volume_root
+            .strip_prefix(r"\\?\")?
+            .strip_suffix('\\')?;
+        let expected_vol_target = query_dos_device_by_name(volume_dev_name)?;
+        if classify_dos_device_target(&expected_vol_target) != DosDeviceTarget::VolumeDevice {
+            return None;
+        }
+
         let mut wide_vol: Vec<u16> = volume_root.encode_utf16().collect();
         if wide_vol.is_empty() || wide_vol.contains(&0) {
             return None;
@@ -842,7 +864,13 @@ mod win_reg_ops {
                         && entry[1] == u16::from(b':')
                         && entry[2] == u16::from(b'\\')
                     {
-                        return Some((entry[0] as u8 as char).to_ascii_uppercase());
+                        let drive = (entry[0] as u8 as char).to_ascii_uppercase();
+                        if let Some(drive_target) = query_dos_device_target(drive) {
+                            if dos_device_targets_match_volume(&expected_vol_target, &drive_target)
+                            {
+                                return Some(drive);
+                            }
+                        }
                     }
                 }
                 return None;
@@ -939,15 +967,19 @@ mod win_reg_ops {
         }
     }
 
-    fn query_dos_device_target(drive: char) -> Option<String> {
-        let dos_drive = [drive.to_ascii_uppercase() as u16, b':' as u16, 0];
+    fn query_dos_device_by_name(device_name: &str) -> Option<String> {
+        let mut wide_name: Vec<u16> = device_name.encode_utf16().collect();
+        if wide_name.is_empty() || wide_name.contains(&0) {
+            return None;
+        }
+        wide_name.push(0);
         let mut cap: usize = 512;
         for _ in 0..4 {
             let mut buf = vec![0u16; cap];
-            // SAFETY: `dos_drive` is NUL-terminated UTF-16 (`X:`) and `buf` holds `cap` writable `u16` units.
+            // SAFETY: `wide_name` is NUL-terminated UTF-16 and `buf` holds `cap` writable `u16` units.
             let copied = unsafe {
                 QueryDosDeviceW(
-                    dos_drive.as_ptr(),
+                    wide_name.as_ptr(),
                     buf.as_mut_ptr(),
                     u32::try_from(buf.len()).unwrap_or(u32::MAX),
                 )
@@ -969,6 +1001,11 @@ mod win_reg_ops {
             return None;
         }
         None
+    }
+
+    fn query_dos_device_target(drive: char) -> Option<String> {
+        let name = format!("{}:", drive.to_ascii_uppercase());
+        query_dos_device_by_name(&name)
     }
 
     fn verify_local_path_recursive(path: &Path, remaining_depth: usize) -> PathLocality {

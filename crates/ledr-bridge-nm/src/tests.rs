@@ -1693,17 +1693,80 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
         "live Volume GUID pointing to a different file must not block removing unrelated manifest"
     );
     assert!(!vol_manifest.exists());
+
+    // Live Volume GUID as the deletion candidate itself (preserves `\\?\Volume{...}` through
+    // normalize_display_path): preserved when peer references same file, deleted when peer
+    // references an unrelated manifest.
+    write_manifest_atomic(&vol_manifest, &manifest).unwrap();
+    assert_eq!(
+        crate::manifest::normalize_display_path(Path::new(&live_vol_same)),
+        live_vol_same,
+        "normalize_display_path must preserve \\\\?\\Volume{{guid}}\\... paths verbatim"
+    );
+    let (u_key_vg_cand_same, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key_vg_cand_same.set_value("", &live_vol_same).unwrap();
+    let (p_key_vg_cand_same, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key_vg_cand_same
+        .set_value("", &vol_manifest.to_string_lossy().into_owned())
+        .unwrap();
+    let res_vg_cand_same = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg Volume GUID candidate with matching drive-path peer");
+    assert!(
+        !res_vg_cand_same.manifest_removed,
+        "Volume GUID deletion candidate must be preserved when peer references same file via drive letter"
+    );
+    assert!(vol_manifest.is_file());
+
+    let (u_key_vg_cand_diff, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key_vg_cand_diff.set_value("", &live_vol_same).unwrap();
+    let (p_key_vg_cand_diff, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key_vg_cand_diff
+        .set_value("", &vol_other.to_string_lossy().into_owned())
+        .unwrap();
+    let res_vg_cand_diff = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg Volume GUID candidate with unrelated peer");
+    assert!(
+        res_vg_cand_diff.manifest_removed && res_vg_cand_diff.browsers[0].manifest_removed,
+        "Volume GUID deletion candidate must be removed when peer references an unrelated manifest"
+    );
+    assert!(!vol_manifest.exists());
+    assert!(vol_other.is_file());
     let _ = fs::remove_file(&vol_other);
 
     // 6. Boundary checks for Layer 1 path parsing, Layer 2 DOS device / drive types, and Layer 3 reparse targets.
     use crate::setup::{
-        classify_dos_device_target, extract_local_drive_letter, is_local_drive_type,
-        parse_reparse_data_buffer, parse_volume_guid_path, resolve_local_reparse_target,
-        DosDeviceTarget, ParsedReparseBuffer, ReparseTargetResolution, DRIVE_FIXED, DRIVE_RAMDISK,
-        DRIVE_REMOTE, DRIVE_REMOVABLE, IO_REPARSE_TAG_DFS, IO_REPARSE_TAG_DFSR,
-        IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_NFS, IO_REPARSE_TAG_SYMLINK,
-        SYMLINK_FLAG_RELATIVE,
+        classify_dos_device_target, dos_device_targets_match_volume, extract_local_drive_letter,
+        is_local_drive_type, parse_reparse_data_buffer, parse_volume_guid_path,
+        resolve_local_reparse_target, DosDeviceTarget, ParsedReparseBuffer,
+        ReparseTargetResolution, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
+        IO_REPARSE_TAG_DFS, IO_REPARSE_TAG_DFSR, IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_NFS,
+        IO_REPARSE_TAG_SYMLINK, SYMLINK_FLAG_RELATIVE,
     };
+
+    assert!(dos_device_targets_match_volume(
+        r"\Device\HarddiskVolume3",
+        r"\device\harddiskvolume3"
+    ));
+    assert!(!dos_device_targets_match_volume(
+        r"\Device\HarddiskVolume3",
+        r"\Device\HarddiskVolume4"
+    ));
+    assert!(!dos_device_targets_match_volume(
+        r"\Device\HarddiskVolume3",
+        r"\??\D:\override"
+    ));
+    assert!(!dos_device_targets_match_volume(
+        r"\Device\LanmanRedirector\srv\sh",
+        r"\Device\LanmanRedirector\srv\sh"
+    ));
 
     assert_eq!(
         extract_local_drive_letter(Path::new(r"C:\ProgramData\LocalEDR\com.localedr.bridge.json")),

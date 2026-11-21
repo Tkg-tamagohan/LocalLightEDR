@@ -52,13 +52,19 @@ pub struct ManifestValidation {
     pub error: Option<String>,
 }
 
-/// Strips Windows extended-length prefixes (`\\?\` / `\\?\UNC\`) for manifest display/storage.
+/// Strips Windows extended-length prefixes (`\\?\X:\...` / `\\?\UNC\...`) for manifest
+/// display/storage while preserving `\\?\Volume{guid}\...` paths verbatim so they remain valid.
 pub fn normalize_display_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
     if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
     } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
-        rest.to_string()
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+            rest.to_string()
+        } else {
+            raw.into_owned()
+        }
     } else {
         raw.into_owned()
     }

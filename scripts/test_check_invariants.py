@@ -469,8 +469,13 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertIn("non-contamination", text_field)
 
         # Verify offline (even when the global plugin script is not installed) that
-        # every path_glob in .agents/invariants.json matches tracked repo file(s)
-        # covered by check_invariants.DEFAULT_PATHS.
+        # every path_glob in .agents/invariants.json is reachable through
+        # check_invariants.DEFAULT_PATHS:
+        # - Literal file paths must exist in the repository and match DEFAULT_PATHS.
+        # - Wildcard patterns must match at least one tracked file covered by
+        #   DEFAULT_PATHS; intentional exclusions outside DEFAULT_PATHS are limited
+        #   to crate manifests (crates/*/Cargo.toml) and opt-in integration tests
+        #   (check_invariants.TEST_PATHS, enabled via --include-tests).
         ls_proc = subprocess.run(
             ["git", "ls-files", "-z"],
             cwd=str(REPO_ROOT),
@@ -481,6 +486,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
         tracked_files = [
             p for p in ls_proc.stdout.decode("utf-8", errors="strict").split("\0") if p
         ]
+        allowed_non_default_patterns = ("crates/*/Cargo.toml", *check_invariants.TEST_PATHS)
         for key, (exp_globs, _, _) in EXPECTED_QUESTIONS.items():
             for pat in exp_globs:
                 is_literal = not any(ch in pat for ch in "*?[")
@@ -513,6 +519,20 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                     self.assertTrue(
                         covered,
                         f"{key}.path_globs pattern {pat!r} has no tracked files covered by check_invariants.DEFAULT_PATHS",
+                    )
+                    unexpected_uncovered = [
+                        f
+                        for f in matched_tracked
+                        if f not in covered
+                        and not any(
+                            _posix_glob_match(f, exc_pat)
+                            for exc_pat in allowed_non_default_patterns
+                        )
+                    ]
+                    self.assertEqual(
+                        unexpected_uncovered,
+                        [],
+                        f"{key}.path_globs pattern {pat!r} has tracked files unexpectedly excluded from check_invariants.DEFAULT_PATHS: {unexpected_uncovered}",
                     )
 
         gate_script = self._require_gate_script()

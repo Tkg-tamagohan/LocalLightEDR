@@ -355,9 +355,18 @@
     if (!Array.isArray(matchedDownloads) || matchedDownloads.length === 0) {
       return null;
     }
+    const procPath = normalizeWindowsPath(proc?.exe_path);
     const procOrigin =
       typeof proc?.origin_url === "string" ? proc.origin_url.trim() : "";
     if (!procOrigin) {
+      if (procPath) {
+        const pathMatch = matchedDownloads.find(
+          (d) => normalizeWindowsPath(d?.file_path) === procPath,
+        );
+        if (pathMatch) {
+          return pathMatch;
+        }
+      }
       return matchedDownloads[0] || null;
     }
     const originMatches = matchedDownloads.filter((d) => {
@@ -367,7 +376,6 @@
     if (originMatches.length === 0) {
       return null;
     }
-    const procPath = normalizeWindowsPath(proc?.exe_path);
     if (procPath) {
       const pathMatch = originMatches.find(
         (d) => normalizeWindowsPath(d?.file_path) === procPath,
@@ -872,6 +880,7 @@
         manifest_path:
           "C:\\Users\\user\\AppData\\Local\\LocalEDR\\native-messaging\\com.localedr.bridge.user.chrome.json",
         manifest_valid: true,
+        manifest_status: "valid",
         manifest_error: null,
         uri_scheme_scope: "HKCU",
         expected_extension_id: "ecelachfiiiiiibpjeomfncgpegbpanh",
@@ -884,6 +893,7 @@
             manifest_path:
               "C:\\Users\\user\\AppData\\Local\\LocalEDR\\native-messaging\\com.localedr.bridge.user.chrome.json",
             manifest_valid: true,
+            manifest_status: "valid",
             manifest_error: null,
           },
           {
@@ -894,6 +904,7 @@
             manifest_path:
               "C:\\Users\\user\\AppData\\Local\\LocalEDR\\native-messaging\\com.localedr.bridge.user.edge.json",
             manifest_valid: true,
+            manifest_status: "valid",
             manifest_error: null,
           },
           {
@@ -903,6 +914,7 @@
             hklm_registered: false,
             manifest_path: null,
             manifest_valid: false,
+            manifest_status: "not_registered",
             manifest_error: null,
           },
         ],
@@ -2724,14 +2736,19 @@
       if (!shield.native_host_registered) {
         return `<span class="badge badge-orphan">Not Registered</span>`;
       }
-      const badge = shield.manifest_valid
-        ? `<span class="badge badge-action-allow">Valid</span>`
-        : `<span class="badge badge-action-block">Invalid</span>`;
+      const overallStatus =
+        shield.manifest_status || (shield.manifest_valid ? "valid" : "invalid");
+      const badge =
+        overallStatus === "valid"
+          ? `<span class="badge badge-action-allow">Valid</span>`
+          : overallStatus === "unverified"
+            ? `<span class="badge badge-unsigned">Unverified</span>`
+            : `<span class="badge badge-action-block">Invalid</span>`;
       const pathHtml = shield.manifest_path
         ? ` <span class="mono-wrap">${escapeHtml(shield.manifest_path)}</span>`
         : "";
       const errHtml =
-        !shield.manifest_valid && shield.manifest_error
+        overallStatus !== "valid" && shield.manifest_error
           ? `<div class="mono-wrap">${escapeHtml(shield.manifest_error)}</div>`
           : "";
       const registeredDetails = (shield.browsers || []).filter(
@@ -2741,11 +2758,16 @@
         registeredDetails.length > 0
           ? `<div class="browser-detail-list">${registeredDetails
               .map((b) => {
-                const bBadge = b.manifest_valid
-                  ? `<span class="badge badge-action-allow">${escapeHtml(b.effective_scope || "")} Valid</span>`
-                  : `<span class="badge badge-action-block">${escapeHtml(b.effective_scope || "")} Invalid</span>`;
+                const bStatus =
+                  b.manifest_status || (b.manifest_valid ? "valid" : "invalid");
+                const bBadge =
+                  bStatus === "valid"
+                    ? `<span class="badge badge-action-allow">${escapeHtml(b.effective_scope || "")} Valid</span>`
+                    : bStatus === "unverified"
+                      ? `<span class="badge badge-unsigned">${escapeHtml(b.effective_scope || "")} Unverified</span>`
+                      : `<span class="badge badge-action-block">${escapeHtml(b.effective_scope || "")} Invalid</span>`;
                 const bErr =
-                  !b.manifest_valid && b.manifest_error
+                  bStatus !== "valid" && b.manifest_error
                     ? ` <span class="mono-wrap">${escapeHtml(b.manifest_error)}</span>`
                     : b.manifest_path
                       ? ` <span class="mono-wrap">${escapeHtml(b.manifest_path)}</span>`

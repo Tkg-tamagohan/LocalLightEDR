@@ -50,6 +50,7 @@ Chrome へ隔離プロファイル（`--user-data-dir`）を指定しても、Wi
 
 ```powershell
 # ウィンドウ B（通常ユーザー権限）: 既存の HKCU 登録とマニフェストを退避（未登録キーはスキップ）
+$reg64 = "$env:SystemRoot\System32\reg.exe"
 $hkcuBackups = @(
     @{ Key = "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge"; File = "hkcu_chrome_nmh.reg" },
     @{ Key = "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.localedr.bridge"; File = "hkcu_edge_nmh.reg" },
@@ -58,12 +59,16 @@ $hkcuBackups = @(
 )
 foreach ($item in $hkcuBackups) {
     if (Test-Path ("Registry::" + $item.Key)) {
-        reg export $item.Key (Join-Path "$runDir\backup" $item.File) /y | Out-Null
+        $outFile = Join-Path "$runDir\backup" $item.File
+        & $reg64 export $item.Key $outFile /y | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outFile) -or (Get-Item $outFile).Length -eq 0) {
+            throw "HKCU レジストリ退避に失敗したため setup を中止します: $($item.Key)"
+        }
     }
 }
 $userManifestDir = Join-Path $env:LOCALAPPDATA "LocalEDR\native-messaging"
 if (Test-Path $userManifestDir) {
-    Copy-Item -Recurse -Force $userManifestDir "$runDir\backup\user-native-messaging"
+    Copy-Item -Recurse -Force -ErrorAction Stop $userManifestDir "$runDir\backup\user-native-messaging"
 }
 ```
 
@@ -76,38 +81,55 @@ cd e:\Documents\code\LocalEDR
 ```
 
 必要に応じてウィンドウ A（管理者権限）でも `--scope machine` を検証できます。
-既存のマシン全体登録がある環境では、先に `HKLM` の該当キー（64 ビットビューと 32 ビットビューの双方）および `C:\ProgramData\LocalEDR\native-messaging` を `$runDir\backup` へ退避してから `setup` を実行してください。
+既存のマシン全体登録がある環境では、通常ユーザーが書き込めない管理者専用の退避フォルダ（`Administrators` と `SYSTEM` のみ許可）を作成したうえで、64 ビット版 `reg.exe` と 32 ビット版 `SysWOW64\reg.exe` で `HKLM` の該当キー（`Chrome`、`Edge` の 64/32 ビット双方、`ledr` URI、および `AppUserModelId\LocalEDR.AlertUI`）と `C:\ProgramData\LocalEDR\native-messaging` を退避し、全退避の成功を確認してから `setup` を実行してください。
+マシン単位で URI と AUMID を検証しない場合は、`setup` に `--skip-uri`、後片付けの `unregister` に `--keep-uri` を指定すると両キーを変更せずに検証できます。
 
 ```powershell
-# ウィンドウ A（管理者 PowerShell）
+# ウィンドウ A（管理者 PowerShell）: 管理者専用の退避先へ HKLM とマシンマニフェストを退避
 cd e:\Documents\code\LocalEDR
-$runDir = (Get-ChildItem C:\Temp -Directory -Filter "ledr-p4-e2e-*" | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+$reg64 = "$env:SystemRoot\System32\reg.exe"
+$reg32 = "$env:SystemRoot\SysWOW64\reg.exe"
+$adminBackupDir = Join-Path $env:ProgramData ("LocalEDR-e2e-admin-backup-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $adminBackupDir -ErrorAction Stop | Out-Null
+icacls $adminBackupDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "管理者専用退避フォルダの ACL 設定に失敗したため中止します: $adminBackupDir"
+}
+if ((Get-Item $adminBackupDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    throw "管理者専用退避フォルダがリパースポイントのため中止します: $adminBackupDir"
+}
 $hklmBackups = @(
-    @{ Key = "HKLM\Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_chrome_nmh_64.reg"; View = "/reg:64" },
-    @{ Key = "HKLM\Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_chrome_nmh_32.reg"; View = "/reg:32" },
-    @{ Key = "HKLM\Software\Microsoft\Edge\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_edge_nmh_64.reg"; View = "/reg:64" },
-    @{ Key = "HKLM\Software\Microsoft\Edge\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_edge_nmh_32.reg"; View = "/reg:32" },
-    @{ Key = "HKLM\Software\Classes\ledr"; File = "hklm_ledr_uri.reg"; View = "/reg:64" }
+    @{ Key = "HKLM\Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_chrome_nmh_64.reg"; RegExe = $reg64 },
+    @{ Key = "HKLM\Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_chrome_nmh_32.reg"; RegExe = $reg32 },
+    @{ Key = "HKLM\Software\Microsoft\Edge\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_edge_nmh_64.reg"; RegExe = $reg64 },
+    @{ Key = "HKLM\Software\Microsoft\Edge\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_edge_nmh_32.reg"; RegExe = $reg32 },
+    @{ Key = "HKLM\Software\Classes\ledr"; File = "hklm_ledr_uri_64.reg"; RegExe = $reg64 },
+    @{ Key = "HKLM\Software\Classes\AppUserModelId\LocalEDR.AlertUI"; File = "hklm_aumid_64.reg"; RegExe = $reg64 }
 )
 foreach ($item in $hklmBackups) {
-    reg query $item.Key $item.View *> $null
+    & $item.RegExe query $item.Key *> $null
     if ($LASTEXITCODE -eq 0) {
-        reg export $item.Key (Join-Path "$runDir\backup" $item.File) /y $item.View | Out-Null
+        $outFile = Join-Path $adminBackupDir $item.File
+        & $item.RegExe export $item.Key $outFile /y | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outFile) -or (Get-Item $outFile).Length -eq 0) {
+            throw "HKLM レジストリ退避に失敗したため setup を中止します: $($item.Key) ($($item.RegExe))"
+        }
     }
 }
 if (Test-Path "C:\ProgramData\LocalEDR\native-messaging") {
-    Copy-Item -Recurse -Force "C:\ProgramData\LocalEDR\native-messaging" "$runDir\backup\machine-native-messaging"
+    Copy-Item -Recurse -Force -ErrorAction Stop "C:\ProgramData\LocalEDR\native-messaging" "$adminBackupDir\machine-native-messaging"
 }
+Write-Output ("AdminBackupDir=" + $adminBackupDir)
 .\target\debug\ledr-bridge-nm.exe setup --scope machine --browsers chrome,edge --bridge-exe "$PWD\target\debug\ledr-bridge-nm.exe" --ui-exe "$PWD\target\debug\ledr-ui.exe"
 .\target\debug\ledr-bridge-nm.exe status --scope all
 ```
 
 ウィンドウ A で `ledr-daemon.exe` を検証用設定で起動し、続けてウィンドウ B で `ledr-ui.exe` を開いて `View 3: 防御ポリシー・カナリア・ブラウザシールド` を確認してください。
-起動前にウィンドウ A の `$runDir` へ同じ一時フォルダパスを設定します。
+起動前に、ウィンドウ B で出力された `RunDir=...` のパスをウィンドウ A の `$runDir` へ明示的に設定します。
 
 ```powershell
 # ウィンドウ A（管理者 PowerShell）
-$runDir = (Get-ChildItem C:\Temp -Directory -Filter "ledr-p4-e2e-*" | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+$runDir = "<ウィンドウ B で表示された RunDir の絶対パス>"
 $nrdUrl = ([Uri]"$runDir\nrd-test-feed.txt").AbsoluteUri
 .\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --db "$runDir\ledr.db" --nrd-feed-url $nrdUrl --nrd-cache "$runDir\nrd-cache.txt"
 ```
@@ -173,14 +195,15 @@ if (-not (Test-Path $chromeExe)) { $chromeExe = "${env:ProgramFiles(x86)}\Google
 | `E2E-P4-03` | `http://nrd-sim.localedr.invalid:8765/phase4-browser-test.html` の `Password` 欄へフォーカスして 1 文字入力し、`ledr-ui` で `Refresh` を押下 | ブラウザ内に NRD 警告が表示され、View 1 に `NrdPasswordWarning` が記録される |
 | `E2E-P4-04` | `http://login-paypa1.localedr.invalid:8765/phase4-browser-test.html` の `Password` 欄へフォーカスして 1 文字入力し、`ledr-ui` で `Refresh` を押下 | ブラウザ内にホモグラフ警告（対象ブランド `paypal`）が表示され、View 1 に `HomographWarning` が記録される |
 | `E2E-P4-05` | `Fetch safe-sim.localedr.invalid` と `Fetch c2-sim.localedr.invalid` を順に押下し、`ledr-ui` で `Refresh` を押下 | `safe-sim` は `HTTP 200` で成功し、`c2-sim` と `blocked-test` は DNR 静的ルールで即座に遮断され、`DnrBlockedRequest` が記録される |
-| `E2E-P4-06` | `Download localedr-e2e-sample.exe` でダウンロード後、下記コマンドで `$runDir\moved\localedr-e2e-sample.exe` へ移動して `--scenario cookies-open` を実行し、`ledr-ui` で `Refresh` を押下 | View 1 に `localedr-e2e-sample.exe` の `LEDR-CANARY-COOKIE_DB` アラートと MOTW カード（`Origin URL`、`Source`、一致ダウンロード行）が表示され、`Allow Once` で再開できる。View 2 のプロセスツリーに `MOTW` バッジと `Origin URL (MOTW)`、選択時の `download_origins` 行（`referrer_url` と短縮 `sha256`）が表示され、View 3 の `Tracked Downloads` が増加する |
+| `E2E-P4-06` | `Download localedr-e2e-sample.exe` でダウンロード完了後、まず `ledr-ui` で `Refresh` を押下し、View 2（`Downloads` タブ）に元パスと SHA-256 が記録されたことを確認してから、下記コマンドで `$runDir\moved\localedr-e2e-sample.exe` へ移動して `--scenario cookies-open` を実行し、再度 `ledr-ui` で `Refresh` を押下 | 移動前に View 2 へ元パスと SHA-256 が記録され、View 3 の `Tracked Downloads` が増加している。移動後の起動により View 1 に `localedr-e2e-sample.exe` の `LEDR-CANARY-COOKIE_DB` アラートと MOTW カード（`Origin URL`、`Source`、一致ダウンロード行）が表示され、`Allow Once` で再開できる。View 2 のプロセスツリーに `MOTW` バッジと `Origin URL (MOTW)`、選択時の `download_origins` 行（`referrer_url` と短縮 `sha256`）が表示される |
 | `E2E-P4-07` | View 1 の未解決 `LAYER_4_BROWSER` アラートを `Acknowledge` で解決後、`ledr-ui` ウィンドウを閉じる | View 1 で解決状態へ遷移し、ウィンドウ閉鎖後に `ledr-ui` と WebView2 の残留プロセスが 0 件になる |
 
-`E2E-P4-06` では、ダウンロード直後の移動とダミーカナリア起動をウィンドウ B で実行してください。
-`localedr-e2e-sample.exe` は検知直後に凍結されるため、`Start-Process -PassThru` で別プロセスとして起動し、View 1 と View 2 の確認後に `Allow Once` で再開します。
+`E2E-P4-06` では、拡張機能のダウンロード完了通知とデーモン側の SHA-256 算出が非同期で走るため、**移動コマンドを実行する前に** `ledr-ui` 上部の `Refresh` を押し、View 2 の `Downloads` タブ（または View 3 の `Tracked Downloads`）に `Downloads\localedr-e2e-sample.exe` と短縮 `sha256` が記録されたことを確かめてください。
+記録を確認してから、ウィンドウ B で移動とダミーカナリア起動を実行します。
+`localedr-e2e-sample.exe` は検知直後に凍結されるため、`Start-Process -PassThru` で別プロセスとして起動し、再度 `Refresh` を押して View 1 と View 2 を確認したあとに `Allow Once` で再開します。
 
 ```powershell
-# ウィンドウ B（通常ユーザー PowerShell）: E2E-P4-06 移動後起動（View 1 MOTW カードと View 2 の双方を検証）
+# ウィンドウ B（通常ユーザー PowerShell）: View 2 で元パスと SHA-256 の記録を確認した後に実行
 New-Item -ItemType Directory -Force -Path "$runDir\moved" | Out-Null
 Move-Item "$env:USERPROFILE\Downloads\localedr-e2e-sample.exe" "$runDir\moved\localedr-e2e-sample.exe" -Force
 $simMotw = Start-Process -FilePath "$runDir\moved\localedr-e2e-sample.exe" -ArgumentList "--scenario", "cookies-open", "--base-dir", "$runDir\canary_dir", "--hold-ms", "120000", "--json" -PassThru
@@ -253,46 +276,62 @@ Get-Process ledr-daemon -ErrorAction SilentlyContinue
 手順 1 で既存設定を `$runDir\backup` へ退避していた場合は、一時フォルダを削除する前に `reg import` とマニフェスト書き戻しで元の登録を復元します。
 
 ```powershell
-# 2. ウィンドウ B（通常ユーザー PowerShell）: ローカルサーバ停止、登録解除、既存設定復元
+# 2. ウィンドウ B（通常ユーザー PowerShell）: ローカルサーバ停止、登録解除、既存 HKCU 設定復元
+$reg64 = "$env:SystemRoot\System32\reg.exe"
 if ($serverProc -and -not $serverProc.HasExited) { Stop-Process -Id $serverProc.Id -Force }
 if ($simMotw -and -not $simMotw.HasExited) { Stop-Process -Id $simMotw.Id -Force -ErrorAction SilentlyContinue }
 .\target\debug\ledr-bridge-nm.exe unregister --scope user --browsers chrome,edge
 
-# 手順 1 で既存 HKCU 設定を退避した場合のみ復元する
+# 手順 1 で既存 HKCU 設定を退避した場合のみ復元し、失敗時は退避ファイルを消さずに停止する
 Get-ChildItem "$runDir\backup\hkcu_*.reg" -ErrorAction SilentlyContinue | ForEach-Object {
-    reg import $_.FullName | Out-Null
+    & $reg64 import $_.FullName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "HKCU レジストリ復元に失敗したため退避フォルダを削除せず中止します: $($_.FullName)"
+    }
 }
 if (Test-Path "$runDir\backup\user-native-messaging") {
     $userManifestDir = Join-Path $env:LOCALAPPDATA "LocalEDR\native-messaging"
     New-Item -ItemType Directory -Force -Path $userManifestDir | Out-Null
-    Copy-Item -Recurse -Force "$runDir\backup\user-native-messaging\*" $userManifestDir
+    Copy-Item -Recurse -Force -ErrorAction Stop "$runDir\backup\user-native-messaging\*" $userManifestDir
 }
 ```
 
-管理者ウィンドウ A で `--scope machine` を登録していた場合は、ウィンドウ A で解除と退避復元を実行してください。
+管理者ウィンドウ A で `--scope machine` を登録していた場合は、ウィンドウ A で解除と管理者専用退避フォルダ（`$adminBackupDir`）からの復元を実行し、すべての復元成功を確認してから `$adminBackupDir` を削除してください。
 
 ```powershell
 # 3. ウィンドウ A（管理者 PowerShell）: --scope machine を登録した場合のみ実施
+$reg64 = "$env:SystemRoot\System32\reg.exe"
+$reg32 = "$env:SystemRoot\SysWOW64\reg.exe"
 .\target\debug\ledr-bridge-nm.exe unregister --scope machine --browsers chrome,edge
-Get-ChildItem "$runDir\backup\hklm_*_64.reg" -ErrorAction SilentlyContinue | ForEach-Object {
-    reg import $_.FullName /reg:64 | Out-Null
-}
-Get-ChildItem "$runDir\backup\hklm_*_32.reg" -ErrorAction SilentlyContinue | ForEach-Object {
-    reg import $_.FullName /reg:32 | Out-Null
-}
-if (Test-Path "$runDir\backup\hklm_ledr_uri.reg") {
-    reg import "$runDir\backup\hklm_ledr_uri.reg" /reg:64 | Out-Null
-}
-if (Test-Path "$runDir\backup\machine-native-messaging") {
-    New-Item -ItemType Directory -Force -Path "C:\ProgramData\LocalEDR\native-messaging" | Out-Null
-    Copy-Item -Recurse -Force "$runDir\backup\machine-native-messaging\*" "C:\ProgramData\LocalEDR\native-messaging"
+if ($adminBackupDir -and (Test-Path $adminBackupDir)) {
+    if ((Get-Item $adminBackupDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "管理者専用退避フォルダがリパースポイントのため復元を中止します: $adminBackupDir"
+    }
+    Get-ChildItem "$adminBackupDir\hklm_*_64.reg" -ErrorAction SilentlyContinue | ForEach-Object {
+        & $reg64 import $_.FullName | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "HKLM 64 ビットビューの復元に失敗したため退避フォルダを保持します: $($_.FullName)"
+        }
+    }
+    Get-ChildItem "$adminBackupDir\hklm_*_32.reg" -ErrorAction SilentlyContinue | ForEach-Object {
+        & $reg32 import $_.FullName | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "HKLM 32 ビットビューの復元に失敗したため退避フォルダを保持します: $($_.FullName)"
+        }
+    }
+    if (Test-Path "$adminBackupDir\machine-native-messaging") {
+        New-Item -ItemType Directory -Force -Path "C:\ProgramData\LocalEDR\native-messaging" | Out-Null
+        Copy-Item -Recurse -Force -ErrorAction Stop "$adminBackupDir\machine-native-messaging\*" "C:\ProgramData\LocalEDR\native-messaging"
+    }
+    .\target\debug\ledr-bridge-nm.exe status --scope all
+    Remove-Item -Recurse -Force $adminBackupDir
 }
 ```
 
 最後に、復元結果に問題がないことを `.\target\debug\ledr-bridge-nm.exe status --scope all` で確認したうえで一時フォルダを削除してください。
 
 ```powershell
-# 4. ウィンドウ B（通常ユーザー PowerShell）
+# 4. ウィンドウ B（通常ユーザー PowerShell）: 全復元成功を確認したうえで削除
 .\target\debug\ledr-bridge-nm.exe status --scope all
 Remove-Item -Recurse -Force $runDir
 ```

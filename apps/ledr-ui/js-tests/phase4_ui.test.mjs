@@ -506,6 +506,20 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
   assert.match(html, /ledr:\/\/ \(HKLM\)/);
   assert.match(html, /2 \(1 unresolved\)/);
   assert.match(html, /<dd class="mono">3<\/dd>/);
+
+  // Custom `--manifest-dir` outside default 2 directories renders as `Unverified` (distinct from red `Invalid`).
+  ui.state.localDefenseStatus.browser_shield.manifest_status = "unverified";
+  ui.state.localDefenseStatus.browser_shield.manifest_error =
+    "Edge: manifest path is outside default LocalEDR manifest directories (unverified by UI; run 'ledr-bridge-nm status' to verify custom --manifest-dir)";
+  ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_status = "unverified";
+  ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_error =
+    "manifest path is outside default LocalEDR manifest directories (unverified by UI; run 'ledr-bridge-nm status' to verify custom --manifest-dir)";
+  ui.renderPolicyView();
+  const unverifiedHtml = ui.el.browserShieldDl.innerHTML;
+  assert.match(unverifiedHtml, /badge-unsigned">Unverified</);
+  assert.match(unverifiedHtml, /badge-unsigned">HKLM Unverified</);
+  assert.doesNotMatch(unverifiedHtml, />Invalid</);
+  assert.match(unverifiedHtml, /ledr-bridge-nm status/);
 });
 
 test("UI-P4-09: Same-path download with different SHA-256 is excluded without path fallback", () => {
@@ -661,10 +675,11 @@ test("UI-P4-10: Process inspector prevents cross-site origin/referrer/frame mixi
   assert.doesNotMatch(ui.el.processInspector.innerHTML, /ref-b\.localedr\.invalid/);
   assert.doesNotMatch(ui.el.processInspector.innerHTML, /frame-b\.localedr\.invalid/);
 
-  // Case 3: When proc.origin_url is unset, fallback to newest matched download row remains active
+  // Case 3: When proc.origin_url is unset, prefer matching exe_path if present, else newest matched row
   const procNoOrigin = { ...procSiteA, process_instance_id: "400:2", origin_url: null };
   ui.state.snapshot.processes = [procNoOrigin];
   ui.state.selectedProcessId = procNoOrigin.process_instance_id;
+  assert.equal(ui.selectPrimaryDownloadOrigin(procNoOrigin, matchedBoth)?.id, dlSiteAOlder.id);
   assert.equal(ui.selectPrimaryDownloadOrigin(procNoOrigin, matchedBOnly)?.id, dlSiteBNewer.id);
   ui.renderTree();
   assert.match(ui.el.processInspector.innerHTML, /site-b\.localedr\.invalid\/mirror/);

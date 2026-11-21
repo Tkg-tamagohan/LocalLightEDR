@@ -9,6 +9,19 @@ pub(crate) enum RegDefaultSzProbe {
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RegNativeHostSzProbe {
+    Absent,
+    Present(String),
+    /// Default value exists as `REG_SZ` and was read successfully, but is empty/whitespace.
+    /// Chromium's `RegKey::ReadValue` succeeds on empty `REG_SZ` and stops 64-bit fallback.
+    EmptyString,
+    /// Key exists, but default value is absent or not `REG_SZ` (`ReadValue` fails in Chromium,
+    /// allowing 32-bit -> 64-bit fallback).
+    MissingOrInvalidType,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegWow64View {
     Default,
@@ -60,8 +73,8 @@ pub(crate) fn format_ledr_uri_command(exe_path: &std::path::Path) -> String {
 #[cfg(windows)]
 pub(crate) mod win_uri_reg {
     use super::{
-        LEDR_URI_DESCRIPTION, RegDefaultSzProbe, RegWow64View, UriRegistrationOutcome,
-        format_ledr_uri_command,
+        LEDR_URI_DESCRIPTION, RegDefaultSzProbe, RegNativeHostSzProbe, RegWow64View,
+        UriRegistrationOutcome, format_ledr_uri_command,
     };
     use std::ffi::c_void;
     use std::path::Path;
@@ -80,6 +93,8 @@ pub(crate) mod win_uri_reg {
     pub(crate) const KEY_WOW64_32KEY: u32 = 0x0200;
     const REG_OPTION_NON_VOLATILE: u32 = 0;
     const REG_SZ: u32 = 1;
+    #[cfg(test)]
+    const REG_DWORD: u32 = 4;
     const ERROR_SUCCESS: i32 = 0;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_MORE_DATA: i32 = 234;
@@ -179,11 +194,11 @@ pub(crate) mod win_uri_reg {
         }
     }
 
-    pub(crate) fn reg_query_default_sz_in_hive_with_view(
+    pub(crate) fn reg_query_native_host_sz_in_hive_with_view(
         is_hklm: bool,
         subkey: &str,
         view: RegWow64View,
-    ) -> Result<RegDefaultSzProbe, String> {
+    ) -> Result<RegNativeHostSzProbe, String> {
         let access = KEY_QUERY_VALUE | wow64_access_flag(view);
         let key = if is_hklm {
             reg_open_hklm(subkey, access)?
@@ -191,13 +206,28 @@ pub(crate) mod win_uri_reg {
             reg_open_hkcu(subkey, access)?
         };
         let Some(key) = key else {
-            return Ok(RegDefaultSzProbe::Absent);
+            return Ok(RegNativeHostSzProbe::Absent);
         };
         match reg_query_sz(&key, None)? {
             Some(val) if !val.trim().is_empty() => {
-                Ok(RegDefaultSzProbe::Present(val.trim().to_string()))
+                Ok(RegNativeHostSzProbe::Present(val.trim().to_string()))
             }
-            Some(_) | None => Ok(RegDefaultSzProbe::EmptyOrInvalidType),
+            Some(_) => Ok(RegNativeHostSzProbe::EmptyString),
+            None => Ok(RegNativeHostSzProbe::MissingOrInvalidType),
+        }
+    }
+
+    pub(crate) fn reg_query_default_sz_in_hive_with_view(
+        is_hklm: bool,
+        subkey: &str,
+        view: RegWow64View,
+    ) -> Result<RegDefaultSzProbe, String> {
+        match reg_query_native_host_sz_in_hive_with_view(is_hklm, subkey, view)? {
+            RegNativeHostSzProbe::Absent => Ok(RegDefaultSzProbe::Absent),
+            RegNativeHostSzProbe::Present(val) => Ok(RegDefaultSzProbe::Present(val)),
+            RegNativeHostSzProbe::EmptyString | RegNativeHostSzProbe::MissingOrInvalidType => {
+                Ok(RegDefaultSzProbe::EmptyOrInvalidType)
+            }
         }
     }
 
@@ -385,6 +415,34 @@ pub(crate) mod win_uri_reg {
             KEY_SET_VALUE | KEY_CREATE_SUB_KEY | wow64_access_flag(view),
         )?;
         reg_set_sz(&key, None, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reg_set_hkcu_default_dword_with_view(
+        subkey: &str,
+        value: u32,
+        view: RegWow64View,
+    ) -> Result<(), String> {
+        let key = reg_create_hkcu(
+            subkey,
+            KEY_SET_VALUE | KEY_CREATE_SUB_KEY | wow64_access_flag(view),
+        )?;
+        let bytes = value.to_le_bytes();
+        // SAFETY: `key.0` is an open HKEY with write access and `bytes` is a 4-byte little-endian DWORD.
+        let status = unsafe {
+            RegSetValueExW(
+                key.0,
+                ptr::null(),
+                0,
+                REG_DWORD,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(format!("RegSetValueExW(REG_DWORD) failed: OS status {status}"));
+        }
+        Ok(())
     }
 
     #[cfg(test)]

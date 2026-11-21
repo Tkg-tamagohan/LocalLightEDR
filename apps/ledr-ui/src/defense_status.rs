@@ -1,5 +1,7 @@
 #[cfg(windows)]
-use crate::uri_reg::{LEDR_URI_REG_SUBKEY, RegDefaultSzProbe, RegWow64View, win_uri_reg};
+use crate::uri_reg::{
+    LEDR_URI_REG_SUBKEY, RegDefaultSzProbe, RegNativeHostSzProbe, RegWow64View, win_uri_reg,
+};
 use ledr_proto::{AUTHORIZED_BRIDGE_EXE_PATH, PROGRAM_DATA_DIR};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -38,6 +40,7 @@ pub(crate) struct ProtectedPathTemplate {
 pub(crate) enum RegistryStringProbe {
     Absent,
     Present(String),
+    EmptyString,
     EmptyOrInvalidType,
     AccessError(String),
 }
@@ -64,6 +67,7 @@ pub(crate) struct BrowserRegistrationDetail {
     pub(crate) hklm_registered: bool,
     pub(crate) manifest_path: Option<String>,
     pub(crate) manifest_valid: bool,
+    pub(crate) manifest_status: String,
     pub(crate) manifest_error: Option<String>,
 }
 
@@ -77,10 +81,36 @@ pub(crate) struct BrowserShieldStatus {
     pub(crate) registered_browsers: Vec<String>,
     pub(crate) manifest_path: Option<String>,
     pub(crate) manifest_valid: bool,
+    pub(crate) manifest_status: String,
     pub(crate) manifest_error: Option<String>,
     pub(crate) uri_scheme_scope: Option<String>,
     pub(crate) expected_extension_id: String,
     pub(crate) browsers: Vec<BrowserRegistrationDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManifestReadError {
+    UnverifiedCustomPath(String),
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManifestValidationOutcome {
+    Valid,
+    UnverifiedCustomPath(String),
+    Invalid(String),
+}
+
+pub(crate) const MANIFEST_STATUS_VALID: &str = "valid";
+pub(crate) const MANIFEST_STATUS_UNVERIFIED: &str = "unverified";
+pub(crate) const MANIFEST_STATUS_INVALID: &str = "invalid";
+pub(crate) const MANIFEST_STATUS_NOT_REGISTERED: &str = "not_registered";
+
+const UNVERIFIED_CUSTOM_MANIFEST_MSG: &str = "manifest path is outside default LocalEDR manifest directories (unverified by UI; run 'ledr-bridge-nm status' to verify custom --manifest-dir)";
+
+fn is_custom_localedr_manifest_filename(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    lower.starts_with("com.localedr.bridge") && lower.ends_with(".json")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,7 +190,10 @@ pub(crate) fn default_allowed_manifest_dirs() -> Vec<PathBuf> {
 
 #[cfg(windows)]
 mod win_manifest_io {
-    use super::MAX_MANIFEST_BYTES;
+    use super::{
+        MAX_MANIFEST_BYTES, ManifestReadError, UNVERIFIED_CUSTOM_MANIFEST_MSG,
+        is_custom_localedr_manifest_filename,
+    };
     use std::ffi::c_void;
     use std::fs::File;
     use std::io::{ErrorKind, Read};
@@ -397,6 +430,39 @@ mod win_manifest_io {
         None
     }
 
+    fn segment_eq_case_insensitive(a: &str, b: &str) -> bool {
+        if a.is_ascii() && b.is_ascii() {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a.to_lowercase() == b.to_lowercase()
+        }
+    }
+
+    fn expand_long_segments(drive: char, segments: &[String]) -> Option<(char, Vec<String>)> {
+        let verbatim = build_verbatim_drive_path(drive, segments);
+        if let Some(long_path) = query_long_path(&verbatim) {
+            if let Some((ld, lsegs)) = parse_strict_local_drive_path(&long_path) {
+                if !lsegs.is_empty() {
+                    return Some((ld, lsegs));
+                }
+            }
+        }
+        // When the leaf directory (e.g. `LocalEDR\native-messaging`) does not yet exist on disk,
+        // expand the longest existing ancestor prefix so 8.3 usernames still match long paths.
+        for prefix_len in (1..segments.len()).rev() {
+            let prefix_verbatim = build_verbatim_drive_path(drive, &segments[..prefix_len]);
+            if let Some(long_prefix) = query_long_path(&prefix_verbatim) {
+                if let Some((ld, mut lsegs)) = parse_strict_local_drive_path(&long_prefix) {
+                    if !lsegs.is_empty() {
+                        lsegs.extend(segments[prefix_len..].iter().cloned());
+                        return Some((ld, lsegs));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn expand_allowed_dirs(allowed_dirs: &[PathBuf]) -> Vec<(char, Vec<String>)> {
         let mut out: Vec<(char, Vec<String>)> = Vec::new();
         for dir in allowed_dirs {
@@ -410,20 +476,19 @@ mod win_manifest_io {
                 let exists = list.iter().any(|(ed, es)| {
                     *ed == d
                         && es.len() == segs.len()
-                        && es.iter().zip(&segs).all(|(a, b)| a.eq_ignore_ascii_case(b))
+                        && es
+                            .iter()
+                            .zip(&segs)
+                            .all(|(a, b)| segment_eq_case_insensitive(a, b))
                 });
                 if !exists {
                     list.push((d, segs));
                 }
             };
-            let verbatim = build_verbatim_drive_path(drive, &segments);
+            let long_expanded = expand_long_segments(drive, &segments);
             push_unique(&mut out, drive, segments);
-            if let Some(long_path) = query_long_path(&verbatim) {
-                if let Some((ld, lsegs)) = parse_strict_local_drive_path(&long_path) {
-                    if !lsegs.is_empty() {
-                        push_unique(&mut out, ld, lsegs);
-                    }
-                }
+            if let Some((ld, lsegs)) = long_expanded {
+                push_unique(&mut out, ld, lsegs);
             }
         }
         out
@@ -444,7 +509,7 @@ mod win_manifest_io {
                 && parent
                     .iter()
                     .zip(aseg)
-                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                    .all(|(a, b)| segment_eq_case_insensitive(a, b))
         })
     }
 
@@ -462,24 +527,37 @@ mod win_manifest_io {
     pub(super) fn safe_read_manifest_bytes(
         path: &Path,
         allowed_dirs: &[PathBuf],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, ManifestReadError> {
         // Step 1: Pure syntactic allowlist verification before touching the untrusted path.
         if path
             .to_str()
             .is_some_and(|s| s.ends_with('\\') || s.ends_with('/'))
         {
-            return Err("manifest path is not a regular file".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest path is not a regular file".to_string(),
+            ));
         }
         let allowed_candidates = expand_allowed_dirs(allowed_dirs);
         let Some((drive, segments)) = parse_strict_local_drive_path(path) else {
-            return Err(
+            return Err(ManifestReadError::Invalid(
                 "manifest path is outside allowed LocalEDR manifest directories".to_string(),
-            );
+            ));
         };
         if !is_direct_child_of_allowed(drive, &segments, &allowed_candidates) {
-            return Err(
+            // Preserve zero I/O outside allowlisted directories while distinguishing a clean
+            // custom `--manifest-dir` LocalEDR manifest filename from unsafe/arbitrary paths.
+            if segments.len() >= 2
+                && segments
+                    .last()
+                    .is_some_and(|leaf| is_custom_localedr_manifest_filename(leaf))
+            {
+                return Err(ManifestReadError::UnverifiedCustomPath(
+                    UNVERIFIED_CUSTOM_MANIFEST_MSG.to_string(),
+                ));
+            }
+            return Err(ManifestReadError::Invalid(
                 "manifest path is outside allowed LocalEDR manifest directories".to_string(),
-            );
+            ));
         }
 
         // Step 2: Walk every ancestor component and the leaf via verbatim `\\?\` `GetFileAttributesW`
@@ -487,7 +565,9 @@ mod win_manifest_io {
         for prefix_len in 1..=segments.len() {
             let current = build_verbatim_drive_path(drive, &segments[..prefix_len]);
             let Some(wide) = encode_wide_nul(&current) else {
-                return Err("manifest path contains invalid characters".to_string());
+                return Err(ManifestReadError::Invalid(
+                    "manifest path contains invalid characters".to_string(),
+                ));
             };
             // SAFETY: `wide` is NUL-terminated UTF-16; `GetFileAttributesW` inspects the
             // component itself without traversing a trailing reparse point.
@@ -495,17 +575,23 @@ mod win_manifest_io {
             if attrs == INVALID_FILE_ATTRIBUTES {
                 let err = std::io::Error::last_os_error();
                 if is_not_found_os_err(&err) {
-                    return Err("manifest file does not exist".to_string());
+                    return Err(ManifestReadError::Invalid(
+                        "manifest file does not exist".to_string(),
+                    ));
                 }
-                return Err(format!("failed to stat manifest: {err}"));
+                return Err(ManifestReadError::Invalid(format!(
+                    "failed to stat manifest: {err}"
+                )));
             }
             if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-                return Err(
+                return Err(ManifestReadError::Invalid(
                     "manifest path or parent directory is a reparse point (rejected)".to_string(),
-                );
+                ));
             }
             if prefix_len == segments.len() && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 {
-                return Err("manifest path is not a regular file".to_string());
+                return Err(ManifestReadError::Invalid(
+                    "manifest path is not a regular file".to_string(),
+                ));
             }
         }
 
@@ -515,7 +601,9 @@ mod win_manifest_io {
         // and final kernel path containment inside `allowed_dirs`.
         let leaf_verbatim = build_verbatim_drive_path(drive, &segments);
         let Some(leaf_wide) = encode_wide_nul(&leaf_verbatim) else {
-            return Err("manifest path contains invalid characters".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest path contains invalid characters".to_string(),
+            ));
         };
         let share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         // SAFETY: `leaf_wide` is NUL-terminated UTF-16; attribute-only access with
@@ -534,53 +622,69 @@ mod win_manifest_io {
         if attr_raw.is_null() || attr_raw as isize == INVALID_HANDLE_VALUE {
             let err = std::io::Error::last_os_error();
             if is_not_found_os_err(&err) {
-                return Err("manifest file does not exist".to_string());
+                return Err(ManifestReadError::Invalid(
+                    "manifest file does not exist".to_string(),
+                ));
             }
-            return Err(format!("failed to inspect manifest attributes: {err}"));
+            return Err(ManifestReadError::Invalid(format!(
+                "failed to inspect manifest attributes: {err}"
+            )));
         }
         let attr_handle = OwnedHandle(attr_raw);
 
         // SAFETY: `attr_handle.0` is an open Win32 file handle.
         let file_type = unsafe { GetFileType(attr_handle.0) };
         if file_type != FILE_TYPE_DISK {
-            return Err("manifest path is not a regular file".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest path is not a regular file".to_string(),
+            ));
         }
 
         let mut info = ByHandleFileInformation::default();
         // SAFETY: `attr_handle.0` is an open Win32 file handle and `info` is valid out storage.
         if unsafe { GetFileInformationByHandle(attr_handle.0, &mut info) } == 0 {
             let err = std::io::Error::last_os_error();
-            return Err(format!("failed to query manifest file info: {err}"));
+            return Err(ManifestReadError::Invalid(format!(
+                "failed to query manifest file info: {err}"
+            )));
         }
         if (info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return Err("manifest path is a reparse point (rejected)".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest path is a reparse point (rejected)".to_string(),
+            ));
         }
         if (info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
-            return Err("manifest path is not a regular file".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest path is not a regular file".to_string(),
+            ));
         }
         if info.n_number_of_links != 1 {
-            return Err(format!(
+            return Err(ManifestReadError::Invalid(format!(
                 "manifest file has {} hard links (expected 1; rejected)",
                 info.n_number_of_links
-            ));
+            )));
         }
         let initial_size = (u64::from(info.n_file_size_high) << 32) | u64::from(info.n_file_size_low);
         if initial_size > MAX_MANIFEST_BYTES {
-            return Err("manifest exceeds 64 KiB limit".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest exceeds 64 KiB limit".to_string(),
+            ));
         }
 
         let Some(final_path) = query_final_path_dos(attr_handle.0) else {
-            return Err("failed to verify manifest final path".to_string());
+            return Err(ManifestReadError::Invalid(
+                "failed to verify manifest final path".to_string(),
+            ));
         };
         let Some((final_drive, final_segments)) = parse_strict_local_drive_path(&final_path) else {
-            return Err(
+            return Err(ManifestReadError::Invalid(
                 "manifest final path escaped allowed LocalEDR manifest directories".to_string(),
-            );
+            ));
         };
         if !is_direct_child_of_allowed(final_drive, &final_segments, &allowed_candidates) {
-            return Err(
+            return Err(ManifestReadError::Invalid(
                 "manifest final path escaped allowed LocalEDR manifest directories".to_string(),
-            );
+            ));
         }
 
         // Step 4: Upgrade the exact verified kernel file object via `ReOpenFile` (no path
@@ -596,7 +700,9 @@ mod win_manifest_io {
         };
         if read_raw.is_null() || read_raw as isize == INVALID_HANDLE_VALUE {
             let err = std::io::Error::last_os_error();
-            return Err(format!("failed to open manifest: {err}"));
+            return Err(ManifestReadError::Invalid(format!(
+                "failed to open manifest: {err}"
+            )));
         }
         let read_handle = OwnedHandle(read_raw);
 
@@ -604,25 +710,33 @@ mod win_manifest_io {
         // SAFETY: `read_handle.0` is an open Win32 file handle and `info2` is valid out storage.
         if unsafe { GetFileInformationByHandle(read_handle.0, &mut info2) } == 0 {
             let err = std::io::Error::last_os_error();
-            return Err(format!("failed to stat manifest: {err}"));
+            return Err(ManifestReadError::Invalid(format!(
+                "failed to stat manifest: {err}"
+            )));
         }
         if (info2.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return Err("manifest path is a reparse point (rejected)".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest path is a reparse point (rejected)".to_string(),
+            ));
         }
         if (info2.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
-            return Err("manifest path is not a regular file".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest path is not a regular file".to_string(),
+            ));
         }
         if info2.n_number_of_links != 1 {
-            return Err(format!(
+            return Err(ManifestReadError::Invalid(format!(
                 "manifest file has {} hard links (expected 1; rejected)",
                 info2.n_number_of_links
-            ));
+            )));
         }
         if info2.dw_volume_serial_number != info.dw_volume_serial_number
             || info2.n_file_index_high != info.n_file_index_high
             || info2.n_file_index_low != info.n_file_index_low
         {
-            return Err("manifest file identity changed during open (rejected)".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest file identity changed during open (rejected)".to_string(),
+            ));
         }
 
         // SAFETY: `read_handle.into_raw()` transfers unique ownership of a valid Win32 file handle.
@@ -632,16 +746,21 @@ mod win_manifest_io {
         let mut buf = Vec::new();
         file.take(MAX_MANIFEST_BYTES + 1)
             .read_to_end(&mut buf)
-            .map_err(|err| format!("failed to read manifest: {err}"))?;
+            .map_err(|err| ManifestReadError::Invalid(format!("failed to read manifest: {err}")))?;
         if buf.len() as u64 > MAX_MANIFEST_BYTES {
-            return Err("manifest exceeds 64 KiB limit".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest exceeds 64 KiB limit".to_string(),
+            ));
         }
         Ok(buf)
     }
 }
 
 #[cfg(not(windows))]
-fn safe_read_manifest_bytes(path: &Path, allowed_dirs: &[PathBuf]) -> Result<Vec<u8>, String> {
+fn safe_read_manifest_bytes(
+    path: &Path,
+    allowed_dirs: &[PathBuf],
+) -> Result<Vec<u8>, ManifestReadError> {
     use std::io::Read;
     use std::path::Component;
 
@@ -650,13 +769,28 @@ fn safe_read_manifest_bytes(path: &Path, allowed_dirs: &[PathBuf]) -> Result<Vec
             .components()
             .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
     {
-        return Err("manifest path is outside allowed LocalEDR manifest directories".to_string());
+        return Err(ManifestReadError::Invalid(
+            "manifest path is outside allowed LocalEDR manifest directories".to_string(),
+        ));
     }
     let Some(parent) = path.parent() else {
-        return Err("manifest path is outside allowed LocalEDR manifest directories".to_string());
+        return Err(ManifestReadError::Invalid(
+            "manifest path is outside allowed LocalEDR manifest directories".to_string(),
+        ));
     };
     if !allowed_dirs.iter().any(|dir| dir == parent) {
-        return Err("manifest path is outside allowed LocalEDR manifest directories".to_string());
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_custom_localedr_manifest_filename)
+        {
+            return Err(ManifestReadError::UnverifiedCustomPath(
+                UNVERIFIED_CUSTOM_MANIFEST_MSG.to_string(),
+            ));
+        }
+        return Err(ManifestReadError::Invalid(
+            "manifest path is outside allowed LocalEDR manifest directories".to_string(),
+        ));
     }
 
     let mut cur = PathBuf::new();
@@ -664,59 +798,84 @@ fn safe_read_manifest_bytes(path: &Path, allowed_dirs: &[PathBuf]) -> Result<Vec
         cur.push(comp);
         let meta = std::fs::symlink_metadata(&cur).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
-                "manifest file does not exist".to_string()
+                ManifestReadError::Invalid("manifest file does not exist".to_string())
             } else {
-                format!("failed to stat manifest: {err}")
+                ManifestReadError::Invalid(format!("failed to stat manifest: {err}"))
             }
         })?;
         if meta.file_type().is_symlink() {
-            return Err("manifest path or parent directory is a symlink (rejected)".to_string());
+            return Err(ManifestReadError::Invalid(
+                "manifest path or parent directory is a symlink (rejected)".to_string(),
+            ));
         }
     }
 
     let leaf_meta = std::fs::symlink_metadata(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
-            "manifest file does not exist".to_string()
+            ManifestReadError::Invalid("manifest file does not exist".to_string())
         } else {
-            format!("failed to stat manifest: {err}")
+            ManifestReadError::Invalid(format!("failed to stat manifest: {err}"))
         }
     })?;
     if !leaf_meta.is_file() {
-        return Err("manifest path is not a regular file".to_string());
+        return Err(ManifestReadError::Invalid(
+            "manifest path is not a regular file".to_string(),
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if leaf_meta.nlink() != 1 {
-            return Err(format!(
+            return Err(ManifestReadError::Invalid(format!(
                 "manifest file has {} hard links (expected 1; rejected)",
                 leaf_meta.nlink()
-            ));
+            )));
         }
     }
     if leaf_meta.len() > MAX_MANIFEST_BYTES {
-        return Err("manifest exceeds 64 KiB limit".to_string());
+        return Err(ManifestReadError::Invalid(
+            "manifest exceeds 64 KiB limit".to_string(),
+        ));
     }
 
     let file = std::fs::File::open(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
-            "manifest file does not exist".to_string()
+            ManifestReadError::Invalid("manifest file does not exist".to_string())
         } else {
-            format!("failed to open manifest: {err}")
+            ManifestReadError::Invalid(format!("failed to open manifest: {err}"))
         }
     })?;
     let meta = file
         .metadata()
-        .map_err(|err| format!("failed to stat manifest: {err}"))?;
+        .map_err(|err| ManifestReadError::Invalid(format!("failed to stat manifest: {err}")))?;
     if !meta.is_file() {
-        return Err("manifest path is not a regular file".to_string());
+        return Err(ManifestReadError::Invalid(
+            "manifest path is not a regular file".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return Err(ManifestReadError::Invalid(format!(
+                "manifest file has {} hard links (expected 1; rejected)",
+                meta.nlink()
+            )));
+        }
+        if meta.dev() != leaf_meta.dev() || meta.ino() != leaf_meta.ino() {
+            return Err(ManifestReadError::Invalid(
+                "manifest file identity changed during open (rejected)".to_string(),
+            ));
+        }
     }
     let mut buf = Vec::new();
     file.take(MAX_MANIFEST_BYTES + 1)
         .read_to_end(&mut buf)
-        .map_err(|err| format!("failed to read manifest: {err}"))?;
+        .map_err(|err| ManifestReadError::Invalid(format!("failed to read manifest: {err}")))?;
     if buf.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err("manifest exceeds 64 KiB limit".to_string());
+        return Err(ManifestReadError::Invalid(
+            "manifest exceeds 64 KiB limit".to_string(),
+        ));
     }
     Ok(buf)
 }
@@ -741,21 +900,36 @@ fn is_safe_bridge_exe_candidate(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn safe_read_manifest_bytes(path: &Path, allowed_dirs: &[PathBuf]) -> Result<Vec<u8>, String> {
+fn safe_read_manifest_bytes(
+    path: &Path,
+    allowed_dirs: &[PathBuf],
+) -> Result<Vec<u8>, ManifestReadError> {
     win_manifest_io::safe_read_manifest_bytes(path, allowed_dirs)
 }
 
-/// Validates an on-disk Native Messaging Host manifest strictly within `allowed_dirs`
+/// Classifies an on-disk Native Messaging Host manifest strictly within `allowed_dirs`
 /// without trusting out-of-scope paths, reparse points, hard links, oversized, or malformed files.
-pub(crate) fn validate_manifest_file_in_allowed_dirs(
+pub(crate) fn classify_manifest_file_in_allowed_dirs(
     path: &Path,
     expected_extension_id: &str,
     allowed_dirs: &[PathBuf],
-) -> Result<(), String> {
-    let buf = safe_read_manifest_bytes(path, allowed_dirs)?;
+) -> ManifestValidationOutcome {
+    let buf = match safe_read_manifest_bytes(path, allowed_dirs) {
+        Ok(b) => b,
+        Err(ManifestReadError::UnverifiedCustomPath(msg)) => {
+            return ManifestValidationOutcome::UnverifiedCustomPath(msg);
+        }
+        Err(ManifestReadError::Invalid(msg)) => {
+            return ManifestValidationOutcome::Invalid(msg);
+        }
+    };
 
-    let parsed: NativeMessagingManifestDoc = serde_json::from_slice(&buf)
-        .map_err(|err| format!("invalid manifest JSON: {err}"))?;
+    let parsed: NativeMessagingManifestDoc = match serde_json::from_slice(&buf) {
+        Ok(p) => p,
+        Err(err) => {
+            return ManifestValidationOutcome::Invalid(format!("invalid manifest JSON: {err}"));
+        }
+    };
 
     let mut problems = Vec::new();
     if parsed.name != NATIVE_HOST_NAME {
@@ -799,9 +973,24 @@ pub(crate) fn validate_manifest_file_in_allowed_dirs(
     }
 
     if problems.is_empty() {
-        Ok(())
+        ManifestValidationOutcome::Valid
     } else {
-        Err(problems.join("; "))
+        ManifestValidationOutcome::Invalid(problems.join("; "))
+    }
+}
+
+/// Validates an on-disk Native Messaging Host manifest strictly within `allowed_dirs`
+/// without trusting out-of-scope paths, reparse points, hard links, oversized, or malformed files.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn validate_manifest_file_in_allowed_dirs(
+    path: &Path,
+    expected_extension_id: &str,
+    allowed_dirs: &[PathBuf],
+) -> Result<(), String> {
+    match classify_manifest_file_in_allowed_dirs(path, expected_extension_id, allowed_dirs) {
+        ManifestValidationOutcome::Valid => Ok(()),
+        ManifestValidationOutcome::UnverifiedCustomPath(msg)
+        | ManifestValidationOutcome::Invalid(msg) => Err(msg),
     }
 }
 
@@ -900,24 +1089,51 @@ pub(crate) fn collect_local_defense_status_with_probe_in_allowed_dirs(
             (None, None)
         };
 
-        let (manifest_path, manifest_valid, manifest_error) = match active_probe {
-            None | Some(RegistryStringProbe::Absent) => (None, false, None),
+        let (manifest_path, manifest_valid, manifest_status, manifest_error) = match active_probe {
+            None | Some(RegistryStringProbe::Absent) => {
+                (None, false, MANIFEST_STATUS_NOT_REGISTERED.to_string(), None)
+            }
             Some(RegistryStringProbe::Present(path_str)) => {
-                match validate_manifest_file_in_allowed_dirs(
+                match classify_manifest_file_in_allowed_dirs(
                     Path::new(path_str),
                     EXPECTED_CHROME_EXTENSION_ID,
                     allowed_manifest_dirs,
                 ) {
-                    Ok(()) => (Some(path_str.clone()), true, None),
-                    Err(err) => (Some(path_str.clone()), false, Some(err)),
+                    ManifestValidationOutcome::Valid => {
+                        (Some(path_str.clone()), true, MANIFEST_STATUS_VALID.to_string(), None)
+                    }
+                    ManifestValidationOutcome::UnverifiedCustomPath(note) => (
+                        Some(path_str.clone()),
+                        false,
+                        MANIFEST_STATUS_UNVERIFIED.to_string(),
+                        Some(note),
+                    ),
+                    ManifestValidationOutcome::Invalid(err) => (
+                        Some(path_str.clone()),
+                        false,
+                        MANIFEST_STATUS_INVALID.to_string(),
+                        Some(err),
+                    ),
                 }
             }
+            Some(RegistryStringProbe::EmptyString) => (
+                None,
+                false,
+                MANIFEST_STATUS_INVALID.to_string(),
+                Some("registry default value is empty REG_SZ".to_string()),
+            ),
             Some(RegistryStringProbe::EmptyOrInvalidType) => (
                 None,
                 false,
+                MANIFEST_STATUS_INVALID.to_string(),
                 Some("registry default value is empty or not REG_SZ".to_string()),
             ),
-            Some(RegistryStringProbe::AccessError(err)) => (None, false, Some(err.clone())),
+            Some(RegistryStringProbe::AccessError(err)) => (
+                None,
+                false,
+                MANIFEST_STATUS_INVALID.to_string(),
+                Some(err.clone()),
+            ),
         };
 
         if hkcu_registered || hklm_registered {
@@ -931,6 +1147,7 @@ pub(crate) fn collect_local_defense_status_with_probe_in_allowed_dirs(
             hklm_registered,
             manifest_path,
             manifest_valid,
+            manifest_status,
             manifest_error,
         });
     }
@@ -943,39 +1160,75 @@ pub(crate) fn collect_local_defense_status_with_probe_in_allowed_dirs(
         .collect();
     let all_valid = !registered_details.is_empty()
         && registered_details.iter().all(|d| d.manifest_valid);
+    let any_invalid = registered_details
+        .iter()
+        .any(|d| d.manifest_status == MANIFEST_STATUS_INVALID);
 
-    let (manifest_path, manifest_valid, manifest_error) = if all_valid {
-        (
-            registered_details
-                .first()
-                .and_then(|d| d.manifest_path.clone()),
-            true,
-            None,
-        )
-    } else {
-        let first_invalid = registered_details.iter().find(|d| !d.manifest_valid);
-        let chosen_path = first_invalid
-            .and_then(|d| d.manifest_path.clone())
-            .or_else(|| registered_details.iter().find_map(|d| d.manifest_path.clone()));
-        let errors: Vec<String> = registered_details
-            .iter()
-            .filter(|d| !d.manifest_valid)
-            .map(|d| {
-                format!(
-                    "{}: {}",
-                    d.browser,
-                    d.manifest_error
-                        .as_deref()
-                        .unwrap_or("invalid manifest")
-                )
-            })
-            .collect();
-        (
-            chosen_path,
-            false,
-            (!errors.is_empty()).then(|| errors.join("; ")),
-        )
-    };
+    let (manifest_path, manifest_valid, manifest_status, manifest_error) =
+        if registered_details.is_empty() {
+            (None, false, MANIFEST_STATUS_NOT_REGISTERED.to_string(), None)
+        } else if all_valid {
+            (
+                registered_details
+                    .first()
+                    .and_then(|d| d.manifest_path.clone()),
+                true,
+                MANIFEST_STATUS_VALID.to_string(),
+                None,
+            )
+        } else if any_invalid {
+            let first_invalid = registered_details
+                .iter()
+                .find(|d| d.manifest_status == MANIFEST_STATUS_INVALID);
+            let chosen_path = first_invalid
+                .and_then(|d| d.manifest_path.clone())
+                .or_else(|| registered_details.iter().find_map(|d| d.manifest_path.clone()));
+            let errors: Vec<String> = registered_details
+                .iter()
+                .filter(|d| !d.manifest_valid)
+                .map(|d| {
+                    format!(
+                        "{}: {}",
+                        d.browser,
+                        d.manifest_error
+                            .as_deref()
+                            .unwrap_or("invalid manifest")
+                    )
+                })
+                .collect();
+            (
+                chosen_path,
+                false,
+                MANIFEST_STATUS_INVALID.to_string(),
+                (!errors.is_empty()).then(|| errors.join("; ")),
+            )
+        } else {
+            let first_unverified = registered_details
+                .iter()
+                .find(|d| d.manifest_status == MANIFEST_STATUS_UNVERIFIED);
+            let chosen_path = first_unverified
+                .and_then(|d| d.manifest_path.clone())
+                .or_else(|| registered_details.iter().find_map(|d| d.manifest_path.clone()));
+            let notes: Vec<String> = registered_details
+                .iter()
+                .filter(|d| d.manifest_status == MANIFEST_STATUS_UNVERIFIED)
+                .map(|d| {
+                    format!(
+                        "{}: {}",
+                        d.browser,
+                        d.manifest_error
+                            .as_deref()
+                            .unwrap_or(UNVERIFIED_CUSTOM_MANIFEST_MSG)
+                    )
+                })
+                .collect();
+            (
+                chosen_path,
+                false,
+                MANIFEST_STATUS_UNVERIFIED.to_string(),
+                (!notes.is_empty()).then(|| notes.join("; ")),
+            )
+        };
 
     let uri_scheme_scope = format_scope(probe.uri_hkcu, probe.uri_hklm);
     let uri_scheme_registered = uri_scheme_scope.is_some();
@@ -992,6 +1245,7 @@ pub(crate) fn collect_local_defense_status_with_probe_in_allowed_dirs(
             registered_browsers,
             manifest_path,
             manifest_valid,
+            manifest_status,
             manifest_error,
             uri_scheme_scope,
             expected_extension_id: EXPECTED_CHROME_EXTENSION_ID.to_string(),
@@ -1016,13 +1270,18 @@ pub(crate) fn collect_local_defense_status_with_probe(
 
 /// Selects the effective Native Messaging Host registry probe across WOW64 32-bit and 64-bit
 /// views following Chromium's precedence (`KEY_WOW64_32KEY` first, then `KEY_WOW64_64KEY`).
+///
+/// Chromium stops at the 32-bit view whenever `RegKey::ReadValue(nullptr, &path)` returns
+/// `ERROR_SUCCESS`, including when the `REG_SZ` value is empty (`EmptyString`). Only failed
+/// reads (`Absent`, `EmptyOrInvalidType` for missing/non-`REG_SZ`, or `AccessError`) fall back
+/// to the 64-bit view.
 pub(crate) fn select_preferred_wow64_probe(
     view32: RegistryStringProbe,
     view64: RegistryStringProbe,
 ) -> RegistryStringProbe {
     match (&view32, &view64) {
-        (RegistryStringProbe::Present(_), _) => view32,
-        (_, RegistryStringProbe::Present(_)) => view64,
+        (RegistryStringProbe::Present(_) | RegistryStringProbe::EmptyString, _) => view32,
+        (_, RegistryStringProbe::Present(_) | RegistryStringProbe::EmptyString) => view64,
         (RegistryStringProbe::Absent, _) => view64,
         (_, RegistryStringProbe::Absent) => view32,
         _ => view32,
@@ -1058,31 +1317,36 @@ pub(crate) fn collect_local_defense_status_with(
 }
 
 #[cfg(windows)]
-fn probe_reg_string_with_view(
+fn probe_native_host_reg_string_with_view(
     is_hklm: bool,
     subkey: &str,
     view: RegWow64View,
 ) -> RegistryStringProbe {
-    match win_uri_reg::reg_query_default_sz_in_hive_with_view(is_hklm, subkey, view) {
-        Ok(RegDefaultSzProbe::Absent) => RegistryStringProbe::Absent,
-        Ok(RegDefaultSzProbe::Present(val)) => RegistryStringProbe::Present(val),
-        Ok(RegDefaultSzProbe::EmptyOrInvalidType) => RegistryStringProbe::EmptyOrInvalidType,
+    match win_uri_reg::reg_query_native_host_sz_in_hive_with_view(is_hklm, subkey, view) {
+        Ok(RegNativeHostSzProbe::Absent) => RegistryStringProbe::Absent,
+        Ok(RegNativeHostSzProbe::Present(val)) => RegistryStringProbe::Present(val),
+        Ok(RegNativeHostSzProbe::EmptyString) => RegistryStringProbe::EmptyString,
+        Ok(RegNativeHostSzProbe::MissingOrInvalidType) => RegistryStringProbe::EmptyOrInvalidType,
         Err(err) => RegistryStringProbe::AccessError(err),
     }
 }
 
 /// Probes a Native Messaging Host registry key in Chromium's lookup order:
-/// 32-bit view (`KEY_WOW64_32KEY`) first, falling back to 64-bit view (`KEY_WOW64_64KEY`).
+/// 32-bit view (`KEY_WOW64_32KEY`) first, falling back to 64-bit view (`KEY_WOW64_64KEY`)
+/// only when the 32-bit read does not yield a `REG_SZ` string (empty `REG_SZ` stops fallback).
 #[cfg(windows)]
 pub(crate) fn probe_native_host_reg_string(
     is_hklm: bool,
     subkey: &str,
 ) -> RegistryStringProbe {
-    let view32 = probe_reg_string_with_view(is_hklm, subkey, RegWow64View::View32);
-    if matches!(view32, RegistryStringProbe::Present(_)) {
+    let view32 = probe_native_host_reg_string_with_view(is_hklm, subkey, RegWow64View::View32);
+    if matches!(
+        view32,
+        RegistryStringProbe::Present(_) | RegistryStringProbe::EmptyString
+    ) {
         return view32;
     }
-    let view64 = probe_reg_string_with_view(is_hklm, subkey, RegWow64View::View64);
+    let view64 = probe_native_host_reg_string_with_view(is_hklm, subkey, RegWow64View::View64);
     select_preferred_wow64_probe(view32, view64)
 }
 

@@ -4,7 +4,9 @@ use cli::parse_launch_mode;
 use defense_status::probe_native_host_reg_string;
 use defense_status::{
     BrowserRegistryProbe, BrowserShieldProbe, EXPECTED_CHROME_EXTENSION_ID, HONEYPOT_FILENAME,
-    MAX_MANIFEST_BYTES, NATIVE_HOST_NAME, RegistryStringProbe, collect_local_defense_status_with,
+    MANIFEST_STATUS_INVALID, MANIFEST_STATUS_NOT_REGISTERED, MANIFEST_STATUS_UNVERIFIED,
+    MANIFEST_STATUS_VALID, MAX_MANIFEST_BYTES, ManifestValidationOutcome, NATIVE_HOST_NAME,
+    RegistryStringProbe, classify_manifest_file_in_allowed_dirs, collect_local_defense_status_with,
     collect_local_defense_status_with_probe,
     collect_local_defense_status_with_probe_in_allowed_dirs, default_allowed_manifest_dirs_from,
     select_preferred_wow64_probe, validate_manifest_file, validate_manifest_file_in_allowed_dirs,
@@ -28,7 +30,8 @@ use std::path::{Path, PathBuf};
 use tree::build_process_tree;
 #[cfg(windows)]
 use uri_reg::{
-    LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, RegDefaultSzProbe, RegWow64View, win_uri_reg,
+    LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, RegDefaultSzProbe, RegNativeHostSzProbe,
+    RegWow64View, win_uri_reg,
 };
 use uri_reg::{
     LEDR_URI_REG_SUBKEY, UriRegistrationOutcome, build_register_uri_event, format_ledr_uri_command,
@@ -1587,6 +1590,27 @@ fn ui_p4_11_wow64_32_64_registry_view_probing_and_precedence() {
     );
     assert_eq!(
         select_preferred_wow64_probe(
+            RegistryStringProbe::EmptyString,
+            RegistryStringProbe::Present(r"C:\m64.json".to_string()),
+        ),
+        RegistryStringProbe::EmptyString
+    );
+    assert_eq!(
+        select_preferred_wow64_probe(
+            RegistryStringProbe::Absent,
+            RegistryStringProbe::EmptyString,
+        ),
+        RegistryStringProbe::EmptyString
+    );
+    assert_eq!(
+        select_preferred_wow64_probe(
+            RegistryStringProbe::EmptyOrInvalidType,
+            RegistryStringProbe::EmptyString,
+        ),
+        RegistryStringProbe::EmptyString
+    );
+    assert_eq!(
+        select_preferred_wow64_probe(
             RegistryStringProbe::EmptyOrInvalidType,
             RegistryStringProbe::Present(r"C:\m64.json".to_string()),
         ),
@@ -1696,6 +1720,76 @@ fn ui_p4_11_wow64_32_64_registry_view_probing_and_precedence() {
             win_uri_reg::reg_query_default_sz_in_hive_with_view(false, &subkey, RegWow64View::View32)
                 .expect("query deleted 32-bit view"),
             RegDefaultSzProbe::Absent
+        );
+        assert_eq!(
+            probe_native_host_reg_string(false, &subkey),
+            RegistryStringProbe::Present(val_64.to_string())
+        );
+
+        // 4. Empty REG_SZ in 32-bit view with valid 64-bit view: Chromium stops at 32-bit view
+        //    and fails host launch, so Native Messaging probe MUST return EmptyString (not val_64).
+        win_uri_reg::reg_set_hkcu_default_sz_with_view(&subkey, "", RegWow64View::View32)
+            .expect("write empty REG_SZ in 32-bit view");
+        assert_eq!(
+            win_uri_reg::reg_query_native_host_sz_in_hive_with_view(
+                false,
+                &subkey,
+                RegWow64View::View32
+            )
+            .expect("query empty REG_SZ in 32-bit view"),
+            RegNativeHostSzProbe::EmptyString
+        );
+        // URI protocol probe remains separate and continues collapsing empty REG_SZ to EmptyOrInvalidType.
+        assert_eq!(
+            win_uri_reg::reg_query_default_sz_in_hive_with_view(false, &subkey, RegWow64View::View32)
+                .expect("URI-style probe on empty REG_SZ"),
+            RegDefaultSzProbe::EmptyOrInvalidType
+        );
+        assert_eq!(
+            probe_native_host_reg_string(false, &subkey),
+            RegistryStringProbe::EmptyString
+        );
+        let empty32_status = collect_local_defense_status_with_probe(
+            None,
+            Path::new(r"C:\Program Files\LocalEDR\ledr-bridge-nm.exe"),
+            &BrowserShieldProbe {
+                browsers: vec![BrowserRegistryProbe {
+                    browser: "Chrome".to_string(),
+                    hkcu: RegistryStringProbe::Absent,
+                    hklm: probe_native_host_reg_string(false, &subkey),
+                }],
+                uri_hkcu: false,
+                uri_hklm: false,
+            },
+        );
+        assert!(empty32_status.browser_shield.native_host_registered);
+        assert!(!empty32_status.browser_shield.manifest_valid);
+        assert_eq!(
+            empty32_status.browser_shield.manifest_status,
+            MANIFEST_STATUS_INVALID
+        );
+        assert!(
+            empty32_status
+                .browser_shield
+                .manifest_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("empty REG_SZ")),
+            "expected empty REG_SZ error, got: {:?}",
+            empty32_status.browser_shield.manifest_error
+        );
+
+        // 5. Non-REG_SZ (REG_DWORD) default value in 32-bit view: Chromium's ReadValue fails and
+        //    falls back to the valid 64-bit view.
+        win_uri_reg::reg_set_hkcu_default_dword_with_view(&subkey, 1, RegWow64View::View32)
+            .expect("write REG_DWORD in 32-bit view");
+        assert_eq!(
+            win_uri_reg::reg_query_native_host_sz_in_hive_with_view(
+                false,
+                &subkey,
+                RegWow64View::View32
+            )
+            .expect("query REG_DWORD in 32-bit view"),
+            RegNativeHostSzProbe::MissingOrInvalidType
         );
         assert_eq!(
             probe_native_host_reg_string(false, &subkey),
@@ -2082,5 +2176,152 @@ fn ui_p4_13_manifest_allowlist_reparse_hardlink_and_sensitive_file_non_touch() {
             &allowed,
         ),
         Ok(())
+    );
+    assert_eq!(
+        classify_manifest_file_in_allowed_dirs(
+            &clean_manifest,
+            EXPECTED_CHROME_EXTENSION_ID,
+            &allowed,
+        ),
+        ManifestValidationOutcome::Valid
+    );
+
+    // 8. Custom `--manifest-dir` path outside allowed_dirs with LocalEDR manifest filename:
+    //    must still perform ZERO file I/O (even when exclusively locked), keep `manifest_valid == false`,
+    //    and classify as `Unverified` (distinct from red `Invalid` for Cookies/id_rsa/corrupt).
+    let custom_manifest = outside_dir.join("com.localedr.bridge.user.chrome.json");
+    write_test_manifest(
+        &custom_manifest,
+        NATIVE_HOST_NAME,
+        "stdio",
+        &bridge_str,
+        &[&expected_origin],
+    );
+    #[cfg(windows)]
+    let _custom_lock = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&custom_manifest)
+            .expect("exclusively lock custom manifest")
+    };
+    assert!(matches!(
+        classify_manifest_file_in_allowed_dirs(
+            &custom_manifest,
+            EXPECTED_CHROME_EXTENSION_ID,
+            &allowed,
+        ),
+        ManifestValidationOutcome::UnverifiedCustomPath(_)
+    ));
+    let custom_status = collect_local_defense_status_with_probe_in_allowed_dirs(
+        Some(&tmp.0),
+        &bridge_exe,
+        &BrowserShieldProbe {
+            browsers: vec![
+                BrowserRegistryProbe {
+                    browser: "Chrome".to_string(),
+                    hkcu: RegistryStringProbe::Present(
+                        clean_manifest.to_string_lossy().into_owned(),
+                    ),
+                    hklm: RegistryStringProbe::Absent,
+                },
+                BrowserRegistryProbe {
+                    browser: "Edge".to_string(),
+                    hkcu: RegistryStringProbe::Present(
+                        custom_manifest.to_string_lossy().into_owned(),
+                    ),
+                    hklm: RegistryStringProbe::Absent,
+                },
+                BrowserRegistryProbe {
+                    browser: "Brave".to_string(),
+                    hkcu: RegistryStringProbe::Absent,
+                    hklm: RegistryStringProbe::Absent,
+                },
+            ],
+            uri_hkcu: true,
+            uri_hklm: false,
+        },
+        &allowed,
+    );
+    assert!(!custom_status.browser_shield.manifest_valid);
+    assert_eq!(
+        custom_status.browser_shield.manifest_status,
+        MANIFEST_STATUS_UNVERIFIED
+    );
+    assert_eq!(
+        custom_status.browser_shield.browsers[0].manifest_status,
+        MANIFEST_STATUS_VALID
+    );
+    assert_eq!(
+        custom_status.browser_shield.browsers[1].manifest_status,
+        MANIFEST_STATUS_UNVERIFIED
+    );
+    assert_eq!(
+        custom_status.browser_shield.browsers[2].manifest_status,
+        MANIFEST_STATUS_NOT_REGISTERED
+    );
+    assert!(
+        custom_status
+            .browser_shield
+            .manifest_error
+            .as_deref()
+            .is_some_and(|m| m.contains("Edge:") && m.contains("ledr-bridge-nm status")),
+        "unexpected unverified note: {:?}",
+        custom_status.browser_shield.manifest_error
+    );
+
+    // Mixed Unverified + Invalid (Cookies) must escalate overall status to Invalid (fail-closed).
+    let mixed_invalid_status = collect_local_defense_status_with_probe_in_allowed_dirs(
+        Some(&tmp.0),
+        &bridge_exe,
+        &BrowserShieldProbe {
+            browsers: vec![
+                BrowserRegistryProbe {
+                    browser: "Chrome".to_string(),
+                    hkcu: RegistryStringProbe::Present(
+                        custom_manifest.to_string_lossy().into_owned(),
+                    ),
+                    hklm: RegistryStringProbe::Absent,
+                },
+                BrowserRegistryProbe {
+                    browser: "Edge".to_string(),
+                    hkcu: RegistryStringProbe::Present(
+                        cookies_path.to_string_lossy().into_owned(),
+                    ),
+                    hklm: RegistryStringProbe::Absent,
+                },
+            ],
+            uri_hkcu: false,
+            uri_hklm: false,
+        },
+        &allowed,
+    );
+    assert!(!mixed_invalid_status.browser_shield.manifest_valid);
+    assert_eq!(
+        mixed_invalid_status.browser_shield.manifest_status,
+        MANIFEST_STATUS_INVALID
+    );
+    assert_eq!(
+        mixed_invalid_status.browser_shield.browsers[0].manifest_status,
+        MANIFEST_STATUS_UNVERIFIED
+    );
+    assert_eq!(
+        mixed_invalid_status.browser_shield.browsers[1].manifest_status,
+        MANIFEST_STATUS_INVALID
+    );
+
+    // 9. Missing leaf directory under an existing allowed parent must report missing file
+    //    (not outside allowlist), exercising ancestor prefix long-path expansion.
+    let nonexistent_allowed = tmp.0.join("not-yet-created").join("native-messaging");
+    let missing_in_nonexistent = nonexistent_allowed.join("com.localedr.bridge.user.chrome.json");
+    assert_eq!(
+        classify_manifest_file_in_allowed_dirs(
+            &missing_in_nonexistent,
+            EXPECTED_CHROME_EXTENSION_ID,
+            std::slice::from_ref(&nonexistent_allowed),
+        ),
+        ManifestValidationOutcome::Invalid("manifest file does not exist".to_string())
     );
 }

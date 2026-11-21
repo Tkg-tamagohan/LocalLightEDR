@@ -214,7 +214,7 @@ pub(crate) fn print_report(report: &SimReport, json_output: bool) -> Result<()> 
     }
     if let Some(motw) = &report.motw_download {
         println!(
-            "[motw-download] verified={} zone_id={} sha256={} host_url={} referrer_url={} path={}",
+            "[motw-download] ads_roundtrip_verified={} (no process spawn) zone_id={} sha256={} host_url={} referrer_url={} path={}",
             motw.verified_roundtrip,
             motw.zone_id,
             motw.sha256,

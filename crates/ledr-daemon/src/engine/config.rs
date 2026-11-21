@@ -12,6 +12,7 @@ const DEFAULT_MAX_CONCURRENT_IPC_CLIENTS: usize = 16;
 const DEFAULT_IPC_FRAME_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_IPC_SESSION_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_WFP_DROP_DNS_GRACE_MS: u64 = 300;
+const DEFAULT_MOTW_SYNC_WAIT_BUDGET_MS: u64 = 50;
 
 /// Controls how aggressively Phase 3 outbound firewall rules enforce containment (`L-03`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,6 +119,9 @@ pub struct DaemonConfig {
     /// Maximum file byte size hashed with SHA-256 during `ReportDownloadOrigin` and Stage 2 MOTW
     /// correlation. Defaults to 128 MiB (`MAX_DOWNLOAD_HASH_BYTES`).
     pub download_hash_max_bytes: u64,
+    /// Bounded wait budget (ms) for offloading synchronous `ProcessStart` MOTW I/O onto the
+    /// dedicated worker pool before continuing asynchronously with late backfill (`50 ms` default).
+    pub motw_sync_wait_budget_ms: u64,
 }
 
 impl Default for DaemonConfig {
@@ -158,6 +162,7 @@ impl Default for DaemonConfig {
             dns_history_capacity: DNS_RESOLUTION_CACHE_CAPACITY,
             notify_browser_events: false,
             download_hash_max_bytes: super::motw::MAX_DOWNLOAD_HASH_BYTES,
+            motw_sync_wait_budget_ms: DEFAULT_MOTW_SYNC_WAIT_BUDGET_MS,
         }
     }
 }

@@ -1,5 +1,7 @@
 use super::*;
-use super::fs_scenarios::{TempSimDir, dummy_cookie_path, dummy_honeypot_path};
+use super::fs_scenarios::{
+    TempSimDir, dummy_cookie_path, dummy_honeypot_path, run_motw_download_scenario_with_ads_writer,
+};
 use super::net::{exchange_ping_ack, handle_ping_server};
 use std::path::{Path, PathBuf};
 use ledr_proto::HONEYPOT_DEFAULT_FILENAME;
@@ -507,4 +509,36 @@ async fn sim_p4_03_run_all_report_includes_motw_download_json() {
     );
     assert!(print_report(&report, true).is_ok());
     assert!(print_report(&report, false).is_ok());
+}
+
+#[test]
+fn sim_p4_04_motw_download_refuses_overwrite_and_cleans_up_new_file_on_failure() {
+    let existing_dir = TempSimDir::new("motw-existing").expect("temp existing dir");
+    let existing_file = existing_dir.path().join(SIM_MOTW_FILENAME);
+    let sentinel = b"EXISTING-DO-NOT-CLOBBER-SENTINEL";
+    std::fs::write(&existing_file, sentinel).expect("write existing file");
+
+    let err = run_motw_download_scenario_in(existing_dir.path())
+        .expect_err("must refuse overwriting existing sample-tool.exe");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("exclusively create") || msg.contains("exists"),
+        "unexpected error message: {msg}"
+    );
+    assert_eq!(
+        std::fs::read(&existing_file).expect("existing sentinel intact"),
+        sentinel
+    );
+
+    let fail_dir = TempSimDir::new("motw-fail-cleanup").expect("temp fail cleanup dir");
+    let created_path = fail_dir.path().join(SIM_MOTW_FILENAME);
+    let hook_err = run_motw_download_scenario_with_ads_writer(fail_dir.path(), |_, _| {
+        anyhow::bail!("simulated ADS write failure")
+    })
+    .expect_err("simulated ADS failure must error");
+    assert!(format!("{hook_err:#}").contains("simulated ADS write failure"));
+    assert!(
+        !created_path.exists(),
+        "newly created dummy file must be removed when ADS write fails"
+    );
 }

@@ -303,12 +303,19 @@ pub fn run_honeypot_write_scenario_in(base_dir: &Path) -> Result<HoneypotWriteOu
 
 /// Creates a harmless dummy `sample-tool.exe` file with NTFS `:Zone.Identifier` (`ZoneId=3`)
 /// in a temporary directory, verifies the ADS round-trip, and reports its SHA-256 (`AUTO-15`).
+///
+/// Scope note: this scenario only validates dummy file creation, `:Zone.Identifier` ADS
+/// round-trip, and SHA-256 calculation without spawning a child process; daemon 3-stage MOTW
+/// process attribution is verified in `ledr-daemon` tests and Chrome E2E (`FU-E2E-02`).
 pub async fn run_motw_download_scenario() -> Result<MotwDownloadOutcome> {
     run_motw_download_scenario_with_options(None, 0).await
 }
 
 /// Like [`run_motw_download_scenario`], optionally running inside an existing `base_dir`
 /// without deleting it afterwards and holding for `hold_ms` milliseconds.
+///
+/// Scope is limited to harmless dummy file + `:Zone.Identifier` ADS round-trip + SHA-256
+/// verification (no child process launch).
 pub async fn run_motw_download_scenario_with_options(
     base_dir: Option<PathBuf>,
     hold_ms: u64,
@@ -334,46 +341,78 @@ pub async fn run_motw_download_scenario_with_options(
 }
 
 /// Runs the harmless MOTW `:Zone.Identifier` simulation under `base_dir` without removing `base_dir`.
+///
+/// Uses `create_new(true)` so pre-existing files in `--base-dir` are never overwritten, and on
+/// failure removes only the newly created `sample-tool.exe`. Scope is limited to dummy file +
+/// ADS round-trip + SHA-256 verification without spawning a child process.
 pub fn run_motw_download_scenario_in(base_dir: &Path) -> Result<MotwDownloadOutcome> {
+    run_motw_download_scenario_with_ads_writer(base_dir, |target_path, expected_zone| {
+        write_zone_identifier(target_path, expected_zone).with_context(|| {
+            format!(
+                "failed to write :Zone.Identifier ADS on {}",
+                target_path.display()
+            )
+        })
+    })
+}
+
+pub(crate) fn run_motw_download_scenario_with_ads_writer<F>(
+    base_dir: &Path,
+    ads_writer: F,
+) -> Result<MotwDownloadOutcome>
+where
+    F: FnOnce(&Path, &MotwZoneInfo) -> Result<()>,
+{
     std::fs::create_dir_all(base_dir)
         .with_context(|| format!("failed to create MOTW sim dir {}", base_dir.display()))?;
     let target_path = base_dir.join(SIM_MOTW_FILENAME);
-    {
-        let mut writer = File::create(&target_path)
-            .with_context(|| format!("failed to create dummy MOTW file {}", target_path.display()))?;
+    let writer = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target_path)
+        .with_context(|| {
+            format!(
+                "failed to exclusively create dummy MOTW file {}",
+                target_path.display()
+            )
+        })?;
+
+    let outcome = (|| {
+        let mut writer = writer;
         writer.write_all(DUMMY_MOTW_PAYLOAD)?;
         writer.flush()?;
-    }
+        drop(writer);
 
-    let bytes = std::fs::read(&target_path)
-        .with_context(|| format!("failed to read dummy MOTW file {}", target_path.display()))?;
-    let sha256 = hex::encode(Sha256::digest(&bytes));
+        let bytes = std::fs::read(&target_path)
+            .with_context(|| format!("failed to read dummy MOTW file {}", target_path.display()))?;
+        let sha256 = hex::encode(Sha256::digest(&bytes));
 
-    let expected_zone = MotwZoneInfo {
-        zone_id: ZONE_ID_INTERNET,
-        host_url: Some(SIM_MOTW_HOST_URL.to_string()),
-        referrer_url: Some(SIM_MOTW_REFERRER_URL.to_string()),
-    };
-    write_zone_identifier(&target_path, &expected_zone).with_context(|| {
-        format!(
-            "failed to write :Zone.Identifier ADS on {}",
+        let expected_zone = MotwZoneInfo {
+            zone_id: ZONE_ID_INTERNET,
+            host_url: Some(SIM_MOTW_HOST_URL.to_string()),
+            referrer_url: Some(SIM_MOTW_REFERRER_URL.to_string()),
+        };
+        ads_writer(&target_path, &expected_zone)?;
+        let read_back = read_zone_identifier(&target_path);
+        let verified_roundtrip = read_back.as_ref() == Some(&expected_zone);
+        anyhow::ensure!(
+            verified_roundtrip,
+            "MOTW :Zone.Identifier read-back mismatch on {}",
             target_path.display()
-        )
-    })?;
-    let read_back = read_zone_identifier(&target_path);
-    let verified_roundtrip = read_back.as_ref() == Some(&expected_zone);
-    anyhow::ensure!(
-        verified_roundtrip,
-        "MOTW :Zone.Identifier read-back mismatch on {}",
-        target_path.display()
-    );
+        );
 
-    Ok(MotwDownloadOutcome {
-        target_path: target_path.display().to_string(),
-        sha256,
-        zone_id: expected_zone.zone_id,
-        host_url: SIM_MOTW_HOST_URL.to_string(),
-        referrer_url: SIM_MOTW_REFERRER_URL.to_string(),
-        verified_roundtrip,
-    })
+        Ok(MotwDownloadOutcome {
+            target_path: target_path.display().to_string(),
+            sha256,
+            zone_id: expected_zone.zone_id,
+            host_url: SIM_MOTW_HOST_URL.to_string(),
+            referrer_url: SIM_MOTW_REFERRER_URL.to_string(),
+            verified_roundtrip,
+        })
+    })();
+
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&target_path);
+    }
+    outcome
 }

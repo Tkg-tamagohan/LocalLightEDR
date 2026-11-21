@@ -2372,3 +2372,51 @@ fn rules_p3_16_load_rules_dir_separates_shipped_defaults_from_managed_rules() {
         "early_pruner.prune_loopback_network=false from default_allowlist.json must be preserved"
     );
 }
+
+#[test]
+fn rules_p4_cancellable_sha256_respects_max_bytes_and_midstream_cancel() {
+    use std::io::{self, Cursor, Read};
+    use std::sync::atomic::AtomicBool;
+
+    let tmp_dir = TestTempDir::new("ledr-rules-p4-cancel");
+    let file_path = tmp_dir.path().join("chunked.bin");
+    let payload = vec![0x5Au8; 150_000];
+    std::fs::write(&file_path, &payload).expect("write chunked payload");
+
+    let cancel = AtomicBool::new(false);
+    let hashed = compute_file_sha256_hex_cancellable(&file_path, 200_000, &cancel)
+        .expect("hash within limit")
+        .expect("some digest");
+    assert_eq!(hashed, sha256_hex(&payload));
+
+    let oversized = compute_file_sha256_hex_cancellable(&file_path, 149_999, &cancel)
+        .expect("oversized returns Ok(None)");
+    assert_eq!(oversized, None);
+
+    // Mid-stream cancellation after reading first 64 KiB chunk.
+    struct CancellingReader<'a> {
+        inner: Cursor<Vec<u8>>,
+        cancel: &'a AtomicBool,
+        reads: usize,
+    }
+    impl Read for CancellingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            let n = self.inner.read(buf)?;
+            if self.reads == 1 {
+                self.cancel.store(true, Ordering::Release);
+            }
+            Ok(n)
+        }
+    }
+
+    let mid_cancel = AtomicBool::new(false);
+    let mut reader = CancellingReader {
+        inner: Cursor::new(payload),
+        cancel: &mid_cancel,
+        reads: 0,
+    };
+    let err = compute_reader_sha256_hex_cancellable(&mut reader, 200_000, &mid_cancel)
+        .expect_err("midstream cancel must abort");
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+}

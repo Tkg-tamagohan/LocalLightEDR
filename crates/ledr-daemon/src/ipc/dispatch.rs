@@ -8,13 +8,14 @@ use crate::engine::{BrowserEventOutcome, BrowserReportError, DaemonEngine, Polic
 
 use super::auth::verify_authorized_caller_binary;
 
-pub(super) fn dispatch_request(
+pub(super) fn authorize_caller_flags(
     engine: &DaemonEngine,
     caller_exe: Option<&str>,
-    req: IpcRequest,
-) -> IpcResponse {
+    requires_ui_authorization: bool,
+    requires_bridge_authorization: bool,
+) -> Option<IpcResponse> {
     let cfg = engine.config();
-    if req.requires_ui_authorization()
+    if requires_ui_authorization
         && !verify_authorized_caller_binary(
             caller_exe,
             AUTHORIZED_UI_EXE_PATH,
@@ -24,33 +25,49 @@ pub(super) fn dispatch_request(
             cfg.dev_mode_bypass_ui_auth,
         )
     {
-        return IpcResponse::Error {
+        return Some(IpcResponse::Error {
             code: "UNAUTHORIZED".to_string(),
             message: format!(
                 "caller {:?} is not authorized for mutating IPC command (expected {})",
                 caller_exe, AUTHORIZED_UI_EXE_PATH
             ),
-        };
+        });
     }
 
-    if matches!(
-        req,
-        IpcRequest::ReportDownloadOrigin { .. } | IpcRequest::ReportBrowserEvent { .. }
-    ) && !verify_authorized_caller_binary(
-        caller_exe,
-        AUTHORIZED_BRIDGE_EXE_PATH,
-        cfg.authorized_bridge_sha256.as_deref(),
-        cfg.authorized_bridge_signer.as_deref(),
-        cfg.authorized_bridge_root_thumbprint.as_deref(),
-        cfg.dev_mode_bypass_ui_auth,
-    ) {
-        return IpcResponse::Error {
+    if requires_bridge_authorization
+        && !verify_authorized_caller_binary(
+            caller_exe,
+            AUTHORIZED_BRIDGE_EXE_PATH,
+            cfg.authorized_bridge_sha256.as_deref(),
+            cfg.authorized_bridge_signer.as_deref(),
+            cfg.authorized_bridge_root_thumbprint.as_deref(),
+            cfg.dev_mode_bypass_ui_auth,
+        )
+    {
+        return Some(IpcResponse::Error {
             code: "UNAUTHORIZED_CALLER".to_string(),
             message: format!(
                 "caller {:?} is not authorized for browser bridge IPC command (expected {})",
                 caller_exe, AUTHORIZED_BRIDGE_EXE_PATH
             ),
-        };
+        });
+    }
+
+    None
+}
+
+pub(super) fn dispatch_request(
+    engine: &DaemonEngine,
+    caller_exe: Option<&str>,
+    req: IpcRequest,
+) -> IpcResponse {
+    let requires_ui = req.requires_ui_authorization();
+    let requires_bridge = matches!(
+        req,
+        IpcRequest::ReportDownloadOrigin { .. } | IpcRequest::ReportBrowserEvent { .. }
+    );
+    if let Some(denied) = authorize_caller_flags(engine, caller_exe, requires_ui, requires_bridge) {
+        return denied;
     }
 
     let store = engine.store();
@@ -164,11 +181,7 @@ pub(super) fn dispatch_request(
             Ok(_) => IpcResponse::Ack {
                 message: "recorded download origin".to_string(),
             },
-            Err(BrowserReportError::Invalid(msg)) => IpcResponse::Error {
-                code: "INVALID_REQUEST".to_string(),
-                message: msg,
-            },
-            Err(BrowserReportError::Store(err)) => store_error_response(err),
+            Err(err) => browser_report_error_response(err),
         },
         IpcRequest::ReportBrowserEvent {
             event_type,
@@ -182,11 +195,21 @@ pub(super) fn dispatch_request(
             Ok(BrowserEventOutcome::Deduplicated) => IpcResponse::Ack {
                 message: "browser event deduplicated".to_string(),
             },
-            Err(BrowserReportError::Invalid(msg)) => IpcResponse::Error {
-                code: "INVALID_REQUEST".to_string(),
-                message: msg,
-            },
-            Err(BrowserReportError::Store(err)) => store_error_response(err),
+            Err(err) => browser_report_error_response(err),
+        },
+    }
+}
+
+pub(super) fn browser_report_error_response(err: BrowserReportError) -> IpcResponse {
+    match err {
+        BrowserReportError::Invalid(msg) => IpcResponse::Error {
+            code: "INVALID_REQUEST".to_string(),
+            message: msg,
+        },
+        BrowserReportError::Store(err) => store_error_response(err),
+        BrowserReportError::Cancelled => IpcResponse::Error {
+            code: "CANCELLED".to_string(),
+            message: "browser report cancelled".to_string(),
         },
     }
 }

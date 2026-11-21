@@ -373,3 +373,135 @@ fn store_p4_06_query_flight_recorder_joins_process_downloads_case_insensitively(
         "https://dl.example.invalid/moved.exe"
     );
 }
+
+#[test]
+fn store_p4_07_update_process_motw_metadata_coalesce_and_identical_download_lookup() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let t0 = 1_760_005_000_000i64;
+    let ft = 116_444_736_000_000_000u64 + (t0 as u64) * 10_000;
+
+    // 1. Update un-flushed buffered ProcessStart before flush_batch().
+    let ident_buffered = ProcessIdentity::new(7101, ft);
+    store
+        .ingest_event_with_process_metadata(
+            &SensorEvent::ProcessStart {
+                identity: ident_buffered,
+                parent_pid: 4,
+                exe_path: r"C:\Users\Alice\Downloads\slow_motw.exe".to_string(),
+                command_line: "slow_motw.exe".to_string(),
+                user_sid: None,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest buffered process");
+    assert_eq!(store.buffered_len(), 1);
+
+    let updated_buf = store
+        .update_process_motw_metadata(
+            &ident_buffered.instance_id(),
+            Some("https://buffered.example.invalid/slow.exe"),
+            Some("AABBCCDDEEFF0011"),
+        )
+        .expect("update buffered process");
+    assert!(updated_buf);
+    store.flush_batch().expect("flush buffered process");
+
+    let snap_buf = store
+        .query_flight_recorder(10, Some(&ident_buffered.instance_id()))
+        .expect("query flushed proc");
+    assert_eq!(
+        snap_buf.processes[0].origin_url.as_deref(),
+        Some("https://buffered.example.invalid/slow.exe")
+    );
+    assert_eq!(
+        snap_buf.processes[0].sha256.as_deref(),
+        Some("aabbccddeeff0011")
+    );
+
+    // 2. COALESCE preserves already-populated origin_url while filling missing sha256 on DB row.
+    let ident_db = ProcessIdentity::new(7102, ft + 1);
+    store
+        .ingest_event_with_process_metadata(
+            &SensorEvent::ProcessStart {
+                identity: ident_db,
+                parent_pid: 4,
+                exe_path: r"C:\Users\Alice\Downloads\partial.exe".to_string(),
+                command_line: "partial.exe".to_string(),
+                user_sid: None,
+            },
+            None,
+            None,
+            None,
+            Some("https://initial.example.invalid/partial.exe"),
+            None,
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest partial process");
+    store.flush_batch().expect("flush partial process");
+
+    let updated_db = store
+        .update_process_motw_metadata(
+            &ident_db.instance_id(),
+            Some("https://should-not-overwrite.example.invalid/"),
+            Some("11223344"),
+        )
+        .expect("update committed partial row");
+    assert!(updated_db);
+    let snap_db = store
+        .query_flight_recorder(10, Some(&ident_db.instance_id()))
+        .expect("query partial proc");
+    assert_eq!(
+        snap_db.processes[0].origin_url.as_deref(),
+        Some("https://initial.example.invalid/partial.exe")
+    );
+    assert_eq!(snap_db.processes[0].sha256.as_deref(), Some("11223344"));
+
+    // 3. Idempotent download origin lookup handles path case / \\?\ / slash differences.
+    store
+        .record_download_origin(&DownloadOriginRecord {
+            id: None,
+            file_path: r"C:\Users\Alice\Downloads\RetryTool.exe".to_string(),
+            sha256: Some("deadbeef".to_string()),
+            tab_url: "https://dl.example.invalid/retry".to_string(),
+            frame_url: None,
+            referrer_url: None,
+            downloaded_at_ms: t0 + 123,
+        })
+        .expect("record download origin");
+
+    let hit = store
+        .find_recent_identical_download_origin(
+            r"\\?\c:/users/alice/downloads/retrytool.exe",
+            "https://dl.example.invalid/retry",
+            t0 + 123,
+        )
+        .expect("identical lookup");
+    assert!(hit.is_some());
+    assert!(
+        store
+            .find_recent_identical_download_origin(
+                r"C:\Users\Alice\Downloads\RetryTool.exe",
+                "https://dl.example.invalid/other",
+                t0 + 123,
+            )
+            .expect("different tab_url")
+            .is_none()
+    );
+    assert!(
+        store
+            .find_recent_identical_download_origin(
+                r"C:\Users\Alice\Downloads\RetryTool.exe",
+                "https://dl.example.invalid/retry",
+                t0 + 124,
+            )
+            .expect("different timestamp")
+            .is_none()
+    );
+}

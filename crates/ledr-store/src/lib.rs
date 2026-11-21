@@ -291,6 +291,56 @@ impl LedrStore {
         Ok(())
     }
 
+    /// Backfills missing MOTW `origin_url` and `sha256` on a `ProcessStart` without overwriting
+    /// already-populated columns (`COALESCE`), updating both any pending batch buffer entry and
+    /// committed `processes` row under the canonical `writer -> batch` lock order.
+    pub fn update_process_motw_metadata(
+        &self,
+        process_instance_id: &str,
+        origin_url: Option<&str>,
+        sha256: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let clean_instance = process_instance_id.trim();
+        let clean_origin = origin_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let clean_sha256 = normalize_sha256(sha256);
+        if clean_instance.is_empty() || (clean_origin.is_none() && clean_sha256.is_none()) {
+            return Ok(false);
+        }
+
+        let writer = self.lock_writer()?;
+        let mut updated_in_batch = false;
+        {
+            let mut batch = self.lock_batch()?;
+            for buffered in &mut batch.events {
+                if let SensorEvent::ProcessStart { identity, .. } = &buffered.event {
+                    if identity.instance_id() == clean_instance {
+                        if buffered.origin_url.is_none() && clean_origin.is_some() {
+                            buffered.origin_url = clean_origin.clone();
+                            updated_in_batch = true;
+                        }
+                        if buffered.sha256.is_none() && clean_sha256.is_some() {
+                            buffered.sha256 = clean_sha256.clone();
+                            updated_in_batch = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let rows_affected = writer.execute(
+            "UPDATE processes
+             SET origin_url = COALESCE(origin_url, ?1),
+                 sha256 = COALESCE(sha256, ?2)
+             WHERE process_instance_id = ?3",
+            params![clean_origin, clean_sha256, clean_instance],
+        )?;
+
+        Ok(updated_in_batch || rows_affected > 0)
+    }
+
     /// Flushes all buffered events and executes `PRAGMA wal_checkpoint(TRUNCATE);` (`AUTO-10`).
     pub fn checkpoint_truncate(&self) -> Result<(), StoreError> {
         self.flush_batch()?;

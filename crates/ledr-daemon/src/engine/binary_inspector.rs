@@ -1,15 +1,42 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use ledr_proto::AuthenticodeInfo;
-use ledr_rules::{compute_file_sha256_hex, inspect_authenticode, BinaryIdentity};
+use ledr_rules::{
+    compute_file_sha256_hex, compute_file_sha256_hex_cancellable, inspect_authenticode,
+    BinaryIdentity,
+};
 
 const BINARY_INSPECTOR_CACHE_CAPACITY: usize = 512;
 
 /// Abstraction for inspecting binary SHA-256 and Authenticode metadata (`L-04`).
 pub trait BinaryInspector: Send + Sync {
     fn inspect(&self, exe_path: &str) -> BinaryIdentity;
+
+    /// Computes or returns only the SHA-256 hex digest of `exe_path` without Authenticode
+    /// verification overhead (`Phase 4A` MOTW hot-path optimization).
+    fn compute_sha256(&self, exe_path: &str) -> Option<String> {
+        self.inspect(exe_path).sha256
+    }
+
+    /// Streaming, 64 KiB chunk-cancellable SHA-256 computation capped at `max_bytes`.
+    fn compute_sha256_cancellable(
+        &self,
+        exe_path: &str,
+        _max_bytes: u64,
+        cancel: &AtomicBool,
+    ) -> io::Result<Option<String>> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "SHA-256 hashing cancelled",
+            ));
+        }
+        Ok(self.compute_sha256(exe_path))
+    }
 }
 
 /// Default Windows binary inspector computing fresh streaming SHA-256 on every call
@@ -85,6 +112,38 @@ impl BinaryInspector for WindowsBinaryInspector {
             sha256: Some(fresh_sha256),
             authenticode,
         }
+    }
+
+    fn compute_sha256(&self, exe_path: &str) -> Option<String> {
+        if exe_path.trim().is_empty() {
+            return None;
+        }
+        let path = Path::new(exe_path);
+        let Ok(meta) = std::fs::metadata(path) else {
+            return None;
+        };
+        if !meta.is_file() {
+            return None;
+        }
+        compute_file_sha256_hex(path).ok()
+    }
+
+    fn compute_sha256_cancellable(
+        &self,
+        exe_path: &str,
+        max_bytes: u64,
+        cancel: &AtomicBool,
+    ) -> io::Result<Option<String>> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "SHA-256 hashing cancelled",
+            ));
+        }
+        if exe_path.trim().is_empty() {
+            return Ok(None);
+        }
+        compute_file_sha256_hex_cancellable(Path::new(exe_path), max_bytes, cancel)
     }
 }
 

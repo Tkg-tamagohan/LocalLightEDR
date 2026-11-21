@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use crate::channel::TwoLaneReceiver;
 
+use super::motw::{refresh_download_origins_after_purge, LateMotwAttribution};
 use super::nrd::{execute_nrd_refresh, NrdThreadHandle};
 use super::wfp_drops::{PendingWfpDrop, QueuedWfpDrop};
 use super::{current_unix_ms, DaemonEngine};
@@ -18,6 +19,7 @@ impl DaemonEngine {
         self: Arc<Self>,
         mut receiver: TwoLaneReceiver,
         mut wfp_drop_rx: tokio::sync::mpsc::Receiver<QueuedWfpDrop>,
+        mut motw_result_rx: tokio::sync::mpsc::Receiver<LateMotwAttribution>,
     ) -> Result<(), StoreError> {
         let interval_ms = self.config.batch_flush_interval_ms.max(50);
         let mut flush_ticker = tokio::time::interval(Duration::from_millis(interval_ms));
@@ -42,6 +44,7 @@ impl DaemonEngine {
 
         let mut pending_wfp_drops: VecDeque<PendingWfpDrop> = VecDeque::new();
         let mut wfp_drop_rx_closed = false;
+        let mut motw_result_rx_closed = false;
         let mut sync_telemetry_streak = 0usize;
         let mut last_warned_coalesced: u64 = 0;
 
@@ -51,8 +54,9 @@ impl DaemonEngine {
             // are always up to date for attribution (`L-10`).
             if let Some(event) = receiver.try_recv_high_priority() {
                 sync_telemetry_streak = 0;
-                if let Some(dns_update) =
-                    self.process_event_with_lane(&event, EventLane::HighPriority)
+                if let Some(dns_update) = self
+                    .process_event_with_lane_async(&event, EventLane::HighPriority)
+                    .await
                 {
                     if let SensorEvent::DnsQuery { query_name, .. } = &event {
                         self.flush_ready_pending_wfp_drops(
@@ -65,6 +69,21 @@ impl DaemonEngine {
                     }
                 }
                 continue;
+            }
+
+            // Tier 1b: Drain completed asynchronous MOTW attributions promptly before Tier 2/3.
+            if !motw_result_rx_closed {
+                match motw_result_rx.try_recv() {
+                    Ok(late_motw) => {
+                        sync_telemetry_streak = 0;
+                        self.apply_late_motw_attribution(late_motw);
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        motw_result_rx_closed = true;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
             }
 
             // Tier 2a: Flush any grace-window WFP drops whose deadline has already expired.
@@ -101,7 +120,9 @@ impl DaemonEngine {
             // Tier 3: Steady telemetry lane, yielding periodically so single-threaded runtimes and
             // grace timers remain responsive during bursts.
             if let Some(event) = receiver.try_recv_telemetry() {
-                if let Some(dns_update) = self.process_event_with_lane(&event, EventLane::Telemetry)
+                if let Some(dns_update) = self
+                    .process_event_with_lane_async(&event, EventLane::Telemetry)
+                    .await
                 {
                     if let SensorEvent::DnsQuery { query_name, .. } = &event {
                         self.flush_ready_pending_wfp_drops(
@@ -135,7 +156,7 @@ impl DaemonEngine {
                 maybe_event = receiver.recv_with_lane() => {
                     match maybe_event {
                         Some((event, lane)) => {
-                            if let Some(dns_update) = self.process_event_with_lane(&event, lane) {
+                            if let Some(dns_update) = self.process_event_with_lane_async(&event, lane).await {
                                 if let SensorEvent::DnsQuery { query_name, .. } = &event {
                                     self.flush_ready_pending_wfp_drops(
                                         &dns_update.instance_id,
@@ -148,6 +169,14 @@ impl DaemonEngine {
                             }
                         }
                         None => break,
+                    }
+                }
+                maybe_late = motw_result_rx.recv(), if !motw_result_rx_closed => {
+                    match maybe_late {
+                        Some(late_motw) => {
+                            self.apply_late_motw_attribution(late_motw);
+                        }
+                        None => motw_result_rx_closed = true,
                     }
                 }
                 maybe_drop = wfp_drop_rx.recv(), if !wfp_drop_rx_closed => {
@@ -184,11 +213,22 @@ impl DaemonEngine {
                     let busy = purge_in_flight.as_ref().is_some_and(|h| !h.is_finished());
                     if !busy {
                         let store = self.store.clone();
+                        let dl_state = Arc::clone(&self.download_origin_state);
+                        let before_state = dl_state.load(Ordering::Acquire);
                         let retention_days = self.config.ttl_retention_days;
                         purge_in_flight = Some(tokio::task::spawn_blocking(move || {
                             let now_ms = current_unix_ms();
-                            if let Err(err) = store.purge_expired(now_ms, retention_days) {
-                                tracing::warn!(error = %err, "periodic SQLite TTL purge failed");
+                            match store.purge_expired(now_ms, retention_days) {
+                                Ok(_) => {
+                                    refresh_download_origins_after_purge(
+                                        &dl_state,
+                                        &store,
+                                        before_state,
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "periodic SQLite TTL purge failed");
+                                }
                             }
                         }));
                     }
@@ -296,7 +336,10 @@ impl DaemonEngine {
         }
 
         for (remaining, lane) in receiver.drain_ready_with_lane() {
-            let _ = self.process_event_with_lane(&remaining, lane);
+            let _ = self.process_event_with_lane_async(&remaining, lane).await;
+        }
+        while let Ok(late_motw) = motw_result_rx.try_recv() {
+            self.apply_late_motw_attribution(late_motw);
         }
         while let Ok(drop_item) = wfp_drop_rx.try_recv() {
             self.handle_wfp_drop_event_now(&drop_item);

@@ -6,8 +6,9 @@ mod ffi;
 mod matcher;
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ledr_proto::AuthenticodeInfo;
 use serde::{Deserialize, Serialize};
@@ -51,4 +52,71 @@ pub fn compute_file_sha256_hex(path: &Path) -> Result<String, std::io::Error> {
         hasher.update(&buf[..read_bytes]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn sha256_cancelled_err() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "SHA-256 hashing cancelled")
+}
+
+/// Computes the streaming lowercase hex SHA-256 digest from `reader` in 64 KiB chunks,
+/// returning `Ok(None)` when cumulative bytes exceed `max_bytes` and aborting with
+/// `ErrorKind::Interrupted` when `cancel` becomes `true`.
+pub fn compute_reader_sha256_hex_cancellable<R: Read>(
+    reader: &mut R,
+    max_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<Option<String>, io::Error> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; SHA256_BUF_LEN];
+    let mut total: u64 = 0;
+
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(sha256_cancelled_err());
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read_bytes) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(sha256_cancelled_err());
+                }
+                let n_u64 = u64::try_from(read_bytes).unwrap_or(u64::MAX);
+                total = total.saturating_add(n_u64);
+                if total > max_bytes {
+                    return Ok(None);
+                }
+                hasher.update(&buf[..read_bytes]);
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(sha256_cancelled_err());
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(Some(hex::encode(hasher.finalize())))
+}
+
+/// Computes the streaming lowercase hex SHA-256 digest of the regular file at `path` in
+/// 64 KiB chunks, returning `Ok(None)` if not a regular file or larger than `max_bytes`,
+/// `Err` if stat/open fails, and `ErrorKind::Interrupted` if cancelled via `cancel`.
+pub fn compute_file_sha256_hex_cancellable(
+    path: &Path,
+    max_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<Option<String>, io::Error> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(sha256_cancelled_err());
+    }
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > max_bytes {
+        return Ok(None);
+    }
+    let mut file = File::open(path)?;
+    if file.metadata().is_ok_and(|m| m.len() > max_bytes) {
+        return Ok(None);
+    }
+    compute_reader_sha256_hex_cancellable(&mut file, max_bytes, cancel)
 }

@@ -2,6 +2,7 @@
 
 use std::ffi::c_void;
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,10 +15,10 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 
-use crate::engine::DaemonEngine;
+use crate::engine::{BrowserReportError, DaemonEngine};
 
 use super::auth::inspect_pipe_client_exe;
-use super::dispatch::dispatch_request;
+use super::dispatch::{authorize_caller_flags, browser_report_error_response, dispatch_request};
 use super::security::build_service_pipe_security_descriptor;
 #[cfg(doc)]
 use super::security::SERVICE_PIPE_SDDL;
@@ -342,6 +343,91 @@ async fn handle_pipe_client(
         }
 
         let response = match decode_ipc_frame::<IpcRequest>(&frame) {
+            Ok(IpcRequest::ReportDownloadOrigin {
+                file_path,
+                tab_url,
+                frame_url,
+                referrer_url,
+                downloaded_at_ms,
+            }) => {
+                let session_remaining =
+                    session_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if session_remaining.is_zero() {
+                    tracing::info!(
+                        timeout_ms = session_timeout.as_millis(),
+                        "IPC client session lifetime cap reached before dispatch; closing session (SEC_0001)"
+                    );
+                    break;
+                }
+                let auth_engine = Arc::clone(&engine);
+                let auth_caller = caller_exe.clone();
+                let auth_task = tokio::task::spawn_blocking(move || {
+                    authorize_caller_flags(&auth_engine, auth_caller.as_deref(), false, true)
+                });
+                let denied_opt = match tokio::time::timeout(session_remaining, auth_task).await {
+                    Ok(Ok(opt)) => opt,
+                    Ok(Err(join_err)) => {
+                        tracing::error!(error = %join_err, "IPC authorization task panicked");
+                        Some(IpcResponse::Error {
+                            code: "INTERNAL_ERROR".to_string(),
+                            message: format!("IPC authorization task failed: {join_err}"),
+                        })
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            timeout_ms = session_timeout.as_millis(),
+                            "IPC client session lifetime cap reached during auth; closing session (SEC_0001)"
+                        );
+                        break;
+                    }
+                };
+                if let Some(denied) = denied_opt {
+                    denied
+                } else {
+                    let session_remaining =
+                        session_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if session_remaining.is_zero() {
+                        tracing::info!(
+                            timeout_ms = session_timeout.as_millis(),
+                            "IPC client session lifetime cap reached before download inspect; closing session (SEC_0001)"
+                        );
+                        break;
+                    }
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    match tokio::time::timeout(
+                        session_remaining,
+                        engine.record_browser_download_origin_async(
+                            &file_path,
+                            &tab_url,
+                            frame_url.as_deref(),
+                            referrer_url.as_deref(),
+                            downloaded_at_ms,
+                            Arc::clone(&cancel),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => IpcResponse::Ack {
+                            message: "recorded download origin".to_string(),
+                        },
+                        Ok(Err(BrowserReportError::Cancelled)) => {
+                            tracing::info!(
+                                "download origin report cancelled before completion; closing IPC session"
+                            );
+                            break;
+                        }
+                        Ok(Err(err)) => browser_report_error_response(err),
+                        Err(_) => {
+                            cancel.store(true, Ordering::Release);
+                            tracing::info!(
+                                timeout_ms = session_timeout.as_millis(),
+                                "IPC client session lifetime cap reached during ReportDownloadOrigin; cancelling and closing session (SEC_0001)"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
             Ok(req) => {
                 let session_remaining =
                     session_deadline.saturating_duration_since(tokio::time::Instant::now());

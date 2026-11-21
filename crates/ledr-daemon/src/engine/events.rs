@@ -14,7 +14,6 @@ use ledr_store::StoreError;
 use uuid::Uuid;
 
 use crate::firewall::{WfpFilterOrigin, WfpRuleManager};
-#[cfg(doc)]
 use crate::process_table::ProcessStartResolution;
 
 use super::{current_unix_ms, event_timestamp_ms, DaemonEngine};
@@ -25,9 +24,104 @@ pub(super) struct DnsCorrelationUpdate {
     pub(super) accepted_ips: Vec<IpAddr>,
 }
 
+struct PreparedCanaryBackfill {
+    ident: ProcessIdentity,
+    create_time_100ns: u64,
+    existing_ppid: u32,
+    exe_path: String,
+    command_line: String,
+    res: ProcessStartResolution,
+}
+
 impl DaemonEngine {
+    fn attach_motw_to_proc_ctx(
+        &self,
+        instance_id: Option<&str>,
+        proc_ctx: &mut ResolvedProcessContext,
+        motw: super::motw::MotwAttribution,
+    ) {
+        let motw_source_str = motw.stage.as_str().to_string();
+        if let Some(inst_id) = instance_id {
+            self.process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_motw_metadata(
+                    inst_id,
+                    motw.origin_url.clone(),
+                    motw_source_str.clone(),
+                    motw.referrer_url.clone(),
+                    motw.frame_url.clone(),
+                    motw.zone_id,
+                );
+        }
+        proc_ctx.origin_url = Some(motw.origin_url);
+        proc_ctx.motw_source = Some(motw_source_str);
+        proc_ctx.motw_referrer = motw.referrer_url;
+        proc_ctx.motw_frame_url = motw.frame_url;
+        proc_ctx.motw_zone_id = motw.zone_id;
+        proc_ctx.proc_sha256 = motw.sha256;
+    }
+
+    pub(super) fn apply_late_motw_attribution(&self, late: super::motw::LateMotwAttribution) {
+        let exe_path = {
+            let mut table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            table.set_motw_metadata_if_active(
+                &late.instance_id,
+                late.attribution.origin_url.clone(),
+                late.attribution.stage.as_str().to_string(),
+                late.attribution.referrer_url.clone(),
+                late.attribution.frame_url.clone(),
+                late.attribution.zone_id,
+            )
+        };
+        let Some(exe_path) = exe_path else {
+            return;
+        };
+
+        if let Err(err) = self.store.update_process_motw_metadata(
+            &late.instance_id,
+            Some(&late.attribution.origin_url),
+            late.attribution.sha256.as_deref(),
+        ) {
+            tracing::warn!(
+                process_instance_id = %late.instance_id,
+                error = %err,
+                "failed backfilling delayed MOTW metadata into SQLite store"
+            );
+        }
+
+        if self.config.outbound_firewall_enabled {
+            self.maybe_apply_preemptive_wfp_block_with_motw(&exe_path, true);
+        }
+    }
+
     pub(super) fn process_seed_process_start(&self, event: &SensorEvent) -> Option<String> {
-        let _ = self.process_event_with_lane(event, event.default_lane());
+        let now_ms = current_unix_ms();
+        let event_ts_ms = event_timestamp_ms(event, now_ms);
+        let proc_ctx = self.resolve_process_context(event, event_ts_ms);
+
+        if matches!(event, SensorEvent::ProcessStart { .. })
+            && proc_ctx.origin_url.is_none()
+            && proc_ctx.exited_at_ms.is_none()
+            && !proc_ctx.skip_store_ingest
+        {
+            if let (Some(inst_id), Some(effective_exe)) = (
+                proc_ctx.proc_instance_id.as_deref(),
+                proc_ctx.proc_exe_path.as_deref(),
+            ) {
+                self.submit_process_motw_nonblocking(
+                    inst_id,
+                    effective_exe,
+                    proc_ctx.exited_at_ms,
+                    proc_ctx.skip_store_ingest,
+                );
+            }
+        }
+
+        let _ = self.finish_event_processing(event, event.default_lane(), event_ts_ms, proc_ctx);
         if let SensorEvent::ProcessStart { identity, .. } = event {
             let table = self
                 .process_table
@@ -43,7 +137,7 @@ impl DaemonEngine {
         None
     }
 
-    pub(super) fn process_event_with_lane(
+    pub(super) async fn process_event_with_lane_async(
         &self,
         event: &SensorEvent,
         lane: EventLane,
@@ -70,42 +164,110 @@ impl DaemonEngine {
             && !proc_ctx.skip_store_ingest
         {
             if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
-                if let Some(motw) = self.resolve_process_motw(
-                    effective_exe,
-                    proc_ctx.exited_at_ms,
-                    proc_ctx.skip_store_ingest,
-                ) {
-                    let motw_source_str = motw.stage.as_str().to_string();
-                    if let Some(ref inst_id) = proc_ctx.proc_instance_id {
-                        self.process_table
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .set_motw_metadata(
-                                inst_id,
-                                motw.origin_url.clone(),
-                                motw_source_str.clone(),
-                                motw.referrer_url.clone(),
-                                motw.frame_url.clone(),
-                                motw.zone_id,
-                            );
-                    }
-                    proc_ctx.origin_url = Some(motw.origin_url);
-                    proc_ctx.motw_source = Some(motw_source_str);
-                    proc_ctx.motw_referrer = motw.referrer_url;
-                    proc_ctx.motw_frame_url = motw.frame_url;
-                    proc_ctx.motw_zone_id = motw.zone_id;
-                    proc_ctx.proc_sha256 = motw.sha256;
+                if let Some(motw) = self
+                    .resolve_process_motw_budgeted(
+                        proc_ctx.proc_instance_id.as_deref(),
+                        effective_exe,
+                        proc_ctx.exited_at_ms,
+                        proc_ctx.skip_store_ingest,
+                    )
+                    .await
+                {
+                    let inst_id = proc_ctx.proc_instance_id.clone();
+                    self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
                 }
             }
         }
 
         if matches!(event, SensorEvent::CanaryFileAccess { .. }) {
-            self.backfill_canary_process_context_if_missing(event, &mut proc_ctx, event_ts_ms);
+            self.backfill_canary_process_context_if_missing_async(
+                event,
+                &mut proc_ctx,
+                event_ts_ms,
+            )
+            .await;
             self.handle_canary_file_access(event, &proc_ctx, event_ts_ms);
             self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
+        self.finish_event_processing(event, lane, event_ts_ms, proc_ctx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn process_event_with_lane(
+        &self,
+        event: &SensorEvent,
+        lane: EventLane,
+    ) -> Option<DnsCorrelationUpdate> {
+        if let SensorEvent::CanaryFileAccess {
+            category: CanaryCategory::Honeypot,
+            is_write_or_delete: false,
+            ..
+        } = event
+        {
+            self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let now_ms = current_unix_ms();
+        let event_ts_ms = event_timestamp_ms(event, now_ms);
+        let mut proc_ctx = self.resolve_process_context(event, event_ts_ms);
+
+        if matches!(event, SensorEvent::ProcessStart { .. })
+            && proc_ctx.origin_url.is_none()
+            && proc_ctx.exited_at_ms.is_none()
+            && !proc_ctx.skip_store_ingest
+        {
+            if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
+                if let Some(motw) = self.resolve_process_motw(
+                    effective_exe,
+                    proc_ctx.exited_at_ms,
+                    proc_ctx.skip_store_ingest,
+                ) {
+                    let inst_id = proc_ctx.proc_instance_id.clone();
+                    self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
+                }
+            }
+        }
+
+        if matches!(event, SensorEvent::CanaryFileAccess { .. }) {
+            if let Some((pid, prepared)) =
+                self.prepare_canary_backfill_sync(event, &proc_ctx, event_ts_ms)
+            {
+                if proc_ctx.origin_url.is_none()
+                    && !prepared.exe_path.is_empty()
+                    && !prepared.res.skip_store_ingest
+                {
+                    if let Some(motw) = self.resolve_process_motw(
+                        &prepared.exe_path,
+                        prepared.res.exited_at_ms,
+                        prepared.res.skip_store_ingest,
+                    ) {
+                        self.attach_motw_to_proc_ctx(
+                            Some(&prepared.res.instance_id),
+                            &mut proc_ctx,
+                            motw,
+                        );
+                    }
+                }
+                self.finalize_canary_backfill(pid, &mut proc_ctx, prepared);
+            }
+            self.handle_canary_file_access(event, &proc_ctx, event_ts_ms);
+            self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        self.finish_event_processing(event, lane, event_ts_ms, proc_ctx)
+    }
+
+    fn finish_event_processing(
+        &self,
+        event: &SensorEvent,
+        lane: EventLane,
+        event_ts_ms: i64,
+        proc_ctx: ResolvedProcessContext,
+    ) -> Option<DnsCorrelationUpdate> {
         let effective_event = proc_ctx.effective_process_start.as_ref().unwrap_or(event);
         let ctx = EventContext::with_parent(
             effective_event,
@@ -372,14 +534,47 @@ impl DaemonEngine {
 
     /// On-demand PID lookup fallback for ETW cross-provider ordering races (`Kernel-File`
     /// delivering a canary access milliseconds before `Kernel-Process` delivers `ProcessStart`).
-    fn backfill_canary_process_context_if_missing(
+    async fn backfill_canary_process_context_if_missing_async(
         &self,
         event: &SensorEvent,
         proc_ctx: &mut ResolvedProcessContext,
         event_ts_ms: i64,
     ) {
-        let SensorEvent::CanaryFileAccess { pid, .. } = event else {
+        let Some((pid, prepared)) = self.prepare_canary_backfill_sync(event, proc_ctx, event_ts_ms)
+        else {
             return;
+        };
+        if proc_ctx.origin_url.is_none()
+            && !prepared.exe_path.is_empty()
+            && !prepared.res.skip_store_ingest
+        {
+            if let Some(motw) = self
+                .resolve_process_motw_budgeted(
+                    Some(&prepared.res.instance_id),
+                    &prepared.exe_path,
+                    prepared.res.exited_at_ms,
+                    prepared.res.skip_store_ingest,
+                )
+                .await
+            {
+                self.attach_motw_to_proc_ctx(
+                    Some(&prepared.res.instance_id),
+                    proc_ctx,
+                    motw,
+                );
+            }
+        }
+        self.finalize_canary_backfill(pid, proc_ctx, prepared);
+    }
+
+    fn prepare_canary_backfill_sync(
+        &self,
+        event: &SensorEvent,
+        proc_ctx: &ResolvedProcessContext,
+        event_ts_ms: i64,
+    ) -> Option<(u32, PreparedCanaryBackfill)> {
+        let SensorEvent::CanaryFileAccess { pid, .. } = event else {
+            return None;
         };
         let needs_create_time = proc_ctx
             .proc_identity
@@ -389,36 +584,24 @@ impl DaemonEngine {
             .as_deref()
             .is_none_or(|p| p.trim().is_empty());
         if !needs_create_time && !needs_exe_path {
-            return;
+            return None;
         }
 
-        let Some(live) = self.live_process_inspector.inspect_live_process(*pid) else {
-            return;
-        };
-        self.apply_canary_live_process_backfill(*pid, proc_ctx, event_ts_ms, live);
-    }
-
-    fn apply_canary_live_process_backfill(
-        &self,
-        pid: u32,
-        proc_ctx: &mut ResolvedProcessContext,
-        event_ts_ms: i64,
-        live: ledr_sensor_win::etw::LiveProcessInfo,
-    ) {
+        let live = self.live_process_inspector.inspect_live_process(*pid)?;
         if live.create_time_100ns == 0 {
-            return;
+            return None;
         }
         // Guard against PID reuse (`BUG_0001`): if the live OS process at `pid` was created
         // strictly after the canary event timestamp, it cannot be the original accessor.
         let live_created_ms = super::filetime_100ns_to_unix_ms(live.create_time_100ns, i64::MAX);
         if live_created_ms > event_ts_ms {
             tracing::debug!(
-                pid,
+                pid = *pid,
                 live_created_ms,
                 event_ts_ms,
                 "skipping canary process backfill because live process started after event timestamp (possible PID reuse)"
             );
-            return;
+            return None;
         }
 
         // Guard against PID reuse: if we already have a non-zero creation timestamp for this
@@ -427,7 +610,7 @@ impl DaemonEngine {
             if existing_id.create_time_100ns != 0
                 && existing_id.create_time_100ns != live.create_time_100ns
             {
-                return;
+                return None;
             }
         }
 
@@ -446,14 +629,12 @@ impl DaemonEngine {
         // only backfill when the live OS process reports a matching executable path (fail closed
         // if the live image path cannot be queried).
         if let Some(existing_exe) = existing_exe_opt {
-            let Some(live_exe) = live_exe_opt else {
-                return;
-            };
+            let live_exe = live_exe_opt?;
             if !existing_exe
                 .replace('/', "\\")
                 .eq_ignore_ascii_case(&live_exe.replace('/', "\\"))
             {
-                return;
+                return None;
             }
         }
 
@@ -474,7 +655,7 @@ impl DaemonEngine {
         let gained_exe_path = existing_exe_opt.is_none() && live_exe_opt.is_some();
         let gained_command_line = existing_cmd_opt.is_none() && live_cmd_opt.is_some();
         if !gained_create_time && !gained_exe_path && !gained_command_line {
-            return;
+            return None;
         }
 
         let exe_path = existing_exe_opt
@@ -491,7 +672,7 @@ impl DaemonEngine {
         // occurring between process creation and this canary event.
         let backfilled_created_ms =
             super::filetime_100ns_to_unix_ms(live.create_time_100ns, event_ts_ms);
-        let ident = ProcessIdentity::new(pid, live.create_time_100ns);
+        let ident = ProcessIdentity::new(*pid, live.create_time_100ns);
         let ident_instance_id = ident.instance_id();
         let (existing_ppid, res) = {
             let mut table = self
@@ -519,30 +700,33 @@ impl DaemonEngine {
             (existing_ppid, res)
         };
 
-        if proc_ctx.origin_url.is_none() && !exe_path.is_empty() && !res.skip_store_ingest {
-            if let Some(motw) =
-                self.resolve_process_motw(&exe_path, res.exited_at_ms, res.skip_store_ingest)
-            {
-                let motw_source_str = motw.stage.as_str().to_string();
-                self.process_table
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .set_motw_metadata(
-                        &res.instance_id,
-                        motw.origin_url.clone(),
-                        motw_source_str.clone(),
-                        motw.referrer_url.clone(),
-                        motw.frame_url.clone(),
-                        motw.zone_id,
-                    );
-                proc_ctx.origin_url = Some(motw.origin_url);
-                proc_ctx.motw_source = Some(motw_source_str);
-                proc_ctx.motw_referrer = motw.referrer_url;
-                proc_ctx.motw_frame_url = motw.frame_url;
-                proc_ctx.motw_zone_id = motw.zone_id;
-                proc_ctx.proc_sha256 = motw.sha256;
-            }
-        }
+        Some((
+            *pid,
+            PreparedCanaryBackfill {
+                ident,
+                create_time_100ns: live.create_time_100ns,
+                existing_ppid,
+                exe_path,
+                command_line,
+                res,
+            },
+        ))
+    }
+
+    fn finalize_canary_backfill(
+        &self,
+        pid: u32,
+        proc_ctx: &mut ResolvedProcessContext,
+        prepared: PreparedCanaryBackfill,
+    ) {
+        let PreparedCanaryBackfill {
+            ident,
+            create_time_100ns,
+            existing_ppid,
+            exe_path,
+            command_line,
+            res,
+        } = prepared;
 
         let synthetic_start = SensorEvent::ProcessStart {
             identity: ident,
@@ -584,7 +768,7 @@ impl DaemonEngine {
 
         tracing::debug!(
             pid,
-            create_time_100ns = live.create_time_100ns,
+            create_time_100ns,
             exe_path = %exe_path,
             "backfilled missing process context on canary file access via on-demand PID lookup"
         );

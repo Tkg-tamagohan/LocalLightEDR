@@ -15,8 +15,10 @@ use crate::process_table::ActiveProcessTable;
 
 use super::dns_history::ProcessDnsHistory;
 use super::motw::{
-    BrowserEventDedupCache, MotwInspector, WindowsMotwInspector, BROWSER_EVENT_DEDUP_CAPACITY,
-    BROWSER_EVENT_DEDUP_WINDOW_MS,
+    initial_download_origin_state, refresh_download_origins_after_purge, BrowserEventDedupCache,
+    MotwInspector, MotwIoWorkerPool, MotwStage2Cache, WindowsMotwInspector,
+    BROWSER_EVENT_DEDUP_CAPACITY, BROWSER_EVENT_DEDUP_WINDOW_MS, MOTW_IO_QUEUE_CAPACITY,
+    MOTW_STAGE2_CACHE_CAPACITY, MOTW_STAGE2_CACHE_TTL_SECS,
 };
 use super::wfp_drops::{AppWfpAlertDedup, WfpDropDedupCache, WfpDropOverflowQueue};
 use super::{
@@ -180,6 +182,23 @@ impl DaemonEngine {
         let wfp_drop_overflow = Mutex::new(WfpDropOverflowQueue::new(
             config.high_priority_capacity.max(1),
         ));
+        let download_origin_state =
+            Arc::new(AtomicU64::new(initial_download_origin_state(initial_has_downloads)));
+        let motw_stage2_cache = Arc::new(Mutex::new(MotwStage2Cache::new(
+            MOTW_STAGE2_CACHE_CAPACITY,
+            MOTW_STAGE2_CACHE_TTL_SECS,
+        )));
+        let (motw_result_tx, motw_result_rx) =
+            tokio::sync::mpsc::channel(MOTW_IO_QUEUE_CAPACITY);
+        let motw_pool = MotwIoWorkerPool::new(
+            store.clone(),
+            Arc::clone(&inspector),
+            Arc::clone(&motw_inspector),
+            Arc::clone(&download_origin_state),
+            Arc::clone(&motw_stage2_cache),
+            config.download_hash_max_bytes,
+            motw_result_tx,
+        );
 
         let engine = Arc::new(Self {
             config,
@@ -191,7 +210,9 @@ impl DaemonEngine {
             inspector,
             live_process_inspector,
             motw_inspector,
-            has_download_origins: AtomicBool::new(initial_has_downloads),
+            download_origin_state,
+            motw_stage2_cache,
+            motw_pool,
             browser_event_dedup: Mutex::new(BrowserEventDedupCache::new(
                 BROWSER_EVENT_DEDUP_CAPACITY,
                 BROWSER_EVENT_DEDUP_WINDOW_MS,
@@ -238,7 +259,9 @@ impl DaemonEngine {
 
         let worker_engine = Arc::clone(&engine);
         let handle = tokio::spawn(async move {
-            worker_engine.run_pipeline(receiver, wfp_drop_rx).await
+            worker_engine
+                .run_pipeline(receiver, wfp_drop_rx, motw_result_rx)
+                .await
         });
 
         if let Ok(mut slot) = engine.worker_handle.try_lock() {
@@ -300,10 +323,17 @@ impl DaemonEngine {
         Ok(count)
     }
 
-    /// Executes a single SQLite TTL purge pass using the configured retention window (`L-11`).
+    /// Executes a single SQLite TTL purge pass using the configured retention window (`L-11`),
+    /// resetting cached `has_download_origins` to `false` when no rows remain (generation-guarded).
     pub fn run_ttl_purge_once(&self) -> Result<PurgeStats, StoreError> {
-        self.store
-            .purge_expired(current_unix_ms(), self.config.ttl_retention_days)
+        let before_state = self
+            .download_origin_state
+            .load(std::sync::atomic::Ordering::Acquire);
+        let stats = self
+            .store
+            .purge_expired(current_unix_ms(), self.config.ttl_retention_days)?;
+        refresh_download_origins_after_purge(&self.download_origin_state, &self.store, before_state);
+        Ok(stats)
     }
 
     /// Transitions overdue `PENDING` alerts older than `alert_timeout_ms` to
@@ -436,6 +466,10 @@ impl DaemonEngine {
                 );
             }
         }
+
+        // Shutdown the dedicated MOTW I/O worker pool AFTER pipeline drain + WAL checkpoint,
+        // cancelling active file hashes and detaching wedged raw OS worker threads on timeout.
+        self.motw_pool.shutdown_and_join(deadline).await;
 
         if let Some(err) = drain_err {
             return Err(err);

@@ -4,11 +4,12 @@
 //! alert resolution, bridge IPC auth, `spawn_blocking` responsiveness, and burst budget.
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_daemon::{
     start_ipc_server, verify_caller_identity, ActiveProcessEntry, BinaryInspector,
@@ -19,7 +20,7 @@ use ledr_daemon::{
 use ledr_proto::{
     read_ipc_frame, write_ipc_frame, ActiveDefenseController, AlertDecision, AlertRecord,
     AlertSeverity, AlertStatus, AllowlistRuleRecord, AuthenticodeInfo, BrowserSecurityEventType,
-    CanaryCategory, IpcRequest, IpcResponse, ProcessIdentity, RuleScope, SensorEvent,
+    CanaryCategory, FrameError, IpcRequest, IpcResponse, ProcessIdentity, RuleScope, SensorEvent,
     ACTIVE_PROCESS_TABLE_CAPACITY, AUTHORIZED_BRIDGE_EXE_PATH, HIGH_PRIORITY_CHANNEL_CAPACITY,
     TELEMETRY_CHANNEL_CAPACITY,
 };
@@ -270,16 +271,41 @@ impl MotwInspector for MapMotwInspector {
 }
 
 struct BlockingGateMotwInspector {
-    entered: Arc<(Mutex<bool>, Condvar)>,
+    entered: Arc<(Mutex<usize>, Condvar)>,
     released: Arc<(Mutex<bool>, Condvar)>,
+    completed: Arc<(Mutex<usize>, Condvar)>,
+    target_substring: Option<String>,
+    return_zone: Option<MotwZoneInfo>,
+}
+
+impl BlockingGateMotwInspector {
+    fn new(
+        entered: Arc<(Mutex<usize>, Condvar)>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+        completed: Arc<(Mutex<usize>, Condvar)>,
+    ) -> Self {
+        Self {
+            entered,
+            released,
+            completed,
+            target_substring: None,
+            return_zone: None,
+        }
+    }
 }
 
 impl MotwInspector for BlockingGateMotwInspector {
-    fn read_zone_identifier(&self, _path: &Path) -> Option<MotwZoneInfo> {
+    fn read_zone_identifier(&self, path: &Path) -> Option<MotwZoneInfo> {
+        if let Some(sub) = self.target_substring.as_deref() {
+            let raw = path.display().to_string();
+            if !raw.to_ascii_lowercase().contains(&sub.to_ascii_lowercase()) {
+                return None;
+            }
+        }
         {
             let (lock, cvar) = &*self.entered;
-            let mut flag = lock.lock().expect("lock entered");
-            *flag = true;
+            let mut count = lock.lock().expect("lock entered");
+            *count += 1;
             cvar.notify_all();
         }
         {
@@ -289,7 +315,13 @@ impl MotwInspector for BlockingGateMotwInspector {
                 flag = cvar.wait(flag).expect("wait released");
             }
         }
-        None
+        {
+            let (lock, cvar) = &*self.completed;
+            let mut count = lock.lock().expect("lock completed");
+            *count += 1;
+            cvar.notify_all();
+        }
+        self.return_zone.clone()
     }
 }
 
@@ -301,6 +333,83 @@ impl Drop for GateReleaseGuard {
         let mut flag = lock.lock().unwrap_or_else(|e| e.into_inner());
         *flag = true;
         cvar.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct CountingBinaryInspector {
+    inner: WindowsBinaryInspector,
+    inspect_calls: AtomicU64,
+    sha256_calls: AtomicU64,
+}
+
+impl CountingBinaryInspector {
+    fn inspect_calls(&self) -> u64 {
+        self.inspect_calls.load(Ordering::Acquire)
+    }
+
+    fn sha256_calls(&self) -> u64 {
+        self.sha256_calls.load(Ordering::Acquire)
+    }
+}
+
+impl BinaryInspector for CountingBinaryInspector {
+    fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+        self.inspect_calls.fetch_add(1, Ordering::AcqRel);
+        self.inner.inspect(exe_path)
+    }
+
+    fn compute_sha256(&self, exe_path: &str) -> Option<String> {
+        self.sha256_calls.fetch_add(1, Ordering::AcqRel);
+        self.inner.compute_sha256(exe_path)
+    }
+
+    fn compute_sha256_cancellable(
+        &self,
+        exe_path: &str,
+        max_bytes: u64,
+        cancel: &AtomicBool,
+    ) -> std::io::Result<Option<String>> {
+        self.inner.compute_sha256_cancellable(exe_path, max_bytes, cancel)
+    }
+}
+
+fn wait_count_reached(pair: &(Mutex<usize>, Condvar), target: usize) {
+    let (lock, cvar) = pair;
+    let mut count = lock.lock().expect("lock count");
+    while *count < target {
+        let (next, timed) = cvar
+            .wait_timeout(count, Duration::from_secs(3))
+            .expect("wait count");
+        count = next;
+        assert!(
+            !timed.timed_out() || *count >= target,
+            "timed out waiting for gate count >= {target} (got {})",
+            *count
+        );
+    }
+}
+
+fn try_send_pipe_request(pipe_name: &str, req: &IpcRequest) -> Result<IpcResponse, FrameError> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_name)
+        {
+            Ok(mut pipe) => {
+                write_ipc_frame(&mut pipe, req)?;
+                return read_ipc_frame::<_, IpcResponse>(&mut pipe);
+            }
+            Err(err)
+                if Instant::now() < deadline
+                    && matches!(err.raw_os_error(), Some(231) | Some(2)) =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => return Err(FrameError::Io(err)),
+        }
     }
 }
 
@@ -1681,14 +1790,16 @@ async fn daemon_p4_12_ipc_bridge_auth_and_end_to_end_named_pipe_roundtrip() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn daemon_p4_13_ipc_spawn_blocking_keeps_async_runtime_responsive() {
-    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let entered = Arc::new((Mutex::new(0usize), Condvar::new()));
     let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let completed = Arc::new((Mutex::new(0usize), Condvar::new()));
     let _release_guard = GateReleaseGuard(Arc::clone(&released));
 
-    let blocking_motw = Arc::new(BlockingGateMotwInspector {
-        entered: Arc::clone(&entered),
-        released: Arc::clone(&released),
-    });
+    let blocking_motw = Arc::new(BlockingGateMotwInspector::new(
+        Arc::clone(&entered),
+        Arc::clone(&released),
+        Arc::clone(&completed),
+    ));
 
     let pipe_name = unique_test_pipe_name();
     let engine = DaemonEngine::start_with_motw_inspector(
@@ -1722,19 +1833,13 @@ async fn daemon_p4_13_ipc_spawn_blocking_keeps_async_runtime_responsive() {
         )
     });
 
-    // Deterministically wait until `dispatch_request` has entered `BlockingGateMotwInspector`
-    // inside `spawn_blocking`, then confirm the current-thread Tokio runtime still drives
-    // both async tasks and concurrent `Ping` IPC requests immediately.
+    // Deterministically wait until `record_browser_download_origin_async` has entered
+    // `BlockingGateMotwInspector` on the dedicated MOTW I/O thread pool, then confirm the
+    // current-thread Tokio runtime still drives concurrent `Ping` IPC requests immediately.
     let entered_wait = Arc::clone(&entered);
-    tokio::task::spawn_blocking(move || {
-        let (lock, cvar) = &*entered_wait;
-        let mut flag = lock.lock().expect("lock entered");
-        while !*flag {
-            flag = cvar.wait(flag).expect("wait entered");
-        }
-    })
-    .await
-    .expect("join entered waiter");
+    tokio::task::spawn_blocking(move || wait_count_reached(&entered_wait, 1))
+        .await
+        .expect("join entered waiter");
 
     let pipe_ping = pipe_name.clone();
     let ping_resp = tokio::time::timeout(
@@ -1820,5 +1925,757 @@ async fn daemon_p4_14_burst_with_motw_preserves_zero_hp_drop_and_memory_budget()
     assert!(
         total_bounded_bytes <= 20 * 1024 * 1024,
         "bounded buffer baseline {total_bounded_bytes} bytes exceeds 20 MB budget"
+    );
+}
+
+#[tokio::test]
+async fn daemon_p4_15_stage1_verifies_current_binary_hash_and_falls_back_on_replacement() {
+    let dir = TestTempDir::new("p4-15");
+    let target_path = dir.0.join("replaced_tool.exe");
+    let other_path = dir.0.join("other_dl.exe");
+
+    std::fs::write(&target_path, b"original-downloaded-binary-v1").expect("write v1");
+    let stage2_payload = b"different-downloaded-binary-v3-content-for-stage2";
+    std::fs::write(&other_path, stage2_payload).expect("write stage2 payload");
+    let expected_stage2_sha = compute_file_sha256_hex(&other_path).expect("sha stage2");
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(WindowsBinaryInspector::new()),
+        Arc::new(NullLiveProcessInspector),
+        Arc::new(WindowsMotwInspector::new()),
+    );
+
+    let target_str = target_path.display().to_string();
+    engine
+        .record_browser_download_origin(
+            &target_str,
+            "https://dl-v1.example.invalid/tool.exe",
+            None,
+            Some("https://ref-v1.example.invalid/"),
+            1_760_015_000_000,
+        )
+        .expect("record v1");
+
+    // 1. Replace binary at same path with clean clean build (no ADS) -> Stage 1 must reject!
+    std::fs::write(&target_path, b"clean-rebuilt-binary-no-ads-v2-different-length")
+        .expect("overwrite with v2 clean");
+    assert_eq!(
+        engine.resolve_process_motw(&target_str, None, false),
+        None,
+        "replaced binary without matching hash or ADS must not inherit stale Stage 1 URL"
+    );
+
+    let sender = engine.sender();
+    let base_ms = 1_760_015_001_000i64;
+    let ident_a = ProcessIdentity::new(8001, unix_ms_to_filetime(base_ms));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident_a,
+            parent_pid: 4,
+            exe_path: target_str.clone(),
+            command_line: "replaced_tool.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send ProcessStart clean replacement");
+    wait_high_priority_processed(&engine, 1, "clean replacement ProcessStart").await;
+    store.flush_batch().expect("flush clean replacement");
+
+    let snap_a = store
+        .query_flight_recorder(10, Some(&ident_a.instance_id()))
+        .expect("query clean replacement");
+    assert_eq!(snap_a.processes.len(), 1);
+    assert_eq!(snap_a.processes[0].origin_url, None);
+    assert_eq!(snap_a.processes[0].sha256, None);
+
+    // Subcheck on a GeneralUnknown path (`C:\Tools\portable\...`, outside HighRiskPath `%TEMP%`):
+    // replaced clean binary without ADS must also avoid L-18 MOTW pre-emptive WFP block.
+    let general_exe = r"C:\Tools\portable\replaced_general.exe";
+    let gen_v1_sha = "1111111111111111111111111111111111111111111111111111111111111111";
+    let gen_v2_sha = "2222222222222222222222222222222222222222222222222222222222222222";
+    let gen_bin = Arc::new(MapBinaryInspector::default());
+    gen_bin.insert(
+        general_exe,
+        BinaryIdentity {
+            exe_path: general_exe.to_string(),
+            sha256: Some(gen_v1_sha.to_string()),
+            authenticode: None,
+        },
+    );
+    let gen_defense = Arc::new(MockDefense::new());
+    let gen_store = LedrStore::open_in_memory().expect("open gen store");
+    let gen_engine = DaemonEngine::start_with_motw_inspector(
+        gen_store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        gen_defense.clone(),
+        Arc::new(RecordingNotifier::default()),
+        gen_bin.clone(),
+        Arc::new(NullLiveProcessInspector),
+        Arc::new(MapMotwInspector::default()),
+    );
+    gen_engine
+        .record_browser_download_origin(
+            general_exe,
+            "https://dl-gen.example.invalid/v1.exe",
+            None,
+            None,
+            1_760_015_000_500,
+        )
+        .expect("record general v1");
+    gen_bin.insert(
+        general_exe,
+        BinaryIdentity {
+            exe_path: general_exe.to_string(),
+            sha256: Some(gen_v2_sha.to_string()),
+            authenticode: None,
+        },
+    );
+    let ident_gen = ProcessIdentity::new(8091, unix_ms_to_filetime(base_ms));
+    gen_engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: ident_gen,
+            parent_pid: 4,
+            exe_path: general_exe.to_string(),
+            command_line: "replaced_general.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send general ProcessStart");
+    wait_high_priority_processed(&gen_engine, 1, "general clean replacement").await;
+    assert!(
+        gen_defense.added_wfp().is_empty(),
+        "replaced non-MOTW GeneralUnknown binary must not receive L-18 pre-emptive WFP block"
+    );
+    gen_engine.shutdown_and_flush().await.expect("shutdown gen");
+
+    // 2. Register `other_path` (stage2_payload), then overwrite `target_path` with `stage2_payload`:
+    //    Stage 1 path match rejects old dl-v1 URL and falls back to Stage 2 hash match without re-hashing.
+    engine
+        .record_browser_download_origin(
+            &other_path.display().to_string(),
+            "https://stage2-v3.example.invalid/other.exe",
+            None,
+            Some("https://ref-v3.example.invalid/"),
+            1_760_015_002_000,
+        )
+        .expect("record v3 stage2");
+    std::fs::write(&target_path, stage2_payload).expect("overwrite with v3 payload");
+    let stage2_attr = engine
+        .resolve_process_motw(&target_str, None, false)
+        .expect("Stage 2 fallback match");
+    assert_eq!(stage2_attr.stage, MotwMatchStage::DownloadSha256);
+    assert_eq!(
+        stage2_attr.origin_url,
+        "https://stage2-v3.example.invalid/other.exe"
+    );
+    assert_eq!(
+        stage2_attr.sha256.as_deref(),
+        Some(expected_stage2_sha.as_str())
+    );
+
+    let ident_b = ProcessIdentity::new(8002, unix_ms_to_filetime(base_ms + 1_000));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident_b,
+            parent_pid: 4,
+            exe_path: target_str.clone(),
+            command_line: "replaced_tool.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send ProcessStart stage2 fallback");
+    wait_high_priority_processed(&engine, 2, "stage2 fallback ProcessStart").await;
+    assert!(
+        !defense.added_wfp().is_empty(),
+        "Stage 2 fallback MOTW binary should receive L-18 pre-emptive WFP block"
+    );
+
+    // 3. Overwrite with unregistered payload carrying ZoneId=3 ADS -> Stage 3 fallback.
+    std::fs::write(&target_path, b"unregistered-ads-binary-v4").expect("overwrite v4");
+    write_zone_identifier(
+        &target_path,
+        &MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some("https://ads-v4.example.invalid/v4.exe".to_string()),
+            referrer_url: Some("https://ref-v4.example.invalid/".to_string()),
+        },
+    )
+    .expect("write ZoneId=3 ADS");
+    let stage3_attr = engine
+        .resolve_process_motw(&target_str, None, false)
+        .expect("Stage 3 fallback match");
+    assert_eq!(stage3_attr.stage, MotwMatchStage::ZoneIdentifierAds);
+    assert_eq!(
+        stage3_attr.origin_url,
+        "https://ads-v4.example.invalid/v4.exe"
+    );
+    assert_eq!(stage3_attr.sha256, None);
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    // 4. Oversized replacement over a hashed Stage 1 download rejects Stage 1 and skips Stage 2.
+    let small_to_large = dir.0.join("grew_oversized.exe");
+    std::fs::write(&small_to_large, b"tiny-v1").expect("write small binary");
+    let capped_engine = DaemonEngine::start_with_motw_inspector(
+        LedrStore::open_in_memory().expect("open capped store"),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            download_hash_max_bytes: 16,
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockDefense::new()),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(WindowsBinaryInspector::new()),
+        Arc::new(NullLiveProcessInspector),
+        Arc::new(WindowsMotwInspector::new()),
+    );
+    let large_str = small_to_large.display().to_string();
+    capped_engine
+        .record_browser_download_origin(
+            &large_str,
+            "https://small.example.invalid/tiny.exe",
+            None,
+            None,
+            1_760_015_010_000,
+        )
+        .expect("record small hashed binary");
+    std::fs::write(&small_to_large, vec![b'X'; 64]).expect("overwrite with oversized >16B file");
+    assert_eq!(
+        capped_engine.resolve_process_motw(&large_str, None, false),
+        None
+    );
+    write_zone_identifier(
+        &small_to_large,
+        &MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some("https://oversized-ads.example.invalid/big.exe".to_string()),
+            referrer_url: None,
+        },
+    )
+    .expect("write oversized ADS");
+    let oversized_stage3 = capped_engine
+        .resolve_process_motw(&large_str, None, false)
+        .expect("oversized falls back to Stage 3 ADS");
+    assert_eq!(oversized_stage3.stage, MotwMatchStage::ZoneIdentifierAds);
+    assert_eq!(
+        oversized_stage3.origin_url,
+        "https://oversized-ads.example.invalid/big.exe"
+    );
+    capped_engine
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown capped");
+}
+
+#[tokio::test]
+async fn daemon_p4_16_blocked_motw_io_does_not_stall_pipeline_late_backfill_and_clean_shutdown() {
+    let entered = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let completed = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let _release_guard = GateReleaseGuard(Arc::clone(&released));
+
+    let gated_motw = Arc::new(BlockingGateMotwInspector {
+        entered: Arc::clone(&entered),
+        released: Arc::clone(&released),
+        completed: Arc::clone(&completed),
+        target_substring: Some("hung-server".to_string()),
+        return_zone: Some(MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some("https://late-ads.example.invalid/slow.exe".to_string()),
+            referrer_url: Some("https://ref-late.example.invalid/".to_string()),
+        }),
+    });
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            motw_sync_wait_budget_ms: 25,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(MapBinaryInspector::default()),
+        Arc::new(NullLiveProcessInspector),
+        gated_motw,
+    );
+
+    let sender = engine.sender();
+    let t0_ms = 1_760_016_000_000i64;
+    let exited_exe = r"\\hung-server\share\exited_slow.exe";
+    let active_exe = r"\\hung-server\share\active_slow.exe";
+    let exited_ident = ProcessIdentity::new(8101, unix_ms_to_filetime(t0_ms));
+    let active_ident = ProcessIdentity::new(8102, unix_ms_to_filetime(t0_ms + 10));
+    let canary_ident = ProcessIdentity::new(8103, unix_ms_to_filetime(t0_ms + 20));
+
+    // Saturate both raw-OS MOTW worker threads on hung SMB paths (`exited_slow` then `active_slow`).
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: exited_ident,
+            parent_pid: 4,
+            exe_path: exited_exe.to_string(),
+            command_line: "exited_slow.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send exited_slow ProcessStart");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: active_ident,
+            parent_pid: 4,
+            exe_path: active_exe.to_string(),
+            command_line: "active_slow.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send active_slow ProcessStart");
+    // Stop PID 8101 before the MOTW I/O gate opens so its late attribution must be discarded.
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: exited_ident.pid,
+            exit_code: 0,
+            exit_time_100ns: unix_ms_to_filetime(t0_ms + 50),
+        })
+        .await
+        .expect("send exited_slow ProcessStop");
+    // Send an unrelated process + CanaryFileAccess while BOTH MOTW workers remain wedged!
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: canary_ident,
+            parent_pid: 4,
+            exe_path: r"C:\Temp\canary_probe.exe".to_string(),
+            command_line: "canary_probe.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send canary_probe ProcessStart");
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: canary_ident.pid,
+            target_path: r"C:\Temp\!00_LocalEDR_Canary_DoNotEdit.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 2,
+            is_write_or_delete: true,
+            timestamp_ms: t0_ms + 60,
+        })
+        .await
+        .expect("send CanaryFileAccess");
+
+    // Verify CanaryFileAccess alert fires promptly WITHOUT waiting on wedged MOTW workers.
+    let canary_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let alerts = store.list_alerts(None, 10).expect("list alerts");
+        if alerts.iter().any(|a| a.source_layer == "LAYER_1_CANARY") {
+            break;
+        }
+        assert!(
+            Instant::now() < canary_deadline,
+            "CanaryFileAccess stalled behind blocked MOTW I/O"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Wait until both wedged MOTW workers have entered the gate, then open the gate.
+    let entered_wait = Arc::clone(&entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&entered_wait, 2))
+        .await
+        .expect("wait both workers in gate");
+    {
+        let (lock, cvar) = &*released;
+        let mut flag = lock.lock().expect("lock released");
+        *flag = true;
+        cvar.notify_all();
+    }
+
+    // Active process (`8102`) receives late backfill (table/SQLite + L-18 pre-emptive WFP block),
+    // and enqueue a third sentinel after opening the gate to ensure `exited_slow` has drained too.
+    let sentinel_ident = ProcessIdentity::new(8104, unix_ms_to_filetime(t0_ms + 100));
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: sentinel_ident,
+            parent_pid: 4,
+            exe_path: r"\\hung-server\share\sentinel_after.exe".to_string(),
+            command_line: "sentinel_after.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send sentinel_after ProcessStart");
+
+    let backfill_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let _ = store.flush_batch();
+        let active_snap = store
+            .query_flight_recorder(10, Some(&active_ident.instance_id()))
+            .expect("query active_slow");
+        let wfp_calls = defense.added_wfp();
+        let active_backfilled = active_snap
+            .processes
+            .first()
+            .and_then(|p| p.origin_url.as_deref())
+            == Some("https://late-ads.example.invalid/slow.exe")
+            && wfp_calls.iter().any(|c| c.exe_path.ends_with("active_slow.exe"));
+        let sentinel_backfilled = store
+            .query_flight_recorder(10, Some(&sentinel_ident.instance_id()))
+            .expect("query sentinel")
+            .processes
+            .first()
+            .and_then(|p| p.origin_url.as_deref())
+            .is_some();
+        if active_backfilled && sentinel_backfilled {
+            break;
+        }
+        assert!(
+            Instant::now() < backfill_deadline,
+            "timed out waiting for late MOTW backfill and L-18 WFP block"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let exited_snap = store
+        .query_flight_recorder(10, Some(&exited_ident.instance_id()))
+        .expect("query exited_slow");
+    assert_eq!(exited_snap.processes.len(), 1);
+    assert_eq!(
+        exited_snap.processes[0].origin_url, None,
+        "already-exited process must discard late MOTW backfill"
+    );
+    assert!(
+        !defense
+            .added_wfp()
+            .iter()
+            .any(|c| c.exe_path.ends_with("exited_slow.exe")),
+        "already-exited process must not receive late WFP block"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown engine1");
+
+    // Part 2: Verify `shutdown_and_flush` detaches a permanently wedged raw-OS MOTW worker thread
+    // within `shutdown_flush_timeout_ms` without hanging Tokio `Runtime::drop`.
+    let entered2 = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let released2 = Arc::new((Mutex::new(false), Condvar::new()));
+    let completed2 = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let _release_guard2 = GateReleaseGuard(Arc::clone(&released2));
+
+    let wedged_engine = DaemonEngine::start_with_motw_inspector(
+        LedrStore::open_in_memory().expect("open store2"),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            motw_sync_wait_budget_ms: 20,
+            shutdown_flush_timeout_ms: 200,
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockDefense::new()),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(MapBinaryInspector::default()),
+        Arc::new(NullLiveProcessInspector),
+        Arc::new(BlockingGateMotwInspector::new(
+            Arc::clone(&entered2),
+            Arc::clone(&released2),
+            Arc::clone(&completed2),
+        )),
+    );
+    wedged_engine
+        .sender()
+        .send(SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(8105, unix_ms_to_filetime(t0_ms + 200)),
+            parent_pid: 4,
+            exe_path: r"\\hung-server\share\wedged_forever.exe".to_string(),
+            command_line: "wedged_forever.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send wedged ProcessStart");
+
+    let entered2_wait = Arc::clone(&entered2);
+    tokio::task::spawn_blocking(move || wait_count_reached(&entered2_wait, 1))
+        .await
+        .expect("wait wedged worker in gate");
+
+    let shutdown_t0 = Instant::now();
+    wedged_engine
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown must detach wedged MOTW worker cleanly");
+    assert!(
+        shutdown_t0.elapsed() < Duration::from_secs(2),
+        "shutdown took {:?} with wedged MOTW worker",
+        shutdown_t0.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn daemon_p4_17_stage2_cache_generation_invalidation_and_ttl_purge_flag_reset() {
+    let dir = TestTempDir::new("p4-17");
+    let tool_path = dir.0.join("repeat_binary.exe");
+    let expired_dl_1 = dir.0.join("expired_dl_1.exe");
+    let expired_dl_2 = dir.0.join("expired_dl_2.exe");
+    let after_purge_path = dir.0.join("after_purge.exe");
+    std::fs::write(&tool_path, b"repeated-launch-binary-content").expect("write repeat binary");
+    std::fs::write(&after_purge_path, b"post-purge-binary-content").expect("write post-purge binary");
+
+    let counting_insp = Arc::new(CountingBinaryInspector::default());
+    let engine = DaemonEngine::start_with_motw_inspector(
+        LedrStore::open_in_memory().expect("open store"),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockDefense::new()),
+        Arc::new(RecordingNotifier::default()),
+        counting_insp.clone(),
+        Arc::new(NullLiveProcessInspector),
+        Arc::new(WindowsMotwInspector::new()),
+    );
+
+    assert!(!engine.has_download_origins_cached());
+
+    // Record an expired download origin (>30 days old) for an unrelated path.
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_millis(),
+    )
+    .expect("i64 ms");
+    let expired_ts = now_ms - 40 * 86_400_000;
+    engine
+        .record_browser_download_origin(
+            &expired_dl_1.display().to_string(),
+            "https://old1.example.invalid/a.exe",
+            None,
+            None,
+            expired_ts,
+        )
+        .expect("record expired download 1");
+    assert!(engine.has_download_origins_cached());
+
+    let tool_str = tool_path.display().to_string();
+    assert_eq!(engine.resolve_process_motw(&tool_str, None, false), None);
+    assert_eq!(counting_insp.sha256_calls(), 1);
+    assert_eq!(
+        counting_insp.inspect_calls(),
+        0,
+        "MOTW hot path must use lightweight compute_sha256 without Authenticode inspect()"
+    );
+
+    // Repeat launch of unchanged binary must hit bounded Stage 2 cache (no re-hash).
+    assert_eq!(engine.resolve_process_motw(&tool_str, None, false), None);
+    assert_eq!(counting_insp.sha256_calls(), 1);
+
+    // New download increments generation and invalidates the Stage 2 cache.
+    engine
+        .record_browser_download_origin(
+            &expired_dl_2.display().to_string(),
+            "https://old2.example.invalid/b.exe",
+            None,
+            None,
+            expired_ts + 1_000,
+        )
+        .expect("record expired download 2");
+    assert_eq!(engine.resolve_process_motw(&tool_str, None, false), None);
+    assert_eq!(counting_insp.sha256_calls(), 2);
+
+    // TTL purge removing all download_origins rows resets `has_download_origins_cached` to false.
+    let purged = engine.run_ttl_purge_once().expect("run TTL purge");
+    assert_eq!(purged.downloads_deleted, 2);
+    assert!(
+        !engine.has_download_origins_cached(),
+        "has_download_origins flag must reset to false after TTL purge empties download_origins"
+    );
+
+    // Once reset, launching a brand-new binary does zero Stage 2 hashing.
+    assert_eq!(
+        engine.resolve_process_motw(&after_purge_path.display().to_string(), None, false),
+        None
+    );
+    assert_eq!(counting_insp.sha256_calls(), 2);
+
+    // Direct smoke check of `WindowsBinaryInspector::compute_sha256`.
+    let expected_tool_sha = compute_file_sha256_hex(&tool_path).expect("expected sha");
+    assert_eq!(
+        WindowsBinaryInspector::new()
+            .compute_sha256(&tool_str)
+            .as_deref(),
+        Some(expected_tool_sha.as_str())
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_p4_18_ipc_download_timeout_cancels_write_and_retry_is_idempotent() {
+    // Part A: IPC session timeout cancels in-flight ReportDownloadOrigin before SQLite write.
+    let entered = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let completed = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let _release_guard = GateReleaseGuard(Arc::clone(&released));
+
+    let pipe_timeout = unique_test_pipe_name();
+    let store_timeout = LedrStore::open_in_memory().expect("open timeout store");
+    let engine_timeout = DaemonEngine::start_with_motw_inspector(
+        store_timeout.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_timeout.clone(),
+            ipc_session_timeout_ms: 150,
+            shutdown_flush_timeout_ms: 200,
+            dev_mode_bypass_ui_auth: true,
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockDefense::new()),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(MapBinaryInspector::default()),
+        Arc::new(NullLiveProcessInspector),
+        Arc::new(BlockingGateMotwInspector::new(
+            Arc::clone(&entered),
+            Arc::clone(&released),
+            Arc::clone(&completed),
+        )),
+    );
+    let ipc_timeout = start_ipc_server(Arc::clone(&engine_timeout)).expect("bind timeout pipe");
+
+    let pipe_req = pipe_timeout.clone();
+    let client_res = tokio::task::spawn_blocking(move || {
+        try_send_pipe_request(
+            &pipe_req,
+            &IpcRequest::ReportDownloadOrigin {
+                file_path: r"C:\Temp\timed_out_download.exe".to_string(),
+                tab_url: "https://timeout.example.invalid/file.exe".to_string(),
+                frame_url: None,
+                referrer_url: None,
+                downloaded_at_ms: 1_760_018_000_000,
+            },
+        )
+    })
+    .await
+    .expect("join timeout client");
+    assert!(
+        matches!(
+            client_res,
+            Err(FrameError::Io(ref e))
+                if matches!(
+                    e.kind(),
+                    ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                )
+        ) || matches!(client_res, Err(FrameError::TruncatedFrame { .. })),
+        "timed out ReportDownloadOrigin must close pipe cleanly: {client_res:?}"
+    );
+
+    // Release gate and wait deterministically for the cancelled MOTW job to finish cleanly.
+    {
+        let (lock, cvar) = &*released;
+        let mut flag = lock.lock().expect("lock released");
+        *flag = true;
+        cvar.notify_all();
+    }
+    let completed_wait = Arc::clone(&completed);
+    tokio::task::spawn_blocking(move || wait_count_reached(&completed_wait, 1))
+        .await
+        .expect("wait completed");
+
+    ipc_timeout.shutdown().await;
+    engine_timeout
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown timeout engine");
+
+    let snap_timeout = store_timeout
+        .query_flight_recorder(10, None)
+        .expect("query timeout store");
+    assert!(
+        snap_timeout.download_origins.is_empty(),
+        "cancelled ReportDownloadOrigin must not commit late SQLite rows"
+    );
+
+    // Part B: Retrying identical ReportDownloadOrigin over IPC is idempotent (single DB row).
+    let dir = TestTempDir::new("p4-18");
+    let dl_file = dir.0.join("RetrySame.exe");
+    std::fs::write(&dl_file, b"idempotent-download-payload").expect("write retry payload");
+
+    let pipe_retry = unique_test_pipe_name();
+    let store_retry = LedrStore::open_in_memory().expect("open retry store");
+    let engine_retry = DaemonEngine::start(
+        store_retry.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_retry.clone(),
+            dev_mode_bypass_ui_auth: true,
+            ..DaemonConfig::default()
+        },
+    );
+    let ipc_retry = start_ipc_server(Arc::clone(&engine_retry)).expect("bind retry pipe");
+
+    let canonical_path = dl_file.display().to_string();
+    let alt_case_path = format!(r"\\?\{}", canonical_path.replace('\\', "/").to_ascii_lowercase());
+    let (r1, r2) = tokio::task::spawn_blocking(move || {
+        let first = send_pipe_request(
+            &pipe_retry,
+            &IpcRequest::ReportDownloadOrigin {
+                file_path: canonical_path,
+                tab_url: "https://retry.example.invalid/tool.exe".to_string(),
+                frame_url: None,
+                referrer_url: Some("https://ref.example.invalid/".to_string()),
+                downloaded_at_ms: 1_760_018_500_000,
+            },
+        );
+        let retry = send_pipe_request(
+            &pipe_retry,
+            &IpcRequest::ReportDownloadOrigin {
+                file_path: alt_case_path,
+                tab_url: "https://retry.example.invalid/tool.exe".to_string(),
+                frame_url: None,
+                referrer_url: None,
+                downloaded_at_ms: 1_760_018_500_000,
+            },
+        );
+        (first, retry)
+    })
+    .await
+    .expect("join retry client");
+    assert!(matches!(r1, IpcResponse::Ack { .. }));
+    assert!(matches!(r2, IpcResponse::Ack { .. }));
+
+    ipc_retry.shutdown().await;
+    engine_retry
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown retry engine");
+
+    let snap_retry = store_retry
+        .query_flight_recorder(10, None)
+        .expect("query retry store");
+    assert_eq!(
+        snap_retry.download_origins.len(),
+        1,
+        "identical download retry must deduplicate instead of inserting duplicate rows"
     );
 }

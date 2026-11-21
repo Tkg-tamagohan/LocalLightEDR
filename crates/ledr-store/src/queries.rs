@@ -155,6 +155,36 @@ impl LedrStore {
         query_optional_row(&reader, &sql, params![normalized], row_to_download)
     }
 
+    /// Looks up an existing `download_origins` row matching `(file_path COLLATE NOCASE, tab_url, downloaded_at_ms)`
+    /// via `idx_dl_path_nocase` for idempotent retry deduplication.
+    pub fn find_recent_identical_download_origin(
+        &self,
+        file_path: &str,
+        tab_url: &str,
+        downloaded_at_ms: i64,
+    ) -> Result<Option<DownloadOriginRecord>, StoreError> {
+        let normalized = crate::normalize_windows_path(file_path);
+        let clean_tab = tab_url.trim();
+        if normalized.is_empty() || clean_tab.is_empty() {
+            return Ok(None);
+        }
+        let reader = self.lock_reader()?;
+        let sql = format!(
+            "SELECT {DOWNLOAD_COLS} FROM download_origins
+             WHERE file_path COLLATE NOCASE = ?1
+               AND tab_url = ?2
+               AND downloaded_at_ms = ?3
+             ORDER BY id DESC
+             LIMIT 1"
+        );
+        query_optional_row(
+            &reader,
+            &sql,
+            params![normalized, clean_tab, downloaded_at_ms],
+            row_to_download,
+        )
+    }
+
     /// Returns `true` if `download_origins` contains at least one row.
     pub fn has_any_download_origins(&self) -> Result<bool, StoreError> {
         let reader = self.lock_reader()?;

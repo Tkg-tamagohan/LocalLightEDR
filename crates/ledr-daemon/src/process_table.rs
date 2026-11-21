@@ -572,6 +572,29 @@ impl ActiveProcessTable {
         true
     }
 
+    /// Attaches resolved MOTW origin metadata only if `instance_id` is still active (unexited)
+    /// and does not already carry `origin_url`, returning the entry's `exe_path` when applied.
+    pub fn set_motw_metadata_if_active(
+        &mut self,
+        instance_id: &str,
+        origin_url: String,
+        motw_source: String,
+        motw_referrer: Option<String>,
+        motw_frame_url: Option<String>,
+        motw_zone_id: Option<u32>,
+    ) -> Option<String> {
+        let entry = self.entries.get_mut(instance_id)?;
+        if entry.exited_at_ms.is_some() || entry.origin_url.is_some() {
+            return None;
+        }
+        entry.origin_url = Some(origin_url);
+        entry.motw_source = Some(motw_source);
+        entry.motw_referrer = motw_referrer;
+        entry.motw_frame_url = motw_frame_url;
+        entry.motw_zone_id = motw_zone_id;
+        Some(entry.exe_path.clone())
+    }
+
     /// Returns `true` if any currently unexited process matching `target_exe_key` carries MOTW
     /// origin metadata (`L-18`).
     pub fn has_active_motw_for_exe_key(&self, target_exe_key: &str) -> bool {

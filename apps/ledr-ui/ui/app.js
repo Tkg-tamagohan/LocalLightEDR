@@ -1601,7 +1601,14 @@
     el.btnAllowOnce.disabled = !unresolved || state.isResolvingAlert;
     el.btnAllowPermanent.disabled = !unresolved || state.isResolvingAlert;
 
-    if (state.triageFeedback && state.triageFeedback.message) {
+    const showDetailFeedback = Boolean(
+      state.triageFeedback &&
+        state.triageFeedback.message &&
+        (state.triageFeedback.alertId === null ||
+          state.triageFeedback.alertId === undefined ||
+          state.triageFeedback.alertId === alert.alert_id),
+    );
+    if (showDetailFeedback) {
       el.triageActionStatus.textContent = state.triageFeedback.message;
       el.triageActionStatus.className = `triage-feedback ${
         state.triageFeedback.ok ? "is-ok" : "is-error"
@@ -1639,6 +1646,7 @@
         state.triageFeedback = {
           ok: false,
           message: "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
+          alertId: alert.alert_id,
         };
         renderTriageView();
         return;
@@ -1668,6 +1676,7 @@
       state.triageFeedback = {
         ok: true,
         message: previewMessage,
+        alertId: alert.alert_id,
       };
       renderTriageView();
       return;
@@ -1678,6 +1687,7 @@
       state.triageFeedback = {
         ok: false,
         message: "Tauri IPC bridge unavailable outside Tauri runtime.",
+        alertId: alert.alert_id,
       };
       renderTriageView();
       return;
@@ -1694,10 +1704,14 @@
       });
       // The daemon's Ack message already reports whether the requested rule was
       // actually saved; do not re-derive it from the checkbox state (ANALYSIS_0001).
-      state.triageFeedback = { ok: true, message: ackMessage };
+      state.triageFeedback = { ok: true, message: ackMessage, alertId: alert.alert_id };
       await refreshAll();
     } catch (err) {
-      state.triageFeedback = { ok: false, message: formatBackendError(err) };
+      state.triageFeedback = {
+        ok: false,
+        message: formatBackendError(err),
+        alertId: alert.alert_id,
+      };
       await refreshAll();
     } finally {
       state.isResolvingAlert = false;
@@ -2538,10 +2552,18 @@
       state.metrics = metrics;
       if (alertsRes.ok) {
         state.alerts = Array.isArray(alertsRes.data) ? alertsRes.data : [];
+        if (
+          state.triageFeedback &&
+          state.triageFeedback.alertId === null &&
+          !state.triageFeedback.ok
+        ) {
+          state.triageFeedback = null;
+        }
       } else if (!(state.triageFeedback && !state.triageFeedback.ok)) {
         state.triageFeedback = {
           ok: false,
           message: `Failed to refresh alerts: ${alertsRes.error}`,
+          alertId: null,
         };
       }
       if (rulesRes.ok) {

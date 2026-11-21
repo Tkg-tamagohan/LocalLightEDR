@@ -430,6 +430,10 @@ impl DaemonEngine {
             SensorEvent::ProcessStop { pid, .. } => {
                 if let Some(ref inst_id) = proc_ctx.proc_instance_id {
                     self.outbound_classifier.remove_pid(*pid);
+                    self.verified_app_wide_allows
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(inst_id);
                     self.process_dns_history
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -752,6 +756,18 @@ impl DaemonEngine {
             );
             (existing_ppid, res)
         };
+        if res.superseded_exit.is_some() || !res.evicted_instance_ids.is_empty() {
+            let mut cache = self
+                .verified_app_wide_allows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((ref prev_id, _)) = res.superseded_exit {
+                cache.remove(prev_id);
+            }
+            for evicted_id in &res.evicted_instance_ids {
+                cache.remove(evicted_id);
+            }
+        }
 
         Some((
             *pid,
@@ -1132,27 +1148,30 @@ impl DaemonEngine {
         event: &SensorEvent,
         event_ts_ms: i64,
     ) -> ResolvedProcessContext {
-        let mut table = self
-            .process_table
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut evicted_instance_ids: Vec<String> = Vec::new();
+        let ctx = {
+            let mut table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
 
-        match event {
-            SensorEvent::ProcessStart {
-                identity,
-                parent_pid,
-                exe_path,
-                command_line,
-                user_sid,
-            } => {
-                let res = table.on_process_start(
-                    *identity,
-                    *parent_pid,
-                    exe_path.clone(),
-                    command_line.clone(),
-                    user_sid.clone(),
-                    event_ts_ms,
-                );
+            match event {
+                SensorEvent::ProcessStart {
+                    identity,
+                    parent_pid,
+                    exe_path,
+                    command_line,
+                    user_sid,
+                } => {
+                    let res = table.on_process_start(
+                        *identity,
+                        *parent_pid,
+                        exe_path.clone(),
+                        command_line.clone(),
+                        user_sid.clone(),
+                        event_ts_ms,
+                    );
+                    evicted_instance_ids = res.evicted_instance_ids;
                 let (
                     resolved_exe,
                     resolved_cmd,
@@ -1311,6 +1330,20 @@ impl DaemonEngine {
                 }
             }
         }
+        };
+        if ctx.superseded_exit.is_some() || !evicted_instance_ids.is_empty() {
+            let mut cache = self
+                .verified_app_wide_allows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((ref prev_id, _)) = ctx.superseded_exit {
+                cache.remove(prev_id);
+            }
+            for evicted_id in &evicted_instance_ids {
+                cache.remove(evicted_id);
+            }
+        }
+        ctx
     }
 }
 

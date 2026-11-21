@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::label_edit_distance;
-use crate::nrd::matches_domain_or_parent_in_set;
+use crate::nrd::{matches_domain_or_parent_in_set, NrdCache};
 
 const PROTECTED_BRANDS: &[&str] = &[
     "google",
@@ -35,7 +35,21 @@ pub fn assess_domain_risk(
 ) -> DomainRiskAssessment {
     let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     let is_nrd = nrd_domains.is_some_and(|set| matches_domain_or_parent_in_set(&normalized, set));
+    assess_normalized_domain_risk(normalized, is_nrd)
+}
 
+/// Evaluates whether `domain` appears in `nrd_cache` (direct flat-arena binary search),
+/// uses Punycode (`xn--`), or closely resembles a protected brand label via Levenshtein edit distance.
+pub fn assess_domain_risk_with_cache(
+    domain: &str,
+    nrd_cache: Option<&NrdCache>,
+) -> DomainRiskAssessment {
+    let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let is_nrd = nrd_cache.is_some_and(|cache| cache.contains(&normalized));
+    assess_normalized_domain_risk(normalized, is_nrd)
+}
+
+fn assess_normalized_domain_risk(normalized: String, is_nrd: bool) -> DomainRiskAssessment {
     let has_punycode = normalized
         .split('.')
         .any(|label| label.starts_with("xn--"));

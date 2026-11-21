@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -23,6 +24,76 @@ use super::domain_policy::{
 };
 use super::events::ResolvedProcessContext;
 use super::DaemonEngine;
+
+/// Maximum number of verified process instances cached for app-wide `NetworkAllow` fast path.
+pub(super) const VERIFIED_APP_WIDE_ALLOW_CAPACITY: usize = 4_096;
+
+/// Cached verification proof for a concrete process instance (`create_time_100ns != 0`) that
+/// passed full `BinaryInspector` (`SEC_0005` SHA-256 + Authenticode) against an unscoped
+/// app-wide `NetworkAllow` rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerifiedAppWideAllowEntry {
+    pub(super) exe_key: String,
+    pub(super) authorizing_rule: AllowlistRuleRecord,
+}
+
+/// Bounded FIFO cache mapping `process_instance_id` (`create_time_100ns != 0` only) to its
+/// verified app-wide `NetworkAllow` entry so steady browser connections avoid re-hashing the
+/// executable on disk while `WindowsBinaryInspector::inspect` stays strictly uncached (`SEC_0005`).
+#[derive(Debug)]
+pub(super) struct VerifiedAppWideAllowCache {
+    capacity: usize,
+    entries: HashMap<String, VerifiedAppWideAllowEntry>,
+    order: VecDeque<String>,
+}
+
+impl VerifiedAppWideAllowCache {
+    pub(super) fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Self {
+            capacity: cap,
+            entries: HashMap::with_capacity(cap.min(256)),
+            order: VecDeque::with_capacity(cap.min(256)),
+        }
+    }
+
+    pub(super) fn get(&self, instance_id: &str) -> Option<&VerifiedAppWideAllowEntry> {
+        self.entries.get(instance_id)
+    }
+
+    pub(super) fn insert(&mut self, instance_id: String, entry: VerifiedAppWideAllowEntry) {
+        if let Some(existing) = self.entries.get_mut(&instance_id) {
+            *existing = entry;
+            return;
+        }
+        while self.entries.len() >= self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(instance_id.clone(), entry);
+        self.order.push_back(instance_id);
+        if self.order.len() > self.capacity.saturating_mul(2) {
+            let entries = &self.entries;
+            self.order.retain(|id| entries.contains_key(id));
+        }
+    }
+
+    pub(super) fn remove(&mut self, instance_id: &str) -> bool {
+        self.entries.remove(instance_id).is_some()
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// Per-process alert deduplication key for enforced (suspension/WFP-containment) outbound alerts.
 pub(super) const NET_OUTBOUND_ENFORCE_DEDUP_KEY: &str = "NET_OUTBOUND";
@@ -354,6 +425,87 @@ impl DaemonEngine {
             }
         }
 
+        let has_block_rule_for_exe = rules.iter().any(|r| {
+            r.scope == RuleScope::NetworkBlock
+                && (r.exe_path_pattern.trim().is_empty()
+                    || matches_path_pattern(exe_path, &r.exe_path_pattern))
+        });
+        let has_target_scoped_rule_for_exe = rules.iter().any(|r| {
+            matches!(r.scope, RuleScope::NetworkAllow | RuleScope::NetworkBlock)
+                && r.allowed_target
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                && (r.exe_path_pattern.trim().is_empty()
+                    || matches_path_pattern(exe_path, &r.exe_path_pattern))
+        });
+        let verified_inst_id = proc_ctx
+            .proc_identity
+            .filter(|id| id.create_time_100ns != 0)
+            .and_then(|id| {
+                proc_ctx
+                    .proc_instance_id
+                    .as_deref()
+                    .filter(|inst_id| *inst_id == id.instance_id())
+            });
+        let is_audit_mode =
+            self.config.outbound_enforcement_mode == OutboundEnforcementMode::Audit;
+
+        // Verified app-wide `NetworkAllow` fast path: for a concrete process instance
+        // (`create_time_100ns != 0`) already verified once against an unscoped app-wide allow
+        // rule, skip redundant `inspector.inspect` (disk SHA-256 + Authenticode) only when the
+        // live rules snapshot has no `NetworkBlock` or target-scoped rule for `exe_path`, the
+        // authorizing rule's ID and full content are unchanged, and (outside Audit mode) an
+        // app-wide WFP Permit filter is active with no app-wide block.
+        if rules_loaded {
+            if let Some(inst_id) = verified_inst_id {
+                let exe_k = WfpRuleManager::exe_key(exe_path);
+                let cached_rule_valid = {
+                    let mut cache = self
+                        .verified_app_wide_allows
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    match cache.get(inst_id) {
+                        Some(entry)
+                            if entry.exe_key == exe_k
+                                && !has_block_rule_for_exe
+                                && !has_target_scoped_rule_for_exe
+                                && rules.iter().any(|r| {
+                                    r.scope == RuleScope::NetworkAllow
+                                        && r.allowed_target
+                                            .as_deref()
+                                            .is_none_or(|s| s.trim().is_empty())
+                                        && r == &entry.authorizing_rule
+                                }) =>
+                        {
+                            true
+                        }
+                        Some(_) => {
+                            cache.remove(inst_id);
+                            false
+                        }
+                        None => false,
+                    }
+                };
+                if cached_rule_valid {
+                    let wfp_ok = {
+                        let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        fw.active_app_block(exe_path).is_none()
+                            && (is_audit_mode || fw.has_active_filter(exe_path, None, true))
+                    };
+                    if wfp_ok {
+                        if !is_audit_mode {
+                            self.outbound_classifier.mark_steady(pid);
+                        }
+                        return ("ALLOWED", false);
+                    }
+                    self.verified_app_wide_allows
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(inst_id);
+                }
+            }
+        }
+
         let bin_identity = self.inspector.inspect(exe_path);
         let (decision, effective_domain_hint) = select_outbound_decision_for_domains(
             &bin_identity,
@@ -376,11 +528,6 @@ impl DaemonEngine {
                 &synthetic_event
             }
         };
-        let has_block_rule_for_exe = rules.iter().any(|r| {
-            r.scope == RuleScope::NetworkBlock
-                && !r.exe_path_pattern.trim().is_empty()
-                && matches_path_pattern(exe_path, &r.exe_path_pattern)
-        });
         let has_domain_rules_for_exe = rules.iter().any(|r| {
             matches!(r.scope, RuleScope::NetworkAllow | RuleScope::NetworkBlock)
                 && r.allowed_target
@@ -401,6 +548,13 @@ impl DaemonEngine {
                 ("OBSERVED", false)
             }
             OutboundDecision::AllowedByRule { rule_id } => {
+                let authorizing_app_wide_rule = rules.iter().find(|r| {
+                    r.rule_id == rule_id
+                        && r.scope == RuleScope::NetworkAllow
+                        && r.allowed_target
+                            .as_deref()
+                            .is_none_or(|s| s.trim().is_empty())
+                });
                 // If an app-wide pre-emptive block is active (e.g. script interpreter with a
                 // domain/CIDR-scoped NetworkAllow), install an IP-specific Permit so this
                 // destination flows cleanly through WFP and survives rule reconciliations —
@@ -504,11 +658,51 @@ impl DaemonEngine {
                             );
                         }
                     }
+                } else if !is_audit_mode
+                    && self.config.outbound_firewall_enabled
+                    && authorizing_app_wide_rule.is_some()
+                    && !has_block_rule_for_exe
+                    && !has_target_scoped_rule_for_exe
+                    && !fw.has_active_filter(exe_path, None, true)
+                {
+                    // Materialize the concrete app-wide WFP Permit for wildcard app-wide allow
+                    // rules (e.g. default browser rules when Chrome/Edge starts after daemon boot)
+                    // so steady-PID promotion, Security #8 Permit revocation, and the
+                    // `verified_app_wide_allows` fast path all engage consistently.
+                    if let Err(err) = fw.ensure_policy_permit(exe_path, &*self.defense) {
+                        tracing::debug!(
+                            exe_path = %exe_path,
+                            error = %err,
+                            "could not install app-wide WFP permit for allowed executable"
+                        );
+                    }
                 }
                 let has_app_wide_permit = fw.has_active_filter(exe_path, None, true);
+                let has_app_block = fw.active_app_block(exe_path).is_some();
                 drop(fw);
                 if has_app_wide_permit && !has_block_rule_for_exe && !has_domain_rules_for_exe {
                     self.outbound_classifier.mark_steady(pid);
+                }
+                if rules_loaded
+                    && !has_app_block
+                    && !has_block_rule_for_exe
+                    && !has_target_scoped_rule_for_exe
+                    && (is_audit_mode || has_app_wide_permit)
+                {
+                    if let (Some(inst_id), Some(auth_rule)) =
+                        (verified_inst_id, authorizing_app_wide_rule)
+                    {
+                        self.verified_app_wide_allows
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(
+                                inst_id.to_string(),
+                                VerifiedAppWideAllowEntry {
+                                    exe_key: WfpRuleManager::exe_key(exe_path),
+                                    authorizing_rule: auth_rule.clone(),
+                                },
+                            );
+                    }
                 }
                 ("ALLOWED", false)
             }

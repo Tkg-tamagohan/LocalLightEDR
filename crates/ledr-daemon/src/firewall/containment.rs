@@ -190,6 +190,41 @@ impl WfpRuleManager {
         Ok(handle)
     }
 
+    /// Ensures a concrete app-wide WFP Permit filter is active for an executable authorized by an
+    /// unscoped (`allowed_target == None`) persisted `NetworkAllow` rule (including wildcard
+    /// default browser rules materialized after daemon startup). Never replaces an active Block.
+    pub fn ensure_policy_permit(
+        &mut self,
+        exe_path: &str,
+        defense: &dyn ActiveDefenseController,
+    ) -> Result<u64, String> {
+        let trimmed = exe_path.trim();
+        if trimmed.is_empty() || Self::is_wildcard_pattern(trimmed) {
+            return Err("refusing WFP permit for empty or wildcard executable path".to_string());
+        }
+        let key = (Self::exe_key(trimmed), None);
+        if let Some(existing) = self.installed.get(&key) {
+            if existing.allow {
+                return Ok(existing.handle);
+            }
+            return Err(format!(
+                "refusing WFP permit for `{trimmed}` while app-wide block filter is active"
+            ));
+        }
+
+        let handle = defense.add_wfp_app_rule(Path::new(trimmed), None, true)?;
+        self.installed.insert(
+            key,
+            InstalledWfpFilter {
+                handle,
+                exe_path: trimmed.to_string(),
+                allow: true,
+                origin: WfpFilterOrigin::PersistedPolicy,
+            },
+        );
+        Ok(handle)
+    }
+
     /// Lifts a transient or pre-emptive app-wide WFP Block for `AllowOnce` if no persisted
     /// `NetworkBlock` rule blocks `exe_path` and no other unresolved network alert requires it.
     ///

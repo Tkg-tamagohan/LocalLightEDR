@@ -16,8 +16,8 @@ mod winhttp_ctx;
 #[cfg(windows)]
 mod winhttp_ffi;
 
-use std::collections::HashSet;
-
+use cache::{FlatDomainSet, InsertOutcome};
+use parser::parse_nrd_line_into;
 use winhttp::fetch_http_winhttp_cancellable;
 
 pub use cache::{NrdCache, NrdRefreshStats};
@@ -132,7 +132,8 @@ pub fn refresh_nrd_cache_cancellable(
     }
 
     let cap = max_entries.max(1);
-    let mut merged = HashSet::new();
+    let mut merged = FlatDomainSet::new();
+    let mut norm_buf = String::new();
     let mut stats = NrdRefreshStats::default();
 
     for url in feed_urls {
@@ -142,7 +143,16 @@ pub fn refresh_nrd_cache_cancellable(
         match fetch_nrd_feed_url_cancellable(url, max_bytes_per_feed, cancel) {
             Ok((bytes, byte_truncated)) => {
                 stats.feeds_succeeded += 1;
-                let (_, entry_truncated) = parse_nrd_feed_bytes(&bytes, &mut merged, cap);
+                let text = String::from_utf8_lossy(&bytes);
+                let mut entry_truncated = false;
+                for line in text.lines() {
+                    if parse_nrd_line_into(line, &mut norm_buf)
+                        && merged.insert_bounded(&norm_buf, cap) == InsertOutcome::CapReached
+                    {
+                        entry_truncated = true;
+                        break;
+                    }
+                }
                 if byte_truncated || entry_truncated {
                     stats.truncated = true;
                 }
@@ -170,10 +180,6 @@ pub fn refresh_nrd_cache_cancellable(
     }
 
     stats.total_entries = merged.len();
-    let cache = NrdCache {
-        domains: merged,
-        updated_at_ms: Some(now_ms),
-        truncated: stats.truncated,
-    };
+    let cache = merged.into_nrd_cache(Some(now_ms), stats.truncated);
     Ok((cache, stats))
 }

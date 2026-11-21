@@ -221,6 +221,9 @@ impl DaemonEngine {
             process_table,
             firewall: Mutex::new(wfp_manager),
             outbound_classifier,
+            verified_app_wide_allows: Mutex::new(super::VerifiedAppWideAllowCache::new(
+                super::VERIFIED_APP_WIDE_ALLOW_CAPACITY,
+            )),
             process_dns_history,
             wfp_drop_dedup,
             wfp_drop_tx,

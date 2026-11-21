@@ -1007,15 +1007,24 @@ brand-new.org
     assert!(!loaded.contains("xyz"));
     assert!(!loaded.contains("not-fresh-login.xyz"));
 
-    // Verify assess_domain_risk integrates subdomain NRD + homograph detection.
-    let sub_risk = assess_domain_risk("login.phish-bank.top", Some(loaded.domains()));
+    // Verify both `assess_domain_risk_with_cache` (flat arena) and legacy `assess_domain_risk`
+    // (`&HashSet<String>`) integrate subdomain NRD + homograph detection identically.
+    let sub_risk = assess_domain_risk_with_cache("login.phish-bank.top", Some(&loaded));
     assert!(sub_risk.is_nrd);
     assert!(!sub_risk.is_homograph);
+    assert_eq!(
+        sub_risk,
+        assess_domain_risk("login.phish-bank.top", Some(&set))
+    );
 
-    let typo_risk = assess_domain_risk("micros0ft.com", Some(loaded.domains()));
+    let typo_risk = assess_domain_risk_with_cache("micros0ft.com", Some(&loaded));
     assert!(!typo_risk.is_nrd);
     assert!(typo_risk.is_homograph);
     assert_eq!(typo_risk.matched_brand.as_deref(), Some("microsoft"));
+    assert_eq!(
+        typo_risk,
+        assess_domain_risk("micros0ft.com", Some(&set))
+    );
 }
 
 #[test]
@@ -2419,4 +2428,137 @@ fn rules_p4_cancellable_sha256_respects_max_bytes_and_midstream_cancel() {
     let err = compute_reader_sha256_hex_cancellable(&mut reader, 200_000, &mid_cancel)
         .expect_err("midstream cancel must abort");
     assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+}
+
+/// `RULES-NRD-MEM-01`: Flat sorted arena `NrdCache` (`Box<[u8]>` + `Box<[u32]>`) holds
+/// `NRD_MAX_ENTRIES` (`50,000`) domains in compact contiguous memory, supports sorted binary
+/// search (exact + subdomain, case/trailing-dot normalization, bare TLD rejection), roundtrips
+/// sorted and unsorted files cleanly, preserves duplicate/cap truncation semantics, and agrees
+/// with legacy `assess_domain_risk`.
+#[test]
+fn rules_nrd_mem_01_flat_sorted_arena_50k_compact_lookup_roundtrip_and_edges() {
+    let tmp = TestTempDir::new("ledr-rules-nrd-mem-01");
+
+    // 1. Empty and single-entry boundary cases.
+    let empty = NrdCache::new();
+    assert_eq!(empty.len(), 0);
+    assert!(empty.is_empty());
+    assert_eq!(empty.heap_bytes(), 0);
+    assert!(!empty.contains("example.com"));
+    assert!(!assess_domain_risk_with_cache("example.com", Some(&empty)).is_nrd);
+    let empty_path = tmp.path().join("empty-nrd.txt");
+    empty.save_to_file(&empty_path).expect("save empty cache");
+    let loaded_empty = NrdCache::load_from_file(&empty_path, NRD_MAX_ENTRIES).expect("load empty");
+    assert!(loaded_empty.is_empty());
+    assert_eq!(loaded_empty.heap_bytes(), 0);
+
+    let single = NrdCache::from_domains(["ONLY-ONE.XYZ."], Some(1_760_000_000_000), 10);
+    assert_eq!(single.len(), 1);
+    assert!(!single.is_empty());
+    assert!(single.contains("only-one.xyz"));
+    assert!(single.contains("sub.only-one.xyz"));
+    assert!(!single.contains("aaa.xyz"));
+    assert!(!single.contains("zzz.xyz"));
+    assert!(!single.contains("xyz"));
+
+    // 2. Duplicate handling before and at cap (both sorted and unsorted input orders).
+    let dedup_sorted = NrdCache::from_domains(
+        ["a.example", "b.example", "b.example", "c.example"],
+        None,
+        2,
+    );
+    assert_eq!(dedup_sorted.len(), 2);
+    assert!(dedup_sorted.is_truncated());
+    assert!(dedup_sorted.contains("a.example"));
+    assert!(dedup_sorted.contains("b.example"));
+    assert!(!dedup_sorted.contains("c.example"));
+
+    let dedup_unsorted_no_trunc = NrdCache::from_domains(
+        ["zeta.example", "alpha.example", "zeta.example", "alpha.example"],
+        None,
+        2,
+    );
+    assert_eq!(dedup_unsorted_no_trunc.len(), 2);
+    assert!(!dedup_unsorted_no_trunc.is_truncated());
+    let collected: Vec<&str> = dedup_unsorted_no_trunc.iter().collect();
+    assert_eq!(collected, vec!["alpha.example", "zeta.example"]);
+
+    // Unsorted cache file load must also produce a sorted binary-searchable arena.
+    let unsorted_path = tmp.path().join("unsorted-nrd.txt");
+    std::fs::write(
+        &unsorted_path,
+        "# LocalEDR NRD Cache\n# updated_at_ms=1760000000001\nzeta.top\nalpha.top\nmid.top\nalpha.top\n",
+    )
+    .expect("write unsorted file");
+    let loaded_unsorted =
+        NrdCache::load_from_file(&unsorted_path, NRD_MAX_ENTRIES).expect("load unsorted");
+    assert_eq!(
+        loaded_unsorted.iter().collect::<Vec<_>>(),
+        vec!["alpha.top", "mid.top", "zeta.top"]
+    );
+    assert!(loaded_unsorted.contains("sub.mid.top"));
+    assert_eq!(loaded_unsorted.updated_at_ms(), Some(1_760_000_000_001));
+
+    // 3. Full 50,000-entry (`NRD_MAX_ENTRIES`) capacity, compact flat arena footprint,
+    // binary-search correctness across reversed insertion order, and disk roundtrip.
+    let domains_50k: Vec<String> = (0..NRD_MAX_ENTRIES)
+        .rev()
+        .map(|i| format!("nrd-{i:05}.fresh-drop.xyz"))
+        .collect();
+    let cache = NrdCache::from_domains(
+        domains_50k.iter(),
+        Some(1_760_000_123_456),
+        NRD_MAX_ENTRIES,
+    );
+    assert_eq!(cache.len(), NRD_MAX_ENTRIES);
+    assert!(!cache.is_truncated());
+    let expected_data_bytes: usize = domains_50k.iter().map(String::len).sum();
+    let expected_heap_bytes =
+        expected_data_bytes + (NRD_MAX_ENTRIES + 1) * std::mem::size_of::<u32>();
+    assert_eq!(cache.heap_bytes(), expected_heap_bytes);
+    assert!(
+        cache.heap_bytes() < 2 * 1024 * 1024,
+        "50,000-entry flat NRD arena must remain under 2 MiB (got {} bytes)",
+        cache.heap_bytes()
+    );
+
+    // Verify sorted invariant across all 50,000 entries.
+    let mut prev: Option<&str> = None;
+    for entry in cache.iter() {
+        if let Some(p) = prev {
+            assert!(p < entry, "NrdCache arena must be strictly sorted: {p} >= {entry}");
+        }
+        prev = Some(entry);
+    }
+
+    // Spot-check first, middle, last, subdomain, and non-matches.
+    assert!(cache.contains("nrd-00000.fresh-drop.xyz"));
+    assert!(cache.contains("SUB.NRD-25000.FRESH-DROP.XYZ."));
+    assert!(cache.contains("nrd-49999.fresh-drop.xyz"));
+    assert!(!cache.contains("nrd-50000.fresh-drop.xyz"));
+    assert!(!cache.contains("fresh-drop.xyz"));
+    assert!(!cache.contains("xyz"));
+
+    // Disk save + sorted load roundtrip preserves count, timestamp, and exact arena size.
+    let cache_path = tmp.path().join("nrd-50k.txt");
+    cache.save_to_file(&cache_path).expect("save 50k NRD cache");
+    let reloaded =
+        NrdCache::load_from_file(&cache_path, NRD_MAX_ENTRIES).expect("reload 50k NRD cache");
+    assert_eq!(reloaded.len(), NRD_MAX_ENTRIES);
+    assert_eq!(reloaded.updated_at_ms(), Some(1_760_000_123_456));
+    assert_eq!(reloaded.heap_bytes(), expected_heap_bytes);
+    assert!(reloaded.contains("deep.sub.nrd-12345.fresh-drop.xyz"));
+    assert!(!reloaded.contains("google.com"));
+
+    // Direct cache risk assessment matches legacy HashSet path.
+    let mut sample_set = std::collections::HashSet::new();
+    sample_set.insert("nrd-12345.fresh-drop.xyz".to_string());
+    assert_eq!(
+        assess_domain_risk_with_cache("login.nrd-12345.fresh-drop.xyz", Some(&reloaded)),
+        assess_domain_risk("login.nrd-12345.fresh-drop.xyz", Some(&sample_set))
+    );
+    let homo = assess_domain_risk_with_cache("paypa1.com", Some(&reloaded));
+    assert!(!homo.is_nrd);
+    assert!(homo.is_homograph);
+    assert_eq!(homo.matched_brand.as_deref(), Some("paypal"));
 }

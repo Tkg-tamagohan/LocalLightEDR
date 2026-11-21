@@ -48,6 +48,8 @@ pub struct ProcessStartResolution {
     /// running verified process without enriching any missing metadata, so persisting a synthetic
     /// `pid:0` row into SQLite must be skipped.
     pub skip_store_ingest: bool,
+    /// `process_instance_id` values evicted from memory to stay within `capacity`.
+    pub evicted_instance_ids: Vec<String>,
 }
 
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
@@ -140,6 +142,7 @@ impl ActiveProcessTable {
                             exited_at_ms: None,
                             superseded_exit: None,
                             skip_store_ingest: true,
+                            evicted_instance_ids: Vec::new(),
                         };
                     }
 
@@ -206,6 +209,7 @@ impl ActiveProcessTable {
                         exited_at_ms: None,
                         superseded_exit: None,
                         skip_store_ingest: !enriched,
+                        evicted_instance_ids: Vec::new(),
                     };
                 }
             }
@@ -280,6 +284,7 @@ impl ActiveProcessTable {
                 exited_at_ms: None,
                 superseded_exit: None,
                 skip_store_ingest: false,
+                evicted_instance_ids: Vec::new(),
             };
         }
 
@@ -326,7 +331,7 @@ impl ActiveProcessTable {
                     );
                     self.exited_fifo.push_back(instance_id.clone());
                     self.insertion_fifo.push_back(instance_id.clone());
-                    self.evict_if_over_capacity(&instance_id);
+                    let evicted_instance_ids = self.evict_if_over_capacity(&instance_id);
                     return ProcessStartResolution {
                         resolved_identity: identity,
                         instance_id,
@@ -337,6 +342,7 @@ impl ActiveProcessTable {
                         exited_at_ms: Some(inferred_exit_ms),
                         superseded_exit: None,
                         skip_store_ingest: false,
+                        evicted_instance_ids,
                     };
                 }
             }
@@ -382,7 +388,7 @@ impl ActiveProcessTable {
         self.active_count += 1;
         self.insertion_fifo.push_back(instance_id.clone());
 
-        self.evict_if_over_capacity(&instance_id);
+        let evicted_instance_ids = self.evict_if_over_capacity(&instance_id);
 
         ProcessStartResolution {
             resolved_identity: identity,
@@ -394,6 +400,7 @@ impl ActiveProcessTable {
             exited_at_ms: None,
             superseded_exit,
             skip_store_ingest: false,
+            evicted_instance_ids,
         }
     }
 
@@ -755,7 +762,8 @@ impl ActiveProcessTable {
         parent_opt.map_or((None, None, None), Self::parent_metadata_from_entry)
     }
 
-    fn evict_if_over_capacity(&mut self, protect_id: &str) {
+    fn evict_if_over_capacity(&mut self, protect_id: &str) -> Vec<String> {
+        let mut evicted_ids = Vec::new();
         while self.entries.len() > self.capacity {
             let mut evicted = false;
 
@@ -769,6 +777,7 @@ impl ActiveProcessTable {
                     .is_some_and(|e| e.exited_at_ms.is_some())
                 {
                     self.remove_entry(&candidate_id);
+                    evicted_ids.push(candidate_id);
                     evicted = true;
                     break;
                 }
@@ -781,6 +790,7 @@ impl ActiveProcessTable {
                     }
                     if self.entries.contains_key(&candidate_id) {
                         self.remove_entry(&candidate_id);
+                        evicted_ids.push(candidate_id);
                         evicted = true;
                         break;
                     }
@@ -796,6 +806,7 @@ impl ActiveProcessTable {
             let entries = &self.entries;
             self.insertion_fifo.retain(|id| entries.contains_key(id));
         }
+        evicted_ids
     }
 
     fn remove_entry(&mut self, instance_id: &str) {

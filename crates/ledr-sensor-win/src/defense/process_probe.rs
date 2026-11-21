@@ -1,13 +1,14 @@
 //! Low-level Win32 process handle inspection, Toolhelp32 snapshot, and liveness probe (`BUG_0002`, `BUG_0004`).
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, FILETIME, HANDLE};
+use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, FILETIME, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
     GetProcessId, GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
-    QueryFullProcessImageNameW,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
+    WaitForSingleObject,
 };
 
 use crate::OwnedHandle;
@@ -129,6 +130,9 @@ pub(super) fn query_full_image_name(handle: HANDLE) -> Option<String> {
     ))
 }
 
+/// Bounded wait (in milliseconds) for Windows asynchronous kernel process rundown.
+pub(super) const PROCESS_EXIT_WAIT_MS: u32 = 25;
+
 pub(super) fn query_process_creation_time(handle: HANDLE) -> Option<u64> {
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
@@ -139,6 +143,39 @@ pub(super) fn query_process_creation_time(handle: HANDLE) -> Option<u64> {
     Some(((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64))
 }
 
+pub(super) fn query_process_exit_time(handle: HANDLE) -> Option<u64> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: `handle` is an open process handle and all four `FILETIME` structs are valid.
+    unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }.ok()?;
+    Some(((exit.dwHighDateTime as u64) << 32) | (exit.dwLowDateTime as u64))
+}
+
+/// Returns `true` only when `handle` positively confirms the process has exited in the kernel:
+/// either `GetProcessTimes` reports a non-zero `lpExitTime`, or waiting up to `wait_ms` with
+/// `PROCESS_SYNCHRONIZE` observes `WAIT_OBJECT_0`.
+pub(super) fn is_process_handle_exited(
+    handle: HANDLE,
+    has_synchronize: bool,
+    wait_ms: u32,
+) -> bool {
+    if query_process_exit_time(handle).is_some_and(|exit| exit != 0) {
+        return true;
+    }
+    if has_synchronize {
+        // SAFETY: `handle` is an open process handle granted `PROCESS_SYNCHRONIZE`.
+        if unsafe { WaitForSingleObject(handle, wait_ms) } == WAIT_OBJECT_0 {
+            return true;
+        }
+        if query_process_exit_time(handle).is_some_and(|exit| exit != 0) {
+            return true;
+        }
+    }
+    false
+}
+
 pub(super) fn find_process_exe_toolhelp32(pid: u32) -> Option<String> {
     let entries = snapshot_process_entries().ok()?;
     entries
@@ -147,10 +184,12 @@ pub(super) fn find_process_exe_toolhelp32(pid: u32) -> Option<String> {
         .map(|e| e.exe_name)
 }
 
-/// Tri-state liveness of a PID from the Toolhelp32 snapshot. [`ProcessLiveness::Gone`]
-/// means the snapshot enumerated successfully and the PID is absent; `Unknown` means
-/// snapshot creation or enumeration failed, so absence is unconfirmed. Containment
-/// decisions must not treat `Unknown` as "gone" (`BUG_0002`).
+/// Tri-state liveness of a PID from the Toolhelp32 snapshot and kernel exit probe.
+/// [`ProcessLiveness::Gone`] means the snapshot positively confirmed absence or the
+/// kernel confirmed process exit (`lpExitTime != 0` or signaled `SYNCHRONIZE` handle
+/// for a zombie/rundown process); `Unknown` means snapshot creation or enumeration
+/// failed, so absence is unconfirmed. Containment decisions must not treat `Unknown`
+/// as "gone" (`BUG_0002`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessLiveness {
     Running,
@@ -158,15 +197,64 @@ pub enum ProcessLiveness {
     Unknown,
 }
 
-/// Probes whether `pid` is present in the current Toolhelp32 snapshot, distinguishing
-/// confirmed absence from snapshot/enumeration failures (`BUG_0004`, `BUG_0002` — lets
-/// callers tell "target already exited" from a genuine suspend/resume/terminate failure
-/// on a still-running process, and both from an unverifiable state).
+/// Probes whether `pid` is live, distinguishing confirmed absence/exit (including terminated
+/// zombie processes whose handles are still held open during Windows asynchronous rundown)
+/// from genuinely running processes and snapshot/enumeration failures (`BUG_0004`, `BUG_0002`).
 pub fn process_liveness(pid: u32) -> ProcessLiveness {
     match snapshot_process_entries() {
-        Ok(entries) if entries.iter().any(|e| e.pid == pid) => ProcessLiveness::Running,
+        Ok(entries) if entries.iter().any(|e| e.pid == pid) => {
+            probe_snapshot_present_pid_liveness(pid)
+        }
         Ok(_) => ProcessLiveness::Gone,
         Err(_) => ProcessLiveness::Unknown,
+    }
+}
+
+pub(super) fn probe_snapshot_present_pid_liveness(pid: u32) -> ProcessLiveness {
+    if pid == 0 {
+        return ProcessLiveness::Running;
+    }
+
+    match open_process_checked_detailed(
+        pid,
+        PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+    ) {
+        Ok(handle) => {
+            if is_process_handle_exited(handle.as_raw(), true, PROCESS_EXIT_WAIT_MS) {
+                ProcessLiveness::Gone
+            } else {
+                ProcessLiveness::Running
+            }
+        }
+        Err(OpenProcessError::PidZero | OpenProcessError::PidMismatch { .. }) => {
+            ProcessLiveness::Running
+        }
+        Err(OpenProcessError::Failed(_)) => {
+            match open_process_checked_detailed(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+                Ok(handle) => {
+                    if is_process_handle_exited(handle.as_raw(), false, 0) {
+                        ProcessLiveness::Gone
+                    } else {
+                        ProcessLiveness::Running
+                    }
+                }
+                Err(OpenProcessError::PidZero | OpenProcessError::PidMismatch { .. }) => {
+                    ProcessLiveness::Running
+                }
+                Err(OpenProcessError::Failed(_)) => {
+                    // Re-check snapshot once in case the PID finished exiting between the first
+                    // snapshot and `OpenProcess`, while staying fail-closed (`Running`) on live
+                    // protected processes that deny `OpenProcess` (`ERROR_ACCESS_DENIED`).
+                    match snapshot_process_entries() {
+                        Ok(entries) if entries.iter().any(|e| e.pid == pid) => {
+                            ProcessLiveness::Running
+                        }
+                        Ok(_) => ProcessLiveness::Gone,
+                        Err(_) => ProcessLiveness::Unknown,
+                    }
+                }
+            }
+        }
     }
 }
 

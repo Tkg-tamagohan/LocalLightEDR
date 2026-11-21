@@ -56,6 +56,7 @@ use dns_history::{DnsHistoryEntry, DomainTimestamp, MAX_DOMAINS_PER_PROCESS_IP};
 use domain_policy::select_outbound_decision_for_domains;
 use motw::{BrowserEventDedupCache, MotwIoWorkerPool, MotwStage2Cache};
 use nrd::NrdThreadHandle;
+use outbound::{VerifiedAppWideAllowCache, VERIFIED_APP_WIDE_ALLOW_CAPACITY};
 #[cfg(test)]
 use wfp_drops::{OverflowPushOutcome, PendingWfpDrop};
 use wfp_drops::{AppWfpAlertDedup, QueuedWfpDrop, WfpDropDedupCache, WfpDropOverflowQueue};
@@ -85,6 +86,7 @@ pub struct DaemonEngine {
     process_table: Mutex<ActiveProcessTable>,
     firewall: Mutex<WfpRuleManager>,
     outbound_classifier: Arc<OutboundLaneClassifier>,
+    verified_app_wide_allows: Mutex<VerifiedAppWideAllowCache>,
     process_dns_history: Mutex<ProcessDnsHistory>,
     wfp_drop_dedup: Mutex<WfpDropDedupCache>,
     wfp_drop_tx: tokio::sync::mpsc::Sender<QueuedWfpDrop>,
@@ -130,6 +132,18 @@ impl DaemonEngine {
 
     fn invalidate_non_protected_steady_pids(&self) {
         self.outbound_classifier.clear_non_protected();
+        self.verified_app_wide_allows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn verified_app_wide_allows_len(&self) -> usize {
+        self.verified_app_wide_allows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Returns a reference to the backing [`LedrStore`].

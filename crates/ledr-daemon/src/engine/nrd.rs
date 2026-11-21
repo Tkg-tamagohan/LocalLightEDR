@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 
 use ledr_rules::{
-    assess_domain_risk, refresh_nrd_cache_cancellable, DomainRiskAssessment, NrdCache,
+    assess_domain_risk_with_cache, refresh_nrd_cache_cancellable, DomainRiskAssessment, NrdCache,
     NrdCancelToken, NrdRefreshStats, NRD_MAX_ENTRIES, NRD_MAX_RESPONSE_BYTES,
 };
 
@@ -26,10 +26,10 @@ impl DaemonEngine {
     }
 
     /// Evaluates domain risk (NRD cache membership + Punycode/brand homograph detection, `L-14`)
-    /// using the live in-memory [`NrdCache`] without cloning the domain set.
+    /// using the live in-memory [`NrdCache`] directly via flat-arena binary search.
     pub fn assess_domain(&self, domain: &str) -> DomainRiskAssessment {
         let guard = self.nrd_cache.read().unwrap_or_else(|e| e.into_inner());
-        assess_domain_risk(domain, Some(guard.domains()))
+        assess_domain_risk_with_cache(domain, Some(&guard))
     }
 
     /// Returns the number of entries currently loaded in the live NRD cache.

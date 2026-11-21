@@ -20,7 +20,7 @@ pub use allowlist::{
     compute_reader_sha256_hex_cancellable, inspect_authenticode, is_allowed_by_rules,
     matches_path_pattern, signer_subject_matches, BinaryIdentity,
 };
-pub use domain::{assess_domain_risk, DomainRiskAssessment};
+pub use domain::{assess_domain_risk, assess_domain_risk_with_cache, DomainRiskAssessment};
 pub use nrd::{
     fetch_nrd_feed_url, fetch_nrd_feed_url_cancellable, normalize_nrd_domain, parse_file_url,
     parse_http_url, parse_nrd_feed_bytes, parse_nrd_line, refresh_nrd_cache,

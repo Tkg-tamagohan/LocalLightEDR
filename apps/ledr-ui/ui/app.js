@@ -41,7 +41,11 @@
     isResolvingAlert: false,
     selectedAlertIsNetwork: false,
     triageFeedback: null,
+    triageFeedbackByAlert: new Map(),
+    triageValidationFeedback: null,
   };
+
+  const MAX_TRIAGE_FEEDBACK_ENTRIES = 64;
 
   const el = {
     navTabs: Array.from(document.querySelectorAll(".nav-tab")),
@@ -1193,6 +1197,9 @@
       allAlerts.find((a) => a.alert_id === state.selectedAlertId) || null;
     if (!selected) {
       state.selectedAlertIsNetwork = false;
+      // Keep lastSyncedAlertId so temporary empty filter results preserve in-progress form edits
+      // when returning to the same alert; only clear transient validation feedback.
+      state.triageValidationFeedback = null;
       el.triageDetail.classList.add("hidden");
       el.triageEmpty.classList.remove("hidden");
 
@@ -1565,6 +1572,87 @@
     el.targetScopeNote.classList.remove("hidden");
   }
 
+  function setAlertTriageFeedback(alertId, ok, message) {
+    const feedback = { ok: Boolean(ok), message, alertId };
+    state.triageFeedback = feedback;
+    if (
+      state.triageValidationFeedback &&
+      (alertId === null ||
+        alertId === undefined ||
+        state.triageValidationFeedback.alertId === alertId)
+    ) {
+      state.triageValidationFeedback = null;
+    }
+    if (alertId !== null && alertId !== undefined) {
+      state.triageFeedbackByAlert.delete(alertId);
+      state.triageFeedbackByAlert.set(alertId, feedback);
+      while (state.triageFeedbackByAlert.size > MAX_TRIAGE_FEEDBACK_ENTRIES) {
+        const oldestKey = state.triageFeedbackByAlert.keys().next().value;
+        state.triageFeedbackByAlert.delete(oldestKey);
+      }
+    }
+  }
+
+  function setTransientTriageFeedback(alertId, message) {
+    state.triageValidationFeedback = { ok: false, message, alertId };
+  }
+
+  function clearAlertTriageFeedback(alertId) {
+    if (alertId !== null && alertId !== undefined) {
+      state.triageFeedbackByAlert.delete(alertId);
+    }
+    if (state.triageFeedback && state.triageFeedback.alertId === alertId) {
+      state.triageFeedback = null;
+    }
+    if (
+      state.triageValidationFeedback &&
+      state.triageValidationFeedback.alertId === alertId
+    ) {
+      state.triageValidationFeedback = null;
+    }
+  }
+
+  function resolvePersistedDetailTriageFeedback(alertId) {
+    const perAlert =
+      state.triageFeedbackByAlert.get(alertId) ||
+      (state.triageFeedback && state.triageFeedback.alertId === alertId
+        ? state.triageFeedback
+        : null);
+    const globalFeedback =
+      state.triageFeedback &&
+      (state.triageFeedback.alertId === null || state.triageFeedback.alertId === undefined)
+        ? state.triageFeedback
+        : null;
+    if (perAlert && !perAlert.ok) {
+      return perAlert;
+    }
+    return globalFeedback || perAlert;
+  }
+
+  function resolveDetailTriageFeedback(alertId) {
+    if (
+      state.triageValidationFeedback &&
+      state.triageValidationFeedback.alertId === alertId
+    ) {
+      return state.triageValidationFeedback;
+    }
+    return resolvePersistedDetailTriageFeedback(alertId);
+  }
+
+  function renderDetailTriageFeedback(alertId) {
+    const detailFeedback = resolveDetailTriageFeedback(alertId);
+    if (detailFeedback && detailFeedback.message) {
+      el.triageActionStatus.textContent = detailFeedback.message;
+      el.triageActionStatus.className = `triage-feedback ${
+        detailFeedback.ok ? "is-ok" : "is-error"
+      }`;
+      el.triageActionStatus.setAttribute("role", detailFeedback.ok ? "status" : "alert");
+      el.triageActionStatus.classList.remove("hidden");
+    } else {
+      el.triageActionStatus.classList.add("hidden");
+    }
+  }
+
   function syncResolutionControls(alert, details) {
     const unresolved = isUnresolvedAlert(alert);
     const hasSigner = Boolean(details.signerSubject);
@@ -1572,9 +1660,25 @@
 
     if (state.lastSyncedAlertId !== alert.alert_id) {
       state.lastSyncedAlertId = alert.alert_id;
+      state.triageValidationFeedback = null;
+      if (
+        state.triageFeedback &&
+        state.triageFeedback.alertId !== null &&
+        state.triageFeedback.alertId !== undefined &&
+        state.triageFeedback.alertId !== alert.alert_id
+      ) {
+        state.triageFeedback = null;
+      }
       el.optAddBlockRule.checked = true;
       el.optUseSigner.checked = hasSigner;
       el.optAllowDest.value = "";
+    }
+    if (
+      !unresolved &&
+      state.triageValidationFeedback &&
+      state.triageValidationFeedback.alertId === alert.alert_id
+    ) {
+      state.triageValidationFeedback = null;
     }
 
     el.optUseSigner.disabled = !unresolved || !hasSigner || state.isResolvingAlert;
@@ -1601,16 +1705,7 @@
     el.btnAllowOnce.disabled = !unresolved || state.isResolvingAlert;
     el.btnAllowPermanent.disabled = !unresolved || state.isResolvingAlert;
 
-    if (state.triageFeedback && state.triageFeedback.message) {
-      el.triageActionStatus.textContent = state.triageFeedback.message;
-      el.triageActionStatus.className = `triage-feedback ${
-        state.triageFeedback.ok ? "is-ok" : "is-error"
-      }`;
-      el.triageActionStatus.setAttribute("role", state.triageFeedback.ok ? "status" : "alert");
-      el.triageActionStatus.classList.remove("hidden");
-    } else {
-      el.triageActionStatus.classList.add("hidden");
-    }
+    renderDetailTriageFeedback(alert.alert_id);
   }
 
   async function handleResolveAlert(kind) {
@@ -1636,10 +1731,10 @@
       const details = extractAlertDetails(alert, buildHierarchy(state.snapshot).byId);
       const allowDestRaw = el.optAllowDest.value.trim();
       if (details.isNetworkAlert && allowDestRaw.includes("/") && !isLiteralIpOrCidr(allowDestRaw)) {
-        state.triageFeedback = {
-          ok: false,
-          message: "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
-        };
+        setTransientTriageFeedback(
+          alert.alert_id,
+          "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
+        );
         renderTriageView();
         return;
       }
@@ -1665,26 +1760,23 @@
                 : "no NetworkBlock rule saved"
             }`
           : `Preview: ${alert.alert_id} → ${previewStatus}`;
-      state.triageFeedback = {
-        ok: true,
-        message: previewMessage,
-      };
+      setAlertTriageFeedback(alert.alert_id, true, previewMessage);
       renderTriageView();
       return;
     }
 
     const invoke = getInvoke();
     if (!invoke) {
-      state.triageFeedback = {
-        ok: false,
-        message: "Tauri IPC bridge unavailable outside Tauri runtime.",
-      };
+      setTransientTriageFeedback(
+        alert.alert_id,
+        "Tauri IPC bridge unavailable outside Tauri runtime.",
+      );
       renderTriageView();
       return;
     }
 
     state.isResolvingAlert = true;
-    state.triageFeedback = null;
+    clearAlertTriageFeedback(alert.alert_id);
     renderTriageView();
 
     try {
@@ -1694,10 +1786,10 @@
       });
       // The daemon's Ack message already reports whether the requested rule was
       // actually saved; do not re-derive it from the checkbox state (ANALYSIS_0001).
-      state.triageFeedback = { ok: true, message: ackMessage };
+      setAlertTriageFeedback(alert.alert_id, true, ackMessage);
       await refreshAll();
     } catch (err) {
-      state.triageFeedback = { ok: false, message: formatBackendError(err) };
+      setAlertTriageFeedback(alert.alert_id, false, formatBackendError(err));
       await refreshAll();
     } finally {
       state.isResolvingAlert = false;
@@ -2531,18 +2623,52 @@
           .catch((err) => ({ ok: false, error: String(err) })),
       ]);
 
+      const wasSamplePreview = state.isSamplePreview;
       state.localDefenseStatus = localStatus;
       state.isDaemonOnline = true;
       state.isSamplePreview = false;
+      if (wasSamplePreview) {
+        state.selectedAlertId = null;
+        state.lastSyncedAlertId = null;
+        state.triageFeedback = null;
+        state.triageFeedbackByAlert.clear();
+        state.triageValidationFeedback = null;
+        state.alerts = [];
+        state.rules = [];
+        state.policyFeedback = null;
+      }
       state.snapshot = snapshot;
       state.metrics = metrics;
       if (alertsRes.ok) {
         state.alerts = Array.isArray(alertsRes.data) ? alertsRes.data : [];
-      } else if (!(state.triageFeedback && !state.triageFeedback.ok)) {
-        state.triageFeedback = {
-          ok: false,
-          message: `Failed to refresh alerts: ${alertsRes.error}`,
-        };
+        const liveAlertIds = new Set(state.alerts.map((a) => a.alert_id));
+        for (const cachedId of state.triageFeedbackByAlert.keys()) {
+          if (!liveAlertIds.has(cachedId)) {
+            state.triageFeedbackByAlert.delete(cachedId);
+          }
+        }
+        if (
+          state.triageValidationFeedback &&
+          !liveAlertIds.has(state.triageValidationFeedback.alertId)
+        ) {
+          state.triageValidationFeedback = null;
+        }
+        if (
+          state.triageFeedback &&
+          ((state.triageFeedback.alertId === null && !state.triageFeedback.ok) ||
+            (state.triageFeedback.alertId !== null &&
+              state.triageFeedback.alertId !== undefined &&
+              !liveAlertIds.has(state.triageFeedback.alertId)))
+        ) {
+          state.triageFeedback = null;
+        }
+      } else {
+        const persistedVisibleFeedback = state.selectedAlertId
+          ? resolvePersistedDetailTriageFeedback(state.selectedAlertId)
+          : state.triageFeedback;
+        if (!(persistedVisibleFeedback && !persistedVisibleFeedback.ok)) {
+          setAlertTriageFeedback(null, false, `Failed to refresh alerts: ${alertsRes.error}`);
+        }
       }
       if (rulesRes.ok) {
         state.rules = Array.isArray(rulesRes.data) ? rulesRes.data : [];
@@ -2612,7 +2738,10 @@
     state.isSamplePreview = true;
     state.isDaemonOnline = false;
     state.selectedProcessId = null;
+    state.lastSyncedAlertId = null;
     state.triageFeedback = null;
+    state.triageFeedbackByAlert.clear();
+    state.triageValidationFeedback = null;
     state.policyFeedback = null;
     state.domainRiskResult = null;
     state.domainRiskError = null;
@@ -2699,7 +2828,10 @@
     const nextAlertId = btn.dataset.alertId;
     state.launchFocusAlertId = null;
     if (state.selectedAlertId !== nextAlertId) {
-      state.triageFeedback = null;
+      state.triageValidationFeedback = null;
+      if (state.triageFeedback && state.triageFeedback.alertId !== null) {
+        state.triageFeedback = null;
+      }
     }
     state.selectedAlertId = nextAlertId;
     renderTriageView();
@@ -2707,6 +2839,12 @@
 
   el.optAllowDest.addEventListener("input", () => {
     syncTriageTargetScopeNote(state.selectedAlertIsNetwork);
+    if (state.triageValidationFeedback) {
+      state.triageValidationFeedback = null;
+      if (state.selectedAlertId) {
+        renderDetailTriageFeedback(state.selectedAlertId);
+      }
+    }
   });
 
   el.inspectInView2Btn.addEventListener("click", () => {

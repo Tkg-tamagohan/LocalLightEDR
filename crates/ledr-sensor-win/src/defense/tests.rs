@@ -800,3 +800,216 @@ fn sens_p3_14_open_process_and_guard_reject_low_bit_pid_aliases() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// `SENS-P2-RUNDOWN-01`: Terminated zombie processes (whose handles are still held open during
+/// Windows asynchronous kernel rundown) must be classified as [`ProcessLiveness::Gone`] via
+/// `SYNCHRONIZE` (`WaitForSingleObject == WAIT_OBJECT_0`) or `GetExitCodeProcess != STILL_ACTIVE`,
+/// and `terminate_process` must succeed cleanly for an already-exited validated zombie while still
+/// keeping live/suspended processes `Running` and enforcing `CreationTime` mismatch checks.
+#[test]
+fn sens_p2_rundown_01_zombie_process_liveness_and_terminate_accept_exited_rundown() {
+    use super::process_probe::{
+        is_process_handle_exited, probe_snapshot_present_pid_liveness, query_process_exit_code,
+    };
+    use windows::Win32::Foundation::{STILL_ACTIVE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{PROCESS_SYNCHRONIZE, WaitForSingleObject};
+
+    let controller = WindowsDefenseController::new();
+
+    // 1. Live & suspended process must report `ProcessLiveness::Running`.
+    let mut child = Command::new("cmd.exe")
+        .args(["/c", "findstr .*"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn harmless cmd.exe child for rundown test");
+    let _stdin_keepalive = child.stdin.take();
+    let child_pid = child.id();
+
+    let zombie_keepalive = open_process_checked(
+        child_pid,
+        PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+    )
+    .expect("open child handle to keep zombie object alive");
+    let child_ct = query_process_creation_time(zombie_keepalive.as_raw())
+        .expect("query child CreationTime");
+    let valid_ident = ProcessIdentity::new(child_pid, child_ct);
+
+    assert_eq!(
+        process_liveness(child_pid),
+        ProcessLiveness::Running,
+        "live child must report Running"
+    );
+    assert_eq!(
+        probe_snapshot_present_pid_liveness(child_pid),
+        ProcessLiveness::Running,
+        "snapshot-present probe on live child must report Running"
+    );
+    assert!(
+        !is_process_handle_exited(zombie_keepalive.as_raw(), true, 0),
+        "live child handle must not be marked exited via SYNCHRONIZE"
+    );
+    assert!(
+        !is_process_handle_exited(zombie_keepalive.as_raw(), false, 0),
+        "live child handle must not be marked exited via GetExitCodeProcess fallback"
+    );
+    assert_eq!(
+        query_process_exit_code(zombie_keepalive.as_raw()),
+        Some(STILL_ACTIVE.0 as u32),
+        "live child must report STILL_ACTIVE"
+    );
+
+    controller
+        .suspend_process(&valid_ident, false)
+        .expect("suspend child");
+    assert_eq!(
+        process_liveness(child_pid),
+        ProcessLiveness::Running,
+        "suspended (non-exited) child must still report Running, never Gone"
+    );
+    assert_eq!(
+        probe_snapshot_present_pid_liveness(child_pid),
+        ProcessLiveness::Running,
+        "snapshot-present probe on suspended child must still report Running"
+    );
+    assert!(
+        !is_process_handle_exited(zombie_keepalive.as_raw(), true, 0),
+        "suspended (non-exited) child handle must not be marked exited via SYNCHRONIZE"
+    );
+    assert!(
+        !is_process_handle_exited(zombie_keepalive.as_raw(), false, 0),
+        "suspended (non-exited) child handle must not be marked exited via GetExitCodeProcess fallback"
+    );
+
+    // 2. Terminate while holding `zombie_keepalive` + `Child` open so the kernel process object
+    // remains addressable as a zombie even after exit completes.
+    // SAFETY: `zombie_keepalive` is our spawned test child opened with `PROCESS_TERMINATE`.
+    unsafe { TerminateProcess(zombie_keepalive.as_raw(), 1) }.expect("terminate test child");
+    // SAFETY: `zombie_keepalive` has `PROCESS_SYNCHRONIZE`.
+    let wait_res = unsafe { WaitForSingleObject(zombie_keepalive.as_raw(), 2_000) };
+    assert_eq!(
+        wait_res, WAIT_OBJECT_0,
+        "terminated child handle must become signaled"
+    );
+    assert_eq!(
+        query_process_exit_code(zombie_keepalive.as_raw()),
+        Some(1),
+        "terminated zombie child must report its non-STILL_ACTIVE exit code"
+    );
+    assert!(
+        is_process_handle_exited(zombie_keepalive.as_raw(), true, 0),
+        "terminated zombie handle must be confirmed exited via SYNCHRONIZE"
+    );
+    assert!(
+        is_process_handle_exited(zombie_keepalive.as_raw(), false, 0),
+        "terminated zombie handle must be confirmed exited via GetExitCodeProcess fallback"
+    );
+
+    // Even when a Toolhelp32 snapshot still includes the zombie PID during rundown,
+    // `probe_snapshot_present_pid_liveness` (and `process_liveness`) must classify it as `Gone`.
+    assert_eq!(
+        probe_snapshot_present_pid_liveness(child_pid),
+        ProcessLiveness::Gone,
+        "snapshot-present probe must classify exited zombie with open handle as Gone"
+    );
+    assert_eq!(
+        process_liveness(child_pid),
+        ProcessLiveness::Gone,
+        "terminated zombie process with open handles must report Gone"
+    );
+
+    // `CreationTime` mismatch against a zombie PID must still fail closed.
+    let wrong_ct_ident = ProcessIdentity::new(child_pid, child_ct.saturating_add(1));
+    let mismatch_err = controller
+        .terminate_process(&wrong_ct_ident, false)
+        .expect_err("CreationTime mismatch on zombie PID must still be rejected");
+    assert!(
+        mismatch_err.contains("CreationTime mismatch")
+            || mismatch_err.contains("unable to resolve image name"),
+        "unexpected zombie mismatch error: {mismatch_err}"
+    );
+
+    // Re-terminating an already-exited zombie must either succeed directly (when Toolhelp32
+    // still retains its image name during rundown) or fail closed with `process_liveness == Gone`
+    // once Windows tears down the zombie's image metadata — never surfacing an unresolvable
+    // `Running` error (`RESOLVE_ERROR`).
+    if let Err(err) = controller.terminate_process(&valid_ident, false) {
+        assert!(
+            err.contains("unable to resolve image name") || err.contains("OpenProcess"),
+            "unexpected error when re-terminating exited zombie: {err}"
+        );
+        assert_eq!(
+            process_liveness(child_pid),
+            ProcessLiveness::Gone,
+            "exited zombie that failed image lookup must still report ProcessLiveness::Gone"
+        );
+    }
+
+    drop(zombie_keepalive);
+    let _ = child.wait();
+    assert_eq!(
+        process_liveness(child_pid),
+        ProcessLiveness::Gone,
+        "reaped child PID must report Gone"
+    );
+
+    // 3. Tree suspend + terminate (`cmd.exe` -> `findstr.exe`) must leave parent and recorded
+    // descendants immediately observable as `ProcessLiveness::Gone` after terminate returns.
+    let mut tree_root = Command::new("cmd.exe")
+        .args(["/c", "echo ready & findstr .*"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn two-level process tree");
+    let _tree_stdin = tree_root.stdin.take();
+    let root_pid = tree_root.id();
+    let root_handle = open_process_checked(root_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .expect("open tree root");
+    let root_ct =
+        query_process_creation_time(root_handle.as_raw()).expect("query tree root CreationTime");
+    drop(root_handle);
+    let root_ident = ProcessIdentity::new(root_pid, root_ct);
+
+    // Wait briefly (bounded) for `cmd.exe` to spawn its `findstr.exe` child before suspending.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let has_child = snapshot_process_entries()
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e.ppid == root_pid);
+        if has_child {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+
+    controller
+        .suspend_process(&root_ident, true)
+        .expect("suspend tree");
+    let recorded_kids = controller.tracked_suspended_children(&root_ident);
+    controller
+        .terminate_process(&root_ident, true)
+        .expect("terminate suspended tree");
+
+    assert!(
+        !recorded_kids.is_empty(),
+        "cmd.exe tree root must have at least one recorded suspended descendant before termination"
+    );
+    assert_eq!(
+        process_liveness(root_pid),
+        ProcessLiveness::Gone,
+        "terminated tree root must immediately report Gone even before Child::wait()"
+    );
+    for kid in &recorded_kids {
+        assert_eq!(
+            process_liveness(kid.pid),
+            ProcessLiveness::Gone,
+            "terminated tree descendant PID {} must immediately report Gone",
+            kid.pid
+        );
+    }
+
+    let _ = tree_root.wait();
+}

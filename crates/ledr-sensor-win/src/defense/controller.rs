@@ -5,10 +5,11 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use ledr_proto::{ActiveDefenseController, ProcessIdentity};
+use ledr_proto::{ActiveDefenseController, ProcessIdentity, is_never_suspend_process};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, TerminateProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, TerminateProcess,
 };
 
 use crate::wfp::{WfpDropSinkFn, WfpDynamicEngine, validate_wfp_rule_request};
@@ -17,7 +18,10 @@ use super::guard::{
     TargetValidationError, ValidatedTarget, validate_and_inspect_target,
     validate_and_inspect_target_detailed, validate_open_handle,
 };
-use super::process_probe::open_process_checked;
+use super::process_probe::{
+    PROCESS_EXIT_WAIT_MS, is_process_handle_exited, open_process_checked,
+    open_process_checked_detailed, query_full_image_name, query_process_creation_time,
+};
 use super::tree::collect_validated_descendants;
 
 #[link(name = "ntdll.dll", kind = "raw-dylib", modifiers = "+verbatim")]
@@ -218,19 +222,72 @@ impl WindowsDefenseController {
 
     fn terminate_single_validated(&self, target: &ProcessIdentity) -> Result<(), String> {
         let pre = validate_and_inspect_target(target)?;
-        let handle = open_process_checked(
+        let (handle, has_synchronize) = match open_process_checked(
             target.pid,
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-        )?;
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+        ) {
+            Ok(h) => (h, true),
+            Err(_) => match open_process_checked(
+                target.pid,
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            ) {
+                Ok(h) => (h, false),
+                Err(open_err) => {
+                    if confirm_validated_identity_exited(&pre.identity) {
+                        self.suspended_processes
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&pre.identity);
+                        tracing::info!(
+                            pid = pre.identity.pid,
+                            exe = %pre.exe_path,
+                            "target process already exited before TerminateProcess handle open"
+                        );
+                        return Ok(());
+                    }
+                    return Err(open_err);
+                }
+            },
+        };
         let verified = validate_open_handle(handle.as_raw(), &pre.identity)?;
 
+        if is_process_handle_exited(handle.as_raw(), has_synchronize, 0) {
+            self.suspended_processes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&verified.identity);
+            tracing::info!(
+                pid = verified.identity.pid,
+                exe = %verified.exe_path,
+                "target process already exited (kernel rundown zombie); skipping TerminateProcess"
+            );
+            return Ok(());
+        }
+
         // SAFETY: `handle` has `PROCESS_TERMINATE` and passed Never-Suspend and CreationTime checks.
-        unsafe { TerminateProcess(handle.as_raw(), 1) }.map_err(|err| {
-            format!(
+        if let Err(err) = unsafe { TerminateProcess(handle.as_raw(), 1) } {
+            if is_process_handle_exited(handle.as_raw(), has_synchronize, PROCESS_EXIT_WAIT_MS) {
+                self.suspended_processes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&verified.identity);
+                tracing::info!(
+                    pid = verified.identity.pid,
+                    exe = %verified.exe_path,
+                    error = %err,
+                    "TerminateProcess returned error after process already exited during rundown"
+                );
+                return Ok(());
+            }
+            return Err(format!(
                 "TerminateProcess failed for PID {} (`{}`): {err}",
                 verified.identity.pid, verified.exe_path
-            )
-        })?;
+            ));
+        }
+
+        // Give Windows asynchronous kernel rundown a brief bounded window to finish signaling the
+        // process object before callers inspect liveness or reap children.
+        let _ = is_process_handle_exited(handle.as_raw(), has_synchronize, PROCESS_EXIT_WAIT_MS);
         self.suspended_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -295,6 +352,32 @@ impl WindowsDefenseController {
             }
         }
     }
+}
+
+fn confirm_validated_identity_exited(identity: &ProcessIdentity) -> bool {
+    if identity.create_time_100ns == 0 {
+        return false;
+    }
+    let (probe, has_synchronize) = match open_process_checked_detailed(
+        identity.pid,
+        PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+    ) {
+        Ok(h) => (h, true),
+        Err(_) => match open_process_checked_detailed(
+            identity.pid,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        ) {
+            Ok(h) => (h, false),
+            Err(_) => return false,
+        },
+    };
+    if query_process_creation_time(probe.as_raw()) != Some(identity.create_time_100ns) {
+        return false;
+    }
+    if query_full_image_name(probe.as_raw()).is_some_and(|exe| is_never_suspend_process(&exe)) {
+        return false;
+    }
+    is_process_handle_exited(probe.as_raw(), has_synchronize, PROCESS_EXIT_WAIT_MS)
 }
 
 fn collect_deduplicated_descendants(

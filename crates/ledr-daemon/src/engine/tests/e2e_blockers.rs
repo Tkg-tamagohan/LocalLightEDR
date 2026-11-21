@@ -3207,3 +3207,728 @@ async fn pr23_r30_t1_same_instance_snapshot_corrects_missing_etw_ppid_in_memory_
         Some(parent_1200.instance_id().as_str())
     );
 }
+
+/// `DAEMON-PERF-FASTPATH-01`: `verified_app_wide_allows` skips redundant `BinaryInspector::inspect`
+/// (disk SHA-256 + Authenticode) on repeated connects of a verified `create_time_100ns != 0`
+/// browser/app-wide `NetworkAllow` process, while strictly respecting:
+/// - bounded FIFO capacity (`4,096`),
+/// - direct `store.upsert_rule` rule fingerprint changes, `NetworkBlock` addition, and
+///   destination-scoped (`allowed_target != None`) rule addition,
+/// - `create_time_100ns == 0` exclusion,
+/// - invalidation on `ProcessStop`, `ActiveProcessTable` eviction, and
+///   `invalidate_non_protected_steady_pids()`,
+/// - non-Audit app-wide WFP Permit requirement vs Audit mode allowance.
+#[tokio::test]
+async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidation() {
+    use crate::engine::outbound::{VerifiedAppWideAllowCache, VerifiedAppWideAllowEntry};
+    use ledr_proto::AuthenticodeInfo;
+    use std::sync::atomic::AtomicUsize;
+
+    struct SignedCountingInspector {
+        calls: AtomicUsize,
+        sha256: String,
+        signer: String,
+        thumbprint: String,
+    }
+
+    impl SignedCountingInspector {
+        fn new(sha256: &str, signer: &str, thumbprint: &str) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                sha256: sha256.to_string(),
+                signer: signer.to_string(),
+                thumbprint: thumbprint.to_string(),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl crate::engine::BinaryInspector for SignedCountingInspector {
+        fn inspect(&self, exe_path: &str) -> ledr_rules::BinaryIdentity {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            ledr_rules::BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: Some(self.sha256.clone()),
+                authenticode: Some(AuthenticodeInfo {
+                    signer_subject: self.signer.clone(),
+                    root_thumbprint: self.thumbprint.clone(),
+                }),
+            }
+        }
+    }
+
+    struct FailingPermitDefense;
+
+    impl ActiveDefenseController for FailingPermitDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(&self, _: &Path, _: Option<IpAddr>, allow: bool) -> Result<u64, String> {
+            if allow {
+                Err("injected WFP permit registration failure".to_string())
+            } else {
+                Ok(1)
+            }
+        }
+        fn remove_wfp_rule(&self, _: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let browser_rule = AllowlistRuleRecord {
+        rule_id: "ALLOW-NET-BROWSER-CHROME".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: r"C:\Program Files*\Google\Chrome\Application\chrome.exe".to_string(),
+        sha256: None,
+        signer_subject: Some("CN=Google LLC".to_string()),
+        root_thumbprint: Some("DDFB16CD4931C973A2037D3FC83A4D7D775D05E4".to_string()),
+        allowed_target: None,
+        created_at_ms: 1_760_000_000_000,
+        created_by: "default_allowlist".to_string(),
+    };
+
+    // Part A: Bounded FIFO eviction, generation-tracked compaction, and re-insert order check
+    // on `VerifiedAppWideAllowCache`.
+    {
+        let mut cache = VerifiedAppWideAllowCache::new(3);
+        let mk_entry = || VerifiedAppWideAllowEntry {
+            exe_key: r"c:\program files\google\chrome\application\chrome.exe".to_string(),
+            authorizing_rule: browser_rule.clone(),
+        };
+        for i in 1..=4 {
+            cache.insert(format!("{i}:100"), mk_entry());
+        }
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get("1:100").is_none(), "oldest entry must be FIFO-evicted");
+        assert!(cache.get("2:100").is_some());
+        assert!(cache.get("4:100").is_some());
+        // Updating existing entry must not evict live neighbors.
+        cache.insert("2:100".to_string(), mk_entry());
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get("3:100").is_some());
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+
+        // Repeated remove + re-insert of the same key must keep `order` strictly bounded (no
+        // duplicate accumulation defeating compaction) and must not prematurely evict the freshly
+        // re-inserted entry ahead of older keys.
+        for _ in 0..1_000 {
+            cache.insert("same:1".to_string(), mk_entry());
+            assert!(cache.remove("same:1"));
+        }
+        assert!(
+            cache.order_len() <= 6,
+            "stale order entries must be compacted strictly within 2 * capacity (got {})",
+            cache.order_len()
+        );
+        cache.clear();
+        cache.insert("a:1".to_string(), mk_entry());
+        assert!(cache.remove("a:1"));
+        cache.insert("b:1".to_string(), mk_entry());
+        cache.insert("c:1".to_string(), mk_entry());
+        cache.insert("a:1".to_string(), mk_entry()); // newest entry despite earlier removed `a:1`
+        cache.insert("d:1".to_string(), mk_entry()); // must evict `b:1`, NOT freshly re-inserted `a:1`
+        assert!(cache.get("b:1").is_none(), "oldest live entry `b:1` must be evicted");
+        assert!(cache.get("a:1").is_some(), "freshly re-inserted `a:1` must survive eviction");
+        assert!(cache.get("c:1").is_some());
+        assert!(cache.get("d:1").is_some());
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+    }
+
+    // Part B: Post-startup wildcard browser allowlist + fast path + direct SQLite rule mutations +
+    // ProcessStop + ActiveProcessTable eviction + invalidate_non_protected_steady_pids().
+    let chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+    let store = LedrStore::open_in_memory().expect("open store");
+    store
+        .upsert_rule(&browser_rule)
+        .expect("seed browser allow rule");
+
+    let defense = Arc::new(RecordingDefense::new());
+    let inspector = Arc::new(SignedCountingInspector::new(
+        &"a".repeat(64),
+        "CN=Google LLC",
+        "DDFB16CD4931C973A2037D3FC83A4D7D775D05E4",
+    ));
+    let engine = start_stopped_engine(
+        store.clone(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::PreemptiveOnly,
+            active_process_capacity: 2,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::clone(&inspector) as Arc<dyn crate::engine::BinaryInspector>,
+    )
+    .await;
+
+    let chrome_1 = ProcessIdentity::new(7101, 700_001);
+    send_process_start(&engine, chrome_1, chrome_exe);
+    let calls_after_start = inspector.calls();
+    let now_ms = current_unix_ms();
+
+    // Connect #1 verifies the binary, materializes the app-wide WFP Permit, promotes steady PID,
+    // and populates `verified_app_wide_allows`.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: chrome_1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 78)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        },
+        EventLane::HighPriority,
+    );
+    let calls_after_first_connect = inspector.calls();
+    assert_eq!(
+        calls_after_first_connect,
+        calls_after_start + 1,
+        "first outbound connect must run BinaryInspector once"
+    );
+    assert!(
+        engine.has_active_wfp_filter(chrome_exe, None, true),
+        "post-startup wildcard browser allow must materialize app-wide WFP Permit"
+    );
+    assert_eq!(engine.verified_app_wide_allows_len(), 1);
+
+    // Connects #2..=#10 across distinct destinations must skip BinaryInspector completely.
+    for i in 1..=9u8 {
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::NetworkConnect {
+                pid: chrome_1.pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 80 + i)),
+                dst_port: 443,
+                domain_hint: None,
+                timestamp_ms: now_ms + i64::from(i),
+            },
+            EventLane::Telemetry,
+        );
+    }
+    assert_eq!(
+        inspector.calls(),
+        calls_after_first_connect,
+        "subsequent connects for verified app-wide allowed browser must skip BinaryInspector"
+    );
+
+    // Direct SQLite mutation #1 (bypassing DaemonEngine): adding a destination-scoped rule must
+    // immediately disable the fast path and re-invoke BinaryInspector.
+    let scoped_rule = AllowlistRuleRecord {
+        rule_id: "ALLOW-CHROME-SCOPED".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: chrome_exe.to_string(),
+        sha256: None,
+        signer_subject: Some("CN=Google LLC".to_string()),
+        root_thumbprint: Some("DDFB16CD4931C973A2037D3FC83A4D7D775D05E4".to_string()),
+        allowed_target: Some("api.example.com".to_string()),
+        created_at_ms: now_ms + 20,
+        created_by: "test".to_string(),
+    };
+    store.upsert_rule(&scoped_rule).expect("insert scoped rule directly");
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: chrome_1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 99)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 21,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(
+        inspector.calls(),
+        calls_after_first_connect + 1,
+        "direct store.upsert_rule of destination-scoped rule must bypass fast path"
+    );
+    assert_eq!(engine.verified_app_wide_allows_len(), 0);
+    store
+        .delete_rule(&scoped_rule.rule_id)
+        .expect("remove scoped rule");
+
+    // Re-populate fast path once, then test direct SQLite `NetworkBlock` insertion.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: chrome_1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 100)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 22,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(engine.verified_app_wide_allows_len(), 1);
+    let calls_before_block = inspector.calls();
+
+    let block_rule = AllowlistRuleRecord {
+        rule_id: "BLOCK-CHROME-DIRECT".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: chrome_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("203.0.113.55".to_string()),
+        created_at_ms: now_ms + 23,
+        created_by: "test".to_string(),
+    };
+    store
+        .upsert_rule(&block_rule)
+        .expect("insert block rule directly");
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: chrome_1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 24,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(
+        inspector.calls(),
+        calls_before_block + 1,
+        "direct store.upsert_rule of NetworkBlock must invalidate fast path and evaluate block"
+    );
+    assert!(
+        engine.has_active_wfp_filter(chrome_exe, Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55))), false),
+        "NetworkBlock added directly in store must take effect immediately"
+    );
+    store
+        .delete_rule(&block_rule.rule_id)
+        .expect("remove block rule");
+    let _ = engine.deploy_persisted_network_rules();
+
+    // Direct SQLite mutation #3: changing authorizing rule content (fingerprint mismatch) must
+    // bypass the fast path and re-run BinaryInspector.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: chrome_1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 101)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 25,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(engine.verified_app_wide_allows_len(), 1);
+    let calls_before_rule_edit = inspector.calls();
+    let mut edited_rule = browser_rule.clone();
+    edited_rule.signer_subject = Some("CN=Different Signer".to_string());
+    store
+        .upsert_rule(&edited_rule)
+        .expect("edit authorizing rule directly");
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: chrome_1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 102)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 26,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(
+        inspector.calls(),
+        calls_before_rule_edit + 1,
+        "mutating authorizing rule content directly must invalidate fast path"
+    );
+    // Restore original rule and re-deploy.
+    store
+        .upsert_rule(&browser_rule)
+        .expect("restore original browser rule");
+    let _ = engine.deploy_persisted_network_rules();
+
+    // Re-populate fast path, then verify `invalidate_non_protected_steady_pids()` clears it.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: chrome_1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 103)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 27,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(engine.verified_app_wide_allows_len(), 1);
+    engine.invalidate_non_protected_steady_pids();
+    assert_eq!(engine.verified_app_wide_allows_len(), 0);
+
+    // Re-populate fast path, then verify `ProcessStop` invalidates `chrome_1`.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: chrome_1.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 104)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms + 28,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(engine.verified_app_wide_allows_len(), 1);
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: chrome_1.pid,
+            exit_code: 0,
+            exit_time_100ns: 700_099,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(
+        engine.verified_app_wide_allows_len(),
+        0,
+        "ProcessStop must evict verified_app_wide_allows entry"
+    );
+
+    // ActiveProcessTable capacity eviction (`active_process_capacity = 2`) must also evict.
+    let chrome_2 = ProcessIdentity::new(7102, 700_002);
+    send_process_start(&engine, chrome_2, chrome_exe);
+    let chrome_2_ts = current_unix_ms();
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::NetworkConnect {
+            pid: chrome_2.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 105)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: chrome_2_ts,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(engine.verified_app_wide_allows_len(), 1);
+    // Start 2 more processes to push `chrome_2` out of the 2-slot `ActiveProcessTable`.
+    send_process_start(
+        &engine,
+        ProcessIdentity::new(7103, 700_003),
+        r"C:\Apps\other1.exe",
+    );
+    send_process_start(
+        &engine,
+        ProcessIdentity::new(7104, 700_004),
+        r"C:\Apps\other2.exe",
+    );
+    assert_eq!(
+        engine.verified_app_wide_allows_len(),
+        0,
+        "ActiveProcessTable eviction must remove evicted process_instance_id from verified_app_wide_allows"
+    );
+
+    // Part C: `create_time_100ns == 0` must NEVER be cached in `verified_app_wide_allows`.
+    let unverified_pid0 = ProcessIdentity::new(7105, 0);
+    send_process_start(&engine, unverified_pid0, chrome_exe);
+    let pid0_ts = current_unix_ms();
+    let calls_before_pid0 = inspector.calls();
+    for i in 0..3i64 {
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::NetworkConnect {
+                pid: unverified_pid0.pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 110)),
+                dst_port: 443 + i as u16,
+                domain_hint: None,
+                timestamp_ms: pid0_ts + i,
+            },
+            EventLane::HighPriority,
+        );
+    }
+    assert_eq!(
+        inspector.calls(),
+        calls_before_pid0 + 3,
+        "create_time_100ns == 0 processes must never use verified_app_wide_allows"
+    );
+    assert_eq!(engine.verified_app_wide_allows_len(), 0);
+
+    // Part D: Non-Audit mode without active app-wide WFP Permit (permit install fails) must NOT
+    // engage the fast path, whereas Audit mode engages it without requiring a WFP Permit.
+    let store_fail = LedrStore::open_in_memory().expect("open store fail");
+    store_fail
+        .upsert_rule(&browser_rule)
+        .expect("seed browser allow");
+    let insp_fail = Arc::new(SignedCountingInspector::new(
+        &"b".repeat(64),
+        "CN=Google LLC",
+        "DDFB16CD4931C973A2037D3FC83A4D7D775D05E4",
+    ));
+    let engine_fail = start_stopped_engine(
+        store_fail,
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::new(FailingPermitDefense) as Arc<dyn ActiveDefenseController>,
+        Arc::clone(&insp_fail) as Arc<dyn crate::engine::BinaryInspector>,
+    )
+    .await;
+    let p_fail = ProcessIdentity::new(7201, 700_201);
+    send_process_start(&engine_fail, p_fail, chrome_exe);
+    let fail_ts = current_unix_ms();
+    let calls_fail_start = insp_fail.calls();
+    for i in 0..3i64 {
+        let _ = engine_fail.process_event_with_lane(
+            &SensorEvent::NetworkConnect {
+                pid: p_fail.pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 120)),
+                dst_port: 443 + i as u16,
+                domain_hint: None,
+                timestamp_ms: fail_ts + i,
+            },
+            EventLane::HighPriority,
+        );
+    }
+    assert_eq!(
+        insp_fail.calls(),
+        calls_fail_start + 3,
+        "non-Audit mode without active app-wide WFP Permit must not cache fast path"
+    );
+    assert_eq!(engine_fail.verified_app_wide_allows_len(), 0);
+
+    let store_audit = LedrStore::open_in_memory().expect("open store audit");
+    store_audit
+        .upsert_rule(&browser_rule)
+        .expect("seed browser allow audit");
+    let insp_audit = Arc::new(SignedCountingInspector::new(
+        &"c".repeat(64),
+        "CN=Google LLC",
+        "DDFB16CD4931C973A2037D3FC83A4D7D775D05E4",
+    ));
+    let engine_audit = start_stopped_engine(
+        store_audit,
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Audit,
+            ..DaemonConfig::default()
+        },
+        Arc::new(FailingPermitDefense) as Arc<dyn ActiveDefenseController>,
+        Arc::clone(&insp_audit) as Arc<dyn crate::engine::BinaryInspector>,
+    )
+    .await;
+    let p_audit = ProcessIdentity::new(7202, 700_202);
+    send_process_start(&engine_audit, p_audit, chrome_exe);
+    let audit_ts = current_unix_ms();
+    let calls_audit_start = insp_audit.calls();
+    for i in 0..4i64 {
+        let _ = engine_audit.process_event_with_lane(
+            &SensorEvent::NetworkConnect {
+                pid: p_audit.pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 130)),
+                dst_port: 443 + i as u16,
+                domain_hint: None,
+                timestamp_ms: audit_ts + i,
+            },
+            EventLane::HighPriority,
+        );
+    }
+    assert_eq!(
+        insp_audit.calls(),
+        calls_audit_start + 1,
+        "Audit mode must engage verified_app_wide_allows fast path without requiring a WFP Permit"
+    );
+    assert_eq!(engine_audit.verified_app_wide_allows_len(), 1);
+
+    // Part E (`SEC_0001`): Concurrent `delete_policy_rule` completing while an outbound connect
+    // is paused inside `inspector.inspect` must never resurrect a stale WFP Permit or fast-path
+    // cache entry once `inspect` finishes.
+    struct GatedSignedInspector {
+        sha256: String,
+        signer_subject: String,
+        root_thumbprint: String,
+        gate_armed: std::sync::atomic::AtomicBool,
+        state: std::sync::Mutex<(bool, bool, bool, bool)>, // (entered, released, worker_finished, release_timed_out)
+        cv: std::sync::Condvar,
+    }
+    impl crate::engine::BinaryInspector for GatedSignedInspector {
+        fn inspect(&self, exe_path: &str) -> ledr_rules::BinaryIdentity {
+            if self.gate_armed.swap(false, Ordering::AcqRel) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.0 = true;
+                self.cv.notify_all();
+                while !guard.1 {
+                    let Some(remaining) =
+                        deadline.checked_duration_since(std::time::Instant::now())
+                    else {
+                        guard.3 = true;
+                        break;
+                    };
+                    let (next_guard, wait_res) = self
+                        .cv
+                        .wait_timeout(guard, remaining)
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = next_guard;
+                    if !guard.1 && wait_res.timed_out() {
+                        guard.3 = true;
+                        break;
+                    }
+                }
+            }
+            ledr_rules::BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: Some(self.sha256.clone()),
+                authenticode: Some(AuthenticodeInfo {
+                    signer_subject: self.signer_subject.clone(),
+                    root_thumbprint: self.root_thumbprint.clone(),
+                }),
+            }
+        }
+    }
+    struct WorkerFinishedGuard {
+        inspector: Arc<GatedSignedInspector>,
+    }
+    impl Drop for WorkerFinishedGuard {
+        fn drop(&mut self) {
+            let mut guard = self
+                .inspector
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.2 = true;
+            self.inspector.cv.notify_all();
+        }
+    }
+    struct ReleaseGateOnDrop {
+        inspector: Arc<GatedSignedInspector>,
+    }
+    impl Drop for ReleaseGateOnDrop {
+        fn drop(&mut self) {
+            let mut guard = self
+                .inspector
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.1 = true;
+            self.inspector.cv.notify_all();
+        }
+    }
+
+    let store_race = LedrStore::open_in_memory().expect("open store race");
+    store_race
+        .upsert_rule(&browser_rule)
+        .expect("seed browser allow race");
+    let race_defense = Arc::new(RecordingDefense::new());
+    let race_inspector = Arc::new(GatedSignedInspector {
+        sha256: "d".repeat(64),
+        signer_subject: "CN=Google LLC".to_string(),
+        root_thumbprint: "DDFB16CD4931C973A2037D3FC83A4D7D775D05E4".to_string(),
+        gate_armed: std::sync::atomic::AtomicBool::new(false),
+        state: std::sync::Mutex::new((false, false, false, false)),
+        cv: std::sync::Condvar::new(),
+    });
+    let engine_race = Arc::new(
+        start_stopped_engine(
+            store_race,
+            DaemonConfig {
+                outbound_firewall_enabled: true,
+                outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+                ..DaemonConfig::default()
+            },
+            Arc::clone(&race_defense) as Arc<dyn ActiveDefenseController>,
+            Arc::clone(&race_inspector) as Arc<dyn crate::engine::BinaryInspector>,
+        )
+        .await,
+    );
+    let p_race = ProcessIdentity::new(7203, 700_203);
+    send_process_start(&engine_race, p_race, chrome_exe);
+    let race_ts = current_unix_ms();
+
+    // Arm the gate for the outbound connect's `inspector.inspect`, run connect on a worker thread.
+    race_inspector.gate_armed.store(true, Ordering::Release);
+    let release_guard = ReleaseGateOnDrop {
+        inspector: Arc::clone(&race_inspector),
+    };
+    let engine_worker = Arc::clone(&engine_race);
+    let inspector_worker = Arc::clone(&race_inspector);
+    let connect_thread = std::thread::spawn(move || {
+        let _finished_guard = WorkerFinishedGuard {
+            inspector: inspector_worker,
+        };
+        let _ = engine_worker.process_event_with_lane(
+            &SensorEvent::NetworkConnect {
+                pid: p_race.pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 190, 140)),
+                dst_port: 443,
+                domain_hint: None,
+                timestamp_ms: race_ts,
+            },
+            EventLane::HighPriority,
+        );
+    });
+
+    // Wait with a bounded deadline until the outbound connect is paused inside `inspector.inspect`
+    // (or fail immediately if the worker exits without entering `inspector.inspect`).
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut guard = race_inspector
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while !guard.0 && !guard.2 {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let (next_guard, wait_res) = race_inspector
+                .cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = next_guard;
+            if wait_res.timed_out() {
+                break;
+            }
+        }
+        let entered = guard.0;
+        let worker_finished = guard.2;
+        drop(guard);
+        assert!(
+            entered,
+            "outbound connect did not enter inspector.inspect before deadline (worker_finished={worker_finished})"
+        );
+    }
+
+    // Delete the authorizing rule while the connect evaluation holds its stale rule snapshot.
+    let (deleted, _report) = engine_race
+        .delete_policy_rule(&browser_rule.rule_id)
+        .expect("delete browser rule concurrently");
+    assert!(deleted, "browser allow rule must be deleted");
+
+    // Release `inspector.inspect` and wait for the in-flight connect evaluation to finish.
+    drop(release_guard);
+    connect_thread.join().expect("join connect thread");
+    let release_timed_out = race_inspector
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .3;
+    assert!(
+        !release_timed_out,
+        "inspector.inspect timed out waiting for gate release (delete_policy_rule must not block on inspector.inspect)"
+    );
+
+    assert!(
+        !engine_race.has_active_wfp_filter(chrome_exe, None, true),
+        "deleted app-wide NetworkAllow must NEVER resurrect a stale WFP Permit after concurrent delete_policy_rule"
+    );
+    assert_eq!(
+        engine_race.verified_app_wide_allows_len(),
+        0,
+        "deleted app-wide NetworkAllow must NEVER populate verified_app_wide_allows"
+    );
+}

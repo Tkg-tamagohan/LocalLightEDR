@@ -40,7 +40,8 @@
 
 作業ディレクトリ `e:\Documents\code\LocalEDR` 配下に次のバイナリが揃っており、PowerShell ウィンドウ 3 つを開ける状態にしてください。
 
-- **ビルド済みバイナリ**：`target\debug\ledr-daemon.exe`、`target\debug\ledr-ui.exe`、`target\debug\ledr-sim.exe`
+- **ビルド済みバイナリ（機能確認用）**：`target\debug\ledr-daemon.exe`、`target\debug\ledr-ui.exe`、`target\debug\ledr-sim.exe`
+- **ビルド済みバイナリ（`E2E-PERF-01` 性能計測用）**：`cargo build --release --locked` で生成した `target\release\ledr-daemon.exe` と `target\release\ledr-ui.exe`
 - **検証用一時フォルダ**：実行ごとに新規割り当てする `C:\Temp\ledr-e2e-<yyyyMMdd-HHmmss>`（変数 `$runDir` で参照し、SQLite DB、NRD キャッシュ、ダミーカナリア、および `netsh wfp` 出力 XML を保存し、過去の検証フォルダは自動削除しない）
 - **ウィンドウ A（管理者 PowerShell）**：`ledr-daemon.exe` のフォアグラウンド起動とログ監視用
 - **ウィンドウ B（管理者 PowerShell）**：`ledr-sim.exe` 実行、`netsh wfp` 確認、TCP 接続試験、および `taskkill` 用
@@ -216,6 +217,10 @@ explorer.exe (Join-Path $runDir "canary_dir")
 > 安全ガードで保護されていますが、手順上は **`Allow Once`** でアラートを閉じるだけにしてください。
 
 確認が終わったら、リネームしたファイルを元の名前 `!00_LocalEDR_Canary_DoNotEdit.docx` に戻すか削除してください。
+
+> [!NOTE]
+> PowerShell から `Rename-Item` を実行すると ETW 上の実行元プロセスは `explorer.exe` ではなく `powershell.exe` になり、Never-Suspend ガードの対象外として凍結する。
+> そのため、`E2E-P2-05` は対話デスクトップ上のエクスプローラウィンドウからリネーム操作を行う必要があり、非対話環境では未検証差異として記録する。
 
 ### 8. ETW `Kernel-Registry` 自動起動キー監視と `CloseKey` 無効化確認（ウィンドウ B と `ledr-ui`）
 
@@ -408,11 +413,26 @@ Select-String -Path $afterKillFiltersXml -Pattern "LocalEDR"
 
 ## リソース消費と UI 完全終了の確認
 
-[implementation-plan.md](implementation-plan.md) のリソース基準を確認するため、ウィンドウ A で `ledr-daemon.exe` を起動した状態のまま以下を計測してください。
+[implementation-plan.md](implementation-plan.md) のリソース基準（`E2E-PERF-01`）は、デバッグシンボルや未最適化コードによるメモリと CPU の膨張を除くため、必ず `--release` ビルドで計測してください。
+最初にワークスペースのリリースバイナリをビルドし、ウィンドウ A で `RUST_LOG=info` の `target\release\ledr-daemon.exe`（NRD キャッシュ読み込み付き）を起動します。
+
+```powershell
+# ビルド（任意ウィンドウ）
+cd e:\Documents\code\LocalEDR
+cargo build --release --locked
+
+# ウィンドウ A（管理者 PowerShell）で既存の debug デーモンを停止したうえで起動する
+$runDir = (Get-Content C:\Temp\ledr-e2e-latest.txt -Raw).Trim()
+$env:RUST_LOG = "info"
+.\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
+```
+
+指定した `nrd-cache.txt` が未作成の場合、`ledr-daemon.exe` は空の NRD キャッシュで起動し、バックグラウンドで初回フィード取得を実行する。
+計測を始める前に、ウィンドウ A のログで `loaded local NRD cache from disk`（`entries` が 0 より大きいこと）または `refreshed daily NRD domain cache`（`entries` が 0 より大きいこと）が出力されたことを確認してください。
 
 ### 1. `ledr-ui` 閉鎖時のプロセス 0 件確認（`L-08`）
 
-ウィンドウ C で `.\target\debug\ledr-ui.exe` を開いた状態で右上の閉じるボタンから終了し、直後にウィンドウ C で UI 本体と WebView2 子プロセスの残存がないことを確認してください。
+ウィンドウ C で `.\target\release\ledr-ui.exe` を開いた状態で右上の閉じるボタンから終了し、直後にウィンドウ C で UI 本体と WebView2 子プロセスの残存がないことを確認してください。
 
 ```powershell
 Get-Process ledr-ui -ErrorAction SilentlyContinue
@@ -423,7 +443,7 @@ Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object
 
 ### 2. `ledr-daemon` 常駐メモリ（20 MB 以下）と定常 CPU 使用率（0.5% 未満）の計測
 
-ウィンドウ B で次の計測スクリプトを実行し、定常アイドル時（および必要に応じて別ウィンドウでの `cargo build` 負荷中）の Working Set と平均 CPU 使用率を計測してください。
+ウィンドウ B で次の計測スクリプトを実行し、`target\release\ledr-daemon.exe` の定常アイドル時（および必要に応じて別ウィンドウでの `cargo build` 負荷中）の Working Set と平均 CPU 使用率を計測してください。
 標準の目標確認では `$sampleSec = 60`（厳密な計画基準に沿うアイドル計測では `600` 秒）として計測できます。
 
 ```powershell
@@ -449,8 +469,9 @@ $cpuPct = (($p1.CPU - $cpu0) / ($sampleSec * $logicalCores)) * 100.0
 
 `PeakWorkingSetMB` が `20.0` 以下、かつ定常時 `AvgCpuPercent` が `0.5` 未満であれば性能目標を満たしている。
 
-あわせて、既定許可対象のブラウザ（Chrome、Edge、Firefox 等）を起動して通常閲覧や複数タブ読み込みを行っている状態でも同じ 60 秒計測を実施し、`AvgCpuPercent` と高優先度レーンの遅延（並行してカナリア検知や通知が 1 秒以内に応答するか）を確認してください。
-既定ブラウザ許可ルールに一致する通信は `SEC_0005`（`SetFileTime` スプーフィング防止）の制約により `WindowsBinaryInspector` が接続ごとに実ファイルの SHA-256 を算出するため、実測で CPU 目標を超過した場合は独立した最適化タスクで対処方針を検討する。
+あわせて、既定許可対象のブラウザ（Chrome、Edge、Firefox 等）を起動して通常閲覧や複数タブ読み込みを行っている状態でも同じ 60 秒計測を実施し、`AvgCpuPercent`、`PeakWorkingSetMB`、および高優先度レーンの遅延（並行してカナリア検知や通知が 1 秒以内に応答するか）を確認してください。
+現行実装では、`WindowsBinaryInspector::inspect` が単体呼び出しごとの実ファイル SHA-256 算出（`SEC_0005`）を維持したまま、`DaemonEngine` が `create_time_100ns != 0` の検証済み `process_instance_id` ごとにアプリ全体 `NetworkAllow` 判定をキャッシュして 2 回目以降の重複ハッシュ算出を省略し、`NrdCache` はソート済み平坦アリーナ（`Box<[u8]>` と `Box<[u32]>`）で常駐メモリを抑制する。
+`--release` ビルドで上記計測を実施しても目標値を超過した場合は、実測値と当時のルール数および接続レートを添えて報告してください。
 
 ## 補足手順（任意）：Session 0（`LocalSystem`）境界の代替確認
 
@@ -511,5 +532,5 @@ if ($preexistingFile -and (Test-Path -LiteralPath $preexistingFile)) {
 | `E2E-P3-05` | Phase 3 | 実 WinHTTP NRD 取得と View 3 `NRD / Homograph Check` | | |
 | `E2E-P3-06` | Phase 3 | 未応答 UNC 共有での 3 秒停止予算、WAL 先行チェックポイント、非ハング終了 | | |
 | `E2E-P3-07` | Phase 3 | `taskkill /F` 強制終了時の動的 WFP フィルタ 0 件消去と通信回復 | | |
-| `E2E-PERF-01` | 共通 | `ledr-ui` 閉鎖後プロセス 0 件、`ledr-daemon` Working Set 20 MB 以下／CPU 0.5% 未満（アイドル時およびブラウザ稼働時） | | |
+| `E2E-PERF-01` | 共通 | `--release` バイナリ計測：`ledr-ui` 閉鎖後プロセス 0 件、`ledr-daemon` Working Set 20 MB 以下および CPU 0.5% 未満（NRD 読み込み済みのアイドル時およびブラウザ稼働時） | | |
 | `E2E-SVC-01` | 共通 | Session 0 (`LocalSystem`) `CreateProcessAsUserW`（SCM 未実装差異の切り分け） | | |

@@ -1,14 +1,16 @@
-//! Bounded in-memory and atomic disk-persisted NRD cache.
+//! Bounded in-memory and atomic disk-persisted NRD cache backed by a compact flat sorted arena.
 
-use std::collections::HashSet;
+use std::cmp::Ordering as CmpOrdering;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::RulesError;
 
-use super::parser::{matches_domain_or_parent_in_set, normalize_nrd_domain, parse_nrd_line};
+use super::parser::{
+    matches_domain_or_parent, normalize_nrd_domain_into, parse_nrd_line_into,
+};
 use super::NRD_MAX_RESPONSE_BYTES;
 
 static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -17,9 +19,15 @@ const NRD_CACHE_HEADER: &str = "# LocalEDR NRD Cache";
 const NRD_UPDATED_PREFIX: &str = "# updated_at_ms=";
 
 /// Bounded in-memory + disk-persisted cache of newly registered domains (`L-14`).
+///
+/// Stores all normalized ASCII lowercase domains in two contiguous heap allocations:
+/// a sorted flat byte arena (`data`) and a `len + 1` offset index (`offsets`) searched
+/// via binary search. At `NRD_MAX_ENTRIES` (`50,000`), this reduces heap allocations
+/// from ~50,001 (`HashSet<String>`) to exactly 2 and keeps RSS well below 2 MiB.
 #[derive(Debug, Clone, Default)]
 pub struct NrdCache {
-    pub(super) domains: HashSet<String>,
+    pub(super) data: Box<[u8]>,
+    pub(super) offsets: Box<[u32]>,
     pub(super) updated_at_ms: Option<i64>,
     pub(super) truncated: bool,
 }
@@ -32,6 +40,247 @@ pub struct NrdRefreshStats {
     pub total_entries: usize,
     pub truncated: bool,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InsertOutcome {
+    Inserted,
+    Duplicate,
+    CapReached,
+}
+
+/// Staging builder that deduplicates normalized domains into a single flat byte arena without
+/// allocating per-domain `String`s, then compacts into a sorted [`NrdCache`].
+pub(super) struct FlatDomainSet {
+    data: Vec<u8>,
+    offsets: Vec<u32>,
+    /// Open-addressed hash table storing `entry_idx + 1` (`0` = empty slot), allocated lazily
+    /// only when out-of-order domains appear so sorted cache loads incur zero hash overhead.
+    buckets: Vec<u32>,
+    sorted_so_far: bool,
+}
+
+impl FlatDomainSet {
+    pub(super) fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            offsets: vec![0],
+            buckets: Vec::new(),
+            sorted_so_far: true,
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    #[inline]
+    fn entry_bytes(&self, idx: usize) -> &[u8] {
+        let start = self.offsets[idx] as usize;
+        let end = self.offsets[idx + 1] as usize;
+        &self.data[start..end]
+    }
+
+    pub(super) fn insert_bounded(&mut self, domain: &str, cap: usize) -> InsertOutcome {
+        let bytes = domain.as_bytes();
+        let count = self.len();
+
+        if self.sorted_so_far && self.buckets.is_empty() {
+            if count > 0 {
+                let last = self.entry_bytes(count - 1);
+                match bytes.cmp(last) {
+                    CmpOrdering::Equal => return InsertOutcome::Duplicate,
+                    CmpOrdering::Greater => {
+                        if count >= cap {
+                            return InsertOutcome::CapReached;
+                        }
+                        return self.append_unchecked(bytes);
+                    }
+                    CmpOrdering::Less => {
+                        if self.contains_in_sorted(bytes) {
+                            return InsertOutcome::Duplicate;
+                        }
+                        if count >= cap {
+                            return InsertOutcome::CapReached;
+                        }
+                        self.sorted_so_far = false;
+                        self.build_buckets(count + 1);
+                        let outcome = self.append_unchecked(bytes);
+                        if outcome == InsertOutcome::Inserted {
+                            self.insert_bucket_index(count as u32, bytes);
+                        }
+                        return outcome;
+                    }
+                }
+            } else {
+                if count >= cap {
+                    return InsertOutcome::CapReached;
+                }
+                return self.append_unchecked(bytes);
+            }
+        }
+
+        if self.contains_in_buckets(bytes) {
+            return InsertOutcome::Duplicate;
+        }
+        if count >= cap {
+            return InsertOutcome::CapReached;
+        }
+        if (count + 1).saturating_mul(2) > self.buckets.len() {
+            self.grow_buckets(count + 1);
+        }
+        let outcome = self.append_unchecked(bytes);
+        if outcome == InsertOutcome::Inserted {
+            let new_idx = count as u32;
+            self.insert_bucket_index(new_idx, bytes);
+        }
+        outcome
+    }
+
+    fn contains_in_sorted(&self, needle: &[u8]) -> bool {
+        let mut lo = 0usize;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.entry_bytes(mid).cmp(needle) {
+                CmpOrdering::Less => lo = mid + 1,
+                CmpOrdering::Greater => hi = mid,
+                CmpOrdering::Equal => return true,
+            }
+        }
+        false
+    }
+
+    fn append_unchecked(&mut self, bytes: &[u8]) -> InsertOutcome {
+        let count = self.len();
+        let Some(next_end) = self
+            .data
+            .len()
+            .checked_add(bytes.len())
+            .and_then(|n| u32::try_from(n).ok())
+        else {
+            return InsertOutcome::CapReached;
+        };
+        if u32::try_from(count + 1).is_err() {
+            return InsertOutcome::CapReached;
+        }
+        self.data.extend_from_slice(bytes);
+        self.offsets.push(next_end);
+        InsertOutcome::Inserted
+    }
+
+    fn build_buckets(&mut self, min_entries: usize) {
+        let count = self.len();
+        let min_slots = min_entries
+            .max(count)
+            .saturating_mul(2)
+            .max(16)
+            .next_power_of_two();
+        self.buckets.clear();
+        self.buckets.resize(min_slots, 0);
+        for idx in 0..count {
+            let entry_hash = fnv1a_64(self.entry_bytes(idx));
+            self.insert_bucket_hashed(idx as u32, entry_hash);
+        }
+    }
+
+    fn grow_buckets(&mut self, needed_entries: usize) {
+        let count = self.len();
+        let min_slots = needed_entries
+            .saturating_mul(2)
+            .max(self.buckets.len().saturating_mul(2))
+            .max(16)
+            .next_power_of_two();
+        self.buckets.clear();
+        self.buckets.resize(min_slots, 0);
+        for idx in 0..count {
+            let entry_hash = fnv1a_64(self.entry_bytes(idx));
+            self.insert_bucket_hashed(idx as u32, entry_hash);
+        }
+    }
+
+    fn contains_in_buckets(&self, needle: &[u8]) -> bool {
+        if self.buckets.is_empty() {
+            return false;
+        }
+        let mask = self.buckets.len() - 1;
+        let mut slot = (fnv1a_64(needle) as usize) & mask;
+        loop {
+            let stored = self.buckets[slot];
+            if stored == 0 {
+                return false;
+            }
+            if self.entry_bytes((stored - 1) as usize) == needle {
+                return true;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    fn insert_bucket_index(&mut self, idx: u32, bytes: &[u8]) {
+        self.insert_bucket_hashed(idx, fnv1a_64(bytes));
+    }
+
+    fn insert_bucket_hashed(&mut self, idx: u32, hash: u64) {
+        let mask = self.buckets.len() - 1;
+        let mut slot = (hash as usize) & mask;
+        while self.buckets[slot] != 0 {
+            slot = (slot + 1) & mask;
+        }
+        self.buckets[slot] = idx + 1;
+    }
+
+    pub(super) fn into_nrd_cache(mut self, updated_at_ms: Option<i64>, truncated: bool) -> NrdCache {
+        self.buckets = Vec::new();
+        let count = self.len();
+        if count == 0 {
+            return NrdCache {
+                data: Box::default(),
+                offsets: Box::default(),
+                updated_at_ms,
+                truncated,
+            };
+        }
+        if self.sorted_so_far {
+            return NrdCache {
+                data: self.data.into_boxed_slice(),
+                offsets: self.offsets.into_boxed_slice(),
+                updated_at_ms,
+                truncated,
+            };
+        }
+
+        let mut order: Vec<u32> = (0..count as u32).collect();
+        order.sort_unstable_by(|&a, &b| {
+            self.entry_bytes(a as usize)
+                .cmp(self.entry_bytes(b as usize))
+        });
+
+        let mut sorted_data = Vec::with_capacity(self.data.len());
+        let mut sorted_offsets = Vec::with_capacity(count + 1);
+        sorted_offsets.push(0u32);
+        for idx in order {
+            sorted_data.extend_from_slice(self.entry_bytes(idx as usize));
+            sorted_offsets.push(sorted_data.len() as u32);
+        }
+
+        NrdCache {
+            data: sorted_data.into_boxed_slice(),
+            offsets: sorted_offsets.into_boxed_slice(),
+            updated_at_ms,
+            truncated,
+        }
+    }
+}
+
+#[inline]
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 impl NrdCache {
@@ -47,37 +296,41 @@ impl NrdCache {
         S: AsRef<str>,
     {
         let cap = max_entries.max(1);
-        let mut set = HashSet::new();
+        let mut builder = FlatDomainSet::new();
+        let mut norm_buf = String::new();
         let mut truncated = false;
         for item in domains {
-            if let Some(norm) = normalize_nrd_domain(item.as_ref()) {
-                if set.len() >= cap && !set.contains(&norm) {
-                    truncated = true;
-                    break;
-                }
-                set.insert(norm);
+            if normalize_nrd_domain_into(item.as_ref(), &mut norm_buf)
+                && builder.insert_bounded(&norm_buf, cap) == InsertOutcome::CapReached
+            {
+                truncated = true;
+                break;
             }
         }
-        Self {
-            domains: set,
-            updated_at_ms,
-            truncated,
-        }
+        builder.into_nrd_cache(updated_at_ms, truncated)
     }
 
     /// Returns the number of cached NRD domains.
     pub fn len(&self) -> usize {
-        self.domains.len()
+        self.offsets.len().saturating_sub(1)
     }
 
     /// Returns `true` when the cache contains no domains.
     pub fn is_empty(&self) -> bool {
-        self.domains.is_empty()
+        self.len() == 0
     }
 
-    /// Returns the backing normalized lowercase domain set for [`crate::assess_domain_risk`].
-    pub fn domains(&self) -> &HashSet<String> {
-        &self.domains
+    /// Returns an iterator over all cached normalized lowercase domains in ascending sorted order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
+        (0..self.len()).map(|idx| {
+            std::str::from_utf8(self.entry_bytes(idx))
+                .expect("NrdCache arena contains only validated ASCII domains")
+        })
+    }
+
+    /// Returns the total heap bytes owned by the flat sorted arena (`data` + `offsets`).
+    pub fn heap_bytes(&self) -> usize {
+        self.data.len() + self.offsets.len() * std::mem::size_of::<u32>()
     }
 
     /// Returns the Unix epoch timestamp (milliseconds) of the last successful refresh.
@@ -99,9 +352,38 @@ impl NrdCache {
         now_ms.saturating_sub(updated) >= interval
     }
 
+    #[inline]
+    fn entry_bytes(&self, idx: usize) -> &[u8] {
+        let start = self.offsets[idx] as usize;
+        let end = self.offsets[idx + 1] as usize;
+        &self.data[start..end]
+    }
+
+    fn contains_exact_normalized(&self, normalized: &str) -> bool {
+        let count = self.len();
+        if count == 0 {
+            return false;
+        }
+        let needle = normalized.as_bytes();
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.entry_bytes(mid).cmp(needle) {
+                CmpOrdering::Less => lo = mid + 1,
+                CmpOrdering::Greater => hi = mid,
+                CmpOrdering::Equal => return true,
+            }
+        }
+        false
+    }
+
     /// Returns `true` if `domain` or any multi-label parent suffix of `domain` is in the cache.
     pub fn contains(&self, domain: &str) -> bool {
-        matches_domain_or_parent_in_set(domain, &self.domains)
+        if self.is_empty() {
+            return false;
+        }
+        matches_domain_or_parent(domain, |candidate| self.contains_exact_normalized(candidate))
     }
 
     /// Loads an [`NrdCache`] from a local cache file, enforcing `max_entries` and
@@ -119,8 +401,9 @@ impl NrdCache {
         let limited = file.take(NRD_MAX_RESPONSE_BYTES as u64 + 1);
         let mut reader = BufReader::new(limited);
         let mut line = String::new();
+        let mut norm_buf = String::new();
         let mut updated_at_ms = None;
-        let mut domains = HashSet::new();
+        let mut builder = FlatDomainSet::new();
         let mut truncated = false;
         let mut bytes_read = 0usize;
 
@@ -142,23 +425,18 @@ impl NrdCache {
                 }
                 continue;
             }
-            if let Some(domain) = parse_nrd_line(trimmed) {
-                if domains.len() >= cap && !domains.contains(&domain) {
-                    truncated = true;
-                    break;
-                }
-                domains.insert(domain);
+            if parse_nrd_line_into(trimmed, &mut norm_buf)
+                && builder.insert_bounded(&norm_buf, cap) == InsertOutcome::CapReached
+            {
+                truncated = true;
+                break;
             }
         }
 
-        Ok(Self {
-            domains,
-            updated_at_ms: updated_at_ms.or(fallback_mtime_ms),
-            truncated,
-        })
+        Ok(builder.into_nrd_cache(updated_at_ms.or(fallback_mtime_ms), truncated))
     }
 
-    /// Atomically persists the cache to `path` (sorted for deterministic diffs/inspection).
+    /// Atomically persists the cache to `path` (already sorted for deterministic diffs/inspection).
     pub fn save_to_file(&self, path: &Path) -> Result<(), RulesError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -177,17 +455,16 @@ impl NrdCache {
         ));
 
         let write_res = (|| -> Result<(), std::io::Error> {
-            let mut file = File::create(&tmp_path)?;
-            writeln!(file, "{NRD_CACHE_HEADER}")?;
+            let file = File::create(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+            writeln!(writer, "{NRD_CACHE_HEADER}")?;
             if let Some(ts) = self.updated_at_ms {
-                writeln!(file, "{NRD_UPDATED_PREFIX}{ts}")?;
+                writeln!(writer, "{NRD_UPDATED_PREFIX}{ts}")?;
             }
-            let mut sorted: Vec<&str> = self.domains.iter().map(String::as_str).collect();
-            sorted.sort_unstable();
-            for domain in sorted {
-                writeln!(file, "{domain}")?;
+            for domain in self.iter() {
+                writeln!(writer, "{domain}")?;
             }
-            file.flush()?;
+            writer.flush()?;
             Ok(())
         })();
         if let Err(err) = write_res {

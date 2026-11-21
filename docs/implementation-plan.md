@@ -8,8 +8,8 @@
 
 [ledr_artifact.html](../ledr_artifact.html) は、全ファイル走査型の従来型アンチウイルスや常駐型 Electron GUI を排し、OS カーネルのイベント駆動通知、Rust 製常駐コアデーモン、組み込み SQLite WAL ストア、オンデマンド起動の Tauri v2 UI、および Chrome Manifest V3 拡張機能の連携によって CPU 負荷 1% 未満と常駐メモリ 10〜20 MB 以下の両立を目指している。
 
-設計レビューで抽出した要協議事項 A〜P は、2026-11-18 にユーザーが全推奨案を承認して確定した。
-確定した 16 件の仕様判断は [decision-records.md](decision-records.md) に保存しており、本計画書では決定内容や根拠を重複管理せず `決定記録 L-01` 〜 `決定記録 L-16` の ID で参照する。
+設計レビューで抽出した要協議事項 A〜P は 2026-11-18 に、Phase 4 詳細設計の追加論点 5 件は 2026-11-21 にユーザーが全推奨案を承認して確定した。
+確定した 21 件の仕様判断は [decision-records.md](decision-records.md) に保存しており、本計画書では決定内容や根拠を重複管理せず `決定記録 L-01` 〜 `決定記録 L-21` の ID で参照する。
 
 | 決定 ID | 論点 | 計画書内の主な反映先 |
 | :--- | :--- | :--- |
@@ -29,6 +29,11 @@
 | `決定記録 L-14` | NRD とホモグラフ判定のデータソース | Layer 2 詳細設計、Layer 4 詳細設計 |
 | `決定記録 L-15` | Pastejacking と ClickFix の発火条件 | Layer 4 詳細設計 |
 | `決定記録 L-16` | Windows Service 復旧と自己保護方針 | 前提と実行環境、Layer 2 詳細設計 |
+| `決定記録 L-17` | Phase 4 の PR 分割方針と実機 Chrome E2E 検証の切り分け | 段階的実装計画（Phase 4）、`FU-E2E-02` |
+| `決定記録 L-18` | 移動後 MOTW バイナリの事前 WFP 制限 | Layer 2 詳細設計（`ProcessStart` MOTW 評価） |
+| `決定記録 L-19` | `ReportBrowserEvent` 受信時の OS トースト通知要否 | Layer 2 詳細設計、Layer 4 詳細設計 |
+| `決定記録 L-20` | 拡張機能の固定公開鍵と `ledr-bridge-nm setup` スコープ | Layer 4 詳細設計（Native Messaging） |
+| `決定記録 L-21` | ClickFix 観測用 `MAIN` world フックと DNR 初期ルール範囲 | Layer 4 詳細設計（Chrome MV3 拡張） |
 
 技術的な品質と安全性を確保するための改善 15 項目（`AUTO-01` 〜 `AUTO-15`）は、仕様の意図を変えない範囲で各層の設計へ織り込んでいる。
 
@@ -541,10 +546,11 @@ Phase 3 の実装項目 4 件は合成自動テストに合格して `main` へ�
 
 ### Phase 4 Chrome 拡張と Native Messaging の統合
 
-- [ ] `crates/ledr-bridge-nm` に Native Messaging ブリッジ CLI とマニフェスト、レジストリ、`ledr://` URI スキームの自動登録コマンドを実装する
-- [ ] `extensions/ledr-chrome-mv3` に固定公開鍵 ID、DNR ブロックルール、ClickFix と Pastejacking の検知、NRD やホモグラフ URL 上のパスワード入力警告、および `downloads.onCreated` と `onChanged` の連携を実装する
-- [ ] `crates/ledr-sensor-win`、`crates/ledr-daemon`、`crates/ledr-store` に `:Zone.Identifier` 読み取り、`download_origins` 保存、および 3 段階 MOTW 紐付けを実装する
+- [x] `crates/ledr-bridge-nm` に Native Messaging ブリッジ CLI とマニフェスト、レジストリ、`ledr://` URI スキームの自動登録コマンドを実装する（PR #26、`6bb8bd3` にて `main` マージ済み）
+- [x] `extensions/ledr-chrome-mv3` に固定公開鍵 ID、DNR ブロックルール、ClickFix と Pastejacking の検知、NRD やホモグラフ URL 上のパスワード入力警告、および `downloads.onCreated` と `onChanged` の連携を実装する（PR #26、`6bb8bd3` にて `main` マージ済み）
+- [x] `crates/ledr-sensor-win`、`crates/ledr-daemon`、`crates/ledr-store` に `:Zone.Identifier` 読み取り、`download_origins` 保存、および 3 段階 MOTW 紐付けを実装する（PR #25、`cf7e866` にて `main` マージ済み）
 - [ ] `apps/ledr-ui` の View 1〜3 へブラウザ由来のダウンロード元 URL、リファラ、および拡張ステータス表示を統合する
+- [ ] 実機 Chrome E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[phase4-e2e-runbook.md](phase4-e2e-runbook.md) および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-02` 参照）
 
 受け入れ条件として、ローカルテストページでの疑似 ClickFix コピー試行および NRD パスワード入力時にブラウザ内警告とデーモン記録が動作すること、また Chrome でダウンロードしたテストバイナリの起動時にダウンロード元 URL とリファラが自動紐付けされて UI へ表示されることを確認する。
 
@@ -570,16 +576,16 @@ cargo test -p ledr-store --test ttl_purge_lineage --locked
 
 1. 疑似攻撃シナリオ検証（Windows 10/11 の管理者昇格 PowerShell で実行）では、`ledr-daemon.exe` を稼働させた状態で `ledr-sim.exe run-all` を実行し、Phase 1〜3 の受け入れ条件（親子系譜記録、ダミー機密ファイルアクセス時のサスペンドと再開、おとり書込によるツリー封じ込め、WFP 動的遮断と強制終了時の通信不能回避）を確認する。なお、トースト通知（`ledr://alert/<id>`）クリック起動の検証にはユーザー単位の `HKCU\Software\Classes\ledr` 登録（`--notify` 実行時の自動登録または `ledr-ui --register-uri` の事前実行）を用い、システム全体のレジストリ登録は Phase 4 インストーラ（`AUTO-14`）で実施する。
 2. リソース上限の計測（10 分間アイドルおよび `cargo build` 負荷計測）では、ウィンドウ閉鎖状態で `Get-Process ledr-ui -ErrorAction SilentlyContinue` が 0 件（UI メモリ 0 MB）であること、`Get-Process ledr-daemon` の Working Set が 20 MB 以下かつ定常時 CPU 平均使用率が 0.5% 未満であることを確認する。
-3. Chrome 拡張 E2E 検証（Phase 4）では、`extensions/ledr-chrome-mv3` を Chrome のデベロッパーモードで読み込み、ローカル検証用 HTML 上で ClickFix 疑似ボタンと疑似 NRD パスワードフォームを操作してブラウザ警告と `ledr-ui` の記録を確認し、さらにローカルサーバーからダウンロードしたテスト実行ファイルの起動時にオリジン URL が View 1 と View 2 に表示されることを確認する。
+3. Chrome 拡張 E2E 検証（Phase 4）では、[phase4-e2e-runbook.md](phase4-e2e-runbook.md) に従い `extensions/ledr-chrome-mv3` を Chrome のデベロッパーモードで読み込み、[phase4-browser-test.html](fixtures/phase4-browser-test.html) 上で ClickFix 疑似ボタンと疑似 NRD パスワードフォームを操作してブラウザ警告と `ledr-ui` の記録を確認し、さらにローカルサーバーからダウンロードしたテスト実行ファイルの起動時にオリジン URL が View 1 と View 2 に表示されることを確認する。
 
 ## 引き継ぎと次セッションへの移行手順
 
-Phase 0 から Phase 3 までの実装および合成自動テストは `main` ブランチへマージ済みであり、残作業は Phase 4 の実装と Phase 2 および Phase 3 の実機 E2E 検証に分かれる。
+Phase 0 から Phase 3 までの実装、ならびに Phase 4 のコア追跡基盤（PR #25）とブリッジおよび拡張（PR #26）は `main` ブランチへマージ済みであり、残作業は Phase 4 UI 統合（PR 4C）のマージと実機 E2E 検証（`FU-E2E-01`、`FU-E2E-02`）に分かれる。
 後続の作業はいずれも新しいセッションで開始する。
 
 ### 現在地の確認方法
 
-実装を再開する際は、はじめに `main` ブランチの最新状態、本計画書の Phase 0〜4 チェックリストの `[x]` 完了状況、および [decision-records.md](decision-records.md) の `L-01` 〜 `L-16` を確認する。
+実装を再開する際は、はじめに `main` ブランチの最新状態、本計画書の Phase 0〜4 チェックリストの `[x]` 完了状況、および [decision-records.md](decision-records.md) の `L-01` 〜 `L-21` を確認する。
 
 ### ブランチ運用とマージ後の基準点更新ルール
 
@@ -595,10 +601,10 @@ ETW、WFP、Named Pipe DACL、`NtSuspendProcess`、`CreateProcessAsUser`、お�
 
 次セッションの開始時は着手対象に応じて以下の再開プロンプト案を使用する。
 
-#### Phase 4（`phase-4-chrome-mv3`）着手用
+#### Phase 4 実機 Chrome E2E 検証（`FU-E2E-02`）用
 
 ```text
-docs/implementation-plan.md、docs/decision-records.md（L-01〜L-16）、および AGENTS.md に基づき、main の最新コミットから作業ブランチ phase-4-chrome-mv3 を作成して Phase 4（crates/ledr-bridge-nm、extensions/ledr-chrome-mv3、:Zone.Identifier と 3 段階 MOTW 紐付け、apps/ledr-ui の View 1〜3 統合）を実装し、標準検証コマンド一式まで通してください。
+docs/phase4-e2e-runbook.md、docs/follow-up-notes.md の FU-E2E-02、docs/decision-records.md（L-01〜L-21）、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU 環境で Phase 4 の実機 Chrome E2E 検証を実施し、検証結果と合否記録を独立した PR としてまとめてください。
 ```
 
 #### Phase 2〜3 実機 E2E 検証（`FU-E2E-01`）用

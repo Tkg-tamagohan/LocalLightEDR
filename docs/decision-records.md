@@ -1,7 +1,7 @@
 # LocalEDR 仕様決定記録
 
-本記録は [ledr_artifact.html](../ledr_artifact.html) の設計レビューで抽出した要協議事項 A〜P に対する確定仕様を一覧化したものである。
-決定内容は 2026-11-18 にユーザーが全推奨案を受け入れた結果に基づき、各決定は [implementation-plan.md](implementation-plan.md) から `決定記録 L-01` 〜 `決定記録 L-16` の ID で参照する。
+本記録は [ledr_artifact.html](../ledr_artifact.html) の設計レビューで抽出した要協議事項 A〜P（2026-11-18 確定分 `L-01`〜`L-16`）および Phase 4 詳細設計で確定した追加論点（2026-11-21 確定分 `L-17`〜`L-21`）を一覧化したものである。
+各決定は [implementation-plan.md](implementation-plan.md) から `決定記録 L-01` 〜 `決定記録 L-21` の ID で参照する。
 
 ## 確定仕様一覧
 
@@ -23,3 +23,8 @@
 | L-14 | Layer 2, 4 | NRD とホモグラフ判定のデータソース（項目 N） | 通信ごとの外部照会は行わず、1. デーモンが 1 日 1 回取得する公開 NRD フィード（登録 14 日以内）のローカルキャッシュ照合、2. ローカル DNS 履歴にない初見ドメイン判定、および 3. Punycode（`xn--`）と主要ブランド名との編集距離によるホモグラフ判定を組み合わせる。 | ブラウザや通信処理へ待機遅延や訪問先ドメインの外部露出を持ち込まず、ローカル環境内で高速にフィッシング兆候を判定できるため。 |
 | L-15 | Chrome 拡張 | Pastejacking（ClickFix）検知の発火条件（項目 O） | 警告発火をコピー文字列が危険な LOTL コマンド特徴量（`powershell`、`pwsh`、`cmd`、`mshta`、`certutil`、`curl` パイプ経由シェル実行、`iex`、`-enc`、不可視制御文字や改行注入）を含む場合、またはユーザーの DOM 選択範囲（`getSelection()`）とクリップボード書き込み文字列が不一致の場合に限定する。 | 開発者の日常的なコードコピー作業を妨げずに、ユーザーに気付かせず悪性コマンドを貼らせる ClickFix や Pastejacking のみを捕捉できるため。 |
 | L-16 | Layer 2〜3 | Windows Service 復旧と自己保護方針（項目 P） | `LocalSystem` サービスとして SCM 回復オプション（失敗時 1 秒後に自動再起動）を設定し、設定、ルール、および SQLite DB を `C:\ProgramData\LocalEDR\`（DACL を `SYSTEM` と管理者のみ書込許可に設定）へ格納する。 | カーネル保護ドライバ（ELAM や PPL）を書かない制約のもとで、OS 標準の権限分離のみでサービス停止攻撃と設定改ざんを阻止できるため。 |
+| L-17 | Phase 4 | PR 分割方針と実機 Chrome E2E 検証の切り分け | Phase 4 の実装を排他ファイル境界の 3 PR（PR 4A コア追跡基盤、PR 4B ブリッジと Chrome MV3 拡張、PR 4C UI 統合と文書同期）へ分割し、実機 Windows 10 および 11 上の Chrome E2E 検証は `FU-E2E-02` として独立項目に切り分ける。 | Rust コア変更、ブラウザ拡張とブリッジ、および UI 統合を独立してレビューおよび自動検証でき、PR 肥大化と手戻りを防げるため。 |
+| L-18 | Layer 2〜3 | 移動後 MOTW バイナリの事前 WFP 制限 | `ProcessStart` 時の Stage 2（SHA-256）または Stage 3（`:Zone.Identifier` の `ZoneId >= 3`）で MOTW が確認された未許可バイナリ（`ProtectedOs` と既存 `NetworkAllow` 一致を除く）には、`HighRiskPath` と同じく起動時に事前 WFP ブロックを適用する（`outbound_enforcement_mode != Audit` 時）。 | [ledr_artifact.html](../ledr_artifact.html) の「外部 Web 由来の未知バイナリへ厳格な通信制限を自動適用する」要件を満たし、`Downloads` からの移動による事前制限回避を防げるため。 |
+| L-19 | Layer 2, 4 | `ReportBrowserEvent` 受信時の OS トースト通知要否 | 既定では OS トースト通知を発火せず、ブラウザ内警告オーバーレイと SQLite `alerts` 記録（View 1 表示）にとどめ、将来の設定切替用フック（`notify_browser_events`）のみ設ける。 | ユーザーはブラウザ上で警告を直接見ているため、同時トースト発火による二重通知とワンショット UI 起動の負荷を避けられるため。 |
+| L-20 | Layer 4 | 拡張機能の固定公開鍵と `ledr-bridge-nm setup` スコープ | リポジトリ用の RSA-2048 公開鍵を新規生成して公開鍵のみ [manifest.json](../extensions/ledr-chrome-mv3/manifest.json) の `"key"` へ固定（秘密鍵は破棄、固定 ID `ecelachfiiiiiibpjeomfncgpegbpanh`）し、`ledr-bridge-nm setup` は既定 `--scope user`（`HKCU`）と管理者向け `--scope machine`（`HKLM`）の両対応とする。 | 秘密鍵を残さずアンパック拡張 ID と `allowed_origins` を固定でき、非特権開発とシステム全体導入の双方を単一 CLI で扱えるため。 |
+| L-21 | Chrome 拡張 | ClickFix 観測用 `MAIN` world フックと DNR 初期ルール範囲 | MV3 標準の `"world": "MAIN"` 軽量スクリプト（`content_main.js`）で `navigator.clipboard.writeText`、`write`、および `execCommand('copy')` を観測して `ISOLATED` world へ通知し、[dnr_static.json](../extensions/ledr-chrome-mv3/rules/dnr_static.json) の初期静的ルールは検証用 `.localedr.invalid` ドメインのみを同梱した上で動的 DNR ルール API を実装する。 | ボタン押下型 ClickFix の多くは `MAIN` world の `writeText` を使うため `ISOLATED` world のみでは捕捉漏れが起き、また初期ルールを検証ドメインに絞ることで通常閲覧の誤遮断とサードパーティリストのライセンス問題を回避できるため。 |

@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LocalEDR Phase 4 Local Browser Fixture</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0f172a;
+        --panel: #1e293b;
+        --border: #334155;
+        --text: #f8fafc;
+        --muted: #94a3b8;
+        --accent: #38bdf8;
+        --danger: #f87171;
+        --ok: #34d399;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.5;
+      }
+      main {
+        max-width: 880px;
+        margin: 0 auto;
+        display: grid;
+        gap: 16px;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 12px;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 12px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 20px;
+      }
+      h2 {
+        margin: 0 0 10px;
+        font-size: 16px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+      button,
+      .link-btn {
+        display: inline-block;
+        padding: 8px 12px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: #0f172a;
+        color: var(--text);
+        font-size: 13px;
+        cursor: pointer;
+        text-decoration: none;
+      }
+      button:hover,
+      .link-btn:hover {
+        border-color: var(--accent);
+      }
+      code,
+      pre,
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        font-size: 13px;
+      }
+      pre,
+      .select-box {
+        background: #0b1220;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 10px 12px;
+        margin: 8px 0;
+        user-select: all;
+        overflow-x: auto;
+      }
+      input[type="password"] {
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: #0b1220;
+        color: var(--text);
+        min-width: 260px;
+      }
+      .status {
+        margin-top: 8px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .status.is-ok {
+        color: var(--ok);
+      }
+      .status.is-blocked {
+        color: var(--danger);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>LocalEDR Phase 4 Browser Verification Fixture</h1>
+        <span id="origin-label" class="mono">Origin: -</span>
+      </header>
+
+      <section class="card" aria-labelledby="sec-clickfix">
+        <h2 id="sec-clickfix">1. ClickFix (Clipboard writeText)</h2>
+        <div class="row">
+          <button id="btn-clickfix" type="button">Copy Verification Command</button>
+        </div>
+        <div id="status-clickfix" class="status" role="status" aria-live="polite">Ready</div>
+      </section>
+
+      <section class="card" aria-labelledby="sec-pastejack">
+        <h2 id="sec-pastejack">2. Pastejacking (DOM copy swap)</h2>
+        <div id="pastejack-target" class="select-box mono" tabindex="0">echo hello-localedr</div>
+        <div id="status-pastejack" class="status" role="status" aria-live="polite">Select text above and press Ctrl+C</div>
+      </section>
+
+      <section class="card" aria-labelledby="sec-benign">
+        <h2 id="sec-benign">3. Benign Developer Copy</h2>
+        <pre id="benign-snippet">cargo test --workspace --locked</pre>
+        <div class="row">
+          <button id="btn-benign-copy" type="button">Copy Snippet</button>
+        </div>
+        <div id="status-benign" class="status" role="status" aria-live="polite">Ready</div>
+      </section>
+
+      <section class="card" aria-labelledby="sec-password">
+        <h2 id="sec-password">4. Password Input (NRD / Homograph)</h2>
+        <form id="password-form" class="row">
+          <label for="test-password">Password</label>
+          <input id="test-password" type="password" autocomplete="off" />
+          <button type="submit">Submit (Local No-Op)</button>
+        </form>
+        <div id="status-password" class="status" role="status" aria-live="polite">Hostname: -</div>
+      </section>
+
+      <section class="card" aria-labelledby="sec-dnr">
+        <h2 id="sec-dnr">5. DNR Block vs Allowed Control</h2>
+        <div class="row">
+          <button id="btn-dnr-safe" type="button">Fetch safe-sim.localedr.invalid</button>
+          <button id="btn-dnr-c2" type="button">Fetch c2-sim.localedr.invalid</button>
+          <button id="btn-dnr-blocked" type="button">Fetch blocked-test.localedr.invalid</button>
+        </div>
+        <div id="status-dnr" class="status" role="status" aria-live="polite">Ready</div>
+      </section>
+
+      <section class="card" aria-labelledby="sec-download">
+        <h2 id="sec-download">6. MOTW Download Attribution</h2>
+        <div class="row">
+          <a class="link-btn" href="/download/localedr-e2e-sample.exe" download="localedr-e2e-sample.exe">
+            Download localedr-e2e-sample.exe
+          </a>
+          <a class="link-btn" href="/download/localedr-e2e-sample.cmd" download="localedr-e2e-sample.cmd">
+            Download localedr-e2e-sample.cmd
+          </a>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      (() => {
+        "use strict";
+
+        const host = window.location.hostname || "unknown";
+        const port = window.location.port || "8765";
+        const originLabel = document.getElementById("origin-label");
+        const statusPassword = document.getElementById("status-password");
+        originLabel.textContent = `Origin: ${window.location.origin}`;
+        statusPassword.textContent = `Hostname: ${host}`;
+
+        async function copyWithFallback(text) {
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+            try {
+              await navigator.clipboard.writeText(text);
+              return "clipboard.writeText";
+            } catch {
+              // Fall back to execCommand when opened outside a Secure Context.
+            }
+          }
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.setAttribute("readonly", "");
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand("copy");
+          document.body.removeChild(ta);
+          return ok ? "execCommand(copy)" : "copy failed";
+        }
+
+        document.getElementById("btn-clickfix").addEventListener("click", async () => {
+          const payload =
+            "powershell -NoProfile -EncodedCommand VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIAAiAEwAbwBjAGEAbABFAEQAUgAiAA==";
+          const method = await copyWithFallback(payload);
+          document.getElementById("status-clickfix").textContent = `Copied via ${method}`;
+        });
+
+        document.getElementById("pastejack-target").addEventListener("copy", (event) => {
+          if (event.clipboardData) {
+            event.preventDefault();
+            event.clipboardData.setData(
+              "text/plain",
+              "cmd /c powershell -NoProfile -Command Write-Output LocalEDR-Pastejacking-Test",
+            );
+            document.getElementById("status-pastejack").textContent =
+              "Copy event swapped clipboard payload";
+          }
+        });
+
+        document.getElementById("btn-benign-copy").addEventListener("click", async () => {
+          const text = document.getElementById("benign-snippet").textContent || "";
+          const method = await copyWithFallback(text.trim());
+          document.getElementById("status-benign").textContent = `Copied via ${method}`;
+        });
+
+        document.getElementById("password-form").addEventListener("submit", (event) => {
+          event.preventDefault();
+          statusPassword.textContent = `Submitted locally on ${host} (no network request)`;
+        });
+
+        async function probeUrl(targetHost) {
+          if (!targetHost.endsWith(".localedr.invalid")) {
+            throw new Error("Only .localedr.invalid hosts are allowed");
+          }
+          const statusEl = document.getElementById("status-dnr");
+          const url = "http://" + targetHost + ":" + port + "/beacon";
+          statusEl.className = "status";
+          statusEl.textContent = `Requesting ${url}...`;
+          try {
+            const resp = await fetch(url, { cache: "no-store" });
+            statusEl.className = "status is-ok";
+            statusEl.textContent = `Allowed: ${url} (HTTP ${resp.status})`;
+          } catch (err) {
+            statusEl.className = "status is-blocked";
+            statusEl.textContent = `Blocked/Failed: ${url} (${err && err.message ? err.message : String(err)})`;
+          }
+        }
+
+        document.getElementById("btn-dnr-safe").addEventListener("click", () => {
+          probeUrl("safe-sim.localedr.invalid");
+        });
+        document.getElementById("btn-dnr-c2").addEventListener("click", () => {
+          probeUrl("c2-sim.localedr.invalid");
+        });
+        document.getElementById("btn-dnr-blocked").addEventListener("click", () => {
+          probeUrl("blocked-test.localedr.invalid");
+        });
+      })();
+    </script>
+  </body>
+</html>

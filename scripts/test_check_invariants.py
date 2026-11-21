@@ -135,6 +135,37 @@ def _reject_nonstandard_json_constant(token: str) -> None:
     raise ValueError(f"Non-standard JSON constant is not allowed: {token!r}")
 
 
+def _posix_glob_match(path_str: str, pattern: str) -> bool:
+    """Match a POSIX relative path against a glob pattern supporting '**'."""
+    norm = path_str.replace("\\", "/").strip()
+    if norm.startswith("./"):
+        norm = norm[2:]
+    pat = pattern.replace("\\", "/").strip()
+    if pat.startswith("./"):
+        pat = pat[2:]
+    i = 0
+    n = len(pat)
+    parts: list[str] = ["^"]
+    while i < n:
+        if pat[i : i + 3] == "**/":
+            parts.append("(?:.*/)?")
+            i += 3
+        elif pat[i : i + 2] == "**":
+            parts.append(".*")
+            i += 2
+        elif pat[i] == "*":
+            parts.append("[^/]*")
+            i += 1
+        elif pat[i] == "?":
+            parts.append("[^/]")
+            i += 1
+        else:
+            parts.append(re.escape(pat[i]))
+            i += 1
+    parts.append("$")
+    return bool(re.match("".join(parts), norm))
+
+
 def _load_gate_module(gate_script: Path):
     spec = importlib.util.spec_from_file_location("check_invariants_decision1", gate_script)
     if spec is None or spec.loader is None:
@@ -405,6 +436,21 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
         self.assertIn("View 3", phase4_ui["instructions"])
         self.assertIn("KEY_WOW64_32KEY", phase4_ui["instructions"])
         self.assertIn("KEY_WOW64_64KEY", phase4_ui["instructions"])
+        self.assertIn("apps/ledr-ui/src/defense_status.rs", phase4_ui["instructions"])
+        self.assertIn("apps/ledr-ui/src/uri_reg.rs", phase4_ui["instructions"])
+        for handle_kw in (
+            "FILE_FLAG_OPEN_REPARSE_POINT",
+            "FILE_READ_ATTRIBUTES",
+            "nNumberOfLinks == 1",
+            "GetFinalPathNameByHandleW",
+            "ReOpenFile",
+            "description",
+        ):
+            self.assertIn(handle_kw, phase4_ui["instructions"])
+        self.assertIn(
+            "conflates unverified with verified or invalid",
+            phase4_ui["criteria"]["true_description"],
+        )
         self.assertIn(
             "removing non-contamination assertions alone",
             phase4_ui["criteria"]["true_description"],
@@ -421,6 +467,53 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertIn("diagnostic", text_field.lower())
             self.assertIn("UI-P4-08", text_field)
             self.assertIn("non-contamination", text_field)
+
+        # Verify offline (even when the global plugin script is not installed) that
+        # every path_glob in .agents/invariants.json matches tracked repo file(s)
+        # covered by check_invariants.DEFAULT_PATHS.
+        ls_proc = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(ls_proc.returncode, 0, msg=ls_proc.stderr.decode("utf-8", errors="replace"))
+        tracked_files = [
+            p for p in ls_proc.stdout.decode("utf-8", errors="strict").split("\0") if p
+        ]
+        for key, (exp_globs, _, _) in EXPECTED_QUESTIONS.items():
+            for pat in exp_globs:
+                is_literal = not any(ch in pat for ch in "*?[")
+                if is_literal:
+                    self.assertTrue(
+                        (REPO_ROOT / pat).is_file(),
+                        f"{key}.path_globs literal path does not exist: {pat}",
+                    )
+                    self.assertTrue(
+                        any(
+                            _posix_glob_match(pat, default_pat)
+                            for default_pat in check_invariants.DEFAULT_PATHS
+                        ),
+                        f"{key}.path_globs literal path {pat!r} is not covered by check_invariants.DEFAULT_PATHS",
+                    )
+                else:
+                    matched_tracked = [f for f in tracked_files if _posix_glob_match(f, pat)]
+                    self.assertTrue(
+                        matched_tracked,
+                        f"{key}.path_globs pattern {pat!r} matches no tracked repository files",
+                    )
+                    covered = [
+                        f
+                        for f in matched_tracked
+                        if any(
+                            _posix_glob_match(f, default_pat)
+                            for default_pat in check_invariants.DEFAULT_PATHS
+                        )
+                    ]
+                    self.assertTrue(
+                        covered,
+                        f"{key}.path_globs pattern {pat!r} has no tracked files covered by check_invariants.DEFAULT_PATHS",
+                    )
 
         gate_script = self._require_gate_script()
 
@@ -580,6 +673,20 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                 "@@ -1344,2 +1344,2 @@",
                 "         view32,",
                 "-        RegistryStringProbe::Present(_) | RegistryStringProbe::EmptyString\n+        RegistryStringProbe::Present(_)",
+                {"phase4_ui_manifest_allowlist_and_wow64"},
+            ),
+            (
+                "apps/ledr-ui/src/uri_reg.rs",
+                "@@ -191,2 +191,2 @@",
+                "             RegWow64View::Default => 0,",
+                "-            RegWow64View::View32 => KEY_WOW64_32KEY,\n+            RegWow64View::View32 => KEY_WOW64_64KEY,",
+                {"phase4_ui_manifest_allowlist_and_wow64"},
+            ),
+            (
+                "apps/ledr-ui/ui/app.js",
+                "@@ -2776,3 +2776,3 @@",
+                "                 return `<div class=\"browser-detail-row\"><span class=\"badge badge-metric\">${escapeHtml(",
+                "                   b.browser,\n-                )}</span> ${bBadge}${bPath}${bErr}</div>`;\n+                )}</span> ${bBadge}${bPath}</div>`;",
                 {"phase4_ui_manifest_allowlist_and_wow64"},
             ),
             (

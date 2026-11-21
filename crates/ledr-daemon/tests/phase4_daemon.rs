@@ -1,10 +1,11 @@
-//! Phase 4A integration tests for `ledr-daemon` (`DAEMON-P4-01`..`DAEMON-P4-22`):
+//! Phase 4A integration tests for `ledr-daemon` (`DAEMON-P4-01`..`DAEMON-P4-23`):
 //! `ReportDownloadOrigin`, 3-stage MOTW attribution, `L-18` pre-emptive WFP restrictions,
 //! `ReportBrowserEvent` severity/dedup/`L-19` notification suppression, `LAYER_4_BROWSER`
 //! alert resolution, bridge IPC auth, `spawn_blocking` responsiveness, burst budget,
 //! delayed MOTW observe-to-enforce escalation, startup seed MOTW backlog deduplication,
 //! Stage 2 `(sha256, generation)` cache invalidation, default cancellable SHA-256 contract,
-//! case-preserving seed MOTW grouping, and non-blocking late attribution with fair drain.
+//! case-preserving seed MOTW grouping, non-blocking late attribution with fair drain, and
+//! bounded late-slot reservation under saturated real-time process MOTW bursts.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -3912,5 +3913,402 @@ async fn daemon_p4_22_seed_case_sensitivity_and_nonblocking_late_motw_fair_drain
     assert_eq!(
         final_matched, seed_group_count,
         "all 80 seed MOTW groups must persist origin_url with zero loss"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p4_23_saturated_motw_burst_above_pending_late_zero_loss_and_ipc_responsive() {
+    #[derive(Clone)]
+    struct CanaryGate {
+        entered: Arc<(Mutex<usize>, Condvar)>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl CanaryGate {
+        fn new() -> (Self, GateReleaseGuard) {
+            let entered = Arc::new((Mutex::new(0usize), Condvar::new()));
+            let released = Arc::new((Mutex::new(false), Condvar::new()));
+            let guard = GateReleaseGuard(Arc::clone(&released));
+            (Self { entered, released }, guard)
+        }
+
+        fn wait_inside(&self) {
+            let do_wait = || {
+                {
+                    let (lock, cvar) = &*self.entered;
+                    let mut count = lock.lock().expect("lock canary gate entered");
+                    *count += 1;
+                    cvar.notify_all();
+                }
+                {
+                    let (lock, cvar) = &*self.released;
+                    let mut flag = lock.lock().expect("lock canary gate released");
+                    while !*flag {
+                        flag = cvar.wait(flag).expect("wait canary gate released");
+                    }
+                }
+            };
+            // Yield the Tokio worker slot before blocking on a Condvar so the multi-threaded
+            // runtime's timer driver and IPC server remain responsive while `run_pipeline` is paused.
+            if tokio::runtime::Handle::try_current()
+                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            {
+                tokio::task::block_in_place(do_wait);
+            } else {
+                do_wait();
+            }
+        }
+
+        fn release(&self) {
+            let (lock, cvar) = &*self.released;
+            let mut flag = lock.lock().expect("lock canary gate released");
+            *flag = true;
+            cvar.notify_all();
+        }
+    }
+
+    struct GatedCanaryNotifier {
+        gate1: CanaryGate,
+        gate2: CanaryGate,
+        gate3: CanaryGate,
+    }
+
+    impl NotificationDispatcher for GatedCanaryNotifier {
+        fn notify_alert(&self, alert: &AlertRecord) -> Result<(), String> {
+            if alert.context_json.contains("gate1_canary") {
+                self.gate1.wait_inside();
+            } else if alert.context_json.contains("gate2_canary") {
+                self.gate2.wait_inside();
+            } else if alert.context_json.contains("gate3_canary") {
+                self.gate3.wait_inside();
+            }
+            Ok(())
+        }
+    }
+
+    struct CountingBurstMotwInspector {
+        zones: HashMap<String, MotwZoneInfo>,
+        seed_calls: Arc<(Mutex<usize>, Condvar)>,
+        rt_calls: Arc<(Mutex<usize>, Condvar)>,
+    }
+
+    impl MotwInspector for CountingBurstMotwInspector {
+        fn read_zone_identifier(&self, path: &Path) -> Option<MotwZoneInfo> {
+            let normalized = path.display().to_string().replace('/', "\\");
+            let found = self.zones.get(&normalized).cloned();
+            if normalized.contains(r"\seed_") {
+                let (lock, cvar) = &*self.seed_calls;
+                let mut count = lock.lock().expect("lock seed_calls");
+                *count += 1;
+                cvar.notify_all();
+            } else if normalized.contains(r"\rt_") {
+                let (lock, cvar) = &*self.rt_calls;
+                let mut count = lock.lock().expect("lock rt_calls");
+                *count += 1;
+                cvar.notify_all();
+            }
+            found
+        }
+    }
+
+    const SEED_COUNT: usize = 64;
+    const WAVE1_COUNT: usize = 50;
+    const WAVE2_COUNT: usize = 40;
+    const RT_TOTAL: usize = WAVE1_COUNT + WAVE2_COUNT; // 90 > MOTW_PENDING_LATE_CAPACITY (66)
+    const EXPECTED_TOTAL: usize = SEED_COUNT + RT_TOTAL; // 154
+
+    let base_ms = 1_760_023_000_000i64;
+    let mut zones: HashMap<String, MotwZoneInfo> = HashMap::with_capacity(EXPECTED_TOTAL);
+    let mut expected_origins: HashMap<String, String> = HashMap::with_capacity(EXPECTED_TOTAL);
+    let mut seed_events: Vec<SensorEvent> = Vec::with_capacity(SEED_COUNT);
+
+    for i in 0..SEED_COUNT {
+        let exe = format!(r"C:\SeedBurst23\seed_{i:02}.exe");
+        let url = format!("https://seed23.example.invalid/seed_{i:02}.exe");
+        zones.insert(
+            exe.clone(),
+            MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(url.clone()),
+                referrer_url: Some("https://seed23-ref.example.invalid/".to_string()),
+            },
+        );
+        let ident = ProcessIdentity::new(41_000 + i as u32, unix_ms_to_filetime(base_ms + i as i64));
+        expected_origins.insert(ident.instance_id(), url);
+        seed_events.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe,
+            command_line: format!("seed_{i:02}.exe"),
+            user_sid: None,
+        });
+    }
+
+    let mut rt_events: Vec<SensorEvent> = Vec::with_capacity(RT_TOTAL);
+    for i in 0..RT_TOTAL {
+        let exe = format!(r"C:\RtBurst23\rt_{i:02}.exe");
+        let url = format!("https://rt23.example.invalid/rt_{i:02}.exe");
+        zones.insert(
+            exe.clone(),
+            MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(url.clone()),
+                referrer_url: Some("https://rt23-ref.example.invalid/".to_string()),
+            },
+        );
+        let ident = ProcessIdentity::new(
+            42_000 + i as u32,
+            unix_ms_to_filetime(base_ms + 10_000 + i as i64),
+        );
+        expected_origins.insert(ident.instance_id(), url);
+        rt_events.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe,
+            command_line: format!("rt_{i:02}.exe"),
+            user_sid: None,
+        });
+    }
+
+    let dir = TestTempDir::new("p4-23");
+    let dl_file = dir.0.join("urgent_p4_23_dl.exe");
+    std::fs::write(&dl_file, b"p4-23-urgent-download-payload-for-sha256")
+        .expect("write urgent_p4_23_dl.exe");
+    let expected_dl_sha = compute_file_sha256_hex(&dl_file).expect("hash urgent_p4_23_dl.exe");
+    let dl_path_str = dl_file.display().to_string();
+
+    let (gate1, _gate1_guard) = CanaryGate::new();
+    let (gate2, _gate2_guard) = CanaryGate::new();
+    let (gate3, _gate3_guard) = CanaryGate::new();
+    let notifier = Arc::new(GatedCanaryNotifier {
+        gate1: gate1.clone(),
+        gate2: gate2.clone(),
+        gate3: gate3.clone(),
+    });
+
+    let seed_calls = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let rt_calls = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let motw_inspector = Arc::new(CountingBurstMotwInspector {
+        zones,
+        seed_calls: Arc::clone(&seed_calls),
+        rt_calls: Arc::clone(&rt_calls),
+    });
+
+    let pipe_name = unique_test_pipe_name();
+    let store = LedrStore::open_in_memory().expect("open store");
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_name.clone(),
+            dev_mode_bypass_ui_auth: true,
+            ipc_session_timeout_ms: 1_500,
+            motw_sync_wait_budget_ms: 0,
+            shutdown_flush_timeout_ms: 3_000,
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockDefense::new()),
+        notifier.clone(),
+        Arc::new(WindowsBinaryInspector::new()),
+        Arc::new(NullLiveProcessInspector),
+        motw_inspector,
+    );
+    let ipc = start_ipc_server(Arc::clone(&engine)).expect("bind IPC pipe");
+    let sender = engine.sender();
+
+    // 1. Hold `run_pipeline` at Gate 1 (`CanaryFileAccess`), preventing `motw_result_rx` drains.
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: 99_001,
+            target_path: r"C:\Temp\gate1_canary.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 2,
+            is_write_or_delete: true,
+            timestamp_ms: base_ms + 1,
+        })
+        .await
+        .expect("send gate1 canary");
+    let g1_wait = Arc::clone(&gate1.entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&g1_wait, 1))
+        .await
+        .expect("wait gate1 entered");
+
+    // 2. Seed 64 startup MOTW groups to fill `motw_result_tx` (capacity 64).
+    assert_eq!(
+        engine.seed_processes(seed_events).expect("seed 64 MOTW groups"),
+        SEED_COUNT
+    );
+    let seed_wait = Arc::clone(&seed_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&seed_wait, SEED_COUNT))
+        .await
+        .expect("wait 64 seeds resolved into motw_result_tx");
+
+    // 3. Wave 1 (50 real-time ProcessStarts + Gate 2 canary): release Gate 1 so all 50 events
+    //    enqueue into `process_queue` (< 64); 3 slots drain via Tier 1b interleave (high_priority_streak
+    //    1 -> 51 => 3 drains) and 47 stash into `pending_late`, yielding `rt_calls == 50`.
+    for event in rt_events.iter().take(WAVE1_COUNT).cloned() {
+        sender.send(event).await.expect("send wave1 ProcessStart");
+    }
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: 99_002,
+            target_path: r"C:\Temp\gate2_canary.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 2,
+            is_write_or_delete: true,
+            timestamp_ms: base_ms + 2,
+        })
+        .await
+        .expect("send gate2 canary");
+    gate1.release();
+
+    let g2_wait = Arc::clone(&gate2.entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&g2_wait, 1))
+        .await
+        .expect("wait gate2 entered");
+    let rt_wait_50 = Arc::clone(&rt_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&rt_wait_50, WAVE1_COUNT))
+        .await
+        .expect("wait wave1 50 real-time MOTW resolutions");
+
+    // 4. Wave 2 (40 real-time ProcessStarts + Gate 3 canary, total 90 > pending_late cap 66):
+    //    2 more drains occur via Tier 1b interleave (`streak` 4 -> 44 => 2 drains), bringing
+    //    total capacity to 64 (channel) + 5 (drained) + 66 (pending_late) - 64 (seeds) = 71,
+    //    while the remaining 19 stay queued in `process_queue` gated by late-slot reservation.
+    for event in rt_events.iter().skip(WAVE1_COUNT).cloned() {
+        sender.send(event).await.expect("send wave2 ProcessStart");
+    }
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: 99_003,
+            target_path: r"C:\Temp\gate3_canary.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 2,
+            is_write_or_delete: true,
+            timestamp_ms: base_ms + 3,
+        })
+        .await
+        .expect("send gate3 canary");
+    gate2.release();
+
+    let g3_wait = Arc::clone(&gate3.entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&g3_wait, 1))
+        .await
+        .expect("wait gate3 entered");
+    let rt_wait_71 = Arc::clone(&rt_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&rt_wait_71, 71))
+        .await
+        .expect("wait 71 real-time MOTW resolutions under saturated pending_late");
+
+    // 5. While Gate 3 holds `run_pipeline` and `motw_result_tx` (64/64) + `pending_late` (66/66)
+    //    are both saturated with 19 jobs held in `process_queue`, IPC `ReportDownloadOrigin` must
+    //    still preempt via `download_queue`, hash the real temp file, and Ack in < 1s.
+    let dl_t0 = Instant::now();
+    let pipe_for_dl = pipe_name.clone();
+    let dl_req_path = dl_path_str.clone();
+    let dl_resp = tokio::task::spawn_blocking(move || {
+        send_pipe_request(
+            &pipe_for_dl,
+            &IpcRequest::ReportDownloadOrigin {
+                file_path: dl_req_path,
+                tab_url: "https://urgent-p4-23.example.invalid/dl.exe".to_string(),
+                frame_url: None,
+                referrer_url: Some("https://urgent-p4-23-ref.example.invalid/".to_string()),
+                downloaded_at_ms: base_ms + 500,
+            },
+        )
+    })
+    .await
+    .expect("join ReportDownloadOrigin client");
+    let dl_elapsed = dl_t0.elapsed();
+    assert!(
+        matches!(dl_resp, IpcResponse::Ack { .. }),
+        "IPC ReportDownloadOrigin must return Ack while MOTW queues are saturated: {dl_resp:?}"
+    );
+    assert!(
+        dl_elapsed < Duration::from_secs(1),
+        "IPC ReportDownloadOrigin took {dl_elapsed:?} under saturated MOTW burst"
+    );
+
+    let dl_snap = store
+        .query_flight_recorder(10, None)
+        .expect("query persisted download origin");
+    assert_eq!(dl_snap.download_origins.len(), 1);
+    assert_eq!(
+        dl_snap.download_origins[0].sha256.as_deref(),
+        Some(expected_dl_sha.as_str())
+    );
+    assert_eq!(
+        dl_snap.download_origins[0].tab_url,
+        "https://urgent-p4-23.example.invalid/dl.exe"
+    );
+    assert_eq!(
+        *rt_calls.0.lock().expect("lock rt_calls during saturation"),
+        71,
+        "late-slot reservation gate must block the 72nd real-time lookup while pending_late is full"
+    );
+    assert_eq!(*seed_calls.0.lock().expect("lock seed_calls"), SEED_COUNT);
+
+    // 6. Release Gate 3 and verify all 154 processes (64 seeds + 90 real-time launches) persist
+    //    their `origin_url` with zero loss, zero HP drops, and clean shutdown within 3s budget.
+    gate3.release();
+
+    let persist_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = store.flush_batch();
+        let snap = store
+            .query_flight_recorder(512, None)
+            .expect("query persisted MOTW attributions");
+        let matched = snap
+            .processes
+            .iter()
+            .filter(|p| {
+                expected_origins
+                    .get(&p.process_instance_id)
+                    .is_some_and(|exp| p.origin_url.as_deref() == Some(exp.as_str()))
+            })
+            .count();
+        if matched == EXPECTED_TOTAL {
+            break;
+        }
+        assert!(
+            Instant::now() < persist_deadline,
+            "timed out waiting for all {EXPECTED_TOTAL} MOTW origin_urls (matched={matched})"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(*rt_calls.0.lock().expect("lock final rt_calls"), RT_TOTAL);
+    assert_eq!(*seed_calls.0.lock().expect("lock final seed_calls"), SEED_COUNT);
+    assert_eq!(engine.high_priority_dropped(), 0);
+
+    ipc.shutdown().await;
+    let shutdown_t0 = Instant::now();
+    engine
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown_and_flush must complete cleanly within budget");
+    assert!(
+        shutdown_t0.elapsed() < Duration::from_secs(3),
+        "shutdown_and_flush exceeded 3s budget: {:?}",
+        shutdown_t0.elapsed()
+    );
+
+    let final_snap = store
+        .query_flight_recorder(512, None)
+        .expect("query final flight recorder");
+    let final_matched = final_snap
+        .processes
+        .iter()
+        .filter(|p| {
+            expected_origins
+                .get(&p.process_instance_id)
+                .is_some_and(|exp| p.origin_url.as_deref() == Some(exp.as_str()))
+        })
+        .count();
+    assert_eq!(
+        final_matched, EXPECTED_TOTAL,
+        "all {EXPECTED_TOTAL} MOTW attributions must persist with zero loss"
     );
 }

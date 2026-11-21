@@ -314,35 +314,35 @@ pub(super) enum SubmitDownloadIoOutcome {
     Cancelled,
 }
 
-enum MotwIoJob {
-    ResolveProcess {
-        instance_id: String,
-        exe_path: String,
-        reply: Option<oneshot::Sender<Option<MotwAttribution>>>,
-    },
-    ResolveSeedGroup {
-        exe_path: String,
-        instance_ids: Vec<String>,
-    },
-    InspectDownloadFile {
-        normalized_path: String,
-        max_hash_bytes: u64,
-        cancel: Arc<AtomicBool>,
-        reply: oneshot::Sender<DownloadFileIoResult>,
-    },
+struct DownloadInspectJob {
+    normalized_path: String,
+    max_hash_bytes: u64,
+    cancel: Arc<AtomicBool>,
+    reply: oneshot::Sender<DownloadFileIoResult>,
+}
+
+struct ProcessMotwJob {
+    instance_id: String,
+    exe_path: String,
+    reply: Option<oneshot::Sender<Option<MotwAttribution>>>,
 }
 
 struct MotwIoQueueState {
-    queue: VecDeque<MotwIoJob>,
+    download_queue: VecDeque<DownloadInspectJob>,
+    process_queue: VecDeque<ProcessMotwJob>,
     pending_late: VecDeque<LateMotwAttribution>,
+    reserved_late_slots: usize,
+    flushing_pending_late: usize,
     seed_backlog: VecDeque<SeedMotwGroup>,
     seed_backlog_capacity: usize,
     closed: bool,
 }
 
 enum WorkerAction {
-    RunJob(MotwIoJob),
+    InspectDownload(DownloadInspectJob),
     FlushPendingLate(LateMotwAttribution),
+    ResolveProcess(ProcessMotwJob),
+    ResolveSeedGroup(SeedMotwGroup),
 }
 
 struct MotwWorkerHandle {
@@ -370,34 +370,138 @@ impl Drop for LateWaiterGuard<'_> {
     }
 }
 
-fn enqueue_late_attribution_nonblocking(
+struct LateSlotReservationGuard<'a> {
+    queue_pair: &'a (Mutex<MotwIoQueueState>, Condvar),
+    armed: bool,
+}
+
+impl<'a> LateSlotReservationGuard<'a> {
+    fn armed(queue_pair: &'a (Mutex<MotwIoQueueState>, Condvar)) -> Self {
+        Self {
+            queue_pair,
+            armed: true,
+        }
+    }
+
+    fn consume_under_lock(&mut self, state: &mut MotwIoQueueState) {
+        if self.armed {
+            self.armed = false;
+            state.reserved_late_slots = state.reserved_late_slots.saturating_sub(1);
+        }
+    }
+
+    fn release_under_lock(&mut self, state: &mut MotwIoQueueState, cvar: &Condvar) {
+        if self.armed {
+            self.armed = false;
+            state.reserved_late_slots = state.reserved_late_slots.saturating_sub(1);
+            if !state.process_queue.is_empty() || !state.seed_backlog.is_empty() {
+                cvar.notify_one();
+            }
+        }
+    }
+}
+
+impl Drop for LateSlotReservationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let (lock, cvar) = self.queue_pair;
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.release_under_lock(&mut state, cvar);
+        }
+    }
+}
+
+struct PendingFlushGuard<'a> {
+    queue_pair: &'a (Mutex<MotwIoQueueState>, Condvar),
+    armed: bool,
+}
+
+impl<'a> PendingFlushGuard<'a> {
+    fn armed(queue_pair: &'a (Mutex<MotwIoQueueState>, Condvar)) -> Self {
+        Self {
+            queue_pair,
+            armed: true,
+        }
+    }
+
+    fn finish_under_lock(&mut self, state: &mut MotwIoQueueState, cvar: &Condvar) {
+        if self.armed {
+            self.armed = false;
+            state.flushing_pending_late = state.flushing_pending_late.saturating_sub(1);
+            if state.flushing_pending_late == 0
+                && (!state.pending_late.is_empty()
+                    || !state.process_queue.is_empty()
+                    || !state.seed_backlog.is_empty())
+            {
+                cvar.notify_all();
+            }
+        }
+    }
+}
+
+impl Drop for PendingFlushGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let (lock, cvar) = self.queue_pair;
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.finish_under_lock(&mut state, cvar);
+        }
+    }
+}
+
+fn enqueue_late_attribution_reserved(
     late_tx: &mpsc::Sender<LateMotwAttribution>,
     item: LateMotwAttribution,
+    mut reservation: LateSlotReservationGuard<'_>,
     shutdown_flag: &AtomicBool,
     queue_pair: &(Mutex<MotwIoQueueState>, Condvar),
 ) {
-    if shutdown_flag.load(Ordering::Acquire) {
+    if shutdown_flag.load(Ordering::Acquire) || late_tx.is_closed() {
         return;
     }
-    match late_tx.try_send(item) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-        Err(mpsc::error::TrySendError::Full(returned)) => {
-            let (lock, cvar) = queue_pair;
-            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
-            if state.closed || shutdown_flag.load(Ordering::Acquire) {
-                return;
-            }
-            if state.pending_late.len() >= MOTW_PENDING_LATE_CAPACITY {
-                tracing::warn!(
-                    pending_late_capacity = MOTW_PENDING_LATE_CAPACITY,
-                    instance_count = returned.instance_ids.len(),
-                    "MOTW pending late attribution queue saturated; dropping attribution"
-                );
-                return;
-            }
-            state.pending_late.push_back(returned);
+    let can_direct_send = {
+        let (lock, cvar) = queue_pair;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || shutdown_flag.load(Ordering::Acquire) || late_tx.is_closed() {
+            reservation.release_under_lock(&mut state, cvar);
+            return;
+        }
+        if state.pending_late.is_empty()
+            && state.flushing_pending_late == 0
+            && late_tx.capacity() > 0
+        {
+            true
+        } else {
+            state.pending_late.push_back(item);
+            reservation.consume_under_lock(&mut state);
+            debug_assert!(
+                state.pending_late.len() + state.reserved_late_slots <= MOTW_PENDING_LATE_CAPACITY
+            );
             if late_tx.capacity() > 0 {
                 cvar.notify_one();
+            }
+            return;
+        }
+    };
+    if can_direct_send {
+        match late_tx.try_send(item) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                let (lock, cvar) = queue_pair;
+                let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if state.closed || shutdown_flag.load(Ordering::Acquire) || late_tx.is_closed() {
+                    reservation.release_under_lock(&mut state, cvar);
+                    return;
+                }
+                state.pending_late.push_back(returned);
+                reservation.consume_under_lock(&mut state);
+                debug_assert!(
+                    state.pending_late.len() + state.reserved_late_slots
+                        <= MOTW_PENDING_LATE_CAPACITY
+                );
+                if late_tx.capacity() > 0 {
+                    cvar.notify_one();
+                }
             }
         }
     }
@@ -476,8 +580,11 @@ impl MotwIoWorkerPool {
     ) -> Self {
         let queue_pair = Arc::new((
             Mutex::new(MotwIoQueueState {
-                queue: VecDeque::new(),
+                download_queue: VecDeque::new(),
+                process_queue: VecDeque::new(),
                 pending_late: VecDeque::new(),
+                reserved_late_slots: 0,
+                flushing_pending_late: 0,
                 seed_backlog: VecDeque::new(),
                 seed_backlog_capacity: seed_backlog_capacity.max(256),
                 closed: false,
@@ -546,43 +653,83 @@ impl MotwIoWorkerPool {
                                 if state.closed || shutdown_flag.load(Ordering::Acquire) {
                                     break None;
                                 }
-                                if let Some(job) = state.queue.pop_front() {
-                                    // Reserve the busy slot atomically under the queue lock so
-                                    // `busy_workers + queue.len()` never undercounts popped work.
+                                // Priority 1: `InspectDownloadFile` (produces no late MOTW attribution).
+                                if let Some(job) = state.download_queue.pop_front() {
                                     busy.fetch_add(1, Ordering::AcqRel);
-                                    break Some(WorkerAction::RunJob(job));
+                                    break Some(WorkerAction::InspectDownload(job));
                                 }
+                                // Priority 2: Flush already-resolved `pending_late` before starting new
+                                // `ResolveProcess` or `ResolveSeedGroup` work when `w_late_tx` has room.
                                 if w_late_tx.is_closed() {
                                     state.pending_late.clear();
                                     state.seed_backlog.clear();
+                                    state.process_queue.retain(|job| job.reply.is_some());
                                 } else if w_late_tx.capacity() > 0 {
                                     if let Some(item) = state.pending_late.pop_front() {
+                                        // 1 popped + 1 reserved keeps `pending_late + reserved_late_slots` constant.
+                                        state.reserved_late_slots += 1;
+                                        state.flushing_pending_late += 1;
                                         break Some(WorkerAction::FlushPendingLate(item));
                                     }
-                                    if let Some(seed_group) = state.seed_backlog.pop_front() {
+                                }
+                                // Priority 3: `process_queue` only when a late slot can be pre-reserved.
+                                if state.pending_late.len() + state.reserved_late_slots
+                                    < MOTW_PENDING_LATE_CAPACITY
+                                {
+                                    if let Some(job) = state.process_queue.pop_front() {
                                         busy.fetch_add(1, Ordering::AcqRel);
-                                        break Some(WorkerAction::RunJob(
-                                            MotwIoJob::ResolveSeedGroup {
-                                                exe_path: seed_group.exe_path,
-                                                instance_ids: seed_group.instance_ids,
-                                            },
-                                        ));
+                                        state.reserved_late_slots += 1;
+                                        break Some(WorkerAction::ResolveProcess(job));
+                                    }
+                                }
+                                // Priority 4: `seed_backlog` only once `pending_late` is empty, no
+                                // final flush is still in flight, and `w_late_tx` has capacity.
+                                if !w_late_tx.is_closed()
+                                    && w_late_tx.capacity() > 0
+                                    && state.pending_late.is_empty()
+                                    && state.flushing_pending_late == 0
+                                    && state.pending_late.len() + state.reserved_late_slots
+                                        < MOTW_PENDING_LATE_CAPACITY
+                                {
+                                    if let Some(group) = state.seed_backlog.pop_front() {
+                                        busy.fetch_add(1, Ordering::AcqRel);
+                                        state.reserved_late_slots += 1;
+                                        break Some(WorkerAction::ResolveSeedGroup(group));
                                     }
                                 }
                                 if state.closed || shutdown_flag.load(Ordering::Acquire) {
                                     break None;
                                 }
-                                if !state.pending_late.is_empty() || !state.seed_backlog.is_empty()
+                                if !w_late_tx.is_closed()
+                                    && (!state.pending_late.is_empty()
+                                        || !state.process_queue.is_empty()
+                                        || !state.seed_backlog.is_empty())
                                 {
-                                    late_waiters.fetch_add(1, Ordering::SeqCst);
-                                    let _waiter_guard = LateWaiterGuard(&late_waiters);
-                                    if w_late_tx.capacity() > 0 || w_late_tx.is_closed() {
-                                        continue;
+                                    if state.pending_late.is_empty()
+                                        && state.process_queue.is_empty()
+                                        && state.flushing_pending_late > 0
+                                        && w_late_tx.capacity() > 0
+                                    {
+                                        // Wait for `PendingFlushGuard` completion notice instead of
+                                        // spinning while `w_late_tx.capacity() > 0`.
+                                        state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
+                                    } else if state.pending_late.is_empty()
+                                        && state.pending_late.len() + state.reserved_late_slots
+                                            >= MOTW_PENDING_LATE_CAPACITY
+                                    {
+                                        // Wait for `LateSlotReservationGuard` release notification.
+                                        state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
+                                    } else {
+                                        late_waiters.fetch_add(1, Ordering::SeqCst);
+                                        let _waiter_guard = LateWaiterGuard(&late_waiters);
+                                        if w_late_tx.capacity() > 0 || w_late_tx.is_closed() {
+                                            continue;
+                                        }
+                                        let (next_state, _) = cvar
+                                            .wait_timeout(state, LATE_WAIT_RETRY_SLICE)
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        state = next_state;
                                     }
-                                    let (next_state, _) = cvar
-                                        .wait_timeout(state, LATE_WAIT_RETRY_SLICE)
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    state = next_state;
                                 } else {
                                     state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
                                 }
@@ -594,200 +741,222 @@ impl MotwIoWorkerPool {
 
                         match action {
                             WorkerAction::FlushPendingLate(item) => {
+                                // Declare `flush_guard` before `reservation` so LIFO drop releases
+                                // the reserved slot before decrementing `flushing_pending_late`.
+                                let mut flush_guard = PendingFlushGuard::armed(&qp);
+                                let mut reservation = LateSlotReservationGuard::armed(&qp);
                                 if shutdown_flag.load(Ordering::Acquire) {
                                     break;
                                 }
                                 match w_late_tx.try_send(item) {
-                                    Ok(()) => {}
+                                    Ok(()) => {
+                                        let (lock, cvar) = &*qp;
+                                        let mut state =
+                                            lock.lock().unwrap_or_else(|e| e.into_inner());
+                                        reservation.release_under_lock(&mut state, cvar);
+                                        flush_guard.finish_under_lock(&mut state, cvar);
+                                    }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        let (lock, _) = &*qp;
+                                        let (lock, cvar) = &*qp;
                                         let mut state =
                                             lock.lock().unwrap_or_else(|e| e.into_inner());
                                         state.pending_late.clear();
                                         state.seed_backlog.clear();
+                                        state.process_queue.retain(|job| job.reply.is_some());
+                                        reservation.release_under_lock(&mut state, cvar);
+                                        flush_guard.finish_under_lock(&mut state, cvar);
                                     }
                                     Err(mpsc::error::TrySendError::Full(returned)) => {
-                                        let (lock, _) = &*qp;
+                                        let (lock, cvar) = &*qp;
                                         let mut state =
                                             lock.lock().unwrap_or_else(|e| e.into_inner());
                                         if !state.closed && !shutdown_flag.load(Ordering::Acquire) {
-                                            if state.pending_late.len() < MOTW_PENDING_LATE_CAPACITY
-                                            {
-                                                state.pending_late.push_front(returned);
-                                            } else {
-                                                tracing::warn!(
-                                                    pending_late_capacity =
-                                                        MOTW_PENDING_LATE_CAPACITY,
-                                                    instance_count = returned.instance_ids.len(),
-                                                    "MOTW pending late attribution queue saturated during retry; dropping attribution"
+                                            state.pending_late.push_front(returned);
+                                            reservation.consume_under_lock(&mut state);
+                                            debug_assert!(
+                                                state.pending_late.len()
+                                                    + state.reserved_late_slots
+                                                    <= MOTW_PENDING_LATE_CAPACITY
+                                            );
+                                        } else {
+                                            reservation.release_under_lock(&mut state, cvar);
+                                        }
+                                        flush_guard.finish_under_lock(&mut state, cvar);
+                                    }
+                                }
+                            }
+                            WorkerAction::ResolveProcess(job) => {
+                                let _busy_guard = BusyWorkerGuard(&busy);
+                                let reservation = LateSlotReservationGuard::armed(&qp);
+                                if shutdown_flag.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                let ProcessMotwJob {
+                                    instance_id,
+                                    exe_path,
+                                    reply,
+                                } = job;
+                                let attr = resolve_process_motw_core(
+                                    &w_store,
+                                    &*w_inspector,
+                                    &*w_motw,
+                                    &w_dl_state,
+                                    &w_cache,
+                                    download_hash_max_bytes,
+                                    &exe_path,
+                                    None,
+                                    false,
+                                );
+                                match reply {
+                                    Some(tx) => {
+                                        if let Err(Some(late_attr)) = tx.send(attr) {
+                                            if !instance_id.is_empty() {
+                                                enqueue_late_attribution_reserved(
+                                                    &w_late_tx,
+                                                    LateMotwAttribution {
+                                                        instance_ids: vec![instance_id],
+                                                        attribution: late_attr,
+                                                    },
+                                                    reservation,
+                                                    &shutdown_flag,
+                                                    &qp,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        if let Some(late_attr) = attr {
+                                            if !instance_id.is_empty() {
+                                                enqueue_late_attribution_reserved(
+                                                    &w_late_tx,
+                                                    LateMotwAttribution {
+                                                        instance_ids: vec![instance_id],
+                                                        attribution: late_attr,
+                                                    },
+                                                    reservation,
+                                                    &shutdown_flag,
+                                                    &qp,
                                                 );
                                             }
                                         }
                                     }
                                 }
                             }
-                            WorkerAction::RunJob(job) => {
+                            WorkerAction::ResolveSeedGroup(group) => {
+                                let _busy_guard = BusyWorkerGuard(&busy);
+                                let reservation = LateSlotReservationGuard::armed(&qp);
+                                if shutdown_flag.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                let SeedMotwGroup {
+                                    exe_path,
+                                    instance_ids,
+                                } = group;
+                                let attr = resolve_process_motw_core(
+                                    &w_store,
+                                    &*w_inspector,
+                                    &*w_motw,
+                                    &w_dl_state,
+                                    &w_cache,
+                                    download_hash_max_bytes,
+                                    &exe_path,
+                                    None,
+                                    false,
+                                );
+                                if let Some(late_attr) = attr {
+                                    enqueue_late_attribution_reserved(
+                                        &w_late_tx,
+                                        LateMotwAttribution {
+                                            instance_ids,
+                                            attribution: late_attr,
+                                        },
+                                        reservation,
+                                        &shutdown_flag,
+                                        &qp,
+                                    );
+                                }
+                            }
+                            WorkerAction::InspectDownload(job) => {
                                 let _busy_guard = BusyWorkerGuard(&busy);
                                 if shutdown_flag.load(Ordering::Acquire) {
                                     break;
                                 }
-
-                                match job {
-                                    MotwIoJob::ResolveProcess {
-                                        instance_id,
-                                        exe_path,
-                                        reply,
-                                    } => {
-                                        let attr = resolve_process_motw_core(
-                                            &w_store,
-                                            &*w_inspector,
-                                            &*w_motw,
-                                            &w_dl_state,
-                                            &w_cache,
-                                            download_hash_max_bytes,
-                                            &exe_path,
-                                            None,
-                                            false,
-                                        );
-                                        match reply {
-                                            Some(tx) => {
-                                                if let Err(Some(late_attr)) = tx.send(attr) {
-                                                    if !instance_id.is_empty() {
-                                                        enqueue_late_attribution_nonblocking(
-                                                            &w_late_tx,
-                                                            LateMotwAttribution {
-                                                                instance_ids: vec![instance_id],
-                                                                attribution: late_attr,
-                                                            },
-                                                            &shutdown_flag,
-                                                            &qp,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            None => {
-                                                if let Some(late_attr) = attr {
-                                                    if !instance_id.is_empty() {
-                                                        enqueue_late_attribution_nonblocking(
-                                                            &w_late_tx,
-                                                            LateMotwAttribution {
-                                                                instance_ids: vec![instance_id],
-                                                                attribution: late_attr,
-                                                            },
-                                                            &shutdown_flag,
-                                                            &qp,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
+                                let DownloadInspectJob {
+                                    normalized_path,
+                                    max_hash_bytes,
+                                    cancel,
+                                    reply,
+                                } = job;
+                                let _cancel_guard = {
+                                    let mut guard =
+                                        cancels.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.push(Arc::clone(&cancel));
+                                    CancelRegistrationGuard {
+                                        active_cancels: Arc::clone(&cancels),
+                                        cancel: Arc::clone(&cancel),
                                     }
-                                    MotwIoJob::ResolveSeedGroup {
-                                        exe_path,
-                                        instance_ids,
-                                    } => {
-                                        let attr = resolve_process_motw_core(
-                                            &w_store,
-                                            &*w_inspector,
-                                            &*w_motw,
-                                            &w_dl_state,
-                                            &w_cache,
-                                            download_hash_max_bytes,
-                                            &exe_path,
-                                            None,
-                                            false,
-                                        );
-                                        if let Some(late_attr) = attr {
-                                            enqueue_late_attribution_nonblocking(
-                                                &w_late_tx,
-                                                LateMotwAttribution {
-                                                    instance_ids,
-                                                    attribution: late_attr,
-                                                },
-                                                &shutdown_flag,
-                                                &qp,
-                                            );
-                                        }
-                                    }
-                                    MotwIoJob::InspectDownloadFile {
-                                        normalized_path,
-                                        max_hash_bytes,
-                                        cancel,
-                                        reply,
-                                    } => {
-                                        let _cancel_guard = {
-                                            let mut guard =
-                                                cancels.lock().unwrap_or_else(|e| e.into_inner());
-                                            guard.push(Arc::clone(&cancel));
-                                            CancelRegistrationGuard {
-                                                active_cancels: Arc::clone(&cancels),
-                                                cancel: Arc::clone(&cancel),
-                                            }
-                                        };
-                                        if cancel.load(Ordering::Acquire)
-                                            || shutdown_flag.load(Ordering::Acquire)
-                                        {
-                                            let _ = reply.send(DownloadFileIoResult {
-                                                sha256: None,
-                                                zone_info: None,
-                                                cancelled: true,
-                                            });
-                                            continue;
-                                        }
-
-                                        let sha256 = match w_inspector.compute_sha256_cancellable(
-                                            &normalized_path,
-                                            max_hash_bytes,
-                                            &cancel,
-                                        ) {
-                                            Ok(opt) => opt
-                                                .map(|h| h.trim().to_ascii_lowercase())
-                                                .filter(|h| !h.is_empty()),
-                                            Err(err)
-                                                if err.kind() == ErrorKind::Interrupted
-                                                    && (cancel.load(Ordering::Acquire)
-                                                        || shutdown_flag
-                                                            .load(Ordering::Acquire)) =>
-                                            {
-                                                let _ = reply.send(DownloadFileIoResult {
-                                                    sha256: None,
-                                                    zone_info: None,
-                                                    cancelled: true,
-                                                });
-                                                continue;
-                                            }
-                                            Err(err) => {
-                                                tracing::debug!(
-                                                    file_path = %normalized_path,
-                                                    error = %err,
-                                                    "failed computing SHA-256 for downloaded file; recording origin without hash"
-                                                );
-                                                None
-                                            }
-                                        };
-
-                                        if cancel.load(Ordering::Acquire)
-                                            || shutdown_flag.load(Ordering::Acquire)
-                                        {
-                                            let _ = reply.send(DownloadFileIoResult {
-                                                sha256: None,
-                                                zone_info: None,
-                                                cancelled: true,
-                                            });
-                                            continue;
-                                        }
-
-                                        let zone_info =
-                                            w_motw.read_zone_identifier(Path::new(&normalized_path));
-                                        let cancelled = cancel.load(Ordering::Acquire)
-                                            || shutdown_flag.load(Ordering::Acquire);
-                                        let _ = reply.send(DownloadFileIoResult {
-                                            sha256,
-                                            zone_info,
-                                            cancelled,
-                                        });
-                                    }
+                                };
+                                if cancel.load(Ordering::Acquire)
+                                    || shutdown_flag.load(Ordering::Acquire)
+                                {
+                                    let _ = reply.send(DownloadFileIoResult {
+                                        sha256: None,
+                                        zone_info: None,
+                                        cancelled: true,
+                                    });
+                                    continue;
                                 }
+
+                                let sha256 = match w_inspector.compute_sha256_cancellable(
+                                    &normalized_path,
+                                    max_hash_bytes,
+                                    &cancel,
+                                ) {
+                                    Ok(opt) => opt
+                                        .map(|h| h.trim().to_ascii_lowercase())
+                                        .filter(|h| !h.is_empty()),
+                                    Err(err)
+                                        if err.kind() == ErrorKind::Interrupted
+                                            && (cancel.load(Ordering::Acquire)
+                                                || shutdown_flag.load(Ordering::Acquire)) =>
+                                    {
+                                        let _ = reply.send(DownloadFileIoResult {
+                                            sha256: None,
+                                            zone_info: None,
+                                            cancelled: true,
+                                        });
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        tracing::debug!(
+                                            file_path = %normalized_path,
+                                            error = %err,
+                                            "failed computing SHA-256 for downloaded file; recording origin without hash"
+                                        );
+                                        None
+                                    }
+                                };
+
+                                if cancel.load(Ordering::Acquire)
+                                    || shutdown_flag.load(Ordering::Acquire)
+                                {
+                                    let _ = reply.send(DownloadFileIoResult {
+                                        sha256: None,
+                                        zone_info: None,
+                                        cancelled: true,
+                                    });
+                                    continue;
+                                }
+
+                                let zone_info =
+                                    w_motw.read_zone_identifier(Path::new(&normalized_path));
+                                let cancelled = cancel.load(Ordering::Acquire)
+                                    || shutdown_flag.load(Ordering::Acquire);
+                                let _ = reply.send(DownloadFileIoResult {
+                                    sha256,
+                                    zone_info,
+                                    cancelled,
+                                });
                             }
                         }
                     }
@@ -870,20 +1039,23 @@ impl MotwIoWorkerPool {
         if state.closed || self.shutdown_requested.load(Ordering::Acquire) {
             return SubmitProcessMotwOutcome::Rejected;
         }
-        if state.queue.len() >= MOTW_IO_QUEUE_CAPACITY {
+        if state.process_queue.len() >= MOTW_IO_QUEUE_CAPACITY {
             tracing::warn!(
                 exe_path = %exe_path,
                 queue_capacity = MOTW_IO_QUEUE_CAPACITY,
-                "MOTW I/O worker queue saturated; skipping deferred MOTW lookup"
+                "MOTW process I/O queue saturated; skipping deferred MOTW lookup"
             );
             return SubmitProcessMotwOutcome::Rejected;
         }
 
-        let in_flight_and_queued =
-            self.busy_workers.load(Ordering::Acquire) + state.queue.len();
-        if allow_sync_wait && in_flight_and_queued < MOTW_IO_WORKERS {
+        let in_flight_and_queued = self.busy_workers.load(Ordering::Acquire)
+            + state.download_queue.len()
+            + state.process_queue.len();
+        let has_late_slot =
+            state.pending_late.len() + state.reserved_late_slots < MOTW_PENDING_LATE_CAPACITY;
+        if allow_sync_wait && in_flight_and_queued < MOTW_IO_WORKERS && has_late_slot {
             let (tx, rx) = oneshot::channel();
-            state.queue.push_back(MotwIoJob::ResolveProcess {
+            state.process_queue.push_back(ProcessMotwJob {
                 instance_id,
                 exe_path,
                 reply: Some(tx),
@@ -891,7 +1063,7 @@ impl MotwIoWorkerPool {
             cvar.notify_one();
             SubmitProcessMotwOutcome::Await(rx)
         } else {
-            state.queue.push_back(MotwIoJob::ResolveProcess {
+            state.process_queue.push_back(ProcessMotwJob {
                 instance_id,
                 exe_path,
                 reply: None,
@@ -918,11 +1090,11 @@ impl MotwIoWorkerPool {
         {
             return SubmitDownloadIoOutcome::Cancelled;
         }
-        if state.queue.len() >= MOTW_IO_QUEUE_CAPACITY {
+        if state.download_queue.len() >= MOTW_IO_QUEUE_CAPACITY {
             return SubmitDownloadIoOutcome::QueueFull;
         }
         let (tx, rx) = oneshot::channel();
-        state.queue.push_back(MotwIoJob::InspectDownloadFile {
+        state.download_queue.push_back(DownloadInspectJob {
             normalized_path,
             max_hash_bytes,
             cancel,
@@ -942,7 +1114,8 @@ impl MotwIoWorkerPool {
         let (lock, cvar) = &*self.queue_pair;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
-        state.queue.clear();
+        state.download_queue.clear();
+        state.process_queue.clear();
         state.pending_late.clear();
         state.seed_backlog.clear();
         cvar.notify_all();
@@ -1699,6 +1872,8 @@ impl DaemonEngine {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use ledr_rules::BinaryIdentity;
 
@@ -1797,22 +1972,24 @@ mod tests {
             2
         );
 
-        // Wait until all 3 real-time jobs have been stashed into bounded `pending_late`.
+        // Wait until all 3 real-time jobs have been stashed into bounded `pending_late`
+        // and all reservation slots have been released.
         let stash_deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let pending_len = pool
-                .queue_pair
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pending_late
-                .len();
-            if pending_len == 3 {
+            let (pending_len, reserved_slots) = {
+                let state = pool
+                    .queue_pair
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                (state.pending_late.len(), state.reserved_late_slots)
+            };
+            if pending_len == 3 && reserved_slots == 0 {
                 break;
             }
             assert!(
                 Instant::now() < stash_deadline,
-                "timed out waiting for 3 pending_late items (got {pending_len})"
+                "timed out waiting for 3 pending_late items (pending={pending_len}, reserved={reserved_slots})"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -1843,32 +2020,65 @@ mod tests {
             "seed_backlog must still stay gated after download inspect while late_tx is full"
         );
 
-        // Drain dummy + 3 pending_late + 2 seed groups: pending_late must arrive before seed_backlog.
+        // Drain dummy + 3 pending_late + 2 seed groups: `flushing_pending_late == 0` gate ensures
+        // all 3 `pending_late` arrive before any `seed_backlog` starts, without depending on the
+        // intra-group order across 2 concurrent workers.
         let dummy = late_rx.recv().await.expect("recv dummy");
         assert_eq!(dummy.instance_ids, vec!["dummy-0"]);
         pool.notify_late_result_consumed();
 
-        let mut received_ids: Vec<String> = Vec::new();
-        for _ in 0..5 {
+        let mut rt_received: HashSet<String> = HashSet::new();
+        for idx in 0..3 {
             let item = tokio::time::timeout(Duration::from_secs(2), late_rx.recv())
                 .await
-                .expect("timed out draining pending_late / seed_backlog")
+                .expect("timed out draining pending_late")
                 .expect("late_rx open");
-            received_ids.extend(item.instance_ids);
+            assert_eq!(item.instance_ids.len(), 1);
+            let id = item.instance_ids[0].clone();
+            assert!(
+                id.starts_with("rt-"),
+                "pending_late real-time results must flush before seed_backlog (idx={idx}, got={id})"
+            );
+            assert!(rt_received.insert(id), "duplicate rt id received");
+            if idx < 2 {
+                // While >= 1 pending_late remains (in queue, flushing, or occupying capacity-1 late_tx),
+                // no seed_backlog group may start.
+                assert_eq!(
+                    motw_impl.seed_calls.load(Ordering::Acquire),
+                    0,
+                    "seed_backlog started before final pending_late was received (idx={idx})"
+                );
+            }
             pool.notify_late_result_consumed();
         }
-        assert_eq!(received_ids.len(), 5);
-        assert!(
-            received_ids[..3].iter().all(|id| id.starts_with("rt-")),
-            "pending_late real-time results must flush before seed_backlog: {received_ids:?}"
-        );
-        assert!(
-            received_ids[3..].iter().all(|id| id.starts_with("seed-")),
-            "seed_backlog groups must flush once pending_late drains: {received_ids:?}"
+        assert_eq!(
+            rt_received,
+            HashSet::from(["rt-0".to_string(), "rt-1".to_string(), "rt-2".to_string()])
         );
 
+        let mut seed_received: HashSet<String> = HashSet::new();
+        for _ in 0..2 {
+            let item = tokio::time::timeout(Duration::from_secs(2), late_rx.recv())
+                .await
+                .expect("timed out draining seed_backlog")
+                .expect("late_rx open");
+            assert_eq!(item.instance_ids.len(), 1);
+            let id = item.instance_ids[0].clone();
+            assert!(
+                id.starts_with("seed-"),
+                "expected seed_backlog group after pending_late drained (got={id})"
+            );
+            assert!(seed_received.insert(id), "duplicate seed id received");
+            pool.notify_late_result_consumed();
+        }
+        assert_eq!(
+            seed_received,
+            HashSet::from(["seed-0".to_string(), "seed-1".to_string()])
+        );
+        assert_eq!(motw_impl.seed_calls.load(Ordering::Acquire), 2);
+
         // Re-fill `late_tx` and enqueue one more pending_late item, then verify `request_shutdown`
-        // clears `pending_late` and `seed_backlog` and joins cleanly.
+        // clears all queues and joins cleanly with zero lingering reservations.
         late_tx
             .try_send(LateMotwAttribution {
                 instance_ids: vec!["dummy-1".to_string()],
@@ -1914,11 +2124,280 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(state.closed);
-            assert!(state.queue.is_empty());
+            assert!(state.download_queue.is_empty());
+            assert!(state.process_queue.is_empty());
             assert!(state.pending_late.is_empty());
             assert!(state.seed_backlog.is_empty());
         }
         pool.shutdown_and_join(tokio::time::Instant::now() + Duration::from_secs(2))
             .await;
+        {
+            let state = pool
+                .queue_pair
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.reserved_late_slots, 0);
+            assert_eq!(state.flushing_pending_late, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn motw_pool_02_reserved_late_slots_prevent_drop_and_keep_download_inspect_responsive() {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let inspector: Arc<dyn BinaryInspector> = Arc::new(StaticTestBinaryInspector);
+        let motw_inspector: Arc<dyn MotwInspector> = Arc::new(StaticTestMotwInspector {
+            seed_calls: AtomicUsize::new(0),
+        });
+        let dl_state = Arc::new(AtomicU64::new(0));
+        let stage2_cache = Arc::new(Mutex::new(MotwStage2Cache::new(16, 60)));
+        let (late_tx, mut late_rx) = mpsc::channel(4);
+
+        for i in 0..4 {
+            late_tx
+                .try_send(LateMotwAttribution {
+                    instance_ids: vec![format!("dummy-{i}")],
+                    attribution: MotwAttribution {
+                        origin_url: format!("https://dummy.example.invalid/{i}"),
+                        referrer_url: None,
+                        frame_url: None,
+                        sha256: None,
+                        zone_id: Some(3),
+                        stage: MotwMatchStage::ZoneIdentifierAds,
+                    },
+                })
+                .expect("pre-fill late_tx");
+        }
+
+        let pool = MotwIoWorkerPool::new(
+            store,
+            inspector,
+            motw_inspector,
+            dl_state,
+            stage2_cache,
+            MAX_DOWNLOAD_HASH_BYTES,
+            64,
+            late_tx.clone(),
+        );
+
+        // Wave 1: Submit 64 real-time jobs while `late_tx` is full -> all stash into `pending_late`.
+        for i in 0..64 {
+            assert!(matches!(
+                pool.submit_process_motw(
+                    format!("rt-{i:03}"),
+                    format!(r"C:\Apps\rt_{i:03}.exe"),
+                    false,
+                ),
+                SubmitProcessMotwOutcome::QueuedAsync
+            ));
+        }
+        let wave1_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (pending_len, proc_len, reserved) = {
+                let state = pool
+                    .queue_pair
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                (
+                    state.pending_late.len(),
+                    state.process_queue.len(),
+                    state.reserved_late_slots,
+                )
+            };
+            if pending_len == 64 && proc_len == 0 && reserved == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < wave1_deadline,
+                "timed out waiting for wave 1 stash (pending={pending_len}, proc={proc_len}, reserved={reserved})"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Wave 2: Submit 36 more jobs (`rt-064`..`rt-099`): 2 fill `pending_late` to 66/66 and
+        // the remaining 34 wait in `process_queue`.
+        for i in 64..100 {
+            assert!(matches!(
+                pool.submit_process_motw(
+                    format!("rt-{i:03}"),
+                    format!(r"C:\Apps\rt_{i:03}.exe"),
+                    false,
+                ),
+                SubmitProcessMotwOutcome::QueuedAsync
+            ));
+        }
+        let wave2_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (pending_len, proc_len, reserved) = {
+                let state = pool
+                    .queue_pair
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                (
+                    state.pending_late.len(),
+                    state.process_queue.len(),
+                    state.reserved_late_slots,
+                )
+            };
+            if pending_len == MOTW_PENDING_LATE_CAPACITY && reserved == 0 && proc_len == 34 {
+                break;
+            }
+            assert!(
+                Instant::now() < wave2_deadline,
+                "timed out waiting for wave 2 saturation (pending={pending_len}, proc={proc_len}, reserved={reserved})"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Wave 3: Even with `allow_sync_wait = true`, full `pending_late` must return `QueuedAsync`
+        // immediately rather than issuing a synchronous `Await` receiver.
+        assert!(matches!(
+            pool.submit_process_motw(
+                "rt-100".to_string(),
+                r"C:\Apps\rt_100.exe".to_string(),
+                true,
+            ),
+            SubmitProcessMotwOutcome::QueuedAsync
+        ));
+
+        // Wave 4: Fill the remaining 29 slots of `process_queue` (`rt-101`..`rt-129`, 130 accepted
+        // total), verify the 131st is rejected at entry, and confirm `submit_download_inspect`
+        // preempts all saturated process/late queues in under 1 second.
+        for i in 101..130 {
+            assert!(matches!(
+                pool.submit_process_motw(
+                    format!("rt-{i:03}"),
+                    format!(r"C:\Apps\rt_{i:03}.exe"),
+                    false,
+                ),
+                SubmitProcessMotwOutcome::QueuedAsync
+            ));
+        }
+        assert!(matches!(
+            pool.submit_process_motw(
+                "rt-overflow".to_string(),
+                r"C:\Apps\rt_overflow.exe".to_string(),
+                false,
+            ),
+            SubmitProcessMotwOutcome::Rejected
+        ));
+        {
+            let state = pool
+                .queue_pair
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.process_queue.len(), MOTW_IO_QUEUE_CAPACITY);
+            assert_eq!(state.pending_late.len(), MOTW_PENDING_LATE_CAPACITY);
+            assert_eq!(state.reserved_late_slots, 0);
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let SubmitDownloadIoOutcome::Await(dl_rx) = pool.submit_download_inspect(
+            r"C:\Apps\urgent_dl_during_saturation.exe".to_string(),
+            MAX_DOWNLOAD_HASH_BYTES,
+            cancel,
+        ) else {
+            panic!("expected SubmitDownloadIoOutcome::Await while process_queue is full");
+        };
+        let dl_res = tokio::time::timeout(Duration::from_secs(1), dl_rx)
+            .await
+            .expect("download inspect must preempt saturated process_queue and pending_late")
+            .expect("download inspect oneshot");
+        assert!(!dl_res.cancelled);
+        assert!(dl_res.sha256.is_some());
+        {
+            let state = pool
+                .queue_pair
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.process_queue.len(), MOTW_IO_QUEUE_CAPACITY);
+            assert_eq!(state.pending_late.len(), MOTW_PENDING_LATE_CAPACITY);
+        }
+
+        // Wave 5: Drain the 4 dummies, then drain all 130 accepted `rt-*` items slowly and verify
+        // the invariant `pending_late.len() + reserved_late_slots <= MOTW_PENDING_LATE_CAPACITY`
+        // holds throughout and zero accepted attributions are dropped.
+        for i in 0..4 {
+            let dummy = late_rx.recv().await.expect("recv dummy");
+            assert_eq!(dummy.instance_ids, vec![format!("dummy-{i}")]);
+            pool.notify_late_result_consumed();
+        }
+
+        let mut received: HashSet<String> = HashSet::with_capacity(130);
+        for i in 0..130 {
+            let item = tokio::time::timeout(Duration::from_secs(5), late_rx.recv())
+                .await
+                .expect("timed out draining accepted MOTW attribution")
+                .expect("late_rx open");
+            assert_eq!(item.instance_ids.len(), 1);
+            assert!(
+                received.insert(item.instance_ids[0].clone()),
+                "duplicate attribution received: {}",
+                item.instance_ids[0]
+            );
+            pool.notify_late_result_consumed();
+            {
+                let state = pool
+                    .queue_pair
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                assert!(
+                    state.pending_late.len() + state.reserved_late_slots
+                        <= MOTW_PENDING_LATE_CAPACITY,
+                    "late reservation invariant violated: pending={} reserved={}",
+                    state.pending_late.len(),
+                    state.reserved_late_slots
+                );
+            }
+            if i % 20 == 19 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let expected: HashSet<String> = (0..130).map(|i| format!("rt-{i:03}")).collect();
+        assert_eq!(received, expected);
+        assert!(!received.contains("rt-overflow"));
+
+        // Verify worker counters return to idle (0 reserved, 0 flushing) even before shutdown.
+        let idle_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (reserved, flushing, pending_len, proc_len) = {
+                let state = pool
+                    .queue_pair
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                (
+                    state.reserved_late_slots,
+                    state.flushing_pending_late,
+                    state.pending_late.len(),
+                    state.process_queue.len(),
+                )
+            };
+            if reserved == 0 && flushing == 0 && pending_len == 0 && proc_len == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < idle_deadline,
+                "timed out waiting for idle counters (reserved={reserved}, flushing={flushing}, pending={pending_len}, proc={proc_len})"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        pool.shutdown_and_join(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        {
+            let state = pool
+                .queue_pair
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.reserved_late_slots, 0);
+            assert_eq!(state.flushing_pending_late, 0);
+        }
     }
 }

@@ -1416,6 +1416,7 @@ mod tests {
         BinaryInspector, DaemonConfig, DaemonEngine, NotificationDispatcher,
         OutboundEnforcementMode,
     };
+    use super::WfpRuleManager;
 
     struct RecordingWfpDefense {
         next_handle: AtomicU64,
@@ -1480,7 +1481,8 @@ mod tests {
 
     /// `MOTW-LATE-01`: `apply_late_motw_attribution` must separate SQLite `COALESCE` backfill
     /// from active-only WFP/outbound-classifier updates across active, exited, pre-populated,
-    /// and `process_table`-evicted instances, including PID-reuse protection on `outbound_classifier`.
+    /// `process_table`-evicted (full and partial `origin_url`-only), and PID-reused successor
+    /// instances without polluting live successor processes on reused PIDs.
     #[tokio::test]
     async fn motw_late_01_separates_sqlite_backfill_from_active_defense_across_active_exited_and_evicted(
     ) {
@@ -1515,6 +1517,9 @@ mod tests {
         let exited_preset_id = ProcessIdentity::new(61_004, base_ft + 4);
         let evicted_unset_id = ProcessIdentity::new(61_005, base_ft + 5);
         let evicted_preset_id = ProcessIdentity::new(61_006, base_ft + 6);
+        let evicted_partial_id = ProcessIdentity::new(61_007, base_ft + 7);
+        let reused_exited_successor_id = ProcessIdentity::new(61_003, base_ft + 100);
+        let reused_evicted_successor_id = ProcessIdentity::new(61_005, base_ft + 105);
 
         let specs = [
             (
@@ -1564,6 +1569,14 @@ mod tests {
                 true,
                 Some(prior_url),
                 Some(prior_sha),
+            ),
+            (
+                evicted_partial_id,
+                r"C:\Late01\evicted_partial.exe",
+                false,
+                true,
+                Some(prior_url),
+                None,
             ),
         ];
 
@@ -1618,10 +1631,76 @@ mod tests {
                 }
             }
         }
+
+        // Register active successor processes that reuse PIDs 61_003 (after `exited_unset_id`
+        // stopped) and 61_005 (after `evicted_unset_id` was evicted) with distinct creation times.
+        let successor_specs = [
+            (
+                reused_exited_successor_id,
+                r"C:\Late01\reused_exited_successor.exe",
+                base_ms + 100,
+            ),
+            (
+                reused_evicted_successor_id,
+                r"C:\Late01\reused_evicted_successor.exe",
+                base_ms + 105,
+            ),
+        ];
+        for (ident, exe, started_ms) in successor_specs {
+            let start_ev = SensorEvent::ProcessStart {
+                identity: ident,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            };
+            store
+                .ingest_event_with_process_metadata(
+                    &start_ev,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    "OBSERVED",
+                )
+                .expect("ingest successor process row");
+            let mut table = engine
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let res = table.on_process_start(
+                ident,
+                4,
+                exe.to_string(),
+                exe.to_string(),
+                None,
+                started_ms,
+            );
+            assert_eq!(res.instance_id, ident.instance_id());
+            assert!(!res.skip_store_ingest);
+        }
+        {
+            let table = engine
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                table.lookup_by_pid(61_003).map(|e| e.instance_id.as_str()),
+                Some(reused_exited_successor_id.instance_id().as_str()),
+                "PID 61_003 must now point to the active reused successor process"
+            );
+            assert_eq!(
+                table.lookup_by_pid(61_005).map(|e| e.instance_id.as_str()),
+                Some(reused_evicted_successor_id.instance_id().as_str()),
+                "PID 61_005 must now point to the active reused successor process"
+            );
+        }
         store.flush_batch().expect("flush initial rows");
 
         // Mark PIDs steady in `outbound_classifier`: active_unset must be cleared, while
-        // active_preset and PID-reused exited/evicted PIDs must remain untouched.
+        // active_preset and PID-reused active successor processes (61_003, 61_005) must remain steady.
         for pid in [61_001, 61_002, 61_003, 61_005] {
             engine.outbound_classifier.mark_steady(pid);
         }
@@ -1634,6 +1713,7 @@ mod tests {
                 exited_preset_id.instance_id(),
                 evicted_unset_id.instance_id(),
                 evicted_preset_id.instance_id(),
+                evicted_partial_id.instance_id(),
             ],
             attribution: MotwAttribution {
                 origin_url: late_url.to_string(),
@@ -1665,12 +1745,17 @@ mod tests {
         assert_eq!(r_active_preset.sha256, None);
         assert!(engine.outbound_classifier.is_steady_pid(61_002));
 
-        // 3. Exited without prior URL -> SQLite backfilled, table unchanged, classifier/WFP untouched.
+        // 3. Exited without prior URL -> SQLite backfilled, table unchanged, active PID-reused
+        //    successor untouched (SQLite, process_table, has_active_motw_for_exe_key, classifier, WFP).
         let r_exited_unset = query_row(exited_unset_id);
         assert_eq!(r_exited_unset.origin_url.as_deref(), Some(late_url));
         assert_eq!(r_exited_unset.sha256.as_deref(), Some(late_sha));
         assert!(r_exited_unset.exited_at_ms.is_some());
         assert!(engine.outbound_classifier.is_steady_pid(61_003));
+        let r_reused_exited_succ = query_row(reused_exited_successor_id);
+        assert_eq!(r_reused_exited_succ.origin_url, None);
+        assert_eq!(r_reused_exited_succ.sha256, None);
+        assert!(r_reused_exited_succ.exited_at_ms.is_none());
         {
             let table = engine
                 .process_table
@@ -1689,9 +1774,30 @@ mod tests {
                 None,
                 "exited process_table entry must remain immutable in memory"
             );
+            let exited_succ = table
+                .get_by_instance_id(&reused_exited_successor_id.instance_id())
+                .expect("reused_exited_successor must remain active in process_table");
+            assert_eq!(exited_succ.origin_url, None);
+            assert_eq!(exited_succ.motw_source, None);
+            assert!(exited_succ.exited_at_ms.is_none());
+            assert!(!table.has_active_motw_for_exe_key(&WfpRuleManager::exe_key(
+                r"C:\Late01\reused_exited_successor.exe"
+            )));
             assert!(table
                 .get_by_instance_id(&evicted_unset_id.instance_id())
                 .is_none());
+            assert!(table
+                .get_by_instance_id(&evicted_partial_id.instance_id())
+                .is_none());
+            let evicted_succ = table
+                .get_by_instance_id(&reused_evicted_successor_id.instance_id())
+                .expect("reused_evicted_successor must remain active in process_table");
+            assert_eq!(evicted_succ.origin_url, None);
+            assert_eq!(evicted_succ.motw_source, None);
+            assert!(evicted_succ.exited_at_ms.is_none());
+            assert!(!table.has_active_motw_for_exe_key(&WfpRuleManager::exe_key(
+                r"C:\Late01\reused_evicted_successor.exe"
+            )));
         }
 
         // 4. Exited with prior URL -> skipped.
@@ -1699,17 +1805,29 @@ mod tests {
         assert_eq!(r_exited_preset.origin_url.as_deref(), Some(prior_url));
         assert_eq!(r_exited_preset.sha256, None);
 
-        // 5. Evicted from process_table without prior URL -> SQLite backfilled, classifier/WFP untouched.
+        // 5. Evicted from process_table without prior URL -> SQLite backfilled, active PID-reused
+        //    successor untouched (SQLite, process_table, classifier, WFP).
         let r_evicted_unset = query_row(evicted_unset_id);
         assert_eq!(r_evicted_unset.origin_url.as_deref(), Some(late_url));
         assert_eq!(r_evicted_unset.sha256.as_deref(), Some(late_sha));
         assert!(r_evicted_unset.exited_at_ms.is_some());
         assert!(engine.outbound_classifier.is_steady_pid(61_005));
+        let r_reused_evicted_succ = query_row(reused_evicted_successor_id);
+        assert_eq!(r_reused_evicted_succ.origin_url, None);
+        assert_eq!(r_reused_evicted_succ.sha256, None);
+        assert!(r_reused_evicted_succ.exited_at_ms.is_none());
 
         // 6. Evicted from process_table with prior URL/SHA -> COALESCE preserves both.
         let r_evicted_preset = query_row(evicted_preset_id);
         assert_eq!(r_evicted_preset.origin_url.as_deref(), Some(prior_url));
         assert_eq!(r_evicted_preset.sha256.as_deref(), Some(prior_sha));
+
+        // 7. Evicted from process_table with prior URL but missing SHA -> COALESCE preserves
+        //    existing URL while backfilling missing SHA-256 only.
+        let r_evicted_partial = query_row(evicted_partial_id);
+        assert_eq!(r_evicted_partial.origin_url.as_deref(), Some(prior_url));
+        assert_eq!(r_evicted_partial.sha256.as_deref(), Some(late_sha));
+        assert!(r_evicted_partial.exited_at_ms.is_some());
 
         // Only `active_unset.exe` must receive an L-18 pre-emptive WFP block.
         let wfp = defense.added_wfp();

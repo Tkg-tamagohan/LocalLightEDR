@@ -108,6 +108,16 @@ EXPECTED_QUESTIONS: dict[str, tuple[list[str], float, float]] = {
         0.70,
         0.40,
     ),
+    "phase4_ui_manifest_allowlist_and_wow64": (
+        [
+            "apps/ledr-ui/src/defense_status.rs",
+            "apps/ledr-ui/src/uri_reg.rs",
+            "apps/ledr-ui/ui/app.js",
+            "apps/ledr-ui/js-tests/phase4_ui.test.mjs",
+        ],
+        0.65,
+        0.40,
+    ),
 }
 
 
@@ -314,7 +324,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.skipTest(f"Global invariant gate script not installed: {exc}")
 
     def test_T1_05_invariants_json_strict_schema_and_gate_loader(self) -> None:
-        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 10 keys and load_custom_questions."""
+        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 11 keys and load_custom_questions."""
         invariants_path = REPO_ROOT / ".agents" / "invariants.json"
         self.assertTrue(invariants_path.is_file(), f"Missing {invariants_path}")
 
@@ -390,6 +400,22 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
         ):
             self.assertIn("64 KiB", text_field)
             self.assertIn("NRD_FILE_READ_CHUNK_BYTES", text_field)
+
+        phase4_ui = questions["phase4_ui_manifest_allowlist_and_wow64"]
+        self.assertIn("View 3", phase4_ui["instructions"])
+        self.assertIn("KEY_WOW64_32KEY", phase4_ui["instructions"])
+        self.assertIn("KEY_WOW64_64KEY", phase4_ui["instructions"])
+        for text_field in (
+            phase4_ui["instructions"],
+            phase4_ui["criteria"]["true_description"],
+            phase4_ui["criteria"]["false_description"],
+        ):
+            self.assertIn("unverified", text_field)
+            self.assertIn("EmptyString", text_field)
+            self.assertIn(".browser-detail-row", text_field)
+            self.assertIn("manifest_path", text_field)
+            self.assertIn("diagnostic", text_field.lower())
+            self.assertIn("UI-P4-08", text_field)
 
         gate_script = self._require_gate_script()
 
@@ -543,6 +569,20 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                 " use super::cancel::NrdCancelToken;",
                 "-pub(crate) const NRD_FILE_READ_CHUNK_BYTES: usize = 64 * 1024;\n+pub(crate) const NRD_FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;",
                 {"nrd_shutdown_nonblocking_and_checkpoint"},
+            ),
+            (
+                "apps/ledr-ui/src/defense_status.rs",
+                "@@ -1344,2 +1344,2 @@",
+                "         view32,",
+                "-        RegistryStringProbe::Present(_) | RegistryStringProbe::EmptyString\n+        RegistryStringProbe::Present(_)",
+                {"phase4_ui_manifest_allowlist_and_wow64"},
+            ),
+            (
+                "apps/ledr-ui/js-tests/phase4_ui.test.mjs",
+                "@@ -550,2 +550,2 @@",
+                "   assert.ok(",
+                "-    !initialChromeRow.includes(escapeHtmlText(edgeDefaultPath)),\n+    html.includes(escapeHtmlText(chromeDefaultPath)),",
+                {"phase4_ui_manifest_allowlist_and_wow64"},
             ),
         ]
 

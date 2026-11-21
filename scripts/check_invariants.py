@@ -20,6 +20,7 @@ DEFAULT_PATHS: tuple[str, ...] = (
     "crates/*/src/**",
     "apps/ledr-ui/src/**",
     "apps/ledr-ui/ui/**",
+    "apps/ledr-ui/js-tests/**",
     "extensions/**",
     "rules/**",
 )

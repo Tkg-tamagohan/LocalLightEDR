@@ -57,7 +57,7 @@
 - `apps/ledr-ui/src/defense_status.rs` はユーザーの機密ファイル（`Cookies`、`.ssh` 等）へ一切アクセスせず、おとりファイル、ブリッジバイナリ、`HKCU` および `HKLM` の読み取り専用レジストリ参照とマニフェスト検証のみを行い、ウィンドウ閉鎖時は `ledr-ui` と WebView2 を 0 プロセスで終了する（`L-08`）。
   マニフェスト検証は既定 2 ディレクトリのホワイトリスト配下だけに限定し、リパースポイント拒否、`FILE_FLAG_OPEN_REPARSE_POINT` と `FILE_READ_ATTRIBUTES` の先行検査、`nNumberOfLinks == 1`、`GetFinalPathNameByHandleW` 閉じ込め、`ReOpenFile` 昇格を経て読み取り、`description` を必須項目として検証する。
   カスタム配置パスに対してはファイル I/O を行わず、`unverified` として検証済み状態と区別する。
-- Native Messaging レジストリの WOW64 参照は `KEY_WOW64_32KEY -> KEY_WOW64_64KEY` の順で探索し、32 ビット側で `EmptyString` を検出した場合は 64 ビット側へフォールバックせず 32 ビット側で打ち切る。
+- View 3（`apps/ledr-ui/src/defense_status.rs`）の Native Messaging レジストリ診断では、WOW64 参照を `KEY_WOW64_32KEY -> KEY_WOW64_64KEY` の順で探索し、32 ビット側で `EmptyString` を検出した場合は 64 ビット側へフォールバックせず 32 ビット側で打ち切る（CLI `ledr-bridge-nm` の 32 ビットビュー対応は `FU-P4-01` 対象）。
 - View 3 のブラウザ別詳細行（`.browser-detail-row`）には各ブラウザの `manifest_path` と診断表示を併記し、`UI-P4-08` 等の UI 回帰テストではコンテナ全体検索だけで済ませず、ブラウザ単位で詳細行要素を抽出して期待する値が併記されていることと他ブラウザの情報が混入していないことを検証する。
 - 実 Chrome 拡張ロード、実 Native Messaging ホスト起動、実ダウンロードの `:Zone.Identifier` 付与と移動後紐付け、および実 WebView2 終了計測は合成テストでは検証済みと扱わず、Windows 10/11 クライアント SKU の実機 E2E（`FU-E2E-02`）対象として残す。
 

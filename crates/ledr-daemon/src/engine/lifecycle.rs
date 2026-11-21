@@ -14,6 +14,10 @@ use crate::notify::{NoopNotificationDispatcher, NotificationDispatcher};
 use crate::process_table::ActiveProcessTable;
 
 use super::dns_history::ProcessDnsHistory;
+use super::motw::{
+    BrowserEventDedupCache, MotwInspector, WindowsMotwInspector, BROWSER_EVENT_DEDUP_CAPACITY,
+    BROWSER_EVENT_DEDUP_WINDOW_MS,
+};
 use super::wfp_drops::{AppWfpAlertDedup, WfpDropDedupCache, WfpDropOverflowQueue};
 use super::{
     current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, LiveProcessInspector,
@@ -97,6 +101,34 @@ impl DaemonEngine {
         inspector: Arc<dyn BinaryInspector>,
         live_process_inspector: Arc<dyn LiveProcessInspector>,
     ) -> Arc<Self> {
+        Self::start_with_motw_inspector(
+            store,
+            sigma,
+            pruner,
+            config,
+            defense,
+            notifier,
+            inspector,
+            live_process_inspector,
+            Arc::new(WindowsMotwInspector::new()),
+        )
+    }
+
+    /// Starts a new [`DaemonEngine`] with all standard dependencies plus a custom
+    /// [`MotwInspector`] (`Phase 4A` deterministic `:Zone.Identifier` testing).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_motw_inspector(
+        store: LedrStore,
+        sigma: SigmaEngine,
+        pruner: EarlyPruner,
+        config: DaemonConfig,
+        defense: Arc<dyn ActiveDefenseController>,
+        notifier: Arc<dyn NotificationDispatcher>,
+        inspector: Arc<dyn BinaryInspector>,
+        live_process_inspector: Arc<dyn LiveProcessInspector>,
+        motw_inspector: Arc<dyn MotwInspector>,
+    ) -> Arc<Self> {
+        let initial_has_downloads = store.has_any_download_origins().unwrap_or(false);
         let prior_running_candidates = store.list_running_process_instance_ids().unwrap_or_default();
         let (sender, receiver) = TwoLaneChannel::with_capacities(
             config.high_priority_capacity,
@@ -158,6 +190,12 @@ impl DaemonEngine {
             notifier,
             inspector,
             live_process_inspector,
+            motw_inspector,
+            has_download_origins: AtomicBool::new(initial_has_downloads),
+            browser_event_dedup: Mutex::new(BrowserEventDedupCache::new(
+                BROWSER_EVENT_DEDUP_CAPACITY,
+                BROWSER_EVENT_DEDUP_WINDOW_MS,
+            )),
             process_table,
             firewall: Mutex::new(wfp_manager),
             outbound_classifier,

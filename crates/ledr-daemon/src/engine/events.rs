@@ -62,10 +62,44 @@ impl DaemonEngine {
         let now_ms = current_unix_ms();
         let event_ts_ms = event_timestamp_ms(event, now_ms);
 
-        let proc_ctx = self.resolve_process_context(event, event_ts_ms);
+        let mut proc_ctx = self.resolve_process_context(event, event_ts_ms);
+
+        if matches!(event, SensorEvent::ProcessStart { .. })
+            && proc_ctx.origin_url.is_none()
+            && proc_ctx.exited_at_ms.is_none()
+            && !proc_ctx.skip_store_ingest
+        {
+            if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
+                if let Some(motw) = self.resolve_process_motw(
+                    effective_exe,
+                    proc_ctx.exited_at_ms,
+                    proc_ctx.skip_store_ingest,
+                ) {
+                    let motw_source_str = motw.stage.as_str().to_string();
+                    if let Some(ref inst_id) = proc_ctx.proc_instance_id {
+                        self.process_table
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .set_motw_metadata(
+                                inst_id,
+                                motw.origin_url.clone(),
+                                motw_source_str.clone(),
+                                motw.referrer_url.clone(),
+                                motw.frame_url.clone(),
+                                motw.zone_id,
+                            );
+                    }
+                    proc_ctx.origin_url = Some(motw.origin_url);
+                    proc_ctx.motw_source = Some(motw_source_str);
+                    proc_ctx.motw_referrer = motw.referrer_url;
+                    proc_ctx.motw_frame_url = motw.frame_url;
+                    proc_ctx.motw_zone_id = motw.zone_id;
+                    proc_ctx.proc_sha256 = motw.sha256;
+                }
+            }
+        }
 
         if matches!(event, SensorEvent::CanaryFileAccess { .. }) {
-            let mut proc_ctx = proc_ctx;
             self.backfill_canary_process_context_if_missing(event, &mut proc_ctx, event_ts_ms);
             self.handle_canary_file_access(event, &proc_ctx, event_ts_ms);
             self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
@@ -109,6 +143,11 @@ impl DaemonEngine {
                     "parent_exe_path": proc_ctx.parent_exe_path,
                     "parent_command_line": proc_ctx.parent_command_line,
                     "matched_fields": m.matched_fields,
+                    "origin_url": proc_ctx.origin_url,
+                    "motw_source": proc_ctx.motw_source,
+                    "motw_referrer": proc_ctx.motw_referrer,
+                    "motw_frame_url": proc_ctx.motw_frame_url,
+                    "motw_zone_id": proc_ctx.motw_zone_id,
                 })
                 .to_string();
 
@@ -165,7 +204,10 @@ impl DaemonEngine {
                         self.outbound_classifier.remove_pid(identity.pid);
                     }
                     if self.config.outbound_firewall_enabled {
-                        self.maybe_apply_preemptive_wfp_block(effective_exe);
+                        self.maybe_apply_preemptive_wfp_block_with_motw(
+                            effective_exe,
+                            proc_ctx.origin_url.is_some(),
+                        );
                     }
                 }
                 "OBSERVED"
@@ -284,7 +326,7 @@ impl DaemonEngine {
         };
 
         if !proc_ctx.skip_store_ingest {
-            if let Err(err) = self.store.ingest_event_with_lifecycle(
+            if let Err(err) = self.store.ingest_event_with_process_metadata(
                 effective_event,
                 proc_ctx.store_hint.as_deref(),
                 proc_ctx.exited_at_ms,
@@ -292,6 +334,8 @@ impl DaemonEngine {
                     .superseded_exit
                     .as_ref()
                     .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
+                proc_ctx.origin_url.as_deref(),
+                proc_ctx.proc_sha256.as_deref(),
                 is_nrd,
                 action,
             ) {
@@ -475,6 +519,31 @@ impl DaemonEngine {
             (existing_ppid, res)
         };
 
+        if proc_ctx.origin_url.is_none() && !exe_path.is_empty() && !res.skip_store_ingest {
+            if let Some(motw) =
+                self.resolve_process_motw(&exe_path, res.exited_at_ms, res.skip_store_ingest)
+            {
+                let motw_source_str = motw.stage.as_str().to_string();
+                self.process_table
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_motw_metadata(
+                        &res.instance_id,
+                        motw.origin_url.clone(),
+                        motw_source_str.clone(),
+                        motw.referrer_url.clone(),
+                        motw.frame_url.clone(),
+                        motw.zone_id,
+                    );
+                proc_ctx.origin_url = Some(motw.origin_url);
+                proc_ctx.motw_source = Some(motw_source_str);
+                proc_ctx.motw_referrer = motw.referrer_url;
+                proc_ctx.motw_frame_url = motw.frame_url;
+                proc_ctx.motw_zone_id = motw.zone_id;
+                proc_ctx.proc_sha256 = motw.sha256;
+            }
+        }
+
         let synthetic_start = SensorEvent::ProcessStart {
             identity: ident,
             parent_pid: existing_ppid,
@@ -482,13 +551,15 @@ impl DaemonEngine {
             command_line: command_line.clone(),
             user_sid: None,
         };
-        if let Err(err) = self.store.ingest_event_with_lifecycle(
+        if let Err(err) = self.store.ingest_event_with_process_metadata(
             &synthetic_start,
             res.parent_instance_id.as_deref(),
             res.exited_at_ms,
             res.superseded_exit
                 .as_ref()
                 .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
+            proc_ctx.origin_url.as_deref(),
+            proc_ctx.proc_sha256.as_deref(),
             false,
             "OBSERVED",
         ) {
@@ -683,6 +754,11 @@ impl DaemonEngine {
             "signer_subject": bin_identity.authenticode.as_ref().map(|a| a.signer_subject.as_str()),
             "root_thumbprint": bin_identity.authenticode.as_ref().map(|a| a.root_thumbprint.as_str()),
             "include_children": include_children,
+            "origin_url": proc_ctx.origin_url,
+            "motw_source": proc_ctx.motw_source,
+            "motw_referrer": proc_ctx.motw_referrer,
+            "motw_frame_url": proc_ctx.motw_frame_url,
+            "motw_zone_id": proc_ctx.motw_zone_id,
         });
         if include_children && process_suspended {
             if let Some(map) = context_obj.as_object_mut() {
@@ -840,24 +916,50 @@ impl DaemonEngine {
                     user_sid.clone(),
                     event_ts_ms,
                 );
-                let (resolved_exe, resolved_cmd, effective_process_start) =
-                    if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
-                        let differs = entry.identity != *identity
-                            || entry.ppid != *parent_pid
-                            || entry.exe_path != *exe_path
-                            || entry.command_line != *command_line
-                            || entry.user_sid != *user_sid;
-                        let merged_ev = differs.then(|| SensorEvent::ProcessStart {
-                            identity: entry.identity,
-                            parent_pid: entry.ppid,
-                            exe_path: entry.exe_path.clone(),
-                            command_line: entry.command_line.clone(),
-                            user_sid: entry.user_sid.clone(),
-                        });
-                        (entry.exe_path.clone(), entry.command_line.clone(), merged_ev)
-                    } else {
-                        (exe_path.clone(), command_line.clone(), None)
-                    };
+                let (
+                    resolved_exe,
+                    resolved_cmd,
+                    effective_process_start,
+                    origin_url,
+                    motw_source,
+                    motw_referrer,
+                    motw_frame_url,
+                    motw_zone_id,
+                ) = if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
+                    let differs = entry.identity != *identity
+                        || entry.ppid != *parent_pid
+                        || entry.exe_path != *exe_path
+                        || entry.command_line != *command_line
+                        || entry.user_sid != *user_sid;
+                    let merged_ev = differs.then(|| SensorEvent::ProcessStart {
+                        identity: entry.identity,
+                        parent_pid: entry.ppid,
+                        exe_path: entry.exe_path.clone(),
+                        command_line: entry.command_line.clone(),
+                        user_sid: entry.user_sid.clone(),
+                    });
+                    (
+                        entry.exe_path.clone(),
+                        entry.command_line.clone(),
+                        merged_ev,
+                        entry.origin_url.clone(),
+                        entry.motw_source.clone(),
+                        entry.motw_referrer.clone(),
+                        entry.motw_frame_url.clone(),
+                        entry.motw_zone_id,
+                    )
+                } else {
+                    (
+                        exe_path.clone(),
+                        command_line.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                };
                 ResolvedProcessContext {
                     proc_identity: Some(res.resolved_identity),
                     proc_instance_id: Some(res.instance_id),
@@ -871,6 +973,12 @@ impl DaemonEngine {
                     superseded_exit: res.superseded_exit,
                     skip_store_ingest: res.skip_store_ingest,
                     effective_process_start,
+                    origin_url,
+                    motw_source,
+                    motw_referrer,
+                    motw_frame_url,
+                    motw_zone_id,
+                    proc_sha256: None,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
@@ -892,6 +1000,12 @@ impl DaemonEngine {
                     superseded_exit: None,
                     skip_store_ingest: false,
                     effective_process_start: None,
+                    origin_url: None,
+                    motw_source: None,
+                    motw_referrer: None,
+                    motw_frame_url: None,
+                    motw_zone_id: None,
+                    proc_sha256: None,
                 }
             }
             SensorEvent::DnsQuery { pid, .. }
@@ -900,16 +1014,31 @@ impl DaemonEngine {
             | SensorEvent::ScriptEvaluated { pid, .. } => {
                 // Clone only the fields the context needs: cloning the whole entry would copy
                 // `emitted_rule_ids`, which grows with every distinct fired (rule, script) pair.
-                let Some((identity, instance_id, exe_path, command_line, parent_instance_id)) =
-                    table.lookup_by_pid_at(*pid, event_ts_ms).map(|e| {
-                        (
-                            e.identity,
-                            e.instance_id.clone(),
-                            e.exe_path.clone(),
-                            e.command_line.clone(),
-                            e.parent_instance_id.clone(),
-                        )
-                    })
+                let Some((
+                    identity,
+                    instance_id,
+                    exe_path,
+                    command_line,
+                    parent_instance_id,
+                    origin_url,
+                    motw_source,
+                    motw_referrer,
+                    motw_frame_url,
+                    motw_zone_id,
+                )) = table.lookup_by_pid_at(*pid, event_ts_ms).map(|e| {
+                    (
+                        e.identity,
+                        e.instance_id.clone(),
+                        e.exe_path.clone(),
+                        e.command_line.clone(),
+                        e.parent_instance_id.clone(),
+                        e.origin_url.clone(),
+                        e.motw_source.clone(),
+                        e.motw_referrer.clone(),
+                        e.motw_frame_url.clone(),
+                        e.motw_zone_id,
+                    )
+                })
                 else {
                     return ResolvedProcessContext::default();
                 };
@@ -936,6 +1065,12 @@ impl DaemonEngine {
                     superseded_exit: None,
                     skip_store_ingest: false,
                     effective_process_start: None,
+                    origin_url,
+                    motw_source,
+                    motw_referrer,
+                    motw_frame_url,
+                    motw_zone_id,
+                    proc_sha256: None,
                 }
             }
         }
@@ -965,6 +1100,12 @@ pub(super) struct ResolvedProcessContext {
     /// event, so `EarlyPruner`, `SigmaEngine`, alert context, and SQLite ingestion evaluate the
     /// same launch metadata.
     pub(super) effective_process_start: Option<SensorEvent>,
+    pub(super) origin_url: Option<String>,
+    pub(super) motw_source: Option<String>,
+    pub(super) motw_referrer: Option<String>,
+    pub(super) motw_frame_url: Option<String>,
+    pub(super) motw_zone_id: Option<u32>,
+    pub(super) proc_sha256: Option<String>,
 }
 
 impl Default for ResolvedProcessContext {
@@ -982,6 +1123,12 @@ impl Default for ResolvedProcessContext {
             superseded_exit: None,
             skip_store_ingest: false,
             effective_process_start: None,
+            origin_url: None,
+            motw_source: None,
+            motw_referrer: None,
+            motw_frame_url: None,
+            motw_zone_id: None,
+            proc_sha256: None,
         }
     }
 }

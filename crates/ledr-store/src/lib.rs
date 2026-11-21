@@ -83,6 +83,10 @@ struct BufferedEvent {
     /// supersedes an earlier active row (such as a `pid:0` snapshot placeholder); `None` for
     /// every other event.
     superseded_process_exit: Option<(String, i64)>,
+    /// MOTW / browser origin URL attached on `ProcessStart`; `None` for every other event.
+    origin_url: Option<String>,
+    /// Lowercase hex SHA-256 attached on `ProcessStart` when known; `None` for every other event.
+    sha256: Option<String>,
 }
 
 const MAX_PENDING_SUPERSEDED_EXITS: usize = 1_024;
@@ -268,14 +272,16 @@ impl LedrStore {
 
     /// Records a browser download origin entry into `download_origins`.
     pub fn record_download_origin(&self, origin: &DownloadOriginRecord) -> Result<(), StoreError> {
+        let normalized_path = normalize_windows_path(&origin.file_path);
+        let normalized_sha256 = normalize_sha256(origin.sha256.as_deref());
         let writer = self.lock_writer()?;
         writer.execute(
             "INSERT INTO download_origins (
                 file_path, sha256, tab_url, frame_url, referrer_url, downloaded_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                origin.file_path,
-                origin.sha256,
+                normalized_path,
+                normalized_sha256,
                 origin.tab_url,
                 origin.frame_url,
                 origin.referrer_url,
@@ -301,6 +307,33 @@ impl LedrStore {
         );
         Ok(())
     }
+}
+
+pub(crate) fn normalize_windows_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let body = if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\") || p.eq_ignore_ascii_case("//?/UNC/"))
+    {
+        format!(r"\\{}", &trimmed[8..])
+    } else if trimmed
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\") || p.eq_ignore_ascii_case("//?/"))
+    {
+        trimmed[4..].to_string()
+    } else {
+        trimmed.to_string()
+    };
+    body.replace('/', "\\")
+}
+
+pub(crate) fn normalize_sha256(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]

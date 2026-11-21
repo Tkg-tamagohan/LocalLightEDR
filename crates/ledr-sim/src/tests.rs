@@ -392,3 +392,119 @@ fn sim_p2_05_prepare_dir_rolls_back_created_files() {
     assert!(Path::new(&retried.cookies_path).is_file());
     assert!(Path::new(&retried.honeypot_path).is_file());
 }
+
+#[test]
+fn sim_p4_01_cli_parses_motw_download_scenario() {
+    assert_eq!(
+        parse_cli_args(["motw-download"]).unwrap(),
+        CliAction::Run(SimConfig {
+            scenario: Scenario::MotwDownload,
+            ..SimConfig::default()
+        })
+    );
+    assert_eq!(
+        parse_cli_args([
+            "--scenario=motw-download",
+            "--base-dir",
+            r"C:\Temp\motw-base",
+            "--hold-ms",
+            "150",
+            "--json"
+        ])
+        .unwrap(),
+        CliAction::Run(SimConfig {
+            scenario: Scenario::MotwDownload,
+            base_dir: Some(PathBuf::from(r"C:\Temp\motw-base")),
+            hold_ms: 150,
+            json_output: true,
+            ..SimConfig::default()
+        })
+    );
+}
+
+#[tokio::test]
+async fn sim_p4_02_motw_download_writes_verifies_ads_and_sha256() {
+    let outcome = run_motw_download_scenario()
+        .await
+        .expect("motw-download temp scenario should succeed");
+    assert!(outcome.verified_roundtrip);
+    assert_eq!(outcome.zone_id, 3);
+    assert_eq!(outcome.host_url, SIM_MOTW_HOST_URL);
+    assert_eq!(outcome.referrer_url, SIM_MOTW_REFERRER_URL);
+    assert_eq!(outcome.sha256.len(), 64);
+    assert!(
+        outcome.target_path.ends_with(SIM_MOTW_FILENAME),
+        "unexpected target path: {}",
+        outcome.target_path
+    );
+    assert!(
+        !Path::new(&outcome.target_path).exists(),
+        "temp MOTW simulation file must be cleaned up"
+    );
+
+    let temp = TempSimDir::new("test-motw").expect("temp dir");
+    let in_dir = run_motw_download_scenario_with_options(Some(temp.path().to_path_buf()), 10)
+        .await
+        .expect("motw-download with --base-dir");
+    assert!(in_dir.verified_roundtrip);
+    let target = PathBuf::from(&in_dir.target_path);
+    assert!(target.is_file(), "--base-dir file must remain on disk");
+    let zone = ledr_sensor_win::read_zone_identifier(&target).expect("read written ADS");
+    assert_eq!(zone.zone_id, 3);
+    assert_eq!(zone.host_url.as_deref(), Some(SIM_MOTW_HOST_URL));
+    assert_eq!(zone.referrer_url.as_deref(), Some(SIM_MOTW_REFERRER_URL));
+}
+
+#[tokio::test]
+async fn sim_p4_03_run_all_report_includes_motw_download_json() {
+    let temp = TempSimDir::new("run-all-motw").expect("temp dir");
+    let cookies_open =
+        run_cookies_open_scenario_with_options(Some(temp.path().to_path_buf()), 0)
+            .await
+            .expect("cookies-open");
+    let honeypot_write =
+        run_honeypot_write_scenario_with_options(Some(temp.path().to_path_buf()), 0)
+            .await
+            .expect("honeypot-write");
+    let motw_download =
+        run_motw_download_scenario_with_options(Some(temp.path().to_path_buf()), 0)
+            .await
+            .expect("motw-download");
+
+    let report = SimReport {
+        target_pipe: ledr_proto::IPC_PIPE_NAME.to_string(),
+        scenario: Scenario::All,
+        lotl: None,
+        dns_tcp: None,
+        cookies_open: Some(cookies_open),
+        honeypot_write: Some(honeypot_write),
+        motw_download: Some(motw_download.clone()),
+    };
+
+    let json = serde_json::to_string_pretty(&report).expect("serialize SimReport JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse SimReport JSON");
+    assert_eq!(
+        parsed.pointer("/scenario").and_then(|v| v.as_str()),
+        Some("all")
+    );
+    assert_eq!(
+        parsed
+            .pointer("/motw_download/verified_roundtrip")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        parsed
+            .pointer("/motw_download/zone_id")
+            .and_then(|v| v.as_u64()),
+        Some(3)
+    );
+    assert_eq!(
+        parsed
+            .pointer("/motw_download/sha256")
+            .and_then(|v| v.as_str()),
+        Some(motw_download.sha256.as_str())
+    );
+    assert!(print_report(&report, true).is_ok());
+    assert!(print_report(&report, false).is_ok());
+}

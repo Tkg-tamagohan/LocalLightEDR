@@ -12,6 +12,9 @@ pub use fs_scenarios::{
     run_cookies_open_scenario_with_hold, run_cookies_open_scenario_with_options,
     run_honeypot_write_scenario, run_honeypot_write_scenario_in,
     run_honeypot_write_scenario_with_hold, run_honeypot_write_scenario_with_options,
+    run_motw_download_scenario, run_motw_download_scenario_in,
+    run_motw_download_scenario_with_options, SIM_MOTW_FILENAME, SIM_MOTW_HOST_URL,
+    SIM_MOTW_REFERRER_URL,
 };
 pub use lotl::{
     LOTL_HARMLESS_SCRIPT, build_lotl_cmd_args, encode_powershell_command_utf16le,
@@ -20,7 +23,7 @@ pub use lotl::{
 pub use net::{run_dns_tcp_scenario, run_loopback_tcp_exchange};
 pub use types::{
     CliAction, CookiesOpenOutcome, DnsTcpOutcome, HoneypotWriteOutcome, LotlOutcome,
-    PrepareDirOutcome, Scenario, SimConfig, SimReport,
+    MotwDownloadOutcome, PrepareDirOutcome, Scenario, SimConfig, SimReport,
 };
 
 use anyhow::Result;
@@ -54,14 +57,20 @@ async fn main() -> Result<()> {
 
     let lotl = match config.scenario {
         Scenario::Lotl | Scenario::All => Some(run_lotl_scenario().await?),
-        Scenario::DnsTcp | Scenario::CookiesOpen | Scenario::HoneypotWrite => None,
+        Scenario::DnsTcp
+        | Scenario::CookiesOpen
+        | Scenario::HoneypotWrite
+        | Scenario::MotwDownload => None,
     };
 
     let dns_tcp = match config.scenario {
         Scenario::DnsTcp | Scenario::All => {
             Some(run_dns_tcp_scenario(&config.domain, config.port, config.loopback).await?)
         }
-        Scenario::Lotl | Scenario::CookiesOpen | Scenario::HoneypotWrite => None,
+        Scenario::Lotl
+        | Scenario::CookiesOpen
+        | Scenario::HoneypotWrite
+        | Scenario::MotwDownload => None,
     };
 
     let cookies_open = match config.scenario {
@@ -69,7 +78,10 @@ async fn main() -> Result<()> {
             run_cookies_open_scenario_with_options(config.base_dir.clone(), config.hold_ms)
                 .await?,
         ),
-        Scenario::Lotl | Scenario::DnsTcp | Scenario::HoneypotWrite => None,
+        Scenario::Lotl
+        | Scenario::DnsTcp
+        | Scenario::HoneypotWrite
+        | Scenario::MotwDownload => None,
     };
 
     let honeypot_write = match config.scenario {
@@ -77,7 +89,21 @@ async fn main() -> Result<()> {
             run_honeypot_write_scenario_with_options(config.base_dir.clone(), config.hold_ms)
                 .await?,
         ),
-        Scenario::Lotl | Scenario::DnsTcp | Scenario::CookiesOpen => None,
+        Scenario::Lotl
+        | Scenario::DnsTcp
+        | Scenario::CookiesOpen
+        | Scenario::MotwDownload => None,
+    };
+
+    let motw_download = match config.scenario {
+        Scenario::MotwDownload | Scenario::All => Some(
+            run_motw_download_scenario_with_options(config.base_dir.clone(), config.hold_ms)
+                .await?,
+        ),
+        Scenario::Lotl
+        | Scenario::DnsTcp
+        | Scenario::CookiesOpen
+        | Scenario::HoneypotWrite => None,
     };
 
     let report = SimReport {
@@ -87,6 +113,7 @@ async fn main() -> Result<()> {
         dns_tcp,
         cookies_open,
         honeypot_write,
+        motw_download,
     };
 
     print_report(&report, config.json_output)

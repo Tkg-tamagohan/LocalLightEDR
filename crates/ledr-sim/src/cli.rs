@@ -158,8 +158,8 @@ pub(crate) fn print_usage() {
     println!("Target daemon pipe: {IPC_PIPE_NAME}");
     println!();
     println!("Usage:");
-    println!("  ledr-sim <lotl|dns-tcp|cookies-open|honeypot-write|run-all> [OPTIONS]");
-    println!("  ledr-sim --scenario <lotl|dns-tcp|cookies-open|honeypot-write|all> [OPTIONS]");
+    println!("  ledr-sim <lotl|dns-tcp|cookies-open|honeypot-write|motw-download|run-all> [OPTIONS]");
+    println!("  ledr-sim --scenario <lotl|dns-tcp|cookies-open|honeypot-write|motw-download|all> [OPTIONS]");
     println!("  ledr-sim --prepare-dir <DIR> [--json]");
     println!();
     println!("Options:");
@@ -210,6 +210,17 @@ pub(crate) fn print_report(report: &SimReport, json_output: bool) -> Result<()> 
             honeypot.appended_bytes,
             honeypot.final_bytes,
             honeypot.target_path
+        );
+    }
+    if let Some(motw) = &report.motw_download {
+        println!(
+            "[motw-download] verified={} zone_id={} sha256={} host_url={} referrer_url={} path={}",
+            motw.verified_roundtrip,
+            motw.zone_id,
+            motw.sha256,
+            motw.host_url,
+            motw.referrer_url,
+            motw.target_path
         );
     }
     Ok(())

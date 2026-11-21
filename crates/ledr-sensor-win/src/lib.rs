@@ -3,6 +3,7 @@
 pub mod defense;
 pub mod dns_cache;
 pub mod etw;
+pub mod motw;
 pub mod path_norm;
 pub mod privileges;
 pub mod wfp;
@@ -13,6 +14,10 @@ pub use defense::{
 pub use etw::file_canary::{
     CanaryMatcher, is_autorun_registry_key, is_autorun_registry_key_u16,
     prefilter_and_classify_canary, prefilter_and_classify_canary_u16,
+};
+pub use motw::{
+    MAX_ZONE_IDENTIFIER_BYTES, MotwZoneInfo, ZONE_ID_INTERNET, parse_zone_identifier,
+    read_zone_identifier, write_zone_identifier,
 };
 pub use wfp::{
     LEDR_WFP_PROVIDER_GUID, LEDR_WFP_SUBLAYER_GUID, WFP_WEIGHT_BLOCK_APP,

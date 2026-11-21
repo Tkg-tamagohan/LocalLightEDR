@@ -40,6 +40,9 @@ struct CliArgs {
     ui_sha256: Option<String>,
     ui_signer: Option<String>,
     ui_root_thumbprint: Option<String>,
+    bridge_sha256: Option<String>,
+    bridge_signer: Option<String>,
+    bridge_root_thumbprint: Option<String>,
     show_help: bool,
 }
 
@@ -60,6 +63,9 @@ impl Default for CliArgs {
             ui_sha256: None,
             ui_signer: None,
             ui_root_thumbprint: None,
+            bridge_sha256: None,
+            bridge_signer: None,
+            bridge_root_thumbprint: None,
             show_help: false,
         }
     }
@@ -167,6 +173,36 @@ where
                 }
                 parsed.ui_root_thumbprint = Some(trimmed);
             }
+            "--bridge-sha256" => {
+                let val = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--bridge-sha256 requires a SHA-256 hex argument")
+                })?;
+                let trimmed = val.to_string_lossy().trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--bridge-sha256 cannot be empty");
+                }
+                parsed.bridge_sha256 = Some(trimmed);
+            }
+            "--bridge-signer" => {
+                let val = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--bridge-signer requires a signer subject argument")
+                })?;
+                let trimmed = val.to_string_lossy().trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--bridge-signer cannot be empty");
+                }
+                parsed.bridge_signer = Some(trimmed);
+            }
+            "--bridge-root-thumbprint" => {
+                let val = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--bridge-root-thumbprint requires a thumbprint hex argument")
+                })?;
+                let trimmed = val.to_string_lossy().trim().to_string();
+                if trimmed.is_empty() {
+                    anyhow::bail!("--bridge-root-thumbprint cannot be empty");
+                }
+                parsed.bridge_root_thumbprint = Some(trimmed);
+            }
             "--help" | "-h" => parsed.show_help = true,
             other => anyhow::bail!("unrecognized argument: {other}"),
         }
@@ -178,6 +214,12 @@ where
     // `--dev-bypass-auth` no authorization runs at all, so the pair is not required.
     if !parsed.dev_bypass_auth && parsed.ui_signer.is_some() && parsed.ui_root_thumbprint.is_none() {
         anyhow::bail!("--ui-signer requires --ui-root-thumbprint");
+    }
+    if !parsed.dev_bypass_auth
+        && parsed.bridge_signer.is_some()
+        && parsed.bridge_root_thumbprint.is_none()
+    {
+        anyhow::bail!("--bridge-signer requires --bridge-root-thumbprint");
     }
 
     Ok(parsed)
@@ -314,7 +356,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = parse_cli_args(std::env::args_os())?;
     if cli.show_help {
         println!(
-            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>]"
+            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>] [--bridge-sha256 <hex>] [--bridge-signer <dn>] [--bridge-root-thumbprint <sha1>]"
         );
         return Ok(());
     }
@@ -349,8 +391,13 @@ async fn main() -> anyhow::Result<()> {
             resolve_existing_sha256(&[Path::new(AUTHORIZED_UI_EXE_PATH), ui_exe.as_path()])
         }
     });
-    let authorized_bridge_sha256 =
-        resolve_existing_sha256(&[Path::new(AUTHORIZED_BRIDGE_EXE_PATH)]);
+    let authorized_bridge_sha256 = cli.bridge_sha256.clone().or_else(|| {
+        if cli.bridge_signer.is_some() {
+            None
+        } else {
+            resolve_existing_sha256(&[Path::new(AUTHORIZED_BRIDGE_EXE_PATH)])
+        }
+    });
 
     let nrd_cache_path = cli.nrd_cache_path.clone().or_else(|| {
         db_path
@@ -393,6 +440,8 @@ async fn main() -> anyhow::Result<()> {
         authorized_ui_signer: cli.ui_signer.clone(),
         authorized_ui_root_thumbprint: cli.ui_root_thumbprint.clone(),
         authorized_bridge_sha256,
+        authorized_bridge_signer: cli.bridge_signer.clone(),
+        authorized_bridge_root_thumbprint: cli.bridge_root_thumbprint.clone(),
         outbound_firewall_enabled,
         outbound_enforcement_mode: cli.outbound_mode,
         resume_suspended_on_shutdown,
@@ -533,6 +582,9 @@ mod tests {
         assert_eq!(def.ui_sha256, None);
         assert_eq!(def.ui_signer, None);
         assert_eq!(def.ui_root_thumbprint, None);
+        assert_eq!(def.bridge_sha256, None);
+        assert_eq!(def.bridge_signer, None);
+        assert_eq!(def.bridge_root_thumbprint, None);
 
         let custom = parse_cli_args([
             "ledr-daemon",
@@ -557,6 +609,12 @@ mod tests {
             "CN=LocalEDR",
             "--ui-root-thumbprint",
             "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+            "--bridge-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--bridge-signer",
+            "CN=LocalEDR Bridge",
+            "--bridge-root-thumbprint",
+            "4C2EFD3A66EA28B16697394703A72CA340A05BD6",
         ])
         .expect("custom args");
         assert!(custom.foreground);
@@ -584,6 +642,15 @@ mod tests {
         assert_eq!(
             custom.ui_root_thumbprint.as_deref(),
             Some("3B1EFD3A66EA28B16697394703A72CA340A05BD5")
+        );
+        assert_eq!(
+            custom.bridge_sha256.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(custom.bridge_signer.as_deref(), Some("CN=LocalEDR Bridge"));
+        assert_eq!(
+            custom.bridge_root_thumbprint.as_deref(),
+            Some("4C2EFD3A66EA28B16697394703A72CA340A05BD6")
         );
 
         let service_strict = parse_cli_args(["ledr-daemon", "--service-strict"]).expect("service strict");
@@ -641,6 +708,36 @@ mod tests {
                 true,
             ),
             ("--ui-root-thumbprint missing value", &["ledr-daemon", "--ui-root-thumbprint"], false),
+            ("--bridge-sha256 missing value", &["ledr-daemon", "--bridge-sha256"], false),
+            ("--bridge-sha256 empty", &["ledr-daemon", "--bridge-sha256", "   "], false),
+            ("--bridge-signer missing value", &["ledr-daemon", "--bridge-signer"], false),
+            (
+                "--bridge-signer alone must fail (root thumbprint pin required)",
+                &["ledr-daemon", "--bridge-signer", "CN=LocalEDR Bridge"],
+                false,
+            ),
+            (
+                "--dev-bypass-auth + --bridge-signer must be accepted",
+                &[
+                    "ledr-daemon",
+                    "--dev-bypass-auth",
+                    "--bridge-signer",
+                    "CN=LocalEDR Bridge",
+                ],
+                true,
+            ),
+            (
+                "bridge signer + root thumbprint pair must be accepted",
+                &[
+                    "ledr-daemon",
+                    "--bridge-signer",
+                    "CN=LocalEDR Bridge",
+                    "--bridge-root-thumbprint",
+                    "4C2EFD3A66EA28B16697394703A72CA340A05BD6",
+                ],
+                true,
+            ),
+            ("--bridge-root-thumbprint missing value", &["ledr-daemon", "--bridge-root-thumbprint"], false),
             ("--nrd-feed-url missing value", &["ledr-daemon", "--nrd-feed-url"], false),
             ("--nrd-feed-url whitespace", &["ledr-daemon", "--nrd-feed-url", "   "], false),
             ("--nrd-cache missing value", &["ledr-daemon", "--nrd-cache"], false),

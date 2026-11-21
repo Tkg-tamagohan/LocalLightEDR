@@ -342,7 +342,39 @@ async fn handle_pipe_client(
         }
 
         let response = match decode_ipc_frame::<IpcRequest>(&frame) {
-            Ok(req) => dispatch_request(&engine, caller_exe.as_deref(), req),
+            Ok(req) => {
+                let session_remaining =
+                    session_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if session_remaining.is_zero() {
+                    tracing::info!(
+                        timeout_ms = session_timeout.as_millis(),
+                        "IPC client session lifetime cap reached before dispatch; closing session (SEC_0001)"
+                    );
+                    break;
+                }
+                let dispatch_engine = Arc::clone(&engine);
+                let dispatch_caller = caller_exe.clone();
+                let blocking = tokio::task::spawn_blocking(move || {
+                    dispatch_request(&dispatch_engine, dispatch_caller.as_deref(), req)
+                });
+                match tokio::time::timeout(session_remaining, blocking).await {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(join_err)) => {
+                        tracing::error!(error = %join_err, "IPC dispatch blocking task panicked");
+                        IpcResponse::Error {
+                            code: "INTERNAL_ERROR".to_string(),
+                            message: format!("IPC dispatch task failed: {join_err}"),
+                        }
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            timeout_ms = session_timeout.as_millis(),
+                            "IPC client session lifetime cap reached during dispatch; closing session (SEC_0001)"
+                        );
+                        break;
+                    }
+                }
+            }
             Err(err) => IpcResponse::Error {
                 code: "INVALID_REQUEST".to_string(),
                 message: err.to_string(),

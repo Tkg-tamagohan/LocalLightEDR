@@ -112,6 +112,12 @@ pub struct DaemonConfig {
     /// records retained in `ProcessDnsHistory` (`L-10`). Defaults to
     /// [`DNS_RESOLUTION_CACHE_CAPACITY`] (`4,096`). Values of `0` are clamped to `1`.
     pub dns_history_capacity: usize,
+    /// When `true`, `ReportBrowserEvent` (`LAYER_4_BROWSER`) alerts also trigger an OS toast
+    /// notification (`L-19`). Defaults to `false` because the browser UI already shows an overlay.
+    pub notify_browser_events: bool,
+    /// Maximum file byte size hashed with SHA-256 during `ReportDownloadOrigin` and Stage 2 MOTW
+    /// correlation. Defaults to 128 MiB (`MAX_DOWNLOAD_HASH_BYTES`).
+    pub download_hash_max_bytes: u64,
 }
 
 impl Default for DaemonConfig {
@@ -150,6 +156,8 @@ impl Default for DaemonConfig {
                 .collect(),
             wfp_drop_dns_grace_ms: DEFAULT_WFP_DROP_DNS_GRACE_MS,
             dns_history_capacity: DNS_RESOLUTION_CACHE_CAPACITY,
+            notify_browser_events: false,
+            download_hash_max_bytes: super::motw::MAX_DOWNLOAD_HASH_BYTES,
         }
     }
 }

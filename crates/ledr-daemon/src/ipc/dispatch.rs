@@ -1,12 +1,10 @@
 //! IPC request authorization enforcement and command dispatch to `DaemonEngine`.
 
 use ledr_proto::{
-    AlertDecision, AlertRecord, AlertSeverity, AlertStatus, DownloadOriginRecord, IpcRequest,
-    IpcResponse, AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH,
+    AlertDecision, IpcRequest, IpcResponse, AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH,
 };
-use uuid::Uuid;
 
-use crate::engine::{DaemonEngine, PolicyRuleError};
+use crate::engine::{BrowserEventOutcome, BrowserReportError, DaemonEngine, PolicyRuleError};
 
 use super::auth::verify_authorized_caller_binary;
 
@@ -156,55 +154,40 @@ pub(super) fn dispatch_request(
             frame_url,
             referrer_url,
             downloaded_at_ms,
-        } => {
-            let record = DownloadOriginRecord {
-                id: None,
-                file_path,
-                sha256: None,
-                tab_url,
-                frame_url,
-                referrer_url,
-                downloaded_at_ms,
-            };
-            match store.record_download_origin(&record) {
-                Ok(()) => IpcResponse::Ack {
-                    message: "recorded download origin".to_string(),
-                },
-                Err(err) => store_error_response(err),
-            }
-        }
+        } => match engine.record_browser_download_origin(
+            &file_path,
+            &tab_url,
+            frame_url.as_deref(),
+            referrer_url.as_deref(),
+            downloaded_at_ms,
+        ) {
+            Ok(_) => IpcResponse::Ack {
+                message: "recorded download origin".to_string(),
+            },
+            Err(BrowserReportError::Invalid(msg)) => IpcResponse::Error {
+                code: "INVALID_REQUEST".to_string(),
+                message: msg,
+            },
+            Err(BrowserReportError::Store(err)) => store_error_response(err),
+        },
         IpcRequest::ReportBrowserEvent {
             event_type,
             url,
             details,
             timestamp_ms,
-        } => {
-            let context_json = serde_json::json!({
-                "event_type": event_type,
-                "url": url,
-                "details": details,
-            })
-            .to_string();
-            let alert = AlertRecord {
-                alert_id: Uuid::new_v4().to_string(),
-                timestamp_ms,
-                severity: AlertSeverity::Medium,
-                source_layer: "LAYER_4_BROWSER".to_string(),
-                rule_id: format!("BROWSER-{event_type:?}"),
-                title: format!("Browser Shield Event: {event_type:?}"),
-                process_instance_id: None,
-                process_suspended: false,
-                status: AlertStatus::Pending,
-                context_json,
-                resolved_at_ms: None,
-            };
-            match store.record_alert(&alert) {
-                Ok(()) => IpcResponse::Ack {
-                    message: format!("recorded browser event {}", alert.alert_id),
-                },
-                Err(err) => store_error_response(err),
-            }
-        }
+        } => match engine.record_browser_event(event_type, &url, details.as_deref(), timestamp_ms) {
+            Ok(BrowserEventOutcome::Recorded(alert)) => IpcResponse::Ack {
+                message: format!("recorded browser event {}", alert.alert_id),
+            },
+            Ok(BrowserEventOutcome::Deduplicated) => IpcResponse::Ack {
+                message: "browser event deduplicated".to_string(),
+            },
+            Err(BrowserReportError::Invalid(msg)) => IpcResponse::Error {
+                code: "INVALID_REQUEST".to_string(),
+                message: msg,
+            },
+            Err(BrowserReportError::Store(err)) => store_error_response(err),
+        },
     }
 }
 

@@ -1774,9 +1774,12 @@ name = "ledr-sim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "ledr-proto",
+ "ledr-sensor-win",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

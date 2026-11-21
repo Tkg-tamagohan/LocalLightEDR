@@ -285,6 +285,12 @@ impl DaemonEngine {
         event_ts_ms: i64,
     ) -> (&'static str, bool) {
         let risk = classify_outbound_risk(exe_path);
+        let is_motw_origin = proc_ctx.origin_url.is_some();
+        let effective_risk = if is_motw_origin && risk == OutboundRiskClass::GeneralUnknown {
+            OutboundRiskClass::HighRiskPath
+        } else {
+            risk
+        };
 
         let already_outbound_alerted = proc_ctx
             .proc_instance_id
@@ -600,7 +606,7 @@ impl DaemonEngine {
                     "protocol": protocol,
                     "domain_hint": effective_domain_hint,
                     "matched_rule_id": rule_id,
-                    "risk_class": format!("{risk:?}"),
+                    "risk_class": format!("{effective_risk:?}"),
                     "wfp_blocked": wfp_handle.is_some(),
                     "wfp_filter_id": wfp_handle,
                     "pid": pid,
@@ -615,6 +621,11 @@ impl DaemonEngine {
                     "is_homograph": domain_risk.as_ref().is_some_and(|r| r.is_homograph),
                     "matched_brand": domain_risk.and_then(|r| r.matched_brand),
                     "is_first_seen_domain": is_first_seen_domain,
+                    "origin_url": proc_ctx.origin_url,
+                    "motw_source": proc_ctx.motw_source,
+                    "motw_referrer": proc_ctx.motw_referrer,
+                    "motw_frame_url": proc_ctx.motw_frame_url,
+                    "motw_zone_id": proc_ctx.motw_zone_id,
                 })
                 .to_string();
                 let alert = AlertRecord {
@@ -651,6 +662,7 @@ impl DaemonEngine {
                     OutboundEnforcementMode::Enforce => true,
                     OutboundEnforcementMode::PreemptiveOnly => {
                         matches!(decision, OutboundDecision::PreemptiveRestrict(_))
+                            || is_motw_origin
                     }
                     OutboundEnforcementMode::Audit => false,
                 };
@@ -880,7 +892,7 @@ impl DaemonEngine {
                     .as_ref()
                     .is_some_and(|r| r.is_nrd || r.is_homograph);
 
-                let (rule_id, severity, label) = match risk {
+                let (rule_id, severity, label) = match effective_risk {
                     OutboundRiskClass::HighRiskPath => (
                         "LEDR-NET-HIGH-RISK-PATH",
                         AlertSeverity::High,
@@ -908,7 +920,7 @@ impl DaemonEngine {
                     "dst_port": dst_port,
                     "protocol": protocol,
                     "domain_hint": effective_domain_hint,
-                    "risk_class": format!("{risk:?}"),
+                    "risk_class": format!("{effective_risk:?}"),
                     "wfp_blocked": wfp_filter_id.is_some(),
                     "wfp_filter_id": wfp_filter_id,
                     "wfp_shared_allow_once_deferred": wfp_shared_allow_once_deferred,
@@ -924,6 +936,11 @@ impl DaemonEngine {
                     "is_homograph": domain_risk.as_ref().is_some_and(|r| r.is_homograph),
                     "matched_brand": domain_risk.and_then(|r| r.matched_brand),
                     "is_first_seen_domain": is_first_seen_domain,
+                    "origin_url": proc_ctx.origin_url,
+                    "motw_source": proc_ctx.motw_source,
+                    "motw_referrer": proc_ctx.motw_referrer,
+                    "motw_frame_url": proc_ctx.motw_frame_url,
+                    "motw_zone_id": proc_ctx.motw_zone_id,
                 })
                 .to_string();
 

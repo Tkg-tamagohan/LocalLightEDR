@@ -3752,7 +3752,7 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
         signer_subject: String,
         root_thumbprint: String,
         gate_armed: std::sync::atomic::AtomicBool,
-        state: std::sync::Mutex<(bool, bool)>, // (entered, released)
+        state: std::sync::Mutex<(bool, bool, bool)>, // (entered, released, worker_finished)
         cv: std::sync::Condvar,
     }
     impl crate::engine::BinaryInspector for GatedSignedInspector {
@@ -3775,6 +3775,34 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
             }
         }
     }
+    struct WorkerFinishedGuard {
+        inspector: Arc<GatedSignedInspector>,
+    }
+    impl Drop for WorkerFinishedGuard {
+        fn drop(&mut self) {
+            let mut guard = self
+                .inspector
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.2 = true;
+            self.inspector.cv.notify_all();
+        }
+    }
+    struct ReleaseGateOnDrop {
+        inspector: Arc<GatedSignedInspector>,
+    }
+    impl Drop for ReleaseGateOnDrop {
+        fn drop(&mut self) {
+            let mut guard = self
+                .inspector
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.1 = true;
+            self.inspector.cv.notify_all();
+        }
+    }
 
     let store_race = LedrStore::open_in_memory().expect("open store race");
     store_race
@@ -3786,7 +3814,7 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
         signer_subject: "CN=Google LLC".to_string(),
         root_thumbprint: "DDFB16CD4931C973A2037D3FC83A4D7D775D05E4".to_string(),
         gate_armed: std::sync::atomic::AtomicBool::new(false),
-        state: std::sync::Mutex::new((false, false)),
+        state: std::sync::Mutex::new((false, false, false)),
         cv: std::sync::Condvar::new(),
     });
     let engine_race = Arc::new(
@@ -3808,8 +3836,15 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
 
     // Arm the gate for the outbound connect's `inspector.inspect`, run connect on a worker thread.
     race_inspector.gate_armed.store(true, Ordering::Release);
+    let release_guard = ReleaseGateOnDrop {
+        inspector: Arc::clone(&race_inspector),
+    };
     let engine_worker = Arc::clone(&engine_race);
+    let inspector_worker = Arc::clone(&race_inspector);
     let connect_thread = std::thread::spawn(move || {
+        let _finished_guard = WorkerFinishedGuard {
+            inspector: inspector_worker,
+        };
         let _ = engine_worker.process_event_with_lane(
             &SensorEvent::NetworkConnect {
                 pid: p_race.pid,
@@ -3823,18 +3858,34 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
         );
     });
 
-    // Wait deterministically until the outbound connect is paused inside `inspector.inspect`.
+    // Wait with a bounded deadline until the outbound connect is paused inside `inspector.inspect`
+    // (or fail immediately if the worker exits without entering `inspector.inspect`).
     {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut guard = race_inspector
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        while !guard.0 {
-            guard = race_inspector
+        while !guard.0 && !guard.2 {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let (next_guard, wait_res) = race_inspector
                 .cv
-                .wait(guard)
+                .wait_timeout(guard, remaining)
                 .unwrap_or_else(|e| e.into_inner());
+            guard = next_guard;
+            if wait_res.timed_out() {
+                break;
+            }
         }
+        let entered = guard.0;
+        let worker_finished = guard.2;
+        drop(guard);
+        assert!(
+            entered,
+            "outbound connect did not enter inspector.inspect before deadline (worker_finished={worker_finished})"
+        );
     }
 
     // Delete the authorizing rule while the connect evaluation holds its stale rule snapshot.
@@ -3844,14 +3895,7 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
     assert!(deleted, "browser allow rule must be deleted");
 
     // Release `inspector.inspect` and wait for the in-flight connect evaluation to finish.
-    {
-        let mut guard = race_inspector
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.1 = true;
-        race_inspector.cv.notify_all();
-    }
+    drop(release_guard);
     connect_thread.join().expect("join connect thread");
 
     assert!(

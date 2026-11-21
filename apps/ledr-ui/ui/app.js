@@ -42,6 +42,7 @@
     selectedAlertIsNetwork: false,
     triageFeedback: null,
     triageFeedbackByAlert: new Map(),
+    triageValidationFeedback: null,
   };
 
   const MAX_TRIAGE_FEEDBACK_ENTRIES = 64;
@@ -1196,6 +1197,8 @@
       allAlerts.find((a) => a.alert_id === state.selectedAlertId) || null;
     if (!selected) {
       state.selectedAlertIsNetwork = false;
+      state.lastSyncedAlertId = null;
+      state.triageValidationFeedback = null;
       el.triageDetail.classList.add("hidden");
       el.triageEmpty.classList.remove("hidden");
 
@@ -1571,6 +1574,14 @@
   function setAlertTriageFeedback(alertId, ok, message) {
     const feedback = { ok: Boolean(ok), message, alertId };
     state.triageFeedback = feedback;
+    if (
+      state.triageValidationFeedback &&
+      (alertId === null ||
+        alertId === undefined ||
+        state.triageValidationFeedback.alertId === alertId)
+    ) {
+      state.triageValidationFeedback = null;
+    }
     if (alertId !== null && alertId !== undefined) {
       state.triageFeedbackByAlert.delete(alertId);
       state.triageFeedbackByAlert.set(alertId, feedback);
@@ -1581,6 +1592,10 @@
     }
   }
 
+  function setTransientTriageFeedback(alertId, message) {
+    state.triageValidationFeedback = { ok: false, message, alertId };
+  }
+
   function clearAlertTriageFeedback(alertId) {
     if (alertId !== null && alertId !== undefined) {
       state.triageFeedbackByAlert.delete(alertId);
@@ -1588,9 +1603,15 @@
     if (state.triageFeedback && state.triageFeedback.alertId === alertId) {
       state.triageFeedback = null;
     }
+    if (
+      state.triageValidationFeedback &&
+      state.triageValidationFeedback.alertId === alertId
+    ) {
+      state.triageValidationFeedback = null;
+    }
   }
 
-  function resolveDetailTriageFeedback(alertId) {
+  function resolvePersistedDetailTriageFeedback(alertId) {
     const perAlert =
       state.triageFeedbackByAlert.get(alertId) ||
       (state.triageFeedback && state.triageFeedback.alertId === alertId
@@ -1607,6 +1628,30 @@
     return globalFeedback || perAlert;
   }
 
+  function resolveDetailTriageFeedback(alertId) {
+    if (
+      state.triageValidationFeedback &&
+      state.triageValidationFeedback.alertId === alertId
+    ) {
+      return state.triageValidationFeedback;
+    }
+    return resolvePersistedDetailTriageFeedback(alertId);
+  }
+
+  function renderDetailTriageFeedback(alertId) {
+    const detailFeedback = resolveDetailTriageFeedback(alertId);
+    if (detailFeedback && detailFeedback.message) {
+      el.triageActionStatus.textContent = detailFeedback.message;
+      el.triageActionStatus.className = `triage-feedback ${
+        detailFeedback.ok ? "is-ok" : "is-error"
+      }`;
+      el.triageActionStatus.setAttribute("role", detailFeedback.ok ? "status" : "alert");
+      el.triageActionStatus.classList.remove("hidden");
+    } else {
+      el.triageActionStatus.classList.add("hidden");
+    }
+  }
+
   function syncResolutionControls(alert, details) {
     const unresolved = isUnresolvedAlert(alert);
     const hasSigner = Boolean(details.signerSubject);
@@ -1614,9 +1659,17 @@
 
     if (state.lastSyncedAlertId !== alert.alert_id) {
       state.lastSyncedAlertId = alert.alert_id;
+      state.triageValidationFeedback = null;
       el.optAddBlockRule.checked = true;
       el.optUseSigner.checked = hasSigner;
       el.optAllowDest.value = "";
+    }
+    if (
+      !unresolved &&
+      state.triageValidationFeedback &&
+      state.triageValidationFeedback.alertId === alert.alert_id
+    ) {
+      state.triageValidationFeedback = null;
     }
 
     el.optUseSigner.disabled = !unresolved || !hasSigner || state.isResolvingAlert;
@@ -1643,17 +1696,7 @@
     el.btnAllowOnce.disabled = !unresolved || state.isResolvingAlert;
     el.btnAllowPermanent.disabled = !unresolved || state.isResolvingAlert;
 
-    const detailFeedback = resolveDetailTriageFeedback(alert.alert_id);
-    if (detailFeedback && detailFeedback.message) {
-      el.triageActionStatus.textContent = detailFeedback.message;
-      el.triageActionStatus.className = `triage-feedback ${
-        detailFeedback.ok ? "is-ok" : "is-error"
-      }`;
-      el.triageActionStatus.setAttribute("role", detailFeedback.ok ? "status" : "alert");
-      el.triageActionStatus.classList.remove("hidden");
-    } else {
-      el.triageActionStatus.classList.add("hidden");
-    }
+    renderDetailTriageFeedback(alert.alert_id);
   }
 
   async function handleResolveAlert(kind) {
@@ -1679,9 +1722,8 @@
       const details = extractAlertDetails(alert, buildHierarchy(state.snapshot).byId);
       const allowDestRaw = el.optAllowDest.value.trim();
       if (details.isNetworkAlert && allowDestRaw.includes("/") && !isLiteralIpOrCidr(allowDestRaw)) {
-        setAlertTriageFeedback(
+        setTransientTriageFeedback(
           alert.alert_id,
-          false,
           "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
         );
         renderTriageView();
@@ -1716,9 +1758,8 @@
 
     const invoke = getInvoke();
     if (!invoke) {
-      setAlertTriageFeedback(
+      setTransientTriageFeedback(
         alert.alert_id,
-        false,
         "Tauri IPC bridge unavailable outside Tauri runtime.",
       );
       renderTriageView();
@@ -2587,6 +2628,12 @@
           }
         }
         if (
+          state.triageValidationFeedback &&
+          !liveAlertIds.has(state.triageValidationFeedback.alertId)
+        ) {
+          state.triageValidationFeedback = null;
+        }
+        if (
           state.triageFeedback &&
           state.triageFeedback.alertId === null &&
           !state.triageFeedback.ok
@@ -2594,10 +2641,10 @@
           state.triageFeedback = null;
         }
       } else {
-        const visibleFeedback = state.selectedAlertId
-          ? resolveDetailTriageFeedback(state.selectedAlertId)
+        const persistedVisibleFeedback = state.selectedAlertId
+          ? resolvePersistedDetailTriageFeedback(state.selectedAlertId)
           : state.triageFeedback;
-        if (!(visibleFeedback && !visibleFeedback.ok)) {
+        if (!(persistedVisibleFeedback && !persistedVisibleFeedback.ok)) {
           state.triageFeedback = {
             ok: false,
             message: `Failed to refresh alerts: ${alertsRes.error}`,
@@ -2673,8 +2720,10 @@
     state.isSamplePreview = true;
     state.isDaemonOnline = false;
     state.selectedProcessId = null;
+    state.lastSyncedAlertId = null;
     state.triageFeedback = null;
     state.triageFeedbackByAlert.clear();
+    state.triageValidationFeedback = null;
     state.policyFeedback = null;
     state.domainRiskResult = null;
     state.domainRiskError = null;
@@ -2760,12 +2809,11 @@
     if (!btn) return;
     const nextAlertId = btn.dataset.alertId;
     state.launchFocusAlertId = null;
-    if (
-      state.selectedAlertId !== nextAlertId &&
-      state.triageFeedback &&
-      state.triageFeedback.alertId !== null
-    ) {
-      state.triageFeedback = null;
+    if (state.selectedAlertId !== nextAlertId) {
+      state.triageValidationFeedback = null;
+      if (state.triageFeedback && state.triageFeedback.alertId !== null) {
+        state.triageFeedback = null;
+      }
     }
     state.selectedAlertId = nextAlertId;
     renderTriageView();
@@ -2773,6 +2821,12 @@
 
   el.optAllowDest.addEventListener("input", () => {
     syncTriageTargetScopeNote(state.selectedAlertIsNetwork);
+    if (state.triageValidationFeedback) {
+      state.triageValidationFeedback = null;
+      if (state.selectedAlertId) {
+        renderDetailTriageFeedback(state.selectedAlertId);
+      }
+    }
   });
 
   el.inspectInView2Btn.addEventListener("click", () => {

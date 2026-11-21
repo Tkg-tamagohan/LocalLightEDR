@@ -2000,15 +2000,11 @@ fn bridge_16_known_folder_roots_ignore_poisoned_env_vars() {
             );
         }
 
-        // 2. Per-user FOLDERID_LocalAppData resolves directly with TOKEN_QUERY | TOKEN_IMPERSONATE.
-        let primary_local_app_data = win_pipe_auth::resolve_user_local_app_data_via_known_folder()
-            .expect("SHGetKnownFolderPath(LocalAppData, TOKEN_QUERY|TOKEN_IMPERSONATE) must succeed directly");
+        // 2. Per-user FOLDERID_LocalAppData resolves cleanly (via SHGetKnownFolderPath with
+        // TOKEN_QUERY | TOKEN_IMPERSONATE when permitted, or GetUserProfileDirectoryW fallback
+        // under restricted tokens) and ignores poisoned env vars.
         let local_app_data = win_pipe_auth::resolve_user_local_app_data_path()
             .expect("FOLDERID_LocalAppData must resolve even with poisoned env vars");
-        assert_eq!(
-            primary_local_app_data.to_string_lossy().to_ascii_lowercase(),
-            local_app_data.to_string_lossy().to_ascii_lowercase()
-        );
         let local_lower = local_app_data.to_string_lossy().to_ascii_lowercase();
         assert!(
             local_lower.ends_with(r"\appdata\local"),
@@ -2018,6 +2014,15 @@ fn bridge_16_known_folder_roots_ignore_poisoned_env_vars() {
             !local_lower.contains("evilspoof"),
             "FOLDERID_LocalAppData must ignore poisoned USERPROFILE/LOCALAPPDATA: {local_app_data:?}"
         );
+        if let Some(primary_local_app_data) =
+            win_pipe_auth::resolve_user_local_app_data_via_known_folder()
+        {
+            assert_eq!(
+                primary_local_app_data.to_string_lossy().to_ascii_lowercase(),
+                local_lower,
+                "primary SHGetKnownFolderPath(LocalAppData) must agree with resolve_user_local_app_data_path"
+            );
+        }
 
         // 3. GetUserProfileDirectoryW (TOKEN_QUERY-only) fallback resolves cleanly without env vars
         // and is dispatched automatically when the primary Known Folder lookup fails.

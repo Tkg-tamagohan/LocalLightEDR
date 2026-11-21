@@ -1,7 +1,9 @@
 //! Two-tier binary allowlist evaluation (`決定記録 L-04`), streaming SHA-256 hashing,
 //! and Windows Authenticode signature verification (`WinVerifyTrust` + `CryptQueryObject`).
 
+#[cfg(windows)]
 mod authenticode;
+#[cfg(windows)]
 mod ffi;
 mod matcher;
 
@@ -13,8 +15,16 @@ use ledr_proto::AuthenticodeInfo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(windows)]
 pub use authenticode::inspect_authenticode;
 pub use matcher::{is_allowed_by_rules, matches_path_pattern, signer_subject_matches};
+
+/// Non-Windows stub preserving the [`inspect_authenticode`] signature; Authenticode
+/// verification is unavailable off Windows so it always reports `None`.
+#[cfg(not(windows))]
+pub fn inspect_authenticode(_path: &Path) -> Option<AuthenticodeInfo> {
+    None
+}
 
 const SHA256_BUF_LEN: usize = 65_536;
 

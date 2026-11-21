@@ -2561,4 +2561,47 @@ fn rules_nrd_mem_01_flat_sorted_arena_50k_compact_lookup_roundtrip_and_edges() {
     assert!(!homo.is_nrd);
     assert!(homo.is_homograph);
     assert_eq!(homo.matched_brand.as_deref(), Some("paypal"));
+
+    // 4. Sorted prefix hitting `max_entries` followed by out-of-order entries and duplicates
+    // (mirrors two-feed `nrd7.txt` + `nrd14-8.txt` refresh) plus power-of-2 bucket transition,
+    // `max_entries = 0` clamping, and invalid UTF-8 bytes in feed.
+    let cap_zero = NrdCache::from_domains(["first.example", "second.example"], None, 0);
+    assert_eq!(cap_zero.len(), 1);
+    assert!(cap_zero.is_truncated());
+    assert!(cap_zero.contains("first.example"));
+
+    // Power-of-2 sorted prefix (`8` entries) transitioning to unsorted on the 9th entry.
+    let mut pow2_inputs: Vec<String> = (1..=8).map(|i| format!("d-{i:02}.example")).collect();
+    pow2_inputs.push("d-00.example".to_string());
+    pow2_inputs.push("d-04.example".to_string()); // duplicate after unsorted transition
+    let pow2_cache = NrdCache::from_domains(pow2_inputs.iter(), None, 16);
+    assert_eq!(pow2_cache.len(), 9);
+    assert!(!pow2_cache.is_truncated());
+    assert!(pow2_cache.contains("d-00.example"));
+    assert!(pow2_cache.contains("d-08.example"));
+
+    // Two sorted feeds where feed1 fills cap and feed2 has duplicates + smaller domains + bad UTF-8.
+    let feed1_path = tmp.path().join("sorted-feed1.txt");
+    let feed2_path = tmp.path().join("sorted-feed2.txt");
+    std::fs::write(&feed1_path, "b-one.xyz\nc-two.xyz\nd-three.xyz\n").expect("write feed1");
+    std::fs::write(
+        &feed2_path,
+        b"b-one.xyz\n\xff\xfe-bad-utf8.xyz\na-zero.xyz\n",
+    )
+    .expect("write feed2");
+    let to_url = |p: &Path| format!("file:///{}", p.to_string_lossy().replace('\\', "/"));
+    let (multi_cache, multi_stats) = refresh_nrd_cache(
+        &[to_url(&feed1_path), to_url(&feed2_path)],
+        3,
+        NRD_MAX_RESPONSE_BYTES,
+        1_760_000_200_000,
+    )
+    .expect("multi-feed capped refresh");
+    assert_eq!(multi_stats.feeds_succeeded, 2);
+    assert_eq!(multi_cache.len(), 3);
+    assert!(multi_stats.truncated);
+    assert_eq!(
+        multi_cache.iter().collect::<Vec<_>>(),
+        vec!["b-one.xyz", "c-two.xyz", "d-three.xyz"]
+    );
 }

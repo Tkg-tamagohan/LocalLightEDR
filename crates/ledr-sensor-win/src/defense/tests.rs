@@ -803,15 +803,15 @@ fn sens_p3_14_open_process_and_guard_reject_low_bit_pid_aliases() {
 
 /// `SENS-P2-RUNDOWN-01`: Terminated zombie processes (whose handles are still held open during
 /// Windows asynchronous kernel rundown) must be classified as [`ProcessLiveness::Gone`] via
-/// `GetProcessTimes` (`lpExitTime != 0`) / `SYNCHRONIZE` (`WaitForSingleObject`), and
-/// `terminate_process` must succeed cleanly for an already-exited validated zombie while still
-/// keeping suspended processes `Running` and enforcing `CreationTime` mismatch checks.
+/// `SYNCHRONIZE` (`WaitForSingleObject == WAIT_OBJECT_0`) or `GetExitCodeProcess != STILL_ACTIVE`,
+/// and `terminate_process` must succeed cleanly for an already-exited validated zombie while still
+/// keeping live/suspended processes `Running` and enforcing `CreationTime` mismatch checks.
 #[test]
 fn sens_p2_rundown_01_zombie_process_liveness_and_terminate_accept_exited_rundown() {
     use super::process_probe::{
-        is_process_handle_exited, probe_snapshot_present_pid_liveness, query_process_exit_time,
+        is_process_handle_exited, probe_snapshot_present_pid_liveness, query_process_exit_code,
     };
-    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::Foundation::{STILL_ACTIVE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
     let controller = WindowsDefenseController::new();
@@ -848,12 +848,16 @@ fn sens_p2_rundown_01_zombie_process_liveness_and_terminate_accept_exited_rundow
     );
     assert!(
         !is_process_handle_exited(zombie_keepalive.as_raw(), true, 0),
-        "live child handle must not be marked exited"
+        "live child handle must not be marked exited via SYNCHRONIZE"
+    );
+    assert!(
+        !is_process_handle_exited(zombie_keepalive.as_raw(), false, 0),
+        "live child handle must not be marked exited via GetExitCodeProcess fallback"
     );
     assert_eq!(
-        query_process_exit_time(zombie_keepalive.as_raw()),
-        Some(0),
-        "live child must report lpExitTime == 0"
+        query_process_exit_code(zombie_keepalive.as_raw()),
+        Some(STILL_ACTIVE.0 as u32),
+        "live child must report STILL_ACTIVE"
     );
 
     controller
@@ -871,7 +875,11 @@ fn sens_p2_rundown_01_zombie_process_liveness_and_terminate_accept_exited_rundow
     );
     assert!(
         !is_process_handle_exited(zombie_keepalive.as_raw(), true, 0),
-        "suspended (non-exited) child handle must not be marked exited"
+        "suspended (non-exited) child handle must not be marked exited via SYNCHRONIZE"
+    );
+    assert!(
+        !is_process_handle_exited(zombie_keepalive.as_raw(), false, 0),
+        "suspended (non-exited) child handle must not be marked exited via GetExitCodeProcess fallback"
     );
 
     // 2. Terminate while holding `zombie_keepalive` + `Child` open so the kernel process object
@@ -884,13 +892,18 @@ fn sens_p2_rundown_01_zombie_process_liveness_and_terminate_accept_exited_rundow
         wait_res, WAIT_OBJECT_0,
         "terminated child handle must become signaled"
     );
-    assert!(
-        query_process_exit_time(zombie_keepalive.as_raw()).is_some_and(|t| t != 0),
-        "terminated zombie child must report non-zero lpExitTime"
+    assert_eq!(
+        query_process_exit_code(zombie_keepalive.as_raw()),
+        Some(1),
+        "terminated zombie child must report its non-STILL_ACTIVE exit code"
     );
     assert!(
         is_process_handle_exited(zombie_keepalive.as_raw(), true, 0),
-        "terminated zombie handle must be confirmed exited"
+        "terminated zombie handle must be confirmed exited via SYNCHRONIZE"
+    );
+    assert!(
+        is_process_handle_exited(zombie_keepalive.as_raw(), false, 0),
+        "terminated zombie handle must be confirmed exited via GetExitCodeProcess fallback"
     );
 
     // Even when a Toolhelp32 snapshot still includes the zombie PID during rundown,

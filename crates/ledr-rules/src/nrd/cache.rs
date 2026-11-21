@@ -97,8 +97,19 @@ impl FlatDomainSet {
                         return self.append_unchecked(bytes);
                     }
                     CmpOrdering::Less => {
+                        if self.contains_in_sorted(bytes) {
+                            return InsertOutcome::Duplicate;
+                        }
+                        if count >= cap {
+                            return InsertOutcome::CapReached;
+                        }
                         self.sorted_so_far = false;
-                        self.build_buckets(count);
+                        self.build_buckets(count + 1);
+                        let outcome = self.append_unchecked(bytes);
+                        if outcome == InsertOutcome::Inserted {
+                            self.insert_bucket_index(count as u32, bytes);
+                        }
+                        return outcome;
                     }
                 }
             } else {
@@ -126,6 +137,20 @@ impl FlatDomainSet {
         outcome
     }
 
+    fn contains_in_sorted(&self, needle: &[u8]) -> bool {
+        let mut lo = 0usize;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.entry_bytes(mid).cmp(needle) {
+                CmpOrdering::Less => lo = mid + 1,
+                CmpOrdering::Greater => hi = mid,
+                CmpOrdering::Equal => return true,
+            }
+        }
+        false
+    }
+
     fn append_unchecked(&mut self, bytes: &[u8]) -> InsertOutcome {
         let count = self.len();
         let Some(next_end) = self
@@ -144,8 +169,13 @@ impl FlatDomainSet {
         InsertOutcome::Inserted
     }
 
-    fn build_buckets(&mut self, count: usize) {
-        let min_slots = count.saturating_mul(2).max(16).next_power_of_two();
+    fn build_buckets(&mut self, min_entries: usize) {
+        let count = self.len();
+        let min_slots = min_entries
+            .max(count)
+            .saturating_mul(2)
+            .max(16)
+            .next_power_of_two();
         self.buckets.clear();
         self.buckets.resize(min_slots, 0);
         for idx in 0..count {

@@ -427,6 +427,9 @@ $env:RUST_LOG = "info"
 .\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
 ```
 
+指定した `nrd-cache.txt` が未作成の場合、`ledr-daemon.exe` は空の NRD キャッシュで起動し、バックグラウンドで初回フィード取得を実行する。
+計測を始める前に、ウィンドウ A のログで `loaded local NRD cache from disk`（`entries` が 0 より大きいこと）または `refreshed daily NRD domain cache`（`entries` が 0 より大きいこと）が出力されたことを確認してください。
+
 ### 1. `ledr-ui` 閉鎖時のプロセス 0 件確認（`L-08`）
 
 ウィンドウ C で `.\target\release\ledr-ui.exe` を開いた状態で右上の閉じるボタンから終了し、直後にウィンドウ C で UI 本体と WebView2 子プロセスの残存がないことを確認してください。

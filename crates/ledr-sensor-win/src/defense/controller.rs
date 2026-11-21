@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use ledr_proto::{ActiveDefenseController, ProcessIdentity};
+use ledr_proto::{ActiveDefenseController, ProcessIdentity, is_never_suspend_process};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME, PROCESS_SYNCHRONIZE,
@@ -20,7 +20,7 @@ use super::guard::{
 };
 use super::process_probe::{
     PROCESS_EXIT_WAIT_MS, is_process_handle_exited, open_process_checked,
-    open_process_checked_detailed,
+    open_process_checked_detailed, query_full_image_name, query_process_creation_time,
 };
 use super::tree::collect_validated_descendants;
 
@@ -355,6 +355,9 @@ impl WindowsDefenseController {
 }
 
 fn confirm_validated_identity_exited(identity: &ProcessIdentity) -> bool {
+    if identity.create_time_100ns == 0 {
+        return false;
+    }
     let (probe, has_synchronize) = match open_process_checked_detailed(
         identity.pid,
         PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -368,7 +371,10 @@ fn confirm_validated_identity_exited(identity: &ProcessIdentity) -> bool {
             Err(_) => return false,
         },
     };
-    if validate_open_handle(probe.as_raw(), identity).is_err() {
+    if query_process_creation_time(probe.as_raw()) != Some(identity.create_time_100ns) {
+        return false;
+    }
+    if query_full_image_name(probe.as_raw()).is_some_and(|exe| is_never_suspend_process(&exe)) {
         return false;
     }
     is_process_handle_exited(probe.as_raw(), has_synchronize, PROCESS_EXIT_WAIT_MS)

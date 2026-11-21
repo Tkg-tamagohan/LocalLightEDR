@@ -1,14 +1,14 @@
 //! Low-level Win32 process handle inspection, Toolhelp32 snapshot, and liveness probe (`BUG_0002`, `BUG_0004`).
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, FILETIME, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, FILETIME, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetProcessId, GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
-    WaitForSingleObject,
+    GetExitCodeProcess, GetProcessId, GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    QueryFullProcessImageNameW, WaitForSingleObject,
 };
 
 use crate::OwnedHandle;
@@ -143,37 +143,31 @@ pub(super) fn query_process_creation_time(handle: HANDLE) -> Option<u64> {
     Some(((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64))
 }
 
-pub(super) fn query_process_exit_time(handle: HANDLE) -> Option<u64> {
-    let mut creation = FILETIME::default();
-    let mut exit = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
-    // SAFETY: `handle` is an open process handle and all four `FILETIME` structs are valid.
-    unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }.ok()?;
-    Some(((exit.dwHighDateTime as u64) << 32) | (exit.dwLowDateTime as u64))
+pub(super) fn query_process_exit_code(handle: HANDLE) -> Option<u32> {
+    let mut exit_code = 0u32;
+    // SAFETY: `handle` is an open process handle with `PROCESS_QUERY_LIMITED_INFORMATION`
+    // (or `PROCESS_QUERY_INFORMATION`) and `exit_code` is valid writable storage.
+    unsafe { GetExitCodeProcess(handle, &mut exit_code) }.ok()?;
+    Some(exit_code)
 }
 
 /// Returns `true` only when `handle` positively confirms the process has exited in the kernel:
-/// either `GetProcessTimes` reports a non-zero `lpExitTime`, or waiting up to `wait_ms` with
-/// `PROCESS_SYNCHRONIZE` observes `WAIT_OBJECT_0`.
+/// - When `has_synchronize` is `true`, uses `WaitForSingleObject(handle, wait_ms) == WAIT_OBJECT_0`
+///   (authoritative process-object signal; never relies on `GetProcessTimes` `lpExitTime`, which
+///   Win32 leaves undefined while a process is still running).
+/// - When `has_synchronize` is `false` (`PROCESS_QUERY_LIMITED_INFORMATION` fallback), checks
+///   `GetExitCodeProcess(handle) != STILL_ACTIVE` (`259`), failing closed (`false`) if the query
+///   fails or reports `STILL_ACTIVE`.
 pub(super) fn is_process_handle_exited(
     handle: HANDLE,
     has_synchronize: bool,
     wait_ms: u32,
 ) -> bool {
-    if query_process_exit_time(handle).is_some_and(|exit| exit != 0) {
-        return true;
-    }
     if has_synchronize {
         // SAFETY: `handle` is an open process handle granted `PROCESS_SYNCHRONIZE`.
-        if unsafe { WaitForSingleObject(handle, wait_ms) } == WAIT_OBJECT_0 {
-            return true;
-        }
-        if query_process_exit_time(handle).is_some_and(|exit| exit != 0) {
-            return true;
-        }
+        return unsafe { WaitForSingleObject(handle, wait_ms) } == WAIT_OBJECT_0;
     }
-    false
+    query_process_exit_code(handle).is_some_and(|code| code != STILL_ACTIVE.0 as u32)
 }
 
 pub(super) fn find_process_exe_toolhelp32(pid: u32) -> Option<String> {
@@ -186,8 +180,8 @@ pub(super) fn find_process_exe_toolhelp32(pid: u32) -> Option<String> {
 
 /// Tri-state liveness of a PID from the Toolhelp32 snapshot and kernel exit probe.
 /// [`ProcessLiveness::Gone`] means the snapshot positively confirmed absence or the
-/// kernel confirmed process exit (`lpExitTime != 0` or signaled `SYNCHRONIZE` handle
-/// for a zombie/rundown process); `Unknown` means snapshot creation or enumeration
+/// kernel confirmed process exit (signaled `SYNCHRONIZE` handle or `GetExitCodeProcess !=
+/// STILL_ACTIVE` for a zombie/rundown process); `Unknown` means snapshot creation or enumeration
 /// failed, so absence is unconfirmed. Containment decisions must not treat `Unknown`
 /// as "gone" (`BUG_0002`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -41,7 +41,10 @@
     isResolvingAlert: false,
     selectedAlertIsNetwork: false,
     triageFeedback: null,
+    triageFeedbackByAlert: new Map(),
   };
+
+  const MAX_TRIAGE_FEEDBACK_ENTRIES = 64;
 
   const el = {
     navTabs: Array.from(document.querySelectorAll(".nav-tab")),
@@ -1565,6 +1568,45 @@
     el.targetScopeNote.classList.remove("hidden");
   }
 
+  function setAlertTriageFeedback(alertId, ok, message) {
+    const feedback = { ok: Boolean(ok), message, alertId };
+    state.triageFeedback = feedback;
+    if (alertId !== null && alertId !== undefined) {
+      state.triageFeedbackByAlert.delete(alertId);
+      state.triageFeedbackByAlert.set(alertId, feedback);
+      while (state.triageFeedbackByAlert.size > MAX_TRIAGE_FEEDBACK_ENTRIES) {
+        const oldestKey = state.triageFeedbackByAlert.keys().next().value;
+        state.triageFeedbackByAlert.delete(oldestKey);
+      }
+    }
+  }
+
+  function clearAlertTriageFeedback(alertId) {
+    if (alertId !== null && alertId !== undefined) {
+      state.triageFeedbackByAlert.delete(alertId);
+    }
+    if (state.triageFeedback && state.triageFeedback.alertId === alertId) {
+      state.triageFeedback = null;
+    }
+  }
+
+  function resolveDetailTriageFeedback(alertId) {
+    const perAlert =
+      state.triageFeedbackByAlert.get(alertId) ||
+      (state.triageFeedback && state.triageFeedback.alertId === alertId
+        ? state.triageFeedback
+        : null);
+    const globalFeedback =
+      state.triageFeedback &&
+      (state.triageFeedback.alertId === null || state.triageFeedback.alertId === undefined)
+        ? state.triageFeedback
+        : null;
+    if (perAlert && !perAlert.ok) {
+      return perAlert;
+    }
+    return globalFeedback || perAlert;
+  }
+
   function syncResolutionControls(alert, details) {
     const unresolved = isUnresolvedAlert(alert);
     const hasSigner = Boolean(details.signerSubject);
@@ -1601,19 +1643,13 @@
     el.btnAllowOnce.disabled = !unresolved || state.isResolvingAlert;
     el.btnAllowPermanent.disabled = !unresolved || state.isResolvingAlert;
 
-    const showDetailFeedback = Boolean(
-      state.triageFeedback &&
-        state.triageFeedback.message &&
-        (state.triageFeedback.alertId === null ||
-          state.triageFeedback.alertId === undefined ||
-          state.triageFeedback.alertId === alert.alert_id),
-    );
-    if (showDetailFeedback) {
-      el.triageActionStatus.textContent = state.triageFeedback.message;
+    const detailFeedback = resolveDetailTriageFeedback(alert.alert_id);
+    if (detailFeedback && detailFeedback.message) {
+      el.triageActionStatus.textContent = detailFeedback.message;
       el.triageActionStatus.className = `triage-feedback ${
-        state.triageFeedback.ok ? "is-ok" : "is-error"
+        detailFeedback.ok ? "is-ok" : "is-error"
       }`;
-      el.triageActionStatus.setAttribute("role", state.triageFeedback.ok ? "status" : "alert");
+      el.triageActionStatus.setAttribute("role", detailFeedback.ok ? "status" : "alert");
       el.triageActionStatus.classList.remove("hidden");
     } else {
       el.triageActionStatus.classList.add("hidden");
@@ -1643,11 +1679,11 @@
       const details = extractAlertDetails(alert, buildHierarchy(state.snapshot).byId);
       const allowDestRaw = el.optAllowDest.value.trim();
       if (details.isNetworkAlert && allowDestRaw.includes("/") && !isLiteralIpOrCidr(allowDestRaw)) {
-        state.triageFeedback = {
-          ok: false,
-          message: "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
-          alertId: alert.alert_id,
-        };
+        setAlertTriageFeedback(
+          alert.alert_id,
+          false,
+          "CIDR target must be valid IPv4/prefix (0..32) or IPv6/prefix (0..128).",
+        );
         renderTriageView();
         return;
       }
@@ -1673,28 +1709,24 @@
                 : "no NetworkBlock rule saved"
             }`
           : `Preview: ${alert.alert_id} → ${previewStatus}`;
-      state.triageFeedback = {
-        ok: true,
-        message: previewMessage,
-        alertId: alert.alert_id,
-      };
+      setAlertTriageFeedback(alert.alert_id, true, previewMessage);
       renderTriageView();
       return;
     }
 
     const invoke = getInvoke();
     if (!invoke) {
-      state.triageFeedback = {
-        ok: false,
-        message: "Tauri IPC bridge unavailable outside Tauri runtime.",
-        alertId: alert.alert_id,
-      };
+      setAlertTriageFeedback(
+        alert.alert_id,
+        false,
+        "Tauri IPC bridge unavailable outside Tauri runtime.",
+      );
       renderTriageView();
       return;
     }
 
     state.isResolvingAlert = true;
-    state.triageFeedback = null;
+    clearAlertTriageFeedback(alert.alert_id);
     renderTriageView();
 
     try {
@@ -1704,14 +1736,10 @@
       });
       // The daemon's Ack message already reports whether the requested rule was
       // actually saved; do not re-derive it from the checkbox state (ANALYSIS_0001).
-      state.triageFeedback = { ok: true, message: ackMessage, alertId: alert.alert_id };
+      setAlertTriageFeedback(alert.alert_id, true, ackMessage);
       await refreshAll();
     } catch (err) {
-      state.triageFeedback = {
-        ok: false,
-        message: formatBackendError(err),
-        alertId: alert.alert_id,
-      };
+      setAlertTriageFeedback(alert.alert_id, false, formatBackendError(err));
       await refreshAll();
     } finally {
       state.isResolvingAlert = false;
@@ -2552,6 +2580,12 @@
       state.metrics = metrics;
       if (alertsRes.ok) {
         state.alerts = Array.isArray(alertsRes.data) ? alertsRes.data : [];
+        const liveAlertIds = new Set(state.alerts.map((a) => a.alert_id));
+        for (const cachedId of state.triageFeedbackByAlert.keys()) {
+          if (!liveAlertIds.has(cachedId)) {
+            state.triageFeedbackByAlert.delete(cachedId);
+          }
+        }
         if (
           state.triageFeedback &&
           state.triageFeedback.alertId === null &&
@@ -2559,12 +2593,17 @@
         ) {
           state.triageFeedback = null;
         }
-      } else if (!(state.triageFeedback && !state.triageFeedback.ok)) {
-        state.triageFeedback = {
-          ok: false,
-          message: `Failed to refresh alerts: ${alertsRes.error}`,
-          alertId: null,
-        };
+      } else {
+        const visibleFeedback = state.selectedAlertId
+          ? resolveDetailTriageFeedback(state.selectedAlertId)
+          : state.triageFeedback;
+        if (!(visibleFeedback && !visibleFeedback.ok)) {
+          state.triageFeedback = {
+            ok: false,
+            message: `Failed to refresh alerts: ${alertsRes.error}`,
+            alertId: null,
+          };
+        }
       }
       if (rulesRes.ok) {
         state.rules = Array.isArray(rulesRes.data) ? rulesRes.data : [];
@@ -2635,6 +2674,7 @@
     state.isDaemonOnline = false;
     state.selectedProcessId = null;
     state.triageFeedback = null;
+    state.triageFeedbackByAlert.clear();
     state.policyFeedback = null;
     state.domainRiskResult = null;
     state.domainRiskError = null;
@@ -2720,7 +2760,11 @@
     if (!btn) return;
     const nextAlertId = btn.dataset.alertId;
     state.launchFocusAlertId = null;
-    if (state.selectedAlertId !== nextAlertId) {
+    if (
+      state.selectedAlertId !== nextAlertId &&
+      state.triageFeedback &&
+      state.triageFeedback.alertId !== null
+    ) {
       state.triageFeedback = null;
     }
     state.selectedAlertId = nextAlertId;

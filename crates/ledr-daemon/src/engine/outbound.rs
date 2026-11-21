@@ -7,8 +7,9 @@ use ledr_proto::{
     AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord, RuleScope, SensorEvent,
 };
 use ledr_rules::{
-    classify_outbound_risk, evaluate_outbound_policy, is_external_ip, matches_network_target,
-    matches_path_pattern, parse_cidr_target, BinaryIdentity, OutboundDecision, OutboundRiskClass,
+    classify_outbound_risk, evaluate_outbound_policy, is_external_ip,
+    matches_app_wide_network_allow, matches_network_target, matches_path_pattern,
+    parse_cidr_target, BinaryIdentity, OutboundDecision, OutboundRiskClass,
 };
 use uuid::Uuid;
 
@@ -43,8 +44,9 @@ pub(super) struct VerifiedAppWideAllowEntry {
 #[derive(Debug)]
 pub(super) struct VerifiedAppWideAllowCache {
     capacity: usize,
-    entries: HashMap<String, VerifiedAppWideAllowEntry>,
-    order: VecDeque<String>,
+    next_gen: u64,
+    entries: HashMap<String, (VerifiedAppWideAllowEntry, u64)>,
+    order: VecDeque<(String, u64)>,
 }
 
 impl VerifiedAppWideAllowCache {
@@ -52,31 +54,41 @@ impl VerifiedAppWideAllowCache {
         let cap = capacity.max(1);
         Self {
             capacity: cap,
+            next_gen: 1,
             entries: HashMap::with_capacity(cap.min(256)),
             order: VecDeque::with_capacity(cap.min(256)),
         }
     }
 
     pub(super) fn get(&self, instance_id: &str) -> Option<&VerifiedAppWideAllowEntry> {
-        self.entries.get(instance_id)
+        self.entries.get(instance_id).map(|(entry, _)| entry)
     }
 
     pub(super) fn insert(&mut self, instance_id: String, entry: VerifiedAppWideAllowEntry) {
-        if let Some(existing) = self.entries.get_mut(&instance_id) {
+        if let Some((existing, _)) = self.entries.get_mut(&instance_id) {
             *existing = entry;
             return;
         }
         while self.entries.len() >= self.capacity {
-            let Some(oldest) = self.order.pop_front() else {
+            let Some((oldest_id, oldest_gen)) = self.order.pop_front() else {
                 break;
             };
-            self.entries.remove(&oldest);
+            if self
+                .entries
+                .get(&oldest_id)
+                .is_some_and(|(_, cur_gen)| *cur_gen == oldest_gen)
+            {
+                self.entries.remove(&oldest_id);
+            }
         }
-        self.entries.insert(instance_id.clone(), entry);
-        self.order.push_back(instance_id);
+        let gen_id = self.next_gen;
+        self.next_gen = self.next_gen.wrapping_add(1);
+        self.entries.insert(instance_id.clone(), (entry, gen_id));
+        self.order.push_back((instance_id, gen_id));
         if self.order.len() > self.capacity.saturating_mul(2) {
             let entries = &self.entries;
-            self.order.retain(|id| entries.contains_key(id));
+            self.order
+                .retain(|(id, g)| entries.get(id).is_some_and(|(_, cur_gen)| cur_gen == g));
         }
     }
 
@@ -92,6 +104,11 @@ impl VerifiedAppWideAllowCache {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn order_len(&self) -> usize {
+        self.order.len()
     }
 }
 
@@ -555,6 +572,43 @@ impl DaemonEngine {
                             .as_deref()
                             .is_none_or(|s| s.trim().is_empty())
                 });
+                // Serialize app-wide WFP Permit materialization, steady-PID promotion, and
+                // `verified_app_wide_allows` caching with `upsert_policy_rule`/`delete_policy_rule`
+                // (`policy_lock -> store/firewall -> verified_app_wide_allows`) and re-verify
+                // against the latest persisted rules so a rule deleted while `inspector.inspect`
+                // was running can never resurrect a stale WFP Permit (`SEC_0001`).
+                let app_wide_candidate = rules_loaded
+                    && authorizing_app_wide_rule.is_some()
+                    && !has_block_rule_for_exe
+                    && !has_target_scoped_rule_for_exe;
+                let _policy_guard = app_wide_candidate
+                    .then(|| self.policy_lock.lock().unwrap_or_else(|e| e.into_inner()));
+                let fresh_app_wide_rule: Option<AllowlistRuleRecord> = if app_wide_candidate {
+                    self.store.list_network_rules().ok().and_then(|fresh_rules| {
+                        let fresh_has_block = fresh_rules.iter().any(|r| {
+                            r.scope == RuleScope::NetworkBlock
+                                && (r.exe_path_pattern.trim().is_empty()
+                                    || matches_path_pattern(exe_path, &r.exe_path_pattern))
+                        });
+                        let fresh_has_scoped = fresh_rules.iter().any(|r| {
+                            matches!(r.scope, RuleScope::NetworkAllow | RuleScope::NetworkBlock)
+                                && r.allowed_target
+                                    .as_deref()
+                                    .is_some_and(|s| !s.trim().is_empty())
+                                && (r.exe_path_pattern.trim().is_empty()
+                                    || matches_path_pattern(exe_path, &r.exe_path_pattern))
+                        });
+                        if fresh_has_block || fresh_has_scoped {
+                            return None;
+                        }
+                        fresh_rules
+                            .into_iter()
+                            .find(|r| matches_app_wide_network_allow(r, &bin_identity))
+                    })
+                } else {
+                    None
+                };
+
                 // If an app-wide pre-emptive block is active (e.g. script interpreter with a
                 // domain/CIDR-scoped NetworkAllow), install an IP-specific Permit so this
                 // destination flows cleanly through WFP and survives rule reconciliations —
@@ -660,9 +714,7 @@ impl DaemonEngine {
                     }
                 } else if !is_audit_mode
                     && self.config.outbound_firewall_enabled
-                    && authorizing_app_wide_rule.is_some()
-                    && !has_block_rule_for_exe
-                    && !has_target_scoped_rule_for_exe
+                    && fresh_app_wide_rule.is_some()
                     && !fw.has_active_filter(exe_path, None, true)
                 {
                     // Materialize the concrete app-wide WFP Permit for wildcard app-wide allow
@@ -680,17 +732,16 @@ impl DaemonEngine {
                 let has_app_wide_permit = fw.has_active_filter(exe_path, None, true);
                 let has_app_block = fw.active_app_block(exe_path).is_some();
                 drop(fw);
-                if has_app_wide_permit && !has_block_rule_for_exe && !has_domain_rules_for_exe {
+                if has_app_wide_permit
+                    && !has_block_rule_for_exe
+                    && !has_domain_rules_for_exe
+                    && (!app_wide_candidate || fresh_app_wide_rule.is_some())
+                {
                     self.outbound_classifier.mark_steady(pid);
                 }
-                if rules_loaded
-                    && !has_app_block
-                    && !has_block_rule_for_exe
-                    && !has_target_scoped_rule_for_exe
-                    && (is_audit_mode || has_app_wide_permit)
-                {
+                if !has_app_block && (is_audit_mode || has_app_wide_permit) {
                     if let (Some(inst_id), Some(auth_rule)) =
-                        (verified_inst_id, authorizing_app_wide_rule)
+                        (verified_inst_id, fresh_app_wide_rule)
                     {
                         self.verified_app_wide_allows
                             .lock()
@@ -699,11 +750,12 @@ impl DaemonEngine {
                                 inst_id.to_string(),
                                 VerifiedAppWideAllowEntry {
                                     exe_key: WfpRuleManager::exe_key(exe_path),
-                                    authorizing_rule: auth_rule.clone(),
+                                    authorizing_rule: auth_rule,
                                 },
                             );
                     }
                 }
+                drop(_policy_guard);
                 ("ALLOWED", false)
             }
             OutboundDecision::BlockedByRule { rule_id } => {

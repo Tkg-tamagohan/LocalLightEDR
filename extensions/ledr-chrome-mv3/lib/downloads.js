@@ -1,12 +1,36 @@
-// MV3 download origin tracking using `chrome.storage.session` (bounded FIFO, 512 entries).
+// MV3 download origin tracking using `chrome.storage.session` (bounded FIFO, 512 entries)
+// and short-TTL `<a href>` click hints (15s TTL, 32 entries) without assuming `DownloadItem.tabId`.
 
 import { buildReportDownloadOriginRequest } from "./native_bridge.js";
 
 export const PENDING_DOWNLOADS_STORAGE_KEY = "ledr_pending_downloads";
 export const MAX_PENDING_DOWNLOADS = 512;
 
+export const DOWNLOAD_CLICK_HINTS_STORAGE_KEY = "ledr_download_click_hints";
+export const DOWNLOAD_CLICK_HINT_TTL_MS = 15 * 1000;
+export const MAX_DOWNLOAD_CLICK_HINTS = 32;
+
 function nonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function normalizeHttpUrl(rawUrl, { stripHash = false } = {}) {
+  const value = nonEmptyString(rawUrl);
+  if (!value || value.startsWith("chrome://downloads")) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    if (stripHash) {
+      parsed.hash = "";
+    }
+    return parsed.href;
+  } catch {
+    return null;
+  }
 }
 
 async function readPendingList(storageSession) {
@@ -24,6 +48,21 @@ async function writePendingList(storageSession, entries) {
   return bounded;
 }
 
+async function readClickHintList(storageSession) {
+  const result = await storageSession.get([DOWNLOAD_CLICK_HINTS_STORAGE_KEY]);
+  const list = result?.[DOWNLOAD_CLICK_HINTS_STORAGE_KEY];
+  return Array.isArray(list) ? list : [];
+}
+
+async function writeClickHintList(storageSession, entries) {
+  const bounded =
+    entries.length > MAX_DOWNLOAD_CLICK_HINTS
+      ? entries.slice(entries.length - MAX_DOWNLOAD_CLICK_HINTS)
+      : entries;
+  await storageSession.set({ [DOWNLOAD_CLICK_HINTS_STORAGE_KEY]: bounded });
+  return bounded;
+}
+
 function extractOrigin(rawUrl) {
   const value = nonEmptyString(rawUrl);
   if (!value) {
@@ -33,27 +72,6 @@ function extractOrigin(rawUrl) {
     const parsed = new URL(value);
     if (parsed.protocol === "http:" || parsed.protocol === "https:") {
       return parsed.origin;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-async function queryTabById(tabsApi, tabId) {
-  if (
-    typeof tabId !== "number" ||
-    tabId < 0 ||
-    !tabsApi ||
-    typeof tabsApi.get !== "function"
-  ) {
-    return null;
-  }
-  try {
-    const tab = await tabsApi.get(tabId);
-    const url = nonEmptyString(tab?.url);
-    if (url && !url.startsWith("chrome://downloads")) {
-      return url;
     }
   } catch {
     return null;
@@ -77,31 +95,121 @@ async function queryActiveTabUrl(tabsApi) {
   return null;
 }
 
+function findMatchingClickHint(hints, candidateUrls, now) {
+  const targets = new Set();
+  for (const raw of candidateUrls) {
+    const norm = normalizeHttpUrl(raw, { stripHash: true });
+    if (norm) {
+      targets.add(norm);
+    }
+  }
+  if (targets.size === 0 || !Array.isArray(hints) || hints.length === 0) {
+    return null;
+  }
+  for (let i = hints.length - 1; i >= 0; i--) {
+    const hint = hints[i];
+    if (!hint || typeof hint.clickedAtMs !== "number") {
+      continue;
+    }
+    const ageMs = now - hint.clickedAtMs;
+    if (ageMs < 0 || ageMs >= DOWNLOAD_CLICK_HINT_TTL_MS) {
+      continue;
+    }
+    const hintTarget = normalizeHttpUrl(hint.targetUrl, { stripHash: true });
+    const hintTab = normalizeHttpUrl(hint.tabUrl);
+    if (hintTarget && hintTab && targets.has(hintTarget)) {
+      return hintTab;
+    }
+  }
+  return null;
+}
+
+/**
+ * Records a short-TTL `<a href>` click hint into `chrome.storage.session` (15s TTL, capped at 32).
+ */
+export async function recordDownloadClickHint({ targetUrl, tabUrl }, deps) {
+  const normTarget = normalizeHttpUrl(targetUrl, { stripHash: true });
+  const normTab = normalizeHttpUrl(tabUrl);
+  if (!normTarget || !normTab) {
+    return null;
+  }
+  const { storageSession, nowFn = () => Date.now() } = deps;
+  const now = nowFn();
+  const existing = await readClickHintList(storageSession);
+  const fresh = existing.filter(
+    (entry) =>
+      entry &&
+      typeof entry.clickedAtMs === "number" &&
+      now - entry.clickedAtMs < DOWNLOAD_CLICK_HINT_TTL_MS
+  );
+  const entry = {
+    targetUrl: normTarget,
+    tabUrl: normTab,
+    clickedAtMs: now,
+  };
+  fresh.push(entry);
+  await writeClickHintList(storageSession, fresh);
+  return entry;
+}
+
+/**
+ * Removes expired click hints older than `maxAgeMs` from `chrome.storage.session`.
+ */
+export async function pruneStaleDownloadClickHints(
+  storageSession,
+  maxAgeMs = DOWNLOAD_CLICK_HINT_TTL_MS,
+  nowFn = () => Date.now()
+) {
+  const now = nowFn();
+  const existing = await readClickHintList(storageSession);
+  const kept = existing.filter(
+    (entry) => entry && typeof entry.clickedAtMs === "number" && now - entry.clickedAtMs < maxAgeMs
+  );
+  if (kept.length !== existing.length) {
+    await writeClickHintList(storageSession, kept);
+  }
+  return existing.length - kept.length;
+}
+
 /**
  * Records download creation metadata into `chrome.storage.session` (FIFO capped at 512).
+ *
+ * Resolves `tabUrl` without assuming `DownloadItem.tabId`:
+ * 1. Fresh `<a href>` click hint matching `url` or `finalUrl` (15s TTL)
+ * 2. `referrer` (enriched with active tab URL if same origin)
+ * 3. Active tab URL if same origin as the download URL
+ * 4. Empty string `""` when cross-origin initiation tab cannot be determined
  */
 export async function handleDownloadCreated(downloadItem, deps) {
   if (!downloadItem || typeof downloadItem.id !== "number") {
     return null;
   }
   const { storageSession, tabsApi, nowFn = () => Date.now() } = deps;
+  const now = nowFn();
   const url = nonEmptyString(downloadItem.url) || "";
   const finalUrl = nonEmptyString(downloadItem.finalUrl) || url;
   const referrer = nonEmptyString(downloadItem.referrer);
-  const contextUrl = referrer || finalUrl || url;
+  const downloadSourceUrl = finalUrl || url;
 
-  let tabUrl = await queryTabById(tabsApi, downloadItem.tabId);
+  const clickHints = await readClickHintList(storageSession);
+  let tabUrl = findMatchingClickHint(clickHints, [url, finalUrl], now) || "";
+
   if (!tabUrl) {
     const activeTabUrl = await queryActiveTabUrl(tabsApi);
-    if (activeTabUrl) {
-      const contextOrigin = extractOrigin(contextUrl);
-      if (!contextOrigin || extractOrigin(activeTabUrl) === contextOrigin) {
+    const activeOrigin = extractOrigin(activeTabUrl);
+    if (referrer) {
+      const referrerOrigin = extractOrigin(referrer);
+      if (activeTabUrl && activeOrigin && referrerOrigin && activeOrigin === referrerOrigin) {
+        tabUrl = activeTabUrl;
+      } else {
+        tabUrl = referrer;
+      }
+    } else if (activeTabUrl && activeOrigin) {
+      const sourceOrigin = extractOrigin(downloadSourceUrl);
+      if (sourceOrigin && activeOrigin === sourceOrigin) {
         tabUrl = activeTabUrl;
       }
     }
-  }
-  if (!tabUrl) {
-    tabUrl = contextUrl;
   }
 
   const entry = {
@@ -110,7 +218,7 @@ export async function handleDownloadCreated(downloadItem, deps) {
     finalUrl,
     referrer,
     tabUrl,
-    createdAtMs: nowFn(),
+    createdAtMs: now,
   };
 
   const existing = await readPendingList(storageSession);
@@ -153,8 +261,8 @@ export async function handleDownloadChanged(delta, deps) {
     nonEmptyString(item?.url) ||
     nonEmptyString(pending?.finalUrl) ||
     nonEmptyString(pending?.url);
-  const tabUrl = nonEmptyString(pending?.tabUrl) || referrerUrl || downloadSourceUrl || "";
-  if (!tabUrl) {
+  const tabUrl = nonEmptyString(pending?.tabUrl) || referrerUrl || "";
+  if (!tabUrl && !downloadSourceUrl) {
     return null;
   }
 

@@ -1,4 +1,4 @@
-//! Specification-driven unit and Named Pipe tests for `ledr-bridge-nm` (`BRIDGE-01`..`BRIDGE-14`).
+//! Specification-driven unit and Named Pipe tests for `ledr-bridge-nm` (`BRIDGE-01`..`BRIDGE-17`).
 
 use std::fs;
 use std::io::Cursor;
@@ -20,14 +20,16 @@ use crate::manifest::{
     MANIFEST_FILENAME,
 };
 use crate::pipe_client::{
-    is_authorized_browser_parent_exe_with, is_authorized_pipe_server_exe_with,
-    is_default_ipc_pipe, is_valid_caller_origin, verify_browser_relay_caller,
-    verify_browser_relay_caller_with, BridgeTransportError, PipeClient,
+    evaluate_browser_caller_chain, is_authorized_browser_parent_exe_with,
+    is_authorized_cmd_exe_with, is_authorized_pipe_server_exe_with, is_default_ipc_pipe,
+    is_valid_caller_origin, verify_browser_relay_caller, verify_browser_relay_caller_with,
+    BridgeTransportError, BrowserCallerChain, PipeClient, ProcessSnapshot, StdHandleTransport,
 };
 use crate::relay::{read_raw_frame, run_relay_loop, write_raw_frame, FrameExchange, RawFrameError};
 use crate::setup::{
-    resolve_bridge_exe_with, resolve_manifest_dir, resolve_ui_exe_with, run_setup_with,
-    run_status_with, run_unregister_with, RegistryTarget,
+    format_status_text, resolve_bridge_exe_with, resolve_manifest_dir, resolve_ui_exe_with,
+    run_setup_with, run_status_with, run_unregister_with, RegistryTarget,
+    NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
 };
 
 static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1238,5 +1240,534 @@ fn bridge_14_relay_caller_origin_and_authorized_browser_parent_checks() {
     #[cfg(windows)]
     {
         assert!(verify_browser_relay_caller(&good_origin).is_err());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_indeterminate_error() {
+    use std::process::Command;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    use winreg::RegKey;
+
+    let (_user_guard, user_prefix) = RegTestGuard::new("bridge-nm-b15-user");
+    let (_peer_guard, peer_prefix) = RegTestGuard::new("bridge-nm-b15-peer");
+    let temp = TempDirGuard::new("ledr-bridge-nm-b15");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+
+    let real_dir = temp.path().join("real");
+    let junction_dir = temp.path().join("junction");
+    fs::create_dir_all(&real_dir).unwrap();
+
+    let mklink_out = Command::new("cmd.exe")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &junction_dir.to_string_lossy(),
+            &real_dir.to_string_lossy(),
+        ])
+        .output()
+        .expect("run mklink /J");
+    assert!(
+        mklink_out.status.success(),
+        "mklink /J must succeed without elevation: {}",
+        String::from_utf8_lossy(&mklink_out.stderr)
+    );
+
+    let user_target = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: Some(user_prefix),
+    };
+    let peer_target = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: Some(peer_prefix),
+    };
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let manifest = build_manifest(&fake_bridge, DEFAULT_CHROME_EXTENSION_ID).unwrap();
+
+    // 1. Directory junction alias: HKCU points through junction while peer points to real path.
+    let real_manifest = real_dir.join(MANIFEST_FILENAME);
+    let junction_manifest = junction_dir.join(MANIFEST_FILENAME);
+    write_manifest_atomic(&real_manifest, &manifest).unwrap();
+    assert!(junction_manifest.is_file());
+
+    let (u_key, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key
+        .set_value("", &junction_manifest.to_string_lossy().into_owned())
+        .unwrap();
+    let (p_key, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key
+        .set_value("", &real_manifest.to_string_lossy().into_owned())
+        .unwrap();
+
+    let unreg_user = UnregisterArgs {
+        scope: Scope::User,
+        browsers: vec![BrowserKind::Chrome],
+        manifest_dir: Some(junction_dir.clone()),
+        keep_uri: true,
+        json: false,
+    };
+    let res_junc =
+        run_unregister_with(&unreg_user, &user_target, Some(&peer_target)).expect("unreg user");
+    assert!(
+        !res_junc.manifest_removed,
+        "shared manifest via directory junction must be preserved while peer references real path"
+    );
+    assert!(real_manifest.is_file());
+
+    let unreg_peer = UnregisterArgs {
+        scope: Scope::User,
+        browsers: vec![BrowserKind::Chrome],
+        manifest_dir: Some(real_dir.clone()),
+        keep_uri: true,
+        json: false,
+    };
+    let res_peer =
+        run_unregister_with(&unreg_peer, &peer_target, Some(&user_target)).expect("unreg peer");
+    assert!(res_peer.manifest_removed);
+    assert!(!real_manifest.exists());
+
+    // Remove junction reparse point cleanly before continuing.
+    fs::remove_dir(&junction_dir).expect("remove junction reparse point");
+
+    // 2. Hard link alias: distinct paths sharing the same NTFS file index must protect the manifest.
+    let orig_manifest = real_dir.join("com.localedr.bridge.hardorig.json");
+    let hardlink_manifest = temp.path().join("com.localedr.bridge.hardalias.json");
+    write_manifest_atomic(&orig_manifest, &manifest).unwrap();
+    fs::hard_link(&orig_manifest, &hardlink_manifest).expect("create hard link");
+
+    let (u_key2, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key2
+        .set_value("", &hardlink_manifest.to_string_lossy().into_owned())
+        .unwrap();
+    let (p_key2, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key2
+        .set_value("", &orig_manifest.to_string_lossy().into_owned())
+        .unwrap();
+
+    let res_hl_user = run_unregister_with(
+        &UnregisterArgs {
+            scope: Scope::User,
+            browsers: vec![BrowserKind::Chrome],
+            manifest_dir: Some(temp.path().to_path_buf()),
+            keep_uri: true,
+            json: false,
+        },
+        &user_target,
+        Some(&peer_target),
+    )
+    .expect("unreg hardlink user");
+    assert!(
+        !res_hl_user.manifest_removed,
+        "hard-linked manifest alias must not be deleted while peer references same file ID"
+    );
+    assert!(hardlink_manifest.is_file());
+    assert!(orig_manifest.is_file());
+
+    let res_hl_peer = run_unregister_with(
+        &UnregisterArgs {
+            scope: Scope::User,
+            browsers: vec![BrowserKind::Chrome],
+            manifest_dir: Some(real_dir.clone()),
+            keep_uri: true,
+            json: false,
+        },
+        &peer_target,
+        Some(&user_target),
+    )
+    .expect("unreg hardlink peer");
+    assert!(res_hl_peer.manifest_removed);
+    assert!(!orig_manifest.exists());
+    let _ = fs::remove_file(&hardlink_manifest);
+
+    // 3. Non-NotFound file identity error (e.g. ERROR_INVALID_NAME on peer entry) must conservatively keep file.
+    let protected_manifest = real_dir.join("com.localedr.bridge.protected.json");
+    write_manifest_atomic(&protected_manifest, &manifest).unwrap();
+    let (u_key3, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key3
+        .set_value("", &protected_manifest.to_string_lossy().into_owned())
+        .unwrap();
+    let (p_key3, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key3
+        .set_value("", &r"C:\invalid<bad>path\com.localedr.bridge.json")
+        .unwrap();
+
+    let res_err = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg with indeterminate peer path");
+    assert!(
+        !res_err.manifest_removed,
+        "non-NotFound identity lookup failure must conservatively skip deletion"
+    );
+    assert!(protected_manifest.is_file());
+
+    // 4. Distinct existing file on peer scope does NOT block deletion of unrelated manifest.
+    let other_manifest = real_dir.join("com.localedr.bridge.other.json");
+    write_manifest_atomic(&other_manifest, &manifest).unwrap();
+    let (u_key4, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key4
+        .set_value("", &protected_manifest.to_string_lossy().into_owned())
+        .unwrap();
+    let (p_key4, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key4
+        .set_value("", &other_manifest.to_string_lossy().into_owned())
+        .unwrap();
+
+    let res_distinct = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg distinct manifest");
+    assert!(res_distinct.manifest_removed);
+    assert!(!protected_manifest.exists());
+    assert!(other_manifest.is_file());
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_16_known_folder_roots_ignore_poisoned_env_vars() {
+    use crate::pipe_client::{
+        is_authorized_browser_parent_exe, standard_browser_install_roots,
+        standard_system_cmd_exe_paths, win_pipe_auth,
+    };
+    use std::process::Command;
+
+    let assert_known_folders_clean = || {
+        let local_app_data =
+            win_pipe_auth::resolve_known_folder_path(&win_pipe_auth::FOLDERID_LOCAL_APP_DATA)
+                .expect("FOLDERID_LocalAppData must resolve even with poisoned env vars");
+        let local_lower = local_app_data.to_string_lossy().to_ascii_lowercase();
+        assert!(
+            local_lower.ends_with(r"\appdata\local"),
+            "unexpected LocalAppData path: {local_app_data:?}"
+        );
+        assert!(
+            !local_lower.contains("evilspoof"),
+            "FOLDERID_LocalAppData must ignore poisoned USERPROFILE/LOCALAPPDATA: {local_app_data:?}"
+        );
+        assert!(
+            win_pipe_auth::resolve_known_folder_path(&win_pipe_auth::FOLDERID_PROGRAM_FILES)
+                .is_some(),
+            "FOLDERID_ProgramFiles must resolve"
+        );
+        assert!(
+            win_pipe_auth::resolve_known_folder_path(&win_pipe_auth::FOLDERID_SYSTEM).is_some(),
+            "FOLDERID_System must resolve"
+        );
+
+        let roots = standard_browser_install_roots();
+        assert!(!roots.is_empty(), "SHGetKnownFolderPath must resolve browser install roots");
+        assert!(
+            roots.iter().all(|p| p.is_absolute()),
+            "all Known Folder roots must be absolute: {roots:?}"
+        );
+        assert!(
+            !roots
+                .iter()
+                .any(|p| p.to_string_lossy().to_ascii_lowercase().contains("evilspoof")),
+            "Known Folder roots must ignore poisoned env vars: {roots:?}"
+        );
+
+        let cmd_paths = standard_system_cmd_exe_paths();
+        assert!(!cmd_paths.is_empty(), "SHGetKnownFolderPath must resolve System cmd.exe paths");
+        assert!(
+            cmd_paths
+                .iter()
+                .all(|p| p.to_string_lossy().to_ascii_lowercase().ends_with(r"\cmd.exe")),
+            "system cmd paths must end with cmd.exe: {cmd_paths:?}"
+        );
+        assert!(
+            cmd_paths.iter().any(|p| p.is_file()),
+            "at least one resolved system cmd.exe must exist on disk: {cmd_paths:?}"
+        );
+        assert!(
+            !cmd_paths
+                .iter()
+                .any(|p| p.to_string_lossy().to_ascii_lowercase().contains("evilspoof")),
+            "system cmd paths must ignore poisoned env vars: {cmd_paths:?}"
+        );
+
+        let spoofed_chrome = Path::new(r"C:\EvilSpoof\Google\Chrome\Application\chrome.exe");
+        assert!(!is_authorized_browser_parent_exe(spoofed_chrome));
+        let valid_chrome = roots[0].join(r"Google\Chrome\Application\chrome.exe");
+        assert!(is_authorized_browser_parent_exe(&valid_chrome));
+
+        let cmd_refs: Vec<&Path> = cmd_paths.iter().map(PathBuf::as_path).collect();
+        assert!(!is_authorized_cmd_exe_with(Path::new(r"C:\EvilSpoof\cmd.exe"), &cmd_refs));
+        assert!(is_authorized_cmd_exe_with(&cmd_paths[0], &cmd_refs));
+
+        // Unknown GUID must return None without crashing or leaking.
+        let invalid_guid = win_pipe_auth::Guid {
+            data1: 0,
+            data2: 0,
+            data3: 0,
+            data4: [0; 8],
+        };
+        assert!(win_pipe_auth::resolve_known_folder_path(&invalid_guid).is_none());
+    };
+
+    if std::env::var_os("LEDR_TEST_BRIDGE16_CHILD").is_some() {
+        assert_known_folders_clean();
+        return;
+    }
+
+    assert_known_folders_clean();
+
+    // Verify in an isolated child process with poisoned env vars (without mutating parent env).
+    let output = Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--exact",
+            "tests::bridge_16_known_folder_roots_ignore_poisoned_env_vars",
+            "--nocapture",
+        ])
+        .env("LEDR_TEST_BRIDGE16_CHILD", "1")
+        .env("ProgramFiles", r"C:\EvilSpoof")
+        .env("ProgramW6432", r"C:\EvilSpoof")
+        .env("ProgramFiles(x86)", r"C:\EvilSpoof")
+        .env("LOCALAPPDATA", r"C:\EvilSpoof")
+        .env("USERPROFILE", r"C:\EvilSpoof")
+        .env("SystemRoot", r"C:\EvilSpoof")
+        .env("WINDIR", r"C:\EvilSpoof")
+        .env("ComSpec", r"C:\EvilSpoof\cmd.exe")
+        .output()
+        .expect("spawn poisoned-env child test");
+    assert!(
+        output.status.success(),
+        "poisoned-env child failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn bridge_17_caller_chain_direct_cmd_mediated_rejections_and_status_policy() {
+    let browser_roots = [
+        Path::new(r"C:\Program Files"),
+        Path::new(r"C:\Program Files (x86)"),
+        Path::new(r"C:\Users\Alice\AppData\Local"),
+    ];
+    let cmd_paths = [
+        Path::new(r"C:\Windows\System32\cmd.exe"),
+        Path::new(r"C:\Windows\SysWOW64\cmd.exe"),
+    ];
+    let chrome_exe = PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+    let edge_exe = PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe");
+    let sys32_cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+    let syswow_cmd = PathBuf::from(r"C:\Windows\SysWOW64\cmd.exe");
+
+    // 1. Direct authorized browser parent passes.
+    let direct_ok = BrowserCallerChain {
+        self_create_time_100ns: 300,
+        parent: ProcessSnapshot {
+            pid: 1000,
+            create_time_100ns: 200,
+            exe_path: chrome_exe.clone(),
+        },
+        grandparent: None,
+        stdin_transport: StdHandleTransport::NonPipe,
+        stdout_transport: StdHandleTransport::NonPipe,
+    };
+    assert!(evaluate_browser_caller_chain(&direct_ok, &browser_roots, &cmd_paths).is_ok());
+
+    // 2. Direct parent with reversed timestamp (PID reuse) is rejected.
+    let direct_reversed = BrowserCallerChain {
+        self_create_time_100ns: 150,
+        ..direct_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&direct_reversed, &browser_roots, &cmd_paths).is_err());
+
+    // 3. cmd.exe mediated with authorized browser grandparent + pipe stdio matching grandparent PID passes.
+    let mediated_ok = BrowserCallerChain {
+        self_create_time_100ns: 300,
+        parent: ProcessSnapshot {
+            pid: 2000,
+            create_time_100ns: 200,
+            exe_path: sys32_cmd.clone(),
+        },
+        grandparent: Some(ProcessSnapshot {
+            pid: 1000,
+            create_time_100ns: 100,
+            exe_path: chrome_exe.clone(),
+        }),
+        stdin_transport: StdHandleTransport::Pipe {
+            pipe_server_pid: Some(1000),
+        },
+        stdout_transport: StdHandleTransport::Pipe {
+            pipe_server_pid: Some(1000),
+        },
+    };
+    assert!(evaluate_browser_caller_chain(&mediated_ok, &browser_roots, &cmd_paths).is_ok());
+
+    // 4. SysWOW64 cmd.exe with Edge grandparent and pipe handles where GetNamedPipeServerProcessId returns None passes.
+    let mediated_wow64_ok = BrowserCallerChain {
+        parent: ProcessSnapshot {
+            pid: 2001,
+            create_time_100ns: 200,
+            exe_path: syswow_cmd,
+        },
+        grandparent: Some(ProcessSnapshot {
+            pid: 1001,
+            create_time_100ns: 100,
+            exe_path: edge_exe,
+        }),
+        stdin_transport: StdHandleTransport::Pipe {
+            pipe_server_pid: None,
+        },
+        stdout_transport: StdHandleTransport::Pipe {
+            pipe_server_pid: Some(1001),
+        },
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&mediated_wow64_ok, &browser_roots, &cmd_paths).is_ok());
+
+    // 5. Standalone cmd.exe (missing grandparent or untrusted grandparent) is rejected.
+    let cmd_no_gp = BrowserCallerChain {
+        grandparent: None,
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&cmd_no_gp, &browser_roots, &cmd_paths).is_err());
+
+    let cmd_bad_gp = BrowserCallerChain {
+        grandparent: Some(ProcessSnapshot {
+            pid: 1000,
+            create_time_100ns: 100,
+            exe_path: PathBuf::from(r"C:\Windows\explorer.exe"),
+        }),
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&cmd_bad_gp, &browser_roots, &cmd_paths).is_err());
+
+    // 6. Fake cmd.exe outside System/SystemX86 is rejected even with valid grandparent & pipes.
+    let fake_cmd = BrowserCallerChain {
+        parent: ProcessSnapshot {
+            pid: 2000,
+            create_time_100ns: 200,
+            exe_path: PathBuf::from(r"C:\Temp\cmd.exe"),
+        },
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&fake_cmd, &browser_roots, &cmd_paths).is_err());
+
+    // 7. Non-pipe (console/file) stdin or stdout is rejected under cmd.exe mediation.
+    let non_pipe_in = BrowserCallerChain {
+        stdin_transport: StdHandleTransport::NonPipe,
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&non_pipe_in, &browser_roots, &cmd_paths).is_err());
+
+    let non_pipe_out = BrowserCallerChain {
+        stdout_transport: StdHandleTransport::NonPipe,
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&non_pipe_out, &browser_roots, &cmd_paths).is_err());
+
+    // 8. Pipe server PID mismatch (e.g. cmd.exe PID or attacker PID or 0) is rejected.
+    let bad_stdin_pid = BrowserCallerChain {
+        stdin_transport: StdHandleTransport::Pipe {
+            pipe_server_pid: Some(2000),
+        },
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&bad_stdin_pid, &browser_roots, &cmd_paths).is_err());
+
+    let bad_stdout_pid = BrowserCallerChain {
+        stdout_transport: StdHandleTransport::Pipe {
+            pipe_server_pid: Some(9999),
+        },
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&bad_stdout_pid, &browser_roots, &cmd_paths).is_err());
+
+    let zero_pipe_pid = BrowserCallerChain {
+        stdin_transport: StdHandleTransport::Pipe {
+            pipe_server_pid: Some(0),
+        },
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&zero_pipe_pid, &browser_roots, &cmd_paths).is_err());
+
+    // 9. Timestamp reversal between grandparent, cmd.exe, and self is rejected.
+    let gp_after_cmd = BrowserCallerChain {
+        grandparent: Some(ProcessSnapshot {
+            pid: 1000,
+            create_time_100ns: 250,
+            exe_path: chrome_exe,
+        }),
+        ..mediated_ok.clone()
+    };
+    assert!(evaluate_browser_caller_chain(&gp_after_cmd, &browser_roots, &cmd_paths).is_err());
+
+    let cmd_after_self = BrowserCallerChain {
+        self_create_time_100ns: 150,
+        ..mediated_ok
+    };
+    assert!(evaluate_browser_caller_chain(&cmd_after_self, &browser_roots, &cmd_paths).is_err());
+
+    // 10. Status reports NativeHostsExecutablesLaunchDirectly policy only when present.
+    #[cfg(windows)]
+    {
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+        use winreg::RegKey;
+
+        let (_reg_guard, prefix) = RegTestGuard::new("bridge-nm-b17-policy");
+        let temp = TempDirGuard::new("ledr-bridge-nm-b17");
+        let target = RegistryTarget {
+            scope: Scope::User,
+            key_prefix: Some(prefix),
+        };
+        let status_args = StatusArgs {
+            scope: StatusScope::User,
+            extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
+            ping: false,
+            pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+            json: false,
+        };
+
+        // Absent policy keys: omitted from both text and JSON.
+        let report_absent =
+            run_status_with(&status_args, std::slice::from_ref(&target), Some(temp.path()))
+                .expect("status without policy");
+        assert!(report_absent.scopes[0]
+            .browsers
+            .iter()
+            .all(|b| b.native_hosts_launch_directly.is_none()));
+        let text_absent = format_status_text(&report_absent);
+        assert!(!text_absent.contains(NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE));
+        let json_absent = serde_json::to_string(&report_absent).unwrap();
+        assert!(!json_absent.contains("native_hosts_launch_directly"));
+
+        // Present policy keys: Chrome=0 (cmd.exe mediated), Edge=1 (direct), Brave=None.
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let chrome_pol_key = target.browser_policy_subkey(BrowserKind::Chrome).unwrap();
+        let edge_pol_key = target.browser_policy_subkey(BrowserKind::Edge).unwrap();
+        let (ck, _) = hkcu.create_subkey_with_flags(&chrome_pol_key, KEY_WRITE).unwrap();
+        ck.set_value(NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE, &0u32).unwrap();
+        let (ek, _) = hkcu.create_subkey_with_flags(&edge_pol_key, KEY_WRITE).unwrap();
+        ek.set_value(NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE, &1u32).unwrap();
+
+        let report_present =
+            run_status_with(&status_args, std::slice::from_ref(&target), Some(temp.path()))
+                .expect("status with policy");
+        let browsers = &report_present.scopes[0].browsers;
+        assert_eq!(browsers[0].native_hosts_launch_directly, Some(false));
+        assert_eq!(browsers[1].native_hosts_launch_directly, Some(true));
+        assert_eq!(browsers[2].native_hosts_launch_directly, None);
+        let text_present = format_status_text(&report_present);
+        assert!(text_present.contains("NativeHostsExecutablesLaunchDirectly=0 (cmd.exe mediated)"));
+        assert!(text_present.contains("NativeHostsExecutablesLaunchDirectly=1 (direct)"));
     }
 }

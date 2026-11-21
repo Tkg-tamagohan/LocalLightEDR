@@ -1,10 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  DOWNLOAD_CLICK_HINTS_STORAGE_KEY,
+  DOWNLOAD_CLICK_HINT_TTL_MS,
+  MAX_DOWNLOAD_CLICK_HINTS,
   MAX_PENDING_DOWNLOADS,
   PENDING_DOWNLOADS_STORAGE_KEY,
   handleDownloadChanged,
   handleDownloadCreated,
+  pruneStaleDownloadClickHints,
+  recordDownloadClickHint,
 } from "../lib/downloads.js";
 import {
   BRIDGE_DIAGNOSTICS_KEY,
@@ -215,7 +220,7 @@ test("EXT-10: native_bridge updates diagnostics cleanly across online, offline, 
 test("EXT-13: background download does not adopt unrelated foreground activeTabUrl (BUG_0003)", async () => {
   const sessionStorage = createMemoryStorageArea();
 
-  // Case 1: Background download with a referrer on a different origin must keep its own context URL
+  // Case 1: Background download with a referrer on a different origin keeps its referrer URL
   const bgEntry = await handleDownloadCreated(
     {
       id: 101,
@@ -235,11 +240,11 @@ test("EXT-13: background download does not adopt unrelated foreground activeTabU
   );
   assert.equal(bgEntry.tabUrl, "https://portal.evil.localedr.invalid/landing");
 
-  // Case 2: When downloadItem.tabId is provided, tabsApi.get(tabId) takes precedence over foreground active tab
-  const byTabIdEntry = await handleDownloadCreated(
+  // Case 2: Cross-origin background download without referrer or click hint (no DownloadItem.tabId)
+  // must neither adopt the unrelated active tab nor promote the CDN URL into tab_url.
+  const unknownTabEntry = await handleDownloadCreated(
     {
       id: 102,
-      tabId: 77,
       url: "https://cdn.evil.localedr.invalid/stage2.zip",
       finalUrl: "https://cdn.evil.localedr.invalid/stage2.zip",
       referrer: "",
@@ -247,10 +252,6 @@ test("EXT-13: background download does not adopt unrelated foreground activeTabU
     {
       storageSession: sessionStorage,
       tabsApi: {
-        async get(tabId) {
-          assert.equal(tabId, 77);
-          return { id: 77, url: "https://source-tab.localedr.invalid/page.html" };
-        },
         async query() {
           return [{ url: "https://unrelated-foreground.localedr.invalid/" }];
         },
@@ -258,5 +259,225 @@ test("EXT-13: background download does not adopt unrelated foreground activeTabU
       nowFn: () => 2001,
     }
   );
-  assert.equal(byTabIdEntry.tabUrl, "https://source-tab.localedr.invalid/page.html");
+  assert.equal(unknownTabEntry.tabUrl, "");
+});
+
+test("EXT-17: real DownloadItem without tabId resolves click hints, expires stale hints, and preserves unknown tab_url as empty string", async () => {
+  const sessionStorage = createMemoryStorageArea();
+
+  // 1. Fresh click hint matches cross-origin download (even after HTTP redirect and tab switch)
+  await recordDownloadClickHint(
+    {
+      targetUrl: "https://redir.localedr.invalid/go?file=setup#download",
+      tabUrl: "https://portal.localedr.invalid/releases",
+    },
+    { storageSession: sessionStorage, nowFn: () => 10_000 }
+  );
+
+  const matchedEntry = await handleDownloadCreated(
+    {
+      id: 201,
+      url: "https://redir.localedr.invalid/go?file=setup",
+      finalUrl: "https://cdn.localedr.invalid/bin/setup.exe",
+      referrer: "",
+    },
+    {
+      storageSession: sessionStorage,
+      tabsApi: {
+        async query() {
+          return [{ url: "https://other-tab.localedr.invalid/inbox" }];
+        },
+      },
+      nowFn: () => 12_500,
+    }
+  );
+  assert.equal(matchedEntry.tabUrl, "https://portal.localedr.invalid/releases");
+
+  const matchedReq = await handleDownloadChanged(
+    { id: 201, state: { current: "complete" } },
+    {
+      storageSession: sessionStorage,
+      downloadsApi: {
+        async search({ id }) {
+          assert.equal(id, 201);
+          return [
+            {
+              id: 201,
+              filename: "C:\\Users\\alice\\Downloads\\setup.exe",
+              url: "https://redir.localedr.invalid/go?file=setup",
+              finalUrl: "https://cdn.localedr.invalid/bin/setup.exe",
+              referrer: "",
+              endTime: "2026-11-21T01:00:00.000Z",
+            },
+          ];
+        },
+      },
+    }
+  );
+  assert.deepEqual(matchedReq, {
+    type: "ReportDownloadOrigin",
+    payload: {
+      file_path: "C:\\Users\\alice\\Downloads\\setup.exe",
+      tab_url: "https://portal.localedr.invalid/releases",
+      frame_url: "https://cdn.localedr.invalid/bin/setup.exe",
+      referrer_url: null,
+      downloaded_at_ms: Date.parse("2026-11-21T01:00:00.000Z"),
+    },
+  });
+
+  // 2. Expired click hint (>= 15s TTL) is ignored; cross-origin download without referrer reports tab_url: "" and frame_url
+  const expiredEntry = await handleDownloadCreated(
+    {
+      id: 202,
+      url: "https://redir.localedr.invalid/go?file=setup",
+      finalUrl: "https://cdn.localedr.invalid/bin/setup.exe",
+      referrer: "",
+    },
+    {
+      storageSession: sessionStorage,
+      tabsApi: {
+        async query() {
+          return [{ url: "https://portal.localedr.invalid/releases" }];
+        },
+      },
+      nowFn: () => 10_000 + DOWNLOAD_CLICK_HINT_TTL_MS,
+    }
+  );
+  assert.equal(expiredEntry.tabUrl, "");
+
+  const expiredReq = await handleDownloadChanged(
+    { id: 202, state: { current: "complete" } },
+    {
+      storageSession: sessionStorage,
+      downloadsApi: {
+        async search() {
+          return [
+            {
+              id: 202,
+              filename: "C:\\Users\\alice\\Downloads\\setup-2.exe",
+              url: "https://redir.localedr.invalid/go?file=setup",
+              finalUrl: "https://cdn.localedr.invalid/bin/setup.exe",
+              referrer: "",
+              endTime: "2026-11-21T01:01:00.000Z",
+            },
+          ];
+        },
+      },
+    }
+  );
+  assert.deepEqual(expiredReq, {
+    type: "ReportDownloadOrigin",
+    payload: {
+      file_path: "C:\\Users\\alice\\Downloads\\setup-2.exe",
+      tab_url: "",
+      frame_url: "https://cdn.localedr.invalid/bin/setup.exe",
+      referrer_url: null,
+      downloaded_at_ms: Date.parse("2026-11-21T01:01:00.000Z"),
+    },
+  });
+
+  // 3. Cross-origin download with no click hint and no referrer keeps tab_url empty and preserves downloadSourceUrl in frame_url
+  const noHintEntry = await handleDownloadCreated(
+    {
+      id: 203,
+      url: "https://cdn.other.localedr.invalid/installer.msi",
+      finalUrl: "https://cdn.other.localedr.invalid/installer.msi",
+      referrer: "",
+    },
+    {
+      storageSession: sessionStorage,
+      tabsApi: {
+        async query() {
+          return [{ url: "https://portal.localedr.invalid/releases" }];
+        },
+      },
+      nowFn: () => 30_000,
+    }
+  );
+  assert.equal(noHintEntry.tabUrl, "");
+
+  const noHintReq = await handleDownloadChanged(
+    { id: 203, state: { current: "complete" } },
+    {
+      storageSession: sessionStorage,
+      downloadsApi: {
+        async search() {
+          return [
+            {
+              id: 203,
+              filename: "C:\\Users\\alice\\Downloads\\installer.msi",
+              url: "https://cdn.other.localedr.invalid/installer.msi",
+              finalUrl: "https://cdn.other.localedr.invalid/installer.msi",
+              referrer: "",
+              endTime: "2026-11-21T01:02:00.000Z",
+            },
+          ];
+        },
+      },
+    }
+  );
+  assert.deepEqual(noHintReq, {
+    type: "ReportDownloadOrigin",
+    payload: {
+      file_path: "C:\\Users\\alice\\Downloads\\installer.msi",
+      tab_url: "",
+      frame_url: "https://cdn.other.localedr.invalid/installer.msi",
+      referrer_url: null,
+      downloaded_at_ms: Date.parse("2026-11-21T01:02:00.000Z"),
+    },
+  });
+
+  // 4. Completion with both empty tabUrl and empty downloadSourceUrl is discarded
+  const emptyReq = await handleDownloadChanged(
+    { id: 999, state: { current: "complete" } },
+    {
+      storageSession: sessionStorage,
+      downloadsApi: {
+        async search() {
+          return [
+            {
+              id: 999,
+              filename: "C:\\Users\\alice\\Downloads\\orphan.bin",
+              url: "",
+              finalUrl: "",
+              referrer: "",
+            },
+          ];
+        },
+      },
+    }
+  );
+  assert.equal(emptyReq, null);
+
+  // 5. Click hint list is bounded to MAX_DOWNLOAD_CLICK_HINTS (32) and pruned on expiry
+  const capStorage = createMemoryStorageArea();
+  for (let i = 1; i <= MAX_DOWNLOAD_CLICK_HINTS + 8; i++) {
+    await recordDownloadClickHint(
+      {
+        targetUrl: `https://cdn.localedr.invalid/pkg-${i}.exe`,
+        tabUrl: "https://portal.localedr.invalid/list",
+      },
+      { storageSession: capStorage, nowFn: () => 50_000 + i }
+    );
+  }
+  const storedHints = (await capStorage.get([DOWNLOAD_CLICK_HINTS_STORAGE_KEY]))[
+    DOWNLOAD_CLICK_HINTS_STORAGE_KEY
+  ];
+  assert.equal(storedHints.length, MAX_DOWNLOAD_CLICK_HINTS);
+  assert.equal(storedHints[0].targetUrl, "https://cdn.localedr.invalid/pkg-9.exe");
+  assert.equal(
+    storedHints[storedHints.length - 1].targetUrl,
+    `https://cdn.localedr.invalid/pkg-${MAX_DOWNLOAD_CLICK_HINTS + 8}.exe`
+  );
+
+  const removed = await pruneStaleDownloadClickHints(
+    capStorage,
+    DOWNLOAD_CLICK_HINT_TTL_MS,
+    () => 50_000 + MAX_DOWNLOAD_CLICK_HINTS + 8 + DOWNLOAD_CLICK_HINT_TTL_MS
+  );
+  assert.equal(removed, MAX_DOWNLOAD_CLICK_HINTS);
+  const afterPrune = (await capStorage.get([DOWNLOAD_CLICK_HINTS_STORAGE_KEY]))[
+    DOWNLOAD_CLICK_HINTS_STORAGE_KEY
+  ];
+  assert.deepEqual(afterPrune, []);
 });

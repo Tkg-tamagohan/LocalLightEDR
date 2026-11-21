@@ -207,6 +207,7 @@ function createDomSandbox({
     Object,
     Symbol,
     Uint8Array,
+    URL,
     Date,
     Math,
     setTimeout,
@@ -507,4 +508,95 @@ test("EXT-16: lib/dnr.js normalizes hostnames, caps rules, and preserves out-of-
   assert.equal(plan.addRules.length, 2);
   assert.equal(plan.addRules[0].id, DYNAMIC_RULE_ID_START);
   assert.equal(plan.addRules[1].id, DYNAMIC_RULE_ID_START + 1);
+});
+
+test("EXT-18: content.js records download click hints for normal and Shadow DOM anchors while excluding javascript: and # hrefs", async () => {
+  const hintMessages = [];
+  const env = createDomSandbox({
+    url: "https://portal.localedr.invalid/releases/index.html",
+    hostname: "portal.localedr.invalid",
+    onRuntimeMessage: async (msg) => {
+      if (msg.type === "RECORD_DOWNLOAD_CLICK_HINT") {
+        hintMessages.push({
+          type: msg.type,
+          targetUrl: msg.targetUrl,
+          pageUrl: msg.pageUrl,
+        });
+      }
+      return { ok: true };
+    },
+  });
+
+  // 1. Normal DOM <a href="https://..."> click on nested <span> child
+  const normalAnchor = new env.MockElement("a");
+  normalAnchor.setAttribute("href", "https://cdn.localedr.invalid/downloads/setup.exe#latest");
+  const childSpan = new env.MockElement("span");
+  normalAnchor.appendChild(childSpan);
+
+  await env.doc.dispatchEventAsync({
+    type: "click",
+    target: childSpan,
+    composedPath: () => [childSpan, normalAnchor, env.doc.body, env.doc.documentElement, env.doc],
+  });
+
+  // 2. Normal DOM relative <a href="/files/tool.msi"> resolved against window.location.href (parentNode walk fallback)
+  const relAnchor = new env.MockElement("a");
+  relAnchor.setAttribute("href", "/files/tool.msi");
+  const relChild = new env.MockElement("span");
+  relAnchor.appendChild(relChild);
+
+  await env.doc.dispatchEventAsync({
+    type: "click",
+    target: relChild,
+  });
+
+  // 3. Shadow DOM <a href="https://..."> click discovered through composedPath()
+  const shadowHost = new env.MockElement("download-card");
+  const shadowAnchor = new env.MockElement("a");
+  shadowAnchor.setAttribute("href", "https://mirror.localedr.invalid/shadow-installer.zip");
+
+  await env.doc.dispatchEventAsync({
+    type: "click",
+    target: shadowHost,
+    composedPath: () => [shadowAnchor, shadowHost, env.doc.body, env.doc.documentElement, env.doc],
+  });
+
+  // 4. Excluded links: javascript:, #fragment, #, mailto:, and anchor without href must NOT emit hints
+  const excludedHrefs = [
+    "javascript:void(0)",
+    "JAVASCRIPT:alert(1)",
+    "#section-2",
+    "#",
+    "mailto:help@localedr.invalid",
+    "",
+  ];
+  for (const href of excludedHrefs) {
+    const a = new env.MockElement("a");
+    if (href !== "") {
+      a.setAttribute("href", href);
+    }
+    await env.doc.dispatchEventAsync({
+      type: "click",
+      target: a,
+      composedPath: () => [a, env.doc.body, env.doc.documentElement, env.doc],
+    });
+  }
+
+  assert.deepEqual(hintMessages, [
+    {
+      type: "RECORD_DOWNLOAD_CLICK_HINT",
+      targetUrl: "https://cdn.localedr.invalid/downloads/setup.exe",
+      pageUrl: "https://portal.localedr.invalid/releases/index.html",
+    },
+    {
+      type: "RECORD_DOWNLOAD_CLICK_HINT",
+      targetUrl: "https://portal.localedr.invalid/files/tool.msi",
+      pageUrl: "https://portal.localedr.invalid/releases/index.html",
+    },
+    {
+      type: "RECORD_DOWNLOAD_CLICK_HINT",
+      targetUrl: "https://mirror.localedr.invalid/shadow-installer.zip",
+      pageUrl: "https://portal.localedr.invalid/releases/index.html",
+    },
+  ]);
 });

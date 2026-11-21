@@ -6,7 +6,9 @@ import { assessLocalDomainRisk, mergeDomainRisk } from "./lib/domain_risk.js";
 import {
   handleDownloadChanged,
   handleDownloadCreated,
+  pruneStaleDownloadClickHints,
   pruneStalePendingDownloads,
+  recordDownloadClickHint,
 } from "./lib/downloads.js";
 import {
   buildCheckDomainRiskRequest,
@@ -240,6 +242,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     [EVENT_DEDUP_KEY]: prunedDedup,
   });
   await pruneStalePendingDownloads(chrome.storage.session);
+  await pruneStaleDownloadClickHints(chrome.storage.session);
 });
 
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
@@ -309,6 +312,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             tabId,
           });
           sendResponse(res);
+          return;
+        }
+        case "RECORD_DOWNLOAD_CLICK_HINT": {
+          if (!sender?.tab) {
+            sendResponse({ ok: false, error: "Forbidden sender context" });
+            return;
+          }
+          const senderTabUrl =
+            typeof sender?.tab?.url === "string" && sender.tab.url.trim()
+              ? sender.tab.url.trim()
+              : typeof message.pageUrl === "string"
+                ? message.pageUrl.trim()
+                : "";
+          const recorded = await recordDownloadClickHint(
+            {
+              targetUrl: message.targetUrl,
+              tabUrl: senderTabUrl,
+            },
+            { storageSession: chrome.storage.session }
+          );
+          sendResponse({ ok: true, recorded: Boolean(recorded) });
           return;
         }
         case "GET_POPUP_STATE": {

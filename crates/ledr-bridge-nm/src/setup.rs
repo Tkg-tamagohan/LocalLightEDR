@@ -19,6 +19,10 @@ pub const EDGE_NMH_SUBKEY: &str = r"Software\Microsoft\Edge\NativeMessagingHosts
 pub const BRAVE_NMH_SUBKEY: &str =
     r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.localedr.bridge";
 
+pub const CHROME_POLICY_SUBKEY: &str = r"Software\Policies\Google\Chrome";
+pub const EDGE_POLICY_SUBKEY: &str = r"Software\Policies\Microsoft\Edge";
+pub const NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE: &str = "NativeHostsExecutablesLaunchDirectly";
+
 pub const LEDR_URI_SUBKEY: &str = r"Software\Classes\ledr";
 pub const LEDR_URI_DESCRIPTION: &str = "URL:LocalEDR Alert Protocol";
 pub const LEDR_AUMID_SUBKEY: &str = r"Software\Classes\AppUserModelId\LocalEDR.AlertUI";
@@ -66,6 +70,15 @@ impl RegistryTarget {
             BrowserKind::Brave => BRAVE_NMH_SUBKEY,
         };
         self.qualify_subkey(base)
+    }
+
+    pub fn browser_policy_subkey(&self, browser: BrowserKind) -> Option<String> {
+        let base = match browser {
+            BrowserKind::Chrome => CHROME_POLICY_SUBKEY,
+            BrowserKind::Edge => EDGE_POLICY_SUBKEY,
+            BrowserKind::Brave => return None,
+        };
+        Some(self.qualify_subkey(base))
     }
 
     pub fn uri_subkey(&self) -> String {
@@ -127,6 +140,8 @@ pub struct BrowserStatusEntry {
     pub registered: bool,
     pub manifest_path: Option<String>,
     pub manifest: Option<ManifestValidation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_hosts_launch_directly: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -265,14 +280,128 @@ pub fn resolve_ui_exe(
 #[cfg(windows)]
 mod win_reg_ops {
     use super::{
-        format_ledr_uri_command, BrowserKind, RegistryTarget, Scope, LEDR_AUMID_DISPLAY_NAME,
-        LEDR_URI_DESCRIPTION,
+        format_ledr_uri_command, normalize_display_path, BrowserKind, RegistryTarget, Scope,
+        LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
     };
     use anyhow::{Context, Result};
+    use std::ffi::c_void;
     use std::io::ErrorKind;
+    use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
+    use std::ptr;
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
     use winreg::RegKey;
+
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: [u32; 2],
+        ft_last_access_time: [u32; 2],
+        ft_last_write_time: [u32; 2],
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+
+    #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *const c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: *mut c_void,
+        ) -> *mut c_void;
+        fn GetFileInformationByHandle(
+            h_file: *mut c_void,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    struct OwnedFileHandle(*mut c_void);
+
+    impl Drop for OwnedFileHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 as isize != INVALID_HANDLE_VALUE {
+                // SAFETY: `self.0` is a valid file handle returned by `CreateFileW`.
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FileIdentity {
+        volume_serial_number: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FileIdentityLookup {
+        Found(FileIdentity),
+        NotFound,
+        Indeterminate,
+    }
+
+    fn query_file_identity(path: &Path) -> FileIdentityLookup {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.is_empty() || wide.contains(&0) {
+            return FileIdentityLookup::Indeterminate;
+        }
+        wide.push(0);
+
+        // SAFETY: `wide` is NUL-terminated UTF-16; `OPEN_EXISTING` without `FILE_FLAG_OPEN_REPARSE_POINT`
+        // resolves junctions/symlinks so aliases to the same underlying file yield the same file ID.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        if raw.is_null() || raw as isize == INVALID_HANDLE_VALUE {
+            let err = std::io::Error::last_os_error();
+            return if err.kind() == ErrorKind::NotFound {
+                FileIdentityLookup::NotFound
+            } else {
+                FileIdentityLookup::Indeterminate
+            };
+        }
+
+        let handle = OwnedFileHandle(raw);
+        let mut info = ByHandleFileInformation::default();
+        // SAFETY: `handle.0` is a valid handle and `info` matches `BY_HANDLE_FILE_INFORMATION`.
+        let ok = unsafe { GetFileInformationByHandle(handle.0, &mut info) };
+        if ok == 0 {
+            return FileIdentityLookup::Indeterminate;
+        }
+        FileIdentityLookup::Found(FileIdentity {
+            volume_serial_number: info.dw_volume_serial_number,
+            file_index_high: info.n_file_index_high,
+            file_index_low: info.n_file_index_low,
+        })
+    }
 
     fn root_key(scope: Scope) -> RegKey {
         match scope {
@@ -435,16 +564,53 @@ mod win_reg_ops {
         (name.is_some(), name)
     }
 
+    pub(crate) fn read_native_hosts_launch_directly_policy(
+        target: &RegistryTarget,
+        browser: BrowserKind,
+    ) -> Option<bool> {
+        let subkey = target.browser_policy_subkey(browser)?;
+        let root = root_key(target.scope);
+        let key = root.open_subkey_with_flags(&subkey, KEY_READ).ok()?;
+        let val = key
+            .get_value::<u32, _>(NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE)
+            .ok()?;
+        Some(val != 0)
+    }
+
     pub(crate) fn any_browser_references_manifest(
         target: &RegistryTarget,
         manifest_display_path: &str,
     ) -> Result<bool> {
+        let mut remaining_existing = Vec::new();
         for browser in [BrowserKind::Chrome, BrowserKind::Edge, BrowserKind::Brave] {
             let subkey = target.browser_subkey(browser);
             if let Some(existing) = read_default_sz(target, &subkey)? {
-                if existing.eq_ignore_ascii_case(manifest_display_path) {
+                if existing.eq_ignore_ascii_case(manifest_display_path)
+                    || normalize_display_path(Path::new(&existing))
+                        .eq_ignore_ascii_case(manifest_display_path)
+                {
                     return Ok(true);
                 }
+                remaining_existing.push(existing);
+            }
+        }
+        if remaining_existing.is_empty() {
+            return Ok(false);
+        }
+
+        let candidate_id = match query_file_identity(Path::new(manifest_display_path)) {
+            FileIdentityLookup::Found(id) => id,
+            FileIdentityLookup::NotFound => return Ok(false),
+            FileIdentityLookup::Indeterminate => return Ok(true),
+        };
+
+        for existing in &remaining_existing {
+            match query_file_identity(Path::new(existing)) {
+                FileIdentityLookup::Found(existing_id) if existing_id == candidate_id => {
+                    return Ok(true);
+                }
+                FileIdentityLookup::Found(_) | FileIdentityLookup::NotFound => {}
+                FileIdentityLookup::Indeterminate => return Ok(true),
             }
         }
         Ok(false)
@@ -453,7 +619,7 @@ mod win_reg_ops {
 
 #[cfg(not(windows))]
 mod win_reg_ops {
-    use super::RegistryTarget;
+    use super::{BrowserKind, RegistryTarget};
     use anyhow::{bail, Result};
     use std::path::Path;
 
@@ -496,6 +662,13 @@ mod win_reg_ops {
 
     pub(crate) fn read_aumid_status(_target: &RegistryTarget) -> (bool, Option<String>) {
         (false, None)
+    }
+
+    pub(crate) fn read_native_hosts_launch_directly_policy(
+        _target: &RegistryTarget,
+        _browser: BrowserKind,
+    ) -> Option<bool> {
+        None
     }
 
     pub(crate) fn any_browser_references_manifest(
@@ -712,12 +885,15 @@ pub fn run_status_with(
             let manifest = reg_val
                 .as_deref()
                 .map(|p| validate_manifest_file(Path::new(p), &expected_extension_id));
+            let native_hosts_launch_directly =
+                win_reg_ops::read_native_hosts_launch_directly_policy(target, browser);
             browsers.push(BrowserStatusEntry {
                 browser,
                 registry_key: format!(r"{}\{subkey}", target.hive_name()),
                 registered: reg_val.is_some(),
                 manifest_path: reg_val,
                 manifest,
+                native_hosts_launch_directly,
             });
         }
 
@@ -881,7 +1057,14 @@ pub fn format_status_text(report: &StatusReport) -> String {
                 ),
                 (true, None) => "registered".to_string(),
             };
-            lines.push(format!("  {}: {state}", b.browser.display_name()));
+            let policy_note = match b.native_hosts_launch_directly {
+                Some(true) => " [policy NativeHostsExecutablesLaunchDirectly=1 (direct)]",
+                Some(false) => {
+                    " [policy NativeHostsExecutablesLaunchDirectly=0 (cmd.exe mediated)]"
+                }
+                None => "",
+            };
+            lines.push(format!("  {}: {state}{policy_note}", b.browser.display_name()));
         }
         lines.push(format!(
             "  ledr:// URI: {}",

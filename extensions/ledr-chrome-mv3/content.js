@@ -553,6 +553,84 @@
     });
   }
 
+  function isAnchorElement(node) {
+    return Boolean(
+      node &&
+        typeof node === "object" &&
+        typeof node.tagName === "string" &&
+        node.tagName.toUpperCase() === "A"
+    );
+  }
+
+  function findAnchorFromEvent(event) {
+    const path = typeof event?.composedPath === "function" ? event.composedPath() : null;
+    if (Array.isArray(path)) {
+      for (const node of path) {
+        if (isAnchorElement(node)) {
+          return node;
+        }
+      }
+    }
+    let current = event?.target || null;
+    while (current && typeof current === "object") {
+      if (isAnchorElement(current)) {
+        return current;
+      }
+      current = current.parentNode || null;
+    }
+    return null;
+  }
+
+  function extractRawHref(anchor) {
+    if (typeof anchor.getAttribute === "function") {
+      const attr = anchor.getAttribute("href");
+      if (typeof attr === "string") {
+        return attr.trim();
+      }
+    }
+    if (typeof anchor.href === "string") {
+      return anchor.href.trim();
+    }
+    return "";
+  }
+
+  function resolveDownloadHintHref(anchor) {
+    const rawHref = extractRawHref(anchor);
+    if (!rawHref || rawHref.startsWith("#")) {
+      return null;
+    }
+    try {
+      const parsed = new URL(rawHref, window.location.href);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return null;
+      }
+      parsed.hash = "";
+      return parsed.href;
+    } catch {
+      return null;
+    }
+  }
+
+  document.addEventListener(
+    "click",
+    (event) => {
+      const anchor = findAnchorFromEvent(event);
+      if (!anchor) {
+        return;
+      }
+      const targetUrl = resolveDownloadHintHref(anchor);
+      if (!targetUrl) {
+        return;
+      }
+      void sendRuntimeMessage({
+        type: "RECORD_DOWNLOAD_CLICK_HINT",
+        targetUrl,
+        pageUrl: window.location.href,
+      });
+    },
+    true
+  );
+
   document.addEventListener(
     "focusin",
     async (event) => {

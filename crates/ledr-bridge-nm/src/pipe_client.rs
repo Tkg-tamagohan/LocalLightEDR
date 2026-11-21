@@ -187,17 +187,168 @@ fn clean_windows_path_no_traversal(raw: &Path) -> Option<String> {
     Some(without_trailing.to_ascii_lowercase())
 }
 
-fn standard_browser_install_roots() -> Vec<PathBuf> {
+pub(crate) fn standard_browser_install_roots() -> Vec<PathBuf> {
+    let mut seen = Vec::new();
     let mut roots = Vec::new();
-    for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)", "LOCALAPPDATA"] {
-        if let Some(val) = std::env::var_os(var).filter(|v| !v.is_empty()) {
-            let pb = PathBuf::from(val);
-            if !roots.iter().any(|existing| existing == &pb) {
-                roots.push(pb);
-            }
+    for path in win_pipe_auth::resolve_known_browser_roots() {
+        let Some(norm) = clean_windows_path_no_traversal(&path) else {
+            continue;
+        };
+        if !seen.iter().any(|existing| existing == &norm) {
+            seen.push(norm);
+            roots.push(path);
         }
     }
     roots
+}
+
+pub(crate) fn standard_system_cmd_exe_paths() -> Vec<PathBuf> {
+    let mut seen = Vec::new();
+    let mut paths = Vec::new();
+    for sys_dir in win_pipe_auth::resolve_known_system_dirs() {
+        let cmd_path = sys_dir.join("cmd.exe");
+        let Some(norm) = clean_windows_path_no_traversal(&cmd_path) else {
+            continue;
+        };
+        if !seen.iter().any(|existing| existing == &norm) {
+            seen.push(norm);
+            paths.push(cmd_path);
+        }
+    }
+    paths
+}
+
+pub(crate) fn is_authorized_cmd_exe_with(
+    exe_path: &Path,
+    authorized_cmd_paths: &[&Path],
+) -> bool {
+    let Some(norm_exe) = clean_windows_path_no_traversal(exe_path) else {
+        return false;
+    };
+    authorized_cmd_paths.iter().any(|allowed| {
+        clean_windows_path_no_traversal(allowed)
+            .is_some_and(|norm_allowed| norm_allowed == norm_exe)
+    })
+}
+
+/// Snapshot of an ancestor process inspected during Native Messaging caller verification (`SEC_0001`, `BUG_0001`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessSnapshot {
+    pub pid: u32,
+    pub create_time_100ns: u64,
+    pub exe_path: PathBuf,
+}
+
+/// Transport state of a standard I/O handle (`STD_INPUT_HANDLE` / `STD_OUTPUT_HANDLE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StdHandleTransport {
+    /// Handle is missing, invalid, or not `FILE_TYPE_PIPE` (e.g. console or disk file).
+    NonPipe,
+    /// `GetFileType` returned `FILE_TYPE_PIPE`; `pipe_server_pid` is `Some(pid)` when
+    /// `GetNamedPipeServerProcessId` succeeded, or `None` if unsupported/failed on this handle.
+    Pipe { pipe_server_pid: Option<u32> },
+}
+
+/// Collected ancestor chain and stdio pipe metadata evaluated by [`evaluate_browser_caller_chain`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrowserCallerChain {
+    pub self_create_time_100ns: u64,
+    pub parent: ProcessSnapshot,
+    pub grandparent: Option<ProcessSnapshot>,
+    pub stdin_transport: StdHandleTransport,
+    pub stdout_transport: StdHandleTransport,
+}
+
+/// Evaluates whether the relay caller chain originates from an authorized Chromium browser directly,
+/// or via Windows `<System|SystemX86>\cmd.exe` when `NativeHostsExecutablesLaunchDirectly` is disabled.
+pub(crate) fn evaluate_browser_caller_chain(
+    chain: &BrowserCallerChain,
+    browser_roots: &[&Path],
+    authorized_cmd_paths: &[&Path],
+) -> anyhow::Result<()> {
+    if chain.self_create_time_100ns == 0 {
+        bail!("refusing default IPC relay: invalid current process creation timestamp");
+    }
+    if chain.parent.pid == 0 {
+        bail!("refusing default IPC relay: invalid inherited parent PID 0");
+    }
+    if chain.parent.create_time_100ns == 0
+        || chain.parent.create_time_100ns > chain.self_create_time_100ns
+    {
+        bail!(
+            "refusing default IPC relay: parent PID {} was created after bridge process (PID reuse)",
+            chain.parent.pid
+        );
+    }
+
+    if is_authorized_browser_parent_exe_with(&chain.parent.exe_path, browser_roots) {
+        return Ok(());
+    }
+
+    if !is_authorized_cmd_exe_with(&chain.parent.exe_path, authorized_cmd_paths) {
+        bail!(
+            "refusing default IPC relay from untrusted parent process PID {} ('{}')",
+            chain.parent.pid,
+            chain.parent.exe_path.display()
+        );
+    }
+
+    let Some(grandparent) = &chain.grandparent else {
+        bail!(
+            "refusing default IPC relay via cmd.exe PID {}: missing grandparent browser process",
+            chain.parent.pid
+        );
+    };
+    if grandparent.pid == 0 || grandparent.pid == chain.parent.pid {
+        bail!(
+            "refusing default IPC relay via cmd.exe PID {}: invalid grandparent PID {}",
+            chain.parent.pid,
+            grandparent.pid
+        );
+    }
+    if grandparent.create_time_100ns == 0
+        || grandparent.create_time_100ns > chain.parent.create_time_100ns
+    {
+        bail!(
+            "refusing default IPC relay via cmd.exe PID {}: grandparent PID {} was created after cmd.exe (PID reuse)",
+            chain.parent.pid,
+            grandparent.pid
+        );
+    }
+    if !is_authorized_browser_parent_exe_with(&grandparent.exe_path, browser_roots) {
+        bail!(
+            "refusing default IPC relay via cmd.exe PID {} from untrusted grandparent PID {} ('{}')",
+            chain.parent.pid,
+            grandparent.pid,
+            grandparent.exe_path.display()
+        );
+    }
+
+    for (stream_name, transport) in [
+        ("stdin", chain.stdin_transport),
+        ("stdout", chain.stdout_transport),
+    ] {
+        match transport {
+            StdHandleTransport::NonPipe => {
+                bail!(
+                    "refusing default IPC relay via cmd.exe PID {}: {stream_name} is not a pipe",
+                    chain.parent.pid
+                );
+            }
+            StdHandleTransport::Pipe {
+                pipe_server_pid: Some(server_pid),
+            } if server_pid != grandparent.pid => {
+                bail!(
+                    "refusing default IPC relay via cmd.exe PID {}: {stream_name} pipe server PID {server_pid} does not match grandparent browser PID {}",
+                    chain.parent.pid,
+                    grandparent.pid
+                );
+            }
+            StdHandleTransport::Pipe { .. } => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Validates a Chromium Native Messaging caller origin argument (`chrome-extension://<id>/`).
@@ -232,8 +383,9 @@ pub fn is_authorized_browser_parent_exe_with(parent_exe: &Path, roots: &[&Path])
     false
 }
 
-/// Checks whether `parent_exe` matches a canonical Chrome/Edge/Brave binary under standard
-/// Windows install roots (`ProgramFiles`, `ProgramW6432`, `ProgramFiles(x86)`, `LOCALAPPDATA`).
+/// Checks whether `parent_exe` matches a canonical Chrome/Edge/Brave binary under OS Known Folders
+/// (`FOLDERID_ProgramFiles`, `ProgramFilesX64`, `ProgramFilesX86`, `LocalAppData`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_authorized_browser_parent_exe(parent_exe: &Path) -> bool {
     let roots = standard_browser_install_roots();
     let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
@@ -273,13 +425,17 @@ pub fn verify_browser_relay_caller(args: &RelayArgs) -> anyhow::Result<()> {
 #[cfg(windows)]
 pub(crate) mod win_pipe_auth {
     use super::{
-        is_authorized_browser_parent_exe, is_authorized_pipe_server_exe, AUTHORIZED_DAEMON_EXE_PATH,
+        evaluate_browser_caller_chain, is_authorized_browser_parent_exe_with,
+        is_authorized_cmd_exe_with, is_authorized_pipe_server_exe, standard_browser_install_roots,
+        standard_system_cmd_exe_paths, BrowserCallerChain, ProcessSnapshot, StdHandleTransport,
+        AUTHORIZED_DAEMON_EXE_PATH,
     };
     use anyhow::bail;
-    use std::ffi::c_void;
+    use std::ffi::{c_void, OsString};
     use std::fs::File;
+    use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::AsRawHandle;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const PROCESS_NAME_WIN32: u32 = 0;
@@ -289,6 +445,61 @@ pub(crate) mod win_pipe_auth {
     const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
     const STATUS_SUCCESS: i32 = 0;
     const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+    const KF_FLAG_DEFAULT_PATH: u32 = 0x0000_0400;
+    const KF_FLAG_NO_ALIAS: u32 = 0x0000_1000;
+    const KF_FLAG_DONT_VERIFY: u32 = 0x0000_4000;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const FILE_TYPE_PIPE: u32 = 0x0003;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(crate) struct Guid {
+        pub data1: u32,
+        pub data2: u16,
+        pub data3: u16,
+        pub data4: [u8; 8],
+    }
+
+    // Known Folder IDs from Microsoft KnownFolders.h
+    pub(crate) const FOLDERID_PROGRAM_FILES: Guid = Guid {
+        data1: 0x905E_63B6,
+        data2: 0xC1BF,
+        data3: 0x494E,
+        data4: [0xB2, 0x9C, 0x65, 0xB7, 0x32, 0xD3, 0xD2, 0x1A],
+    };
+    pub(crate) const FOLDERID_PROGRAM_FILES_X64: Guid = Guid {
+        data1: 0x6D80_9377,
+        data2: 0x6AF0,
+        data3: 0x444B,
+        data4: [0x89, 0x57, 0xA3, 0x77, 0x3F, 0x02, 0x20, 0x0E],
+    };
+    pub(crate) const FOLDERID_PROGRAM_FILES_X86: Guid = Guid {
+        data1: 0x7C5A_40EF,
+        data2: 0xA0FB,
+        data3: 0x4BFC,
+        data4: [0x87, 0x4A, 0xC0, 0xF2, 0xE0, 0xB9, 0xFA, 0x8E],
+    };
+    pub(crate) const FOLDERID_LOCAL_APP_DATA: Guid = Guid {
+        data1: 0xF1B3_2785,
+        data2: 0x6FBA,
+        data3: 0x4FCF,
+        data4: [0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91],
+    };
+    pub(crate) const FOLDERID_SYSTEM: Guid = Guid {
+        data1: 0x1AC1_4E77,
+        data2: 0x02E7,
+        data3: 0x4E5D,
+        data4: [0xB7, 0x44, 0x2E, 0xB1, 0xAE, 0x51, 0x98, 0xB7],
+    };
+    pub(crate) const FOLDERID_SYSTEM_X86: Guid = Guid {
+        data1: 0xD652_31B0,
+        data2: 0xB2F1,
+        data3: 0x4857,
+        data4: [0xA4, 0xCE, 0xA8, 0xE7, 0xC6, 0xEA, 0x7D, 0x27],
+    };
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -327,6 +538,8 @@ pub(crate) mod win_pipe_auth {
     #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
     extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
+        fn GetStdHandle(n_std_handle: u32) -> *mut c_void;
+        fn GetFileType(h_file: *mut c_void) -> u32;
         fn GetNamedPipeServerProcessId(pipe: *mut c_void, server_process_id: *mut u32) -> i32;
         fn OpenProcess(
             desired_access: u32,
@@ -371,6 +584,30 @@ pub(crate) mod win_pipe_auth {
         ) -> i32;
     }
 
+    #[link(name = "advapi32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    extern "system" {
+        fn OpenProcessToken(
+            process_handle: *mut c_void,
+            desired_access: u32,
+            token_handle: *mut *mut c_void,
+        ) -> i32;
+    }
+
+    #[link(name = "shell32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            rfid: *const Guid,
+            dw_flags: u32,
+            h_token: *mut c_void,
+            ppsz_path: *mut *mut u16,
+        ) -> i32;
+    }
+
+    #[link(name = "ole32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    extern "system" {
+        fn CoTaskMemFree(pv: *mut c_void);
+    }
+
     struct OwnedWinHandle(*mut c_void);
 
     impl Drop for OwnedWinHandle {
@@ -382,6 +619,80 @@ pub(crate) mod win_pipe_auth {
                 }
             }
         }
+    }
+
+    struct CoTaskMemStr(*mut u16);
+
+    impl Drop for CoTaskMemStr {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was allocated by `SHGetKnownFolderPath` via the COM allocator.
+                unsafe {
+                    CoTaskMemFree(self.0.cast::<c_void>());
+                }
+            }
+        }
+    }
+
+    pub(crate) fn resolve_known_folder_path(folder_id: &Guid) -> Option<PathBuf> {
+        let mut raw_token: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `GetCurrentProcess` returns the current process pseudo-handle; `raw_token` is a stack out-pointer.
+        let token_ok =
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
+        if token_ok == 0 || raw_token.is_null() {
+            return None;
+        }
+        let token_guard = OwnedWinHandle(raw_token);
+
+        let mut raw_ptr: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `folder_id` is a valid `KNOWNFOLDERID`, `token_guard.0` is a valid `TOKEN_QUERY` handle,
+        // and `raw_ptr` is a valid out-pointer. Passing the process token + `KF_FLAG_DEFAULT_PATH`
+        // resolves per-user folders from the OS profile database rather than `%USERPROFILE%` env vars or
+        // HKCU User Shell Folders redirection.
+        let hr = unsafe {
+            SHGetKnownFolderPath(
+                folder_id as *const Guid,
+                KF_FLAG_DEFAULT_PATH | KF_FLAG_NO_ALIAS | KF_FLAG_DONT_VERIFY,
+                token_guard.0,
+                &mut raw_ptr,
+            )
+        };
+        // `SHGetKnownFolderPath` requires callers to free `raw_ptr` whenever non-null, even on error.
+        let guard = CoTaskMemStr(raw_ptr);
+        if hr < 0 || guard.0.is_null() {
+            return None;
+        }
+        // SAFETY: On success `SHGetKnownFolderPath` yields a NUL-terminated UTF-16 string.
+        let wide = unsafe {
+            let mut len = 0usize;
+            while *guard.0.add(len) != 0 {
+                len += 1;
+            }
+            std::slice::from_raw_parts(guard.0, len)
+        };
+        if wide.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(OsString::from_wide(wide)))
+    }
+
+    pub(crate) fn resolve_known_browser_roots() -> Vec<PathBuf> {
+        [
+            &FOLDERID_PROGRAM_FILES,
+            &FOLDERID_PROGRAM_FILES_X64,
+            &FOLDERID_PROGRAM_FILES_X86,
+            &FOLDERID_LOCAL_APP_DATA,
+        ]
+        .into_iter()
+        .filter_map(resolve_known_folder_path)
+        .collect()
+    }
+
+    pub(crate) fn resolve_known_system_dirs() -> Vec<PathBuf> {
+        [&FOLDERID_SYSTEM, &FOLDERID_SYSTEM_X86]
+            .into_iter()
+            .filter_map(resolve_known_folder_path)
+            .collect()
     }
 
     pub(crate) fn nt_device_path_to_dos_with_map(
@@ -527,36 +838,37 @@ pub(crate) mod win_pipe_auth {
         query_process_image_path_from_handle(proc_handle.0, server_pid)
     }
 
-    pub(crate) fn verify_browser_parent_process() -> anyhow::Result<()> {
-        // SAFETY: `GetCurrentProcess` always returns the current process pseudo-handle.
-        let self_handle = unsafe { GetCurrentProcess() };
-        let mut self_create = FileTime::default();
+    fn query_process_creation_time(handle: *mut c_void, label: &str) -> anyhow::Result<u64> {
+        let mut create_ft = FileTime::default();
         let mut exit_ft = FileTime::default();
         let mut kernel_ft = FileTime::default();
         let mut user_ft = FileTime::default();
-        // SAFETY: All `FILETIME` pointers point to writable stack locals.
-        let ok_self_times = unsafe {
+        // SAFETY: `handle` is valid for process query and all `FileTime` pointers are stack locals.
+        let ok = unsafe {
             GetProcessTimes(
-                self_handle,
-                &mut self_create,
+                handle,
+                &mut create_ft,
                 &mut exit_ft,
                 &mut kernel_ft,
                 &mut user_ft,
             )
         };
-        if ok_self_times == 0 {
+        if ok == 0 {
             bail!(
-                "GetProcessTimes(current process) failed: {}",
+                "refusing default IPC relay: GetProcessTimes({label}) failed: {}",
                 std::io::Error::last_os_error()
             );
         }
+        Ok(filetime_to_u64(create_ft))
+    }
 
+    fn query_inherited_parent_pid(handle: *mut c_void, label: &str) -> anyhow::Result<u32> {
         let mut pbi: ProcessBasicInformation = unsafe { std::mem::zeroed() };
         let mut return_len: u32 = 0;
         // SAFETY: `pbi` is properly sized and aligned for `ProcessBasicInformation` (class 0).
         let status = unsafe {
             NtQueryInformationProcess(
-                self_handle,
+                handle,
                 PROCESS_BASIC_INFORMATION_CLASS,
                 (&mut pbi as *mut ProcessBasicInformation).cast::<c_void>(),
                 u32::try_from(std::mem::size_of::<ProcessBasicInformation>()).unwrap_or(u32::MAX),
@@ -565,19 +877,44 @@ pub(crate) mod win_pipe_auth {
         };
         if status < 0 {
             bail!(
-                "NtQueryInformationProcess(ProcessBasicInformation) failed: NTSTATUS 0x{status:08X}"
+                "refusing default IPC relay: NtQueryInformationProcess({label}) failed: NTSTATUS 0x{status:08X}"
             );
         }
-
-        let parent_pid = u32::try_from(pbi.inherited_from_unique_process_id)
+        u32::try_from(pbi.inherited_from_unique_process_id)
             .ok()
             .filter(|&pid| pid != 0)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "refusing default IPC relay: invalid inherited parent PID {}",
+                    "refusing default IPC relay: invalid inherited parent PID {} for {label}",
                     pbi.inherited_from_unique_process_id
                 )
-            })?;
+            })
+    }
+
+    fn inspect_std_handle_transport(std_handle_id: u32) -> StdHandleTransport {
+        // SAFETY: `GetStdHandle` returns a process-owned pseudo/standard handle (must not be closed).
+        let handle = unsafe { GetStdHandle(std_handle_id) };
+        if handle.is_null() || handle as isize == INVALID_HANDLE_VALUE {
+            return StdHandleTransport::NonPipe;
+        }
+        // SAFETY: `handle` is a non-null, non-invalid handle obtained from `GetStdHandle`.
+        let file_type = unsafe { GetFileType(handle) };
+        if file_type != FILE_TYPE_PIPE {
+            return StdHandleTransport::NonPipe;
+        }
+        let mut server_pid: u32 = 0;
+        // SAFETY: `handle` is a pipe handle; `server_pid` is a valid out-pointer.
+        let ok = unsafe { GetNamedPipeServerProcessId(handle, &mut server_pid) };
+        StdHandleTransport::Pipe {
+            pipe_server_pid: (ok != 0).then_some(server_pid),
+        }
+    }
+
+    pub(crate) fn verify_browser_parent_process() -> anyhow::Result<()> {
+        // SAFETY: `GetCurrentProcess` always returns the current process pseudo-handle.
+        let self_handle = unsafe { GetCurrentProcess() };
+        let self_create_time_100ns = query_process_creation_time(self_handle, "current process")?;
+        let parent_pid = query_inherited_parent_pid(self_handle, "current process")?;
 
         // SAFETY: Plain Win32 PID lookup with minimal read access.
         let raw_parent = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_pid) };
@@ -588,41 +925,63 @@ pub(crate) mod win_pipe_auth {
             );
         }
         let parent_handle = OwnedWinHandle(raw_parent);
+        let parent_create_time_100ns =
+            query_process_creation_time(parent_handle.0, &format!("parent PID {parent_pid}"))?;
+        let parent_exe = query_process_image_path_from_handle(parent_handle.0, parent_pid)
+            .map_err(|e| anyhow::anyhow!("refusing default IPC relay: {e}"))?;
 
-        let mut parent_create = FileTime::default();
-        // SAFETY: `parent_handle.0` is valid and `FileTime` pointers are stack locals.
-        let ok_parent_times = unsafe {
-            GetProcessTimes(
-                parent_handle.0,
-                &mut parent_create,
-                &mut exit_ft,
-                &mut kernel_ft,
-                &mut user_ft,
-            )
+        let browser_roots = standard_browser_install_roots();
+        let browser_root_refs: Vec<&Path> = browser_roots.iter().map(PathBuf::as_path).collect();
+        let cmd_paths = standard_system_cmd_exe_paths();
+        let cmd_path_refs: Vec<&Path> = cmd_paths.iter().map(PathBuf::as_path).collect();
+
+        let parent_path = PathBuf::from(&parent_exe);
+        let mut grandparent = None;
+        let mut stdin_transport = StdHandleTransport::NonPipe;
+        let mut stdout_transport = StdHandleTransport::NonPipe;
+
+        if parent_create_time_100ns <= self_create_time_100ns
+            && !is_authorized_browser_parent_exe_with(&parent_path, &browser_root_refs)
+            && is_authorized_cmd_exe_with(&parent_path, &cmd_path_refs)
+        {
+            let gp_pid =
+                query_inherited_parent_pid(parent_handle.0, &format!("cmd.exe parent PID {parent_pid}"))?;
+            // SAFETY: Plain Win32 PID lookup with minimal read access.
+            let raw_gp = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, gp_pid) };
+            if raw_gp.is_null() {
+                bail!(
+                    "refusing default IPC relay via cmd.exe PID {parent_pid}: cannot inspect grandparent process PID {gp_pid}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let gp_handle = OwnedWinHandle(raw_gp);
+            let gp_create = query_process_creation_time(
+                gp_handle.0,
+                &format!("grandparent PID {gp_pid}"),
+            )?;
+            let gp_exe = query_process_image_path_from_handle(gp_handle.0, gp_pid)
+                .map_err(|e| anyhow::anyhow!("refusing default IPC relay via cmd.exe: {e}"))?;
+            grandparent = Some(ProcessSnapshot {
+                pid: gp_pid,
+                create_time_100ns: gp_create,
+                exe_path: PathBuf::from(gp_exe),
+            });
+            stdin_transport = inspect_std_handle_transport(STD_INPUT_HANDLE);
+            stdout_transport = inspect_std_handle_transport(STD_OUTPUT_HANDLE);
+        }
+
+        let chain = BrowserCallerChain {
+            self_create_time_100ns,
+            parent: ProcessSnapshot {
+                pid: parent_pid,
+                create_time_100ns: parent_create_time_100ns,
+                exe_path: parent_path,
+            },
+            grandparent,
+            stdin_transport,
+            stdout_transport,
         };
-        if ok_parent_times == 0 {
-            bail!(
-                "refusing default IPC relay: GetProcessTimes(parent PID {parent_pid}) failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-
-        if filetime_to_u64(parent_create) > filetime_to_u64(self_create) {
-            bail!(
-                "refusing default IPC relay: parent PID {parent_pid} was created after bridge process (PID reuse)"
-            );
-        }
-
-        let parent_exe =
-            query_process_image_path_from_handle(parent_handle.0, parent_pid).map_err(|e| {
-                anyhow::anyhow!("refusing default IPC relay: {e}")
-            })?;
-        if !is_authorized_browser_parent_exe(Path::new(&parent_exe)) {
-            bail!(
-                "refusing default IPC relay from untrusted parent process PID {parent_pid} ('{parent_exe}')"
-            );
-        }
-        Ok(())
+        evaluate_browser_caller_chain(&chain, &browser_root_refs, &cmd_path_refs)
     }
 
     pub(crate) fn verify_named_pipe_server_process(
@@ -655,6 +1014,16 @@ pub(crate) mod win_pipe_auth {
 
 #[cfg(not(windows))]
 pub(crate) mod win_pipe_auth {
+    use std::path::PathBuf;
+
+    pub(crate) fn resolve_known_browser_roots() -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    pub(crate) fn resolve_known_system_dirs() -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     pub(crate) fn verify_browser_parent_process() -> anyhow::Result<()> {
         anyhow::bail!("Browser parent process verification is only supported on Windows")
     }

@@ -1739,6 +1739,59 @@ fn bridge_15_unregister_preserves_shared_manifest_across_junction_hardlink_and_i
     );
     assert!(!vol_manifest.exists());
     assert!(vol_other.is_file());
+
+    // Verbatim Volume GUID path containing a trailing-dot directory (`Data.`) must preserve
+    // verbatim semantics during drive-letter rewriting rather than falling back to Win32 dot-stripping.
+    let dot_dir_verbatim = PathBuf::from(format!(r"\\?\{}\Data.", real_dir.display()));
+    let dot_manifest_verbatim = dot_dir_verbatim.join("com.localedr.bridge.dotvol.json");
+    let dot_dir_display = format!(r"{}\Data.", real_dir.display());
+    let live_vol_dot_manifest = format!(
+        "{live_vol_root}{}\\com.localedr.bridge.dotvol.json",
+        &dot_dir_display[3..]
+    );
+    fs::create_dir(&dot_dir_verbatim).expect("create verbatim trailing-dot dir Data.");
+    write_manifest_atomic(&dot_manifest_verbatim, &manifest).unwrap();
+
+    let (u_key_vg_dot_same, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key_vg_dot_same
+        .set_value("", &live_vol_dot_manifest)
+        .unwrap();
+    let (p_key_vg_dot_same, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key_vg_dot_same
+        .set_value("", &dot_manifest_verbatim.to_string_lossy().into_owned())
+        .unwrap();
+    let res_vg_dot_same = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg verbatim Data. Volume GUID with matching peer");
+    assert!(
+        !res_vg_dot_same.manifest_removed,
+        "trailing-dot directory Volume GUID candidate must match verbatim peer and preserve manifest"
+    );
+    assert!(dot_manifest_verbatim.is_file());
+
+    let (u_key_vg_dot_diff, _) = hkcu
+        .create_subkey_with_flags(user_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    u_key_vg_dot_diff
+        .set_value("", &live_vol_dot_manifest)
+        .unwrap();
+    let (p_key_vg_dot_diff, _) = hkcu
+        .create_subkey_with_flags(peer_target.browser_subkey(BrowserKind::Chrome), KEY_WRITE)
+        .unwrap();
+    p_key_vg_dot_diff
+        .set_value("", &vol_other.to_string_lossy().into_owned())
+        .unwrap();
+    let res_vg_dot_diff = run_unregister_with(&unreg_peer, &user_target, Some(&peer_target))
+        .expect("unreg verbatim Data. Volume GUID with unrelated peer");
+    assert!(
+        res_vg_dot_diff.manifest_removed,
+        "trailing-dot directory Volume GUID candidate must be deleted when peer references unrelated file"
+    );
+    assert!(!dot_manifest_verbatim.exists());
+    let _ = fs::remove_dir(&dot_dir_verbatim);
     let _ = fs::remove_file(&vol_other);
 
     // 6. Boundary checks for Layer 1 path parsing, Layer 2 DOS device / drive types, and Layer 3 reparse targets.

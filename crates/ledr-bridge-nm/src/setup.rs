@@ -899,7 +899,9 @@ mod win_reg_ops {
             // unavailable MountMgr lookup: never open via CreateFileW, conservatively keep manifest.
             return PathLocality::Indeterminate;
         };
-        let rewritten = build_drive_path(drive, segments, false);
+        // Preserve verbatim `\\?\X:\...` semantics because `\\?\Volume{guid}\...` and reparse
+        // targets bypass Win32 trailing-dot/space stripping (e.g. `Data.\manifest.json`).
+        let rewritten = build_drive_path(drive, segments, true);
         verify_local_path_recursive(&rewritten, remaining_depth - 1)
     }
 

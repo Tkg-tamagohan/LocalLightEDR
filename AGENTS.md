@@ -66,4 +66,7 @@
 - 静的検査：`cargo clippy --workspace --all-targets --locked -- -D warnings`
 - 全体テスト：`cargo test --workspace --locked`
 - 負荷と TTL 回帰：`cargo test -p ledr-daemon --test burst_budget --locked -- --nocapture` と `cargo test -p ledr-store --test ttl_purge_lineage --locked`
+- Chrome MV3 拡張テスト（Node 22、PowerShell 5.1 互換）：`$extTests = @(Get-ChildItem extensions\ledr-chrome-mv3\tests\*.test.mjs | Select-Object -ExpandProperty FullName); if ($extTests.Count -eq 0) { throw "No Chrome MV3 extension test files matched." }; node --test $extTests`
+- UI モック DOM テスト（Node 22、PowerShell 5.1 互換）：`$uiTests = @(Get-ChildItem apps\ledr-ui\js-tests\*.test.mjs | Select-Object -ExpandProperty FullName); if ($uiTests.Count -eq 0) { throw "No Tauri UI test files matched." }; node --test $uiTests`（単体実行：`node --test apps/ledr-ui/js-tests/phase4_ui.test.mjs`）
 - 実機 E2E：ターゲット基準は Windows 10 または 11（x86_64）クライアント SKU であり、Server SKU で代替検証した場合は未検証差異として明記する。
+- 検証記録の区別：文書（`docs/follow-up-notes.md`、`docs/implementation-plan.md` 等）や PR 本文へテスト合格を記録する際は、`.github/workflows/ci.yml` で実際に実行されるジョブ範囲（`changes` によるパス別スキップを含む）とローカル別途実行範囲（`scripts/test_check_invariants.py`、不変条件ゲート、実機 E2E 等）を混同せず、CI 未実行またはスキップされたスイートには別途の実行コマンド、環境、結果記録を明記する。

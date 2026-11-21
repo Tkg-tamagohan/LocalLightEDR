@@ -559,7 +559,7 @@ Phase 4 の実装項目 4 件は合成自動テストに合格して `main` へ�
 
 ### 自動テストと負荷ベンチマーク
 
-ワークスペース全体の静的検査、単体テスト、および高負荷テストは以下の Cargo コマンドで検証する。
+ワークスペース全体の静的検査、単体テスト、Chrome 拡張および Tauri UI の Node テスト、ならびに高負荷テストは以下のコマンドで検証する。
 
 ```powershell
 # 静的検査とワークスペース全単体テスト（Phase 0〜4 共通）
@@ -571,7 +571,20 @@ cargo test -p ledr-daemon --test burst_budget --locked -- --nocapture
 
 # SQLite TTL パージ（長期稼働親プロセスの孤児化防止検証）
 cargo test -p ledr-store --test ttl_purge_lineage --locked
+
+# Chrome MV3 拡張単体テスト（Node 22、PowerShell 5.1 互換のファイル展開）
+$extTests = @(Get-ChildItem extensions\ledr-chrome-mv3\tests\*.test.mjs | Select-Object -ExpandProperty FullName)
+if ($extTests.Count -eq 0) { throw "No Chrome MV3 extension test files matched." }
+node --test $extTests
+
+# Tauri UI モック DOM テスト（Node 22、現行対象: apps/ledr-ui/js-tests/phase4_ui.test.mjs）
+$uiTests = @(Get-ChildItem apps\ledr-ui\js-tests\*.test.mjs | Select-Object -ExpandProperty FullName)
+if ($uiTests.Count -eq 0) { throw "No Tauri UI test files matched." }
+node --test $uiTests
 ```
+
+上記の Cargo 系コマンドは `.github/workflows/ci.yml` の `rust-windows` ジョブで、Node テストは `static-checks` ジョブで自動実行される。
+文書や PR 本文へテスト合格を記録する際は、CI で実際に実行されたジョブ範囲（`changes` によるパス別スキップを含む）とローカル別途実行範囲を混同せず、CI 未実行またはスキップされたスイートは実行コマンド、環境、結果を分けて記載する。
 
 ### 実機検証
 

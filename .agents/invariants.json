@@ -168,6 +168,23 @@
         "true_description": "The Git diff triggers ClickFix warnings broadly on normal copy operations without requiring dangerous LOTL command indicators or a getSelection() versus clipboard mismatch.",
         "false_description": "The Git diff restricts ClickFix warning triggers to LOTL command indicators or DOM getSelection() versus clipboard content mismatches per Decision Record L-15, or is unrelated."
       }
+    },
+    "phase4_ui_manifest_allowlist_and_wow64": {
+      "heading": "Phase 4 View 3 Manifest Allowlist, WOW64 Lookup, and Detail Row Guard",
+      "description": "View 3 マニフェスト検証の既定 2 ディレクトリホワイトリスト（カスタム配置のファイル I/O ゼロと unverified 区別、リパースポイント拒否、FILE_FLAG_OPEN_REPARSE_POINT と FILE_READ_ATTRIBUTES 先行検査、nNumberOfLinks == 1、GetFinalPathNameByHandleW 閉じ込め、ReOpenFile 昇格、description 必須）、WOW64 の KEY_WOW64_32KEY -> KEY_WOW64_64KEY 探索と EmptyString 32 ビット打切り、および .browser-detail-row の manifest_path 併記を維持する。",
+      "source_file": "AGENTS.md",
+      "path_globs": [
+        "apps/ledr-ui/src/defense_status.rs",
+        "apps/ledr-ui/src/uri_reg.rs",
+        "apps/ledr-ui/ui/app.js"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff weaken any Phase 4 View 3 invariant: (1) restricting Native Messaging manifest reads to the two default allowlisted directories with zero file I/O on custom paths (classified as unverified), rejecting reparse points, pre-checking via FILE_FLAG_OPEN_REPARSE_POINT and FILE_READ_ATTRIBUTES for nNumberOfLinks == 1 and GetFinalPathNameByHandleW containment before ReOpenFile upgrade, and requiring description; (2) probing WOW64 registry views in KEY_WOW64_32KEY -> KEY_WOW64_64KEY order and stopping at 32-bit on EmptyString; or (3) displaying each browser's manifest_path inside .browser-detail-row? Answer Yes only if the diff weakens these allowlist, handle-validation, description, WOW64/EmptyString, or .browser-detail-row invariants. Answer No if all are preserved or the diff is unrelated.",
+      "criteria": {
+        "true_description": "The Git diff reads custom manifest paths, conflates unverified with verified, bypasses reparse/link/final-path/ReOpenFile/description checks, breaks KEY_WOW64_32KEY -> KEY_WOW64_64KEY order or 32-bit EmptyString cutoff, or drops manifest_path from .browser-detail-row.",
+        "false_description": "The Git diff preserves the two-directory manifest allowlist, zero custom-path I/O with unverified status, handle validation and required description, WOW64 order with 32-bit EmptyString cutoff, and .browser-detail-row manifest_path display, or is unrelated."
+      }
     }
   }
 }

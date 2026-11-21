@@ -1,6 +1,6 @@
 ---
 trigger: model_decision
-description: LocalEDR の防御アクチュエータ（サスペンド、終了）、おとりファイル、Session 0 通知、IPC 認可、WFP 動的フィルタ、ブラウザ拡張と MOTW 連携を実装またはレビューするとき
+description: LocalEDR の防御アクチュエータ（サスペンド、終了）、おとりファイル、Session 0 通知、IPC 認可、WFP 動的フィルタ、ブラウザ拡張と MOTW 連携、View 3 マニフェスト検証を実装またはレビューするとき
 ---
 
 # 能動防御と特権境界の安全制約を遵守する
@@ -17,6 +17,8 @@ LocalEDR の Layer 1 から Layer 4 にわたる能動防御処理は、誤動�
 5. WFP 動的フィルタ：Phase 3 の WFP エンジンは `FWPM_SESSION_FLAG_DYNAMIC` と独自 SubLayer を必ず使い、異常終了時に恒久ブロックを残さない。
    サスペンドとフィルタ追加の片系失敗時は孤立状態を残さず復元する。
 6. Chrome と MOTW：Phase 4 の NRD 判定は外部へ閲覧ドメインを送信せずローカル完結に保ち、ダウンロード起源はパス、SHA-256、`:Zone.Identifier` の 3 段階で紐付ける。
+7. View 3 マニフェスト検証：Native Messaging マニフェストの読み取りは既定 2 ディレクトリのホワイトリスト配下だけに限定し、カスタム配置パスに対してはファイル I/O を行わない。
+   ホワイトリスト配下でもリパースポイントを拒否し、`FILE_FLAG_OPEN_REPARSE_POINT` と `FILE_READ_ATTRIBUTES` で先行検査して `nNumberOfLinks == 1` および `GetFinalPathNameByHandleW` によるディレクトリ閉じ込めを確認してから、`ReOpenFile` で読み取りハンドルへ昇格して読み取る。
 
 ## 対象外
 

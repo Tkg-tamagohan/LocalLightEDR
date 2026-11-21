@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -14,6 +14,12 @@ use crate::notify::{NoopNotificationDispatcher, NotificationDispatcher};
 use crate::process_table::ActiveProcessTable;
 
 use super::dns_history::ProcessDnsHistory;
+use super::motw::{
+    initial_download_origin_state, refresh_download_origins_after_purge, BrowserEventDedupCache,
+    MotwInspector, MotwIoWorkerPool, MotwStage2Cache, SeedMotwGroup, WindowsMotwInspector,
+    BROWSER_EVENT_DEDUP_CAPACITY, BROWSER_EVENT_DEDUP_WINDOW_MS, MOTW_IO_QUEUE_CAPACITY,
+    MOTW_STAGE2_CACHE_CAPACITY, MOTW_STAGE2_CACHE_TTL_SECS,
+};
 use super::wfp_drops::{AppWfpAlertDedup, WfpDropDedupCache, WfpDropOverflowQueue};
 use super::{
     current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, LiveProcessInspector,
@@ -97,6 +103,34 @@ impl DaemonEngine {
         inspector: Arc<dyn BinaryInspector>,
         live_process_inspector: Arc<dyn LiveProcessInspector>,
     ) -> Arc<Self> {
+        Self::start_with_motw_inspector(
+            store,
+            sigma,
+            pruner,
+            config,
+            defense,
+            notifier,
+            inspector,
+            live_process_inspector,
+            Arc::new(WindowsMotwInspector::new()),
+        )
+    }
+
+    /// Starts a new [`DaemonEngine`] with all standard dependencies plus a custom
+    /// [`MotwInspector`] (`Phase 4A` deterministic `:Zone.Identifier` testing).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_motw_inspector(
+        store: LedrStore,
+        sigma: SigmaEngine,
+        pruner: EarlyPruner,
+        config: DaemonConfig,
+        defense: Arc<dyn ActiveDefenseController>,
+        notifier: Arc<dyn NotificationDispatcher>,
+        inspector: Arc<dyn BinaryInspector>,
+        live_process_inspector: Arc<dyn LiveProcessInspector>,
+        motw_inspector: Arc<dyn MotwInspector>,
+    ) -> Arc<Self> {
+        let initial_has_downloads = store.has_any_download_origins().unwrap_or(false);
         let prior_running_candidates = store.list_running_process_instance_ids().unwrap_or_default();
         let (sender, receiver) = TwoLaneChannel::with_capacities(
             config.high_priority_capacity,
@@ -148,6 +182,24 @@ impl DaemonEngine {
         let wfp_drop_overflow = Mutex::new(WfpDropOverflowQueue::new(
             config.high_priority_capacity.max(1),
         ));
+        let download_origin_state =
+            Arc::new(AtomicU64::new(initial_download_origin_state(initial_has_downloads)));
+        let motw_stage2_cache = Arc::new(Mutex::new(MotwStage2Cache::new(
+            MOTW_STAGE2_CACHE_CAPACITY,
+            MOTW_STAGE2_CACHE_TTL_SECS,
+        )));
+        let (motw_result_tx, motw_result_rx) =
+            tokio::sync::mpsc::channel(MOTW_IO_QUEUE_CAPACITY);
+        let motw_pool = MotwIoWorkerPool::new(
+            store.clone(),
+            Arc::clone(&inspector),
+            Arc::clone(&motw_inspector),
+            Arc::clone(&download_origin_state),
+            Arc::clone(&motw_stage2_cache),
+            config.download_hash_max_bytes,
+            config.active_process_capacity.max(256),
+            motw_result_tx,
+        );
 
         let engine = Arc::new(Self {
             config,
@@ -158,6 +210,14 @@ impl DaemonEngine {
             notifier,
             inspector,
             live_process_inspector,
+            motw_inspector,
+            download_origin_state,
+            motw_stage2_cache,
+            motw_pool,
+            browser_event_dedup: Mutex::new(BrowserEventDedupCache::new(
+                BROWSER_EVENT_DEDUP_CAPACITY,
+                BROWSER_EVENT_DEDUP_WINDOW_MS,
+            )),
             process_table,
             firewall: Mutex::new(wfp_manager),
             outbound_classifier,
@@ -200,7 +260,9 @@ impl DaemonEngine {
 
         let worker_engine = Arc::clone(&engine);
         let handle = tokio::spawn(async move {
-            worker_engine.run_pipeline(receiver, wfp_drop_rx).await
+            worker_engine
+                .run_pipeline(receiver, wfp_drop_rx, motw_result_rx)
+                .await
         });
 
         if let Ok(mut slot) = engine.worker_handle.try_lock() {
@@ -216,10 +278,28 @@ impl DaemonEngine {
     pub fn seed_processes(&self, snapshots: Vec<SensorEvent>) -> Result<usize, anyhow::Error> {
         let mut count = 0usize;
         let mut active_id_set = HashSet::with_capacity(snapshots.len());
+        let mut motw_group_indices: HashMap<String, usize> = HashMap::new();
+        let mut motw_groups: Vec<SeedMotwGroup> = Vec::new();
         for ev in snapshots {
             if matches!(&ev, SensorEvent::ProcessStart { .. }) {
-                if let Some(resolved_id) = self.process_seed_process_start(&ev) {
+                let outcome = self.process_seed_process_start(&ev);
+                if let Some(resolved_id) = outcome.resolved_active_id {
                     active_id_set.insert(resolved_id);
+                }
+                if let Some((inst_id, normalized_exe)) = outcome.motw_candidate {
+                    if let Some(&idx) = motw_group_indices.get(&normalized_exe) {
+                        let ids = &mut motw_groups[idx].instance_ids;
+                        if !ids.iter().any(|existing| existing == &inst_id) {
+                            ids.push(inst_id);
+                        }
+                    } else {
+                        let idx = motw_groups.len();
+                        motw_group_indices.insert(normalized_exe.clone(), idx);
+                        motw_groups.push(SeedMotwGroup {
+                            exe_path: normalized_exe,
+                            instance_ids: vec![inst_id],
+                        });
+                    }
                 }
                 count += 1;
             }
@@ -259,13 +339,32 @@ impl DaemonEngine {
                 "reconciled stale running processes from prior session"
             );
         }
+        // Submit deduplicated seed MOTW groups ONLY after all seeded rows are flushed to SQLite,
+        // preventing any late-backfill race against unpersisted process rows and avoiding real-time
+        // queue saturation (`PRRT_kwDOVyjVyM66PomN`, `PRRT_kwDOVyjVyM66Ponf`).
+        if !motw_groups.is_empty() {
+            self.submit_seed_motw_groups(motw_groups);
+        }
         Ok(count)
     }
 
-    /// Executes a single SQLite TTL purge pass using the configured retention window (`L-11`).
+    /// Executes a single SQLite TTL purge pass using the configured retention window (`L-11`),
+    /// advancing the Stage 2 generation whenever any download row was deleted and resetting cached
+    /// `has_download_origins` to `false` when no rows remain (generation-guarded).
     pub fn run_ttl_purge_once(&self) -> Result<PurgeStats, StoreError> {
-        self.store
-            .purge_expired(current_unix_ms(), self.config.ttl_retention_days)
+        let before_state = self
+            .download_origin_state
+            .load(std::sync::atomic::Ordering::Acquire);
+        let stats = self
+            .store
+            .purge_expired(current_unix_ms(), self.config.ttl_retention_days)?;
+        refresh_download_origins_after_purge(
+            &self.download_origin_state,
+            &self.store,
+            before_state,
+            stats.downloads_deleted,
+        );
+        Ok(stats)
     }
 
     /// Transitions overdue `PENDING` alerts older than `alert_timeout_ms` to
@@ -398,6 +497,10 @@ impl DaemonEngine {
                 );
             }
         }
+
+        // Shutdown the dedicated MOTW I/O worker pool AFTER pipeline drain + WAL checkpoint,
+        // cancelling active file hashes and detaching wedged raw OS worker threads on timeout.
+        self.motw_pool.shutdown_and_join(deadline).await;
 
         if let Some(err) = drain_err {
             return Err(err);

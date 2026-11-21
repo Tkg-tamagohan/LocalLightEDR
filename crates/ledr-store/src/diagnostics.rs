@@ -4,6 +4,7 @@ use ledr_proto::RuleScope;
 use rusqlite::{params, DatabaseName};
 
 use crate::batch::PID_TIME_WINDOW_LOOKUP_SQL;
+use crate::queries::{find_download_by_path_sql, find_download_by_sha256_sql};
 use crate::schema::{query_pragma_summary, RULE_COLS};
 use crate::{LedrStore, StoreError};
 
@@ -83,6 +84,34 @@ impl LedrStore {
              LIMIT 1";
         let mut stmt = reader.prepare(sql)?;
         let mut rows = stmt.query(params!["example.com", "example.com."])?;
+        let mut details = Vec::new();
+        while let Some(row) = rows.next()? {
+            details.push(row.get::<_, String>(3)?);
+        }
+        Ok(details)
+    }
+
+    /// Returns SQLite `EXPLAIN QUERY PLAN` detail lines for [`LedrStore::find_download_origin_by_path`].
+    pub fn explain_download_path_lookup_plan(&self) -> Result<Vec<String>, StoreError> {
+        let reader = self.lock_reader()?;
+        let sql = format!("EXPLAIN QUERY PLAN\n{}", find_download_by_path_sql());
+        let mut stmt = reader.prepare(&sql)?;
+        let mut rows = stmt.query(params![r"C:\Users\alice\Downloads\sample.exe"])?;
+        let mut details = Vec::new();
+        while let Some(row) = rows.next()? {
+            details.push(row.get::<_, String>(3)?);
+        }
+        Ok(details)
+    }
+
+    /// Returns SQLite `EXPLAIN QUERY PLAN` detail lines for [`LedrStore::find_download_origin_by_sha256`].
+    pub fn explain_download_sha256_lookup_plan(&self) -> Result<Vec<String>, StoreError> {
+        let reader = self.lock_reader()?;
+        let sql = format!("EXPLAIN QUERY PLAN\n{}", find_download_by_sha256_sql());
+        let mut stmt = reader.prepare(&sql)?;
+        let mut rows = stmt.query(params![
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ])?;
         let mut details = Vec::new();
         while let Some(row) = rows.next()? {
             details.push(row.get::<_, String>(3)?);

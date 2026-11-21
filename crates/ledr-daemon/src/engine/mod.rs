@@ -8,6 +8,7 @@ mod dns_history;
 mod domain_policy;
 mod events;
 mod lifecycle;
+mod motw;
 mod nrd;
 mod outbound;
 mod pipeline;
@@ -22,6 +23,10 @@ pub use binary_inspector::{
     BinaryInspector, LiveProcessInspector, WindowsBinaryInspector, WindowsLiveProcessInspector,
 };
 pub use config::{DaemonConfig, OutboundEnforcementMode};
+pub use motw::{
+    BrowserEventOutcome, BrowserReportError, MotwAttribution, MotwInspector, MotwMatchStage,
+    WindowsMotwInspector, MAX_BROWSER_EVENT_DETAILS_BYTES, MAX_DOWNLOAD_HASH_BYTES,
+};
 pub use policy::PolicyRuleError;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,6 +54,7 @@ use dns_history::ProcessDnsHistory;
 use dns_history::{DnsHistoryEntry, DomainTimestamp, MAX_DOMAINS_PER_PROCESS_IP};
 #[cfg(test)]
 use domain_policy::select_outbound_decision_for_domains;
+use motw::{BrowserEventDedupCache, MotwIoWorkerPool, MotwStage2Cache};
 use nrd::NrdThreadHandle;
 #[cfg(test)]
 use wfp_drops::{OverflowPushOutcome, PendingWfpDrop};
@@ -71,6 +77,11 @@ pub struct DaemonEngine {
     notifier: Arc<dyn NotificationDispatcher>,
     inspector: Arc<dyn BinaryInspector>,
     live_process_inspector: Arc<dyn LiveProcessInspector>,
+    motw_inspector: Arc<dyn MotwInspector>,
+    download_origin_state: Arc<AtomicU64>,
+    motw_stage2_cache: Arc<Mutex<MotwStage2Cache>>,
+    motw_pool: MotwIoWorkerPool,
+    browser_event_dedup: Mutex<BrowserEventDedupCache>,
     process_table: Mutex<ActiveProcessTable>,
     firewall: Mutex<WfpRuleManager>,
     outbound_classifier: Arc<OutboundLaneClassifier>,

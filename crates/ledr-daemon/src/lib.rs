@@ -15,8 +15,10 @@ pub use channel::{
     TwoLaneChannel, TwoLaneReceiver, TwoLaneSender,
 };
 pub use engine::{
-    BinaryInspector, DaemonConfig, DaemonEngine, LiveProcessInspector, OutboundEnforcementMode,
-    PolicyRuleError, WindowsBinaryInspector, WindowsLiveProcessInspector,
+    BinaryInspector, BrowserEventOutcome, BrowserReportError, DaemonConfig, DaemonEngine,
+    LiveProcessInspector, MotwAttribution, MotwInspector, MotwMatchStage,
+    OutboundEnforcementMode, PolicyRuleError, WindowsBinaryInspector, WindowsLiveProcessInspector,
+    WindowsMotwInspector, MAX_BROWSER_EVENT_DETAILS_BYTES, MAX_DOWNLOAD_HASH_BYTES,
 };
 pub use firewall::{
     InstalledWfpFilter, WfpFailedOp, WfpFilterOrigin, WfpReconcileReport, WfpRuleManager,

@@ -60,6 +60,11 @@ struct WfpCandidate {
     command_line: Option<String>,
     parent_exe_path: Option<String>,
     parent_command_line: Option<String>,
+    origin_url: Option<String>,
+    motw_source: Option<String>,
+    motw_referrer: Option<String>,
+    motw_frame_url: Option<String>,
+    motw_zone_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +378,11 @@ impl DaemonEngine {
                     command_line: (!e.command_line.is_empty()).then(|| e.command_line.clone()),
                     parent_exe_path,
                     parent_command_line,
+                    origin_url: e.origin_url.clone(),
+                    motw_source: e.motw_source.clone(),
+                    motw_referrer: e.motw_referrer.clone(),
+                    motw_frame_url: e.motw_frame_url.clone(),
+                    motw_zone_id: e.motw_zone_id,
                 }
             })
             .collect()
@@ -634,6 +644,12 @@ impl DaemonEngine {
             superseded_exit: None,
             skip_store_ingest: false,
             effective_process_start: None,
+            origin_url: cand.origin_url.clone(),
+            motw_source: cand.motw_source.clone(),
+            motw_referrer: cand.motw_referrer.clone(),
+            motw_frame_url: cand.motw_frame_url.clone(),
+            motw_zone_id: cand.motw_zone_id,
+            proc_sha256: None,
         };
         let (_action, emitted_alert) = self.evaluate_and_handle_outbound_connect(
             None,
@@ -931,7 +947,15 @@ impl DaemonEngine {
                                 .map(|(h, _)| h)
                                 .or((item.os_filter_id != 0).then_some(item.os_filter_id))
                         };
-                        let (rid, sev, lbl) = match risk {
+                        let motw_cand = candidates.iter().find(|c| c.origin_url.is_some());
+                        let effective_risk = if motw_cand.is_some()
+                            && risk == OutboundRiskClass::GeneralUnknown
+                        {
+                            OutboundRiskClass::HighRiskPath
+                        } else {
+                            risk
+                        };
+                        let (rid, sev, lbl) = match effective_risk {
                             OutboundRiskClass::HighRiskPath => (
                                 "LEDR-NET-HIGH-RISK-PATH",
                                 AlertSeverity::High,
@@ -956,6 +980,12 @@ impl DaemonEngine {
                 }
             };
 
+        let motw_cand = candidates.iter().find(|c| c.origin_url.is_some());
+        let effective_risk = if motw_cand.is_some() && risk == OutboundRiskClass::GeneralUnknown {
+            OutboundRiskClass::HighRiskPath
+        } else {
+            risk
+        };
         let candidate_pids: Vec<u32> = candidates.iter().map(|c| c.identity.pid).collect();
         let candidate_instance_ids: Vec<&str> =
             candidates.iter().map(|c| c.instance_id.as_str()).collect();
@@ -971,12 +1001,17 @@ impl DaemonEngine {
             "domain_hint": serde_json::Value::Null,
             "matched_rule_id": matched_rule_id,
             "wfp_permit_error": wfp_permit_error,
-            "risk_class": format!("{risk:?}"),
+            "risk_class": format!("{effective_risk:?}"),
             "wfp_blocked": wfp_filter_id.is_some(),
             "wfp_filter_id": wfp_filter_id,
             "sha256": bin_identity.sha256,
             "signer_subject": bin_identity.authenticode.as_ref().map(|a| a.signer_subject.as_str()),
             "root_thumbprint": bin_identity.authenticode.as_ref().map(|a| a.root_thumbprint.as_str()),
+            "origin_url": motw_cand.and_then(|c| c.origin_url.as_deref()),
+            "motw_source": motw_cand.and_then(|c| c.motw_source.as_deref()),
+            "motw_referrer": motw_cand.and_then(|c| c.motw_referrer.as_deref()),
+            "motw_frame_url": motw_cand.and_then(|c| c.motw_frame_url.as_deref()),
+            "motw_zone_id": motw_cand.and_then(|c| c.motw_zone_id),
         })
         .to_string();
 

@@ -1,5 +1,7 @@
 use super::*;
-use super::fs_scenarios::{TempSimDir, dummy_cookie_path, dummy_honeypot_path};
+use super::fs_scenarios::{
+    TempSimDir, dummy_cookie_path, dummy_honeypot_path, run_motw_download_scenario_with_ads_writer,
+};
 use super::net::{exchange_ping_ack, handle_ping_server};
 use std::path::{Path, PathBuf};
 use ledr_proto::HONEYPOT_DEFAULT_FILENAME;
@@ -391,4 +393,152 @@ fn sim_p2_05_prepare_dir_rolls_back_created_files() {
     let retried = prepare_sim_dir(base).expect("retry after conflict cleanup");
     assert!(Path::new(&retried.cookies_path).is_file());
     assert!(Path::new(&retried.honeypot_path).is_file());
+}
+
+#[test]
+fn sim_p4_01_cli_parses_motw_download_scenario() {
+    assert_eq!(
+        parse_cli_args(["motw-download"]).unwrap(),
+        CliAction::Run(SimConfig {
+            scenario: Scenario::MotwDownload,
+            ..SimConfig::default()
+        })
+    );
+    assert_eq!(
+        parse_cli_args([
+            "--scenario=motw-download",
+            "--base-dir",
+            r"C:\Temp\motw-base",
+            "--hold-ms",
+            "150",
+            "--json"
+        ])
+        .unwrap(),
+        CliAction::Run(SimConfig {
+            scenario: Scenario::MotwDownload,
+            base_dir: Some(PathBuf::from(r"C:\Temp\motw-base")),
+            hold_ms: 150,
+            json_output: true,
+            ..SimConfig::default()
+        })
+    );
+}
+
+#[tokio::test]
+async fn sim_p4_02_motw_download_writes_verifies_ads_and_sha256() {
+    let outcome = run_motw_download_scenario()
+        .await
+        .expect("motw-download temp scenario should succeed");
+    assert!(outcome.verified_roundtrip);
+    assert_eq!(outcome.zone_id, 3);
+    assert_eq!(outcome.host_url, SIM_MOTW_HOST_URL);
+    assert_eq!(outcome.referrer_url, SIM_MOTW_REFERRER_URL);
+    assert_eq!(outcome.sha256.len(), 64);
+    assert!(
+        outcome.target_path.ends_with(SIM_MOTW_FILENAME),
+        "unexpected target path: {}",
+        outcome.target_path
+    );
+    assert!(
+        !Path::new(&outcome.target_path).exists(),
+        "temp MOTW simulation file must be cleaned up"
+    );
+
+    let temp = TempSimDir::new("test-motw").expect("temp dir");
+    let in_dir = run_motw_download_scenario_with_options(Some(temp.path().to_path_buf()), 10)
+        .await
+        .expect("motw-download with --base-dir");
+    assert!(in_dir.verified_roundtrip);
+    let target = PathBuf::from(&in_dir.target_path);
+    assert!(target.is_file(), "--base-dir file must remain on disk");
+    let zone = ledr_sensor_win::read_zone_identifier(&target).expect("read written ADS");
+    assert_eq!(zone.zone_id, 3);
+    assert_eq!(zone.host_url.as_deref(), Some(SIM_MOTW_HOST_URL));
+    assert_eq!(zone.referrer_url.as_deref(), Some(SIM_MOTW_REFERRER_URL));
+}
+
+#[tokio::test]
+async fn sim_p4_03_run_all_report_includes_motw_download_json() {
+    let temp = TempSimDir::new("run-all-motw").expect("temp dir");
+    let cookies_open =
+        run_cookies_open_scenario_with_options(Some(temp.path().to_path_buf()), 0)
+            .await
+            .expect("cookies-open");
+    let honeypot_write =
+        run_honeypot_write_scenario_with_options(Some(temp.path().to_path_buf()), 0)
+            .await
+            .expect("honeypot-write");
+    let motw_download =
+        run_motw_download_scenario_with_options(Some(temp.path().to_path_buf()), 0)
+            .await
+            .expect("motw-download");
+
+    let report = SimReport {
+        target_pipe: ledr_proto::IPC_PIPE_NAME.to_string(),
+        scenario: Scenario::All,
+        lotl: None,
+        dns_tcp: None,
+        cookies_open: Some(cookies_open),
+        honeypot_write: Some(honeypot_write),
+        motw_download: Some(motw_download.clone()),
+    };
+
+    let json = serde_json::to_string_pretty(&report).expect("serialize SimReport JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse SimReport JSON");
+    assert_eq!(
+        parsed.pointer("/scenario").and_then(|v| v.as_str()),
+        Some("all")
+    );
+    assert_eq!(
+        parsed
+            .pointer("/motw_download/verified_roundtrip")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        parsed
+            .pointer("/motw_download/zone_id")
+            .and_then(|v| v.as_u64()),
+        Some(3)
+    );
+    assert_eq!(
+        parsed
+            .pointer("/motw_download/sha256")
+            .and_then(|v| v.as_str()),
+        Some(motw_download.sha256.as_str())
+    );
+    assert!(print_report(&report, true).is_ok());
+    assert!(print_report(&report, false).is_ok());
+}
+
+#[test]
+fn sim_p4_04_motw_download_refuses_overwrite_and_cleans_up_new_file_on_failure() {
+    let existing_dir = TempSimDir::new("motw-existing").expect("temp existing dir");
+    let existing_file = existing_dir.path().join(SIM_MOTW_FILENAME);
+    let sentinel = b"EXISTING-DO-NOT-CLOBBER-SENTINEL";
+    std::fs::write(&existing_file, sentinel).expect("write existing file");
+
+    let err = run_motw_download_scenario_in(existing_dir.path())
+        .expect_err("must refuse overwriting existing sample-tool.exe");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("exclusively create") || msg.contains("exists"),
+        "unexpected error message: {msg}"
+    );
+    assert_eq!(
+        std::fs::read(&existing_file).expect("existing sentinel intact"),
+        sentinel
+    );
+
+    let fail_dir = TempSimDir::new("motw-fail-cleanup").expect("temp fail cleanup dir");
+    let created_path = fail_dir.path().join(SIM_MOTW_FILENAME);
+    let hook_err = run_motw_download_scenario_with_ads_writer(fail_dir.path(), |_, _| {
+        anyhow::bail!("simulated ADS write failure")
+    })
+    .expect_err("simulated ADS failure must error");
+    assert!(format!("{hook_err:#}").contains("simulated ADS write failure"));
+    assert!(
+        !created_path.exists(),
+        "newly created dummy file must be removed when ADS write fails"
+    );
 }

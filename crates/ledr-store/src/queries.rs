@@ -125,6 +125,92 @@ impl LedrStore {
             .optional()?;
         Ok(found.is_some())
     }
+
+    /// Looks up the most recent `download_origins` row matching `file_path` case-insensitively
+    /// after normalizing Windows path prefixes and separators (`idx_dl_path_nocase`).
+    pub fn find_download_origin_by_path(
+        &self,
+        file_path: &str,
+    ) -> Result<Option<DownloadOriginRecord>, StoreError> {
+        let normalized = crate::normalize_windows_path(file_path);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let reader = self.lock_reader()?;
+        let sql = find_download_by_path_sql();
+        query_optional_row(&reader, &sql, params![normalized], row_to_download)
+    }
+
+    /// Looks up the most recent `download_origins` row matching `sha256` case-insensitively
+    /// (`idx_dl_sha256_nocase`).
+    pub fn find_download_origin_by_sha256(
+        &self,
+        sha256: &str,
+    ) -> Result<Option<DownloadOriginRecord>, StoreError> {
+        let Some(normalized) = crate::normalize_sha256(Some(sha256)) else {
+            return Ok(None);
+        };
+        let reader = self.lock_reader()?;
+        let sql = find_download_by_sha256_sql();
+        query_optional_row(&reader, &sql, params![normalized], row_to_download)
+    }
+
+    /// Looks up an existing `download_origins` row matching `(file_path COLLATE NOCASE, tab_url, downloaded_at_ms)`
+    /// via `idx_dl_path_nocase` for idempotent retry deduplication.
+    pub fn find_recent_identical_download_origin(
+        &self,
+        file_path: &str,
+        tab_url: &str,
+        downloaded_at_ms: i64,
+    ) -> Result<Option<DownloadOriginRecord>, StoreError> {
+        let normalized = crate::normalize_windows_path(file_path);
+        let clean_tab = tab_url.trim();
+        if normalized.is_empty() || clean_tab.is_empty() {
+            return Ok(None);
+        }
+        let reader = self.lock_reader()?;
+        let sql = format!(
+            "SELECT {DOWNLOAD_COLS} FROM download_origins
+             WHERE file_path COLLATE NOCASE = ?1
+               AND tab_url = ?2
+               AND downloaded_at_ms = ?3
+             ORDER BY id DESC
+             LIMIT 1"
+        );
+        query_optional_row(
+            &reader,
+            &sql,
+            params![normalized, clean_tab, downloaded_at_ms],
+            row_to_download,
+        )
+    }
+
+    /// Returns `true` if `download_origins` contains at least one row.
+    pub fn has_any_download_origins(&self) -> Result<bool, StoreError> {
+        let reader = self.lock_reader()?;
+        let found: Option<i64> = reader
+            .query_row("SELECT 1 FROM download_origins LIMIT 1", [], |row| row.get(0))
+            .optional()?;
+        Ok(found.is_some())
+    }
+}
+
+pub(crate) fn find_download_by_path_sql() -> String {
+    format!(
+        "SELECT {DOWNLOAD_COLS} FROM download_origins
+         WHERE file_path COLLATE NOCASE = ?1
+         ORDER BY downloaded_at_ms DESC, id DESC
+         LIMIT 1"
+    )
+}
+
+pub(crate) fn find_download_by_sha256_sql() -> String {
+    format!(
+        "SELECT {DOWNLOAD_COLS} FROM download_origins
+         WHERE sha256 COLLATE NOCASE = ?1
+         ORDER BY downloaded_at_ms DESC, id DESC
+         LIMIT 1"
+    )
 }
 
 pub(crate) fn clamp_limit(limit: usize) -> i64 {
@@ -214,21 +300,23 @@ fn query_downloads(
             let Some(proc_row) = matched_process else {
                 return Ok(out);
             };
+            let norm_path = crate::normalize_windows_path(&proc_row.exe_path);
+            let norm_sha256 = crate::normalize_sha256(proc_row.sha256.as_deref());
+            let origin_url = proc_row
+                .origin_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             let sql = format!(
                 "SELECT {DOWNLOAD_COLS} FROM download_origins
-                 WHERE file_path = ?1
-                    OR (?2 IS NOT NULL AND sha256 = ?2)
-                    OR (?3 IS NOT NULL AND tab_url = ?3)
+                 WHERE (?1 != '' AND file_path COLLATE NOCASE = ?1)
+                    OR (?2 IS NOT NULL AND sha256 COLLATE NOCASE = ?2)
+                    OR (?3 IS NOT NULL AND ?3 != '' AND tab_url = ?3)
                  ORDER BY downloaded_at_ms DESC, id DESC
                  LIMIT ?4"
             );
             let mut stmt = reader.prepare(&sql)?;
-            let mut rows = stmt.query(params![
-                proc_row.exe_path,
-                proc_row.sha256,
-                proc_row.origin_url,
-                limit
-            ])?;
+            let mut rows = stmt.query(params![norm_path, norm_sha256, origin_url, limit])?;
             while let Some(row) = rows.next()? {
                 out.push(row_to_download(row)?);
             }

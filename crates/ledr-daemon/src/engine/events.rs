@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -14,7 +15,6 @@ use ledr_store::StoreError;
 use uuid::Uuid;
 
 use crate::firewall::{WfpFilterOrigin, WfpRuleManager};
-#[cfg(doc)]
 use crate::process_table::ProcessStartResolution;
 
 use super::{current_unix_ms, event_timestamp_ms, DaemonEngine};
@@ -25,25 +25,172 @@ pub(super) struct DnsCorrelationUpdate {
     pub(super) accepted_ips: Vec<IpAddr>,
 }
 
+pub(super) struct SeedProcessStartOutcome {
+    pub(super) resolved_active_id: Option<String>,
+    pub(super) motw_candidate: Option<(String, String)>,
+}
+
+struct PreparedCanaryBackfill {
+    ident: ProcessIdentity,
+    create_time_100ns: u64,
+    existing_ppid: u32,
+    exe_path: String,
+    command_line: String,
+    res: ProcessStartResolution,
+}
+
 impl DaemonEngine {
-    pub(super) fn process_seed_process_start(&self, event: &SensorEvent) -> Option<String> {
-        let _ = self.process_event_with_lane(event, event.default_lane());
-        if let SensorEvent::ProcessStart { identity, .. } = event {
+    fn attach_motw_to_proc_ctx(
+        &self,
+        instance_id: Option<&str>,
+        proc_ctx: &mut ResolvedProcessContext,
+        motw: super::motw::MotwAttribution,
+    ) {
+        let motw_source_str = motw.stage.as_str().to_string();
+        if let Some(inst_id) = instance_id {
+            self.process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_motw_metadata(
+                    inst_id,
+                    motw.origin_url.clone(),
+                    motw_source_str.clone(),
+                    motw.referrer_url.clone(),
+                    motw.frame_url.clone(),
+                    motw.zone_id,
+                );
+        }
+        proc_ctx.origin_url = Some(motw.origin_url);
+        proc_ctx.motw_source = Some(motw_source_str);
+        proc_ctx.motw_referrer = motw.referrer_url;
+        proc_ctx.motw_frame_url = motw.frame_url;
+        proc_ctx.motw_zone_id = motw.zone_id;
+        proc_ctx.proc_sha256 = motw.sha256;
+    }
+
+    pub(super) fn apply_late_motw_attribution(&self, late: super::motw::LateMotwAttribution) {
+        let mut persist_instance_ids: Vec<String> = Vec::new();
+        let mut active_instances: Vec<(String, u32)> = Vec::new();
+        {
+            let mut table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for inst_id in &late.instance_ids {
+                if let Some((exe_path, pid)) = table.set_motw_metadata_if_active(
+                    inst_id,
+                    late.attribution.origin_url.clone(),
+                    late.attribution.stage.as_str().to_string(),
+                    late.attribution.referrer_url.clone(),
+                    late.attribution.frame_url.clone(),
+                    late.attribution.zone_id,
+                ) {
+                    persist_instance_ids.push(inst_id.clone());
+                    active_instances.push((exe_path, pid));
+                } else if table
+                    .get_by_instance_id(inst_id)
+                    .is_none_or(|entry| entry.origin_url.is_none())
+                {
+                    // Exited or evicted process without prior `origin_url`: still backfill
+                    // SQLite history (`COALESCE`, non-overwriting) without applying active
+                    // WFP blocks or mutating active outbound classification.
+                    persist_instance_ids.push(inst_id.clone());
+                }
+            }
+        }
+        if persist_instance_ids.is_empty() && active_instances.is_empty() {
+            return;
+        }
+
+        for inst_id in &persist_instance_ids {
+            match self.store.update_process_motw_metadata(
+                inst_id,
+                Some(&late.attribution.origin_url),
+                late.attribution.sha256.as_deref(),
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        process_instance_id = %inst_id,
+                        "delayed MOTW backfill found no matching process row in SQLite store"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        process_instance_id = %inst_id,
+                        error = %err,
+                        "failed backfilling delayed MOTW metadata into SQLite store"
+                    );
+                }
+            }
+        }
+
+        let mut promoted_exe_keys: HashSet<String> = HashSet::new();
+        for (exe_path, pid) in active_instances {
+            // Clear any pre-MOTW steady-state outbound classification so subsequent connects
+            // re-enter the high-priority enforcement path rather than staying on telemetry.
+            self.outbound_classifier.remove_pid(pid);
+
+            if self.config.outbound_firewall_enabled {
+                let exe_key = WfpRuleManager::exe_key(&exe_path);
+                if promoted_exe_keys.insert(exe_key) {
+                    self.maybe_apply_preemptive_wfp_block_with_motw(&exe_path, true);
+                }
+            }
+        }
+    }
+
+    pub(super) fn process_seed_process_start(&self, event: &SensorEvent) -> SeedProcessStartOutcome {
+        let now_ms = current_unix_ms();
+        let event_ts_ms = event_timestamp_ms(event, now_ms);
+        let proc_ctx = self.resolve_process_context(event, event_ts_ms);
+
+        let motw_candidate = if matches!(event, SensorEvent::ProcessStart { .. })
+            && proc_ctx.origin_url.is_none()
+            && proc_ctx.exited_at_ms.is_none()
+            && !proc_ctx.skip_store_ingest
+        {
+            match (
+                proc_ctx.proc_instance_id.as_deref(),
+                proc_ctx.proc_exe_path.as_deref(),
+            ) {
+                (Some(inst_id), Some(effective_exe)) => Self::should_schedule_process_motw(
+                    effective_exe,
+                    proc_ctx.exited_at_ms,
+                    proc_ctx.skip_store_ingest,
+                )
+                .map(|normalized_exe| (inst_id.to_string(), normalized_exe)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let _ = self.finish_event_processing(event, event.default_lane(), event_ts_ms, proc_ctx);
+        let resolved_active_id = if let SensorEvent::ProcessStart { identity, .. } = event {
             let table = self
                 .process_table
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = table.lookup_by_pid(identity.pid) {
                 if entry.exited_at_ms.is_none() {
-                    return Some(entry.instance_id.clone());
+                    Some(entry.instance_id.clone())
+                } else {
+                    Some(identity.instance_id())
                 }
+            } else {
+                Some(identity.instance_id())
             }
-            return Some(identity.instance_id());
+        } else {
+            None
+        };
+        SeedProcessStartOutcome {
+            resolved_active_id,
+            motw_candidate,
         }
-        None
     }
 
-    pub(super) fn process_event_with_lane(
+    pub(super) async fn process_event_with_lane_async(
         &self,
         event: &SensorEvent,
         lane: EventLane,
@@ -62,16 +209,118 @@ impl DaemonEngine {
         let now_ms = current_unix_ms();
         let event_ts_ms = event_timestamp_ms(event, now_ms);
 
-        let proc_ctx = self.resolve_process_context(event, event_ts_ms);
+        let mut proc_ctx = self.resolve_process_context(event, event_ts_ms);
+
+        if matches!(event, SensorEvent::ProcessStart { .. })
+            && proc_ctx.origin_url.is_none()
+            && proc_ctx.exited_at_ms.is_none()
+            && !proc_ctx.skip_store_ingest
+        {
+            if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
+                if let Some(motw) = self
+                    .resolve_process_motw_budgeted(
+                        proc_ctx.proc_instance_id.as_deref(),
+                        effective_exe,
+                        proc_ctx.exited_at_ms,
+                        proc_ctx.skip_store_ingest,
+                    )
+                    .await
+                {
+                    let inst_id = proc_ctx.proc_instance_id.clone();
+                    self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
+                }
+            }
+        }
 
         if matches!(event, SensorEvent::CanaryFileAccess { .. }) {
-            let mut proc_ctx = proc_ctx;
-            self.backfill_canary_process_context_if_missing(event, &mut proc_ctx, event_ts_ms);
+            self.backfill_canary_process_context_if_missing_async(
+                event,
+                &mut proc_ctx,
+                event_ts_ms,
+            )
+            .await;
             self.handle_canary_file_access(event, &proc_ctx, event_ts_ms);
             self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
+        self.finish_event_processing(event, lane, event_ts_ms, proc_ctx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn process_event_with_lane(
+        &self,
+        event: &SensorEvent,
+        lane: EventLane,
+    ) -> Option<DnsCorrelationUpdate> {
+        if let SensorEvent::CanaryFileAccess {
+            category: CanaryCategory::Honeypot,
+            is_write_or_delete: false,
+            ..
+        } = event
+        {
+            self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let now_ms = current_unix_ms();
+        let event_ts_ms = event_timestamp_ms(event, now_ms);
+        let mut proc_ctx = self.resolve_process_context(event, event_ts_ms);
+
+        if matches!(event, SensorEvent::ProcessStart { .. })
+            && proc_ctx.origin_url.is_none()
+            && proc_ctx.exited_at_ms.is_none()
+            && !proc_ctx.skip_store_ingest
+        {
+            if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
+                if let Some(motw) = self.resolve_process_motw(
+                    effective_exe,
+                    proc_ctx.exited_at_ms,
+                    proc_ctx.skip_store_ingest,
+                ) {
+                    let inst_id = proc_ctx.proc_instance_id.clone();
+                    self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
+                }
+            }
+        }
+
+        if matches!(event, SensorEvent::CanaryFileAccess { .. }) {
+            if let Some((pid, prepared)) =
+                self.prepare_canary_backfill_sync(event, &proc_ctx, event_ts_ms)
+            {
+                if proc_ctx.origin_url.is_none()
+                    && !prepared.exe_path.is_empty()
+                    && !prepared.res.skip_store_ingest
+                {
+                    if let Some(motw) = self.resolve_process_motw(
+                        &prepared.exe_path,
+                        prepared.res.exited_at_ms,
+                        prepared.res.skip_store_ingest,
+                    ) {
+                        self.attach_motw_to_proc_ctx(
+                            Some(&prepared.res.instance_id),
+                            &mut proc_ctx,
+                            motw,
+                        );
+                    }
+                }
+                self.finalize_canary_backfill(pid, &mut proc_ctx, prepared);
+            }
+            self.handle_canary_file_access(event, &proc_ctx, event_ts_ms);
+            self.high_priority_processed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        self.finish_event_processing(event, lane, event_ts_ms, proc_ctx)
+    }
+
+    fn finish_event_processing(
+        &self,
+        event: &SensorEvent,
+        lane: EventLane,
+        event_ts_ms: i64,
+        proc_ctx: ResolvedProcessContext,
+    ) -> Option<DnsCorrelationUpdate> {
         let effective_event = proc_ctx.effective_process_start.as_ref().unwrap_or(event);
         let ctx = EventContext::with_parent(
             effective_event,
@@ -109,6 +358,11 @@ impl DaemonEngine {
                     "parent_exe_path": proc_ctx.parent_exe_path,
                     "parent_command_line": proc_ctx.parent_command_line,
                     "matched_fields": m.matched_fields,
+                    "origin_url": proc_ctx.origin_url,
+                    "motw_source": proc_ctx.motw_source,
+                    "motw_referrer": proc_ctx.motw_referrer,
+                    "motw_frame_url": proc_ctx.motw_frame_url,
+                    "motw_zone_id": proc_ctx.motw_zone_id,
                 })
                 .to_string();
 
@@ -165,7 +419,10 @@ impl DaemonEngine {
                         self.outbound_classifier.remove_pid(identity.pid);
                     }
                     if self.config.outbound_firewall_enabled {
-                        self.maybe_apply_preemptive_wfp_block(effective_exe);
+                        self.maybe_apply_preemptive_wfp_block_with_motw(
+                            effective_exe,
+                            proc_ctx.origin_url.is_some(),
+                        );
                     }
                 }
                 "OBSERVED"
@@ -284,7 +541,7 @@ impl DaemonEngine {
         };
 
         if !proc_ctx.skip_store_ingest {
-            if let Err(err) = self.store.ingest_event_with_lifecycle(
+            if let Err(err) = self.store.ingest_event_with_process_metadata(
                 effective_event,
                 proc_ctx.store_hint.as_deref(),
                 proc_ctx.exited_at_ms,
@@ -292,6 +549,8 @@ impl DaemonEngine {
                     .superseded_exit
                     .as_ref()
                     .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
+                proc_ctx.origin_url.as_deref(),
+                proc_ctx.proc_sha256.as_deref(),
                 is_nrd,
                 action,
             ) {
@@ -328,14 +587,47 @@ impl DaemonEngine {
 
     /// On-demand PID lookup fallback for ETW cross-provider ordering races (`Kernel-File`
     /// delivering a canary access milliseconds before `Kernel-Process` delivers `ProcessStart`).
-    fn backfill_canary_process_context_if_missing(
+    async fn backfill_canary_process_context_if_missing_async(
         &self,
         event: &SensorEvent,
         proc_ctx: &mut ResolvedProcessContext,
         event_ts_ms: i64,
     ) {
-        let SensorEvent::CanaryFileAccess { pid, .. } = event else {
+        let Some((pid, prepared)) = self.prepare_canary_backfill_sync(event, proc_ctx, event_ts_ms)
+        else {
             return;
+        };
+        if proc_ctx.origin_url.is_none()
+            && !prepared.exe_path.is_empty()
+            && !prepared.res.skip_store_ingest
+        {
+            if let Some(motw) = self
+                .resolve_process_motw_budgeted(
+                    Some(&prepared.res.instance_id),
+                    &prepared.exe_path,
+                    prepared.res.exited_at_ms,
+                    prepared.res.skip_store_ingest,
+                )
+                .await
+            {
+                self.attach_motw_to_proc_ctx(
+                    Some(&prepared.res.instance_id),
+                    proc_ctx,
+                    motw,
+                );
+            }
+        }
+        self.finalize_canary_backfill(pid, proc_ctx, prepared);
+    }
+
+    fn prepare_canary_backfill_sync(
+        &self,
+        event: &SensorEvent,
+        proc_ctx: &ResolvedProcessContext,
+        event_ts_ms: i64,
+    ) -> Option<(u32, PreparedCanaryBackfill)> {
+        let SensorEvent::CanaryFileAccess { pid, .. } = event else {
+            return None;
         };
         let needs_create_time = proc_ctx
             .proc_identity
@@ -345,36 +637,24 @@ impl DaemonEngine {
             .as_deref()
             .is_none_or(|p| p.trim().is_empty());
         if !needs_create_time && !needs_exe_path {
-            return;
+            return None;
         }
 
-        let Some(live) = self.live_process_inspector.inspect_live_process(*pid) else {
-            return;
-        };
-        self.apply_canary_live_process_backfill(*pid, proc_ctx, event_ts_ms, live);
-    }
-
-    fn apply_canary_live_process_backfill(
-        &self,
-        pid: u32,
-        proc_ctx: &mut ResolvedProcessContext,
-        event_ts_ms: i64,
-        live: ledr_sensor_win::etw::LiveProcessInfo,
-    ) {
+        let live = self.live_process_inspector.inspect_live_process(*pid)?;
         if live.create_time_100ns == 0 {
-            return;
+            return None;
         }
         // Guard against PID reuse (`BUG_0001`): if the live OS process at `pid` was created
         // strictly after the canary event timestamp, it cannot be the original accessor.
         let live_created_ms = super::filetime_100ns_to_unix_ms(live.create_time_100ns, i64::MAX);
         if live_created_ms > event_ts_ms {
             tracing::debug!(
-                pid,
+                pid = *pid,
                 live_created_ms,
                 event_ts_ms,
                 "skipping canary process backfill because live process started after event timestamp (possible PID reuse)"
             );
-            return;
+            return None;
         }
 
         // Guard against PID reuse: if we already have a non-zero creation timestamp for this
@@ -383,7 +663,7 @@ impl DaemonEngine {
             if existing_id.create_time_100ns != 0
                 && existing_id.create_time_100ns != live.create_time_100ns
             {
-                return;
+                return None;
             }
         }
 
@@ -402,14 +682,12 @@ impl DaemonEngine {
         // only backfill when the live OS process reports a matching executable path (fail closed
         // if the live image path cannot be queried).
         if let Some(existing_exe) = existing_exe_opt {
-            let Some(live_exe) = live_exe_opt else {
-                return;
-            };
+            let live_exe = live_exe_opt?;
             if !existing_exe
                 .replace('/', "\\")
                 .eq_ignore_ascii_case(&live_exe.replace('/', "\\"))
             {
-                return;
+                return None;
             }
         }
 
@@ -430,7 +708,7 @@ impl DaemonEngine {
         let gained_exe_path = existing_exe_opt.is_none() && live_exe_opt.is_some();
         let gained_command_line = existing_cmd_opt.is_none() && live_cmd_opt.is_some();
         if !gained_create_time && !gained_exe_path && !gained_command_line {
-            return;
+            return None;
         }
 
         let exe_path = existing_exe_opt
@@ -447,7 +725,7 @@ impl DaemonEngine {
         // occurring between process creation and this canary event.
         let backfilled_created_ms =
             super::filetime_100ns_to_unix_ms(live.create_time_100ns, event_ts_ms);
-        let ident = ProcessIdentity::new(pid, live.create_time_100ns);
+        let ident = ProcessIdentity::new(*pid, live.create_time_100ns);
         let ident_instance_id = ident.instance_id();
         let (existing_ppid, res) = {
             let mut table = self
@@ -475,6 +753,34 @@ impl DaemonEngine {
             (existing_ppid, res)
         };
 
+        Some((
+            *pid,
+            PreparedCanaryBackfill {
+                ident,
+                create_time_100ns: live.create_time_100ns,
+                existing_ppid,
+                exe_path,
+                command_line,
+                res,
+            },
+        ))
+    }
+
+    fn finalize_canary_backfill(
+        &self,
+        pid: u32,
+        proc_ctx: &mut ResolvedProcessContext,
+        prepared: PreparedCanaryBackfill,
+    ) {
+        let PreparedCanaryBackfill {
+            ident,
+            create_time_100ns,
+            existing_ppid,
+            exe_path,
+            command_line,
+            res,
+        } = prepared;
+
         let synthetic_start = SensorEvent::ProcessStart {
             identity: ident,
             parent_pid: existing_ppid,
@@ -482,13 +788,15 @@ impl DaemonEngine {
             command_line: command_line.clone(),
             user_sid: None,
         };
-        if let Err(err) = self.store.ingest_event_with_lifecycle(
+        if let Err(err) = self.store.ingest_event_with_process_metadata(
             &synthetic_start,
             res.parent_instance_id.as_deref(),
             res.exited_at_ms,
             res.superseded_exit
                 .as_ref()
                 .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
+            proc_ctx.origin_url.as_deref(),
+            proc_ctx.proc_sha256.as_deref(),
             false,
             "OBSERVED",
         ) {
@@ -513,7 +821,7 @@ impl DaemonEngine {
 
         tracing::debug!(
             pid,
-            create_time_100ns = live.create_time_100ns,
+            create_time_100ns,
             exe_path = %exe_path,
             "backfilled missing process context on canary file access via on-demand PID lookup"
         );
@@ -683,6 +991,11 @@ impl DaemonEngine {
             "signer_subject": bin_identity.authenticode.as_ref().map(|a| a.signer_subject.as_str()),
             "root_thumbprint": bin_identity.authenticode.as_ref().map(|a| a.root_thumbprint.as_str()),
             "include_children": include_children,
+            "origin_url": proc_ctx.origin_url,
+            "motw_source": proc_ctx.motw_source,
+            "motw_referrer": proc_ctx.motw_referrer,
+            "motw_frame_url": proc_ctx.motw_frame_url,
+            "motw_zone_id": proc_ctx.motw_zone_id,
         });
         if include_children && process_suspended {
             if let Some(map) = context_obj.as_object_mut() {
@@ -840,24 +1153,50 @@ impl DaemonEngine {
                     user_sid.clone(),
                     event_ts_ms,
                 );
-                let (resolved_exe, resolved_cmd, effective_process_start) =
-                    if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
-                        let differs = entry.identity != *identity
-                            || entry.ppid != *parent_pid
-                            || entry.exe_path != *exe_path
-                            || entry.command_line != *command_line
-                            || entry.user_sid != *user_sid;
-                        let merged_ev = differs.then(|| SensorEvent::ProcessStart {
-                            identity: entry.identity,
-                            parent_pid: entry.ppid,
-                            exe_path: entry.exe_path.clone(),
-                            command_line: entry.command_line.clone(),
-                            user_sid: entry.user_sid.clone(),
-                        });
-                        (entry.exe_path.clone(), entry.command_line.clone(), merged_ev)
-                    } else {
-                        (exe_path.clone(), command_line.clone(), None)
-                    };
+                let (
+                    resolved_exe,
+                    resolved_cmd,
+                    effective_process_start,
+                    origin_url,
+                    motw_source,
+                    motw_referrer,
+                    motw_frame_url,
+                    motw_zone_id,
+                ) = if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
+                    let differs = entry.identity != *identity
+                        || entry.ppid != *parent_pid
+                        || entry.exe_path != *exe_path
+                        || entry.command_line != *command_line
+                        || entry.user_sid != *user_sid;
+                    let merged_ev = differs.then(|| SensorEvent::ProcessStart {
+                        identity: entry.identity,
+                        parent_pid: entry.ppid,
+                        exe_path: entry.exe_path.clone(),
+                        command_line: entry.command_line.clone(),
+                        user_sid: entry.user_sid.clone(),
+                    });
+                    (
+                        entry.exe_path.clone(),
+                        entry.command_line.clone(),
+                        merged_ev,
+                        entry.origin_url.clone(),
+                        entry.motw_source.clone(),
+                        entry.motw_referrer.clone(),
+                        entry.motw_frame_url.clone(),
+                        entry.motw_zone_id,
+                    )
+                } else {
+                    (
+                        exe_path.clone(),
+                        command_line.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                };
                 ResolvedProcessContext {
                     proc_identity: Some(res.resolved_identity),
                     proc_instance_id: Some(res.instance_id),
@@ -871,6 +1210,12 @@ impl DaemonEngine {
                     superseded_exit: res.superseded_exit,
                     skip_store_ingest: res.skip_store_ingest,
                     effective_process_start,
+                    origin_url,
+                    motw_source,
+                    motw_referrer,
+                    motw_frame_url,
+                    motw_zone_id,
+                    proc_sha256: None,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
@@ -892,6 +1237,12 @@ impl DaemonEngine {
                     superseded_exit: None,
                     skip_store_ingest: false,
                     effective_process_start: None,
+                    origin_url: None,
+                    motw_source: None,
+                    motw_referrer: None,
+                    motw_frame_url: None,
+                    motw_zone_id: None,
+                    proc_sha256: None,
                 }
             }
             SensorEvent::DnsQuery { pid, .. }
@@ -900,16 +1251,31 @@ impl DaemonEngine {
             | SensorEvent::ScriptEvaluated { pid, .. } => {
                 // Clone only the fields the context needs: cloning the whole entry would copy
                 // `emitted_rule_ids`, which grows with every distinct fired (rule, script) pair.
-                let Some((identity, instance_id, exe_path, command_line, parent_instance_id)) =
-                    table.lookup_by_pid_at(*pid, event_ts_ms).map(|e| {
-                        (
-                            e.identity,
-                            e.instance_id.clone(),
-                            e.exe_path.clone(),
-                            e.command_line.clone(),
-                            e.parent_instance_id.clone(),
-                        )
-                    })
+                let Some((
+                    identity,
+                    instance_id,
+                    exe_path,
+                    command_line,
+                    parent_instance_id,
+                    origin_url,
+                    motw_source,
+                    motw_referrer,
+                    motw_frame_url,
+                    motw_zone_id,
+                )) = table.lookup_by_pid_at(*pid, event_ts_ms).map(|e| {
+                    (
+                        e.identity,
+                        e.instance_id.clone(),
+                        e.exe_path.clone(),
+                        e.command_line.clone(),
+                        e.parent_instance_id.clone(),
+                        e.origin_url.clone(),
+                        e.motw_source.clone(),
+                        e.motw_referrer.clone(),
+                        e.motw_frame_url.clone(),
+                        e.motw_zone_id,
+                    )
+                })
                 else {
                     return ResolvedProcessContext::default();
                 };
@@ -936,6 +1302,12 @@ impl DaemonEngine {
                     superseded_exit: None,
                     skip_store_ingest: false,
                     effective_process_start: None,
+                    origin_url,
+                    motw_source,
+                    motw_referrer,
+                    motw_frame_url,
+                    motw_zone_id,
+                    proc_sha256: None,
                 }
             }
         }
@@ -965,6 +1337,12 @@ pub(super) struct ResolvedProcessContext {
     /// event, so `EarlyPruner`, `SigmaEngine`, alert context, and SQLite ingestion evaluate the
     /// same launch metadata.
     pub(super) effective_process_start: Option<SensorEvent>,
+    pub(super) origin_url: Option<String>,
+    pub(super) motw_source: Option<String>,
+    pub(super) motw_referrer: Option<String>,
+    pub(super) motw_frame_url: Option<String>,
+    pub(super) motw_zone_id: Option<u32>,
+    pub(super) proc_sha256: Option<String>,
 }
 
 impl Default for ResolvedProcessContext {
@@ -982,6 +1360,12 @@ impl Default for ResolvedProcessContext {
             superseded_exit: None,
             skip_store_ingest: false,
             effective_process_start: None,
+            origin_url: None,
+            motw_source: None,
+            motw_referrer: None,
+            motw_frame_url: None,
+            motw_zone_id: None,
+            proc_sha256: None,
         }
     }
 }
@@ -1014,4 +1398,440 @@ fn canary_alert_title(category: CanaryCategory, target_path: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(target_path);
     format!("{label}: {name}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::IpAddr;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use ledr_proto::{ActiveDefenseController, AlertRecord, ProcessIdentity, SensorEvent};
+    use ledr_rules::{BinaryIdentity, EarlyPruner, SigmaEngine};
+    use ledr_store::LedrStore;
+
+    use super::super::motw::{LateMotwAttribution, MotwAttribution, MotwMatchStage};
+    use super::super::{
+        BinaryInspector, DaemonConfig, DaemonEngine, NotificationDispatcher,
+        OutboundEnforcementMode,
+    };
+    use super::WfpRuleManager;
+
+    struct RecordingWfpDefense {
+        next_handle: AtomicU64,
+        added_wfp: Mutex<Vec<String>>,
+    }
+
+    impl RecordingWfpDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(1),
+                added_wfp: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn added_wfp(&self) -> Vec<String> {
+            self.added_wfp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    impl ActiveDefenseController for RecordingWfpDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(&self, exe: &Path, _: Option<IpAddr>, _: bool) -> Result<u64, String> {
+            self.added_wfp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(exe.display().to_string());
+            Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
+        }
+        fn remove_wfp_rule(&self, _: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct NoopNotifier;
+    impl NotificationDispatcher for NoopNotifier {
+        fn notify_alert(&self, _: &AlertRecord) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct EmptyInspector;
+    impl BinaryInspector for EmptyInspector {
+        fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+            BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: None,
+                authenticode: None,
+            }
+        }
+    }
+
+    /// `MOTW-LATE-01`: `apply_late_motw_attribution` must separate SQLite `COALESCE` backfill
+    /// from active-only WFP/outbound-classifier updates across active, exited, pre-populated,
+    /// `process_table`-evicted (full and partial `origin_url`-only), and PID-reused successor
+    /// instances without polluting live successor processes on reused PIDs.
+    #[tokio::test]
+    async fn motw_late_01_separates_sqlite_backfill_from_active_defense_across_active_exited_and_evicted(
+    ) {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(RecordingWfpDefense::new());
+        let engine = DaemonEngine::start_with_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                outbound_firewall_enabled: true,
+                outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+                motw_sync_wait_budget_ms: 0,
+                ..DaemonConfig::default()
+            },
+            defense.clone(),
+            Arc::new(NoopNotifier),
+            Arc::new(EmptyInspector),
+        );
+        engine.shutdown_and_flush().await.expect("stop pipeline");
+
+        let base_ft = 134_000_000_000_000_000u64;
+        let base_ms = 1_760_025_000_000i64;
+        let prior_url = "https://prior.example.invalid/orig.exe";
+        let prior_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let late_url = "https://late.example.invalid/new.exe";
+        let late_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let active_unset_id = ProcessIdentity::new(61_001, base_ft + 1);
+        let active_preset_id = ProcessIdentity::new(61_002, base_ft + 2);
+        let exited_unset_id = ProcessIdentity::new(61_003, base_ft + 3);
+        let exited_preset_id = ProcessIdentity::new(61_004, base_ft + 4);
+        let evicted_unset_id = ProcessIdentity::new(61_005, base_ft + 5);
+        let evicted_preset_id = ProcessIdentity::new(61_006, base_ft + 6);
+        let evicted_partial_id = ProcessIdentity::new(61_007, base_ft + 7);
+        let reused_exited_successor_id = ProcessIdentity::new(61_003, base_ft + 100);
+        let reused_evicted_successor_id = ProcessIdentity::new(61_005, base_ft + 105);
+
+        let specs = [
+            (
+                active_unset_id,
+                r"C:\Late01\active_unset.exe",
+                true,
+                false,
+                None,
+                None,
+            ),
+            (
+                active_preset_id,
+                r"C:\Late01\active_preset.exe",
+                true,
+                false,
+                Some(prior_url),
+                None,
+            ),
+            (
+                exited_unset_id,
+                r"C:\Late01\exited_unset.exe",
+                true,
+                true,
+                None,
+                None,
+            ),
+            (
+                exited_preset_id,
+                r"C:\Late01\exited_preset.exe",
+                true,
+                true,
+                Some(prior_url),
+                None,
+            ),
+            (
+                evicted_unset_id,
+                r"C:\Late01\evicted_unset.exe",
+                false,
+                true,
+                None,
+                None,
+            ),
+            (
+                evicted_preset_id,
+                r"C:\Late01\evicted_preset.exe",
+                false,
+                true,
+                Some(prior_url),
+                Some(prior_sha),
+            ),
+            (
+                evicted_partial_id,
+                r"C:\Late01\evicted_partial.exe",
+                false,
+                true,
+                Some(prior_url),
+                None,
+            ),
+        ];
+
+        for (ident, exe, in_table, exited, init_url, init_sha) in specs {
+            let start_ev = SensorEvent::ProcessStart {
+                identity: ident,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            };
+            store
+                .ingest_event_with_process_metadata(
+                    &start_ev,
+                    None,
+                    exited.then_some(base_ms + 50),
+                    None,
+                    init_url,
+                    init_sha,
+                    false,
+                    "OBSERVED",
+                )
+                .expect("ingest process row");
+            if in_table {
+                let mut table = engine
+                    .process_table
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let res = table.on_process_start(
+                    ident,
+                    4,
+                    exe.to_string(),
+                    exe.to_string(),
+                    None,
+                    base_ms,
+                );
+                if let Some(url) = init_url {
+                    assert!(table.set_motw_metadata(
+                        &res.instance_id,
+                        url.to_string(),
+                        "zone_identifier_ads".to_string(),
+                        None,
+                        None,
+                        Some(3),
+                    ));
+                }
+                if exited {
+                    assert_eq!(
+                        table.on_process_stop(ident.pid, base_ms + 50),
+                        Some(res.instance_id)
+                    );
+                }
+            }
+        }
+
+        // Register active successor processes that reuse PIDs 61_003 (after `exited_unset_id`
+        // stopped) and 61_005 (after `evicted_unset_id` was evicted) with distinct creation times.
+        let successor_specs = [
+            (
+                reused_exited_successor_id,
+                r"C:\Late01\reused_exited_successor.exe",
+                base_ms + 100,
+            ),
+            (
+                reused_evicted_successor_id,
+                r"C:\Late01\reused_evicted_successor.exe",
+                base_ms + 105,
+            ),
+        ];
+        for (ident, exe, started_ms) in successor_specs {
+            let start_ev = SensorEvent::ProcessStart {
+                identity: ident,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            };
+            store
+                .ingest_event_with_process_metadata(
+                    &start_ev,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    "OBSERVED",
+                )
+                .expect("ingest successor process row");
+            let mut table = engine
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let res = table.on_process_start(
+                ident,
+                4,
+                exe.to_string(),
+                exe.to_string(),
+                None,
+                started_ms,
+            );
+            assert_eq!(res.instance_id, ident.instance_id());
+            assert!(!res.skip_store_ingest);
+        }
+        {
+            let table = engine
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                table.lookup_by_pid(61_003).map(|e| e.instance_id.as_str()),
+                Some(reused_exited_successor_id.instance_id().as_str()),
+                "PID 61_003 must now point to the active reused successor process"
+            );
+            assert_eq!(
+                table.lookup_by_pid(61_005).map(|e| e.instance_id.as_str()),
+                Some(reused_evicted_successor_id.instance_id().as_str()),
+                "PID 61_005 must now point to the active reused successor process"
+            );
+        }
+        store.flush_batch().expect("flush initial rows");
+
+        // Mark PIDs steady in `outbound_classifier`: active_unset must be cleared, while
+        // active_preset and PID-reused active successor processes (61_003, 61_005) must remain steady.
+        for pid in [61_001, 61_002, 61_003, 61_005] {
+            engine.outbound_classifier.mark_steady(pid);
+        }
+
+        engine.apply_late_motw_attribution(LateMotwAttribution {
+            instance_ids: vec![
+                active_unset_id.instance_id(),
+                active_preset_id.instance_id(),
+                exited_unset_id.instance_id(),
+                exited_preset_id.instance_id(),
+                evicted_unset_id.instance_id(),
+                evicted_preset_id.instance_id(),
+                evicted_partial_id.instance_id(),
+            ],
+            attribution: MotwAttribution {
+                origin_url: late_url.to_string(),
+                referrer_url: None,
+                frame_url: None,
+                sha256: Some(late_sha.to_string()),
+                zone_id: Some(3),
+                stage: MotwMatchStage::DownloadSha256,
+            },
+        });
+
+        let query_row = |ident: ProcessIdentity| {
+            let snap = store
+                .query_flight_recorder(10, Some(&ident.instance_id()))
+                .expect("query process row");
+            assert_eq!(snap.processes.len(), 1);
+            snap.processes.into_iter().next().unwrap()
+        };
+
+        // 1. Active without prior URL -> table + SQLite updated, classifier cleared, WFP added.
+        let r_active_unset = query_row(active_unset_id);
+        assert_eq!(r_active_unset.origin_url.as_deref(), Some(late_url));
+        assert_eq!(r_active_unset.sha256.as_deref(), Some(late_sha));
+        assert!(!engine.outbound_classifier.is_steady_pid(61_001));
+
+        // 2. Active with prior URL -> skipped (non-overwrite, classifier/WFP untouched).
+        let r_active_preset = query_row(active_preset_id);
+        assert_eq!(r_active_preset.origin_url.as_deref(), Some(prior_url));
+        assert_eq!(r_active_preset.sha256, None);
+        assert!(engine.outbound_classifier.is_steady_pid(61_002));
+
+        // 3. Exited without prior URL -> SQLite backfilled, table unchanged, active PID-reused
+        //    successor untouched (SQLite, process_table, has_active_motw_for_exe_key, classifier, WFP).
+        let r_exited_unset = query_row(exited_unset_id);
+        assert_eq!(r_exited_unset.origin_url.as_deref(), Some(late_url));
+        assert_eq!(r_exited_unset.sha256.as_deref(), Some(late_sha));
+        assert!(r_exited_unset.exited_at_ms.is_some());
+        assert!(engine.outbound_classifier.is_steady_pid(61_003));
+        let r_reused_exited_succ = query_row(reused_exited_successor_id);
+        assert_eq!(r_reused_exited_succ.origin_url, None);
+        assert_eq!(r_reused_exited_succ.sha256, None);
+        assert!(r_reused_exited_succ.exited_at_ms.is_none());
+        {
+            let table = engine
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                table
+                    .get_by_instance_id(&active_unset_id.instance_id())
+                    .and_then(|e| e.origin_url.as_deref()),
+                Some(late_url)
+            );
+            assert_eq!(
+                table
+                    .get_by_instance_id(&exited_unset_id.instance_id())
+                    .and_then(|e| e.origin_url.as_deref()),
+                None,
+                "exited process_table entry must remain immutable in memory"
+            );
+            let exited_succ = table
+                .get_by_instance_id(&reused_exited_successor_id.instance_id())
+                .expect("reused_exited_successor must remain active in process_table");
+            assert_eq!(exited_succ.origin_url, None);
+            assert_eq!(exited_succ.motw_source, None);
+            assert!(exited_succ.exited_at_ms.is_none());
+            assert!(!table.has_active_motw_for_exe_key(&WfpRuleManager::exe_key(
+                r"C:\Late01\reused_exited_successor.exe"
+            )));
+            assert!(table
+                .get_by_instance_id(&evicted_unset_id.instance_id())
+                .is_none());
+            assert!(table
+                .get_by_instance_id(&evicted_partial_id.instance_id())
+                .is_none());
+            let evicted_succ = table
+                .get_by_instance_id(&reused_evicted_successor_id.instance_id())
+                .expect("reused_evicted_successor must remain active in process_table");
+            assert_eq!(evicted_succ.origin_url, None);
+            assert_eq!(evicted_succ.motw_source, None);
+            assert!(evicted_succ.exited_at_ms.is_none());
+            assert!(!table.has_active_motw_for_exe_key(&WfpRuleManager::exe_key(
+                r"C:\Late01\reused_evicted_successor.exe"
+            )));
+        }
+
+        // 4. Exited with prior URL -> skipped.
+        let r_exited_preset = query_row(exited_preset_id);
+        assert_eq!(r_exited_preset.origin_url.as_deref(), Some(prior_url));
+        assert_eq!(r_exited_preset.sha256, None);
+
+        // 5. Evicted from process_table without prior URL -> SQLite backfilled, active PID-reused
+        //    successor untouched (SQLite, process_table, classifier, WFP).
+        let r_evicted_unset = query_row(evicted_unset_id);
+        assert_eq!(r_evicted_unset.origin_url.as_deref(), Some(late_url));
+        assert_eq!(r_evicted_unset.sha256.as_deref(), Some(late_sha));
+        assert!(r_evicted_unset.exited_at_ms.is_some());
+        assert!(engine.outbound_classifier.is_steady_pid(61_005));
+        let r_reused_evicted_succ = query_row(reused_evicted_successor_id);
+        assert_eq!(r_reused_evicted_succ.origin_url, None);
+        assert_eq!(r_reused_evicted_succ.sha256, None);
+        assert!(r_reused_evicted_succ.exited_at_ms.is_none());
+
+        // 6. Evicted from process_table with prior URL/SHA -> COALESCE preserves both.
+        let r_evicted_preset = query_row(evicted_preset_id);
+        assert_eq!(r_evicted_preset.origin_url.as_deref(), Some(prior_url));
+        assert_eq!(r_evicted_preset.sha256.as_deref(), Some(prior_sha));
+
+        // 7. Evicted from process_table with prior URL but missing SHA -> COALESCE preserves
+        //    existing URL while backfilling missing SHA-256 only.
+        let r_evicted_partial = query_row(evicted_partial_id);
+        assert_eq!(r_evicted_partial.origin_url.as_deref(), Some(prior_url));
+        assert_eq!(r_evicted_partial.sha256.as_deref(), Some(late_sha));
+        assert!(r_evicted_partial.exited_at_ms.is_some());
+
+        // Only `active_unset.exe` must receive an L-18 pre-emptive WFP block.
+        let wfp = defense.added_wfp();
+        assert_eq!(wfp.len(), 1, "unexpected WFP calls: {wfp:?}");
+        assert!(wfp[0].ends_with("active_unset.exe"));
+    }
 }

@@ -83,6 +83,10 @@ struct BufferedEvent {
     /// supersedes an earlier active row (such as a `pid:0` snapshot placeholder); `None` for
     /// every other event.
     superseded_process_exit: Option<(String, i64)>,
+    /// MOTW / browser origin URL attached on `ProcessStart`; `None` for every other event.
+    origin_url: Option<String>,
+    /// Lowercase hex SHA-256 attached on `ProcessStart` when known; `None` for every other event.
+    sha256: Option<String>,
 }
 
 const MAX_PENDING_SUPERSEDED_EXITS: usize = 1_024;
@@ -268,14 +272,16 @@ impl LedrStore {
 
     /// Records a browser download origin entry into `download_origins`.
     pub fn record_download_origin(&self, origin: &DownloadOriginRecord) -> Result<(), StoreError> {
+        let normalized_path = normalize_windows_path(&origin.file_path);
+        let normalized_sha256 = normalize_sha256(origin.sha256.as_deref());
         let writer = self.lock_writer()?;
         writer.execute(
             "INSERT INTO download_origins (
                 file_path, sha256, tab_url, frame_url, referrer_url, downloaded_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                origin.file_path,
-                origin.sha256,
+                normalized_path,
+                normalized_sha256,
                 origin.tab_url,
                 origin.frame_url,
                 origin.referrer_url,
@@ -283,6 +289,56 @@ impl LedrStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Backfills missing MOTW `origin_url` and `sha256` on a `ProcessStart` without overwriting
+    /// already-populated columns (`COALESCE`), updating both any pending batch buffer entry and
+    /// committed `processes` row under the canonical `writer -> batch` lock order.
+    pub fn update_process_motw_metadata(
+        &self,
+        process_instance_id: &str,
+        origin_url: Option<&str>,
+        sha256: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let clean_instance = process_instance_id.trim();
+        let clean_origin = origin_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let clean_sha256 = normalize_sha256(sha256);
+        if clean_instance.is_empty() || (clean_origin.is_none() && clean_sha256.is_none()) {
+            return Ok(false);
+        }
+
+        let writer = self.lock_writer()?;
+        let mut updated_in_batch = false;
+        {
+            let mut batch = self.lock_batch()?;
+            for buffered in &mut batch.events {
+                if let SensorEvent::ProcessStart { identity, .. } = &buffered.event {
+                    if identity.instance_id() == clean_instance {
+                        if buffered.origin_url.is_none() && clean_origin.is_some() {
+                            buffered.origin_url = clean_origin.clone();
+                            updated_in_batch = true;
+                        }
+                        if buffered.sha256.is_none() && clean_sha256.is_some() {
+                            buffered.sha256 = clean_sha256.clone();
+                            updated_in_batch = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let rows_affected = writer.execute(
+            "UPDATE processes
+             SET origin_url = COALESCE(origin_url, ?1),
+                 sha256 = COALESCE(sha256, ?2)
+             WHERE process_instance_id = ?3",
+            params![clean_origin, clean_sha256, clean_instance],
+        )?;
+
+        Ok(updated_in_batch || rows_affected > 0)
     }
 
     /// Flushes all buffered events and executes `PRAGMA wal_checkpoint(TRUNCATE);` (`AUTO-10`).
@@ -301,6 +357,33 @@ impl LedrStore {
         );
         Ok(())
     }
+}
+
+pub(crate) fn normalize_windows_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let body = if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\") || p.eq_ignore_ascii_case("//?/UNC/"))
+    {
+        format!(r"\\{}", &trimmed[8..])
+    } else if trimmed
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\") || p.eq_ignore_ascii_case("//?/"))
+    {
+        trimmed[4..].to_string()
+    } else {
+        trimmed.to_string()
+    };
+    body.replace('/', "\\")
+}
+
+pub(crate) fn normalize_sha256(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]

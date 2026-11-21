@@ -19,6 +19,11 @@ pub struct ActiveProcessEntry {
     pub exited_at_ms: Option<i64>,
     pub sigma_evaluated: bool,
     pub emitted_rule_ids: HashSet<String>,
+    pub origin_url: Option<String>,
+    pub motw_referrer: Option<String>,
+    pub motw_frame_url: Option<String>,
+    pub motw_source: Option<String>,
+    pub motw_zone_id: Option<u32>,
 }
 
 /// Resolution result returned when recording a new `ProcessStart` into [`ActiveProcessTable`].
@@ -312,6 +317,11 @@ impl ActiveProcessTable {
                             exited_at_ms: Some(inferred_exit_ms),
                             sigma_evaluated: true,
                             emitted_rule_ids: HashSet::new(),
+                            origin_url: None,
+                            motw_referrer: None,
+                            motw_frame_url: None,
+                            motw_source: None,
+                            motw_zone_id: None,
                         },
                     );
                     self.exited_fifo.push_back(instance_id.clone());
@@ -362,6 +372,11 @@ impl ActiveProcessTable {
                 exited_at_ms: None,
                 sigma_evaluated: true,
                 emitted_rule_ids: HashSet::new(),
+                origin_url: None,
+                motw_referrer: None,
+                motw_frame_url: None,
+                motw_source: None,
+                motw_zone_id: None,
             },
         );
         self.active_count += 1;
@@ -534,6 +549,61 @@ impl ActiveProcessTable {
     /// O(1) lookup by composite `instance_id` (`"{pid}:{create_time_100ns}"`).
     pub fn get_by_instance_id(&self, instance_id: &str) -> Option<&ActiveProcessEntry> {
         self.entries.get(instance_id)
+    }
+
+    /// Attaches resolved MOTW origin metadata to an existing entry in the process table.
+    pub fn set_motw_metadata(
+        &mut self,
+        instance_id: &str,
+        origin_url: String,
+        motw_source: String,
+        motw_referrer: Option<String>,
+        motw_frame_url: Option<String>,
+        motw_zone_id: Option<u32>,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(instance_id) else {
+            return false;
+        };
+        entry.origin_url = Some(origin_url);
+        entry.motw_source = Some(motw_source);
+        entry.motw_referrer = motw_referrer;
+        entry.motw_frame_url = motw_frame_url;
+        entry.motw_zone_id = motw_zone_id;
+        true
+    }
+
+    /// Attaches resolved MOTW origin metadata only if `instance_id` is still active (unexited)
+    /// and does not already carry `origin_url`, returning `(exe_path, pid)` when applied.
+    pub fn set_motw_metadata_if_active(
+        &mut self,
+        instance_id: &str,
+        origin_url: String,
+        motw_source: String,
+        motw_referrer: Option<String>,
+        motw_frame_url: Option<String>,
+        motw_zone_id: Option<u32>,
+    ) -> Option<(String, u32)> {
+        let entry = self.entries.get_mut(instance_id)?;
+        if entry.exited_at_ms.is_some() || entry.origin_url.is_some() {
+            return None;
+        }
+        entry.origin_url = Some(origin_url);
+        entry.motw_source = Some(motw_source);
+        entry.motw_referrer = motw_referrer;
+        entry.motw_frame_url = motw_frame_url;
+        entry.motw_zone_id = motw_zone_id;
+        Some((entry.exe_path.clone(), entry.pid))
+    }
+
+    /// Returns `true` if any currently unexited process matching `target_exe_key` carries MOTW
+    /// origin metadata (`L-18`).
+    pub fn has_active_motw_for_exe_key(&self, target_exe_key: &str) -> bool {
+        self.entries.values().any(|entry| {
+            entry.exited_at_ms.is_none()
+                && entry.origin_url.is_some()
+                && !entry.exe_path.trim().is_empty()
+                && normalized_exe_key_eq(&entry.exe_path, target_exe_key)
+        })
     }
 
     /// Marks `rule_id` as having emitted an alert for `instance_id`, returning `true` only on

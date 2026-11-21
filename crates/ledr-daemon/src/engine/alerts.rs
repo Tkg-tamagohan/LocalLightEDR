@@ -63,6 +63,39 @@ impl DaemonEngine {
             ));
         }
 
+        if alert.source_layer == "LAYER_4_BROWSER" && alert.process_instance_id.is_none() {
+            let now_ms = current_unix_ms();
+            return match decision {
+                AlertDecision::AllowOnce
+                | AlertDecision::TerminateAndBlock {
+                    add_block_rule: false,
+                } => {
+                    let new_status = decision.resulting_status();
+                    let updated = self
+                        .store
+                        .update_alert_status(alert_id, new_status, Some(now_ms))
+                        .map_err(|err| format!("failed to update alert status: {err}"))?;
+                    if !updated {
+                        return Err(format!("alert {alert_id} not found"));
+                    }
+                    alert.status = new_status;
+                    alert.resolved_at_ms = Some(now_ms);
+                    Ok(ResolvedAlertOutcome {
+                        alert,
+                        saved_rule_id: None,
+                    })
+                }
+                AlertDecision::AllowPermanent { .. } => Err(format!(
+                    "LAYER_4_BROWSER alert {alert_id} has no associated process and cannot create a permanent rule"
+                )),
+                AlertDecision::TerminateAndBlock {
+                    add_block_rule: true,
+                } => Err(format!(
+                    "LAYER_4_BROWSER alert {alert_id} has no associated process and cannot create a block rule"
+                )),
+            };
+        }
+
         let ctx_val: serde_json::Value =
             serde_json::from_str(&alert.context_json).unwrap_or(serde_json::Value::Null);
 
@@ -1196,7 +1229,8 @@ impl DaemonEngine {
             self.clear_rule_alert(instance_id, &dedup_key);
         }
         if source_layer == "LAYER_3_NETWORK" || ctx_val.pointer("/event/NetworkConnect").is_some() {
-            self.clear_rule_alert(instance_id, "NET_OUTBOUND");
+            self.clear_rule_alert(instance_id, super::outbound::NET_OUTBOUND_ENFORCE_DEDUP_KEY);
+            self.clear_rule_alert(instance_id, super::outbound::NET_OUTBOUND_OBSERVE_DEDUP_KEY);
             self.clear_rule_alert(instance_id, "NET_POLICY_BLOCK");
         }
     }

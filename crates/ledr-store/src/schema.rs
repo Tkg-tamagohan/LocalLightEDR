@@ -117,8 +117,10 @@ CREATE TABLE IF NOT EXISTS download_origins (
     referrer_url        TEXT,
     downloaded_at_ms    INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_dl_path   ON download_origins(file_path);
-CREATE INDEX IF NOT EXISTS idx_dl_sha256 ON download_origins(sha256);
+CREATE INDEX IF NOT EXISTS idx_dl_path          ON download_origins(file_path);
+CREATE INDEX IF NOT EXISTS idx_dl_sha256        ON download_origins(sha256);
+CREATE INDEX IF NOT EXISTS idx_dl_path_nocase   ON download_origins(file_path COLLATE NOCASE, downloaded_at_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_dl_sha256_nocase ON download_origins(sha256 COLLATE NOCASE, downloaded_at_ms DESC, id DESC);
 ";
 
 pub(crate) fn writer_open_flags() -> OpenFlags {

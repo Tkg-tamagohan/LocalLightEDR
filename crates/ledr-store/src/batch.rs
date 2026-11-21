@@ -73,6 +73,35 @@ impl LedrStore {
         is_nrd: bool,
         action: &str,
     ) -> Result<bool, StoreError> {
+        self.ingest_event_with_process_metadata(
+            event,
+            parent_instance_id,
+            exited_at_ms,
+            superseded_process_exit,
+            None,
+            None,
+            is_nrd,
+            action,
+        )
+    }
+
+    /// Same as [`Self::ingest_event_with_lifecycle`], additionally persisting MOTW `origin_url`
+    /// and binary `sha256` on `ProcessStart` inside the same SQLite transaction (`Phase 4A`).
+    ///
+    /// `exited_at_ms`, `superseded_process_exit`, `origin_url`, and `sha256` are ignored for
+    /// non-`ProcessStart` events.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_event_with_process_metadata(
+        &self,
+        event: &SensorEvent,
+        parent_instance_id: Option<&str>,
+        exited_at_ms: Option<i64>,
+        superseded_process_exit: Option<(&str, i64)>,
+        origin_url: Option<&str>,
+        sha256: Option<&str>,
+        is_nrd: bool,
+        action: &str,
+    ) -> Result<bool, StoreError> {
         if matches!(event, SensorEvent::ScriptEvaluated { .. }) {
             // Evaluated in-memory by Layer 2 SigmaEngine and stored in alerts.context_json on match.
             tracing::trace!("skipping direct telemetry table buffering for ScriptEvaluated");
@@ -90,6 +119,19 @@ impl LedrStore {
             exited_at_ms: if is_process_start { exited_at_ms } else { None },
             superseded_process_exit: if is_process_start {
                 superseded_process_exit.map(|(id, exit_ms)| (id.to_owned(), exit_ms))
+            } else {
+                None
+            },
+            origin_url: if is_process_start {
+                origin_url
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            } else {
+                None
+            },
+            sha256: if is_process_start {
+                crate::normalize_sha256(sha256)
             } else {
                 None
             },
@@ -480,11 +522,11 @@ fn write_buffered_events(
                     ppid: *parent_pid,
                     exe_path: exe_path.clone(),
                     command_line: cmd,
-                    sha256: None,
+                    sha256: item.sha256.clone(),
                     signer_subject: None,
                     is_trusted_os: false,
                     user_sid: user_sid.clone(),
-                    origin_url: None,
+                    origin_url: item.origin_url.clone(),
                     created_at_ms: filetime_100ns_to_unix_ms(
                         identity.create_time_100ns,
                         item.received_at_ms,

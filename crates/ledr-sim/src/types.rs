@@ -17,6 +17,7 @@ pub enum Scenario {
     DnsTcp,
     CookiesOpen,
     HoneypotWrite,
+    MotwDownload,
     All,
 }
 
@@ -27,9 +28,10 @@ impl Scenario {
             "dns-tcp" => Ok(Self::DnsTcp),
             "cookies-open" => Ok(Self::CookiesOpen),
             "honeypot-write" => Ok(Self::HoneypotWrite),
+            "motw-download" => Ok(Self::MotwDownload),
             "all" | "run-all" => Ok(Self::All),
             other => bail!(
-                "unknown scenario `{other}`; expected one of: lotl, dns-tcp, cookies-open, honeypot-write, all, run-all"
+                "unknown scenario `{other}`; expected one of: lotl, dns-tcp, cookies-open, honeypot-write, motw-download, all, run-all"
             ),
         }
     }
@@ -115,6 +117,17 @@ pub struct HoneypotWriteOutcome {
     pub final_bytes: usize,
 }
 
+/// Outcome of the harmless MOTW `:Zone.Identifier` download-mark simulation (`AUTO-15`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MotwDownloadOutcome {
+    pub target_path: String,
+    pub sha256: String,
+    pub zone_id: u32,
+    pub host_url: String,
+    pub referrer_url: String,
+    pub verified_roundtrip: bool,
+}
+
 /// Combined structured report emitted by `ledr-sim`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimReport {
@@ -124,4 +137,5 @@ pub struct SimReport {
     pub dns_tcp: Option<DnsTcpOutcome>,
     pub cookies_open: Option<CookiesOpenOutcome>,
     pub honeypot_write: Option<HoneypotWriteOutcome>,
+    pub motw_download: Option<MotwDownloadOutcome>,
 }

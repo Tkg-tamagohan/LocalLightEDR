@@ -374,7 +374,24 @@ impl DaemonEngine {
         }
     }
 
+    fn has_active_motw_for_exe(&self, exe_path: &str) -> bool {
+        let trimmed = exe_path.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let exe_key = WfpRuleManager::exe_key(trimmed);
+        self.process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_active_motw_for_exe_key(&exe_key)
+    }
+
     pub(super) fn maybe_apply_preemptive_wfp_block(&self, exe_path: &str) {
+        let has_motw = self.has_active_motw_for_exe(exe_path);
+        self.maybe_apply_preemptive_wfp_block_with_motw(exe_path, has_motw);
+    }
+
+    pub(super) fn maybe_apply_preemptive_wfp_block_with_motw(&self, exe_path: &str, has_motw: bool) {
         if self.config.outbound_enforcement_mode == super::OutboundEnforcementMode::Audit {
             return;
         }
@@ -437,6 +454,7 @@ impl DaemonEngine {
             )
         };
         let is_preemptive_risk = is_startup_pinned
+            || has_motw
             || matches!(
                 risk,
                 OutboundRiskClass::HighRiskPath | OutboundRiskClass::ScriptInterpreter

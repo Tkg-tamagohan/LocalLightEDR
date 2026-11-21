@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>LocalEDR Browser Shield</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup">
+    <header class="header">
+      <h1 class="title">LocalEDR Browser Shield</h1>
+      <span id="status-pill" class="pill pill-checking">Checking</span>
+    </header>
+
+    <section class="daemon-card" aria-label="Daemon Connection">
+      <div class="daemon-meta">
+        <span class="label">Daemon</span>
+        <span id="daemon-info" class="value">Connecting...</span>
+      </div>
+      <button id="ping-btn" type="button" class="btn-ping">Ping</button>
+    </section>
+
+    <section class="stats-grid" aria-label="Shield Counters">
+      <div class="stat">
+        <span class="stat-label">DNR Rules</span>
+        <span id="stat-dnr" class="stat-value">0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">ClickFix</span>
+        <span id="stat-clickfix" class="stat-value">0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Domain Warnings</span>
+        <span id="stat-domain" class="stat-value">0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Downloads</span>
+        <span id="stat-downloads" class="stat-value">0</span>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span id="last-ping" class="meta">Last ping: -</span>
+      <span id="ext-id" class="meta mono">-</span>
+    </footer>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

@@ -1,11 +1,13 @@
-//! Phase 4A integration tests for `ledr-daemon` (`DAEMON-P4-01`..`DAEMON-P4-23`):
+//! Phase 4A integration tests for `ledr-daemon` (`DAEMON-P4-01`..`DAEMON-P4-24`):
 //! `ReportDownloadOrigin`, 3-stage MOTW attribution, `L-18` pre-emptive WFP restrictions,
 //! `ReportBrowserEvent` severity/dedup/`L-19` notification suppression, `LAYER_4_BROWSER`
 //! alert resolution, bridge IPC auth, `spawn_blocking` responsiveness, burst budget,
 //! delayed MOTW observe-to-enforce escalation, startup seed MOTW backlog deduplication,
 //! Stage 2 `(sha256, generation)` cache invalidation, default cancellable SHA-256 contract,
-//! case-preserving seed MOTW grouping, non-blocking late attribution with fair drain, and
-//! bounded late-slot reservation under saturated real-time process MOTW bursts.
+//! case-preserving seed MOTW grouping, non-blocking late attribution with fair drain,
+//! bounded late-slot reservation under saturated real-time process MOTW bursts, and
+//! non-overwriting SQLite MOTW history backfill for short-lived exited processes without
+//! granting late L-18 WFP blocks.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -2256,7 +2258,8 @@ async fn daemon_p4_16_blocked_motw_io_does_not_stall_pipeline_late_backfill_and_
         })
         .await
         .expect("send active_slow ProcessStart");
-    // Stop PID 8101 before the MOTW I/O gate opens so its late attribution must be discarded.
+    // Stop PID 8101 before the MOTW I/O gate opens so its late attribution still backfills
+    // SQLite history (`COALESCE`) while avoiding any late active-defense WFP block.
     sender
         .send(SensorEvent::ProcessStop {
             pid: exited_ident.pid,
@@ -2334,6 +2337,9 @@ async fn daemon_p4_16_blocked_motw_io_does_not_stall_pipeline_late_backfill_and_
         let active_snap = store
             .query_flight_recorder(10, Some(&active_ident.instance_id()))
             .expect("query active_slow");
+        let exited_snap = store
+            .query_flight_recorder(10, Some(&exited_ident.instance_id()))
+            .expect("query exited_slow");
         let wfp_calls = defense.added_wfp();
         let active_backfilled = active_snap
             .processes
@@ -2341,6 +2347,10 @@ async fn daemon_p4_16_blocked_motw_io_does_not_stall_pipeline_late_backfill_and_
             .and_then(|p| p.origin_url.as_deref())
             == Some("https://late-ads.example.invalid/slow.exe")
             && wfp_calls.iter().any(|c| c.exe_path.ends_with("active_slow.exe"));
+        let exited_backfilled = exited_snap.processes.first().is_some_and(|p| {
+            p.origin_url.as_deref() == Some("https://late-ads.example.invalid/slow.exe")
+                && p.exited_at_ms.is_some()
+        });
         let sentinel_backfilled = store
             .query_flight_recorder(10, Some(&sentinel_ident.instance_id()))
             .expect("query sentinel")
@@ -2348,7 +2358,7 @@ async fn daemon_p4_16_blocked_motw_io_does_not_stall_pipeline_late_backfill_and_
             .first()
             .and_then(|p| p.origin_url.as_deref())
             .is_some();
-        if active_backfilled && sentinel_backfilled {
+        if active_backfilled && exited_backfilled && sentinel_backfilled {
             break;
         }
         assert!(
@@ -2363,8 +2373,13 @@ async fn daemon_p4_16_blocked_motw_io_does_not_stall_pipeline_late_backfill_and_
         .expect("query exited_slow");
     assert_eq!(exited_snap.processes.len(), 1);
     assert_eq!(
-        exited_snap.processes[0].origin_url, None,
-        "already-exited process must discard late MOTW backfill"
+        exited_snap.processes[0].origin_url.as_deref(),
+        Some("https://late-ads.example.invalid/slow.exe"),
+        "already-exited process must still backfill SQLite origin_url history"
+    );
+    assert!(
+        exited_snap.processes[0].exited_at_ms.is_some(),
+        "already-exited process must preserve exited_at_ms after late MOTW history backfill"
     );
     assert!(
         !defense
@@ -4310,5 +4325,738 @@ async fn daemon_p4_23_saturated_motw_burst_above_pending_late_zero_loss_and_ipc_
     assert_eq!(
         final_matched, EXPECTED_TOTAL,
         "all {EXPECTED_TOTAL} MOTW attributions must persist with zero loss"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p4_24_short_lived_process_during_saturated_pending_late_backfills_history_without_wfp()
+{
+    #[derive(Clone)]
+    struct CanaryGate {
+        entered: Arc<(Mutex<usize>, Condvar)>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl CanaryGate {
+        fn new() -> (Self, GateReleaseGuard) {
+            let entered = Arc::new((Mutex::new(0usize), Condvar::new()));
+            let released = Arc::new((Mutex::new(false), Condvar::new()));
+            let guard = GateReleaseGuard(Arc::clone(&released));
+            (Self { entered, released }, guard)
+        }
+
+        fn wait_inside(&self) {
+            let do_wait = || {
+                {
+                    let (lock, cvar) = &*self.entered;
+                    let mut count = lock.lock().expect("lock canary gate entered");
+                    *count += 1;
+                    cvar.notify_all();
+                }
+                {
+                    let (lock, cvar) = &*self.released;
+                    let mut flag = lock.lock().expect("lock canary gate released");
+                    while !*flag {
+                        flag = cvar.wait(flag).expect("wait canary gate released");
+                    }
+                }
+            };
+            // Yield the Tokio worker slot before blocking on a Condvar so the multi-threaded
+            // runtime's timer driver remains responsive while `run_pipeline` is paused.
+            if tokio::runtime::Handle::try_current()
+                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            {
+                tokio::task::block_in_place(do_wait);
+            } else {
+                do_wait();
+            }
+        }
+
+        fn release(&self) {
+            let (lock, cvar) = &*self.released;
+            let mut flag = lock.lock().expect("lock canary gate released");
+            *flag = true;
+            cvar.notify_all();
+        }
+    }
+
+    struct GatedCanaryNotifier {
+        gate1: CanaryGate,
+        gate2: CanaryGate,
+        gate3: CanaryGate,
+        gate4: CanaryGate,
+    }
+
+    impl NotificationDispatcher for GatedCanaryNotifier {
+        fn notify_alert(&self, alert: &AlertRecord) -> Result<(), String> {
+            if alert.context_json.contains("gate1_canary") {
+                self.gate1.wait_inside();
+            } else if alert.context_json.contains("gate2_canary") {
+                self.gate2.wait_inside();
+            } else if alert.context_json.contains("gate3_canary") {
+                self.gate3.wait_inside();
+            } else if alert.context_json.contains("gate4_canary") {
+                self.gate4.wait_inside();
+            }
+            Ok(())
+        }
+    }
+
+    struct TwoWaveSlowMotwInspector {
+        zones: HashMap<String, MotwZoneInfo>,
+        slow_gate_a: Arc<(Mutex<bool>, Condvar)>,
+        slow_gate_b: Arc<(Mutex<bool>, Condvar)>,
+        seed_calls: Arc<(Mutex<usize>, Condvar)>,
+        fill_calls: Arc<(Mutex<usize>, Condvar)>,
+        short_lived_calls: Arc<(Mutex<usize>, Condvar)>,
+        preexisting_calls: Arc<(Mutex<usize>, Condvar)>,
+        tail_calls: Arc<(Mutex<usize>, Condvar)>,
+    }
+
+    impl TwoWaveSlowMotwInspector {
+        fn wait_gate(gate: &(Mutex<bool>, Condvar)) {
+            let (lock, cvar) = gate;
+            let mut released = lock.lock().expect("lock slow gate");
+            while !*released {
+                released = cvar.wait(released).expect("wait slow gate");
+            }
+        }
+
+        fn bump(counter: &(Mutex<usize>, Condvar)) {
+            let (lock, cvar) = counter;
+            let mut count = lock.lock().expect("lock motw call counter");
+            *count += 1;
+            cvar.notify_all();
+        }
+    }
+
+    impl MotwInspector for TwoWaveSlowMotwInspector {
+        fn read_zone_identifier(&self, path: &Path) -> Option<MotwZoneInfo> {
+            let normalized = path.display().to_string().replace('/', "\\");
+            if normalized.ends_with(r"\slow_probe_0.exe")
+                || normalized.ends_with(r"\slow_probe_1.exe")
+            {
+                Self::wait_gate(&self.slow_gate_a);
+            } else if normalized.ends_with(r"\slow_probe_2.exe")
+                || normalized.ends_with(r"\slow_probe_3.exe")
+            {
+                Self::wait_gate(&self.slow_gate_b);
+            }
+
+            let found = self.zones.get(&normalized).cloned();
+            if normalized.contains(r"\seed_") {
+                Self::bump(&self.seed_calls);
+            } else if normalized.contains(r"\slow_probe_") || normalized.contains(r"\fill_") {
+                Self::bump(&self.fill_calls);
+            } else if normalized.ends_with(r"\short_lived_tool.exe") {
+                Self::bump(&self.short_lived_calls);
+            } else if normalized.ends_with(r"\preexisting_exited.exe") {
+                Self::bump(&self.preexisting_calls);
+            } else if normalized.contains(r"\tail_active_") {
+                Self::bump(&self.tail_calls);
+            }
+            found
+        }
+    }
+
+    const SEED_COUNT: usize = 64;
+    const WAVE1_FILL_COUNT: usize = 46; // + 2 slow probes = 48 Wave 1 events
+    const WAVE2_FILL_COUNT: usize = 20; // + 2 slow probes = 22 Wave 2 events
+    const WAVE1_TOTAL: usize = 2 + WAVE1_FILL_COUNT; // 48
+    const WAVE2_TOTAL: usize = 2 + WAVE2_FILL_COUNT; // 22
+    const FILL_TOTAL: usize = WAVE1_TOTAL + WAVE2_TOTAL; // 70
+    // 64 seeds + 70 fills + 1 short_lived_tool + 1 preexisting_exited + 2 tail_active = 138
+    const EXPECTED_TOTAL: usize = SEED_COUNT + FILL_TOTAL + 4;
+
+    let base_ms = 1_760_024_000_000i64;
+    let mut zones: HashMap<String, MotwZoneInfo> = HashMap::with_capacity(EXPECTED_TOTAL);
+    let mut expected_origins: HashMap<String, String> = HashMap::with_capacity(EXPECTED_TOTAL);
+
+    let mut seed_events: Vec<SensorEvent> = Vec::with_capacity(SEED_COUNT);
+    for i in 0..SEED_COUNT {
+        let exe = format!(r"C:\SeedSat24\seed_{i:02}.exe");
+        let url = format!("https://seed24.example.invalid/seed_{i:02}.exe");
+        zones.insert(
+            exe.clone(),
+            MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(url.clone()),
+                referrer_url: Some("https://seed24-ref.example.invalid/".to_string()),
+            },
+        );
+        let ident = ProcessIdentity::new(43_000 + i as u32, unix_ms_to_filetime(base_ms + i as i64));
+        expected_origins.insert(ident.instance_id(), url);
+        seed_events.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe,
+            command_line: format!("seed_{i:02}.exe"),
+            user_sid: None,
+        });
+    }
+
+    let mut wave1_events: Vec<SensorEvent> = Vec::with_capacity(WAVE1_TOTAL);
+    for probe_idx in 0..2usize {
+        let exe = format!(r"C:\FillSat24\slow_probe_{probe_idx}.exe");
+        let url = format!("https://fill24.example.invalid/slow_probe_{probe_idx}.exe");
+        zones.insert(
+            exe.clone(),
+            MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(url.clone()),
+                referrer_url: Some("https://fill24-ref.example.invalid/".to_string()),
+            },
+        );
+        let ident = ProcessIdentity::new(
+            44_000 + probe_idx as u32,
+            unix_ms_to_filetime(base_ms + 10_000 + probe_idx as i64),
+        );
+        expected_origins.insert(ident.instance_id(), url);
+        wave1_events.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe,
+            command_line: format!("slow_probe_{probe_idx}.exe"),
+            user_sid: None,
+        });
+    }
+    for i in 0..WAVE1_FILL_COUNT {
+        let exe = format!(r"C:\FillSat24\fill_{i:02}.exe");
+        let url = format!("https://fill24.example.invalid/fill_{i:02}.exe");
+        zones.insert(
+            exe.clone(),
+            MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(url.clone()),
+                referrer_url: Some("https://fill24-ref.example.invalid/".to_string()),
+            },
+        );
+        let ident = ProcessIdentity::new(
+            44_010 + i as u32,
+            unix_ms_to_filetime(base_ms + 10_100 + i as i64),
+        );
+        expected_origins.insert(ident.instance_id(), url);
+        wave1_events.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe,
+            command_line: format!("fill_{i:02}.exe"),
+            user_sid: None,
+        });
+    }
+
+    let mut wave2_events: Vec<SensorEvent> = Vec::with_capacity(WAVE2_TOTAL);
+    for probe_idx in 2..4usize {
+        let exe = format!(r"C:\FillSat24\slow_probe_{probe_idx}.exe");
+        let url = format!("https://fill24.example.invalid/slow_probe_{probe_idx}.exe");
+        zones.insert(
+            exe.clone(),
+            MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(url.clone()),
+                referrer_url: Some("https://fill24-ref.example.invalid/".to_string()),
+            },
+        );
+        let ident = ProcessIdentity::new(
+            44_000 + probe_idx as u32,
+            unix_ms_to_filetime(base_ms + 11_000 + probe_idx as i64),
+        );
+        expected_origins.insert(ident.instance_id(), url);
+        wave2_events.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe,
+            command_line: format!("slow_probe_{probe_idx}.exe"),
+            user_sid: None,
+        });
+    }
+    for i in WAVE1_FILL_COUNT..(WAVE1_FILL_COUNT + WAVE2_FILL_COUNT) {
+        let exe = format!(r"C:\FillSat24\fill_{i:02}.exe");
+        let url = format!("https://fill24.example.invalid/fill_{i:02}.exe");
+        zones.insert(
+            exe.clone(),
+            MotwZoneInfo {
+                zone_id: 3,
+                host_url: Some(url.clone()),
+                referrer_url: Some("https://fill24-ref.example.invalid/".to_string()),
+            },
+        );
+        let ident = ProcessIdentity::new(
+            44_010 + i as u32,
+            unix_ms_to_filetime(base_ms + 11_100 + i as i64),
+        );
+        expected_origins.insert(ident.instance_id(), url);
+        wave2_events.push(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe,
+            command_line: format!("fill_{i:02}.exe"),
+            user_sid: None,
+        });
+    }
+
+    let short_lived_exe = r"C:\ShortLived24\short_lived_tool.exe";
+    let short_lived_url = "https://short-lived.example.invalid/tool.exe";
+    zones.insert(
+        short_lived_exe.to_string(),
+        MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some(short_lived_url.to_string()),
+            referrer_url: Some("https://short-lived-ref.example.invalid/".to_string()),
+        },
+    );
+    let short_lived_ident = ProcessIdentity::new(45_001, unix_ms_to_filetime(base_ms + 20_000));
+    expected_origins.insert(
+        short_lived_ident.instance_id(),
+        short_lived_url.to_string(),
+    );
+
+    let preexisting_exe = r"C:\ShortLived24\preexisting_exited.exe";
+    let preexisting_keep_url = "https://preexisting-origin.example.invalid/keep.exe";
+    zones.insert(
+        preexisting_exe.to_string(),
+        MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some("https://late-overwrite-attempt.example.invalid/keep.exe".to_string()),
+            referrer_url: None,
+        },
+    );
+    let preexisting_ident = ProcessIdentity::new(45_002, unix_ms_to_filetime(base_ms + 20_020));
+    expected_origins.insert(
+        preexisting_ident.instance_id(),
+        preexisting_keep_url.to_string(),
+    );
+
+    let tail1_exe = r"C:\ShortLived24\tail_active_1.exe";
+    let tail1_url = "https://tail24.example.invalid/tail_active_1.exe";
+    zones.insert(
+        tail1_exe.to_string(),
+        MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some(tail1_url.to_string()),
+            referrer_url: None,
+        },
+    );
+    let tail1_ident = ProcessIdentity::new(45_003, unix_ms_to_filetime(base_ms + 20_040));
+    expected_origins.insert(tail1_ident.instance_id(), tail1_url.to_string());
+
+    let tail2_exe = r"C:\ShortLived24\tail_active_2.exe";
+    let tail2_url = "https://tail24.example.invalid/tail_active_2.exe";
+    zones.insert(
+        tail2_exe.to_string(),
+        MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some(tail2_url.to_string()),
+            referrer_url: None,
+        },
+    );
+    let tail2_ident = ProcessIdentity::new(45_004, unix_ms_to_filetime(base_ms + 20_060));
+    expected_origins.insert(tail2_ident.instance_id(), tail2_url.to_string());
+
+    let (gate1, _gate1_guard) = CanaryGate::new();
+    let (gate2, _gate2_guard) = CanaryGate::new();
+    let (gate3, _gate3_guard) = CanaryGate::new();
+    let (gate4, _gate4_guard) = CanaryGate::new();
+    let notifier = Arc::new(GatedCanaryNotifier {
+        gate1: gate1.clone(),
+        gate2: gate2.clone(),
+        gate3: gate3.clone(),
+        gate4: gate4.clone(),
+    });
+
+    let slow_gate_a = Arc::new((Mutex::new(false), Condvar::new()));
+    let slow_gate_b = Arc::new((Mutex::new(false), Condvar::new()));
+    let _slow_gate_a_guard = GateReleaseGuard(Arc::clone(&slow_gate_a));
+    let _slow_gate_b_guard = GateReleaseGuard(Arc::clone(&slow_gate_b));
+
+    let seed_calls = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let fill_calls = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let short_lived_calls = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let preexisting_calls = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let tail_calls = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let motw_inspector = Arc::new(TwoWaveSlowMotwInspector {
+        zones,
+        slow_gate_a: Arc::clone(&slow_gate_a),
+        slow_gate_b: Arc::clone(&slow_gate_b),
+        seed_calls: Arc::clone(&seed_calls),
+        fill_calls: Arc::clone(&fill_calls),
+        short_lived_calls: Arc::clone(&short_lived_calls),
+        preexisting_calls: Arc::clone(&preexisting_calls),
+        tail_calls: Arc::clone(&tail_calls),
+    });
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            dev_mode_bypass_ui_auth: true,
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            motw_sync_wait_budget_ms: 20,
+            shutdown_flush_timeout_ms: 3_000,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        notifier,
+        Arc::new(MapBinaryInspector::default()),
+        Arc::new(NullLiveProcessInspector),
+        motw_inspector,
+    );
+    let sender = engine.sender();
+
+    // 1. Hold `run_pipeline` at Gate 1 and saturate `motw_result_tx` (64/64) with seed groups.
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: 99_001,
+            target_path: r"C:\Temp\gate1_canary.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 2,
+            is_write_or_delete: true,
+            timestamp_ms: base_ms + 1,
+        })
+        .await
+        .expect("send gate1 canary");
+    let g1_wait = Arc::clone(&gate1.entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&g1_wait, 1))
+        .await
+        .expect("wait gate1 entered");
+
+    assert_eq!(
+        engine.seed_processes(seed_events).expect("seed 64 MOTW groups"),
+        SEED_COUNT
+    );
+    let seed_wait = Arc::clone(&seed_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&seed_wait, SEED_COUNT))
+        .await
+        .expect("wait 64 seeds resolved into motw_result_tx");
+
+    // 2. Wave 1 (2 slow probes + 46 fills = 48 ProcessStarts + Gate 2 canary):
+    //    `slow_probe_0` and `slow_probe_1` exceed the 20 ms sync wait budget while wedged at
+    //    `slow_gate_a`, forcing `fill_00..fill_45` to queue asynchronously. Exactly 3 Tier 1b
+    //    drains occur across the 48 events; after releasing `slow_gate_a`, `pending_late` holds
+    //    45/66 items and `process_queue` is empty.
+    for event in wave1_events {
+        sender.send(event).await.expect("send wave1 ProcessStart");
+    }
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: 99_002,
+            target_path: r"C:\Temp\gate2_canary.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 2,
+            is_write_or_delete: true,
+            timestamp_ms: base_ms + 2,
+        })
+        .await
+        .expect("send gate2 canary");
+    gate1.release();
+
+    let g2_wait = Arc::clone(&gate2.entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&g2_wait, 1))
+        .await
+        .expect("wait gate2 entered");
+    {
+        let (lock, cvar) = &*slow_gate_a;
+        let mut flag = lock.lock().expect("lock slow_gate_a");
+        *flag = true;
+        cvar.notify_all();
+    }
+    let fill_wait_48 = Arc::clone(&fill_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&fill_wait_48, WAVE1_TOTAL))
+        .await
+        .expect("wait wave1 48 fill MOTW resolutions");
+
+    // 3. Wave 2 (2 slow probes + 20 fills = 22 ProcessStarts + Gate 3 canary):
+    //    Exactly 1 Tier 1b drain occurs across the 22 events. Releasing `slow_gate_b` fills
+    //    `pending_late` to exactly 64 + 70 - 4 - 64 = 66/66 with `process_queue` empty and both
+    //    MOTW workers idle.
+    for event in wave2_events {
+        sender.send(event).await.expect("send wave2 ProcessStart");
+    }
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: 99_003,
+            target_path: r"C:\Temp\gate3_canary.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 2,
+            is_write_or_delete: true,
+            timestamp_ms: base_ms + 3,
+        })
+        .await
+        .expect("send gate3 canary");
+    gate2.release();
+
+    let g3_wait = Arc::clone(&gate3.entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&g3_wait, 1))
+        .await
+        .expect("wait gate3 entered");
+    {
+        let (lock, cvar) = &*slow_gate_b;
+        let mut flag = lock.lock().expect("lock slow_gate_b");
+        *flag = true;
+        cvar.notify_all();
+    }
+    let fill_wait_70 = Arc::clone(&fill_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&fill_wait_70, FILL_TOTAL))
+        .await
+        .expect("wait wave2 70 total fill MOTW resolutions");
+
+    // 4. Wave 3: While `pending_late` is 66/66 full and `process_queue` is empty, launch and
+    //    immediately stop two short-lived processes (`preexisting_exited.exe` and
+    //    `short_lived_tool.exe`) plus two active tail sentinels, then pause at Gate 4.
+    //    6 events before `gate4_canary` stay below the 16-event Tier 1b interleave threshold
+    //    (streak reaches 14 or 15 < 16), so zero drains occur before Gate 4.
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: preexisting_ident,
+            parent_pid: 4,
+            exe_path: preexisting_exe.to_string(),
+            command_line: "preexisting_exited.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send preexisting_exited ProcessStart");
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: preexisting_ident.pid,
+            exit_code: 0,
+            exit_time_100ns: unix_ms_to_filetime(base_ms + 20_030),
+        })
+        .await
+        .expect("send preexisting_exited ProcessStop");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: short_lived_ident,
+            parent_pid: 4,
+            exe_path: short_lived_exe.to_string(),
+            command_line: "short_lived_tool.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send short_lived_tool ProcessStart");
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: short_lived_ident.pid,
+            exit_code: 0,
+            exit_time_100ns: unix_ms_to_filetime(base_ms + 20_010),
+        })
+        .await
+        .expect("send short_lived_tool ProcessStop");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: tail1_ident,
+            parent_pid: 4,
+            exe_path: tail1_exe.to_string(),
+            command_line: "tail_active_1.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send tail_active_1 ProcessStart");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: tail2_ident,
+            parent_pid: 4,
+            exe_path: tail2_exe.to_string(),
+            command_line: "tail_active_2.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send tail_active_2 ProcessStart");
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: 99_004,
+            target_path: r"C:\Temp\gate4_canary.docx".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 2,
+            is_write_or_delete: true,
+            timestamp_ms: base_ms + 4,
+        })
+        .await
+        .expect("send gate4 canary");
+    gate3.release();
+
+    let g4_wait = Arc::clone(&gate4.entered);
+    tokio::task::spawn_blocking(move || wait_count_reached(&g4_wait, 1))
+        .await
+        .expect("wait gate4 entered");
+
+    // Verify full `pending_late` deferred synchronous MOTW wait even with `motw_sync_wait_budget_ms > 0`,
+    // and both short-lived processes have already exited in SQLite with `origin_url == None`.
+    assert_eq!(
+        *short_lived_calls
+            .0
+            .lock()
+            .expect("lock short_lived_calls at gate4"),
+        0,
+        "short_lived_tool.exe must remain deferred while pending_late is saturated"
+    );
+    assert_eq!(
+        *preexisting_calls
+            .0
+            .lock()
+            .expect("lock preexisting_calls at gate4"),
+        0,
+        "preexisting_exited.exe must remain deferred while pending_late is saturated"
+    );
+    assert_eq!(
+        *tail_calls.0.lock().expect("lock tail_calls at gate4"),
+        0,
+        "tail active sentinels must remain deferred while pending_late is saturated"
+    );
+
+    store.flush_batch().expect("flush batch at gate4");
+    let pre_short_snap = store
+        .query_flight_recorder(10, Some(&short_lived_ident.instance_id()))
+        .expect("query short_lived_tool at gate4");
+    assert_eq!(pre_short_snap.processes.len(), 1);
+    assert!(
+        pre_short_snap.processes[0].exited_at_ms.is_some(),
+        "short_lived_tool.exe must already be marked exited before late MOTW resolves"
+    );
+    assert_eq!(
+        pre_short_snap.processes[0].origin_url, None,
+        "short_lived_tool.exe must not yet have origin_url while deferred"
+    );
+
+    let pre_existing_snap = store
+        .query_flight_recorder(10, Some(&preexisting_ident.instance_id()))
+        .expect("query preexisting_exited at gate4");
+    assert_eq!(pre_existing_snap.processes.len(), 1);
+    assert!(pre_existing_snap.processes[0].exited_at_ms.is_some());
+    assert_eq!(pre_existing_snap.processes[0].origin_url, None);
+
+    // Pre-populate SQLite `origin_url` for `preexisting_exited.exe` while its table entry still
+    // has `origin_url == None`, verifying delayed backfill uses `COALESCE` without overwriting.
+    assert!(
+        store
+            .update_process_motw_metadata(
+                &preexisting_ident.instance_id(),
+                Some(preexisting_keep_url),
+                None,
+            )
+            .expect("seed preexisting SQLite origin_url"),
+        "preexisting_exited row must exist in SQLite before Gate 4 release"
+    );
+
+    // 5. Release Gate 4 and verify delayed MOTW drains cleanly, backfills SQLite history for
+    //    `short_lived_tool.exe`, preserves `preexisting_exited.exe` via `COALESCE`, grants zero
+    //    L-18 WFP blocks to exited processes, and persists all 138 processes with zero loss.
+    gate4.release();
+
+    let sl_wait = Arc::clone(&short_lived_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&sl_wait, 1))
+        .await
+        .expect("wait short_lived_tool MOTW lookup");
+    let pre_wait = Arc::clone(&preexisting_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&pre_wait, 1))
+        .await
+        .expect("wait preexisting_exited MOTW lookup");
+    let tail_wait = Arc::clone(&tail_calls);
+    tokio::task::spawn_blocking(move || wait_count_reached(&tail_wait, 2))
+        .await
+        .expect("wait tail active sentinels MOTW lookups");
+
+    let persist_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = store.flush_batch();
+        let snap = store
+            .query_flight_recorder(512, None)
+            .expect("query persisted MOTW attributions");
+        let matched = snap
+            .processes
+            .iter()
+            .filter(|p| {
+                expected_origins
+                    .get(&p.process_instance_id)
+                    .is_some_and(|exp| p.origin_url.as_deref() == Some(exp.as_str()))
+            })
+            .count();
+        if matched == EXPECTED_TOTAL {
+            break;
+        }
+        assert!(
+            Instant::now() < persist_deadline,
+            "timed out waiting for all {EXPECTED_TOTAL} MOTW origin_urls (matched={matched})"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let post_short_snap = store
+        .query_flight_recorder(10, Some(&short_lived_ident.instance_id()))
+        .expect("query short_lived_tool after drain");
+    assert_eq!(post_short_snap.processes.len(), 1);
+    assert_eq!(
+        post_short_snap.processes[0].origin_url.as_deref(),
+        Some(short_lived_url),
+        "short_lived_tool.exe must backfill SQLite origin_url after exiting"
+    );
+    assert!(
+        post_short_snap.processes[0].exited_at_ms.is_some(),
+        "short_lived_tool.exe must retain exited_at_ms after SQLite history backfill"
+    );
+
+    let post_preexisting_snap = store
+        .query_flight_recorder(10, Some(&preexisting_ident.instance_id()))
+        .expect("query preexisting_exited after drain");
+    assert_eq!(post_preexisting_snap.processes.len(), 1);
+    assert_eq!(
+        post_preexisting_snap.processes[0].origin_url.as_deref(),
+        Some(preexisting_keep_url),
+        "delayed MOTW backfill must not overwrite an existing SQLite origin_url (COALESCE)"
+    );
+    assert!(post_preexisting_snap.processes[0].exited_at_ms.is_some());
+
+    let wfp_calls = defense.added_wfp();
+    assert!(
+        !wfp_calls
+            .iter()
+            .any(|c| c.exe_path.ends_with("short_lived_tool.exe")),
+        "exited short_lived_tool.exe must not receive an L-18 pre-emptive WFP block"
+    );
+    assert!(
+        !wfp_calls
+            .iter()
+            .any(|c| c.exe_path.ends_with("preexisting_exited.exe")),
+        "exited preexisting_exited.exe must not receive an L-18 pre-emptive WFP block"
+    );
+    assert!(
+        wfp_calls.iter().any(|c| c.exe_path.ends_with("tail_active_1.exe"))
+            && wfp_calls.iter().any(|c| c.exe_path.ends_with("tail_active_2.exe"))
+            && wfp_calls.iter().any(|c| c.exe_path.ends_with("seed_00.exe"))
+            && wfp_calls.iter().any(|c| c.exe_path.ends_with("fill_00.exe")),
+        "active MOTW processes must still receive L-18 pre-emptive WFP blocks"
+    );
+    assert_eq!(engine.high_priority_dropped(), 0);
+
+    let shutdown_t0 = Instant::now();
+    engine
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown_and_flush must complete cleanly within budget");
+    assert!(
+        shutdown_t0.elapsed() < Duration::from_secs(3),
+        "shutdown_and_flush exceeded 3s budget: {:?}",
+        shutdown_t0.elapsed()
+    );
+
+    let final_snap = store
+        .query_flight_recorder(512, None)
+        .expect("query final flight recorder");
+    let final_matched = final_snap
+        .processes
+        .iter()
+        .filter(|p| {
+            expected_origins
+                .get(&p.process_instance_id)
+                .is_some_and(|exp| p.origin_url.as_deref() == Some(exp.as_str()))
+        })
+        .count();
+    assert_eq!(
+        final_matched, EXPECTED_TOTAL,
+        "all {EXPECTED_TOTAL} processes must preserve their expected origin_url with zero loss"
     );
 }

@@ -2193,7 +2193,7 @@ mod tests {
         }
         let wave1_deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let (pending_len, proc_len, reserved) = {
+            let (pending_len, proc_len, reserved, busy) = {
                 let state = pool
                     .queue_pair
                     .0
@@ -2203,21 +2203,23 @@ mod tests {
                     state.pending_late.len(),
                     state.process_queue.len(),
                     state.reserved_late_slots,
+                    pool.busy_workers.load(Ordering::Acquire),
                 )
             };
-            if pending_len == 64 && proc_len == 0 && reserved == 0 {
+            if pending_len == 64 && proc_len == 0 && reserved == 0 && busy == 0 {
                 break;
             }
             assert!(
                 Instant::now() < wave1_deadline,
-                "timed out waiting for wave 1 stash (pending={pending_len}, proc={proc_len}, reserved={reserved})"
+                "timed out waiting for wave 1 stash (pending={pending_len}, proc={proc_len}, reserved={reserved}, busy={busy})"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
 
-        // Wave 2: Submit 36 more jobs (`rt-064`..`rt-099`): 2 fill `pending_late` to 66/66 and
-        // the remaining 34 wait in `process_queue`.
-        for i in 64..100 {
+        // Wave 2: Submit exactly 2 more jobs (`rt-064`, `rt-065`) so `pending_late` reaches
+        // 66/66 while `process_queue`, `download_queue`, `reserved_late_slots`, and `busy_workers`
+        // all return to 0.
+        for i in 64..66 {
             assert!(matches!(
                 pool.submit_process_motw(
                     format!("rt-{i:03}"),
@@ -2229,7 +2231,7 @@ mod tests {
         }
         let wave2_deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let (pending_len, proc_len, reserved) = {
+            let (pending_len, proc_len, dl_len, reserved, busy) = {
                 let state = pool
                     .queue_pair
                     .0
@@ -2238,34 +2240,71 @@ mod tests {
                 (
                     state.pending_late.len(),
                     state.process_queue.len(),
+                    state.download_queue.len(),
                     state.reserved_late_slots,
+                    pool.busy_workers.load(Ordering::Acquire),
                 )
             };
-            if pending_len == MOTW_PENDING_LATE_CAPACITY && reserved == 0 && proc_len == 34 {
+            if pending_len == MOTW_PENDING_LATE_CAPACITY
+                && proc_len == 0
+                && dl_len == 0
+                && reserved == 0
+                && busy == 0
+            {
                 break;
             }
             assert!(
                 Instant::now() < wave2_deadline,
-                "timed out waiting for wave 2 saturation (pending={pending_len}, proc={proc_len}, reserved={reserved})"
+                "timed out waiting for wave 2 saturation (pending={pending_len}, proc={proc_len}, dl={dl_len}, reserved={reserved}, busy={busy})"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
 
-        // Wave 3: Even with `allow_sync_wait = true`, full `pending_late` must return `QueuedAsync`
-        // immediately rather than issuing a synchronous `Await` receiver.
+        // Wave 3: With workers completely idle and queues empty (`in_flight_and_queued == 0 <
+        // MOTW_IO_WORKERS`), submitting `rt-066` with `allow_sync_wait = true` must still return
+        // `QueuedAsync` SOLELY because `has_late_slot == false`.
+        {
+            let state = pool
+                .queue_pair
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let busy = pool.busy_workers.load(Ordering::Acquire);
+            let in_flight_and_queued =
+                busy + state.download_queue.len() + state.process_queue.len();
+            assert_eq!(state.pending_late.len(), MOTW_PENDING_LATE_CAPACITY);
+            assert!(state.process_queue.is_empty());
+            assert!(state.download_queue.is_empty());
+            assert_eq!(state.reserved_late_slots, 0);
+            assert_eq!(busy, 0);
+            assert!(
+                in_flight_and_queued < MOTW_IO_WORKERS,
+                "precondition failed: workers must be idle so only `has_late_slot == false` suppresses sync wait"
+            );
+        }
         assert!(matches!(
             pool.submit_process_motw(
-                "rt-100".to_string(),
-                r"C:\Apps\rt_100.exe".to_string(),
+                "rt-066".to_string(),
+                r"C:\Apps\rt_066.exe".to_string(),
                 true,
             ),
             SubmitProcessMotwOutcome::QueuedAsync
         ));
+        {
+            let state = pool
+                .queue_pair
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.process_queue.len(), 1);
+            assert_eq!(state.pending_late.len(), MOTW_PENDING_LATE_CAPACITY);
+            assert_eq!(state.reserved_late_slots, 0);
+        }
 
-        // Wave 4: Fill the remaining 29 slots of `process_queue` (`rt-101`..`rt-129`, 130 accepted
+        // Wave 4: Fill the remaining 63 slots of `process_queue` (`rt-067`..`rt-129`, 130 accepted
         // total), verify the 131st is rejected at entry, and confirm `submit_download_inspect`
         // preempts all saturated process/late queues in under 1 second.
-        for i in 101..130 {
+        for i in 67..130 {
             assert!(matches!(
                 pool.submit_process_motw(
                     format!("rt-{i:03}"),

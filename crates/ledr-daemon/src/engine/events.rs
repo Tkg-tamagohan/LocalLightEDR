@@ -69,7 +69,8 @@ impl DaemonEngine {
     }
 
     pub(super) fn apply_late_motw_attribution(&self, late: super::motw::LateMotwAttribution) {
-        let mut applied_instances: Vec<(String, String, u32)> = Vec::new();
+        let mut persist_instance_ids: Vec<String> = Vec::new();
+        let mut active_instances: Vec<(String, u32)> = Vec::new();
         {
             let mut table = self
                 .process_table
@@ -84,22 +85,26 @@ impl DaemonEngine {
                     late.attribution.frame_url.clone(),
                     late.attribution.zone_id,
                 ) {
-                    applied_instances.push((inst_id.clone(), exe_path, pid));
+                    persist_instance_ids.push(inst_id.clone());
+                    active_instances.push((exe_path, pid));
+                } else if table
+                    .get_by_instance_id(inst_id)
+                    .is_none_or(|entry| entry.origin_url.is_none())
+                {
+                    // Exited or evicted process without prior `origin_url`: still backfill
+                    // SQLite history (`COALESCE`, non-overwriting) without applying active
+                    // WFP blocks or mutating active outbound classification.
+                    persist_instance_ids.push(inst_id.clone());
                 }
             }
         }
-        if applied_instances.is_empty() {
+        if persist_instance_ids.is_empty() && active_instances.is_empty() {
             return;
         }
 
-        let mut promoted_exe_keys: HashSet<String> = HashSet::new();
-        for (inst_id, exe_path, pid) in applied_instances {
-            // Clear any pre-MOTW steady-state outbound classification so subsequent connects
-            // re-enter the high-priority enforcement path rather than staying on telemetry.
-            self.outbound_classifier.remove_pid(pid);
-
+        for inst_id in &persist_instance_ids {
             match self.store.update_process_motw_metadata(
-                &inst_id,
+                inst_id,
                 Some(&late.attribution.origin_url),
                 late.attribution.sha256.as_deref(),
             ) {
@@ -118,6 +123,13 @@ impl DaemonEngine {
                     );
                 }
             }
+        }
+
+        let mut promoted_exe_keys: HashSet<String> = HashSet::new();
+        for (exe_path, pid) in active_instances {
+            // Clear any pre-MOTW steady-state outbound classification so subsequent connects
+            // re-enter the high-priority enforcement path rather than staying on telemetry.
+            self.outbound_classifier.remove_pid(pid);
 
             if self.config.outbound_firewall_enabled {
                 let exe_key = WfpRuleManager::exe_key(&exe_path);

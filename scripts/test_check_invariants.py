@@ -405,6 +405,10 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
         self.assertIn("View 3", phase4_ui["instructions"])
         self.assertIn("KEY_WOW64_32KEY", phase4_ui["instructions"])
         self.assertIn("KEY_WOW64_64KEY", phase4_ui["instructions"])
+        self.assertIn(
+            "removing non-contamination assertions alone",
+            phase4_ui["criteria"]["true_description"],
+        )
         for text_field in (
             phase4_ui["instructions"],
             phase4_ui["criteria"]["true_description"],
@@ -416,6 +420,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertIn("manifest_path", text_field)
             self.assertIn("diagnostic", text_field.lower())
             self.assertIn("UI-P4-08", text_field)
+            self.assertIn("non-contamination", text_field)
 
         gate_script = self._require_gate_script()
 
@@ -579,9 +584,14 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             ),
             (
                 "apps/ledr-ui/js-tests/phase4_ui.test.mjs",
-                "@@ -550,2 +550,2 @@",
-                "   assert.ok(",
-                "-    !initialChromeRow.includes(escapeHtmlText(edgeDefaultPath)),\n+    html.includes(escapeHtmlText(chromeDefaultPath)),",
+                "@@ -549,5 +549,1 @@",
+                "   );",
+                (
+                    "-  assert.ok(\n"
+                    "-    !initialChromeRow.includes(escapeHtmlText(edgeDefaultPath)),\n"
+                    '-    "Chrome valid detail row should not include Edge manifest_path",\n'
+                    "-  );"
+                ),
                 {"phase4_ui_manifest_allowlist_and_wow64"},
             ),
         ]

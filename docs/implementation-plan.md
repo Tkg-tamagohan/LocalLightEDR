@@ -564,23 +564,29 @@ Phase 4 の実装項目 4 件は合成自動テストに合格して `main` へ�
 ```powershell
 # 静的検査とワークスペース全単体テスト（Phase 0〜4 共通）
 cargo clippy --workspace --all-targets --locked -- -D warnings
+if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed (exit code: $LASTEXITCODE)." }
 cargo test --workspace --locked
+if ($LASTEXITCODE -ne 0) { throw "cargo test --workspace failed (exit code: $LASTEXITCODE)." }
 
 # Layer 2 と Layer 3 バースト負荷テスト（毎秒 10,000 イベント投入時にメモリ 20 MB 以下、高優先度ドロップ 0 件を検証）
 cargo test -p ledr-daemon --test burst_budget --locked -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw "ledr-daemon burst_budget failed (exit code: $LASTEXITCODE)." }
 
 # SQLite TTL パージ（長期稼働親プロセスの孤児化防止検証）
 cargo test -p ledr-store --test ttl_purge_lineage --locked
+if ($LASTEXITCODE -ne 0) { throw "ledr-store ttl_purge_lineage failed (exit code: $LASTEXITCODE)." }
 
 # Chrome MV3 拡張単体テスト（Node 22、PowerShell 5.1 互換のファイル展開）
 $extTests = @(Get-ChildItem extensions\ledr-chrome-mv3\tests\*.test.mjs | Select-Object -ExpandProperty FullName)
 if ($extTests.Count -eq 0) { throw "No Chrome MV3 extension test files matched." }
 node --test $extTests
+if ($LASTEXITCODE -ne 0) { throw "Chrome MV3 extension tests failed (exit code: $LASTEXITCODE)." }
 
 # Tauri UI モック DOM テスト（Node 22、現行対象: apps/ledr-ui/js-tests/phase4_ui.test.mjs）
 $uiTests = @(Get-ChildItem apps\ledr-ui\js-tests\*.test.mjs | Select-Object -ExpandProperty FullName)
 if ($uiTests.Count -eq 0) { throw "No Tauri UI test files matched." }
 node --test $uiTests
+if ($LASTEXITCODE -ne 0) { throw "Tauri UI mock DOM tests failed (exit code: $LASTEXITCODE)." }
 ```
 
 上記の Cargo 系コマンドは `.github/workflows/ci.yml` の `rust-windows` ジョブで、Node テストは `static-checks` ジョブで自動実行される。

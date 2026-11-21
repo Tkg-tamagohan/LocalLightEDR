@@ -106,7 +106,7 @@ pub(crate) const MANIFEST_STATUS_UNVERIFIED: &str = "unverified";
 pub(crate) const MANIFEST_STATUS_INVALID: &str = "invalid";
 pub(crate) const MANIFEST_STATUS_NOT_REGISTERED: &str = "not_registered";
 
-const UNVERIFIED_CUSTOM_MANIFEST_MSG: &str = "manifest path is outside default LocalEDR manifest directories (unverified by UI; run 'ledr-bridge-nm status' to verify custom --manifest-dir)";
+const UNVERIFIED_CUSTOM_MANIFEST_MSG: &str = "manifest path is outside default LocalEDR manifest directories (unverified by UI; inspect the listed manifest file directly or run 'ledr-bridge-nm status' — note: CLI status checks only the 64-bit default registry view, not HKLM WOW64 32-bit view)";
 
 fn is_custom_localedr_manifest_filename(filename: &str) -> bool {
     let lower = filename.to_ascii_lowercase();

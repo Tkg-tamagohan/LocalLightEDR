@@ -22,8 +22,8 @@ cargo build --workspace --locked
 - **検証用バイナリ**：`target\debug\ledr-daemon.exe`、`target\debug\ledr-bridge-nm.exe`、`target\debug\ledr-ui.exe`、`target\debug\ledr-sim.exe`
 - **Chrome 拡張ディレクトリ**：`extensions\ledr-chrome-mv3`（固定拡張 ID `ecelachfiiiiiibpjeomfncgpegbpanh`）
 - **ローカル検証ページ**：`docs\fixtures\phase4-browser-test.html`
-- **ウィンドウ A（管理者 PowerShell）**：`ledr-daemon.exe` の起動と停止、`--scope machine` 検証用
-- **ウィンドウ B（通常ユーザー PowerShell）**：既存設定の退避、`ledr-bridge-nm.exe setup`、ローカル HTTP サーバ起動、Chrome 起動、`ledr-ui.exe` 起動、後片付け用
+- **ウィンドウ A（64 ビット版管理者 PowerShell）**：`ledr-daemon.exe` の起動と停止、`--scope machine` 検証用
+- **ウィンドウ B（64 ビット版通常ユーザー PowerShell）**：既存設定の退避、`ledr-bridge-nm.exe setup`、ローカル HTTP サーバ起動、Chrome 起動、`ledr-ui.exe` 起動、後片付け用
 
 検証ごとに独立した一時フォルダを作成し、テスト用 NRD ドメインリスト、ダウンロード用無害実行ファイル（`ledr-sim.exe` のコピー）、および `E2E-P4-06` 用のダミーカナリアディレクトリを `ledr-daemon.exe` 起動前に準備してください。
 
@@ -49,7 +49,10 @@ Chrome へ隔離プロファイル（`--user-data-dir`）を指定しても、Wi
 `ledr-bridge-nm.exe setup` は既存の登録値を上書きし、後片付けの `unregister` は元の設定へ戻さずに削除するため、本手順は検証専用の Windows 環境で実施するか、実行前に既存のレジストリキーとマニフェストを `$runDir\backup` へ退避してから進めてください。
 
 ```powershell
-# ウィンドウ B（通常ユーザー権限）: 既存の HKCU 登録とマニフェストを退避（未登録キーはスキップ）
+# ウィンドウ B（64 ビット版通常ユーザー権限）: 既存の HKCU 登録とマニフェストを退避（未登録キーはスキップ）
+if (-not [Environment]::Is64BitProcess) {
+    throw "32 ビット版 PowerShell では System32 がリダイレクトされるため、64 ビット版 PowerShell で実行してください。"
+}
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 $hkcuBackups = @(
     @{ Key = "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge"; File = "hkcu_chrome_nmh.reg" },
@@ -85,7 +88,10 @@ cd e:\Documents\code\LocalEDR
 マシン単位で URI と AUMID を検証しない場合は、`setup` に `--skip-uri`、後片付けの `unregister` に `--keep-uri` を指定すると両キーを変更せずに検証できます。
 
 ```powershell
-# ウィンドウ A（管理者 PowerShell）: 管理者専用の退避先へ HKLM とマシンマニフェストを退避
+# ウィンドウ A（64 ビット版管理者 PowerShell）: 管理者専用の退避先へ HKLM とマシンマニフェストを退避
+if (-not [Environment]::Is64BitProcess) {
+    throw "32 ビット版 PowerShell では System32 がリダイレクトされ 64 ビットビューを退避できないため、64 ビット版 PowerShell で実行してください。"
+}
 cd e:\Documents\code\LocalEDR
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 $reg32 = "$env:SystemRoot\SysWOW64\reg.exe"
@@ -195,15 +201,15 @@ if (-not (Test-Path $chromeExe)) { $chromeExe = "${env:ProgramFiles(x86)}\Google
 | `E2E-P4-03` | `http://nrd-sim.localedr.invalid:8765/phase4-browser-test.html` の `Password` 欄へフォーカスして 1 文字入力し、`ledr-ui` で `Refresh` を押下 | ブラウザ内に NRD 警告が表示され、View 1 に `NrdPasswordWarning` が記録される |
 | `E2E-P4-04` | `http://login-paypa1.localedr.invalid:8765/phase4-browser-test.html` の `Password` 欄へフォーカスして 1 文字入力し、`ledr-ui` で `Refresh` を押下 | ブラウザ内にホモグラフ警告（対象ブランド `paypal`）が表示され、View 1 に `HomographWarning` が記録される |
 | `E2E-P4-05` | `Fetch safe-sim.localedr.invalid` と `Fetch c2-sim.localedr.invalid` を順に押下し、`ledr-ui` で `Refresh` を押下 | `safe-sim` は `HTTP 200` で成功し、`c2-sim` と `blocked-test` は DNR 静的ルールで即座に遮断され、`DnrBlockedRequest` が記録される |
-| `E2E-P4-06` | `Download localedr-e2e-sample.exe` でダウンロード完了後、まず `ledr-ui` で `Refresh` を押下し、View 2（`Downloads` タブ）に元パスと SHA-256 が記録されたことを確認してから、下記コマンドで `$runDir\moved\localedr-e2e-sample.exe` へ移動して `--scenario cookies-open` を実行し、再度 `ledr-ui` で `Refresh` を押下 | 移動前に View 2 へ元パスと SHA-256 が記録され、View 3 の `Tracked Downloads` が増加している。移動後の起動により View 1 に `localedr-e2e-sample.exe` の `LEDR-CANARY-COOKIE_DB` アラートと MOTW カード（`Origin URL`、`Source`、一致ダウンロード行）が表示され、`Allow Once` で再開できる。View 2 のプロセスツリーに `MOTW` バッジと `Origin URL (MOTW)`、選択時の `download_origins` 行（`referrer_url` と短縮 `sha256`）が表示される |
+| `E2E-P4-06` | `Download localedr-e2e-sample.exe` でダウンロード完了後、まず `ledr-ui` で `Refresh` を押下し、View 2（`Canary & Downloads` タブ・`Scope: All Processes`）に元パスと SHA-256 が記録されたことを確認してから、下記コマンドで `$runDir\moved\localedr-e2e-sample.exe` へ移動して `--scenario cookies-open` を実行し、再度 `ledr-ui` で `Refresh` を押下 | 移動前に View 2 の `Canary & Downloads` タブへ元パスと短縮 `sha256` が記録され、View 3 の `Tracked Downloads` 件数が増加している。移動後の起動により View 1 に `localedr-e2e-sample.exe` の `LEDR-CANARY-COOKIE_DB` アラートと MOTW カード（`Origin URL`、`Source`、一致ダウンロード行）が表示され、`Allow Once` で再開できる。View 2 のプロセスツリーに `MOTW` バッジと `Origin URL (MOTW)`、選択時の `download_origins` 行（`referrer_url` と短縮 `sha256`）が表示される |
 | `E2E-P4-07` | View 1 の未解決 `LAYER_4_BROWSER` アラートを `Acknowledge` で解決後、`ledr-ui` ウィンドウを閉じる | View 1 で解決状態へ遷移し、ウィンドウ閉鎖後に `ledr-ui` と WebView2 の残留プロセスが 0 件になる |
 
-`E2E-P4-06` では、拡張機能のダウンロード完了通知とデーモン側の SHA-256 算出が非同期で走るため、**移動コマンドを実行する前に** `ledr-ui` 上部の `Refresh` を押し、View 2 の `Downloads` タブ（または View 3 の `Tracked Downloads`）に `Downloads\localedr-e2e-sample.exe` と短縮 `sha256` が記録されたことを確かめてください。
+`E2E-P4-06` では、拡張機能のダウンロード完了通知とデーモン側の SHA-256 算出が非同期で走るため、**移動コマンドを実行する前に** `ledr-ui` 上部の `Refresh` を押し、View 2 の `Canary & Downloads` タブ（`Scope: All Processes`）に `Downloads\localedr-e2e-sample.exe` と短縮 `sha256` が記録されたことを確かめてください（View 3 の `Tracked Downloads` は件数表示のみのため、パスと `sha256` の確認は必ず View 2 で行います）。
 記録を確認してから、ウィンドウ B で移動とダミーカナリア起動を実行します。
 `localedr-e2e-sample.exe` は検知直後に凍結されるため、`Start-Process -PassThru` で別プロセスとして起動し、再度 `Refresh` を押して View 1 と View 2 を確認したあとに `Allow Once` で再開します。
 
 ```powershell
-# ウィンドウ B（通常ユーザー PowerShell）: View 2 で元パスと SHA-256 の記録を確認した後に実行
+# ウィンドウ B（通常ユーザー PowerShell）: View 2 の Canary & Downloads タブで元パスと SHA-256 の記録を確認した後に実行
 New-Item -ItemType Directory -Force -Path "$runDir\moved" | Out-Null
 Move-Item "$env:USERPROFILE\Downloads\localedr-e2e-sample.exe" "$runDir\moved\localedr-e2e-sample.exe" -Force
 $simMotw = Start-Process -FilePath "$runDir\moved\localedr-e2e-sample.exe" -ArgumentList "--scenario", "cookies-open", "--base-dir", "$runDir\canary_dir", "--hold-ms", "120000", "--json" -PassThru
@@ -276,7 +282,10 @@ Get-Process ledr-daemon -ErrorAction SilentlyContinue
 手順 1 で既存設定を `$runDir\backup` へ退避していた場合は、一時フォルダを削除する前に `reg import` とマニフェスト書き戻しで元の登録を復元します。
 
 ```powershell
-# 2. ウィンドウ B（通常ユーザー PowerShell）: ローカルサーバ停止、登録解除、既存 HKCU 設定復元
+# 2. ウィンドウ B（64 ビット版通常ユーザー PowerShell）: ローカルサーバ停止、登録解除、既存 HKCU 設定復元
+if (-not [Environment]::Is64BitProcess) {
+    throw "64 ビット版 PowerShell で実行してください。"
+}
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 if ($serverProc -and -not $serverProc.HasExited) { Stop-Process -Id $serverProc.Id -Force }
 if ($simMotw -and -not $simMotw.HasExited) { Stop-Process -Id $simMotw.Id -Force -ErrorAction SilentlyContinue }
@@ -299,7 +308,10 @@ if (Test-Path "$runDir\backup\user-native-messaging") {
 管理者ウィンドウ A で `--scope machine` を登録していた場合は、ウィンドウ A で解除と管理者専用退避フォルダ（`$adminBackupDir`）からの復元を実行し、すべての復元成功を確認してから `$adminBackupDir` を削除してください。
 
 ```powershell
-# 3. ウィンドウ A（管理者 PowerShell）: --scope machine を登録した場合のみ実施
+# 3. ウィンドウ A（64 ビット版管理者 PowerShell）: --scope machine を登録した場合のみ実施
+if (-not [Environment]::Is64BitProcess) {
+    throw "32 ビット版 PowerShell では 64 ビットビューを復元できないため、64 ビット版 PowerShell で実行してください。"
+}
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 $reg32 = "$env:SystemRoot\SysWOW64\reg.exe"
 .\target\debug\ledr-bridge-nm.exe unregister --scope machine --browsers chrome,edge

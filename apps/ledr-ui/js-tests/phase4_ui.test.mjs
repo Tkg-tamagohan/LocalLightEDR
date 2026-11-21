@@ -508,18 +508,19 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
   assert.match(html, /<dd class="mono">3<\/dd>/);
 
   // Custom `--manifest-dir` outside default 2 directories renders as `Unverified` (distinct from red `Invalid`).
+  const customUnverifiedNote =
+    "manifest path is outside default LocalEDR manifest directories (unverified by UI; inspect the listed manifest file directly or run 'ledr-bridge-nm status' — note: CLI status checks only the 64-bit default registry view, not HKLM WOW64 32-bit view)";
   ui.state.localDefenseStatus.browser_shield.manifest_status = "unverified";
-  ui.state.localDefenseStatus.browser_shield.manifest_error =
-    "Edge: manifest path is outside default LocalEDR manifest directories (unverified by UI; run 'ledr-bridge-nm status' to verify custom --manifest-dir)";
+  ui.state.localDefenseStatus.browser_shield.manifest_error = `Edge: ${customUnverifiedNote}`;
   ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_status = "unverified";
-  ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_error =
-    "manifest path is outside default LocalEDR manifest directories (unverified by UI; run 'ledr-bridge-nm status' to verify custom --manifest-dir)";
+  ui.state.localDefenseStatus.browser_shield.browsers[1].manifest_error = customUnverifiedNote;
   ui.renderPolicyView();
   const unverifiedHtml = ui.el.browserShieldDl.innerHTML;
   assert.match(unverifiedHtml, /badge-unsigned">Unverified</);
   assert.match(unverifiedHtml, /badge-unsigned">HKLM Unverified</);
   assert.doesNotMatch(unverifiedHtml, />Invalid</);
   assert.match(unverifiedHtml, /ledr-bridge-nm status/);
+  assert.match(unverifiedHtml, /WOW64 32-bit/);
 });
 
 test("UI-P4-09: Same-path download with different SHA-256 is excluded without path fallback", () => {

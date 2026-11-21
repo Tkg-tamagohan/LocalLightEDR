@@ -2267,7 +2267,11 @@ fn ui_p4_13_manifest_allowlist_reparse_hardlink_and_sensitive_file_non_touch() {
             .browser_shield
             .manifest_error
             .as_deref()
-            .is_some_and(|m| m.contains("Edge:") && m.contains("ledr-bridge-nm status")),
+            .is_some_and(|m| {
+                m.contains("Edge:")
+                    && m.contains("ledr-bridge-nm status")
+                    && m.contains("WOW64 32-bit")
+            }),
         "unexpected unverified note: {:?}",
         custom_status.browser_shield.manifest_error
     );

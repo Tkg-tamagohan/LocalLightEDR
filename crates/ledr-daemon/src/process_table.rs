@@ -2300,12 +2300,15 @@ mod tests {
     }
 
     /// Regression test `PT-EVICT-01` (`PRRT_kwDOVyjVyM66k6lW`, `PRRT_kwDOVyjVyM66k6mA`,
-    /// `PRRT_kwDOVyjVyM66k6ks`):
+    /// `PRRT_kwDOVyjVyM66k6ks`, `PRRT_kwDOVyjVyM66lPbl`):
     /// verifies that:
     /// 1. Re-registering and re-evicting a process does not let stale `evicted_live_fifo` entries
     ///    prematurely evict the newer generation into `overflowed_evicted_live_exes`, so normal
     ///    `ProcessStop` still resolves the process and clears `has_active_exe_key`.
-    /// 2. `evicted_live_by_pid` stays synchronized across eviction, re-registration, `pid:0`
+    /// 2. `remove_evicted_live_by_id` FIFO compaction (`retain`) checks generation equality while
+    ///    the target process remains live-evicted, pruning stale generations of A and keeping
+    ///    only A's current generation when another evicted process (C2) is removed.
+    /// 3. `evicted_live_by_pid` stays synchronized across eviction, re-registration, `pid:0`
     ///    snapshot absorption, out-of-order older start, PID reuse supersede, and explicit stop.
     #[test]
     fn process_table_evicted_live_generation_fifo_and_pid_index_stay_exact() {
@@ -2411,16 +2414,20 @@ mod tests {
         assert_eq!(older_res.exited_at_ms, Some(100));
         assert!(older_res.superseded_exited_processes.is_empty());
 
-        // 7. Re-register and re-evict A > 16 times to trigger `remove_evicted_live_by_id` FIFO
-        //    compaction (`retain`) and verify stale generations are pruned without losing A.
-        let mut saw_fifo_compaction = false;
-        for cycle in 0..18u32 {
-            let fifo_before = table.evicted_live_fifo.len();
+        // 7. Re-register and re-evict A until `evicted_live_fifo.len() > 16` while A remains in
+        //    `evicted_live` alongside C2, then trigger `remove_evicted_live_by_id` compaction by
+        //    stopping C2 (NOT A) so `retain` must distinguish A's stale generations from A's
+        //    current live generation (`PRRT_kwDOVyjVyM66lPbl`).
+        assert!(table.evicted_live.contains_key(&id_a.instance_id()));
+        assert!(table.evicted_live.contains_key(&id_c2.instance_id()));
+        let mut cycle: u32 = 0;
+        while table.evicted_live_fifo.len() <= 16 {
+            assert!(
+                cycle < 32,
+                "evicted_live_fifo must cross the compaction threshold within 32 cycles"
+            );
             table.on_process_start(id_a, 4, exe_a.to_string(), "a.exe".to_string(), None, 100);
             assert!(!table.evicted_live.contains_key(&id_a.instance_id()));
-            if fifo_before > 16 && table.evicted_live_fifo.len() < fifo_before {
-                saw_fifo_compaction = true;
-            }
             let pad_id = ProcessIdentity::new(8200 + cycle, 10_500_000 + u64::from(cycle) * 10_000);
             let pad_ts = 150 + i64::from(cycle) * 2;
             table.on_process_start(
@@ -2436,15 +2443,47 @@ mod tests {
                 table.on_process_stop_with_exe(pad_id.pid, pad_ts + 1).map(|(id, _)| id),
                 Some(pad_id.instance_id())
             );
+            cycle += 1;
         }
+        let current_a_gen = table
+            .evicted_live
+            .get(&id_a.instance_id())
+            .expect("A must remain in evicted_live before compaction")
+            .generation;
+        let a_fifo_entries_before = table
+            .evicted_live_fifo
+            .iter()
+            .filter(|(id, _)| id == &id_a.instance_id())
+            .count();
         assert!(
-            saw_fifo_compaction,
-            "repeated re-registration/re-eviction must trigger generation-aware FIFO compaction"
+            table.evicted_live_fifo.len() > 16,
+            "evicted_live_fifo must exceed compaction threshold before stopping C2 (len={})",
+            table.evicted_live_fifo.len()
         );
         assert!(
-            table.evicted_live_fifo.len() <= 16,
-            "generation-aware FIFO compaction must keep evicted_live_fifo bounded (len={})",
-            table.evicted_live_fifo.len()
+            a_fifo_entries_before > 1,
+            "A must have both stale and current generations in evicted_live_fifo before compaction (count={a_fifo_entries_before})"
+        );
+
+        // Stop C2 while A stays in `evicted_live` -> triggers `remove_evicted_live_by_id`
+        // compaction; only A's current generation may survive in `evicted_live_fifo`.
+        assert_eq!(
+            table.on_process_stop_with_exe(id_c2.pid, 250),
+            Some((id_c2.instance_id(), exe_c.to_string()))
+        );
+        assert!(!table.evicted_live.contains_key(&id_c2.instance_id()));
+        assert!(!table.evicted_live_by_pid.contains_key(&id_c2.pid));
+        assert!(!table.has_active_exe_key(&key_c));
+        assert_eq!(
+            table.evicted_live.get(&id_a.instance_id()).map(|rec| rec.generation),
+            Some(current_a_gen),
+            "A must remain in evicted_live at its current generation after C2 stop compaction"
+        );
+        assert!(table.evicted_live_by_pid.contains_key(&id_a.pid));
+        assert_eq!(
+            table.evicted_live_fifo.iter().cloned().collect::<Vec<_>>(),
+            vec![(id_a.instance_id(), current_a_gen)],
+            "generation-aware FIFO compaction must prune all stale generations of A and retain only A's current generation"
         );
 
         // 8. Stop A normally -> resolves from evicted_live via PID index and clears liveness!

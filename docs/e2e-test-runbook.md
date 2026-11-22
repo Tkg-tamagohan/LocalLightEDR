@@ -675,8 +675,11 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 .\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
 ```
 
-ウィンドウ A に `refreshed daily NRD domain cache`（`entries > 0`、`feeds_succeeded=2`、`feeds_failed=0`）が出力されたら、`ledr-ui` の `View 3` 右下にある `NRD / Homograph Check` 欄へ次の 3 つを順に入力して `Check` を押してください。
-なお、公開 2 フィードのうち 1 件が失敗した場合（`feeds_succeeded=1`、`feeds_failed=1`）でも `nrd-cache.txt` 自体は仕様どおり保存されるため、後続の Track C（`E2E-PERF-01`）を正式な 2 フィード実測値として扱う前提として `feeds_succeeded=2` かつ `feeds_failed=0` を必ず確認し、単一フィード成功に留まった場合はその件数を合否記録表へ明記してください。
+ウィンドウ A に `refreshed daily NRD domain cache`（`feeds_succeeded >= 1` かつ `entries > 0`）が出力されたら、保存されたキャッシュを用いて `ledr-ui` の `View 3` 右下にある `NRD / Homograph Check` 欄へ次の 3 つを順に入力し、`Check` を押してドメイン診断を確認してください。
+一方、後続の Track C（`E2E-PERF-01`）を正式な公開 2 フィード実測値として扱う条件は `feeds_succeeded=2` かつ `feeds_failed=0` であり、画面診断の確認条件とは分けて判定します。
+公開 2 フィードのうち 1 件のみ成功した場合（`feeds_succeeded=1`、`feeds_failed=1`）でも期限内の `nrd-cache.txt` が保存され、デーモンの更新処理（`crates/ledr-daemon/src/engine/pipeline.rs`）は期限内キャッシュを再取得しないため、同じパスのまま再起動しても 2 フィード全体は再取得されません。
+2 フィード取得を再試行する場合は、ウィンドウ A を `Ctrl+C` で停止してから既存の `Join-Path $runDir "nrd-cache.txt"` を削除して再起動するか、新しい `--nrd-cache` パスを指定して再起動してください（新しいパスで `feeds_succeeded=2` を得た場合、Track C で読み込ませるには `Join-Path $runDir "nrd-cache.txt"` へ上書き配置します）。
+単一フィード成功のまま次へ進む場合は、合否記録表へ `feeds_succeeded=1` と `entries` 件数を明記し、Track C では「単一フィード参考値」として記録してください。
 
 1. `paypa1.com`：期待結果は `Not in NRD` と `Homograph: paypal`
 2. `google.com`：期待結果は `Not in NRD` と `No Homograph`
@@ -1244,8 +1247,10 @@ $env:RUST_LOG = "info,ledr_daemon=debug"
 if ($LASTEXITCODE -ne 0) { throw "Program Files ブリッジの一時登録に失敗しました。" }
 ```
 
-   - **一致ハッシュ受理**：ウィンドウ A が一致する `--bridge-sha256 $bridgeHash` で稼働中の状態で、Chrome の検証ページ（`http://clickfix-sim.localedr.invalid:8765/phase4-browser-test.html` 等、30 秒重複抑止を避ける場合は別サブドメイン）から ClickFix 操作を実行し、`C:\Program Files\LocalEDR\ledr-ui.exe` の `View 1` へ `LAYER_4_BROWSER` が新規記録されることを確認する。
-   - **不一致ハッシュ拒否**：ウィンドウ A を `Ctrl+C` で止め、`--bridge-sha256 0000000000000000000000000000000000000000000000000000000000000000` を指定して `C:\Program Files\LocalEDR\ledr-daemon.exe` を再起動したうえで再度ブラウザイベントを送出する。
+   - **一致ハッシュ受理**：ウィンドウ A が一致する `--bridge-sha256 $bridgeHash` で稼働中の状態で、Chrome の検証ページ（`http://clickfix-sim.localedr.invalid:8765/phase4-browser-test.html` 等、30 秒重複抑止を避ける場合は新しいタブまたは `E2E-P4-00` で登録済みの別テストオリジン）から ClickFix 操作を実行し、`C:\Program Files\LocalEDR\ledr-ui.exe` の `View 1` へ `LAYER_4_BROWSER` が新規記録されることを確認する。
+   - **不一致ハッシュ拒否**：ウィンドウ A を `Ctrl+C` で止め、`--bridge-sha256 0000000000000000000000000000000000000000000000000000000000000000` を指定して `C:\Program Files\LocalEDR\ledr-daemon.exe` を再起動したうえで、再びブラウザイベントを送出する。
+     デーモンを再起動しても拡張側（`chrome.storage.session`）の 30 秒重複抑止（`tabId`、オリジン、イベント種別の組）は残るため、同じタブとオリジンで 30 秒以内に再操作すると IPC 自体が送信されず拒否結果を確認できない。
+     IPC 送信を確実に行うため、新しいタブで検証ページを開くか、`E2E-P4-00` で登録済みの別テストオリジン（例：`http://pastejack-sim.localedr.invalid:8765/phase4-browser-test.html`）を使うか、30 秒以上待ってから ClickFix 操作を実行する。
      デーモンの認可判定（`SEC_0002`）は標準出力ログではなく IPC 応答の `UNAUTHORIZED_CALLER` エラーを返し、拡張側の `native_bridge.js` が `chrome.storage.local` の `ledr_bridge_diagnostics.lastError` へ `[UNAUTHORIZED_CALLER] ...` を記録する（`Ping` を押すと `lastError` がクリアされ、ポップアップ自体は `daemonOnline: true` のままのため画面上には表示されない）。
      そのため、イベント送出直後（`Ping` を押す前）に `C:\Program Files\LocalEDR\ledr-ui.exe` の `View 1` へ新規記録されないことと、`chrome://extensions` の LocalEDR Browser Shield の Service Worker DevTools コンソールで `(await chrome.storage.local.get("ledr_bridge_diagnostics")).ledr_bridge_diagnostics.lastError` に `[UNAUTHORIZED_CALLER]` が記録されていることの両方を確認し、イベント未送信と認可拒否を区別する。
    - **一時登録解除**：確認後に Chrome と `ledr-ui.exe` を閉じ、ウィンドウ C で次を実行して一時登録を解除する（元の `HKCU` 設定の完全復元は第 7 章 `CLEAN-02` で行う）。

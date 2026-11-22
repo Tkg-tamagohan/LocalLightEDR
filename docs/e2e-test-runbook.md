@@ -675,7 +675,8 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 .\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
 ```
 
-ウィンドウ A に `refreshed daily NRD domain cache`（`entries > 0` や `feeds_succeeded=2`）が出力されたら、`ledr-ui` の `View 3` 右下にある `NRD / Homograph Check` 欄へ次の 3 つを順に入力して `Check` を押してください。
+ウィンドウ A に `refreshed daily NRD domain cache`（`entries > 0`、`feeds_succeeded=2`、`feeds_failed=0`）が出力されたら、`ledr-ui` の `View 3` 右下にある `NRD / Homograph Check` 欄へ次の 3 つを順に入力して `Check` を押してください。
+なお、公開 2 フィードのうち 1 件が失敗した場合（`feeds_succeeded=1`、`feeds_failed=1`）でも `nrd-cache.txt` 自体は仕様どおり保存されるため、後続の Track C（`E2E-PERF-01`）を正式な 2 フィード実測値として扱う前提として `feeds_succeeded=2` かつ `feeds_failed=0` を必ず確認し、単一フィード成功に留まった場合はその件数を合否記録表へ明記してください。
 
 1. `paypa1.com`：期待結果は `Not in NRD` と `Homograph: paypal`
 2. `google.com`：期待結果は `Not in NRD` と `No Homograph`
@@ -1038,8 +1039,10 @@ $env:RUST_LOG = "info"
 
 $realNrdCache = Join-Path $runDir "nrd-cache.txt"
 if (Test-Path -LiteralPath $realNrdCache) {
-    # ルート 1・ルート 2（オンライン実フィード）: --nrd-feed-url を渡すと実 2 フィードキャッシュが 1 件のテストフィードで上書きされるため、--disable-nrd-refresh で実キャッシュをそのまま読み込む
-    Write-Output "公開 2 フィードの実 NRD キャッシュを使用して正式な E2E-PERF-01 を起動します: $realNrdCache"
+    # ルート 1・ルート 2（オンライン実フィード）: --nrd-feed-url を渡すと実キャッシュが 1 件のテストフィードで上書きされるため、--disable-nrd-refresh で実キャッシュをそのまま読み込む
+    $nrdEntryCount = @(Get-Content -Encoding UTF8 -LiteralPath $realNrdCache | Where-Object { $_ -and -not $_.StartsWith("#") }).Count
+    Write-Output "実 NRD キャッシュを読み込んで E2E-PERF-01 を起動します: $realNrdCache (entries=$nrdEntryCount)"
+    Write-Output "※ 正式な公開 2 フィード実測値とするには E2E-P3-05 ログで feeds_succeeded=2, feeds_failed=0 を確認済みであること（feeds_succeeded=1 の場合は単一フィード参考値として記録）。"
     .\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "perf.db") --nrd-cache $realNrdCache
 } else {
     # ルート 3 単独またはオフライン環境: 1 件のテストキャッシュで起動し、合否記録表では「ルート 3 軽量参考値」または「オフライン参考値」として正式実測値と区別する
@@ -1049,8 +1052,9 @@ if (Test-Path -LiteralPath $realNrdCache) {
 }
 ```
 
-正式な `E2E-PERF-01`（`PeakWorkingSetMB <= 20.0`）は、`E2E-P3-05` で取得した公開 2 フィードの実 `nrd-cache.txt` を `--disable-nrd-refresh` で読み込んだ状態で計測します。
-ルート 3 単独やオフライン環境で `nrd-cache.txt` が未作成の場合は 1 件の `nrd-test-cache.txt` が使われるため、合否記録表には必ず「ルート 3 軽量参考値（NRD 1 件）」または「オフライン参考値」と明記して正式な実フィード実測値と区別してください。
+正式な `E2E-PERF-01`（`PeakWorkingSetMB <= 20.0`）は、`E2E-P3-05` の `refreshed daily NRD domain cache` ログで `feeds_succeeded=2` かつ `feeds_failed=0` を確認済みの実 `nrd-cache.txt` を `--disable-nrd-refresh` で読み込んだ状態で計測します。
+公開フィードの片方が失敗した場合でも `nrd-cache.txt` 自体は `entries > 0` で保存されるため、`E2E-P3-05` が `feeds_succeeded=1` で終わったときは合否記録表へ「単一フィード参考値（`feeds_succeeded=1`、`entries=...`）」と明記してください。
+ルート 3 単独やオフライン環境で `nrd-cache.txt` が未作成の場合は 1 件の `nrd-test-cache.txt` が使われるため、合否記録表には必ず「ルート 3 軽量参考値（NRD 1 件）」または「オフライン参考値」と明記して正式な公開 2 フィード実測値と区別してください。
 計測を始める前に、ウィンドウ A のログへ `loaded local NRD cache from disk` または `refreshed daily NRD domain cache`（どちらも `entries > 0`）が出力されたことを確認します。
 
 ### E2E-UI-01：`ledr-ui` 閉鎖時の 0 プロセス終了（`L-08`）
@@ -1241,7 +1245,9 @@ if ($LASTEXITCODE -ne 0) { throw "Program Files ブリッジの一時登録に�
 ```
 
    - **一致ハッシュ受理**：ウィンドウ A が一致する `--bridge-sha256 $bridgeHash` で稼働中の状態で、Chrome の検証ページ（`http://clickfix-sim.localedr.invalid:8765/phase4-browser-test.html` 等、30 秒重複抑止を避ける場合は別サブドメイン）から ClickFix 操作を実行し、`C:\Program Files\LocalEDR\ledr-ui.exe` の `View 1` へ `LAYER_4_BROWSER` が新規記録されることを確認する。
-   - **不一致ハッシュ拒否**：ウィンドウ A を `Ctrl+C` で止め、`--bridge-sha256 0000000000000000000000000000000000000000000000000000000000000000` を指定して `C:\Program Files\LocalEDR\ledr-daemon.exe` を再起動したうえで再度ブラウザイベントを送出し、ウィンドウ A ログで `SEC_0002` 認可拒否が出て `View 1` へ記録されないことを確認する。
+   - **不一致ハッシュ拒否**：ウィンドウ A を `Ctrl+C` で止め、`--bridge-sha256 0000000000000000000000000000000000000000000000000000000000000000` を指定して `C:\Program Files\LocalEDR\ledr-daemon.exe` を再起動したうえで再度ブラウザイベントを送出する。
+     デーモンの認可判定（`SEC_0002`）は標準出力ログではなく IPC 応答の `UNAUTHORIZED_CALLER` エラーを返し、拡張側の `native_bridge.js` が `chrome.storage.local` の `ledr_bridge_diagnostics.lastError` へ `[UNAUTHORIZED_CALLER] ...` を記録する（`Ping` を押すと `lastError` がクリアされ、ポップアップ自体は `daemonOnline: true` のままのため画面上には表示されない）。
+     そのため、イベント送出直後（`Ping` を押す前）に `C:\Program Files\LocalEDR\ledr-ui.exe` の `View 1` へ新規記録されないことと、`chrome://extensions` の LocalEDR Browser Shield の Service Worker DevTools コンソールで `(await chrome.storage.local.get("ledr_bridge_diagnostics")).ledr_bridge_diagnostics.lastError` に `[UNAUTHORIZED_CALLER]` が記録されていることの両方を確認し、イベント未送信と認可拒否を区別する。
    - **一時登録解除**：確認後に Chrome と `ledr-ui.exe` を閉じ、ウィンドウ C で次を実行して一時登録を解除する（元の `HKCU` 設定の完全復元は第 7 章 `CLEAN-02` で行う）。
 
 ```powershell
@@ -1422,17 +1428,16 @@ if (Test-Path -LiteralPath $adminBackupPtr) {
         if ($ownerSid -notin $allowedSids) {
             throw "管理者専用退避フォルダの所有者が不正なため復元を中止します: $backupFull (Owner=$ownerSid)"
         }
-        $writeRights = [System.Security.AccessControl.FileSystemRights]::Write -bor
-            [System.Security.AccessControl.FileSystemRights]::Modify -bor
-            [System.Security.AccessControl.FileSystemRights]::FullControl -bor
-            [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
-            [System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
-            [System.Security.AccessControl.FileSystemRights]::AppendData -bor
-            [System.Security.AccessControl.FileSystemRights]::WriteData
+        $writeRights = [int][System.Security.AccessControl.FileSystemRights]::Write -bor
+            [int][System.Security.AccessControl.FileSystemRights]::Delete -bor
+            [int][System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+            [int][System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [int][System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+            0x40000000 -bor 0x10000000
         foreach ($ace in $backupAcl.Access) {
             if ($ace.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) {
                 $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-                if (($aceSid -notin $allowedSids) -and (($ace.FileSystemRights -band $writeRights) -ne 0)) {
+                if (($aceSid -notin $allowedSids) -and (([int]$ace.FileSystemRights -band $writeRights) -ne 0)) {
                     throw "管理者専用退避フォルダに非管理者の書き込み ACL があるため復元を中止します: $aceSid"
                 }
             }

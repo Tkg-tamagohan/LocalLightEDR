@@ -8,8 +8,11 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use ledr_proto::HONEYPOT_DEFAULT_FILENAME;
-use ledr_sensor_win::{read_zone_identifier, write_zone_identifier, MotwZoneInfo, ZONE_ID_INTERNET};
+use ledr_proto::{ActiveDefenseController, HONEYPOT_DEFAULT_FILENAME, ProcessIdentity};
+use ledr_sensor_win::{
+    MotwZoneInfo, WindowsDefenseController, ZONE_ID_INTERNET, etw::inspect_live_process,
+    read_zone_identifier, write_zone_identifier,
+};
 use sha2::{Digest, Sha256};
 
 use super::net::{HoldOutcome, ctrl_c_signal, wait_hold_ms_with_cancel};
@@ -50,11 +53,48 @@ impl Drop for TempSimDir {
     }
 }
 
-struct ChildGuard(Option<std::process::Child>);
+struct ChildGuard {
+    child: Option<std::process::Child>,
+    identity: Option<ProcessIdentity>,
+}
+
+impl ChildGuard {
+    fn none() -> Self {
+        Self {
+            child: None,
+            identity: None,
+        }
+    }
+
+    fn from_child(child: Option<std::process::Child>) -> Self {
+        let identity = child.as_ref().and_then(|proc_child| {
+            let pid = proc_child.id();
+            let info = inspect_live_process(pid)?;
+            (info.create_time_100ns != 0).then_some(ProcessIdentity {
+                pid,
+                create_time_100ns: info.create_time_100ns,
+            })
+        });
+        Self { child, identity }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+
+    fn is_some(&self) -> bool {
+        self.child.is_some()
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(identity) = self.identity.take() {
+            // Terminate any grandchild (e.g. `ping.exe` spawned by `cmd.exe`) alongside the child
+            // with CreationTime + Never-Suspend validation so cancelled holds leave no orphans.
+            let _ = WindowsDefenseController::new().terminate_process(&identity, true);
+        }
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -251,6 +291,18 @@ pub(crate) async fn run_honeypot_write_scenario_with_cancel<F>(
 where
     F: Future<Output = ()>,
 {
+    run_honeypot_write_scenario_with_cancel_and_pid(base_dir, hold_ms, cancel, None).await
+}
+
+pub(crate) async fn run_honeypot_write_scenario_with_cancel_and_pid<F>(
+    base_dir: Option<PathBuf>,
+    hold_ms: u64,
+    cancel: F,
+    child_pid_tx: Option<tokio::sync::oneshot::Sender<Option<u32>>>,
+) -> Result<(HoneypotWriteOutcome, HoldOutcome)>
+where
+    F: Future<Output = ()>,
+{
     let (outcome, temp_guard, child_guard) = tokio::task::spawn_blocking(move || -> Result<_> {
         let temp_guard = match base_dir.as_ref() {
             Some(_) => None,
@@ -271,9 +323,9 @@ where
                 .stderr(Stdio::null())
                 .spawn()
                 .ok();
-            ChildGuard(child)
+            ChildGuard::from_child(child)
         } else {
-            ChildGuard(None)
+            ChildGuard::none()
         };
 
         let outcome = run_honeypot_write_scenario_in(target_dir)?;
@@ -282,8 +334,12 @@ where
     .await
     .context("honeypot-write simulation task panicked")??;
 
+    if let Some(tx) = child_pid_tx {
+        let _ = tx.send(child_guard.pid());
+    }
+
     let hold_outcome = wait_hold_ms_with_cancel(hold_ms, cancel).await;
-    if child_guard.0.is_some() || temp_guard.is_some() {
+    if child_guard.is_some() || temp_guard.is_some() {
         let _ = tokio::task::spawn_blocking(move || {
             drop(child_guard);
             drop(temp_guard);

@@ -1,10 +1,13 @@
 use super::*;
 use super::fs_scenarios::{
-    TempSimDir, dummy_cookie_path, dummy_honeypot_path, run_motw_download_scenario_with_ads_writer,
+    TempSimDir, dummy_cookie_path, dummy_honeypot_path,
+    run_honeypot_write_scenario_with_cancel_and_pid, run_motw_download_scenario_with_ads_writer,
 };
 use super::net::{exchange_ping_ack, handle_ping_server};
 use std::path::{Path, PathBuf};
-use ledr_proto::HONEYPOT_DEFAULT_FILENAME;
+use ledr_proto::{HONEYPOT_DEFAULT_FILENAME, ProcessIdentity};
+use ledr_sensor_win::defense::{ProcessLiveness, collect_live_descendants, process_liveness};
+use ledr_sensor_win::etw::inspect_live_process;
 
 fn base64_decode(input: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -699,6 +702,16 @@ fn find_temp_sim_dirs(prefix: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+fn is_same_process_alive(pid: u32, create_time_100ns: u64) -> bool {
+    if process_liveness(pid) == ProcessLiveness::Gone {
+        return false;
+    }
+    match inspect_live_process(pid) {
+        Some(info) if info.create_time_100ns != 0 => info.create_time_100ns == create_time_100ns,
+        _ => process_liveness(pid) == ProcessLiveness::Running,
+    }
+}
+
 #[tokio::test]
 async fn sim_p4_06_fs_scenarios_cancel_hold_promptly_and_drop_guards() {
     use std::time::{Duration, Instant};
@@ -744,17 +757,40 @@ async fn sim_p4_06_fs_scenarios_cancel_hold_promptly_and_drop_guards() {
     // 2. honeypot-write: ChildGuard + TempSimDir stay alive during hold and clean up on cancel.
     {
         let (probe, entered_rx, trigger_tx) = HoldCancelProbe::new();
+        let (child_pid_tx, child_pid_rx) = tokio::sync::oneshot::channel();
         let start = Instant::now();
-        let task = tokio::spawn(run_honeypot_write_scenario_with_cancel(
+        let task = tokio::spawn(run_honeypot_write_scenario_with_cancel_and_pid(
             None,
             LONG_HOLD_MS,
             probe,
+            Some(child_pid_tx),
         ));
 
         tokio::time::timeout(CANCEL_BUDGET, entered_rx)
             .await
             .expect("honeypot-write should enter async hold")
             .expect("entered_tx dropped unexpectedly");
+        let child_pid = tokio::time::timeout(CANCEL_BUDGET, child_pid_rx)
+            .await
+            .expect("honeypot-write should report spawned child PID")
+            .expect("child_pid_tx dropped unexpectedly")
+            .expect("honeypot-write must spawn a live child process when hold_ms > 0");
+        let child_info = inspect_live_process(child_pid)
+            .expect("honeypot-write child process must be inspectable while held");
+        assert_ne!(
+            child_info.create_time_100ns, 0,
+            "honeypot-write child process must have a non-zero CreationTime"
+        );
+        assert_eq!(
+            process_liveness(child_pid),
+            ProcessLiveness::Running,
+            "ChildGuard child PID {child_pid} must stay running during async hold"
+        );
+        let child_identity = ProcessIdentity {
+            pid: child_pid,
+            create_time_100ns: child_info.create_time_100ns,
+        };
+        let descendants_during_hold = collect_live_descendants(&child_identity);
         let dirs_during_hold = find_temp_sim_dirs("honeypot");
 
         let _ = trigger_tx.send(());
@@ -765,6 +801,17 @@ async fn sim_p4_06_fs_scenarios_cancel_hold_promptly_and_drop_guards() {
             .expect("honeypot-write result");
         assert_eq!(hold, HoldOutcome::Interrupted);
         assert!(start.elapsed() < CANCEL_BUDGET);
+        assert!(
+            !is_same_process_alive(child_pid, child_info.create_time_100ns),
+            "ChildGuard must terminate and reap child PID {child_pid} after interrupted hold"
+        );
+        for desc in &descendants_during_hold {
+            assert!(
+                !is_same_process_alive(desc.pid, desc.create_time_100ns),
+                "ChildGuard must terminate descendant PID {} after interrupted hold",
+                desc.pid
+            );
+        }
         let target_path = Path::new(&outcome.target_path);
         let held_dir = dirs_during_hold
             .iter()
@@ -811,36 +858,56 @@ async fn sim_p4_06_fs_scenarios_cancel_hold_promptly_and_drop_guards() {
         );
     }
 
-    // 4. Aborting an async hold and dropping a Tokio Runtime must not hang on spawn_blocking.
-    let drop_elapsed = tokio::task::spawn_blocking(|| {
+    // 4. Aborting an async hold and dropping a Tokio Runtime must not hang on spawn_blocking
+    // and must still drop ChildGuard to terminate the spawned child process.
+    let (drop_elapsed, aborted_child_pid, aborted_child_ct) = tokio::task::spawn_blocking(|| {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("build isolated runtime");
         let (probe, entered_rx, _trigger_tx) = HoldCancelProbe::new();
-        let handle = rt.spawn(run_honeypot_write_scenario_with_cancel(
+        let (child_pid_tx, child_pid_rx) = tokio::sync::oneshot::channel();
+        let handle = rt.spawn(run_honeypot_write_scenario_with_cancel_and_pid(
             None,
             LONG_HOLD_MS,
             probe,
+            Some(child_pid_tx),
         ));
-        rt.block_on(async {
+        let (child_pid, child_ct) = rt.block_on(async {
             tokio::time::timeout(CANCEL_BUDGET, entered_rx)
                 .await
                 .expect("isolated honeypot-write should enter async hold")
                 .expect("entered_tx dropped");
+            let pid = tokio::time::timeout(CANCEL_BUDGET, child_pid_rx)
+                .await
+                .expect("isolated honeypot-write should report child PID")
+                .expect("child_pid_tx dropped")
+                .expect("isolated honeypot-write must spawn child when hold_ms > 0");
+            let info = inspect_live_process(pid)
+                .expect("isolated honeypot-write child must be inspectable while held");
+            assert_eq!(
+                process_liveness(pid),
+                ProcessLiveness::Running,
+                "isolated ChildGuard child PID {pid} must be running before abort"
+            );
             handle.abort();
             let _ = handle.await;
+            (pid, info.create_time_100ns)
         });
         let drop_start = Instant::now();
         drop(rt);
-        drop_start.elapsed()
+        (drop_start.elapsed(), child_pid, child_ct)
     })
     .await
     .expect("runtime drop check join");
     assert!(
         drop_elapsed < CANCEL_BUDGET,
         "Runtime::drop hung instead of returning promptly: {drop_elapsed:?}"
+    );
+    assert!(
+        !is_same_process_alive(aborted_child_pid, aborted_child_ct),
+        "aborting honeypot-write hold must still drop ChildGuard and terminate child PID {aborted_child_pid}"
     );
 }
 

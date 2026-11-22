@@ -127,6 +127,10 @@ impl DaemonEngine {
 
         let mut promoted_exe_keys: HashSet<String> = HashSet::new();
         for (exe_path, pid) in active_instances {
+            if self.is_self_process(pid, &exe_path) {
+                self.outbound_classifier.mark_protected_os(pid);
+                continue;
+            }
             // Clear any pre-MOTW steady-state outbound classification so subsequent connects
             // re-enter the high-priority enforcement path rather than staying on telemetry.
             self.outbound_classifier.remove_pid(pid);
@@ -145,22 +149,29 @@ impl DaemonEngine {
         let event_ts_ms = event_timestamp_ms(event, now_ms);
         let proc_ctx = self.resolve_process_context(event, event_ts_ms);
 
-        let motw_candidate = if matches!(event, SensorEvent::ProcessStart { .. })
-            && proc_ctx.origin_url.is_none()
-            && proc_ctx.exited_at_ms.is_none()
-            && !proc_ctx.skip_store_ingest
-        {
-            match (
-                proc_ctx.proc_instance_id.as_deref(),
-                proc_ctx.proc_exe_path.as_deref(),
-            ) {
-                (Some(inst_id), Some(effective_exe)) => Self::should_schedule_process_motw(
-                    effective_exe,
-                    proc_ctx.exited_at_ms,
-                    proc_ctx.skip_store_ingest,
-                )
-                .map(|normalized_exe| (inst_id.to_string(), normalized_exe)),
-                _ => None,
+        let motw_candidate = if let SensorEvent::ProcessStart { identity, .. } = event {
+            if proc_ctx.origin_url.is_none()
+                && proc_ctx.exited_at_ms.is_none()
+                && !proc_ctx.skip_store_ingest
+            {
+                match (
+                    proc_ctx.proc_instance_id.as_deref(),
+                    proc_ctx.proc_exe_path.as_deref(),
+                ) {
+                    (Some(inst_id), Some(effective_exe))
+                        if !self.is_self_process(identity.pid, effective_exe) =>
+                    {
+                        Self::should_schedule_process_motw(
+                            effective_exe,
+                            proc_ctx.exited_at_ms,
+                            proc_ctx.skip_store_ingest,
+                        )
+                        .map(|normalized_exe| (inst_id.to_string(), normalized_exe))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
             }
         } else {
             None
@@ -211,23 +222,26 @@ impl DaemonEngine {
 
         let mut proc_ctx = self.resolve_process_context(event, event_ts_ms);
 
-        if matches!(event, SensorEvent::ProcessStart { .. })
-            && proc_ctx.origin_url.is_none()
-            && proc_ctx.exited_at_ms.is_none()
-            && !proc_ctx.skip_store_ingest
-        {
-            if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
-                if let Some(motw) = self
-                    .resolve_process_motw_budgeted(
-                        proc_ctx.proc_instance_id.as_deref(),
-                        effective_exe,
-                        proc_ctx.exited_at_ms,
-                        proc_ctx.skip_store_ingest,
-                    )
-                    .await
-                {
-                    let inst_id = proc_ctx.proc_instance_id.clone();
-                    self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
+        if let SensorEvent::ProcessStart { identity, .. } = event {
+            if proc_ctx.origin_url.is_none()
+                && proc_ctx.exited_at_ms.is_none()
+                && !proc_ctx.skip_store_ingest
+            {
+                if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
+                    if !self.is_self_process(identity.pid, effective_exe) {
+                        if let Some(motw) = self
+                            .resolve_process_motw_budgeted(
+                                proc_ctx.proc_instance_id.as_deref(),
+                                effective_exe,
+                                proc_ctx.exited_at_ms,
+                                proc_ctx.skip_store_ingest,
+                            )
+                            .await
+                        {
+                            let inst_id = proc_ctx.proc_instance_id.clone();
+                            self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
+                        }
+                    }
                 }
             }
         }
@@ -267,19 +281,22 @@ impl DaemonEngine {
         let event_ts_ms = event_timestamp_ms(event, now_ms);
         let mut proc_ctx = self.resolve_process_context(event, event_ts_ms);
 
-        if matches!(event, SensorEvent::ProcessStart { .. })
-            && proc_ctx.origin_url.is_none()
-            && proc_ctx.exited_at_ms.is_none()
-            && !proc_ctx.skip_store_ingest
-        {
-            if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
-                if let Some(motw) = self.resolve_process_motw(
-                    effective_exe,
-                    proc_ctx.exited_at_ms,
-                    proc_ctx.skip_store_ingest,
-                ) {
-                    let inst_id = proc_ctx.proc_instance_id.clone();
-                    self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
+        if let SensorEvent::ProcessStart { identity, .. } = event {
+            if proc_ctx.origin_url.is_none()
+                && proc_ctx.exited_at_ms.is_none()
+                && !proc_ctx.skip_store_ingest
+            {
+                if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
+                    if !self.is_self_process(identity.pid, effective_exe) {
+                        if let Some(motw) = self.resolve_process_motw(
+                            effective_exe,
+                            proc_ctx.exited_at_ms,
+                            proc_ctx.skip_store_ingest,
+                        ) {
+                            let inst_id = proc_ctx.proc_instance_id.clone();
+                            self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
+                        }
+                    }
                 }
             }
         }
@@ -413,12 +430,15 @@ impl DaemonEngine {
                         .proc_exe_path
                         .as_deref()
                         .unwrap_or(exe_path.as_str());
-                    if classify_outbound_risk(effective_exe) == OutboundRiskClass::ProtectedOs {
+                    let is_self = self.is_self_process(identity.pid, effective_exe);
+                    if is_self
+                        || classify_outbound_risk(effective_exe) == OutboundRiskClass::ProtectedOs
+                    {
                         self.outbound_classifier.mark_protected_os(identity.pid);
                     } else {
                         self.outbound_classifier.remove_pid(identity.pid);
                     }
-                    if self.config.outbound_firewall_enabled {
+                    if self.config.outbound_firewall_enabled && !is_self {
                         self.maybe_apply_preemptive_wfp_block_with_motw(
                             effective_exe,
                             proc_ctx.origin_url.is_some(),
@@ -482,11 +502,16 @@ impl DaemonEngine {
                 "OBSERVED"
             }
             SensorEvent::DnsQuery {
+                pid,
                 query_name,
                 resolved_ips,
                 ..
             } => {
                 if !resolved_ips.is_empty() {
+                    let is_self_dns = proc_ctx
+                        .proc_exe_path
+                        .as_deref()
+                        .is_some_and(|exe| self.is_self_process(*pid, exe));
                     let exe_k_opt = proc_ctx
                         .proc_exe_path
                         .as_deref()
@@ -517,7 +542,7 @@ impl DaemonEngine {
                         } else {
                             None
                         };
-                    if self.config.outbound_firewall_enabled {
+                    if self.config.outbound_firewall_enabled && !is_self_dns {
                         match accepted_ips.as_deref() {
                             Some([]) => {}
                             Some(ips) => {
@@ -1866,5 +1891,165 @@ mod tests {
         let wfp = defense.added_wfp();
         assert_eq!(wfp.len(), 1, "unexpected WFP calls: {wfp:?}");
         assert!(wfp[0].ends_with("active_unset.exe"));
+    }
+
+    #[test]
+    fn self_check_path_normalization_handles_nt_unc_mixed_slashes_and_unicode() {
+        use super::super::normalize_exe_path_for_self_check;
+
+        let expected_local = r"c:\program files\localedr\ledr-daemon.exe";
+        for variant in [
+            r"C:\Program Files\LocalEDR\ledr-daemon.exe",
+            r"\\?\C:\Program Files\LocalEDR\ledr-daemon.exe",
+            r"\??\C:\Program Files\LocalEDR\ledr-daemon.exe",
+            r"/??/C:/Program Files/LocalEDR/LEDR-DAEMON.EXE",
+            r"\??/C:/Program Files/LocalEDR/ledr-daemon.exe",
+            r"//?/C:\Program Files/LocalEDR\ledr-daemon.exe",
+            r"  \??\C:\Program Files\LocalEDR\ledr-daemon.exe  ",
+        ] {
+            assert_eq!(
+                normalize_exe_path_for_self_check(variant),
+                expected_local,
+                "variant `{variant}` failed to normalize to `{expected_local}`"
+            );
+        }
+
+        let expected_unc = r"\\fileserver\share\ledr-daemon.exe";
+        for unc_variant in [
+            r"\\FileServer\Share\ledr-daemon.exe",
+            r"\\?\UNC\FileServer\Share\ledr-daemon.exe",
+            r"\??\UNC\FileServer\Share\ledr-daemon.exe",
+            r"//?/UNC/FileServer/Share/LEDR-DAEMON.EXE",
+            r"\??\UNC/FileServer/Share/ledr-daemon.exe",
+        ] {
+            assert_eq!(
+                normalize_exe_path_for_self_check(unc_variant),
+                expected_unc,
+                "UNC variant `{unc_variant}` failed to normalize to `{expected_unc}`"
+            );
+        }
+
+        assert_eq!(
+            normalize_exe_path_for_self_check(r"\??\C:\Users\日本語\ÄÖÜ\LEDR-DAEMON.EXE"),
+            r"c:\users\日本語\äöü\ledr-daemon.exe"
+        );
+        assert_eq!(normalize_exe_path_for_self_check(""), "");
+        assert_eq!(normalize_exe_path_for_self_check("   "), "");
+        assert_eq!(normalize_exe_path_for_self_check(r"\??\"), "");
+        assert_eq!(normalize_exe_path_for_self_check(r"\??\   "), "");
+    }
+
+    #[tokio::test]
+    async fn self_process_delayed_motw_backfill_preserves_protected_and_skips_wfp() {
+        let self_pid = std::process::id();
+        let other_pid = if self_pid == u32::MAX {
+            self_pid - 1
+        } else {
+            self_pid + 1
+        };
+        let raw_self_exe = std::env::current_exe()
+            .expect("resolve current_exe")
+            .to_string_lossy()
+            .into_owned();
+        let bare_self_exe = raw_self_exe
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&raw_self_exe)
+            .to_string();
+
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(RecordingWfpDefense::new());
+        let cfg = DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        };
+        let engine = DaemonEngine::start_with_controllers(
+            store.clone(),
+            SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+            EarlyPruner::default(),
+            cfg,
+            defense.clone(),
+            Arc::new(crate::notify::NoopNotificationDispatcher),
+        );
+
+        let self_ident = ProcessIdentity::new(self_pid, 10_001);
+        let other_ident = ProcessIdentity::new(other_pid, 10_002);
+
+        // Seed self and another PID running the same binary; seed must NOT schedule MOTW for self.
+        let self_start = SensorEvent::ProcessStart {
+            identity: self_ident,
+            parent_pid: 4,
+            exe_path: bare_self_exe.clone(),
+            command_line: bare_self_exe.clone(),
+            user_sid: None,
+        };
+        let other_start = SensorEvent::ProcessStart {
+            identity: other_ident,
+            parent_pid: 4,
+            exe_path: bare_self_exe.clone(),
+            command_line: bare_self_exe.clone(),
+            user_sid: None,
+        };
+        let self_seed = engine.process_seed_process_start(&self_start);
+        assert!(
+            self_seed.motw_candidate.is_none(),
+            "seed_processes must not schedule MOTW inspection for the daemon's own process"
+        );
+        let other_seed = engine.process_seed_process_start(&other_start);
+        assert!(
+            other_seed.motw_candidate.is_some(),
+            "seed_processes must still schedule MOTW inspection for non-self PIDs"
+        );
+        store.flush_batch().expect("flush seeded rows");
+        assert!(engine.outbound_classifier.is_steady_pid(self_pid));
+
+        // Even if a delayed MOTW backfill arrives for self_ident, it must preserve self_pid's
+        // ProtectedOs steady marking and must NOT install a pre-emptive WFP block on self.
+        engine.apply_late_motw_attribution(LateMotwAttribution {
+            instance_ids: vec![self_ident.instance_id()],
+            attribution: MotwAttribution {
+                origin_url: "https://evil.example.invalid/ledr-daemon.exe".to_string(),
+                stage: MotwMatchStage::ZoneIdentifierAds,
+                referrer_url: None,
+                frame_url: None,
+                zone_id: Some(3),
+                sha256: Some("a".repeat(64)),
+            },
+        });
+        assert!(
+            engine.outbound_classifier.is_steady_pid(self_pid),
+            "delayed MOTW backfill must not clear self_pid ProtectedOs marker"
+        );
+        assert!(
+            defense.added_wfp().is_empty(),
+            "delayed MOTW backfill for self_pid must not install WFP block: {:?}",
+            defense.added_wfp()
+        );
+
+        // By contrast, delayed MOTW backfill for `other_pid` running the same binary MUST clear
+        // any steady marking and install an L-18 pre-emptive WFP block.
+        engine.outbound_classifier.mark_steady(other_pid);
+        engine.apply_late_motw_attribution(LateMotwAttribution {
+            instance_ids: vec![other_ident.instance_id()],
+            attribution: MotwAttribution {
+                origin_url: "https://evil.example.invalid/copy.exe".to_string(),
+                stage: MotwMatchStage::ZoneIdentifierAds,
+                referrer_url: None,
+                frame_url: None,
+                zone_id: Some(3),
+                sha256: Some("b".repeat(64)),
+            },
+        });
+        assert!(
+            !engine.outbound_classifier.is_steady_pid(other_pid),
+            "delayed MOTW backfill must clear steady marker for non-self PID"
+        );
+        assert_eq!(
+            defense.added_wfp().len(),
+            1,
+            "delayed MOTW backfill for non-self PID must install L-18 pre-emptive WFP block"
+        );
+
+        engine.shutdown_and_flush().await.expect("shutdown engine");
     }
 }

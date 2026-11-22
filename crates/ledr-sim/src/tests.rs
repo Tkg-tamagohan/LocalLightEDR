@@ -1,10 +1,13 @@
 use super::*;
 use super::fs_scenarios::{
-    TempSimDir, dummy_cookie_path, dummy_honeypot_path, run_motw_download_scenario_with_ads_writer,
+    TempSimDir, dummy_cookie_path, dummy_honeypot_path,
+    run_honeypot_write_scenario_with_cancel_and_pid, run_motw_download_scenario_with_ads_writer,
 };
 use super::net::{exchange_ping_ack, handle_ping_server};
 use std::path::{Path, PathBuf};
-use ledr_proto::HONEYPOT_DEFAULT_FILENAME;
+use ledr_proto::{HONEYPOT_DEFAULT_FILENAME, ProcessIdentity};
+use ledr_sensor_win::defense::{ProcessLiveness, collect_live_descendants, process_liveness};
+use ledr_sensor_win::etw::inspect_live_process;
 
 fn base64_decode(input: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -541,4 +544,436 @@ fn sim_p4_04_motw_download_refuses_overwrite_and_cleans_up_new_file_on_failure()
         !created_path.exists(),
         "newly created dummy file must be removed when ADS write fails"
     );
+}
+
+#[tokio::test]
+async fn sim_p4_05_dns_tcp_hold_ms_and_pre_sleep_socket_close() {
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::TcpListener;
+
+    // 0. CLI parses `--hold-ms` cleanly for `dns-tcp`.
+    assert_eq!(
+        parse_cli_args([
+            "--scenario",
+            "dns-tcp",
+            "--domain",
+            "example.com",
+            "--port",
+            "443",
+            "--hold-ms",
+            "120000",
+            "--json",
+        ])
+        .expect("parse dns-tcp with --hold-ms"),
+        CliAction::Run(SimConfig {
+            scenario: Scenario::DnsTcp,
+            domain: "example.com".to_string(),
+            port: 443,
+            loopback: false,
+            json_output: true,
+            hold_ms: 120_000,
+            prepare_dir: None,
+            base_dir: None,
+        })
+    );
+
+    // 1. hold_ms = 0 returns promptly in loopback mode.
+    let fast_start = Instant::now();
+    let fast_out = run_dns_tcp_scenario_with_hold("example.com", 443, true, 0)
+        .await
+        .expect("loopback dns-tcp with hold_ms=0");
+    assert!(fast_out.used_loopback);
+    assert!(fast_out.connected);
+    assert!(
+        fast_start.elapsed() < Duration::from_millis(2_000),
+        "hold_ms=0 should return promptly, took {:?}",
+        fast_start.elapsed()
+    );
+
+    // 2. hold_ms = 120 waits >= 100 ms and succeeds in loopback mode.
+    let hold_start = Instant::now();
+    let hold_out = run_dns_tcp_scenario_with_hold("example.com", 443, true, 120)
+        .await
+        .expect("loopback dns-tcp with hold_ms=120");
+    let hold_elapsed = hold_start.elapsed();
+    assert!(hold_out.used_loopback);
+    assert!(hold_out.connected);
+    assert!(
+        hold_elapsed >= Duration::from_millis(100),
+        "expected hold_ms=120 to sleep at least 100ms, elapsed={hold_elapsed:?}"
+    );
+
+    // 3. External TCP connect path against a local TcpListener: peer must observe EOF
+    // BEFORE hold_ms elapses, proving stream.shutdown() + drop(stream) ran prior to sleeping.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local test listener");
+    let bound_port = listener.local_addr().expect("listener local_addr").port();
+    let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<Instant>();
+    let server = tokio::spawn(async move {
+        let (mut sock, _peer) = listener.accept().await.expect("accept client");
+        let mut buf = [0u8; 16];
+        let n = sock.read(&mut buf).await.expect("read until EOF");
+        assert_eq!(n, 0, "expected clean EOF from closed client socket");
+        let _ = eof_tx.send(Instant::now());
+    });
+
+    let hold_ms = 300;
+    let connect_start = Instant::now();
+    let direct_out = run_dns_tcp_scenario_with_hold("127.0.0.1", bound_port, false, hold_ms)
+        .await
+        .expect("direct TCP connect with hold_ms");
+    let total_elapsed = connect_start.elapsed();
+    let eof_at = eof_rx.await.expect("receive peer EOF timestamp");
+    server.await.expect("server task join");
+
+    let eof_elapsed = eof_at.saturating_duration_since(connect_start);
+    assert!(!direct_out.used_loopback);
+    assert!(direct_out.connected);
+    assert_eq!(
+        direct_out.connected_addr.as_deref(),
+        Some(format!("127.0.0.1:{bound_port}").as_str())
+    );
+    assert!(
+        total_elapsed >= Duration::from_millis(250),
+        "expected total duration to honor hold_ms={hold_ms}, got {total_elapsed:?}"
+    );
+    assert!(
+        eof_elapsed + Duration::from_millis(100) < total_elapsed,
+        "peer must observe EOF well before hold_ms finishes (eof={eof_elapsed:?}, total={total_elapsed:?})"
+    );
+}
+
+struct HoldCancelProbe {
+    entered_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    trigger_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl HoldCancelProbe {
+    fn new() -> (
+        Self,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (trigger_tx, trigger_rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                entered_tx: Some(entered_tx),
+                trigger_rx,
+            },
+            entered_rx,
+            trigger_tx,
+        )
+    }
+}
+
+impl std::future::Future for HoldCancelProbe {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if let Some(tx) = self.entered_tx.take() {
+            let _ = tx.send(());
+        }
+        match std::pin::Pin::new(&mut self.trigger_rx).poll(cx) {
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(()),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+fn find_temp_sim_dirs(prefix: &str) -> Vec<PathBuf> {
+    let expected = format!("ledr-sim-{prefix}-{}-", std::process::id());
+    std::fs::read_dir(std::env::temp_dir())
+        .expect("read temp dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with(&expected))
+        })
+        .collect()
+}
+
+fn is_same_process_alive(pid: u32, create_time_100ns: u64) -> bool {
+    if process_liveness(pid) == ProcessLiveness::Gone {
+        return false;
+    }
+    match inspect_live_process(pid) {
+        Some(info) if info.create_time_100ns != 0 => info.create_time_100ns == create_time_100ns,
+        _ => process_liveness(pid) == ProcessLiveness::Running,
+    }
+}
+
+#[tokio::test]
+async fn sim_p4_06_fs_scenarios_cancel_hold_promptly_and_drop_guards() {
+    use std::time::{Duration, Instant};
+
+    const LONG_HOLD_MS: u64 = 60_000;
+    const CANCEL_BUDGET: Duration = Duration::from_secs(5);
+
+    // 1. cookies-open: TempSimDir stays alive during hold and is cleaned up promptly on cancel.
+    {
+        let (probe, entered_rx, trigger_tx) = HoldCancelProbe::new();
+        let start = Instant::now();
+        let task = tokio::spawn(run_cookies_open_scenario_with_cancel(
+            None,
+            LONG_HOLD_MS,
+            probe,
+        ));
+
+        tokio::time::timeout(CANCEL_BUDGET, entered_rx)
+            .await
+            .expect("cookies-open should enter async hold")
+            .expect("entered_tx dropped unexpectedly");
+        let dirs_during_hold = find_temp_sim_dirs("cookies");
+
+        let _ = trigger_tx.send(());
+        let (outcome, hold) = tokio::time::timeout(CANCEL_BUDGET, task)
+            .await
+            .expect("cookies-open should exit promptly after cancel")
+            .expect("cookies-open task join")
+            .expect("cookies-open result");
+        assert_eq!(hold, HoldOutcome::Interrupted);
+        assert!(start.elapsed() < CANCEL_BUDGET);
+        let target_path = Path::new(&outcome.target_path);
+        let held_dir = dirs_during_hold
+            .iter()
+            .find(|dir| target_path.starts_with(dir))
+            .expect("TempSimDir must stay alive while cookies-open is in async hold");
+        assert!(
+            !target_path.exists() && !held_dir.exists(),
+            "temp cookie dir must be cleaned up after interrupted hold"
+        );
+    }
+
+    // 2. honeypot-write: ChildGuard + TempSimDir stay alive during hold and clean up on cancel.
+    {
+        let (probe, entered_rx, trigger_tx) = HoldCancelProbe::new();
+        let (child_pid_tx, child_pid_rx) = tokio::sync::oneshot::channel();
+        let start = Instant::now();
+        let task = tokio::spawn(run_honeypot_write_scenario_with_cancel_and_pid(
+            None,
+            LONG_HOLD_MS,
+            probe,
+            Some(child_pid_tx),
+        ));
+
+        tokio::time::timeout(CANCEL_BUDGET, entered_rx)
+            .await
+            .expect("honeypot-write should enter async hold")
+            .expect("entered_tx dropped unexpectedly");
+        let child_pid = tokio::time::timeout(CANCEL_BUDGET, child_pid_rx)
+            .await
+            .expect("honeypot-write should report spawned child PID")
+            .expect("child_pid_tx dropped unexpectedly")
+            .expect("honeypot-write must spawn a live child process when hold_ms > 0");
+        let child_info = inspect_live_process(child_pid)
+            .expect("honeypot-write child process must be inspectable while held");
+        assert_ne!(
+            child_info.create_time_100ns, 0,
+            "honeypot-write child process must have a non-zero CreationTime"
+        );
+        assert_eq!(
+            process_liveness(child_pid),
+            ProcessLiveness::Running,
+            "ChildGuard child PID {child_pid} must stay running during async hold"
+        );
+        let child_identity = ProcessIdentity {
+            pid: child_pid,
+            create_time_100ns: child_info.create_time_100ns,
+        };
+        let descendants_during_hold = collect_live_descendants(&child_identity);
+        let dirs_during_hold = find_temp_sim_dirs("honeypot");
+
+        let _ = trigger_tx.send(());
+        let (outcome, hold) = tokio::time::timeout(CANCEL_BUDGET, task)
+            .await
+            .expect("honeypot-write should exit promptly after cancel")
+            .expect("honeypot-write task join")
+            .expect("honeypot-write result");
+        assert_eq!(hold, HoldOutcome::Interrupted);
+        assert!(start.elapsed() < CANCEL_BUDGET);
+        assert!(
+            !is_same_process_alive(child_pid, child_info.create_time_100ns),
+            "ChildGuard must terminate and reap child PID {child_pid} after interrupted hold"
+        );
+        for desc in &descendants_during_hold {
+            assert!(
+                !is_same_process_alive(desc.pid, desc.create_time_100ns),
+                "ChildGuard must terminate descendant PID {} after interrupted hold",
+                desc.pid
+            );
+        }
+        let target_path = Path::new(&outcome.target_path);
+        let held_dir = dirs_during_hold
+            .iter()
+            .find(|dir| target_path.starts_with(dir))
+            .expect("TempSimDir must stay alive while honeypot-write is in async hold");
+        assert!(
+            !target_path.exists() && !held_dir.exists(),
+            "temp honeypot dir must be cleaned up after interrupted hold"
+        );
+    }
+
+    // 3. motw-download: TempSimDir stays alive during hold and is cleaned up promptly on cancel.
+    {
+        let (probe, entered_rx, trigger_tx) = HoldCancelProbe::new();
+        let start = Instant::now();
+        let task = tokio::spawn(run_motw_download_scenario_with_cancel(
+            None,
+            LONG_HOLD_MS,
+            probe,
+        ));
+
+        tokio::time::timeout(CANCEL_BUDGET, entered_rx)
+            .await
+            .expect("motw-download should enter async hold")
+            .expect("entered_tx dropped unexpectedly");
+        let dirs_during_hold = find_temp_sim_dirs("motw");
+
+        let _ = trigger_tx.send(());
+        let (outcome, hold) = tokio::time::timeout(CANCEL_BUDGET, task)
+            .await
+            .expect("motw-download should exit promptly after cancel")
+            .expect("motw-download task join")
+            .expect("motw-download result");
+        assert_eq!(hold, HoldOutcome::Interrupted);
+        assert!(start.elapsed() < CANCEL_BUDGET);
+        let target_path = Path::new(&outcome.target_path);
+        let held_dir = dirs_during_hold
+            .iter()
+            .find(|dir| target_path.starts_with(dir))
+            .expect("TempSimDir must stay alive while motw-download is in async hold");
+        assert!(
+            !target_path.exists() && !held_dir.exists(),
+            "temp motw dir must be cleaned up after interrupted hold"
+        );
+    }
+
+    // 4. Aborting an async hold and dropping a Tokio Runtime must not hang on spawn_blocking
+    // and must still drop ChildGuard to terminate the spawned child process.
+    let (drop_elapsed, aborted_child_pid, aborted_child_ct) = tokio::task::spawn_blocking(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build isolated runtime");
+        let (probe, entered_rx, _trigger_tx) = HoldCancelProbe::new();
+        let (child_pid_tx, child_pid_rx) = tokio::sync::oneshot::channel();
+        let handle = rt.spawn(run_honeypot_write_scenario_with_cancel_and_pid(
+            None,
+            LONG_HOLD_MS,
+            probe,
+            Some(child_pid_tx),
+        ));
+        let (child_pid, child_ct) = rt.block_on(async {
+            tokio::time::timeout(CANCEL_BUDGET, entered_rx)
+                .await
+                .expect("isolated honeypot-write should enter async hold")
+                .expect("entered_tx dropped");
+            let pid = tokio::time::timeout(CANCEL_BUDGET, child_pid_rx)
+                .await
+                .expect("isolated honeypot-write should report child PID")
+                .expect("child_pid_tx dropped")
+                .expect("isolated honeypot-write must spawn child when hold_ms > 0");
+            let info = inspect_live_process(pid)
+                .expect("isolated honeypot-write child must be inspectable while held");
+            assert_eq!(
+                process_liveness(pid),
+                ProcessLiveness::Running,
+                "isolated ChildGuard child PID {pid} must be running before abort"
+            );
+            handle.abort();
+            let _ = handle.await;
+            (pid, info.create_time_100ns)
+        });
+        let drop_start = Instant::now();
+        drop(rt);
+        (drop_start.elapsed(), child_pid, child_ct)
+    })
+    .await
+    .expect("runtime drop check join");
+    assert!(
+        drop_elapsed < CANCEL_BUDGET,
+        "Runtime::drop hung instead of returning promptly: {drop_elapsed:?}"
+    );
+    assert!(
+        !is_same_process_alive(aborted_child_pid, aborted_child_ct),
+        "aborting honeypot-write hold must still drop ChildGuard and terminate child PID {aborted_child_pid}"
+    );
+}
+
+#[tokio::test]
+async fn sim_p4_07_scenario_all_stops_early_on_hold_interrupt() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    // Case A: Interrupt during `dns-tcp` stops `Scenario::All` before FS scenarios run.
+    {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&cancel_calls);
+        let config = SimConfig {
+            scenario: Scenario::All,
+            loopback: true,
+            hold_ms: 60_000,
+            ..SimConfig::default()
+        };
+        let start = Instant::now();
+        let report = execute_sim_report(&config, move || {
+            calls_ref.fetch_add(1, Ordering::SeqCst);
+            async {}
+        })
+        .await
+        .expect("Scenario::All with dns-tcp interrupt");
+
+        assert!(
+            start.elapsed() < Duration::from_secs(25),
+            "interrupted Scenario::All must not wait for 60s hold"
+        );
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert!(report.lotl.is_some());
+        assert!(report.dns_tcp.is_some());
+        assert!(report.cookies_open.is_none());
+        assert!(report.honeypot_write.is_none());
+        assert!(report.motw_download.is_none());
+    }
+
+    // Case B: `dns-tcp` hold completes, then `cookies-open` hold is interrupted;
+    // `honeypot-write` and `motw-download` must not launch.
+    {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&cancel_calls);
+        let config = SimConfig {
+            scenario: Scenario::All,
+            loopback: true,
+            hold_ms: 30,
+            ..SimConfig::default()
+        };
+        let report = execute_sim_report(&config, move || {
+            let idx = calls_ref.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if idx == 0 {
+                    std::future::pending::<()>().await;
+                }
+            }
+        })
+        .await
+        .expect("Scenario::All with cookies-open interrupt");
+
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 2);
+        assert!(report.lotl.is_some());
+        assert!(report.dns_tcp.is_some());
+        assert!(report.cookies_open.is_some());
+        assert!(report.honeypot_write.is_none());
+        assert!(report.motw_download.is_none());
+    }
 }

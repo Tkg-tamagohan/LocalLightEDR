@@ -2203,13 +2203,20 @@
     return kept;
   }
 
+  function resolveEffectiveProcessScope(byId) {
+    return state.selectedProcessId && byId && byId.has(state.selectedProcessId)
+      ? state.selectedProcessId
+      : null;
+  }
+
   function renderTree() {
     const { roots, byId } = buildHierarchy(state.snapshot);
+    const effectiveScopeId = resolveEffectiveProcessScope(byId);
     const query = state.filterText.trim().toLowerCase();
     const visibleRoots = filterNodes(roots, query);
 
     el.treeSummary.textContent = `${state.snapshot.processes.length} processes`;
-    el.allProcsBtn.classList.toggle("is-selected", state.selectedProcessId === null);
+    el.allProcsBtn.classList.toggle("is-selected", effectiveScopeId === null);
 
     if (visibleRoots.length === 0) {
       el.processTree.innerHTML = `<div class="inspector-empty pad-md">No processes match current snapshot/filter.</div>`;
@@ -2223,7 +2230,7 @@
       const id = p.process_instance_id;
       const hasChildren = node.children.length > 0;
       const isCollapsed = !query && state.collapsedIds.has(id);
-      const isSelected = state.selectedProcessId === id;
+      const isSelected = effectiveScopeId === id;
 
       const badges = [];
       if (p.is_trusted_os) {
@@ -2287,10 +2294,12 @@
   }
 
   function renderInspector(byId) {
-    if (!state.selectedProcessId || !byId.has(state.selectedProcessId)) {
+    const effectiveScopeId = resolveEffectiveProcessScope(byId);
+    if (!effectiveScopeId) {
       const dnsCount = (state.snapshot.dns_queries || []).length;
       const netCount = (state.snapshot.network_events || []).length;
       const canaryCount = (state.snapshot.file_canary_events || []).length;
+      const downloadCount = (state.snapshot.download_origins || []).length;
       el.processInspector.innerHTML = `
         <div class="inspector-grid">
           <div class="inspector-item">
@@ -2299,7 +2308,7 @@
           </div>
           <div class="inspector-item">
             <div class="inspector-label">Captured Events</div>
-            <div class="inspector-val">DNS ${dnsCount} | Network ${netCount} | Canary ${canaryCount}</div>
+            <div class="inspector-val">DNS ${dnsCount} | Network ${netCount} | Canary ${canaryCount} | Downloads ${downloadCount}</div>
           </div>
         </div>
       `;
@@ -2307,7 +2316,7 @@
       return;
     }
 
-    const p = byId.get(state.selectedProcessId);
+    const p = byId.get(effectiveScopeId);
     const signer = p.is_trusted_os
       ? `${p.signer_subject || "Windows"} (Trusted OS)`
       : p.signer_subject || "Unsigned";
@@ -2384,7 +2393,7 @@
   }
 
   function renderTelemetry(byId) {
-    const scopeId = state.selectedProcessId;
+    const scopeId = resolveEffectiveProcessScope(byId);
     const filterProc = (item) => !scopeId || item.process_instance_id === scopeId;
 
     const dns = (state.snapshot.dns_queries || []).filter(filterProc);
@@ -3151,6 +3160,13 @@
         state.policyFeedback = null;
       }
       state.snapshot = snapshot;
+      if (
+        state.selectedProcessId &&
+        Array.isArray(snapshot?.processes) &&
+        !snapshot.processes.some((p) => p.process_instance_id === state.selectedProcessId)
+      ) {
+        state.selectedProcessId = null;
+      }
       state.metrics = metrics;
       if (alertsRes.ok) {
         state.alerts = Array.isArray(alertsRes.data) ? alertsRes.data : [];
@@ -3447,6 +3463,7 @@
       renderSuspendBanner,
       syncResolutionControls,
       handleResolveAlert,
+      resolveEffectiveProcessScope,
       renderTree,
       renderInspector,
       renderTelemetry,

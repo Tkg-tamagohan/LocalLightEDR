@@ -1,8 +1,12 @@
 # LocalEDR Phase 2 と Phase 3 実機 E2E 検証手順書
 
+> [!NOTE]
+> Phase 1 から Phase 4 までを一気通貫で実施する場合、および最新の統合版手順（Track A と Track C）を参照する場合は [e2e-test-runbook.md](e2e-test-runbook.md) を使用してください。
+> 本書は `FU-E2E-01` 単独実施向けの従来手順書として保持しています。
+
 この手順書は、[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` および [implementation-plan.md](implementation-plan.md) に基づき、Phase 2 と Phase 3 の実機受け入れ項目を Windows 10 または Windows 11（x86_64）クライアント SKU の管理者環境で検証するための手順をまとめたものである。
 
-現在の作業ブランチ（`fix/e2e-blockers-v2`、`main` ベース）では、非管理者セッションで完結するビルド、Clippy 静的検査（警告 0 件）、ワークスペース自動テスト（`e2e_blockers` 回帰テスト、`burst_budget` 11/11、および `ttl_purge_lineage` 9/9 を含む）が通過している。
+現在の `main` ブランチでは、非管理者セッションで完結するビルド、Clippy 静的検査（警告 0 件）、ワークスペース自動テスト（`e2e_blockers` 回帰テスト、`burst_budget`、`ttl_purge_lineage` を含む）が通過している。
 したがって、ここでは管理者権限または対話デスクトップ環境が必要なカーネル境界（実 ETW、実 `NtSuspendProcess` とツリー終了、実 BFE 動的 WFP フィルタと `FwpmNetEventSubscribe1`）、WinRT トースト通知と `ledr://` URI 起動、応答しない実 UNC 共有での NRD 更新と 3 秒停止予算、WebView2 上の対話操作、および常駐リソース計測を対象とする。
 
 ## 作業分担表
@@ -12,9 +16,8 @@
 
 | 担当 | 作業項目 | 実施状態 |
 | :--- | :--- | :--- |
-| エージェント | `fix/e2e-blockers-v2` でのビルド（`ledr-daemon.exe`、`ledr-ui.exe`、`ledr-sim.exe`） | 完了済み |
-| エージェント | `cargo clippy`（警告 0 件）、ワークスペース自動テスト、`burst_budget`（11/11）、`ttl_purge_lineage`（9/9）の確認 | 完了済み |
-| エージェント | 実機の OS バージョンと SKU（`Microsoft Windows 11 Home`、`10.0.26300`、`ProductType=1`）および `BFE` 稼働状態の確認 | 完了済み |
+| CI と自動テスト | `main` 上での `cargo clippy`（警告 0 件）、ワークスペース自動テスト、`burst_budget`、`ttl_purge_lineage` の確認 | 完了済み |
+| ユーザー（通常または管理者） | `main` からのデバッグビルド（`cargo build --workspace --locked`：`ledr-daemon.exe`、`ledr-ui.exe`、`ledr-sim.exe`）と OS SKU（`ProductType=1`）および `BFE` 稼働状態の確認 | 実施前に確認 |
 | ユーザー（通常） | `ledr-ui.exe --register-uri` による `HKCU` プロトコル・AUMID 登録、`ToastEnabled` 確認、WebView2 上での View 1 から View 3 までの対話操作、通知クリック確認 | 本手順書で実施 |
 | ユーザー（管理者） | Phase 2 実機検証（読み取り非発火、`Cookies` 凍結、おとりツリー凍結と一括終了、60 秒 `EXPIRED_SUSPENDED`、Never-Suspend、`Kernel-Registry` と `CloseKey`） | 本手順書で実施 |
 | ユーザー（管理者） | Phase 3 実機検証（WFP 動的セッション、事前制限、`FwpmNetEventSubscribe1` と曖昧 PID、`ledr-sim` 相関、ドメイン許可と Deny 優先、NRD と 3 秒 WAL チェックポイント、`taskkill /F` 消去） | 本手順書で実施 |
@@ -24,7 +27,7 @@
 
 作業を始める前に、現行コードの実装状況に基づく次の 5 点を確認してください。
 
-1. **Windows Service の SCM エントリポイントは未実装である**：現行の [main.rs](../crates/ledr-daemon/src/main.rs) は `#[tokio::main]` のコンソールプロセス（`Ctrl+C` 待機）であり、`StartServiceCtrlDispatcherW` による Windows Service 制御ディスパッチを備えていない。
+1. **Windows Service の SCM エントリポイントは未実装である**：現行の [main.rs](../crates/ledr-daemon/src/main.rs) は `build_daemon_runtime()`（有界マルチスレッド Tokio ランタイム）上のコンソールプロセス（`Ctrl+C` 待機）であり、`StartServiceCtrlDispatcherW` による Windows Service 制御ディスパッチを備えていない。
    そのため、`sc.exe create` で登録してサービス起動するとタイムアウトエラー（エラー 1053）になる。
    標準手順では `--foreground` 起動時のフォールバック経路（`ledr-ui.exe --notify <alert_id>`）で WinRT トーストと `ledr://alert/<id>` 連携を確認し、Session 0 境界（`WTSQueryUserToken` と `CreateProcessAsUserW`）まで実機確認する場合だけ末尾の補足手順（`PsExec` 等による `LocalSystem` 実行）を用い、Windows Service 登録自体は未実装差異として記録する。
 2. **操作中の管理者 PowerShell ウィンドウを凍結させない**：`powershell.exe` は事前 WFP ブロックの対象であり、かつ `is_never_suspend_process` の保護対象に含まれない。
@@ -96,7 +99,7 @@ Phase 2 と Phase 3 前半の検証では外部通信や NRD 取得のノイズ�
 
 ```powershell
 cd e:\Documents\code\LocalEDR
-$runDir = (Get-Content C:\Temp\ledr-e2e-latest.txt -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 C:\Temp\ledr-e2e-latest.txt -Raw).Trim()
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 .\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
 ```
@@ -140,7 +143,7 @@ Write-Output ("ReadOnlyExitCode=" + $p.ExitCode)
 ウィンドウ B で `ledr-sim.exe` を別プロセスとして起動し、ダミー `Cookies` の Open と 120 秒間の待機を行わせてください。
 
 ```powershell
-$simCookie = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory "e:\Documents\code\LocalEDR" -ArgumentList "--scenario", "cookies-open", "--base-dir", (Join-Path $runDir "canary_dir"), "--hold-ms", "120000", "--json" -PassThru
+$simCookie = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory "e:\Documents\code\LocalEDR" -ArgumentList "--scenario", "cookies-open", "--base-dir", "`"$(Join-Path $runDir 'canary_dir')`"", "--hold-ms", "120000", "--json" -PassThru
 Start-Sleep -Seconds 2
 (Get-Process -Id $simCookie.Id).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
 ```
@@ -160,7 +163,7 @@ Start-Sleep -Seconds 2
 次に、子プロセス（`cmd.exe` と `ping.exe`）を伴った状態でダミーおとりファイルへ 1 バイト追記するシナリオを実行し、プロセスツリー全体の凍結と一括終了を確認してください。
 
 ```powershell
-$simHp = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory "e:\Documents\code\LocalEDR" -ArgumentList "--scenario", "honeypot-write", "--base-dir", (Join-Path $runDir "canary_dir"), "--hold-ms", "120000", "--json" -PassThru
+$simHp = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory "e:\Documents\code\LocalEDR" -ArgumentList "--scenario", "honeypot-write", "--base-dir", "`"$(Join-Path $runDir 'canary_dir')`"", "--hold-ms", "120000", "--json" -PassThru
 Start-Sleep -Seconds 2
 $children = Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $simHp.Id) | Select-Object ProcessId, Name, CommandLine
 $children | Format-Table -AutoSize
@@ -189,7 +192,7 @@ foreach ($c in $children) { Get-Process -Id $c.ProcessId -ErrorAction SilentlyCo
 ウィンドウ B で次のコマンドを実行し、トースト通知をクリックせずに **65 秒以上** 待機してください。
 
 ```powershell
-$simExp = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory "e:\Documents\code\LocalEDR" -ArgumentList "--scenario", "cookies-open", "--base-dir", (Join-Path $runDir "canary_dir"), "--hold-ms", "180000", "--json" -PassThru
+$simExp = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory "e:\Documents\code\LocalEDR" -ArgumentList "--scenario", "cookies-open", "--base-dir", "`"$(Join-Path $runDir 'canary_dir')`"", "--hold-ms", "180000", "--json" -PassThru
 Start-Sleep -Seconds 68
 (Get-Process -Id $simExp.Id).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
 ```
@@ -357,7 +360,7 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 .\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
 ```
 
-ウィンドウ A に `refreshed daily NRD domain cache`（`entries` や `feeds_succeeded=2`）が出たら、`ledr-ui` の `View 3` 右下にある `NRD / Homograph Check` 入力欄へ `paypa1.com`（期待結果 `Not in NRD` と `Homograph: paypal`）、`google.com`（期待結果 `Not in NRD` と `No Homograph`）、および `Get-Content (Join-Path $runDir "nrd-cache.txt") -TotalCount 5` に出た実ドメイン 1 件（期待結果 `NRD (<=14d)`）を入力して **`Check`** を押し、期待どおりに判定されることを確認してください。
+ウィンドウ A に `refreshed daily NRD domain cache`（`entries` や `feeds_succeeded=2`）が出たら、`ledr-ui` の `View 3` 右下にある `NRD / Homograph Check` 入力欄へ `paypa1.com`（期待結果 `Not in NRD` と `Homograph: paypal`）、`google.com`（期待結果 `Not in NRD` と `No Homograph`）、および `(Get-Content -Encoding UTF8 (Join-Path $runDir "nrd-cache.txt") | Where-Object { $_ -and -not $_.StartsWith("#") } | Select-Object -First 5)` に出た実ドメイン 1 件（期待結果 `NRD (<=14d)`）を入力して **`Check`** を押し、期待どおりに判定されることを確認してください。
 確認後はウィンドウ A で `Ctrl+C` を押して停止します。
 
 #### B. 応答しない実 UNC 共有での 3 秒停止予算と WAL チェックポイント確認
@@ -422,7 +425,7 @@ cd e:\Documents\code\LocalEDR
 cargo build --release --locked
 
 # ウィンドウ A（管理者 PowerShell）で既存の debug デーモンを停止したうえで起動する
-$runDir = (Get-Content C:\Temp\ledr-e2e-latest.txt -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 C:\Temp\ledr-e2e-latest.txt -Raw).Trim()
 $env:RUST_LOG = "info"
 .\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
 ```
@@ -489,7 +492,7 @@ $cpuPct = (($p1.CPU - $cpu0) / ($sampleSec * $logicalCores)) * 100.0
 ```powershell
 Get-Process ledr-daemon, ledr-ui, ledr-sim -ErrorAction SilentlyContinue | Stop-Process -Force
 if (-not $runDir -and (Test-Path -LiteralPath "C:\Temp\ledr-e2e-latest.txt")) {
-    $runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+    $runDir = (Get-Content -Encoding UTF8 "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
 }
 # 事前準備で記録した preexisting_honeypots.txt に基づき、検証前から存在したファイルは残して今回作成分だけを削除する
 $preexistingFile = if ($runDir) { Join-Path $runDir "preexisting_honeypots.txt" } else { $null }

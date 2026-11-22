@@ -400,6 +400,13 @@ const CERT_TRUST_IS_PARTIAL_CHAIN: u32 = 0x0001_0000;
 const CHAIN_FALLBACK_ERROR_MASK: u32 =
     CERT_TRUST_IS_NOT_SIGNATURE_VALID | CERT_TRUST_IS_UNTRUSTED_ROOT | CERT_TRUST_IS_PARTIAL_CHAIN;
 
+/// Offline-only flags for `CertGetCertificateChain`: cache end certificates, restrict URL
+/// retrieval to local cache, and disable automatic AuthRoot CTL network updates so chain
+/// building never triggers outbound HTTP/AIA/CRL/AuthRoot traffic from the daemon process.
+pub(crate) const LOCAL_CERT_CHAIN_FLAGS: u32 = CERT_CHAIN_CACHE_END_CERT
+    | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL
+    | CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE;
+
 fn build_chain_root_thumbprint(
     signer_cert: *const CERT_CONTEXT,
     additional_store: *mut c_void,
@@ -409,7 +416,9 @@ fn build_chain_root_thumbprint(
     chain_para.cb_size = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
     let mut chain_ctx: *const CERT_CHAIN_CONTEXT = ptr::null();
 
-    // SAFETY: Builds the local certificate chain for `signer_cert` without network revocation fetches.
+    // SAFETY: Builds the local certificate chain for `signer_cert` strictly offline
+    // (`CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL | CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE`),
+    // avoiding AIA, CRL/OCSP, and AuthRoot auto-update network fetches.
     let ok = unsafe {
         CertGetCertificateChain(
             ptr::null_mut(),
@@ -417,7 +426,7 @@ fn build_chain_root_thumbprint(
             ptr::null(),
             additional_store,
             &chain_para,
-            CERT_CHAIN_CACHE_END_CERT,
+            LOCAL_CERT_CHAIN_FLAGS,
             ptr::null(),
             &mut chain_ctx,
         )

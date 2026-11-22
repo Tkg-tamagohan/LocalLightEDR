@@ -1,17 +1,21 @@
 //! Harmless canary, honeypot, and `--prepare-dir` filesystem scenario implementations.
 
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ledr_proto::HONEYPOT_DEFAULT_FILENAME;
-use ledr_sensor_win::{read_zone_identifier, write_zone_identifier, MotwZoneInfo, ZONE_ID_INTERNET};
+use ledr_proto::{ActiveDefenseController, HONEYPOT_DEFAULT_FILENAME, ProcessIdentity};
+use ledr_sensor_win::{
+    MotwZoneInfo, WindowsDefenseController, ZONE_ID_INTERNET, etw::inspect_live_process,
+    read_zone_identifier, write_zone_identifier,
+};
 use sha2::{Digest, Sha256};
 
+use super::net::{HoldOutcome, ctrl_c_signal, wait_hold_ms_with_cancel};
 use super::types::{
     CookiesOpenOutcome, HoneypotWriteOutcome, MotwDownloadOutcome, PrepareDirOutcome,
 };
@@ -49,11 +53,48 @@ impl Drop for TempSimDir {
     }
 }
 
-struct ChildGuard(Option<std::process::Child>);
+struct ChildGuard {
+    child: Option<std::process::Child>,
+    identity: Option<ProcessIdentity>,
+}
+
+impl ChildGuard {
+    fn none() -> Self {
+        Self {
+            child: None,
+            identity: None,
+        }
+    }
+
+    fn from_child(child: Option<std::process::Child>) -> Self {
+        let identity = child.as_ref().and_then(|proc_child| {
+            let pid = proc_child.id();
+            let info = inspect_live_process(pid)?;
+            (info.create_time_100ns != 0).then_some(ProcessIdentity {
+                pid,
+                create_time_100ns: info.create_time_100ns,
+            })
+        });
+        Self { child, identity }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+
+    fn is_some(&self) -> bool {
+        self.child.is_some()
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(identity) = self.identity.take() {
+            // Terminate any grandchild (e.g. `ping.exe` spawned by `cmd.exe`) alongside the child
+            // with CreationTime + Never-Suspend validation so cancelled holds leave no orphans.
+            let _ = WindowsDefenseController::new().terminate_process(&identity, true);
+        }
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -150,24 +191,40 @@ pub async fn run_cookies_open_scenario_with_options(
     base_dir: Option<PathBuf>,
     hold_ms: u64,
 ) -> Result<CookiesOpenOutcome> {
-    tokio::task::spawn_blocking(move || {
-        let _temp_guard = match base_dir.as_ref() {
+    run_cookies_open_scenario_with_cancel(base_dir, hold_ms, ctrl_c_signal())
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+pub(crate) async fn run_cookies_open_scenario_with_cancel<F>(
+    base_dir: Option<PathBuf>,
+    hold_ms: u64,
+    cancel: F,
+) -> Result<(CookiesOpenOutcome, HoldOutcome)>
+where
+    F: Future<Output = ()>,
+{
+    let (outcome, temp_guard) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let temp_guard = match base_dir.as_ref() {
             Some(_) => None,
             None => Some(TempSimDir::new("cookies")?),
         };
-        let target_dir = match (&base_dir, &_temp_guard) {
+        let target_dir = match (&base_dir, &temp_guard) {
             (Some(dir), _) => dir.as_path(),
             (None, Some(temp)) => temp.path(),
             (None, None) => unreachable!(),
         };
         let outcome = run_cookies_open_scenario_in(target_dir)?;
-        if hold_ms > 0 {
-            std::thread::sleep(Duration::from_millis(hold_ms));
-        }
-        Ok(outcome)
+        Ok((outcome, temp_guard))
     })
     .await
-    .context("cookies-open simulation task panicked")?
+    .context("cookies-open simulation task panicked")??;
+
+    let hold_outcome = wait_hold_ms_with_cancel(hold_ms, cancel).await;
+    if let Some(temp_guard) = temp_guard {
+        let _ = tokio::task::spawn_blocking(move || drop(temp_guard)).await;
+    }
+    Ok((outcome, hold_outcome))
 }
 
 /// Runs the dummy `Cookies` open/read simulation under `base_dir` without removing `base_dir`.
@@ -221,17 +278,42 @@ pub async fn run_honeypot_write_scenario_with_options(
     base_dir: Option<PathBuf>,
     hold_ms: u64,
 ) -> Result<HoneypotWriteOutcome> {
-    tokio::task::spawn_blocking(move || {
-        let _temp_guard = match base_dir.as_ref() {
+    run_honeypot_write_scenario_with_cancel(base_dir, hold_ms, ctrl_c_signal())
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+pub(crate) async fn run_honeypot_write_scenario_with_cancel<F>(
+    base_dir: Option<PathBuf>,
+    hold_ms: u64,
+    cancel: F,
+) -> Result<(HoneypotWriteOutcome, HoldOutcome)>
+where
+    F: Future<Output = ()>,
+{
+    run_honeypot_write_scenario_with_cancel_and_pid(base_dir, hold_ms, cancel, None).await
+}
+
+pub(crate) async fn run_honeypot_write_scenario_with_cancel_and_pid<F>(
+    base_dir: Option<PathBuf>,
+    hold_ms: u64,
+    cancel: F,
+    child_pid_tx: Option<tokio::sync::oneshot::Sender<Option<u32>>>,
+) -> Result<(HoneypotWriteOutcome, HoldOutcome)>
+where
+    F: Future<Output = ()>,
+{
+    let (outcome, temp_guard, child_guard) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let temp_guard = match base_dir.as_ref() {
             Some(_) => None,
             None => Some(TempSimDir::new("honeypot")?),
         };
-        let target_dir = match (&base_dir, &_temp_guard) {
+        let target_dir = match (&base_dir, &temp_guard) {
             (Some(dir), _) => dir.as_path(),
             (None, Some(temp)) => temp.path(),
             (None, None) => unreachable!(),
         };
-        let _child_guard = if hold_ms > 0 {
+        let child_guard = if hold_ms > 0 {
             let ping_count = (hold_ms / 1000).saturating_add(2).clamp(2, 120);
             let cmd = format!("ping -n {ping_count} 127.0.0.1 >nul");
             let child = std::process::Command::new("cmd.exe")
@@ -241,19 +323,30 @@ pub async fn run_honeypot_write_scenario_with_options(
                 .stderr(Stdio::null())
                 .spawn()
                 .ok();
-            ChildGuard(child)
+            ChildGuard::from_child(child)
         } else {
-            ChildGuard(None)
+            ChildGuard::none()
         };
 
         let outcome = run_honeypot_write_scenario_in(target_dir)?;
-        if hold_ms > 0 {
-            std::thread::sleep(Duration::from_millis(hold_ms));
-        }
-        Ok(outcome)
+        Ok((outcome, temp_guard, child_guard))
     })
     .await
-    .context("honeypot-write simulation task panicked")?
+    .context("honeypot-write simulation task panicked")??;
+
+    if let Some(tx) = child_pid_tx {
+        let _ = tx.send(child_guard.pid());
+    }
+
+    let hold_outcome = wait_hold_ms_with_cancel(hold_ms, cancel).await;
+    if child_guard.is_some() || temp_guard.is_some() {
+        let _ = tokio::task::spawn_blocking(move || {
+            drop(child_guard);
+            drop(temp_guard);
+        })
+        .await;
+    }
+    Ok((outcome, hold_outcome))
 }
 
 /// Runs the dummy honeypot 1-byte append simulation under `base_dir` without removing `base_dir`.
@@ -320,24 +413,40 @@ pub async fn run_motw_download_scenario_with_options(
     base_dir: Option<PathBuf>,
     hold_ms: u64,
 ) -> Result<MotwDownloadOutcome> {
-    tokio::task::spawn_blocking(move || {
-        let _temp_guard = match base_dir.as_ref() {
+    run_motw_download_scenario_with_cancel(base_dir, hold_ms, ctrl_c_signal())
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+pub(crate) async fn run_motw_download_scenario_with_cancel<F>(
+    base_dir: Option<PathBuf>,
+    hold_ms: u64,
+    cancel: F,
+) -> Result<(MotwDownloadOutcome, HoldOutcome)>
+where
+    F: Future<Output = ()>,
+{
+    let (outcome, temp_guard) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let temp_guard = match base_dir.as_ref() {
             Some(_) => None,
             None => Some(TempSimDir::new("motw")?),
         };
-        let target_dir = match (&base_dir, &_temp_guard) {
+        let target_dir = match (&base_dir, &temp_guard) {
             (Some(dir), _) => dir.as_path(),
             (None, Some(temp)) => temp.path(),
             (None, None) => unreachable!(),
         };
         let outcome = run_motw_download_scenario_in(target_dir)?;
-        if hold_ms > 0 {
-            std::thread::sleep(Duration::from_millis(hold_ms));
-        }
-        Ok(outcome)
+        Ok((outcome, temp_guard))
     })
     .await
-    .context("motw-download simulation task panicked")?
+    .context("motw-download simulation task panicked")??;
+
+    let hold_outcome = wait_hold_ms_with_cancel(hold_ms, cancel).await;
+    if let Some(temp_guard) = temp_guard {
+        let _ = tokio::task::spawn_blocking(move || drop(temp_guard)).await;
+    }
+    Ok((outcome, hold_outcome))
 }
 
 /// Runs the harmless MOTW `:Zone.Identifier` simulation under `base_dir` without removing `base_dir`.

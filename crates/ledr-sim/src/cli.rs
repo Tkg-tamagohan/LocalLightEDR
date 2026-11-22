@@ -166,7 +166,7 @@ pub(crate) fn print_usage() {
     println!("  --domain <HOST>      Domain to resolve/connect in dns-tcp (default: {DEFAULT_SIM_DOMAIN})");
     println!("  --port <PORT>        TCP port for dns-tcp (default: {DEFAULT_SIM_PORT})");
     println!("  --loopback           Use local 127.0.0.1 TCP listener without external traffic");
-    println!("  --hold-ms <MS>       Keep process alive after canary/honeypot access for E2E checks");
+    println!("  --hold-ms <MS>       Keep process alive after dns-tcp/canary/honeypot/motw-download for E2E checks");
     println!("  --prepare-dir <DIR>  Pre-create dummy canary/honeypot fixtures in <DIR> and exit");
     println!("  --base-dir <DIR>     Run file scenarios inside <DIR> without creating/deleting a temp dir");
     println!("  --json               Print structured JSON simulation report");

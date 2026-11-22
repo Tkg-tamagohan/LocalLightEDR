@@ -102,10 +102,22 @@ pub(super) fn dispatch_request(
             }
         }
         IpcRequest::ResolveAlert { alert_id, decision } => {
+            tracing::info!(
+                alert_id = %alert_id,
+                decision = decision_label(&decision),
+                "received ResolveAlert IPC request"
+            );
             let wants_block_rule =
                 matches!(decision, AlertDecision::TerminateAndBlock { add_block_rule: true });
             match engine.resolve_alert_with_outcome(&alert_id, decision) {
                 Ok(outcome) => {
+                    tracing::info!(
+                        alert_id = %outcome.alert.alert_id,
+                        source_layer = %outcome.alert.source_layer,
+                        status = %outcome.alert.status.as_db_str(),
+                        saved_rule_id = ?outcome.saved_rule_id,
+                        "completed ResolveAlert IPC request"
+                    );
                     let mut message = format!(
                         "alert {} resolved to {}",
                         outcome.alert.alert_id,
@@ -117,7 +129,7 @@ pub(super) fn dispatch_request(
                         message.push_str("; no NetworkBlock rule saved (executable path unresolved)");
                     }
                     IpcResponse::Ack { message }
-                },
+                }
                 Err(msg) => {
                     let code = if msg.contains("not found") {
                         "NOT_FOUND"
@@ -126,6 +138,12 @@ pub(super) fn dispatch_request(
                     } else {
                         "RESOLVE_ERROR"
                     };
+                    tracing::warn!(
+                        alert_id = %alert_id,
+                        code = code,
+                        error = %msg,
+                        "ResolveAlert IPC request failed"
+                    );
                     IpcResponse::Error {
                         code: code.to_string(),
                         message: msg,
@@ -211,6 +229,19 @@ pub(super) fn browser_report_error_response(err: BrowserReportError) -> IpcRespo
             code: "CANCELLED".to_string(),
             message: "browser report cancelled".to_string(),
         },
+    }
+}
+
+fn decision_label(decision: &AlertDecision) -> &'static str {
+    match decision {
+        AlertDecision::AllowOnce => "AllowOnce",
+        AlertDecision::AllowPermanent { .. } => "AllowPermanent",
+        AlertDecision::TerminateAndBlock {
+            add_block_rule: true,
+        } => "TerminateAndBlock(add_block_rule=true)",
+        AlertDecision::TerminateAndBlock {
+            add_block_rule: false,
+        } => "TerminateAndBlock(add_block_rule=false)",
     }
 }
 

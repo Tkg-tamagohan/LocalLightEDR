@@ -919,3 +919,230 @@ test("CSP-01: index.html and tauri.conf.json maintain strict CSP without inline 
     "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self'; script-src 'self'",
   );
 });
+
+test("UI-P4-11: Stale selectedProcessId falls back consistently across View 2 and resets on refreshAll", async () => {
+  const shaInWindow = "a".repeat(64);
+  const procInWindow = {
+    process_instance_id: "501:100",
+    pid: 501,
+    ppid: 4,
+    exe_path: "C:\\Users\\Alice\\Downloads\\in-window.exe",
+    command_line: "in-window.exe",
+    created_at_ms: 1_732_100_000_000,
+    exited_at_ms: null,
+    is_trusted_os: false,
+    signer_subject: null,
+    sha256: shaInWindow,
+    origin_url: "https://dl.localedr.invalid/in-window.exe",
+  };
+  const procOther = {
+    process_instance_id: "502:200",
+    pid: 502,
+    ppid: 4,
+    exe_path: "C:\\Tools\\other.exe",
+    command_line: "other.exe",
+    created_at_ms: 1_732_100_001_000,
+    exited_at_ms: null,
+    is_trusted_os: false,
+    signer_subject: null,
+    sha256: "b".repeat(64),
+    origin_url: null,
+  };
+  const snapshot = {
+    processes: [procInWindow, procOther],
+    dns_queries: [
+      {
+        process_instance_id: procOther.process_instance_id,
+        query_name: "api.localedr.invalid",
+        query_type: 1,
+        resolved_ips: ["198.51.100.5"],
+        is_nrd: false,
+        timestamp_ms: 1_732_100_002_000,
+      },
+    ],
+    network_events: [
+      {
+        process_instance_id: procOther.process_instance_id,
+        protocol: 6,
+        dst_ip: "198.51.100.5",
+        dst_port: 443,
+        domain_hint: "api.localedr.invalid",
+        action: "OBSERVED",
+        timestamp_ms: 1_732_100_003_000,
+      },
+    ],
+    file_canary_events: [],
+    download_origins: [
+      {
+        id: 1,
+        file_path: "C:\\Users\\Alice\\Downloads\\in-window.exe",
+        sha256: shaInWindow,
+        tab_url: "https://dl.localedr.invalid/in-window.exe",
+        frame_url: null,
+        referrer_url: null,
+        downloaded_at_ms: 1_732_100_000_500,
+      },
+    ],
+  };
+
+  const ui = loadAppHarness(async (cmd) => {
+    if (cmd === "fetch_local_defense_status") return null;
+    if (cmd === "ping_daemon") return { daemon_version: "0.1.0", protocol_version: 1 };
+    if (cmd === "fetch_flight_recorder") return snapshot;
+    if (cmd === "fetch_pipeline_metrics") return null;
+    if (cmd === "fetch_alerts") return [];
+    if (cmd === "fetch_rules") return [];
+    return null;
+  });
+
+  ui.state.snapshot = snapshot;
+  ui.state.activeTab = "all";
+
+  // 1. Stale selectedProcessId not present in snapshot.processes
+  ui.state.selectedProcessId = "9999:stale";
+  const { byId } = ui.buildHierarchy(ui.state.snapshot);
+  assert.equal(ui.resolveEffectiveProcessScope(byId), null);
+
+  ui.renderTree();
+  assert.equal(
+    ui.el.allProcsBtn.classList.contains("is-selected"),
+    true,
+    "All Processes button must be highlighted when selectedProcessId is stale",
+  );
+  assert.doesNotMatch(
+    ui.el.processTree.innerHTML,
+    /tree-row is-selected/,
+    "No tree row may be selected when selectedProcessId is stale",
+  );
+  assert.equal(ui.el.scopeIndicator.textContent, "Scope: All Processes");
+  assert.match(
+    ui.el.processInspector.innerHTML,
+    /DNS 1 \| Network 1 \| Canary 0 \| Downloads 1/,
+  );
+  assert.equal(ui.el.countDns.textContent, "1");
+  assert.equal(ui.el.countNetwork.textContent, "1");
+  assert.equal(ui.el.countCanary.textContent, "1");
+  assert.equal(ui.el.countAll.textContent, "3");
+  assert.match(ui.el.telemetryBody.innerHTML, /dl\.localedr\.invalid\/in-window\.exe/);
+  assert.doesNotMatch(ui.el.telemetryBody.innerHTML, /No telemetry recorded for this scope/);
+
+  // 2. Valid in-window selectedProcessId still scopes normally
+  ui.state.selectedProcessId = procInWindow.process_instance_id;
+  assert.equal(ui.resolveEffectiveProcessScope(byId), procInWindow.process_instance_id);
+  ui.renderTree();
+  assert.equal(ui.el.allProcsBtn.classList.contains("is-selected"), false);
+  assert.match(
+    ui.el.processTree.innerHTML,
+    /class="tree-row is-selected" data-proc-id="501:100"/,
+  );
+  assert.equal(ui.el.countDns.textContent, "0");
+  assert.equal(ui.el.countNetwork.textContent, "0");
+  assert.equal(ui.el.countCanary.textContent, "1");
+  assert.equal(ui.el.countAll.textContent, "1");
+  assert.match(ui.el.telemetryBody.innerHTML, /dl\.localedr\.invalid\/in-window\.exe/);
+
+  // 3. refreshAll() keeps valid in-window selectedProcessId, and clears stale selectedProcessId
+  await ui.refreshAll();
+  assert.equal(ui.state.selectedProcessId, procInWindow.process_instance_id);
+
+  ui.state.selectedProcessId = "9999:evicted";
+  await ui.refreshAll();
+  assert.equal(
+    ui.state.selectedProcessId,
+    null,
+    "refreshAll must clear stale selectedProcessId not present in refreshed snapshot",
+  );
+  assert.equal(ui.el.allProcsBtn.classList.contains("is-selected"), true);
+  assert.match(ui.el.telemetryBody.innerHTML, /dl\.localedr\.invalid\/in-window\.exe/);
+});
+
+test("UI-P4-12: ExpiredSuspended processless LAYER_4_BROWSER alert resolves via live IPC AllowOnce", async () => {
+  const invokeCalls = [];
+  let resolved = false;
+  const baseAlert = {
+    alert_id: "brw-expired-001",
+    rule_id: "LEDR-BROWSER-CLICKFIX",
+    source_layer: "LAYER_4_BROWSER",
+    severity: "Critical",
+    title: "ClickFix Pastejacking Detected",
+    process_instance_id: null,
+    process_suspended: false,
+    status: "ExpiredSuspended",
+    timestamp_ms: 1_732_200_000_000,
+    resolved_at_ms: null,
+    context_json: JSON.stringify({
+      event_type: "ClickFixPastejacking",
+      url: "https://verify.evil.invalid/captcha",
+      details: "powershell -enc SQBFAFgA",
+    }),
+  };
+
+  const ui = loadAppHarness(async (cmd, args) => {
+    invokeCalls.push({ cmd, args });
+    if (cmd === "resolve_alert_action") {
+      resolved = true;
+      return `alert ${args.alertId} resolved to APPROVED_ONCE`;
+    }
+    if (cmd === "fetch_local_defense_status") return null;
+    if (cmd === "ping_daemon") return { daemon_version: "0.1.0", protocol_version: 1 };
+    if (cmd === "fetch_flight_recorder") {
+      return {
+        processes: [],
+        dns_queries: [],
+        network_events: [],
+        file_canary_events: [],
+        download_origins: [],
+      };
+    }
+    if (cmd === "fetch_pipeline_metrics") return null;
+    if (cmd === "fetch_alerts") {
+      return [
+        resolved
+          ? { ...baseAlert, status: "ApprovedOnce", resolved_at_ms: 1_732_200_070_000 }
+          : { ...baseAlert },
+      ];
+    }
+    if (cmd === "fetch_rules") return [];
+    return null;
+  });
+
+  ui.state.isSamplePreview = false;
+  ui.state.isDaemonOnline = true;
+  ui.state.alerts = [{ ...baseAlert }];
+  ui.state.selectedAlertId = baseAlert.alert_id;
+  ui.state.alertQueueFilter = "all";
+
+  const { byId } = ui.buildHierarchy(ui.state.snapshot);
+  const details = ui.extractAlertDetails(ui.state.alerts[0], byId);
+  ui.syncResolutionControls(ui.state.alerts[0], details);
+
+  assert.equal(ui.el.btnAllowOnce.textContent, "Acknowledge");
+  assert.equal(
+    ui.el.btnAllowOnce.disabled,
+    false,
+    "Acknowledge button must be enabled for ExpiredSuspended LAYER_4_BROWSER alert",
+  );
+  assert.equal(ui.el.btnTerminateBlock.disabled, true);
+  assert.equal(ui.el.btnAllowPermanent.disabled, true);
+
+  await ui.handleResolveAlert("allow_once");
+
+  const resolveCall = invokeCalls.find((c) => c.cmd === "resolve_alert_action");
+  assert.ok(resolveCall, "expected resolve_alert_action IPC invoke");
+  assert.deepEqual(
+    { ...resolveCall.args },
+    {
+      alertId: baseAlert.alert_id,
+      decision: "AllowOnce",
+    },
+  );
+  assert.ok(
+    invokeCalls.some((c) => c.cmd === "fetch_alerts"),
+    "handleResolveAlert must trigger refreshAll after resolving",
+  );
+  assert.equal(ui.state.alerts[0].status, "ApprovedOnce");
+  const feedback = ui.state.triageFeedbackByAlert.get(baseAlert.alert_id);
+  assert.equal(feedback?.ok, true);
+  assert.match(feedback?.message || "", /resolved to APPROVED_ONCE/);
+  assert.match(ui.el.triageActionStatus.textContent, /resolved to APPROVED_ONCE/);
+});

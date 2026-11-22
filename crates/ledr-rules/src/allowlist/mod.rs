@@ -14,6 +14,8 @@ use ledr_proto::AuthenticodeInfo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+pub(crate) use authenticode::LOCAL_CERT_CHAIN_FLAGS;
 pub use authenticode::inspect_authenticode;
 pub use matcher::{is_allowed_by_rules, matches_path_pattern, signer_subject_matches};
 

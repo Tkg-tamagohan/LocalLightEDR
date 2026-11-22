@@ -2605,3 +2605,66 @@ fn rules_nrd_mem_01_flat_sorted_arena_50k_compact_lookup_roundtrip_and_edges() {
         vec!["b-one.xyz", "c-two.xyz", "d-three.xyz"]
     );
 }
+
+#[test]
+fn rules_p4_01_local_cert_chain_flags_offline_and_verifies_cmd_exe() {
+    // Verify Windows SDK (`wincrypt.h`) bitmask values for offline-only chain building.
+    const EXPECTED_CACHE_END_CERT: u32 = 0x0000_0001;
+    const EXPECTED_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_0004;
+    const EXPECTED_DISABLE_AUTH_ROOT_AUTO_UPDATE: u32 = 0x0000_0100;
+
+    let flags = allowlist::LOCAL_CERT_CHAIN_FLAGS;
+    assert_ne!(flags & EXPECTED_CACHE_END_CERT, 0);
+    assert_ne!(flags & EXPECTED_CACHE_ONLY_URL_RETRIEVAL, 0);
+    assert_ne!(flags & EXPECTED_DISABLE_AUTH_ROOT_AUTO_UPDATE, 0);
+    assert_eq!(
+        flags,
+        EXPECTED_CACHE_END_CERT
+            | EXPECTED_CACHE_ONLY_URL_RETRIEVAL
+            | EXPECTED_DISABLE_AUTH_ROOT_AUTO_UPDATE
+    );
+
+    let cmd_exe = Path::new(r"C:\Windows\System32\cmd.exe");
+    assert!(
+        cmd_exe.is_file(),
+        "expected Windows system binary {} to exist",
+        cmd_exe.display()
+    );
+    let auth = inspect_authenticode(cmd_exe)
+        .expect("cmd.exe should verify locally with offline cert chain flags");
+    assert!(
+        signer_subject_matches(&auth.signer_subject, "CN=Microsoft Windows"),
+        "unexpected signer_subject for cmd.exe: {}",
+        auth.signer_subject
+    );
+    assert_eq!(
+        auth.root_thumbprint,
+        "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+        "expected Microsoft Root Certificate Authority 2010 thumbprint for cmd.exe, got {:?}",
+        auth.root_thumbprint
+    );
+
+    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
+    let cfg = AllowlistConfig::from_json_str(allowlist_json).expect("parse default allowlist");
+    let sys32_rules: Vec<_> = cfg
+        .allowlist_rules
+        .iter()
+        .filter(|rule| rule.rule_id == "ALLOW-OS-WIN-SYS32")
+        .cloned()
+        .collect();
+    assert_eq!(
+        sys32_rules.len(),
+        1,
+        "expected ALLOW-OS-WIN-SYS32 in default_allowlist.json"
+    );
+    let identity = BinaryIdentity::from_path(cmd_exe);
+    assert!(
+        is_allowed_by_rules(
+            &identity,
+            None,
+            ledr_proto::RuleScope::ProcessAllow,
+            &sys32_rules
+        ),
+        "cmd.exe should match ALLOW-OS-WIN-SYS32 from default_allowlist.json"
+    );
+}

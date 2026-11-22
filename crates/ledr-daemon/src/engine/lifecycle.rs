@@ -171,6 +171,33 @@ impl DaemonEngine {
         let outbound_classifier = Arc::new(OutboundLaneClassifier::new(
             config.outbound_firewall_enabled,
         ));
+        let self_pid = std::process::id();
+        let self_exe_normalized = match std::env::current_exe() {
+            Ok(exe_path) => {
+                let raw = exe_path.to_string_lossy();
+                let normalized = super::normalize_exe_path_for_self_check(&raw);
+                if normalized.is_empty() {
+                    tracing::warn!(
+                        pid = self_pid,
+                        "current_exe resolved to empty path; self-process outbound exclusion disabled"
+                    );
+                    None
+                } else {
+                    Some(normalized)
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    pid = self_pid,
+                    error = %err,
+                    "failed to resolve current_exe; self-process outbound exclusion disabled"
+                );
+                None
+            }
+        };
+        if self_exe_normalized.is_some() {
+            outbound_classifier.mark_protected_os(self_pid);
+        }
         let process_dns_history =
             Mutex::new(ProcessDnsHistory::new(config.dns_history_capacity));
         let wfp_drop_dedup = Mutex::new(WfpDropDedupCache::new(
@@ -203,6 +230,8 @@ impl DaemonEngine {
 
         let engine = Arc::new(Self {
             config,
+            self_pid,
+            self_exe_normalized,
             store,
             sigma,
             pruner,

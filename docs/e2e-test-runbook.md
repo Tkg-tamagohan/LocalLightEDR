@@ -1247,7 +1247,7 @@ $env:RUST_LOG = "info,ledr_daemon=debug"
 if ($LASTEXITCODE -ne 0) { throw "Program Files ブリッジの一時登録に失敗しました。" }
 ```
 
-   - **一致ハッシュ受理**：ウィンドウ A が一致する `--bridge-sha256 $bridgeHash` で稼働中の状態で、Chrome の検証ページ（`http://clickfix-sim.localedr.invalid:8765/phase4-browser-test.html` 等、30 秒重複抑止を避ける場合は新しいタブまたは `E2E-P4-00` で登録済みの別テストオリジン）から ClickFix 操作を実行し、`C:\Program Files\LocalEDR\ledr-ui.exe` の `View 1` へ `LAYER_4_BROWSER` が新規記録されることを確認する。
+   - **一致ハッシュ受理**：ウィンドウ A が一致する `--bridge-sha256 $bridgeHash` で稼働中の状態で、Chrome の検証ページ（`http://clickfix-sim.localedr.invalid:8765/phase4-browser-test.html` 等、30 秒重複抑止を避ける場合は `E2E-P4-00` で登録済みの別テストオリジン、または 30 秒以上待機）から ClickFix 操作を実行し、`C:\Program Files\LocalEDR\ledr-ui.exe` の `View 1` へ `LAYER_4_BROWSER` が新規記録されることを確認する。
    - **不一致ハッシュ拒否**：ウィンドウ A を `Ctrl+C` で止め、`--bridge-sha256 0000000000000000000000000000000000000000000000000000000000000000` を指定して `C:\Program Files\LocalEDR\ledr-daemon.exe` を再起動したうえで、再びブラウザイベントを送出する。
      デーモンを再起動しても拡張側（`chrome.storage.session`）の 30 秒重複抑止（`tabId`、オリジン、イベント種別の組）は残るため、同じタブとオリジンで 30 秒以内に再操作すると IPC 自体が送信されず拒否結果を確認できない。
      IPC 送信を確実に行うため、新しいタブで検証ページを開くか、`E2E-P4-00` で登録済みの別テストオリジン（例：`http://pastejack-sim.localedr.invalid:8765/phase4-browser-test.html`）を使うか、30 秒以上待ってから ClickFix 操作を実行する。

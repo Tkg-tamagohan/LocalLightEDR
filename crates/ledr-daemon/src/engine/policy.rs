@@ -236,9 +236,14 @@ impl DaemonEngine {
             fw.restore_promoted_filter_states(&report.promoted_backups);
         }
         let _ = self.deploy_persisted_network_rules();
-        if !report.removed_domain_filters.is_empty() {
+        if !report.removed_domain_filters.is_empty() || !report.removed_app_blocks.is_empty() {
             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-            fw.restore_removed_domain_filters(&report.removed_domain_filters, &*self.defense);
+            if !report.removed_domain_filters.is_empty() {
+                fw.restore_removed_domain_filters(&report.removed_domain_filters, &*self.defense);
+            }
+            if !report.removed_app_blocks.is_empty() {
+                fw.restore_removed_app_blocks(&report.removed_app_blocks, &*self.defense);
+            }
         }
     }
 

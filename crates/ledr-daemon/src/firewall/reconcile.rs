@@ -15,8 +15,9 @@ use super::hints::{
 };
 use super::manager::WfpRuleManager;
 use super::types::{
-    InstalledWfpFilter, PromotedFilterSnapshot, RemovedDomainFilterSnapshot, WfpFailedOp,
-    WfpFilterOrigin, WfpReconcileDnsContext, WfpReconcileReport, WfpTargetKey,
+    InstalledWfpFilter, PromotedFilterSnapshot, RemovedAppBlockSnapshot, RemovedBlockSnapshot,
+    RemovedDomainFilterSnapshot, WfpFailedOp, WfpFilterOrigin, WfpReconcileDnsContext,
+    WfpReconcileReport, WfpTargetKey,
 };
 
 impl WfpRuleManager {
@@ -451,9 +452,36 @@ impl WfpRuleManager {
                             }
                         }
                         self.installed.remove(&key);
-                        self.pending_preemptive_removals.remove(&entry.handle);
-                        self.deferred_preemptive_removals.remove(&entry.handle);
+                        let prev_pending_removal_failures =
+                            self.pending_preemptive_removals.remove(&entry.handle);
+                        let prev_deferred_preemptive_removal =
+                            self.deferred_preemptive_removals.remove(&entry.handle);
+                        let bound_alert_ids: Vec<String> = self
+                            .bound_alerts
+                            .iter()
+                            .filter(|(_, k)| *k == &key)
+                            .map(|(id, _)| id.clone())
+                            .collect();
                         self.bound_alerts.retain(|_, k| k != &key);
+                        if !entry.allow
+                            && matches!(
+                                entry.origin,
+                                WfpFilterOrigin::Preemptive | WfpFilterOrigin::TransientContainment
+                            )
+                            && (prev_pending_removal_failures.is_none()
+                                || !bound_alert_ids.is_empty())
+                        {
+                            report.removed_app_blocks.push(RemovedAppBlockSnapshot {
+                                block: RemovedBlockSnapshot {
+                                    key: key.clone(),
+                                    exe_path: entry.exe_path.clone(),
+                                    origin: entry.origin.clone(),
+                                    prev_pending_removal_failures,
+                                    prev_deferred_preemptive_removal,
+                                },
+                                bound_alert_ids,
+                            });
+                        }
                         report.removed += 1;
                     }
                     Err(err) => {
@@ -719,6 +747,23 @@ impl WfpRuleManager {
                         "failed to restore removed DomainPolicy WFP filter during rollback"
                     );
                 }
+            }
+        }
+    }
+
+    /// Best-effort restoration of non-persisted app-wide block filters (`Preemptive` or
+    /// `TransientContainment`) removed during reconciliation before a subsequent failure caused
+    /// SQLite rollback, preserving alert containment bindings and pending/deferred preemptive
+    /// removal state (`PRRT_kwDOVyjVyM66ksZF`).
+    pub fn restore_removed_app_blocks(
+        &mut self,
+        removed: &[RemovedAppBlockSnapshot],
+        defense: &dyn ActiveDefenseController,
+    ) {
+        for snap in removed {
+            self.restore_lifted_block(None, snap.block.clone(), defense);
+            for alert_id in &snap.bound_alert_ids {
+                self.bind_alert_to_app_block(alert_id, &snap.block.exe_path);
             }
         }
     }

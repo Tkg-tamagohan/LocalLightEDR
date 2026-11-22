@@ -1956,3 +1956,117 @@ fn firewall_restore_promoted_filter_states_preserves_pending_and_deferred_preemp
     assert!(!fw.has_any_app_filter(pending_exe));
     assert!(fw.has_active_filter(deferred_exe, None, false));
 }
+
+/// Regression test `WFP-ROLLBACK-03` (`PRRT_kwDOVyjVyM66ksZF`):
+/// verifies that removed-block snapshots (`snapshot_app_block_and_bindings`,
+/// `lift_block_for_allow_once`, and `WfpReconcileReport::removed_app_blocks`) preserve
+/// `prev_deferred_preemptive_removal` and `prev_pending_removal_failures`, and that
+/// `restore_lifted_block` / `restore_removed_app_blocks` faithfully restore those states while
+/// avoiding re-adding dead unbound `pending_preemptive_removals` filters deleted by reconcile.
+#[test]
+fn firewall_removed_block_snapshots_and_reconcile_rollback_preserve_deferred_and_pending_state() {
+    let defense = StubDefense::new();
+    let inspector = StubInspector("a".repeat(64));
+    let mut fw = WfpRuleManager::new();
+
+    // 1. `snapshot_app_block_and_bindings` + `restore_lifted_block` preserve deferred removal.
+    let exe_deferred = r"C:\Users\Alice\Downloads\rollback_deferred_snap.exe";
+    let h1 = defense
+        .add_wfp_app_rule(Path::new(exe_deferred), None, false)
+        .unwrap();
+    assert!(fw.register_preemptive_block(exe_deferred, h1, &defense));
+    assert!(fw.bind_alert_to_app_block("ALT-SNAP-1", exe_deferred));
+    assert!(!fw.remove_preemptive_block_if_unused(exe_deferred, &defense));
+    assert!(fw.has_deferred_preemptive_removal(exe_deferred));
+
+    let (snap_opt, sibs) = fw.snapshot_app_block_and_bindings(exe_deferred);
+    let snap = snap_opt.expect("snapshot must capture Preemptive block");
+    assert!(snap.prev_deferred_preemptive_removal);
+    assert_eq!(snap.prev_pending_removal_failures, None);
+    assert_eq!(sibs, vec!["ALT-SNAP-1".to_string()]);
+
+    // App-wide `NetworkAllow` reconciliation removes the Preemptive block and records it in
+    // `report.removed_app_blocks` with its deferred flag and bound alert.
+    let allow_rule = AllowlistRuleRecord {
+        rule_id: "R-ALLOW-SNAP-1".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: exe_deferred.to_string(),
+        sha256: Some("a".repeat(64)),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: 1,
+        created_by: "test".to_string(),
+    };
+    let report = fw.reconcile_persisted_rules(&[allow_rule], &[], &inspector, &defense);
+    assert_eq!(report.removed_app_blocks.len(), 1);
+    assert!(report.removed_app_blocks[0].block.prev_deferred_preemptive_removal);
+    assert_eq!(
+        report.removed_app_blocks[0].bound_alert_ids,
+        vec!["ALT-SNAP-1".to_string()]
+    );
+    assert!(fw.has_active_filter(exe_deferred, None, true));
+
+    // Roll back the allow rule (removing Permit) and restore via `restore_removed_app_blocks`.
+    let _ = fw.reconcile_persisted_rules(&[], &[], &inspector, &defense);
+    assert!(!fw.has_any_app_filter(exe_deferred));
+    fw.restore_removed_app_blocks(&report.removed_app_blocks, &defense);
+    assert_eq!(
+        fw.filter_origin(exe_deferred, None),
+        Some(&WfpFilterOrigin::Preemptive)
+    );
+    assert!(fw.is_alert_bound("ALT-SNAP-1"));
+    assert!(
+        fw.has_deferred_preemptive_removal(exe_deferred),
+        "restore_removed_app_blocks must restore deferred_preemptive_removals on the new handle"
+    );
+
+    // Also verify `lift_block_for_allow_once` + `restore_lifted_block` preserves deferred state.
+    let (lifted_opt, was_bound) = fw
+        .lift_block_for_allow_once("ALT-SNAP-1", exe_deferred, false, &defense)
+        .expect("lift_block_for_allow_once");
+    assert!(was_bound);
+    let lifted = lifted_opt.expect("lifted snapshot");
+    assert!(lifted.prev_deferred_preemptive_removal);
+    assert!(!fw.has_any_app_filter(exe_deferred));
+
+    fw.restore_lifted_block(Some("ALT-SNAP-1"), lifted, &defense);
+    assert_eq!(
+        fw.filter_origin(exe_deferred, None),
+        Some(&WfpFilterOrigin::Preemptive)
+    );
+    assert!(fw.is_alert_bound("ALT-SNAP-1"));
+    assert!(
+        fw.has_deferred_preemptive_removal(exe_deferred),
+        "restore_lifted_block must restore deferred_preemptive_removals on the new handle"
+    );
+
+    // 2. Dead unbound `pending_preemptive_removals` handle deleted by reconcile must NOT be
+    //    re-added by `restore_removed_app_blocks` (BFE deletion already succeeded).
+    let exe_dead_pending = r"C:\Users\Alice\Downloads\rollback_dead_pending.exe";
+    let h2 = defense
+        .add_wfp_app_rule(Path::new(exe_dead_pending), None, false)
+        .unwrap();
+    assert!(fw.register_preemptive_block(exe_dead_pending, h2, &defense));
+    defense.set_fail_removes(true);
+    assert!(!fw.remove_preemptive_block_if_unused(exe_dead_pending, &defense));
+    assert!(fw.has_pending_preemptive_removal(exe_dead_pending));
+    defense.set_fail_removes(false);
+
+    let allow_dead = AllowlistRuleRecord {
+        rule_id: "R-ALLOW-DEAD-2".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: exe_dead_pending.to_string(),
+        sha256: Some("a".repeat(64)),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: 2,
+        created_by: "test".to_string(),
+    };
+    let report_dead = fw.reconcile_persisted_rules(&[allow_dead], &[], &inspector, &defense);
+    assert!(
+        report_dead.removed_app_blocks.is_empty(),
+        "successfully deleted unbound pending-removal block must not be queued for rollback restoration"
+    );
+}

@@ -6907,9 +6907,14 @@ async fn daemon_p4_cmd_10_sweep_runs_under_telemetry_backlog_and_preserves_evict
             .process_table
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let evicted_live_id = ProcessIdentity::new(9101, base_100ns).instance_id();
         assert!(
-            !table.has_active_exe_key(&WfpRuleManager::exe_key(evicted_live_exe)),
-            "ActiveProcessTable capacity pressure must have evicted still-running evicted_live_exe"
+            table.get_by_instance_id(&evicted_live_id).is_none(),
+            "ActiveProcessTable capacity pressure must have evicted still-running evicted_live_exe from primary entries"
+        );
+        assert!(
+            table.has_active_exe_key(&WfpRuleManager::exe_key(evicted_live_exe)),
+            "ActiveProcessTable must continue distinguishing evicted live process from exited processes"
         );
     }
 
@@ -7475,8 +7480,12 @@ async fn sibling_alert_auto_resolve_after_process_stop_removes_deferred_preempti
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert!(
-            !table.has_active_exe_key(&WfpRuleManager::exe_key(exe_c)),
-            "capacity pressure must have evicted still-running C1 from ActiveProcessTable"
+            table.get_by_instance_id(&id_c1.instance_id()).is_none(),
+            "capacity pressure must have evicted still-running C1 from primary ActiveProcessTable entries"
+        );
+        assert!(
+            table.has_active_exe_key(&WfpRuleManager::exe_key(exe_c)),
+            "ActiveProcessTable must continue distinguishing evicted live C1 from exited processes"
         );
     }
 
@@ -7723,6 +7732,667 @@ async fn policy_upsert_rollback_restores_pending_preemptive_removal_for_periodic
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+}
+
+/// Regression test `WFP-DEFERRED-03` (`PRRT_kwDOVyjVyM66ksZW`):
+/// verifies that when a still-running sibling (`A1`) of an unapproved executable is evicted from
+/// `ActiveProcessTable::entries` BEFORE another sibling (`A2`) stops and resolves the last bound
+/// network alert (via sibling auto-resolve), `A1`'s `Preemptive` WFP block stays intact — and is
+/// only removed once `A1` itself actually stops. Also verifies scoped `AllowPermanent` after
+/// `ProcessStop` removes a deferred block, while secondary `evicted_live` overflow stays fail-closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evicted_live_sibling_retains_preemptive_block_across_last_alert_resolution_until_stop() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use crate::firewall::{WfpFilterOrigin, WfpRuleManager};
+    use crate::process_table::ActiveProcessTable;
+
+    struct TrackingDefense {
+        next_handle: AtomicU64,
+        active_handles: Mutex<HashSet<u64>>,
+    }
+
+    impl TrackingDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(9500),
+                active_handles: Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn active_handles(&self) -> HashSet<u64> {
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    impl ActiveDefenseController for TrackingDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(
+            &self,
+            _: &Path,
+            _: Option<IpAddr>,
+            _: bool,
+        ) -> Result<u64, String> {
+            let h = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(h);
+            Ok(h)
+        }
+        fn remove_wfp_rule(&self, handle: u64) -> Result<(), String> {
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&handle);
+            Ok(())
+        }
+    }
+
+    let defense = Arc::new(TrackingDefense::new());
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("e".repeat(64))),
+        Arc::new(MapLiveProcessInspector::new([])),
+    );
+    {
+        let mut table = engine
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *table = ActiveProcessTable::new(2);
+    }
+    let sender = engine.sender();
+
+    let now_ms = current_unix_ms();
+    let base_100ns = 116_444_736_000_000_000u64 + ((now_ms - 5_000) as u64) * 10_000;
+    let wait_hp = |target: u64| {
+        let eng = Arc::clone(&engine);
+        async move {
+            let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+            while eng.high_priority_processed.load(Ordering::Relaxed) < target {
+                assert!(tokio::time::Instant::now() < dl, "hp target {target}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+
+    // --- Part A: A1 is evicted BEFORE A2 stops and resolves the last bound alert ---
+    let exe_a = r"C:\Users\Alice\Downloads\evicted_before_stop.exe";
+    let id_a1 = ProcessIdentity::new(9510, base_100ns);
+    let id_a2 = ProcessIdentity::new(9511, base_100ns + 10_000);
+    let inst_a2 = id_a2.instance_id();
+
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: id_a1,
+            parent_pid: 4,
+            exe_path: exe_a.to_string(),
+            command_line: "evicted_before_stop.exe --live-1".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start A1");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: id_a2,
+            parent_pid: 4,
+            exe_path: exe_a.to_string(),
+            command_line: "evicted_before_stop.exe --worker-2".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start A2");
+    wait_hp(hp + 2).await;
+
+    // Evict still-running A1 from `ActiveProcessTable::entries` (cap=2) BEFORE A2 exits.
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(9512, base_100ns + 20_000),
+            parent_pid: 4,
+            exe_path: r"C:\Program Files\BenignPad\pad_a1.exe".to_string(),
+            command_line: "pad_a1.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start pad_a1");
+    wait_hp(hp + 1).await;
+    {
+        let table = engine
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            table.get_by_instance_id(&id_a1.instance_id()).is_none(),
+            "A1 must be evicted from primary entries"
+        );
+        assert!(
+            table.has_active_exe_key(&WfpRuleManager::exe_key(exe_a)),
+            "evicted live A1 must remain active in has_active_exe_key"
+        );
+    }
+
+    let alert_a_rule = AlertRecord {
+        alert_id: "ALT-EVICT-A-RULE".to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_PROCESS".to_string(),
+        rule_id: "SIGMA-EVICT-A".to_string(),
+        title: "Rule alert on A2".to_string(),
+        process_instance_id: Some(inst_a2.clone()),
+        process_suspended: false,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": exe_a,
+            "sha256": "e".repeat(64),
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    let alert_a_net = AlertRecord {
+        alert_id: "ALT-EVICT-A-NET".to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_3_NETWORK".to_string(),
+        rule_id: "WFP-PREEMPT-EVICT-A".to_string(),
+        title: "Network alert on A2".to_string(),
+        process_instance_id: Some(inst_a2.clone()),
+        process_suspended: false,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": exe_a,
+            "sha256": "e".repeat(64),
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    engine.store.record_alert(&alert_a_rule).expect("record rule");
+    engine.store.record_alert(&alert_a_net).expect("record net");
+    {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.bind_alert_to_app_block(&alert_a_net.alert_id, exe_a));
+    }
+
+    // A2 exits while evicted live A1 is STILL running -> must NOT strip block or mark deferred.
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: id_a2.pid,
+            exit_time_100ns: base_100ns + 30_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("stop A2");
+    wait_hp(hp + 1).await;
+
+    // Resolving A2's rule alert auto-resolves A2's bound network alert; A1's Preemptive block
+    // MUST remain active because A1 is still running!
+    engine
+        .resolve_alert(
+            &alert_a_rule.alert_id,
+            ledr_proto::AlertDecision::TerminateAndBlock {
+                add_block_rule: false,
+            },
+        )
+        .expect("resolve rule alert on A2");
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            fw.filter_origin(exe_a, None),
+            Some(&WfpFilterOrigin::Preemptive),
+            "still-running evicted A1 must keep its Preemptive WFP block after A2's last alert resolves"
+        );
+        assert!(!fw.has_deferred_preemptive_removal(exe_a));
+        assert!(!fw.has_pending_preemptive_removal(exe_a));
+    }
+
+    // Now A1 itself finally stops -> `on_process_stop_with_exe` resolves A1 from `evicted_live`
+    // and cleanly removes `exe_a`'s Preemptive WFP block!
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: id_a1.pid,
+            exit_time_100ns: base_100ns + 40_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("stop A1");
+    wait_hp(hp + 1).await;
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !fw.has_any_app_filter(exe_a),
+            "stopping evicted live A1 must cleanly remove exe_a's Preemptive WFP block"
+        );
+    }
+    assert!(defense.active_handles().is_empty());
+
+    // --- Part B: Scoped AllowPermanent after ProcessStop cleans up deferred Preemptive block,
+    //     while secondary `evicted_live` overflow stays fail-closed for a running sibling ---
+    let exe_scoped = r"C:\Users\Alice\Downloads\scoped_allow_after_stop.exe";
+    let id_s1 = ProcessIdentity::new(9520, base_100ns + 50_000);
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: id_s1,
+            parent_pid: 4,
+            exe_path: exe_scoped.to_string(),
+            command_line: "scoped_allow_after_stop.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start S1");
+    wait_hp(hp + 1).await;
+
+    let alert_scoped = AlertRecord {
+        alert_id: "ALT-SCOPED-AFTER-STOP".to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_3_NETWORK".to_string(),
+        rule_id: "WFP-PREEMPT-SCOPED".to_string(),
+        title: "Scoped network alert".to_string(),
+        process_instance_id: Some(id_s1.instance_id()),
+        process_suspended: false,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": exe_scoped,
+            "sha256": "e".repeat(64),
+            "dst_ip": "198.51.100.42",
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    engine
+        .store
+        .record_alert(&alert_scoped)
+        .expect("record scoped alert");
+    {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.bind_alert_to_app_block(&alert_scoped.alert_id, exe_scoped));
+    }
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: id_s1.pid,
+            exit_time_100ns: base_100ns + 60_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("stop S1");
+    wait_hp(hp + 1).await;
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.has_deferred_preemptive_removal(exe_scoped));
+    }
+    engine
+        .resolve_alert(
+            &alert_scoped.alert_id,
+            ledr_proto::AlertDecision::AllowPermanent {
+                use_signer_if_available: false,
+                allow_dest: Some("198.51.100.42".to_string()),
+            },
+        )
+        .expect("resolve scoped AllowPermanent");
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !fw.has_active_filter(exe_scoped, None, false),
+            "scoped AllowPermanent releasing last bound alert after ProcessStop must remove deferred Preemptive block"
+        );
+    }
+
+    // Secondary `evicted_live` overflow fail-closed check: even when `evicted_live` overflows,
+    // `retry_deferred_preemptive_removal_locked` refuses to strip the overflowed exe's block.
+    {
+        let mut table = engine
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *table = ActiveProcessTable::new(1).with_evicted_live_capacity(1);
+    }
+    let exe_ov = r"C:\Users\Alice\Downloads\overflow_protected.exe";
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(9530, base_100ns + 70_000),
+            parent_pid: 4,
+            exe_path: exe_ov.to_string(),
+            command_line: "overflow_protected.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start ov");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(9531, base_100ns + 80_000),
+            parent_pid: 4,
+            exe_path: r"C:\Program Files\BenignPad\ov_pad1.exe".to_string(),
+            command_line: "ov_pad1.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start ov_pad1");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(9532, base_100ns + 90_000),
+            parent_pid: 4,
+            exe_path: r"C:\Program Files\BenignPad\ov_pad2.exe".to_string(),
+            command_line: "ov_pad2.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start ov_pad2");
+    wait_hp(hp + 3).await;
+    {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.bind_alert_to_app_block("ALT-OV-TEMP", exe_ov));
+        assert!(!fw.remove_preemptive_block_if_unused(exe_ov, &*engine.defense));
+        assert!(fw.has_deferred_preemptive_removal(exe_ov));
+        fw.unbind_alert("ALT-OV-TEMP");
+        engine.retry_deferred_preemptive_removal_locked(&mut fw, exe_ov);
+        assert_eq!(
+            fw.filter_origin(exe_ov, None),
+            Some(&WfpFilterOrigin::Preemptive),
+            "secondary evicted_live overflow must keep Preemptive block intact (fail-closed)"
+        );
+        assert!(!fw.has_deferred_preemptive_removal(exe_ov));
+    }
+
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+}
+
+/// Regression test `WFP-ROLLBACK-04` (`PRRT_kwDOVyjVyM66ksZF`):
+/// verifies that when app-wide `AllowPermanent` (or `AllowOnce`) removes a deferred-removal
+/// `Preemptive` block and subsequently fails during alert resolution (rolling back the saved rule
+/// and restoring the block + bindings), the restored `Preemptive` block retains its
+/// `deferred_preemptive_removals` state so a subsequent sibling alert auto-resolve cleanly deletes
+/// the restored filter from BFE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allow_permanent_and_allow_once_rollback_preserve_deferred_preemptive_removal() {
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use crate::firewall::WfpFilterOrigin;
+
+    struct FailResumeDefense {
+        next_handle: AtomicU64,
+        fail_resume: AtomicBool,
+        active_handles: Mutex<HashSet<u64>>,
+    }
+
+    impl FailResumeDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(9600),
+                fail_resume: AtomicBool::new(false),
+                active_handles: Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn active_handles(&self) -> HashSet<u64> {
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    impl ActiveDefenseController for FailResumeDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, target: &ProcessIdentity) -> Result<(), String> {
+            if self.fail_resume.load(Ordering::Acquire) {
+                return Err(format!(
+                    "simulated access denied resuming PID {}",
+                    target.pid
+                ));
+            }
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(
+            &self,
+            _: &Path,
+            _: Option<IpAddr>,
+            _: bool,
+        ) -> Result<u64, String> {
+            let h = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(h);
+            Ok(h)
+        }
+        fn remove_wfp_rule(&self, handle: u64) -> Result<(), String> {
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&handle);
+            Ok(())
+        }
+    }
+
+    let defense = Arc::new(FailResumeDefense::new());
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("f".repeat(64))),
+        Arc::new(MapLiveProcessInspector::new([])),
+    );
+    let sender = engine.sender();
+
+    let now_ms = current_unix_ms();
+    let base_100ns = 116_444_736_000_000_000u64 + ((now_ms - 5_000) as u64) * 10_000;
+    let exe = r"C:\Users\Alice\Downloads\allow_perm_rollback_deferred.exe";
+    let proc_id = ProcessIdentity::new(9610, base_100ns);
+    let proc_inst = proc_id.instance_id();
+
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: proc_id,
+            parent_pid: 4,
+            exe_path: exe.to_string(),
+            command_line: "allow_perm_rollback_deferred.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start proc");
+    let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < hp + 1 {
+        assert!(tokio::time::Instant::now() < dl, "start processed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Use the current process PID as a live `suspended_children` entry so
+    // `is_process_gone_or_replaced` confirms `Running` and treats `resume_process` failure as a
+    // fatal rollback error.
+    let live_child = ProcessIdentity::new(std::process::id(), 1);
+    let alert_rule = AlertRecord {
+        alert_id: "ALT-RB4-RULE".to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_1_PROCESS".to_string(),
+        rule_id: "SIGMA-RB4".to_string(),
+        title: "Rule alert RB4".to_string(),
+        process_instance_id: Some(proc_inst.clone()),
+        process_suspended: false,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": exe,
+            "sha256": "f".repeat(64),
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    let alert_net = AlertRecord {
+        alert_id: "ALT-RB4-NET".to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_3_NETWORK".to_string(),
+        rule_id: "WFP-PREEMPT-RB4".to_string(),
+        title: "Network alert RB4".to_string(),
+        process_instance_id: Some(proc_inst.clone()),
+        process_suspended: true,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": exe,
+            "sha256": "f".repeat(64),
+            "suspended_children": [live_child.instance_id()],
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    engine.store.record_alert(&alert_rule).expect("record rule");
+    engine.store.record_alert(&alert_net).expect("record net");
+    {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.bind_alert_to_app_block(&alert_net.alert_id, exe));
+    }
+
+    // Process exits -> `remove_preemptive_block_if_unused` defers removal while ALT-RB4-NET is bound.
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: proc_id.pid,
+            exit_time_100ns: base_100ns + 10_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("stop proc");
+    let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < hp + 1 {
+        assert!(tokio::time::Instant::now() < dl, "stop processed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.has_deferred_preemptive_removal(exe));
+    }
+
+    // 1. Fail app-wide `AllowPermanent` after reconcile removes the Preemptive block and installs
+    //    PersistedPolicy Permit -> rollback must restore Preemptive block, ALT-RB4-NET binding,
+    //    AND `deferred_preemptive_removals`!
+    defense.fail_resume.store(true, Ordering::Release);
+    let perm_err = engine
+        .resolve_alert(
+            &alert_net.alert_id,
+            ledr_proto::AlertDecision::AllowPermanent {
+                use_signer_if_available: false,
+                allow_dest: None,
+            },
+        )
+        .expect_err("app-wide AllowPermanent must fail and roll back when resume fails");
+    assert!(
+        perm_err.contains("simulated access denied"),
+        "unexpected error: {perm_err}"
+    );
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            fw.filter_origin(exe, None),
+            Some(&WfpFilterOrigin::Preemptive),
+            "AllowPermanent rollback must restore Preemptive block"
+        );
+        assert!(
+            fw.is_alert_bound(&alert_net.alert_id),
+            "AllowPermanent rollback must rebind alert"
+        );
+        assert!(
+            fw.has_deferred_preemptive_removal(exe),
+            "AllowPermanent rollback must preserve deferred_preemptive_removals on restored block"
+        );
+    }
+
+    // 2. Also fail `AllowOnce` (which lifts the Preemptive block directly via
+    //    `lift_block_for_allow_once`) -> rollback must likewise preserve `deferred_preemptive_removals`!
+    let once_err = engine
+        .resolve_alert(&alert_net.alert_id, ledr_proto::AlertDecision::AllowOnce)
+        .expect_err("AllowOnce must fail and roll back when resume fails");
+    assert!(
+        once_err.contains("simulated access denied"),
+        "unexpected error: {once_err}"
+    );
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            fw.filter_origin(exe, None),
+            Some(&WfpFilterOrigin::Preemptive),
+            "AllowOnce rollback must restore Preemptive block"
+        );
+        assert!(
+            fw.is_alert_bound(&alert_net.alert_id),
+            "AllowOnce rollback must rebind alert"
+        );
+        assert!(
+            fw.has_deferred_preemptive_removal(exe),
+            "AllowOnce rollback must preserve deferred_preemptive_removals on restored block"
+        );
+    }
+
+    // 3. Resolve the sibling rule alert via `TerminateAndBlock { add_block_rule: false }`
+    //    (auto-resolving `ALT-RB4-NET` via `resolve_sibling_alerts_as_terminated`) ->
+    //    the restored deferred Preemptive block MUST be cleanly removed from BFE!
+    defense.fail_resume.store(false, Ordering::Release);
+    engine
+        .resolve_alert(
+            &alert_rule.alert_id,
+            ledr_proto::AlertDecision::TerminateAndBlock {
+                add_block_rule: false,
+            },
+        )
+        .expect("resolve sibling rule alert");
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !fw.has_any_app_filter(exe),
+            "auto-resolving last sibling alert after rollback must remove restored deferred Preemptive block"
+        );
+        assert!(!fw.has_deferred_preemptive_removal(exe));
+    }
+    assert!(
+        defense.active_handles().is_empty(),
+        "no BFE handle may leak after sibling resolution following rollback"
+    );
 
     engine.shutdown_and_flush().await.expect("shutdown engine");
 }

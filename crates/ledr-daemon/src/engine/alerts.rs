@@ -757,13 +757,15 @@ impl DaemonEngine {
                         }
                     }
                 } else if is_network_alert && self.config.outbound_firewall_enabled {
-                    let release_res = {
+                    let (release_res, bound_exe) = {
                         let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                        fw.release_transient_containment_for_alert(
+                        let bound_exe = fw.bound_alert_exe_path(alert_id);
+                        let res = fw.release_transient_containment_for_alert(
                             alert_id,
                             exe_path.as_deref(),
                             &*self.defense,
-                        )
+                        );
+                        (res, bound_exe)
                     };
                     if let Err(err) = release_res {
                         tracing::warn!(
@@ -772,7 +774,7 @@ impl DaemonEngine {
                             "best-effort transient WFP release after terminate without block failed"
                         );
                     }
-                    if let Some(ref exe) = exe_path {
+                    if let Some(exe) = exe_path.as_deref().or(bound_exe.as_deref()) {
                         let target_key = WfpRuleManager::exe_key(exe);
                         // Lock order: `firewall` -> `process_table` (unified with `wfp_premat.rs`
                         // and `events.rs`).
@@ -1174,9 +1176,10 @@ impl DaemonEngine {
     /// Retries removal of a non-startup `Preemptive` app-wide WFP block whose `ProcessStop`
     /// cleanup was deferred while unresolved alerts still referenced it (`PRRT_kwDOVyjVyM66kfDX`).
     ///
-    /// Only acts when `has_deferred_preemptive_removal` is set (so `ActiveProcessTable` capacity
-    /// eviction alone can never strip a live process's block), all bound alerts for `exe_path`
-    /// have been released, and no active instance remains in `process_table`.
+    /// Only acts when `has_deferred_preemptive_removal` is set, all bound alerts for `exe_path`
+    /// have been released, and `process_table.has_active_exe_key` (which also tracks live
+    /// instances displaced from `entries` into `evicted_live` / overflow fail-closed sets,
+    /// `PRRT_kwDOVyjVyM66ksZW`) confirms no live instance remains.
     /// Lock order: caller holds `firewall` -> briefly acquires and drops `process_table` before
     /// calling `remove_wfp_rule`.
     pub(super) fn retry_deferred_preemptive_removal_locked(

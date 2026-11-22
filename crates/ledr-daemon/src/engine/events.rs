@@ -1342,11 +1342,10 @@ impl DaemonEngine {
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
-                let id = table.on_process_stop(*pid, event_ts_ms);
-                let exe_path = id
-                    .as_deref()
-                    .and_then(|inst_id| table.get_by_instance_id(inst_id))
-                    .map(|entry| entry.exe_path.clone());
+                let (id, exe_path) = match table.on_process_stop_with_exe(*pid, event_ts_ms) {
+                    Some((inst_id, exe)) => (Some(inst_id), Some(exe)),
+                    None => (None, None),
+                };
                 ResolvedProcessContext {
                     proc_identity: None,
                     proc_instance_id: id.clone(),

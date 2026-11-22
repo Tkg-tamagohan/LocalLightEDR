@@ -232,6 +232,7 @@ impl DaemonEngine {
                     if let Err(err) = self.expire_overdue_alerts(current_unix_ms()) {
                         tracing::warn!(error = %err, "periodic alert expiry transition failed");
                     }
+                    self.sweep_unused_preemptive_wfp_blocks();
                 }
                 _ = purge_ticker.tick() => {
                     let busy = purge_in_flight.as_ref().is_some_and(|h| !h.is_finished());

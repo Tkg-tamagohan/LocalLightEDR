@@ -52,8 +52,9 @@ impl WfpRuleManager {
     ///
     /// If `remove_wfp_rule` fails and no filter currently occupies `(exe_path, None)` in
     /// `self.installed`, retains `handle` as a tracked `Preemptive` filter (consistent with
-    /// [`Self::remove_preemptive_block_if_unused`]) so subsequent `ProcessStop`, `AllowOnce`,
-    /// `TerminateAndBlock`, or persisted-policy reconciliation can retry removal instead of
+    /// [`Self::remove_preemptive_block_if_unused`]) so periodic unused-block sweeps
+    /// ([`Self::sweep_unused_preemptive_blocks`]), subsequent `ProcessStop`, `AllowOnce`,
+    /// `TerminateAndBlock`, or app-wide `NetworkAllow` reconciliation can retry removal instead of
     /// leaking an untracked OS BFE block.
     pub fn discard_obsolete_preemptive_block(
         &mut self,
@@ -317,6 +318,7 @@ impl WfpRuleManager {
         }
 
         self.installed.remove(&key);
+        self.preemptive_remove_failures.remove(&entry.handle);
         Ok((
             Some(RemovedBlockSnapshot {
                 key,
@@ -450,6 +452,7 @@ impl WfpRuleManager {
             ));
         }
         self.installed.remove(&key);
+        self.preemptive_remove_failures.remove(&entry.handle);
         Ok((
             Some(RemovedBlockSnapshot {
                 key,

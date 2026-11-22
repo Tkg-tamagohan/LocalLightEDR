@@ -192,6 +192,216 @@ fn firewall_discard_obsolete_preemptive_block_retains_handle_on_remove_failure()
 }
 
 #[test]
+fn firewall_sweep_unused_preemptive_blocks_fast_path_and_protections() {
+    let mut fw = WfpRuleManager::new();
+    let defense = StubDefense::new();
+    let inspector = StubInspector("c".repeat(64));
+
+    // 1. Empty manager hits 0-candidate fast path without invoking `is_exe_active`.
+    let mut probe_calls = 0usize;
+    assert_eq!(
+        fw.sweep_unused_preemptive_blocks(
+            |_| {
+                probe_calls += 1;
+                false
+            },
+            &defense,
+        ),
+        0
+    );
+    assert_eq!(probe_calls, 0);
+
+    // 2. Protected origins and states (PersistedPolicy, DomainPolicy, TransientContainment,
+    //    startup-pinned Preemptive, alert-bound Preemptive) also hit 0-candidate fast path
+    //    and are never removed even when no process is active.
+    let startup_ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let policy_exe = r"C:\Tools\policy_keep.exe";
+    let domain_exe = r"C:\Tools\domain_keep.exe";
+    let transient_exe = r"C:\Tools\transient_keep.exe";
+    let bound_preempt_exe = r"C:\Users\Alice\Downloads\alert_bound.exe";
+    let domain_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 44));
+
+    fw.set_startup_preemptive_executables(&[startup_ps.to_string()]);
+    let report = fw.reconcile_persisted_rules(
+        &[make_network_rule(
+            "R-SWEEP-KEEP",
+            RuleScope::NetworkBlock,
+            policy_exe,
+            None,
+            None,
+            1,
+        )],
+        &[],
+        &inspector,
+        &defense,
+    );
+    assert_eq!(report.applied, 2); // startup_ps + policy_exe
+
+    let _ = fw
+        .ensure_domain_policy_block(domain_exe, domain_ip, "bad.example", &defense)
+        .expect("domain block");
+    let h_trans = defense
+        .add_wfp_app_rule(Path::new(transient_exe), None, false)
+        .unwrap();
+    assert!(fw
+        .register_transient_containment("ALT-TRANS", transient_exe, h_trans, &defense)
+        .is_some());
+    let h_bound = defense
+        .add_wfp_app_rule(Path::new(bound_preempt_exe), None, false)
+        .unwrap();
+    assert!(fw.register_preemptive_block(bound_preempt_exe, h_bound, &defense));
+    assert!(fw.bind_alert_to_app_block("ALT-PREEMPT", bound_preempt_exe));
+
+    assert_eq!(
+        fw.sweep_unused_preemptive_blocks(
+            |_| {
+                probe_calls += 1;
+                false
+            },
+            &defense,
+        ),
+        0
+    );
+    assert_eq!(
+        probe_calls, 0,
+        "only non-sweepable filters installed must hit 0-candidate fast path"
+    );
+    assert_eq!(fw.active_filter_count(), 5);
+
+    // 3. Add one active non-startup Preemptive and one unused retained Preemptive (via failed
+    //    discard). Sweep removes ONLY the unused one.
+    let active_exe = r"C:\Users\Alice\Downloads\still_active.exe";
+    let unused_exe = r"C:\Users\Alice\Downloads\orphaned_retained.exe";
+    let active_key = WfpRuleManager::exe_key(active_exe);
+
+    let h_active = defense
+        .add_wfp_app_rule(Path::new(active_exe), None, false)
+        .unwrap();
+    assert!(fw.register_preemptive_block(active_exe, h_active, &defense));
+
+    defense.set_fail_removes(true);
+    let h_unused = defense
+        .add_wfp_app_rule(Path::new(unused_exe), None, false)
+        .unwrap();
+    assert!(!fw.discard_obsolete_preemptive_block(unused_exe, h_unused, &defense));
+    defense.set_fail_removes(false);
+
+    let mut probed_keys = Vec::new();
+    let removed = fw.sweep_unused_preemptive_blocks(
+        |exe_key| {
+            probed_keys.push(exe_key.to_string());
+            exe_key == active_key
+        },
+        &defense,
+    );
+    assert_eq!(removed, 1);
+    assert_eq!(probed_keys.len(), 2);
+    assert!(!fw.has_any_app_filter(unused_exe));
+    assert!(fw.has_active_filter(active_exe, None, false));
+    assert!(fw.has_active_filter(startup_ps, None, false));
+    assert!(fw.has_active_filter(policy_exe, None, false));
+    assert!(fw.has_active_filter(domain_exe, Some(domain_ip), false));
+    assert!(fw.has_active_filter(transient_exe, None, false));
+    assert!(fw.has_active_filter(bound_preempt_exe, None, false));
+    assert_eq!(*defense.removed.lock().unwrap(), vec![h_unused]);
+
+    // 4. Once the bound alert unbinds, the previously bound Preemptive filter becomes sweepable.
+    fw.unbind_alert("ALT-PREEMPT");
+    let removed_after_unbind =
+        fw.sweep_unused_preemptive_blocks(|exe_key| exe_key == active_key, &defense);
+    assert_eq!(removed_after_unbind, 1);
+    assert!(!fw.has_any_app_filter(bound_preempt_exe));
+    assert_eq!(*defense.removed.lock().unwrap(), vec![h_unused, h_bound]);
+}
+
+#[test]
+fn firewall_sweep_unused_preemptive_blocks_backoff_throttles_warnings_and_recovers() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    struct WarnCounterSubscriber {
+        warn_count: Arc<AtomicUsize>,
+    }
+
+    impl tracing::Subscriber for WarnCounterSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.warn_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    let mut fw = WfpRuleManager::new();
+    let defense = StubDefense::new();
+    let exe = r"C:\Users\Alice\Downloads\persistent_bfe_err.exe";
+
+    defense.set_fail_removes(true);
+    let h = defense
+        .add_wfp_app_rule(Path::new(exe), None, false)
+        .unwrap();
+    assert!(!fw.discard_obsolete_preemptive_block(exe, h, &defense));
+    assert!(fw.has_active_filter(exe, None, false));
+
+    let warn_count = Arc::new(AtomicUsize::new(0));
+    let sub = WarnCounterSubscriber {
+        warn_count: Arc::clone(&warn_count),
+    };
+
+    // Consecutive failures emit WARN only on powers of two (1, 2, 4, 8).
+    let expected_warns = [1usize, 2, 2, 3, 3, 3, 3, 4];
+    tracing::subscriber::with_default(sub, || {
+        for (idx, expected) in expected_warns.iter().enumerate() {
+            assert_eq!(fw.sweep_unused_preemptive_blocks(|_| false, &defense), 0);
+            assert_eq!(
+                warn_count.load(Ordering::SeqCst),
+                *expected,
+                "unexpected cumulative warning count after failure #{}",
+                idx + 1
+            );
+            assert!(fw.has_active_filter(exe, None, false));
+        }
+
+        // Process reactivation resets backoff so a later exit warns immediately on failure #1.
+        assert_eq!(fw.sweep_unused_preemptive_blocks(|_| true, &defense), 0);
+        assert_eq!(warn_count.load(Ordering::SeqCst), 4);
+        assert_eq!(fw.sweep_unused_preemptive_blocks(|_| false, &defense), 0);
+        assert_eq!(warn_count.load(Ordering::SeqCst), 5);
+
+        // Once BFE recovers, sweep removes the filter with zero extra warnings.
+        defense.set_fail_removes(false);
+        assert_eq!(fw.sweep_unused_preemptive_blocks(|_| false, &defense), 1);
+        assert_eq!(warn_count.load(Ordering::SeqCst), 5);
+    });
+
+    assert!(!fw.has_any_app_filter(exe));
+    assert_eq!(*defense.removed.lock().unwrap(), vec![h]);
+
+    // Subsequent sweep hits 0-candidate fast path (0 probe calls).
+    let mut probe_calls = 0usize;
+    assert_eq!(
+        fw.sweep_unused_preemptive_blocks(
+            |_| {
+                probe_calls += 1;
+                false
+            },
+            &defense,
+        ),
+        0
+    );
+    assert_eq!(probe_calls, 0);
+}
+
+#[test]
 fn firewall_reconcile_distinguishes_startup_preemptive_and_policy_failures() {
     let mut fw = WfpRuleManager::new();
     let defense = StubDefense::new();

@@ -25,9 +25,12 @@ pub use firewall::{
     InstalledWfpFilter, WfpFailedOp, WfpFilterOrigin, WfpReconcileReport, WfpRuleManager,
 };
 pub use ipc::{
-    build_service_pipe_security_descriptor, inspect_pipe_client_exe, is_authorized_bridge_caller,
-    is_authorized_ui_caller, start_ipc_server, verify_authorized_caller_binary,
-    verify_caller_identity, IpcServerHandle, PipeSecurityDescriptor, SERVICE_PIPE_SDDL,
+    build_dev_bypass_pipe_security_descriptor, build_dev_bypass_pipe_security_descriptor_for_sid,
+    build_service_pipe_security_descriptor, canonical_sddl_trustee_for_sid,
+    current_process_user_sid, format_dev_bypass_pipe_sddl, inspect_pipe_client_exe,
+    is_authorized_bridge_caller, is_authorized_ui_caller, read_kernel_object_dacl_sddl,
+    start_ipc_server, verify_authorized_caller_binary, verify_caller_identity, IpcServerHandle,
+    PipeSecurityDescriptor, DEV_BYPASS_SYSTEM_PIPE_SDDL, SERVICE_PIPE_SDDL,
 };
 pub use notify::{
     current_process_session_id, NoopNotificationDispatcher, NotificationDispatcher,

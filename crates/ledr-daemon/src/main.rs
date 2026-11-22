@@ -382,6 +382,46 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(run_daemon(cli))
 }
 
+/// Builds the [`DaemonConfig`] for `ledr-daemon` CLI execution.
+///
+/// Always enables `strict_pipe_dacl` even when `--dev-bypass-auth` is set:
+/// - Production (`--dev-bypass-auth` unset): applies `SERVICE_PIPE_SDDL` (`SY`, `BA`, `IU`)
+///   alongside `L-09` caller binary verification.
+/// - Dev bypass (`--dev-bypass-auth` set): restricts `0x12019B` read/write access to the
+///   launching user's current SID (without `IU`, failing closed to `SY`/`BA` under `S-1-5-18`)
+///   so non-elevated `ledr-ui.exe` / `ledr-bridge-nm.exe` running as the same user can connect
+///   across UAC elevation boundaries while blocking other interactive accounts.
+fn build_daemon_config(
+    cli: &CliArgs,
+    authorized_ui_sha256: Option<String>,
+    authorized_bridge_sha256: Option<String>,
+    nrd_cache_path: Option<PathBuf>,
+    nrd_feed_urls: Vec<String>,
+    preemptive_startup_executables: Vec<String>,
+) -> DaemonConfig {
+    let outbound_firewall_enabled = !cli.disable_outbound_firewall;
+    let resume_suspended_on_shutdown = cli.resume_suspended_on_shutdown || cli.foreground;
+    DaemonConfig {
+        pipe_name: cli.pipe_name.clone(),
+        dev_mode_bypass_ui_auth: cli.dev_bypass_auth,
+        strict_pipe_dacl: true,
+        authorized_ui_sha256,
+        authorized_ui_signer: cli.ui_signer.clone(),
+        authorized_ui_root_thumbprint: cli.ui_root_thumbprint.clone(),
+        authorized_bridge_sha256,
+        authorized_bridge_signer: cli.bridge_signer.clone(),
+        authorized_bridge_root_thumbprint: cli.bridge_root_thumbprint.clone(),
+        outbound_firewall_enabled,
+        outbound_enforcement_mode: cli.outbound_mode,
+        resume_suspended_on_shutdown,
+        preemptive_startup_executables,
+        nrd_refresh_enabled: !cli.disable_nrd_refresh,
+        nrd_cache_path,
+        nrd_feed_urls,
+        ..DaemonConfig::default()
+    }
+}
+
 async fn run_daemon(cli: CliArgs) -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -437,7 +477,6 @@ async fn run_daemon(cli: CliArgs) -> anyhow::Result<()> {
     };
 
     let outbound_firewall_enabled = !cli.disable_outbound_firewall;
-    let resume_suspended_on_shutdown = cli.resume_suspended_on_shutdown || cli.foreground;
     let defense_controller = Arc::new(WindowsDefenseController::new());
     if outbound_firewall_enabled && cli.outbound_mode != OutboundEnforcementMode::Audit {
         if let Err(err) = defense_controller.init_wfp_session() {
@@ -454,25 +493,14 @@ async fn run_daemon(cli: CliArgs) -> anyhow::Result<()> {
         } else {
             Vec::new()
         };
-    let config = DaemonConfig {
-        pipe_name: cli.pipe_name.clone(),
-        dev_mode_bypass_ui_auth: cli.dev_bypass_auth,
-        strict_pipe_dacl: !cli.dev_bypass_auth,
+    let config = build_daemon_config(
+        &cli,
         authorized_ui_sha256,
-        authorized_ui_signer: cli.ui_signer.clone(),
-        authorized_ui_root_thumbprint: cli.ui_root_thumbprint.clone(),
         authorized_bridge_sha256,
-        authorized_bridge_signer: cli.bridge_signer.clone(),
-        authorized_bridge_root_thumbprint: cli.bridge_root_thumbprint.clone(),
-        outbound_firewall_enabled,
-        outbound_enforcement_mode: cli.outbound_mode,
-        resume_suspended_on_shutdown,
-        preemptive_startup_executables,
-        nrd_refresh_enabled: !cli.disable_nrd_refresh,
         nrd_cache_path,
         nrd_feed_urls,
-        ..DaemonConfig::default()
-    };
+        preemptive_startup_executables,
+    );
     let wfp_defense = Arc::clone(&defense_controller);
     let attach_wfp_drop_sink =
         config.outbound_firewall_enabled && config.outbound_enforcement_mode != OutboundEnforcementMode::Audit;
@@ -924,5 +952,33 @@ mod tests {
             tokio::runtime::RuntimeFlavor::MultiThread
         );
         assert_eq!(rt.metrics().num_workers(), DAEMON_TOKIO_WORKER_THREADS);
+    }
+
+    #[test]
+    fn cli_dacl_01_strict_pipe_dacl_always_enabled_for_cli_modes() {
+        let cases = [
+            ("default", &["ledr-daemon"][..], false, true),
+            (
+                "foreground dev bypass",
+                &["ledr-daemon", "--foreground", "--dev-bypass-auth"][..],
+                true,
+                true,
+            ),
+            ("service strict", &["ledr-daemon", "--service-strict"][..], false, false),
+        ];
+
+        for (label, argv, expected_bypass, expected_resume) in cases {
+            let cli = parse_cli_args(argv.iter().copied()).expect(label);
+            let cfg = build_daemon_config(&cli, None, None, None, Vec::new(), Vec::new());
+            assert!(cfg.strict_pipe_dacl, "{label}: strict_pipe_dacl must be true");
+            assert_eq!(
+                cfg.dev_mode_bypass_ui_auth, expected_bypass,
+                "{label}: dev_mode_bypass_ui_auth mismatch"
+            );
+            assert_eq!(
+                cfg.resume_suspended_on_shutdown, expected_resume,
+                "{label}: resume_suspended_on_shutdown mismatch"
+            );
+        }
     }
 }

@@ -19,9 +19,9 @@ use crate::engine::{BrowserReportError, DaemonEngine};
 
 use super::auth::inspect_pipe_client_exe;
 use super::dispatch::{authorize_caller_flags, browser_report_error_response, dispatch_request};
-use super::security::build_service_pipe_security_descriptor;
+use super::security::{build_strict_pipe_security_descriptor, PipeSecurityDescriptor};
 #[cfg(doc)]
-use super::security::SERVICE_PIPE_SDDL;
+use super::security::{DEV_BYPASS_SYSTEM_PIPE_SDDL, SERVICE_PIPE_SDDL};
 
 const IPC_READ_CHUNK_BYTES: usize = 8_192;
 
@@ -50,15 +50,14 @@ impl IpcServerHandle {
 fn create_pipe_server(
     pipe_name: &str,
     first_instance: bool,
-    strict_dacl: bool,
+    pipe_sd: Option<&PipeSecurityDescriptor>,
 ) -> std::io::Result<NamedPipeServer> {
     let mut opts = ServerOptions::new();
     opts.reject_remote_clients(true);
     if first_instance {
         opts.first_pipe_instance(true);
     }
-    if strict_dacl {
-        let sd = build_service_pipe_security_descriptor()?;
+    if let Some(sd) = pipe_sd {
         let mut sa = sd.security_attributes();
         // SAFETY: `sa` points to `sd` which lives until after `create_with_security_attributes_raw` returns.
         unsafe {
@@ -75,14 +74,25 @@ fn create_pipe_server(
 /// Binds the initial Named Pipe instance synchronously (preventing client connection races)
 /// and spawns an asynchronous accept loop serving 4-byte LE JSON frames.
 ///
-/// In `--foreground` dev mode (`strict_pipe_dacl: false`), uses the process default security
-/// descriptor. In `--service-strict` mode (`strict_pipe_dacl: true`), applies
-/// [`SERVICE_PIPE_SDDL`] restricting access to `SYSTEM`, `Administrators`, and `Interactive`
-/// users (`決定記録 L-09`).
+/// In same-privilege test harnesses (`strict_pipe_dacl: false`), uses the process default
+/// security descriptor. The `ledr-daemon` CLI always sets `strict_pipe_dacl: true`:
+/// - Production (`dev_mode_bypass_ui_auth == false`): applies [`SERVICE_PIPE_SDDL`]
+///   (`SYSTEM`, `Administrators`, and `Interactive` users with `0x12019B`) together with
+///   `L-09` binary verification.
+/// - Dev bypass (`dev_mode_bypass_ui_auth == true`): omits `IU` and grants `0x12019B` only
+///   to the launching user's SID (or fails closed to [`DEV_BYPASS_SYSTEM_PIPE_SDDL`] under
+///   `S-1-5-18` `LocalSystem`).
 pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerHandle> {
     let pipe_name = engine.config().pipe_name.clone();
-    let strict_dacl = engine.config().strict_pipe_dacl;
-    let initial_server = create_pipe_server(&pipe_name, true, strict_dacl)?;
+    let pipe_sd = if engine.config().strict_pipe_dacl {
+        Some(build_strict_pipe_security_descriptor(
+            engine.config().dev_mode_bypass_ui_auth,
+        )?)
+    } else {
+        None
+    };
+    let strict_dacl = pipe_sd.is_some();
+    let initial_server = create_pipe_server(&pipe_name, true, pipe_sd.as_ref())?;
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let loop_pipe_name = pipe_name.clone();
@@ -102,7 +112,7 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
                 connect_res = server.connect() => {
                     match connect_res {
                         Ok(()) => {
-                            match create_pipe_server(&loop_pipe_name, false, strict_dacl) {
+                            match create_pipe_server(&loop_pipe_name, false, pipe_sd.as_ref()) {
                                 Ok(next_server) => {
                                     let client_pipe = std::mem::replace(&mut server, next_server);
                                     match Arc::clone(&client_semaphore).try_acquire_owned() {
@@ -131,11 +141,13 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
                                 Err(err)
                                     if strict_dacl && err.kind() == ErrorKind::PermissionDenied =>
                                 {
-                                    // Under SERVICE_PIPE_SDDL, Interactive Users lack
+                                    // Under strict pipe DACL (SERVICE_PIPE_SDDL or dev-bypass
+                                    // current-user DACL), non-elevated callers lack
                                     // FILE_CREATE_PIPE_INSTANCE (0x0004), so a non-elevated
                                     // daemon cannot open a second pipe instance. Finish and drop
                                     // `client_pipe` completely so mio/kernel state resets cleanly,
-                                    // then recreate a brand-new NamedPipeServer instance.
+                                    // then recreate a brand-new NamedPipeServer instance with the
+                                    // same security descriptor.
                                     tracing::debug!(
                                         pipe = %loop_pipe_name,
                                         "strict pipe ACL denies secondary instance creation in non-elevated context; cycling single pipe instance"
@@ -158,9 +170,12 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
                                     if stop_after_client {
                                         break;
                                     }
-                                    let Some(fresh_server) =
-                                        recreate_strict_pipe_with_retry(&loop_pipe_name, &mut shutdown_rx)
-                                            .await
+                                    let Some(fresh_server) = recreate_strict_pipe_with_retry(
+                                        &loop_pipe_name,
+                                        pipe_sd.as_ref(),
+                                        &mut shutdown_rx,
+                                    )
+                                    .await
                                     else {
                                         break;
                                     };
@@ -195,13 +210,14 @@ pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerH
 
 async fn recreate_strict_pipe_with_retry(
     pipe_name: &str,
+    pipe_sd: Option<&PipeSecurityDescriptor>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Option<NamedPipeServer> {
     const MAX_RECREATE_ATTEMPTS: usize = 50;
     const RECREATE_RETRY_DELAY: Duration = Duration::from_millis(4);
 
     for attempt in 0..MAX_RECREATE_ATTEMPTS {
-        match create_pipe_server(pipe_name, true, true) {
+        match create_pipe_server(pipe_name, true, pipe_sd) {
             Ok(next_server) => return Some(next_server),
             Err(err)
                 if attempt + 1 < MAX_RECREATE_ATTEMPTS

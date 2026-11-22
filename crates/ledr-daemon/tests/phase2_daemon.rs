@@ -12,9 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_daemon::{
-    build_service_pipe_security_descriptor, start_ipc_server, verify_authorized_caller_binary,
-    verify_caller_identity, BinaryInspector, DaemonConfig, DaemonEngine, NotificationDispatcher,
-    Session0ToastLauncher, WindowsBinaryInspector, SERVICE_PIPE_SDDL,
+    build_service_pipe_security_descriptor, canonical_sddl_trustee_for_sid,
+    current_process_user_sid, read_kernel_object_dacl_sddl, start_ipc_server,
+    verify_authorized_caller_binary, verify_caller_identity, BinaryInspector, DaemonConfig,
+    DaemonEngine, NotificationDispatcher, Session0ToastLauncher, WindowsBinaryInspector,
+    SERVICE_PIPE_SDDL,
 };
 use ledr_proto::{
     read_ipc_frame, write_ipc_frame, ActiveDefenseController, AlertDecision, AlertRecord,
@@ -1313,6 +1315,114 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn ipc_dacl_01_dev_bypass_with_strict_pipe_dacl_allows_client_roundtrip() {
+    let strict_pipe = unique_test_pipe_name();
+    let store = LedrStore::open_in_memory().expect("open store");
+    let engine = DaemonEngine::start(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: strict_pipe.clone(),
+            dev_mode_bypass_ui_auth: true,
+            strict_pipe_dacl: true,
+            ..DaemonConfig::default()
+        },
+    );
+    let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("bind strict SDDL Named Pipe");
+    let current_sid = current_process_user_sid().expect("query current process user SID");
+
+    let pipe_client = strict_pipe.clone();
+    let (ping_resp, first_sddl, resolve_resp, second_sddl) = tokio::task::spawn_blocking(move || {
+        use std::os::windows::io::AsHandle;
+
+        // First connection inspects initial pipe instance DACL and sends Ping.
+        let mut pipe1 = open_pipe_with_retry(&pipe_client);
+        let dacl1 = read_kernel_object_dacl_sddl(pipe1.as_handle())
+            .expect("read live DACL on initial dev-bypass pipe");
+        write_ipc_frame(&mut pipe1, &IpcRequest::Ping).expect("write Ping");
+        let ping = read_ipc_frame::<_, IpcResponse>(&mut pipe1).expect("read Pong");
+        drop(pipe1);
+
+        // Second connection exercises secondary instance / recreate_strict_pipe_with_retry
+        // and verifies the recreated pipe retains the same dev-bypass DACL without IU.
+        let mut pipe2 = open_pipe_with_retry(&pipe_client);
+        let dacl2 = read_kernel_object_dacl_sddl(pipe2.as_handle())
+            .expect("read live DACL on second dev-bypass pipe");
+        write_ipc_frame(
+            &mut pipe2,
+            &IpcRequest::ResolveAlert {
+                alert_id: "nonexistent-alert-id".to_string(),
+                decision: AlertDecision::AllowOnce,
+            },
+        )
+        .expect("write ResolveAlert");
+        let resolve = read_ipc_frame::<_, IpcResponse>(&mut pipe2).expect("read ResolveAlert");
+        (ping, dacl1, resolve, dacl2)
+    })
+    .await
+    .expect("join strict IPC client under dev bypass");
+
+    for (label, live_sddl) in [("initial", &first_sddl), ("second", &second_sddl)] {
+        assert!(
+            !live_sddl.contains(";;;IU)"),
+            "{label} dev-bypass pipe DACL must omit Interactive Users (IU): {live_sddl}"
+        );
+        // On live Named Pipe kernel objects, Windows maps GENERIC_ALL (`GA`) to FILE_ALL_ACCESS (`FA`).
+        let has_sy_full =
+            live_sddl.contains("(A;;FA;;;SY)") || live_sddl.contains("(A;;GA;;;SY)");
+        let has_ba_full =
+            live_sddl.contains("(A;;FA;;;BA)") || live_sddl.contains("(A;;GA;;;BA)");
+        assert!(
+            has_sy_full && has_ba_full,
+            "{label} dev-bypass pipe DACL must retain SY/BA full control: {live_sddl}"
+        );
+        if !current_sid.eq_ignore_ascii_case("S-1-5-18") {
+            let expected_trustee = canonical_sddl_trustee_for_sid(&current_sid)
+                .expect("canonicalize current process user SID");
+            assert_ne!(
+                expected_trustee, "IU",
+                "{label} dev-bypass pipe DACL must never map current user to IU"
+            );
+            assert_eq!(
+                live_sddl.matches('(').count(),
+                3,
+                "{label} dev-bypass pipe DACL must have exactly 3 ACEs (SY, BA, current user): {live_sddl}"
+            );
+            let expected_suffix = format!(";;;{expected_trustee})");
+            let user_ace = live_sddl
+                .split('(')
+                .find(|ace| ace.contains(&expected_suffix))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label} dev-bypass pipe DACL missing current user trustee {expected_trustee} (SID {current_sid}): {live_sddl}"
+                    )
+                });
+            let rights = user_ace.split(';').nth(2).expect("user ACE rights");
+            let hex = rights
+                .strip_prefix("0x")
+                .or_else(|| rights.strip_prefix("0X"))
+                .unwrap_or_else(|| panic!("expected hex rights mask in {user_ace}"));
+            let mask = u32::from_str_radix(hex, 16).expect("parse hex rights mask");
+            assert_eq!(mask & 0x0004, 0, "must exclude FILE_CREATE_PIPE_INSTANCE");
+            assert_eq!(mask & 0x0012_019B, 0x0012_019B);
+        }
+    }
+
+    assert!(matches!(ping_resp, IpcResponse::Pong { .. }));
+    assert!(
+        matches!(
+            resolve_resp,
+            IpcResponse::Error { ref code, .. } if code == "NOT_FOUND"
+        ),
+        "expected NOT_FOUND (not UNAUTHORIZED) when dev_mode_bypass_ui_auth=true & strict_pipe_dacl=true, got {resolve_resp:?}"
+    );
+
+    ipc_handle.shutdown().await;
+    engine.shutdown_and_flush().await.expect("shutdown");
 }
 
 #[tokio::test]

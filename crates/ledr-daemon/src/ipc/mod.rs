@@ -10,6 +10,9 @@ pub use auth::{
     verify_authorized_caller_binary, verify_caller_identity,
 };
 pub use security::{
-    build_service_pipe_security_descriptor, PipeSecurityDescriptor, SERVICE_PIPE_SDDL,
+    build_dev_bypass_pipe_security_descriptor, build_dev_bypass_pipe_security_descriptor_for_sid,
+    build_service_pipe_security_descriptor, canonical_sddl_trustee_for_sid,
+    current_process_user_sid, format_dev_bypass_pipe_sddl, read_kernel_object_dacl_sddl,
+    PipeSecurityDescriptor, DEV_BYPASS_SYSTEM_PIPE_SDDL, SERVICE_PIPE_SDDL,
 };
 pub use server::{start_ipc_server, IpcServerHandle};

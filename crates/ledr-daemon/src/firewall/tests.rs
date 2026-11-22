@@ -2010,7 +2010,7 @@ fn firewall_removed_block_snapshots_and_reconcile_rollback_preserve_deferred_and
     // Roll back the allow rule (removing Permit) and restore via `restore_removed_app_blocks`.
     let _ = fw.reconcile_persisted_rules(&[], &[], &inspector, &defense);
     assert!(!fw.has_any_app_filter(exe_deferred));
-    fw.restore_removed_app_blocks(&report.removed_app_blocks, &defense);
+    fw.restore_removed_app_blocks(&report.removed_app_blocks, |_| false, &defense);
     assert_eq!(
         fw.filter_origin(exe_deferred, None),
         Some(&WfpFilterOrigin::Preemptive)
@@ -2068,5 +2068,107 @@ fn firewall_removed_block_snapshots_and_reconcile_rollback_preserve_deferred_and
     assert!(
         report_dead.removed_app_blocks.is_empty(),
         "successfully deleted unbound pending-removal block must not be queued for rollback restoration"
+    );
+}
+
+/// Regression test `WFP-ROLLBACK-05` (`PRRT_kwDOVyjVyM66k6kK`):
+/// verifies that `restore_removed_app_blocks` checks executable liveness via `is_exe_active`
+/// before restoring non-startup `Preemptive` blocks:
+/// - unbound non-startup `Preemptive` for an exited app is NOT resurrected;
+/// - unbound non-startup `Preemptive` for an active app IS restored;
+/// - startup-pinned `Preemptive` is always restored even when no instance is running;
+/// - alert-bound non-startup `Preemptive` for an exited app IS restored with
+///   `deferred_preemptive_removals` set so resolving the final bound alert cleans it up.
+#[test]
+fn firewall_restore_removed_app_blocks_skips_exited_unbound_preemptive_and_marks_exited_bound_deferred() {
+    let defense = StubDefense::new();
+    let inspector = StubInspector("b".repeat(64));
+    let mut fw = WfpRuleManager::new();
+
+    let exe_exited_unbound = r"C:\Users\Alice\Downloads\rb5_exited_unbound.exe";
+    let exe_active_unbound = r"C:\Users\Alice\Downloads\rb5_active_unbound.exe";
+    let exe_startup_pinned = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let exe_exited_bound = r"C:\Users\Alice\Downloads\rb5_exited_bound.exe";
+
+    for exe in [
+        exe_exited_unbound,
+        exe_active_unbound,
+        exe_startup_pinned,
+        exe_exited_bound,
+    ] {
+        let h = defense.add_wfp_app_rule(Path::new(exe), None, false).unwrap();
+        assert!(fw.register_preemptive_block(exe, h, &defense));
+    }
+    assert!(fw.bind_alert_to_app_block("ALT-RB5-BOUND", exe_exited_bound));
+
+    let startup_candidates = vec![exe_startup_pinned.to_string()];
+    fw.set_startup_preemptive_executables(&startup_candidates);
+    assert!(fw.is_startup_preemptive(exe_startup_pinned));
+
+    let make_allow = |id: &str, exe: &str| AllowlistRuleRecord {
+        rule_id: id.to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: exe.to_string(),
+        sha256: Some("b".repeat(64)),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: 1,
+        created_by: "test".to_string(),
+    };
+    let allows = vec![
+        make_allow("R-RB5-1", exe_exited_unbound),
+        make_allow("R-RB5-2", exe_active_unbound),
+        make_allow("R-RB5-3", exe_startup_pinned),
+        make_allow("R-RB5-4", exe_exited_bound),
+    ];
+    let report = fw.reconcile_persisted_rules(&allows, &startup_candidates, &inspector, &defense);
+    assert_eq!(report.removed_app_blocks.len(), 4);
+
+    // Roll back persisted rules (removing Permits, and startup_pinned will be re-installed or kept
+    // absent if we reconcile with empty startup_candidates first so we test restore_removed_app_blocks
+    // directly for startup_pinned too).
+    let _ = fw.reconcile_persisted_rules(&[], &[], &inspector, &defense);
+    // Keep startup_pinned registered in `startup_preemptive_exes` without an installed filter by
+    // simulating rollback before startup reconcile: remove only its handle cleanly.
+    assert!(fw.is_startup_preemptive(exe_startup_pinned));
+    assert!(!fw.has_any_app_filter(exe_exited_unbound));
+    assert!(!fw.has_any_app_filter(exe_active_unbound));
+    assert!(!fw.has_any_app_filter(exe_exited_bound));
+
+    let active_key = WfpRuleManager::exe_key(exe_active_unbound);
+    fw.restore_removed_app_blocks(
+        &report.removed_app_blocks,
+        |exe_key| exe_key == active_key,
+        &defense,
+    );
+
+    assert!(
+        !fw.has_any_app_filter(exe_exited_unbound),
+        "exited unbound non-startup Preemptive block must NOT be resurrected on rollback"
+    );
+    assert_eq!(
+        fw.filter_origin(exe_active_unbound, None),
+        Some(&WfpFilterOrigin::Preemptive),
+        "still-active non-startup Preemptive block must be restored on rollback"
+    );
+    assert!(
+        !fw.has_deferred_preemptive_removal(exe_active_unbound),
+        "still-active non-startup Preemptive block must not be marked deferred"
+    );
+    assert_eq!(
+        fw.filter_origin(exe_startup_pinned, None),
+        Some(&WfpFilterOrigin::Preemptive),
+        "startup-pinned Preemptive block must remain active on rollback"
+    );
+    assert_eq!(
+        fw.filter_origin(exe_exited_bound, None),
+        Some(&WfpFilterOrigin::Preemptive),
+        "alert-bound Preemptive block for an exited app must be restored until alert resolves"
+    );
+    assert!(fw.is_alert_bound("ALT-RB5-BOUND"));
+    assert!(
+        fw.has_deferred_preemptive_removal(exe_exited_bound),
+        "alert-bound Preemptive block whose process exited before rollback must be marked deferred"
     );
 }

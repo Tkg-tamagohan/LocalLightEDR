@@ -754,14 +754,39 @@ impl WfpRuleManager {
     /// Best-effort restoration of non-persisted app-wide block filters (`Preemptive` or
     /// `TransientContainment`) removed during reconciliation before a subsequent failure caused
     /// SQLite rollback, preserving alert containment bindings and pending/deferred preemptive
-    /// removal state (`PRRT_kwDOVyjVyM66ksZF`).
-    pub fn restore_removed_app_blocks(
+    /// removal state (`PRRT_kwDOVyjVyM66ksZF`, `PRRT_kwDOVyjVyM66k6kK`).
+    ///
+    /// For non-startup `Preemptive` blocks, re-verifies executable liveness via `is_exe_active`
+    /// (called under `firewall -> process_table` order and releasing any `process_table` lock
+    /// before BFE I/O):
+    /// - if no active process remains and no alert is bound, skips restoration so an already-exited
+    ///   executable does not resurrect an orphaned `Preemptive` block;
+    /// - if no active process remains while alerts remain bound, restores the block with
+    ///   `prev_deferred_preemptive_removal = true` so resolving the final bound alert cleans it up.
+    pub fn restore_removed_app_blocks<F>(
         &mut self,
         removed: &[RemovedAppBlockSnapshot],
+        mut is_exe_active: F,
         defense: &dyn ActiveDefenseController,
-    ) {
+    ) where
+        F: FnMut(&str) -> bool,
+    {
         for snap in removed {
-            self.restore_lifted_block(None, snap.block.clone(), defense);
+            let is_non_startup_preemptive = snap.block.origin == WfpFilterOrigin::Preemptive
+                && !self.startup_preemptive_exes.contains_key(&snap.block.key.0);
+            let mut block = snap.block.clone();
+            if is_non_startup_preemptive {
+                let has_bound_alerts = !snap.bound_alert_ids.is_empty()
+                    || self.bound_alerts.values().any(|k| k == &snap.block.key);
+                let still_active = is_exe_active(&snap.block.key.0);
+                if !still_active {
+                    if !has_bound_alerts {
+                        continue;
+                    }
+                    block.prev_deferred_preemptive_removal = true;
+                }
+            }
+            self.restore_lifted_block(None, block, defense);
             for alert_id in &snap.bound_alert_ids {
                 self.bind_alert_to_app_block(alert_id, &snap.block.exe_path);
             }

@@ -242,7 +242,18 @@ impl DaemonEngine {
                 fw.restore_removed_domain_filters(&report.removed_domain_filters, &*self.defense);
             }
             if !report.removed_app_blocks.is_empty() {
-                fw.restore_removed_app_blocks(&report.removed_app_blocks, &*self.defense);
+                // Lock order: `firewall` -> `process_table`; the closure releases `process_table`
+                // before `restore_removed_app_blocks` invokes BFE (`add_wfp_app_rule`).
+                fw.restore_removed_app_blocks(
+                    &report.removed_app_blocks,
+                    |exe_key| {
+                        self.process_table
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .has_active_exe_key(exe_key)
+                    },
+                    &*self.defense,
+                );
             }
         }
     }

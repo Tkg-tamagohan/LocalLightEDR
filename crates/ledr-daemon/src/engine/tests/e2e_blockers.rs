@@ -8396,3 +8396,679 @@ async fn allow_permanent_and_allow_once_rollback_preserve_deferred_preemptive_re
 
     engine.shutdown_and_flush().await.expect("shutdown engine");
 }
+
+/// Regression test `WFP-ROLLBACK-06` (`PRRT_kwDOVyjVyM66k6kK`):
+/// verifies end-to-end through `DaemonEngine::upsert_policy_rule` that:
+/// 1. When an app-wide `NetworkAllow` removes a non-startup unbound `Preemptive` block and then
+///    fails to add the Permit filter, if the last process exits before rollback restores removed
+///    app blocks, rollback skips resurrecting the dead `Preemptive` block (0 BFE handles left).
+/// 2. When the process is still active during rollback, rollback restores the `Preemptive` block
+///    AND releases `process_table` BEFORE invoking `defense.add_wfp_app_rule` (verified via
+///    `process_table.try_lock().is_ok()` inside the BFE mock).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upsert_policy_rule_rollback_skips_preemptive_restore_after_last_process_exit_and_unlocks_table_before_bfe() {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::time::Duration;
+
+    use crate::firewall::WfpRuleManager;
+    use crate::PolicyRuleError;
+    use ledr_proto::AllowlistRuleRecord;
+
+    struct RollbackLivenessDefense {
+        next_handle: AtomicU64,
+        active: Mutex<HashSet<u64>>,
+        fail_permit_adds: AtomicBool,
+        permit_add_attempts: AtomicUsize,
+        block_add_attempts: AtomicUsize,
+        on_permit_fail_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        on_block_add_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl RollbackLivenessDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(400),
+                active: Mutex::new(HashSet::new()),
+                fail_permit_adds: AtomicBool::new(false),
+                permit_add_attempts: AtomicUsize::new(0),
+                block_add_attempts: AtomicUsize::new(0),
+                on_permit_fail_hook: Mutex::new(None),
+                on_block_add_hook: Mutex::new(None),
+            }
+        }
+
+        fn active_handles(&self) -> Vec<u64> {
+            self.active.lock().unwrap().iter().copied().collect()
+        }
+    }
+
+    impl ActiveDefenseController for RollbackLivenessDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(
+            &self,
+            _exe_path: &Path,
+            _remote_ip: Option<IpAddr>,
+            allow: bool,
+        ) -> Result<u64, String> {
+            if allow {
+                self.permit_add_attempts.fetch_add(1, Ordering::AcqRel);
+                if self.fail_permit_adds.load(Ordering::Acquire) {
+                    if let Some(ref hook) = *self.on_permit_fail_hook.lock().unwrap() {
+                        hook();
+                    }
+                    return Err("simulated BFE permit add failure".to_string());
+                }
+            } else {
+                self.block_add_attempts.fetch_add(1, Ordering::AcqRel);
+                if let Some(ref hook) = *self.on_block_add_hook.lock().unwrap() {
+                    hook();
+                }
+            }
+            let h = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.active.lock().unwrap().insert(h);
+            Ok(h)
+        }
+        fn remove_wfp_rule(&self, handle: u64) -> Result<(), String> {
+            self.active.lock().unwrap().remove(&handle);
+            Ok(())
+        }
+    }
+
+    let defense = Arc::new(RollbackLivenessDefense::new());
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let engine = Arc::new(DaemonEngine::start_with_all_dependencies(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("c".repeat(64))),
+        Arc::new(MapLiveProcessInspector::new([])),
+    ));
+    let sender = engine.sender();
+
+    let now_ms = current_unix_ms();
+    let base_100ns = 116_444_736_000_000_000u64 + ((now_ms - 5_000) as u64) * 10_000;
+
+    // --- Part 1: Last process exits before rollback restores removed Preemptive block ---
+    let exe_dead = r"C:\Users\Alice\Downloads\rb6_exited_during_allow.exe";
+    let pid_dead = ProcessIdentity::new(9651, base_100ns);
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: pid_dead,
+            parent_pid: 4,
+            exe_path: exe_dead.to_string(),
+            command_line: "rb6_exited.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start exe_dead");
+    let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < hp + 1 {
+        assert!(tokio::time::Instant::now() < dl, "exe_dead start");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        try_has_active_wfp_filter(&engine, exe_dead, None, false, Duration::from_secs(2))
+            .await
+            .expect("firewall lock")
+    );
+
+    // When `add_wfp_app_rule(..., allow = true)` fails (after reconcile has already removed the
+    // Preemptive block), enqueue `ProcessStop` and wait until `process_table` records the exit
+    // (proving `process_table` is unlocked during reconcile and the exit happens prior to
+    // `restore_removed_app_blocks`).
+    let stop_tx = sender.clone();
+    let engine_hook = Arc::clone(&engine);
+    let dead_key = WfpRuleManager::exe_key(exe_dead);
+    let stop_time_100ns = base_100ns + 20_000;
+    *defense.on_permit_fail_hook.lock().unwrap() = Some(Box::new(move || {
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread,
+            "block_in_place hook requires multi-threaded Tokio runtime"
+        );
+        tokio::task::block_in_place(|| {
+            stop_tx
+                .try_send(SensorEvent::ProcessStop {
+                    pid: pid_dead.pid,
+                    exit_time_100ns: stop_time_100ns,
+                    exit_code: 0,
+                })
+                .expect("enqueue ProcessStop for exe_dead");
+            let wait_dl = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let still_live = engine_hook
+                    .process_table
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .has_active_exe_key(&dead_key);
+                if !still_live {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < wait_dl,
+                    "ProcessStop must update process_table while reconcile fails permit add"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+    }));
+
+    let block_adds_before_dead_rb = defense.block_add_attempts.load(Ordering::Acquire);
+    let hp_before_stop = engine.high_priority_processed.load(Ordering::Relaxed);
+    defense.fail_permit_adds.store(true, Ordering::Release);
+    let allow_dead = AllowlistRuleRecord {
+        rule_id: "R-RB6-DEAD".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: exe_dead.to_string(),
+        sha256: Some("c".repeat(64)),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: now_ms,
+        created_by: "test".to_string(),
+    };
+    let err = engine
+        .upsert_policy_rule(&allow_dead)
+        .expect_err("upsert_policy_rule must fail and roll back when permit add fails");
+    assert!(
+        matches!(err, PolicyRuleError::FirewallSync(_)),
+        "expected FirewallSync error, got {err:?}"
+    );
+    *defense.on_permit_fail_hook.lock().unwrap() = None;
+
+    // Wait for the concurrent `ProcessStop` event to finish its firewall path too.
+    let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < hp_before_stop + 1 {
+        assert!(tokio::time::Instant::now() < dl, "exe_dead stop finished");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        defense.block_add_attempts.load(Ordering::Acquire),
+        block_adds_before_dead_rb,
+        "rollback must NOT call add_wfp_app_rule to resurrect dead unbound Preemptive block"
+    );
+    assert!(
+        !try_has_active_wfp_filter(&engine, exe_dead, None, false, Duration::from_secs(2))
+            .await
+            .expect("firewall lock"),
+        "exited app must have no resurrected Preemptive WFP filter after rollback"
+    );
+    assert!(
+        defense.active_handles().is_empty(),
+        "zero OS BFE handles must remain after dead app rollback"
+    );
+
+    // --- Part 2: Still-active process MUST be restored, with `process_table` unlocked during BFE ---
+    let exe_live = r"C:\Users\Alice\Downloads\rb6_live_during_allow.exe";
+    let pid_live = ProcessIdentity::new(9652, base_100ns + 30_000);
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: pid_live,
+            parent_pid: 4,
+            exe_path: exe_live.to_string(),
+            command_line: "rb6_live.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start exe_live");
+    let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < hp + 1 {
+        assert!(tokio::time::Instant::now() < dl, "exe_live start");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        try_has_active_wfp_filter(&engine, exe_live, None, false, Duration::from_secs(2))
+            .await
+            .expect("firewall lock")
+    );
+
+    let table_unlocked_during_bfe = Arc::new(AtomicBool::new(false));
+    let flag_hook = Arc::clone(&table_unlocked_during_bfe);
+    let engine_bfe_hook = Arc::clone(&engine);
+    *defense.on_block_add_hook.lock().unwrap() = Some(Box::new(move || {
+        assert!(
+            engine_bfe_hook.process_table.try_lock().is_ok(),
+            "process_table lock MUST be released before BFE add_wfp_app_rule during rollback"
+        );
+        flag_hook.store(true, Ordering::Release);
+    }));
+
+    let allow_live = AllowlistRuleRecord {
+        rule_id: "R-RB6-LIVE".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: exe_live.to_string(),
+        sha256: Some("c".repeat(64)),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: now_ms + 1,
+        created_by: "test".to_string(),
+    };
+    let err_live = engine
+        .upsert_policy_rule(&allow_live)
+        .expect_err("upsert_policy_rule must fail and roll back");
+    assert!(matches!(err_live, PolicyRuleError::FirewallSync(_)));
+    *defense.on_block_add_hook.lock().unwrap() = None;
+
+    assert!(
+        table_unlocked_during_bfe.load(Ordering::Acquire),
+        "rollback must have restored active exe_live via add_wfp_app_rule with process_table unlocked"
+    );
+    assert!(
+        try_has_active_wfp_filter(&engine, exe_live, None, false, Duration::from_secs(2))
+            .await
+            .expect("firewall lock"),
+        "still-active app must retain its restored Preemptive block after rollback"
+    );
+
+    let engine = Arc::try_unwrap(engine)
+        .ok()
+        .expect("single owner before shutdown");
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+}
+
+/// Regression test `E2E-PREEMPT-01` (`PRRT_kwDOVyjVyM66k6ks`):
+/// verifies end-to-end that when an evicted-live process in a normal folder receives a Preemptive
+/// WFP block via delayed MOTW attribution (`apply_late_motw_attribution`) and its `ProcessStop`
+/// arrives late (or is missed) after another executable reuses its PID:
+/// 1. Processing the successor `ProcessStart` runs `ProcessStop`-equivalent cleanup for the
+///    superseded evicted-live executable and removes its unused Preemptive WFP block immediately.
+/// 2. If the superseded executable still has a bound pending alert, cleanup marks
+///    `deferred_preemptive_removals` instead of dropping the block early, and resolving the alert
+///    removes the block cleanly.
+/// 3. If another sibling instance of the superseded executable is still running, the Preemptive
+///    WFP block remains active.
+#[tokio::test]
+async fn pid_reuse_of_evicted_live_late_motw_process_cleans_up_preemptive_block_and_respects_alerts_and_siblings() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use crate::engine::motw::{LateMotwAttribution, MotwAttribution, MotwMatchStage};
+    use crate::firewall::WfpRuleManager;
+    use crate::process_table::ActiveProcessTable;
+    use crate::TwoLaneSender;
+
+    struct HandleTrackingDefense {
+        next_handle: AtomicU64,
+        active: Mutex<HashSet<u64>>,
+    }
+
+    impl HandleTrackingDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(700),
+                active: Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn active_handles(&self) -> HashSet<u64> {
+            self.active.lock().unwrap().clone()
+        }
+    }
+
+    impl ActiveDefenseController for HandleTrackingDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(&self, _: &Path, _: Option<IpAddr>, _: bool) -> Result<u64, String> {
+            let h = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.active.lock().unwrap().insert(h);
+            Ok(h)
+        }
+        fn remove_wfp_rule(&self, handle: u64) -> Result<(), String> {
+            self.active.lock().unwrap().remove(&handle);
+            Ok(())
+        }
+    }
+
+    let defense = Arc::new(HandleTrackingDefense::new());
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("d".repeat(64))),
+        Arc::new(MapLiveProcessInspector::new([])),
+    );
+    // Shrink primary process table capacity to 2 so `A.exe` is deterministically displaced into
+    // `evicted_live` while still running.
+    {
+        let mut table = engine
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *table = ActiveProcessTable::new(2);
+    }
+    let sender = engine.sender();
+    let now_ms = current_unix_ms();
+    let base_100ns = 116_444_736_000_000_000u64 + ((now_ms - 5_000) as u64) * 10_000;
+
+    async fn send_and_wait(engine: &DaemonEngine, sender: &TwoLaneSender, ev: SensorEvent) {
+        let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+        sender.send(ev).await.expect("send sensor event");
+        let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+        while engine.high_priority_processed.load(Ordering::Relaxed) < hp + 1 {
+            assert!(tokio::time::Instant::now() < dl, "event processed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    // --- Part 1: Unbound late-MOTW evicted-live process superseded by PID reuse ---
+    let exe_a = r"C:\Program Files\NormalApp\late_motw_reused_a.exe";
+    let exe_b = r"C:\Program Files\OtherApp\pid_reuser_b.exe";
+    let pid_a = ProcessIdentity::new(9701, base_100ns);
+    send_and_wait(
+        &engine,
+        &sender,
+        SensorEvent::ProcessStart {
+            identity: pid_a,
+            parent_pid: 4,
+            exe_path: exe_a.to_string(),
+            command_line: "a.exe".to_string(),
+            user_sid: None,
+        },
+    )
+    .await;
+    assert!(
+        !try_has_active_wfp_filter(&engine, exe_a, None, false, Duration::from_secs(2))
+            .await
+            .expect("firewall lock"),
+        "normal-folder app without MOTW must not have Preemptive block yet"
+    );
+
+    // Evict A from primary `entries` into `evicted_live`.
+    for (i, pid) in [9702u32, 9703u32].into_iter().enumerate() {
+        send_and_wait(
+            &engine,
+            &sender,
+            SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(pid, base_100ns + ((i + 1) as u64) * 10_000),
+                parent_pid: 4,
+                exe_path: format!(r"C:\Program Files\Pad\pad_{pid}.exe"),
+                command_line: format!("pad_{pid}.exe"),
+                user_sid: None,
+            },
+        )
+        .await;
+    }
+    {
+        let table = engine
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(table.get_by_instance_id(&pid_a.instance_id()).is_none());
+        assert!(table.has_active_exe_key(&WfpRuleManager::exe_key(exe_a)));
+    }
+
+    // Delayed MOTW arrives for evicted-live A -> installs Preemptive WFP block.
+    engine.apply_late_motw_attribution(LateMotwAttribution {
+        instance_ids: vec![pid_a.instance_id()],
+        attribution: MotwAttribution {
+            origin_url: "https://dl.example.test/late_motw_reused_a.exe".to_string(),
+            referrer_url: None,
+            frame_url: None,
+            sha256: Some("d".repeat(64)),
+            stage: MotwMatchStage::ZoneIdentifierAds,
+            zone_id: Some(3),
+        },
+    });
+    assert!(
+        try_has_active_wfp_filter(&engine, exe_a, None, false, Duration::from_secs(2))
+            .await
+            .expect("firewall lock"),
+        "delayed MOTW attribution must install Preemptive WFP block for evicted-live A"
+    );
+
+    // Successor B reuses PID 9701 BEFORE A's ProcessStop arrives -> must clean up A's block!
+    let pid_b = ProcessIdentity::new(9701, base_100ns + 50_000);
+    send_and_wait(
+        &engine,
+        &sender,
+        SensorEvent::ProcessStart {
+            identity: pid_b,
+            parent_pid: 4,
+            exe_path: exe_b.to_string(),
+            command_line: "b.exe".to_string(),
+            user_sid: None,
+        },
+    )
+    .await;
+    assert!(
+        !try_has_active_wfp_filter(&engine, exe_a, None, false, Duration::from_secs(2))
+            .await
+            .expect("firewall lock"),
+        "PID reuse superseding evicted-live A must remove A's unused Preemptive WFP block"
+    );
+    assert!(
+        defense.active_handles().is_empty(),
+        "zero OS BFE handles may remain after superseded A's Preemptive block is removed"
+    );
+
+    // Late-arriving ProcessStop for A (earlier timestamp than B) must be a harmless no-op on B.
+    send_and_wait(
+        &engine,
+        &sender,
+        SensorEvent::ProcessStop {
+            pid: 9701,
+            exit_time_100ns: base_100ns + 40_000,
+            exit_code: 0,
+        },
+    )
+    .await;
+    {
+        let table = engine
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            table.has_active_exe_key(&WfpRuleManager::exe_key(exe_b)),
+            "late ProcessStop for old A must not mark reused successor B as exited"
+        );
+    }
+
+    // --- Part 2: Alert-bound evicted-live process superseded by PID reuse marks deferred ---
+    let exe_bound = r"C:\Program Files\NormalApp\late_motw_bound_a2.exe";
+    let pid_bound = ProcessIdentity::new(9710, base_100ns + 100_000);
+    send_and_wait(
+        &engine,
+        &sender,
+        SensorEvent::ProcessStart {
+            identity: pid_bound,
+            parent_pid: 4,
+            exe_path: exe_bound.to_string(),
+            command_line: "a2.exe".to_string(),
+            user_sid: None,
+        },
+    )
+    .await;
+    for (i, pid) in [9711u32, 9712u32].into_iter().enumerate() {
+        send_and_wait(
+            &engine,
+            &sender,
+            SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(pid, base_100ns + 110_000 + (i as u64) * 10_000),
+                parent_pid: 4,
+                exe_path: format!(r"C:\Program Files\Pad\pad2_{pid}.exe"),
+                command_line: format!("pad2_{pid}.exe"),
+                user_sid: None,
+            },
+        )
+        .await;
+    }
+    engine.apply_late_motw_attribution(LateMotwAttribution {
+        instance_ids: vec![pid_bound.instance_id()],
+        attribution: MotwAttribution {
+            origin_url: "https://dl.example.test/late_motw_bound_a2.exe".to_string(),
+            referrer_url: None,
+            frame_url: None,
+            sha256: Some("d".repeat(64)),
+            stage: MotwMatchStage::ZoneIdentifierAds,
+            zone_id: Some(3),
+        },
+    });
+    let alert_bound = AlertRecord {
+        alert_id: "ALT-PREEMPT-REUSE-BOUND".to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::High,
+        source_layer: "LAYER_3_NETWORK".to_string(),
+        rule_id: "WFP-PREEMPT-REUSE".to_string(),
+        title: "Alert bound to late-MOTW evicted exe".to_string(),
+        process_instance_id: Some(pid_bound.instance_id()),
+        process_suspended: false,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({ "exe_path": exe_bound }).to_string(),
+        resolved_at_ms: None,
+    };
+    engine.store.record_alert(&alert_bound).expect("record alert");
+    {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.bind_alert_to_app_block(&alert_bound.alert_id, exe_bound));
+    }
+
+    // PID 9710 reused by B2 -> Preemptive block stays active while alert is bound, and is marked deferred.
+    send_and_wait(
+        &engine,
+        &sender,
+        SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(9710, base_100ns + 200_000),
+            parent_pid: 4,
+            exe_path: r"C:\Program Files\OtherApp\reuser_b2.exe".to_string(),
+            command_line: "b2.exe".to_string(),
+            user_sid: None,
+        },
+    )
+    .await;
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            fw.has_active_filter(exe_bound, None, false),
+            "bound alert must keep Preemptive block active across PID reuse"
+        );
+        assert!(
+            fw.has_deferred_preemptive_removal(exe_bound),
+            "PID reuse cleanup must mark deferred_preemptive_removals when an alert is bound"
+        );
+    }
+    // Resolving the alert removes the deferred Preemptive block cleanly.
+    engine
+        .resolve_alert(
+            &alert_bound.alert_id,
+            ledr_proto::AlertDecision::TerminateAndBlock {
+                add_block_rule: false,
+            },
+        )
+        .expect("resolve alert");
+    assert!(
+        !try_has_active_wfp_filter(&engine, exe_bound, None, false, Duration::from_secs(2))
+            .await
+            .expect("firewall lock"),
+        "resolving final bound alert after PID reuse must remove deferred Preemptive block"
+    );
+
+    // --- Part 3: Sibling instance of the same executable keeps Preemptive block intact ---
+    let exe_sib = r"C:\Program Files\NormalApp\late_motw_sib_a3.exe";
+    let pid_sib1 = ProcessIdentity::new(9720, base_100ns + 300_000);
+    let pid_sib2 = ProcessIdentity::new(9721, base_100ns + 310_000);
+    send_and_wait(
+        &engine,
+        &sender,
+        SensorEvent::ProcessStart {
+            identity: pid_sib1,
+            parent_pid: 4,
+            exe_path: exe_sib.to_string(),
+            command_line: "a3_1.exe".to_string(),
+            user_sid: None,
+        },
+    )
+    .await;
+    send_and_wait(
+        &engine,
+        &sender,
+        SensorEvent::ProcessStart {
+            identity: pid_sib2,
+            parent_pid: 4,
+            exe_path: exe_sib.to_string(),
+            command_line: "a3_2.exe".to_string(),
+            user_sid: None,
+        },
+    )
+    .await;
+    for (i, pid) in [9722u32, 9723u32].into_iter().enumerate() {
+        send_and_wait(
+            &engine,
+            &sender,
+            SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(pid, base_100ns + 320_000 + (i as u64) * 10_000),
+                parent_pid: 4,
+                exe_path: format!(r"C:\Program Files\Pad\pad3_{pid}.exe"),
+                command_line: format!("pad3_{pid}.exe"),
+                user_sid: None,
+            },
+        )
+        .await;
+    }
+    engine.apply_late_motw_attribution(LateMotwAttribution {
+        instance_ids: vec![pid_sib1.instance_id(), pid_sib2.instance_id()],
+        attribution: MotwAttribution {
+            origin_url: "https://dl.example.test/late_motw_sib_a3.exe".to_string(),
+            referrer_url: None,
+            frame_url: None,
+            sha256: Some("d".repeat(64)),
+            stage: MotwMatchStage::ZoneIdentifierAds,
+            zone_id: Some(3),
+        },
+    });
+    // Reuse PID 9720 only -> sibling 9721 is still live, so Preemptive block must stay!
+    send_and_wait(
+        &engine,
+        &sender,
+        SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(9720, base_100ns + 400_000),
+            parent_pid: 4,
+            exe_path: r"C:\Program Files\OtherApp\reuser_b3.exe".to_string(),
+            command_line: "b3.exe".to_string(),
+            user_sid: None,
+        },
+    )
+    .await;
+    assert!(
+        try_has_active_wfp_filter(&engine, exe_sib, None, false, Duration::from_secs(2))
+            .await
+            .expect("firewall lock"),
+        "running sibling must keep Preemptive block active when only one instance's PID is reused"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+}

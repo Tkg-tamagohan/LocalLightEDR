@@ -50,6 +50,11 @@ pub struct ProcessStartResolution {
     /// supersedes an earlier active entry for the same PID (such as a `pid:0` snapshot
     /// placeholder); the engine propagates it to the store in the same transaction.
     pub superseded_exit: Option<(String, i64)>,
+    /// All active or evicted-live `(process_instance_id, exe_path)` instances superseded by PID
+    /// reuse during this `ProcessStart` so the engine can release per-instance firewall/DNS state
+    /// and re-check unused non-startup `Preemptive` WFP blocks using the same path as
+    /// `ProcessStop` (`PRRT_kwDOVyjVyM66k6ks`).
+    pub superseded_exited_processes: Vec<(String, String)>,
     /// `true` when an unverified `create_time_100ns == 0` snapshot was absorbed into an already
     /// running verified process without enriching any missing metadata, so persisting a synthetic
     /// `pid:0` row into SQLite must be skipped.
@@ -113,6 +118,7 @@ struct EvictedLiveRecord {
     exe_path: String,
     exe_key: String,
     has_motw: bool,
+    generation: u64,
 }
 
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
@@ -127,7 +133,9 @@ pub struct ActiveProcessTable {
     evicted_exited: HashMap<String, EvictedExitedRecord>,
     evicted_exited_fifo: VecDeque<String>,
     evicted_live: HashMap<String, EvictedLiveRecord>,
-    evicted_live_fifo: VecDeque<String>,
+    evicted_live_by_pid: HashMap<u32, Vec<String>>,
+    evicted_live_fifo: VecDeque<(String, u64)>,
+    evicted_live_seq: u64,
     evicted_live_capacity: usize,
     evicted_live_exe_counts: HashMap<String, usize>,
     evicted_live_motw_exe_counts: HashMap<String, usize>,
@@ -157,7 +165,9 @@ impl ActiveProcessTable {
             evicted_exited: HashMap::new(),
             evicted_exited_fifo: VecDeque::new(),
             evicted_live: HashMap::new(),
+            evicted_live_by_pid: HashMap::new(),
             evicted_live_fifo: VecDeque::new(),
+            evicted_live_seq: 0,
             evicted_live_capacity: MAX_EVICTED_LIVE_HISTORY,
             evicted_live_exe_counts: HashMap::new(),
             evicted_live_motw_exe_counts: HashMap::new(),
@@ -234,6 +244,7 @@ impl ActiveProcessTable {
                             should_evaluate_sigma: !prev_sigma_evaluated,
                             exited_at_ms: None,
                             superseded_exit: None,
+                            superseded_exited_processes: Vec::new(),
                             skip_store_ingest: true,
                             skip_launch_guards: true,
                             evicted_instance_ids: Vec::new(),
@@ -302,34 +313,34 @@ impl ActiveProcessTable {
                         should_evaluate_sigma,
                         exited_at_ms: None,
                         superseded_exit: None,
+                        superseded_exited_processes: Vec::new(),
                         skip_store_ingest: !enriched,
                         skip_launch_guards: prev_entry.launch_guards_applied && !upgraded_exe,
                         evicted_instance_ids: Vec::new(),
                     };
                 }
             }
-            if !self.evicted_live.is_empty() {
-                if let Some(ev_identity) = self
-                    .evicted_live
-                    .values()
-                    .filter(|ev| ev.identity.pid == identity.pid && ev.identity.create_time_100ns != 0)
+            if let Some(ev_identity) = self.evicted_live_by_pid.get(&identity.pid).and_then(|ids| {
+                ids.iter()
+                    .filter_map(|id| self.evicted_live.get(id))
+                    .filter(|ev| ev.identity.create_time_100ns != 0)
                     .max_by_key(|ev| (ev.created_at_ms, ev.identity.create_time_100ns))
                     .map(|ev| ev.identity)
-                {
-                    return ProcessStartResolution {
-                        resolved_identity: ev_identity,
-                        instance_id: ev_identity.instance_id(),
-                        parent_instance_id: None,
-                        parent_exe_path: None,
-                        parent_command_line: None,
-                        should_evaluate_sigma: false,
-                        exited_at_ms: None,
-                        superseded_exit: None,
-                        skip_store_ingest: true,
-                        skip_launch_guards: true,
-                        evicted_instance_ids: Vec::new(),
-                    };
-                }
+            }) {
+                return ProcessStartResolution {
+                    resolved_identity: ev_identity,
+                    instance_id: ev_identity.instance_id(),
+                    parent_instance_id: None,
+                    parent_exe_path: None,
+                    parent_command_line: None,
+                    should_evaluate_sigma: false,
+                    exited_at_ms: None,
+                    superseded_exit: None,
+                    superseded_exited_processes: Vec::new(),
+                    skip_store_ingest: true,
+                    skip_launch_guards: true,
+                    evicted_instance_ids: Vec::new(),
+                };
             }
         }
 
@@ -404,6 +415,7 @@ impl ActiveProcessTable {
                 should_evaluate_sigma,
                 exited_at_ms: existing_exited_at_ms,
                 superseded_exit: None,
+                superseded_exited_processes: Vec::new(),
                 skip_store_ingest: false,
                 skip_launch_guards,
                 evicted_instance_ids: Vec::new(),
@@ -444,6 +456,7 @@ impl ActiveProcessTable {
                     should_evaluate_sigma: true,
                     exited_at_ms: Some(evicted_exit_ms),
                     superseded_exit: None,
+                    superseded_exited_processes: Vec::new(),
                     skip_store_ingest: false,
                     skip_launch_guards: true,
                     evicted_instance_ids: Vec::new(),
@@ -454,15 +467,14 @@ impl ActiveProcessTable {
         let (parent_instance_id, parent_exe_path, parent_command_line) =
             self.lookup_parent_for(parent_pid, identity, created_at_ms, true);
 
-        let mut superseded_exit: Option<(String, i64)> = None;
-        if let Some(prev_id) = self
+        let prev_pid_id = self
             .pid_to_identity
             .get(&identity.pid)
             .copied()
             .filter(|prev| *prev != identity)
-            .map(|prev| prev.instance_id())
-        {
-            if let Some(prev_entry) = self.entries.get(&prev_id) {
+            .map(|prev| prev.instance_id());
+        if let Some(ref prev_id) = prev_pid_id {
+            if let Some(prev_entry) = self.entries.get(prev_id) {
                 if prev_entry.identity.create_time_100ns != 0
                     && (prev_entry.created_at_ms, prev_entry.identity.create_time_100ns)
                         > (created_at_ms, identity.create_time_100ns)
@@ -505,13 +517,74 @@ impl ActiveProcessTable {
                         should_evaluate_sigma: true,
                         exited_at_ms: Some(inferred_exit_ms),
                         superseded_exit: None,
+                        superseded_exited_processes: Vec::new(),
                         skip_store_ingest: false,
                         skip_launch_guards: true,
                         evicted_instance_ids,
                     };
                 }
             }
+        }
 
+        // O(1) PID-indexed check against evicted live processes (`PRRT_kwDOVyjVyM66k6mA`).
+        if let Some(inferred_exit_ms) = self.evicted_live_by_pid.get(&identity.pid).and_then(|ids| {
+            ids.iter()
+                .filter_map(|id| self.evicted_live.get(id))
+                .filter(|ev| {
+                    ev.identity != identity
+                        && ev.identity.create_time_100ns != 0
+                        && (ev.created_at_ms, ev.identity.create_time_100ns)
+                            > (created_at_ms, identity.create_time_100ns)
+                })
+                .map(|ev| ev.created_at_ms)
+                .max()
+        }) {
+            self.remove_evicted_live_by_id(&instance_id);
+            self.entries.insert(
+                instance_id.clone(),
+                ActiveProcessEntry {
+                    identity,
+                    instance_id: instance_id.clone(),
+                    pid: identity.pid,
+                    ppid: parent_pid,
+                    parent_instance_id: parent_instance_id.clone(),
+                    exe_path,
+                    command_line,
+                    user_sid,
+                    created_at_ms,
+                    exited_at_ms: Some(inferred_exit_ms),
+                    sigma_evaluated: true,
+                    launch_guards_applied: false,
+                    emitted_rule_ids: HashSet::new(),
+                    origin_url: None,
+                    motw_referrer: None,
+                    motw_frame_url: None,
+                    motw_source: None,
+                    motw_zone_id: None,
+                },
+            );
+            self.exited_fifo.push_back(instance_id.clone());
+            self.insertion_fifo.push_back(instance_id.clone());
+            let evicted_instance_ids = self.evict_if_over_capacity(&instance_id);
+            return ProcessStartResolution {
+                resolved_identity: identity,
+                instance_id,
+                parent_instance_id,
+                parent_exe_path,
+                parent_command_line,
+                should_evaluate_sigma: true,
+                exited_at_ms: Some(inferred_exit_ms),
+                superseded_exit: None,
+                superseded_exited_processes: Vec::new(),
+                skip_store_ingest: false,
+                skip_launch_guards: true,
+                evicted_instance_ids,
+            };
+        }
+
+        let mut superseded_exit: Option<(String, i64)> = None;
+        let mut superseded_exited_processes: Vec<(String, String)> = Vec::new();
+        if let Some(prev_id) = prev_pid_id {
             // If a previous process with the same PID is still marked active (missed stop or
             // `pid:0` snapshot placeholder), mark it exited without inverting its timestamp.
             if let Some(prev_entry) = self
@@ -521,85 +594,38 @@ impl ActiveProcessTable {
             {
                 let exit_ms = created_at_ms.max(prev_entry.created_at_ms);
                 prev_entry.exited_at_ms = Some(exit_ms);
+                let prev_exe_path = prev_entry.exe_path.clone();
                 self.active_count = self.active_count.saturating_sub(1);
                 self.exited_fifo.push_back(prev_id.clone());
-                superseded_exit = Some((prev_id, exit_ms));
+                superseded_exit = Some((prev_id.clone(), exit_ms));
+                superseded_exited_processes.push((prev_id, prev_exe_path));
             }
         }
 
-        if !self.evicted_live.is_empty() {
-            // Re-inserting an evicted live instance removes its duplicate evicted-live record so
-            // per-exe counts remain exact.
-            self.remove_evicted_live_by_id(&instance_id);
-
-            let newer_evicted_created = self
-                .evicted_live
-                .values()
-                .filter(|ev| {
-                    ev.identity.pid == identity.pid
-                        && ev.identity != identity
-                        && ev.identity.create_time_100ns != 0
-                        && (ev.created_at_ms, ev.identity.create_time_100ns)
-                            > (created_at_ms, identity.create_time_100ns)
-                })
-                .map(|ev| ev.created_at_ms)
-                .max();
-            if let Some(inferred_exit_ms) = newer_evicted_created {
-                self.entries.insert(
-                    instance_id.clone(),
-                    ActiveProcessEntry {
-                        identity,
-                        instance_id: instance_id.clone(),
-                        pid: identity.pid,
-                        ppid: parent_pid,
-                        parent_instance_id: parent_instance_id.clone(),
-                        exe_path,
-                        command_line,
-                        user_sid,
-                        created_at_ms,
-                        exited_at_ms: Some(inferred_exit_ms),
-                        sigma_evaluated: true,
-                        launch_guards_applied: false,
-                        emitted_rule_ids: HashSet::new(),
-                        origin_url: None,
-                        motw_referrer: None,
-                        motw_frame_url: None,
-                        motw_source: None,
-                        motw_zone_id: None,
-                    },
-                );
-                self.exited_fifo.push_back(instance_id.clone());
-                self.insertion_fifo.push_back(instance_id.clone());
-                let evicted_instance_ids = self.evict_if_over_capacity(&instance_id);
-                return ProcessStartResolution {
-                    resolved_identity: identity,
-                    instance_id,
-                    parent_instance_id,
-                    parent_exe_path,
-                    parent_command_line,
-                    should_evaluate_sigma: true,
-                    exited_at_ms: Some(inferred_exit_ms),
-                    superseded_exit: None,
-                    skip_store_ingest: false,
-                    skip_launch_guards: true,
-                    evicted_instance_ids,
-                };
-            }
-
-            let older_evicted: Vec<(String, i64, u64)> = self
-                .evicted_live
-                .iter()
-                .filter(|(_, ev)| ev.identity.pid == identity.pid && ev.identity != identity)
-                .map(|(id, ev)| (id.clone(), ev.created_at_ms, ev.identity.create_time_100ns))
-                .collect();
-            if let Some((latest_id, latest_created, _)) = older_evicted
-                .iter()
-                .max_by_key(|(_, c, ct)| (*c, *ct))
+        // Re-inserting an evicted live instance removes its duplicate evicted-live record so
+        // per-exe counts remain exact (O(1) hash lookup).
+        self.remove_evicted_live_by_id(&instance_id);
+        if let Some(older_evicted_ids) = self.evicted_live_by_pid.get(&identity.pid).map(|ids| {
+            ids.iter()
+                .filter(|id| id.as_str() != instance_id.as_str())
                 .cloned()
-            {
-                for (ev_id, _, _) in older_evicted {
-                    self.remove_evicted_live_by_id(&ev_id);
+                .collect::<Vec<_>>()
+        }) {
+            let mut latest_evicted: Option<(String, i64, u64)> = None;
+            for ev_id in older_evicted_ids {
+                if let Some(ev) = self.remove_evicted_live_by_id(&ev_id) {
+                    let key = (ev.created_at_ms, ev.identity.create_time_100ns);
+                    if latest_evicted
+                        .as_ref()
+                        .is_none_or(|(_, c, ct)| key > (*c, *ct))
+                    {
+                        latest_evicted =
+                            Some((ev_id.clone(), ev.created_at_ms, ev.identity.create_time_100ns));
+                    }
+                    superseded_exited_processes.push((ev_id, ev.exe_path));
                 }
+            }
+            if let Some((latest_id, latest_created, _)) = latest_evicted {
                 if superseded_exit.is_none() {
                     superseded_exit = Some((latest_id, created_at_ms.max(latest_created)));
                 }
@@ -644,6 +670,7 @@ impl ActiveProcessTable {
             should_evaluate_sigma: true,
             exited_at_ms: None,
             superseded_exit,
+            superseded_exited_processes,
             skip_store_ingest: false,
             skip_launch_guards: false,
             evicted_instance_ids,
@@ -698,17 +725,15 @@ impl ActiveProcessTable {
             return Some((target_id, exe_path));
         }
 
-        if !self.evicted_live.is_empty() {
-            let evicted_id = self
-                .evicted_live
-                .iter()
-                .filter(|(_, ev)| ev.identity.pid == pid && ev.created_at_ms <= exited_at_ms)
+        if let Some(ev_id) = self.evicted_live_by_pid.get(&pid).and_then(|ids| {
+            ids.iter()
+                .filter_map(|id| self.evicted_live.get(id).map(|ev| (id, ev)))
+                .filter(|(_, ev)| ev.created_at_ms <= exited_at_ms)
                 .max_by_key(|(_, ev)| (ev.created_at_ms, ev.identity.create_time_100ns))
-                .map(|(id, _)| id.clone());
-            if let Some(ev_id) = evicted_id {
-                if let Some(ev) = self.remove_evicted_live_by_id(&ev_id) {
-                    return Some((ev_id, ev.exe_path));
-                }
+                .map(|(id, _)| id.clone())
+        }) {
+            if let Some(ev) = self.remove_evicted_live_by_id(&ev_id) {
+                return Some((ev_id, ev.exe_path));
             }
         }
 
@@ -1234,6 +1259,8 @@ impl ActiveProcessTable {
         if self.evicted_live.contains_key(&instance_id) {
             self.remove_evicted_live_by_id(&instance_id);
         }
+        self.evicted_live_seq = self.evicted_live_seq.wrapping_add(1);
+        let generation = self.evicted_live_seq;
         if !exe_key.is_empty() {
             *self.evicted_live_exe_counts.entry(exe_key.clone()).or_insert(0) += 1;
             if has_motw {
@@ -1251,13 +1278,25 @@ impl ActiveProcessTable {
                 exe_path,
                 exe_key,
                 has_motw,
+                generation,
             },
         );
-        self.evicted_live_fifo.push_back(instance_id);
+        self.evicted_live_by_pid
+            .entry(identity.pid)
+            .or_default()
+            .push(instance_id.clone());
+        self.evicted_live_fifo.push_back((instance_id, generation));
         while self.evicted_live.len() > self.evicted_live_capacity {
-            let Some(oldest_id) = self.evicted_live_fifo.pop_front() else {
+            let Some((oldest_id, oldest_gen)) = self.evicted_live_fifo.pop_front() else {
                 break;
             };
+            if self
+                .evicted_live
+                .get(&oldest_id)
+                .is_none_or(|rec| rec.generation != oldest_gen)
+            {
+                continue;
+            }
             if let Some(old) = self.remove_evicted_live_by_id(&oldest_id) {
                 self.record_overflowed_evicted_live_exe(&old.exe_key, old.has_motw);
             }
@@ -1287,6 +1326,12 @@ impl ActiveProcessTable {
 
     fn remove_evicted_live_by_id(&mut self, instance_id: &str) -> Option<EvictedLiveRecord> {
         let removed = self.evicted_live.remove(instance_id)?;
+        if let Some(ids) = self.evicted_live_by_pid.get_mut(&removed.identity.pid) {
+            ids.retain(|id| id != instance_id);
+            if ids.is_empty() {
+                self.evicted_live_by_pid.remove(&removed.identity.pid);
+            }
+        }
         if !removed.exe_key.is_empty() {
             if let Some(cnt) = self.evicted_live_exe_counts.get_mut(&removed.exe_key) {
                 if *cnt <= 1 {
@@ -1307,7 +1352,8 @@ impl ActiveProcessTable {
         }
         if self.evicted_live_fifo.len() > self.evicted_live_capacity.saturating_mul(2).max(16) {
             let live = &self.evicted_live;
-            self.evicted_live_fifo.retain(|id| live.contains_key(id));
+            self.evicted_live_fifo
+                .retain(|(id, gen)| live.get(id).is_some_and(|rec| rec.generation == *gen));
         }
         Some(removed)
     }
@@ -2209,6 +2255,11 @@ mod tests {
             reuse_res.superseded_exit,
             Some((reused_old.instance_id(), 400))
         );
+        assert_eq!(
+            reuse_res.superseded_exited_processes,
+            vec![(reused_old.instance_id(), reused_exe.to_string())],
+            "PID reuse must return superseded evicted-live executable path for firewall cleanup"
+        );
         assert!(
             !table.has_active_exe_key(&reused_key),
             "PID reuse must clear superseded evicted live executable"
@@ -2246,5 +2297,133 @@ mod tests {
             small.has_active_exe_key(&ov_key),
             "evicted_live secondary overflow must stay fail-closed for the overflowed executable"
         );
+    }
+
+    /// Regression test `PT-EVICT-01` (`PRRT_kwDOVyjVyM66k6lW`, `PRRT_kwDOVyjVyM66k6mA`,
+    /// `PRRT_kwDOVyjVyM66k6ks`):
+    /// verifies that:
+    /// 1. Re-registering and re-evicting a process does not let stale `evicted_live_fifo` entries
+    ///    prematurely evict the newer generation into `overflowed_evicted_live_exes`, so normal
+    ///    `ProcessStop` still resolves the process and clears `has_active_exe_key`.
+    /// 2. `evicted_live_by_pid` stays synchronized across eviction, re-registration, `pid:0`
+    ///    snapshot absorption, out-of-order older start, PID reuse supersede, and explicit stop.
+    #[test]
+    fn process_table_evicted_live_generation_fifo_and_pid_index_stay_exact() {
+        let mut table = ActiveProcessTable::new(1).with_evicted_live_capacity(2);
+        let exe_a = r"C:\Users\Alice\Downloads\gen_a.exe";
+        let exe_b = r"C:\Users\Alice\Downloads\gen_b.exe";
+        let exe_c = r"C:\Users\Alice\Downloads\gen_c.exe";
+        let key_a = normalize_exe_key(exe_a);
+        let key_b = normalize_exe_key(exe_b);
+        let key_c = normalize_exe_key(exe_c);
+
+        let id_a = ProcessIdentity::new(8101, 10_000_000);
+        let id_b = ProcessIdentity::new(8102, 10_100_000);
+        let id_c = ProcessIdentity::new(8103, 10_200_000);
+        let id_d = ProcessIdentity::new(8104, 10_300_000);
+
+        // 1. Start A, then B (evicts A -> fifo [(A, 1)]), then C (evicts B -> fifo [(A, 1), (B, 2)]).
+        table.on_process_start(id_a, 4, exe_a.to_string(), "a.exe".to_string(), None, 100);
+        table.on_process_start(id_b, 4, exe_b.to_string(), "b.exe".to_string(), None, 110);
+        table.on_process_start(id_c, 4, exe_c.to_string(), "c.exe".to_string(), None, 120);
+        assert!(table.evicted_live.contains_key(&id_a.instance_id()));
+        assert!(table.evicted_live.contains_key(&id_b.instance_id()));
+        assert_eq!(table.evicted_live_by_pid.len(), 2);
+
+        // 2. Re-register A (e.g. canary backfill) -> removes A from evicted_live while stale (A, 1)
+        //    remains in evicted_live_fifo; evicts C -> evicted_live = {B, C}.
+        //    First stop C so re-registering A doesn't evict C into evicted_live and overflow B early.
+        assert_eq!(
+            table.on_process_stop_with_exe(id_c.pid, 125),
+            Some((id_c.instance_id(), exe_c.to_string()))
+        );
+        table.on_process_start(id_a, 4, exe_a.to_string(), "a.exe".to_string(), None, 100);
+        assert!(!table.evicted_live.contains_key(&id_a.instance_id()));
+        assert!(!table.evicted_live_by_pid.contains_key(&id_a.pid));
+        assert!(table.evicted_live.contains_key(&id_b.instance_id()));
+
+        // 3. Re-evict A by starting a new process C2 -> evicted_live = {B (gen 2), A (gen 3)},
+        //    evicted_live_fifo = [(A, 1), (B, 2), (A, 3)].
+        let id_c2 = ProcessIdentity::new(8105, 10_400_000);
+        table.on_process_start(id_c2, 4, exe_c.to_string(), "c2.exe".to_string(), None, 130);
+        assert!(table.evicted_live.contains_key(&id_a.instance_id()));
+        assert!(table.evicted_live.contains_key(&id_b.instance_id()));
+        assert!(!table.overflowed_evicted_live_exes.contains(&key_a));
+
+        // 4. Start D -> evicts C2 into evicted_live (size 3 > capacity 2).
+        //    Stale (A, 1) MUST be ignored so B (gen 2) overflows instead of newer A (gen 3).
+        table.on_process_start(
+            id_d,
+            4,
+            r"C:\Program Files\Pad\gen_d.exe".to_string(),
+            "d.exe".to_string(),
+            None,
+            140,
+        );
+        assert!(
+            table.evicted_live.contains_key(&id_a.instance_id()),
+            "newer generation of re-evicted A must NOT be evicted by stale FIFO entry"
+        );
+        assert!(
+            !table.overflowed_evicted_live_exes.contains(&key_a),
+            "A must remain individually tracked rather than fail-closed overflowed"
+        );
+        assert!(
+            !table.evicted_live.contains_key(&id_b.instance_id()),
+            "oldest live generation B must be evicted to overflow"
+        );
+        assert!(
+            table.overflowed_evicted_live_exes.contains(&key_b),
+            "B must move to overflowed_evicted_live_exes (fail-closed)"
+        );
+        assert!(table.has_active_exe_key(&key_b));
+        assert!(table.has_active_exe_key(&key_c));
+
+        // 5. Verify PID-indexed `create_time_100ns == 0` snapshot absorption matches evicted A.
+        let snap_res = table.on_process_start(
+            ProcessIdentity::new(id_a.pid, 0),
+            4,
+            exe_a.to_string(),
+            String::new(),
+            None,
+            145,
+        );
+        assert_eq!(snap_res.resolved_identity, id_a);
+        assert!(snap_res.skip_store_ingest);
+
+        // 6. Verify PID-indexed older out-of-order start against evicted A is marked exited.
+        //    Stop D first so inserting the already-exited older record evicts exited D instead of
+        //    pushing a live D into `evicted_live` and rotating A out.
+        assert_eq!(
+            table.on_process_stop_with_exe(id_d.pid, 146).map(|(id, _)| id),
+            Some(id_d.instance_id())
+        );
+        let older_a = ProcessIdentity::new(id_a.pid, 9_000_000);
+        let older_res = table.on_process_start(
+            older_a,
+            4,
+            r"C:\Program Files\Old\older_a.exe".to_string(),
+            "older_a.exe".to_string(),
+            None,
+            50,
+        );
+        assert_eq!(older_res.exited_at_ms, Some(100));
+        assert!(older_res.superseded_exited_processes.is_empty());
+
+        // 7. Stop A normally -> resolves from evicted_live via PID index and clears liveness!
+        assert_eq!(
+            table.on_process_stop_with_exe(id_a.pid, 150),
+            Some((id_a.instance_id(), exe_a.to_string()))
+        );
+        assert!(
+            !table.has_active_exe_key(&key_a),
+            "stopping re-evicted A must clear has_active_exe_key cleanly"
+        );
+        assert!(!table.evicted_live_by_pid.contains_key(&id_a.pid));
+
+        // 8. Verify PID-indexed `evicted_live_by_pid` stays exact in size with `evicted_live`.
+        let indexed_total: usize = table.evicted_live_by_pid.values().map(Vec::len).sum();
+        assert_eq!(indexed_total, table.evicted_live.len());
+        assert!(table.evicted_live_by_pid.values().all(|v| !v.is_empty()));
     }
 }

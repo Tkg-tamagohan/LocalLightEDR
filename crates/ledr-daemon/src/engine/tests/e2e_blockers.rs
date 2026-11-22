@@ -8552,18 +8552,28 @@ async fn upsert_policy_rule_rollback_skips_preemptive_restore_after_last_process
                 })
                 .expect("enqueue ProcessStop for exe_dead");
             let wait_dl = std::time::Instant::now() + Duration::from_secs(5);
+            let mut ever_acquired_table_lock = false;
             loop {
-                let still_live = engine_hook
-                    .process_table
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .has_active_exe_key(&dead_key);
-                if !still_live {
-                    break;
+                match engine_hook.process_table.try_lock() {
+                    Ok(table) => {
+                        ever_acquired_table_lock = true;
+                        if !table.has_active_exe_key(&dead_key) {
+                            break;
+                        }
+                    }
+                    Err(std::sync::TryLockError::Poisoned(e)) => {
+                        ever_acquired_table_lock = true;
+                        if !e.into_inner().has_active_exe_key(&dead_key) {
+                            break;
+                        }
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {}
                 }
                 assert!(
                     std::time::Instant::now() < wait_dl,
-                    "ProcessStop must update process_table while reconcile fails permit add"
+                    "timed out waiting for ProcessStop to update process_table while reconcile \
+                     fails permit add (ever_acquired_table_lock={ever_acquired_table_lock}; \
+                     false indicates process_table lock was held across BFE permit add)"
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }

@@ -427,13 +427,16 @@ impl WfpRuleManager {
                 if let Some(alert_id) = rebind_alert_id {
                     self.bound_alerts
                         .insert(alert_id.to_string(), snapshot.key.clone());
-                    if existing_is_preemptive
-                        && !self.startup_preemptive_exes.contains_key(&snapshot.key.0)
+                }
+                if existing_is_preemptive
+                    && !self.startup_preemptive_exes.contains_key(&snapshot.key.0)
+                {
+                    let promoted_pending = rebind_alert_id.is_some()
                         && self
                             .pending_preemptive_removals
                             .remove(&existing_handle)
-                            .is_some()
-                    {
+                            .is_some();
+                    if promoted_pending || snapshot.prev_deferred_preemptive_removal {
                         self.deferred_preemptive_removals.insert(existing_handle);
                     }
                 }

@@ -2125,24 +2125,43 @@ fn firewall_restore_removed_app_blocks_skips_exited_unbound_preemptive_and_marks
     let report = fw.reconcile_persisted_rules(&allows, &startup_candidates, &inspector, &defense);
     assert_eq!(report.removed_app_blocks.len(), 4);
 
-    // Roll back persisted rules (removing Permits, and startup_pinned will be re-installed or kept
-    // absent if we reconcile with empty startup_candidates first so we test restore_removed_app_blocks
-    // directly for startup_pinned too).
+    // Roll back persisted rules (removing Permits). Step 5 of `reconcile_persisted_rules`
+    // re-installs `exe_startup_pinned` from `startup_preemptive_exes`, so remove that filter
+    // cleanly before invoking `restore_removed_app_blocks` to prove the restoration helper itself
+    // restores stopped startup-pinned executables (`PRRT_kwDOVyjVyM66lHMA`).
     let _ = fw.reconcile_persisted_rules(&[], &[], &inspector, &defense);
-    // Keep startup_pinned registered in `startup_preemptive_exes` without an installed filter by
-    // simulating rollback before startup reconcile: remove only its handle cleanly.
+    let startup_key = WfpRuleManager::target_key(exe_startup_pinned, None);
+    let startup_reinstalled = fw
+        .installed
+        .remove(&startup_key)
+        .expect("reconcile_persisted_rules step 5 re-installed startup_pinned");
+    defense
+        .remove_wfp_rule(startup_reinstalled.handle)
+        .expect("remove startup_pinned handle before testing restore_removed_app_blocks");
     assert!(fw.is_startup_preemptive(exe_startup_pinned));
+    assert!(
+        !fw.has_any_app_filter(exe_startup_pinned),
+        "startup_pinned filter must be absent prior to calling restore_removed_app_blocks"
+    );
     assert!(!fw.has_any_app_filter(exe_exited_unbound));
     assert!(!fw.has_any_app_filter(exe_active_unbound));
     assert!(!fw.has_any_app_filter(exe_exited_bound));
 
     let active_key = WfpRuleManager::exe_key(exe_active_unbound);
+    let mut queried_keys: Vec<String> = Vec::new();
     fw.restore_removed_app_blocks(
         &report.removed_app_blocks,
-        |exe_key| exe_key == active_key,
+        |exe_key| {
+            queried_keys.push(exe_key.to_string());
+            exe_key == active_key
+        },
         &defense,
     );
 
+    assert!(
+        !queried_keys.contains(&WfpRuleManager::exe_key(exe_startup_pinned)),
+        "startup-pinned Preemptive restoration must not depend on process liveness"
+    );
     assert!(
         !fw.has_any_app_filter(exe_exited_unbound),
         "exited unbound non-startup Preemptive block must NOT be resurrected on rollback"
@@ -2159,7 +2178,12 @@ fn firewall_restore_removed_app_blocks_skips_exited_unbound_preemptive_and_marks
     assert_eq!(
         fw.filter_origin(exe_startup_pinned, None),
         Some(&WfpFilterOrigin::Preemptive),
-        "startup-pinned Preemptive block must remain active on rollback"
+        "startup-pinned Preemptive block must be freshly restored by restore_removed_app_blocks"
+    );
+    assert_ne!(
+        fw.active_app_block(exe_startup_pinned).map(|(h, _)| h),
+        Some(startup_reinstalled.handle),
+        "startup-pinned block must have a newly added BFE handle from restore_removed_app_blocks"
     );
     assert_eq!(
         fw.filter_origin(exe_exited_bound, None),
@@ -2170,5 +2194,26 @@ fn firewall_restore_removed_app_blocks_skips_exited_unbound_preemptive_and_marks
     assert!(
         fw.has_deferred_preemptive_removal(exe_exited_bound),
         "alert-bound Preemptive block whose process exited before rollback must be marked deferred"
+    );
+
+    // Also verify that if a non-startup Preemptive filter already exists when
+    // `restore_removed_app_blocks` runs for an exited alert-bound snapshot, the deferred
+    // removal flag is still preserved on the existing handle.
+    let existing_bound_handle = fw
+        .active_app_block(exe_exited_bound)
+        .expect("exe_exited_bound filter present")
+        .0;
+    fw.deferred_preemptive_removals.remove(&existing_bound_handle);
+    assert!(!fw.has_deferred_preemptive_removal(exe_exited_bound));
+    let exited_bound_only: Vec<_> = report
+        .removed_app_blocks
+        .iter()
+        .filter(|s| s.block.key.0 == WfpRuleManager::exe_key(exe_exited_bound))
+        .cloned()
+        .collect();
+    fw.restore_removed_app_blocks(&exited_bound_only, |_| false, &defense);
+    assert!(
+        fw.has_deferred_preemptive_removal(exe_exited_bound),
+        "existing non-startup Preemptive handle must inherit prev_deferred_preemptive_removal on rollback"
     );
 }

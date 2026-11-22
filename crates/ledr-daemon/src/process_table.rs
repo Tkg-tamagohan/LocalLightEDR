@@ -2351,7 +2351,8 @@ mod tests {
         assert!(!table.overflowed_evicted_live_exes.contains(&key_a));
 
         // 4. Start D -> evicts C2 into evicted_live (size 3 > capacity 2).
-        //    Stale (A, 1) MUST be ignored so B (gen 2) overflows instead of newer A (gen 3).
+        //    Stale (A, 1) sits at the head of FIFO ahead of (B, 2) and MUST be ignored so B (gen 2)
+        //    overflows instead of newer A (gen 3).
         table.on_process_start(
             id_d,
             4,
@@ -2410,9 +2411,45 @@ mod tests {
         assert_eq!(older_res.exited_at_ms, Some(100));
         assert!(older_res.superseded_exited_processes.is_empty());
 
-        // 7. Stop A normally -> resolves from evicted_live via PID index and clears liveness!
+        // 7. Re-register and re-evict A > 16 times to trigger `remove_evicted_live_by_id` FIFO
+        //    compaction (`retain`) and verify stale generations are pruned without losing A.
+        let mut saw_fifo_compaction = false;
+        for cycle in 0..18u32 {
+            let fifo_before = table.evicted_live_fifo.len();
+            table.on_process_start(id_a, 4, exe_a.to_string(), "a.exe".to_string(), None, 100);
+            assert!(!table.evicted_live.contains_key(&id_a.instance_id()));
+            if fifo_before > 16 && table.evicted_live_fifo.len() < fifo_before {
+                saw_fifo_compaction = true;
+            }
+            let pad_id = ProcessIdentity::new(8200 + cycle, 10_500_000 + u64::from(cycle) * 10_000);
+            let pad_ts = 150 + i64::from(cycle) * 2;
+            table.on_process_start(
+                pad_id,
+                4,
+                r"C:\Program Files\Pad\compact_pad.exe".to_string(),
+                format!("compact_pad_{cycle}.exe"),
+                None,
+                pad_ts,
+            );
+            assert!(table.evicted_live.contains_key(&id_a.instance_id()));
+            assert_eq!(
+                table.on_process_stop_with_exe(pad_id.pid, pad_ts + 1).map(|(id, _)| id),
+                Some(pad_id.instance_id())
+            );
+        }
+        assert!(
+            saw_fifo_compaction,
+            "repeated re-registration/re-eviction must trigger generation-aware FIFO compaction"
+        );
+        assert!(
+            table.evicted_live_fifo.len() <= 16,
+            "generation-aware FIFO compaction must keep evicted_live_fifo bounded (len={})",
+            table.evicted_live_fifo.len()
+        );
+
+        // 8. Stop A normally -> resolves from evicted_live via PID index and clears liveness!
         assert_eq!(
-            table.on_process_stop_with_exe(id_a.pid, 150),
+            table.on_process_stop_with_exe(id_a.pid, 300),
             Some((id_a.instance_id(), exe_a.to_string()))
         );
         assert!(
@@ -2421,7 +2458,7 @@ mod tests {
         );
         assert!(!table.evicted_live_by_pid.contains_key(&id_a.pid));
 
-        // 8. Verify PID-indexed `evicted_live_by_pid` stays exact in size with `evicted_live`.
+        // 9. Verify PID-indexed `evicted_live_by_pid` stays exact in size with `evicted_live`.
         let indexed_total: usize = table.evicted_live_by_pid.values().map(Vec::len).sum();
         assert_eq!(indexed_total, table.evicted_live.len());
         assert!(table.evicted_live_by_pid.values().all(|v| !v.is_empty()));

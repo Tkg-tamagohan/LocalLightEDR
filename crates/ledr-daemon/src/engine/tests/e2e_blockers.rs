@@ -5301,3 +5301,441 @@ async fn daemon_p4_cmd_06_canary_first_delayed_motw_exceeding_budget_applies_wfp
         .expect("process row persisted");
     assert_eq!(row.origin_url.as_deref(), Some(motw_url));
 }
+
+/// `DAEMON-P4-CMD-07`: Concurrent startup snapshot (`seed_processes`) racing with ETW
+/// `ProcessStart` + `ProcessStop` for a short-lived `Downloads` executable must never leave a
+/// residual preemptive WFP block or leaked BFE handle (`PRRT_kwDOVyjVyM66jl1W`).
+///
+/// Also verifies that `apply_process_launch_guards`'s active-only entry guard preserves `L-18`
+/// MOTW preemptive blocking when `seed_processes` marks `launch_guards_applied = true` first
+/// without MOTW and ETW `ProcessStart` subsequently finishes MOTW resolution while still active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p4_cmd_07_seed_process_wfp_race_leaves_no_residual_block_and_preserves_motw() {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Condvar;
+    use std::time::Duration;
+
+    use crate::engine::MotwInspector;
+    use ledr_sensor_win::MotwZoneInfo;
+
+    struct Gate {
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        cvar: Condvar,
+    }
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: AtomicBool::new(false),
+                released: Mutex::new(false),
+                cvar: Condvar::new(),
+            })
+        }
+
+        fn wait_gate(&self) {
+            self.entered.store(true, Ordering::Release);
+            let mut guard = self.released.lock().unwrap_or_else(|e| e.into_inner());
+            while !*guard {
+                guard = self.cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+
+        fn release(&self) {
+            let mut guard = self.released.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = true;
+            self.cvar.notify_all();
+        }
+
+        fn is_entered(&self) -> bool {
+            self.entered.load(Ordering::Acquire)
+        }
+    }
+
+    struct ReleaseGatesOnDrop(Vec<Arc<Gate>>);
+    impl Drop for ReleaseGatesOnDrop {
+        fn drop(&mut self) {
+            for gate in &self.0 {
+                gate.release();
+            }
+        }
+    }
+
+    struct DualGatedMotwInspector {
+        short_exe_lower: String,
+        short_gate: Arc<Gate>,
+        normal_exe_lower: String,
+        normal_gate: Arc<Gate>,
+        normal_zone: MotwZoneInfo,
+    }
+
+    impl MotwInspector for DualGatedMotwInspector {
+        fn read_zone_identifier(&self, path: &Path) -> Option<MotwZoneInfo> {
+            let lower = path.to_string_lossy().to_ascii_lowercase();
+            if lower == self.short_exe_lower {
+                self.short_gate.wait_gate();
+                return None;
+            }
+            if lower == self.normal_exe_lower {
+                self.normal_gate.wait_gate();
+                return Some(self.normal_zone.clone());
+            }
+            None
+        }
+    }
+
+    struct GatedWfpDefense {
+        next_handle: AtomicU64,
+        target_exe_lower: String,
+        target_add_calls: AtomicUsize,
+        first_add_gate: Arc<Gate>,
+        active_handles: Mutex<HashSet<u64>>,
+        added_for_target: AtomicUsize,
+        removed_total: AtomicUsize,
+    }
+
+    impl GatedWfpDefense {
+        fn new(target_exe: &str, first_add_gate: Arc<Gate>) -> Self {
+            Self {
+                next_handle: AtomicU64::new(9_000),
+                target_exe_lower: target_exe.to_ascii_lowercase(),
+                target_add_calls: AtomicUsize::new(0),
+                first_add_gate,
+                active_handles: Mutex::new(HashSet::new()),
+                added_for_target: AtomicUsize::new(0),
+                removed_total: AtomicUsize::new(0),
+            }
+        }
+
+        fn active_handles(&self) -> HashSet<u64> {
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    impl ActiveDefenseController for GatedWfpDefense {
+        fn suspend_process(
+            &self,
+            _target: &ProcessIdentity,
+            _include_children: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resume_process(&self, _target: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn terminate_process(
+            &self,
+            _target: &ProcessIdentity,
+            _include_children: bool,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn add_wfp_app_rule(
+            &self,
+            exe_path: &Path,
+            _remote_ip: Option<IpAddr>,
+            allow: bool,
+        ) -> Result<u64, String> {
+            let lower = exe_path.to_string_lossy().to_ascii_lowercase();
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            if !allow && lower == self.target_exe_lower {
+                self.added_for_target.fetch_add(1, Ordering::Relaxed);
+                let call_idx = self.target_add_calls.fetch_add(1, Ordering::AcqRel);
+                if call_idx == 0 {
+                    // Pause the first add_wfp_app_rule call (from seed_processes on its OS thread)
+                    // until ETW ProcessStart + ProcessStop have completed and removed their block.
+                    self.first_add_gate.wait_gate();
+                }
+            }
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(handle);
+            Ok(handle)
+        }
+
+        fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&filter_id);
+            self.removed_total.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let short_exe = r"C:\Users\Alice\Downloads\short_race.exe";
+    let normal_motw_exe = r"C:\Tools\race_motw_app.exe";
+    let short_motw_gate = Gate::new();
+    let normal_motw_gate = Gate::new();
+    let seed_wfp_add_gate = Gate::new();
+    let _release_all = ReleaseGatesOnDrop(vec![
+        Arc::clone(&short_motw_gate),
+        Arc::clone(&normal_motw_gate),
+        Arc::clone(&seed_wfp_add_gate),
+    ]);
+
+    let defense = Arc::new(GatedWfpDefense::new(
+        short_exe,
+        Arc::clone(&seed_wfp_add_gate),
+    ));
+    let motw_inspector = Arc::new(DualGatedMotwInspector {
+        short_exe_lower: short_exe.to_ascii_lowercase(),
+        short_gate: Arc::clone(&short_motw_gate),
+        normal_exe_lower: normal_motw_exe.to_ascii_lowercase(),
+        normal_gate: Arc::clone(&normal_motw_gate),
+        normal_zone: MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some("https://downloads.example.invalid/race_motw_app.exe".to_string()),
+            referrer_url: None,
+        },
+    });
+
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            motw_sync_wait_budget_ms: 5_000,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("e".repeat(64))),
+        Arc::new(MapLiveProcessInspector::new([])),
+        motw_inspector,
+    );
+
+    let sender = engine.sender();
+    let now_ms = current_unix_ms();
+    let pid1 = 8800u32;
+    let create1_100ns = 116_444_736_000_000_000u64 + ((now_ms - 1_000) as u64) * 10_000;
+    let ident1 = ProcessIdentity::new(pid1, create1_100ns);
+
+    // --- Part A: seed_processes add_wfp_app_rule pauses until after ETW ProcessStop cleanup ---
+    // 1. ETW ProcessStart registers pid1 in process_table (launch_guards_applied = false) and pauses at MOTW.
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident1,
+            parent_pid: 4,
+            exe_path: short_exe.to_string(),
+            command_line: "short_race.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send ETW ProcessStart for short_exe");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !short_motw_gate.is_entered() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ETW ProcessStart must enter MOTW gate for short_exe"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // 2. Concurrent startup snapshot (create_time_100ns == 0) merges into pid1 and enters add_wfp_app_rule.
+    let engine_for_seed = Arc::clone(&engine);
+    let seed_handle = std::thread::spawn(move || {
+        engine_for_seed.seed_processes(vec![SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(pid1, 0),
+            parent_pid: 4,
+            exe_path: short_exe.to_string(),
+            command_line: "short_race.exe".to_string(),
+            user_sid: None,
+        }])
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !seed_wfp_add_gate.is_entered() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "seed_processes must enter gated add_wfp_app_rule for short_exe"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // 3. Release ETW MOTW gate -> ETW worker finishes ProcessStart and installs handle #2.
+    short_motw_gate.release();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < 1
+        || !engine.has_active_wfp_filter(short_exe, None, false)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ETW ProcessStart must install preemptive WFP block for short_exe"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // 4. ETW ProcessStop exits pid1 and removes handle #2 while seed_processes is still paused.
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: pid1,
+            exit_time_100ns: create1_100ns + 500_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("send ETW ProcessStop for short_exe");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ETW ProcessStop must finish for short_exe"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !engine.has_active_wfp_filter(short_exe, None, false),
+        "ETW ProcessStop must remove handle #2 before seed_processes resumes"
+    );
+    assert!(
+        defense.active_handles().is_empty(),
+        "no BFE handle may remain active after ETW ProcessStop removed handle #2"
+    );
+
+    // 5. Resume seed_processes -> it must observe pid1 exited under `firewall -> process_table`
+    //    and remove handle #1 instead of leaving a residual block.
+    seed_wfp_add_gate.release();
+    let seeded = tokio::task::spawn_blocking(move || seed_handle.join())
+        .await
+        .expect("join spawn_blocking")
+        .expect("seed_processes thread panicked")
+        .expect("seed_processes returned error");
+    assert_eq!(seeded, 1);
+
+    assert!(
+        !engine.has_active_wfp_filter(short_exe, None, false),
+        "delayed seed_processes must not leave a residual preemptive WFP block after ProcessStop"
+    );
+    assert!(
+        defense.active_handles().is_empty(),
+        "delayed seed_processes must remove its obsolete BFE handle instead of leaking it"
+    );
+    assert_eq!(
+        defense.added_for_target.load(Ordering::Relaxed),
+        2,
+        "both seed_processes and ETW ProcessStart must have attempted add_wfp_app_rule"
+    );
+    assert_eq!(
+        defense.removed_total.load(Ordering::Relaxed),
+        2,
+        "both WFP handles (ETW + obsolete seed handle) must have been removed"
+    );
+
+    // --- Part B: active-only entry guard preserves L-18 MOTW when seed_processes runs first ---
+    let pid2 = 8801u32;
+    let create2_100ns = 116_444_736_000_000_000u64 + ((now_ms + 100) as u64) * 10_000;
+    let ident2 = ProcessIdentity::new(pid2, create2_100ns);
+
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident2,
+            parent_pid: 4,
+            exe_path: normal_motw_exe.to_string(),
+            command_line: "race_motw_app.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send ETW ProcessStart for normal_motw_exe");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !normal_motw_gate.is_entered() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ETW ProcessStart must enter MOTW gate for normal_motw_exe"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // seed_processes completes first without MOTW, marking launch_guards_applied = true.
+    let engine_for_seed2 = Arc::clone(&engine);
+    let seeded2 = tokio::task::spawn_blocking(move || {
+        engine_for_seed2.seed_processes(vec![SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(pid2, 0),
+            parent_pid: 4,
+            exe_path: normal_motw_exe.to_string(),
+            command_line: "race_motw_app.exe".to_string(),
+            user_sid: None,
+        }])
+    })
+    .await
+    .expect("join seed2")
+    .expect("seed_processes for normal_motw_exe");
+    assert_eq!(seeded2, 1);
+
+    {
+        let table = engine
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = table
+            .get_by_instance_id(&ident2.instance_id())
+            .expect("normal_motw_exe entry present");
+        assert!(
+            entry.launch_guards_applied,
+            "seed_processes must mark launch_guards_applied = true"
+        );
+    }
+    assert!(
+        !engine.has_active_wfp_filter(normal_motw_exe, None, false),
+        "normal-folder binary must not be blocked before MOTW resolves"
+    );
+
+    // Release MOTW gate -> ETW ProcessStart must still apply L-18 preemptive WFP block despite
+    // launch_guards_applied already being true.
+    let hp_before_motw_release = engine.high_priority_processed.load(Ordering::Relaxed);
+    normal_motw_gate.release();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < hp_before_motw_release + 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ETW ProcessStart must finish after MOTW release for normal_motw_exe"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        engine.has_active_wfp_filter(normal_motw_exe, None, false),
+        "active-only entry guard must preserve L-18 MOTW preemptive WFP block"
+    );
+
+    // ProcessStop must clean up the MOTW preemptive block cleanly.
+    let hp_before_stop2 = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: pid2,
+            exit_time_100ns: create2_100ns + 500_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("send ProcessStop for normal_motw_exe");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < hp_before_stop2 + 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ETW ProcessStop must finish for normal_motw_exe"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !engine.has_active_wfp_filter(normal_motw_exe, None, false),
+        "ProcessStop must clean up L-18 MOTW preemptive WFP block"
+    );
+    assert!(
+        defense.active_handles().is_empty(),
+        "all BFE handles must be cleaned up after both processes exit"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+}

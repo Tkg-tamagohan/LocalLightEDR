@@ -774,13 +774,15 @@ impl DaemonEngine {
                     }
                     if let Some(ref exe) = exe_path {
                         let target_key = WfpRuleManager::exe_key(exe);
+                        // Lock order: `firewall` -> `process_table` (unified with `wfp_premat.rs`
+                        // and `events.rs`).
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                         let still_active = self
                             .process_table
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .has_active_exe_key(&target_key);
                         if !still_active {
-                            let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                             fw.remove_preemptive_block_if_unused(exe, &*self.defense);
                         }
                     }

@@ -546,25 +546,64 @@ impl DaemonEngine {
             return;
         }
 
-        // Bug #2: Do not re-apply an app-wide automatic Preemptive WFP block while another running
-        // sibling instance holds an active AllowOnce grant.
-        if self
-            .firewall
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .has_once_allowed_for_exe(&exe_key)
+        let has_static_risk = matches!(
+            risk,
+            OutboundRiskClass::HighRiskPath | OutboundRiskClass::ScriptInterpreter
+        );
+        let is_preemptive_still_needed = |fw: &WfpRuleManager| -> bool {
+            if fw.is_startup_preemptive(trimmed) {
+                return true;
+            }
+            let table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if has_static_risk {
+                table.has_active_exe_key(&exe_key)
+            } else {
+                table.has_active_motw_for_exe_key(&exe_key)
+            }
+        };
+
+        // Bug #2 & PRRT_kwDOVyjVyM66jl1W: Do not re-apply an app-wide automatic Preemptive WFP
+        // block while another running sibling instance holds an active AllowOnce grant, and avoid
+        // installing a fresh BFE handle when no qualifying active process remains (unless
+        // startup-pinned). Lock order: `firewall` -> `process_table`.
         {
-            tracing::debug!(
-                exe_path = %trimmed,
-                "deferring automatic pre-emptive WFP block while sibling instance holds AllowOnce"
-            );
-            return;
+            let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+            if fw.has_any_app_filter(trimmed) || fw.has_once_allowed_for_exe(&exe_key) {
+                tracing::debug!(
+                    exe_path = %trimmed,
+                    "deferring automatic pre-emptive WFP block while existing filter or AllowOnce is active"
+                );
+                return;
+            }
+            if !is_preemptive_still_needed(&fw) {
+                tracing::debug!(
+                    exe_path = %trimmed,
+                    "skipping automatic pre-emptive WFP block because no qualifying active instance remains"
+                );
+                return;
+            }
         }
 
         match self.defense.add_wfp_app_rule(Path::new(trimmed), None, false) {
             Ok(handle) => {
+                // Re-verify process liveness atomically under `firewall` -> `process_table` before
+                // committing `handle` so a concurrent `ProcessStop` cleanup cannot leave an
+                // orphaned preemptive block for an already-exited executable.
                 let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                if fw.register_preemptive_block(trimmed, handle, &*self.defense) {
+                if !is_preemptive_still_needed(&fw) {
+                    drop(fw);
+                    if let Err(err) = self.defense.remove_wfp_rule(handle) {
+                        tracing::warn!(
+                            exe_path = %trimmed,
+                            wfp_handle = handle,
+                            error = %err,
+                            "failed removing obsolete pre-emptive WFP handle after concurrent process exit"
+                        );
+                    }
+                } else if fw.register_preemptive_block(trimmed, handle, &*self.defense) {
                     tracing::info!(
                         exe_path = %trimmed,
                         risk = ?risk,

@@ -467,45 +467,60 @@ impl DaemonEngine {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove_process(inst_id);
-                    let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                    let was_once_allowed = fw.on_process_stop(inst_id);
-                    if self.config.outbound_firewall_enabled {
-                        if let Some(ref exe_path) = proc_ctx.proc_exe_path {
-                            let exe_k = WfpRuleManager::exe_key(exe_path);
-                            let is_startup_pinned = fw.is_startup_preemptive(exe_path);
-                            let is_preemptive = fw
-                                .active_app_block(exe_path)
-                                .is_some_and(|(_, origin)| origin == WfpFilterOrigin::Preemptive);
-                            let has_any_filter = fw.has_any_app_filter(exe_path);
-                            let has_other_once_allowed = fw.has_once_allowed_for_exe(&exe_k);
-                            drop(fw);
+                    // Lock order: `firewall` -> `process_table` (unified with `wfp_premat.rs`
+                    // and `alerts.rs`) so preemptive removal and concurrent launch-guard commits
+                    // serialize atomically without TOCTOU leaks.
+                    let restore_preemptive_exe: Option<String> = {
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        let was_once_allowed = fw.on_process_stop(inst_id);
+                        if self.config.outbound_firewall_enabled {
+                            if let Some(ref exe_path) = proc_ctx.proc_exe_path {
+                                let exe_k = WfpRuleManager::exe_key(exe_path);
+                                let is_startup_pinned = fw.is_startup_preemptive(exe_path);
+                                let is_preemptive = fw
+                                    .active_app_block(exe_path)
+                                    .is_some_and(|(_, origin)| {
+                                        origin == WfpFilterOrigin::Preemptive
+                                    });
+                                let has_any_filter = fw.has_any_app_filter(exe_path);
+                                let has_other_once_allowed = fw.has_once_allowed_for_exe(&exe_k);
 
-                            if is_preemptive && !is_startup_pinned {
-                                let still_active = self
-                                    .process_table
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .has_active_exe_key(&exe_k);
-                                if !still_active {
-                                    let mut fw =
-                                        self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                                    fw.remove_preemptive_block_if_unused(exe_path, &*self.defense);
-                                }
-                            } else if was_once_allowed
-                                && !has_any_filter
-                                && !has_other_once_allowed
-                            {
-                                let should_restore = is_startup_pinned
-                                    || self
+                                if is_preemptive && !is_startup_pinned {
+                                    let still_active = self
                                         .process_table
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner())
                                         .has_active_exe_key(&exe_k);
-                                if should_restore {
-                                    self.maybe_apply_preemptive_wfp_block(exe_path);
+                                    if !still_active {
+                                        fw.remove_preemptive_block_if_unused(
+                                            exe_path,
+                                            &*self.defense,
+                                        );
+                                    }
+                                    None
+                                } else if was_once_allowed
+                                    && !has_any_filter
+                                    && !has_other_once_allowed
+                                {
+                                    let should_restore = is_startup_pinned
+                                        || self
+                                            .process_table
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .has_active_exe_key(&exe_k);
+                                    should_restore.then(|| exe_path.clone())
+                                } else {
+                                    None
                                 }
+                            } else {
+                                None
                             }
+                        } else {
+                            None
                         }
+                    };
+                    if let Some(ref exe_path) = restore_preemptive_exe {
+                        self.maybe_apply_preemptive_wfp_block(exe_path);
                     }
                 }
                 "OBSERVED"
@@ -825,6 +840,21 @@ impl DaemonEngine {
         effective_exe: &str,
         has_motw: bool,
     ) {
+        // Active-only entry guard: skip already-exited (or evicted) instances so a delayed
+        // startup snapshot or async MOTW path cannot clobber `outbound_classifier` or arm WFP
+        // for a dead process. Intentionally does NOT gate on `launch_guards_applied` so
+        // `upgraded_exe` (`PRG-001`) and delayed `L-18` MOTW promotion still apply.
+        if let Some(inst_id) = instance_id {
+            let is_active = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_by_instance_id(inst_id)
+                .is_some_and(|e| e.exited_at_ms.is_none());
+            if !is_active {
+                return;
+            }
+        }
         let is_self = self.is_self_process(pid, effective_exe);
         if is_self || classify_outbound_risk(effective_exe) == OutboundRiskClass::ProtectedOs {
             self.outbound_classifier.mark_protected_os(pid);

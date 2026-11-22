@@ -307,6 +307,42 @@ pub(super) fn build_strict_pipe_security_descriptor(
     }
 }
 
+/// Returns the canonical SDDL trustee string (either a numeric SID or a Windows well-known
+/// SDDL alias such as `LA` for local built-in Administrator RID `-500` or `LS` for `S-1-5-19`)
+/// emitted by `ConvertSecurityDescriptorToStringSecurityDescriptorW` for `user_sid`.
+pub fn canonical_sddl_trustee_for_sid(user_sid: &str) -> std::io::Result<String> {
+    let sid = user_sid.trim();
+    if !is_valid_numeric_sid(sid) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid Windows SID for SDDL trustee lookup: {user_sid:?}"),
+        ));
+    }
+    let probe = PipeSecurityDescriptor::from_sddl(&format!("D:P(A;;0x12019B;;;{sid})"))?;
+    let roundtrip = probe.to_sddl_string()?;
+    let ace = roundtrip
+        .split('(')
+        .nth(1)
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unexpected single-ACE SDDL roundtrip: {roundtrip}"),
+            )
+        })?;
+    let trustee = ace
+        .split(';')
+        .nth(5)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("missing trustee in SDDL roundtrip ACE: {ace}"),
+            )
+        })?;
+    Ok(trustee.to_string())
+}
+
 /// Reads the live DACL of a Windows kernel object handle (such as a Named Pipe opened with
 /// `READ_CONTROL`) and formats it as an SDDL string.
 pub fn read_kernel_object_dacl_sddl(handle: BorrowedHandle<'_>) -> std::io::Result<String> {
@@ -332,8 +368,14 @@ pub fn read_kernel_object_dacl_sddl(handle: BorrowedHandle<'_>) -> std::io::Resu
             &mut raw_sd,
         )
     };
-    if status != 0 || raw_sd.is_null() {
+    if status != 0 {
         return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    if raw_sd.is_null() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "GetSecurityInfo succeeded but returned a null security descriptor",
+        ));
     }
     let _guard = LocalVoidGuard(raw_sd);
     security_descriptor_to_sddl(raw_sd)
@@ -416,7 +458,21 @@ mod tests {
         );
         assert_eq!(mask & 0x0012_019B, 0x0012_019B);
 
-        // Live process user SID path
+        // Well-known SID canonicalization: Windows serializes SIDs like S-1-5-19 (`LS`) and the
+        // local machine's built-in Administrator RID `-500` (`LA`, e.g., GitHub Actions runneradmin)
+        // using 2-letter SDDL aliases. Verify both canonicalization and ACE rights.
+        let local_service_trustee =
+            canonical_sddl_trustee_for_sid("S-1-5-19").expect("canonicalize S-1-5-19");
+        assert_eq!(local_service_trustee, "LS");
+        let ls_sd = build_dev_bypass_pipe_security_descriptor_for_sid("S-1-5-19")
+            .expect("build dev-bypass SD for S-1-5-19");
+        let ls_sddl = ls_sd.to_sddl_string().expect("roundtrip S-1-5-19 SDDL");
+        assert!(!ls_sddl.contains(";;;IU)"));
+        let ls_mask = parse_ace_hex_mask(&ls_sddl, &local_service_trustee);
+        assert_eq!(ls_mask & 0x0004, 0);
+        assert_eq!(ls_mask & 0x0012_019B, 0x0012_019B);
+
+        // Live process user SID path (handles both numeric SIDs and well-known aliases like `LA`).
         let current_sid = current_process_user_sid().expect("query current process user SID");
         assert!(
             is_valid_numeric_sid(&current_sid),
@@ -432,9 +488,40 @@ mod tests {
         assert!(live_sddl.contains("(A;;GA;;;SY)"));
         assert!(live_sddl.contains("(A;;GA;;;BA)"));
         if !current_sid.eq_ignore_ascii_case(LOCAL_SYSTEM_SID) {
-            let live_mask = parse_ace_hex_mask(&live_sddl, &current_sid);
+            let expected_trustee = canonical_sddl_trustee_for_sid(&current_sid)
+                .expect("canonicalize current process user SID");
+            assert_ne!(
+                expected_trustee, "IU",
+                "current process SID must never map to Interactive Users"
+            );
+            assert_eq!(
+                live_sddl.matches('(').count(),
+                3,
+                "live dev-bypass DACL must contain exactly 3 ACEs (SY, BA, current user): {live_sddl}"
+            );
+            let live_mask = parse_ace_hex_mask(&live_sddl, &expected_trustee);
             assert_eq!(live_mask & 0x0004, 0);
             assert_eq!(live_mask & 0x0012_019B, 0x0012_019B);
+        }
+
+        // Explicitly exercise the local machine's built-in Administrator SID (`...-500` -> `LA`)
+        // when running under a standard S-1-5-21-* account so CI `runneradmin` canonicalization
+        // is verified on developer workstations too.
+        let parts: Vec<&str> = current_sid.split('-').collect();
+        if parts.len() == 8 && parts[0] == "S" && parts[1] == "1" && parts[2] == "5" && parts[3] == "21" {
+            let local_admin_sid = format!(
+                "S-1-5-21-{}-{}-{}-500",
+                parts[4], parts[5], parts[6]
+            );
+            let la_trustee = canonical_sddl_trustee_for_sid(&local_admin_sid)
+                .expect("canonicalize local built-in admin SID");
+            let la_sd = build_dev_bypass_pipe_security_descriptor_for_sid(&local_admin_sid)
+                .expect("build dev-bypass SD for local built-in admin SID");
+            let la_sddl = la_sd.to_sddl_string().expect("roundtrip local admin SDDL");
+            assert!(!la_sddl.contains(";;;IU)"));
+            let la_mask = parse_ace_hex_mask(&la_sddl, &la_trustee);
+            assert_eq!(la_mask & 0x0004, 0);
+            assert_eq!(la_mask & 0x0012_019B, 0x0012_019B);
         }
     }
 

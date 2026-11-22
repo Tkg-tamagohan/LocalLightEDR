@@ -12,10 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledr_daemon::{
-    build_service_pipe_security_descriptor, current_process_user_sid, read_kernel_object_dacl_sddl,
-    start_ipc_server, verify_authorized_caller_binary, verify_caller_identity, BinaryInspector,
-    DaemonConfig, DaemonEngine, NotificationDispatcher, Session0ToastLauncher,
-    WindowsBinaryInspector, SERVICE_PIPE_SDDL,
+    build_service_pipe_security_descriptor, canonical_sddl_trustee_for_sid,
+    current_process_user_sid, read_kernel_object_dacl_sddl, start_ipc_server,
+    verify_authorized_caller_binary, verify_caller_identity, BinaryInspector, DaemonConfig,
+    DaemonEngine, NotificationDispatcher, Session0ToastLauncher, WindowsBinaryInspector,
+    SERVICE_PIPE_SDDL,
 };
 use ledr_proto::{
     read_ipc_frame, write_ipc_frame, ActiveDefenseController, AlertDecision, AlertRecord,
@@ -1380,13 +1381,24 @@ async fn ipc_dacl_01_dev_bypass_with_strict_pipe_dacl_allows_client_roundtrip() 
             "{label} dev-bypass pipe DACL must retain SY/BA full control: {live_sddl}"
         );
         if !current_sid.eq_ignore_ascii_case("S-1-5-18") {
-            let expected_suffix = format!(";;;{current_sid})");
+            let expected_trustee = canonical_sddl_trustee_for_sid(&current_sid)
+                .expect("canonicalize current process user SID");
+            assert_ne!(
+                expected_trustee, "IU",
+                "{label} dev-bypass pipe DACL must never map current user to IU"
+            );
+            assert_eq!(
+                live_sddl.matches('(').count(),
+                3,
+                "{label} dev-bypass pipe DACL must have exactly 3 ACEs (SY, BA, current user): {live_sddl}"
+            );
+            let expected_suffix = format!(";;;{expected_trustee})");
             let user_ace = live_sddl
                 .split('(')
                 .find(|ace| ace.contains(&expected_suffix))
                 .unwrap_or_else(|| {
                     panic!(
-                        "{label} dev-bypass pipe DACL missing current user SID {current_sid}: {live_sddl}"
+                        "{label} dev-bypass pipe DACL missing current user trustee {expected_trustee} (SID {current_sid}): {live_sddl}"
                     )
                 });
             let rights = user_ace.split(';').nth(2).expect("user ACE rights");

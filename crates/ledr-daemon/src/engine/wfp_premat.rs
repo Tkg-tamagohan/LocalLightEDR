@@ -573,7 +573,8 @@ impl DaemonEngine {
             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
             if fw.has_any_app_filter(trimmed) || fw.has_once_allowed_for_exe(&exe_key) {
                 if !fw.has_once_allowed_for_exe(&exe_key)
-                    && fw.has_pending_preemptive_removal(trimmed)
+                    && (fw.has_pending_preemptive_removal(trimmed)
+                        || fw.has_deferred_preemptive_removal(trimmed))
                     && is_preemptive_still_needed(&fw)
                 {
                     fw.clear_pending_preemptive_removal(trimmed);

@@ -147,7 +147,17 @@ impl DaemonEngine {
             // never consume the 3-second shutdown flush budget.
             if !self.nrd_cancel.is_cancelled() && tokio::time::Instant::now() >= next_expiry_at {
                 sync_telemetry_streak = 0;
-                self.run_periodic_expiry_and_sweep();
+                let removed = self.run_periodic_expiry_and_sweep();
+                #[cfg(test)]
+                {
+                    self.tier2c_periodic_sweeps.fetch_add(1, Ordering::Release);
+                    if removed > 0 {
+                        self.tier2c_periodic_sweep_removals
+                            .fetch_add(removed as u64, Ordering::Release);
+                    }
+                }
+                #[cfg(not(test))]
+                let _ = removed;
                 next_expiry_at = tokio::time::Instant::now() + expiry_interval;
                 continue;
             }
@@ -244,7 +254,18 @@ impl DaemonEngine {
                     }
                 }
                 _ = &mut next_expiry_sleep, if !self.nrd_cancel.is_cancelled() => {
-                    self.run_periodic_expiry_and_sweep();
+                    let removed = self.run_periodic_expiry_and_sweep();
+                    #[cfg(test)]
+                    {
+                        self.select_idle_periodic_sweeps
+                            .fetch_add(1, Ordering::Release);
+                        if removed > 0 {
+                            self.select_idle_periodic_sweep_removals
+                                .fetch_add(removed as u64, Ordering::Release);
+                        }
+                    }
+                    #[cfg(not(test))]
+                    let _ = removed;
                     next_expiry_at = tokio::time::Instant::now() + expiry_interval;
                 }
                 _ = purge_ticker.tick() => {
@@ -402,10 +423,10 @@ impl DaemonEngine {
         }
     }
 
-    fn run_periodic_expiry_and_sweep(&self) {
+    fn run_periodic_expiry_and_sweep(&self) -> usize {
         if let Err(err) = self.expire_overdue_alerts(current_unix_ms()) {
             tracing::warn!(error = %err, "periodic alert expiry transition failed");
         }
-        self.sweep_unused_preemptive_wfp_blocks();
+        self.sweep_unused_preemptive_wfp_blocks()
     }
 }

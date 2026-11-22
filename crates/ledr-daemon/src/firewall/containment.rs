@@ -27,6 +27,7 @@ impl WfpRuleManager {
             if !self.has_once_allowed_for_exe(&key.0) {
                 if let Some(existing) = self.installed.get(&key) {
                     self.pending_preemptive_removals.remove(&existing.handle);
+                    self.deferred_preemptive_removals.remove(&existing.handle);
                 }
             }
             if let Err(err) = defense.remove_wfp_rule(handle) {
@@ -129,8 +130,14 @@ impl WfpRuleManager {
             }
             if bind_existing {
                 let existing_handle = existing.handle;
-                self.bound_alerts.insert(alert_id.to_string(), key);
-                self.pending_preemptive_removals.remove(&existing_handle);
+                let existing_is_preemptive = existing.origin == WfpFilterOrigin::Preemptive;
+                self.bound_alerts.insert(alert_id.to_string(), key.clone());
+                if self.pending_preemptive_removals.remove(&existing_handle).is_some()
+                    && existing_is_preemptive
+                    && !self.startup_preemptive_exes.contains_key(&key.0)
+                {
+                    self.deferred_preemptive_removals.insert(existing_handle);
+                }
             }
             return None;
         }
@@ -151,16 +158,21 @@ impl WfpRuleManager {
     /// `TransientContainment`) so sibling alerts keep the block active until all resolve.
     pub fn bind_alert_to_app_block(&mut self, alert_id: &str, exe_path: &str) -> bool {
         let key = Self::target_key(exe_path, None);
-        if let Some(existing_handle) = self.installed.get(&key).and_then(|e| {
+        if let Some((existing_handle, existing_is_preemptive)) = self.installed.get(&key).and_then(|e| {
             (!e.allow
                 && matches!(
                     e.origin,
                     WfpFilterOrigin::TransientContainment | WfpFilterOrigin::Preemptive
                 ))
-            .then_some(e.handle)
+            .then_some((e.handle, e.origin == WfpFilterOrigin::Preemptive))
         }) {
-            self.bound_alerts.insert(alert_id.to_string(), key);
-            self.pending_preemptive_removals.remove(&existing_handle);
+            self.bound_alerts.insert(alert_id.to_string(), key.clone());
+            if self.pending_preemptive_removals.remove(&existing_handle).is_some()
+                && existing_is_preemptive
+                && !self.startup_preemptive_exes.contains_key(&key.0)
+            {
+                self.deferred_preemptive_removals.insert(existing_handle);
+            }
             true
         } else {
             false
@@ -227,6 +239,7 @@ impl WfpRuleManager {
                 existing.origin = WfpFilterOrigin::PersistedPolicy;
                 self.bound_alerts.retain(|_, k| k != &key);
                 self.pending_preemptive_removals.remove(&existing_handle);
+                self.deferred_preemptive_removals.remove(&existing_handle);
                 return Ok(existing_handle);
             }
             // Replace conflicting Permit with Block (deny-overrides-allow).
@@ -234,6 +247,7 @@ impl WfpRuleManager {
             defense.remove_wfp_rule(old_handle)?;
             self.installed.remove(&key);
             self.pending_preemptive_removals.remove(&old_handle);
+            self.deferred_preemptive_removals.remove(&old_handle);
         }
 
         let handle = defense.add_wfp_app_rule(Path::new(exe_path), canon_ip, false)?;
@@ -332,6 +346,7 @@ impl WfpRuleManager {
 
         self.installed.remove(&key);
         self.pending_preemptive_removals.remove(&entry.handle);
+        self.deferred_preemptive_removals.remove(&entry.handle);
         Ok((
             Some(RemovedBlockSnapshot {
                 key,
@@ -466,6 +481,7 @@ impl WfpRuleManager {
         }
         self.installed.remove(&key);
         self.pending_preemptive_removals.remove(&entry.handle);
+        self.deferred_preemptive_removals.remove(&entry.handle);
         Ok((
             Some(RemovedBlockSnapshot {
                 key,

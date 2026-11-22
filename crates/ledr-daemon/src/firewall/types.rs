@@ -68,12 +68,15 @@ pub struct WfpFailedOp {
 }
 
 /// Snapshot of a filter origin promoted/demoted during reconciliation (plus any alert containment
-/// bindings cleared on promotion) so SQLite rollback can restore the exact pre-reconcile state.
+/// bindings and pending/deferred preemptive removal states cleared on promotion) so SQLite
+/// rollback can restore the exact pre-reconcile state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromotedFilterSnapshot {
     pub key: WfpTargetKey,
     pub prev_origin: WfpFilterOrigin,
     pub bound_alert_ids: Vec<String>,
+    pub prev_pending_removal_failures: Option<u64>,
+    pub prev_deferred_preemptive_removal: bool,
 }
 
 /// Snapshot of a [`WfpFilterOrigin::DomainPolicy`] filter removed during reconciliation so

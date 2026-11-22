@@ -6581,8 +6581,10 @@ async fn try_has_active_wfp_filter_times_out_when_firewall_lock_is_held() {
     );
 
     let locked = Arc::new(AtomicBool::new(false));
+    let timed_out_by_holder = Arc::new(AtomicBool::new(false));
     let release_pair = Arc::new((Mutex::new(false), Condvar::new()));
     let locked_bg = Arc::clone(&locked);
+    let timed_out_bg = Arc::clone(&timed_out_by_holder);
     let release_bg = Arc::clone(&release_pair);
     let engine_bg = Arc::clone(&engine);
 
@@ -6596,12 +6598,30 @@ async fn try_has_active_wfp_filter_times_out_when_firewall_lock_is_held() {
     }
     let _release_guard = ReleaseOnDrop(Arc::clone(&release_pair));
 
+    // Independent safety deadline (`PRRT_kwDOVyjVyM66kfFO`): even if `try_has_active_wfp_filter`
+    // ever regressed to an unbounded blocking `lock()`, `holder` self-releases after 5 seconds so
+    // the probe unblocks and fails the `expect_err` assertion instead of deadlocking the test.
     let holder = std::thread::spawn(move || {
         let _fw_guard = engine_bg.firewall.lock().unwrap_or_else(|e| e.into_inner());
         locked_bg.store(true, Ordering::Release);
+        let safety_deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut released = release_bg.0.lock().unwrap_or_else(|e| e.into_inner());
         while !*released {
-            released = release_bg.1.wait(released).unwrap_or_else(|e| e.into_inner());
+            let Some(remaining) =
+                safety_deadline.checked_duration_since(std::time::Instant::now())
+            else {
+                timed_out_bg.store(true, Ordering::Release);
+                break;
+            };
+            let (guard, wait_res) = release_bg
+                .1
+                .wait_timeout(released, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            released = guard;
+            if wait_res.timed_out() && !*released {
+                timed_out_bg.store(true, Ordering::Release);
+                break;
+            }
         }
     });
 
@@ -6623,6 +6643,10 @@ async fn try_has_active_wfp_filter_times_out_when_firewall_lock_is_held() {
     assert!(
         err.contains("timed out"),
         "expected timeout diagnostic, got: {err}"
+    );
+    assert!(
+        !timed_out_by_holder.load(Ordering::Acquire),
+        "probe must time out on its own bounded deadline well before holder's safety deadline"
     );
 
     drop(_release_guard);
@@ -6903,8 +6927,9 @@ async fn daemon_p4_cmd_10_sweep_runs_under_telemetry_backlog_and_preserves_evict
 
     let flood_sender = sender.clone();
     let flood_flag = Arc::clone(&stop_flood);
+    let telemetry_at_flood_start = engine.telemetry_processed.load(Ordering::Acquire);
     // Pre-fill telemetry ring before starting background flooder so Tier 3 is already non-empty.
-    for i in 0..4_000u16 {
+    for i in 0..6_000u16 {
         let _ = flood_sender.send_telemetry(SensorEvent::NetworkConnect {
             pid: 99_999,
             protocol: 6,
@@ -6917,8 +6942,8 @@ async fn daemon_p4_cmd_10_sweep_runs_under_telemetry_backlog_and_preserves_evict
     let flood_thread = std::thread::spawn(move || {
         let mut seq = 0u16;
         while !flood_flag.load(Ordering::Acquire) {
-            if flood_sender.telemetry_depth() < 4_000 {
-                for _ in 0..128 {
+            if flood_sender.telemetry_depth() < 6_000 {
+                for _ in 0..256 {
                     seq = seq.wrapping_add(1);
                     if flood_sender
                         .send_telemetry(SensorEvent::NetworkConnect {
@@ -6940,8 +6965,21 @@ async fn daemon_p4_cmd_10_sweep_runs_under_telemetry_backlog_and_preserves_evict
         }
     });
 
+    // Wait until the pipeline worker has woken up and is actively consuming Tier 3 telemetry
+    // before enabling BFE recovery so we snapshot the idle `select!` sweep baseline cleanly.
+    let wake_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while engine.telemetry_processed.load(Ordering::Acquire) <= telemetry_at_flood_start {
+        assert!(
+            tokio::time::Instant::now() < wake_deadline,
+            "worker must start consuming flooded telemetry"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
     // Recover BFE under active telemetry flood.
-    let telemetry_before_recovery = engine.telemetry_processed.load(Ordering::Relaxed);
+    let telemetry_before_recovery = engine.telemetry_processed.load(Ordering::Acquire);
+    let tier2c_sweeps_before = engine.tier2c_periodic_sweeps.load(Ordering::Acquire);
+    let select_idle_sweeps_before = engine.select_idle_periodic_sweeps.load(Ordering::Acquire);
     defense.fail_removes.store(false, Ordering::Release);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -6956,12 +6994,34 @@ async fn daemon_p4_cmd_10_sweep_runs_under_telemetry_backlog_and_preserves_evict
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // Confirm telemetry was actively flowing AND still backlogged at the exact instant the sweep
-    // removed `backlog_sweep_exe` (proving Tier 2c executed before telemetry drained).
-    let telemetry_at_sweep = engine.telemetry_processed.load(Ordering::Relaxed);
+    // Directly observe which pipeline branch executed the removal (`PRRT_kwDOVyjVyM66kfEX`):
+    // proves removal happened strictly inside Tier 2c (pre-telemetry overdue branch) rather than
+    // falling through into the idle `tokio::select!` expiry arm.
+    let telemetry_at_sweep = engine.telemetry_processed.load(Ordering::Acquire);
     assert!(
         telemetry_at_sweep > telemetry_before_recovery,
         "telemetry lane must have been actively processing events during the sweep"
+    );
+    assert_eq!(
+        engine.tier2c_periodic_sweep_removals.load(Ordering::Acquire),
+        1,
+        "removal of backlog_sweep_exe must be executed by the Tier 2c pre-telemetry branch"
+    );
+    assert_eq!(
+        engine
+            .select_idle_periodic_sweep_removals
+            .load(Ordering::Acquire),
+        0,
+        "idle select! expiry branch must NOT have executed the removal"
+    );
+    assert!(
+        engine.tier2c_periodic_sweeps.load(Ordering::Acquire) > tier2c_sweeps_before,
+        "Tier 2c periodic sweep counter must have advanced during telemetry backlog"
+    );
+    assert_eq!(
+        engine.select_idle_periodic_sweeps.load(Ordering::Acquire),
+        select_idle_sweeps_before,
+        "pipeline must not have fallen into the idle select! expiry branch while telemetry was flooded"
     );
     assert!(
         defense
@@ -6997,6 +7057,672 @@ async fn daemon_p4_cmd_10_sweep_runs_under_telemetry_backlog_and_preserves_evict
         1,
         "only backlog_sweep_exe's pending-removal handle must have been removed"
     );
+
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+}
+
+/// Regression test `WFP-DEFERRED-02` (`PRRT_kwDOVyjVyM66kfDX`):
+/// verifies that when `ProcessStop` arrives BEFORE a sibling `LAYER_3_NETWORK` alert is
+/// auto-resolved by `resolve_sibling_alerts_as_terminated`, releasing the last bound alert
+/// immediately removes the deferred `Preemptive` WFP block (or queues it into
+/// `pending_preemptive_removals` for periodic sweep retry when BFE fails removal), while NEVER
+/// stripping a live sibling's `Preemptive` block based solely on `ActiveProcessTable` eviction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sibling_alert_auto_resolve_after_process_stop_removes_deferred_preemptive_block_and_respects_live_eviction()
+{
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use crate::firewall::{WfpFilterOrigin, WfpRuleManager};
+    use crate::process_table::ActiveProcessTable;
+
+    struct ToggleRemoveDefense {
+        next_handle: AtomicU64,
+        fail_removes: AtomicBool,
+        active_handles: Mutex<HashSet<u64>>,
+    }
+
+    impl ToggleRemoveDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(9300),
+                fail_removes: AtomicBool::new(false),
+                active_handles: Mutex::new(HashSet::new()),
+            }
+        }
+        fn active_handles(&self) -> HashSet<u64> {
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    impl ActiveDefenseController for ToggleRemoveDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(
+            &self,
+            _exe_path: &Path,
+            _remote_ip: Option<IpAddr>,
+            _allow: bool,
+        ) -> Result<u64, String> {
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(handle);
+            Ok(handle)
+        }
+        fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+            if self.fail_removes.load(Ordering::Acquire) {
+                return Err(format!("transient BFE error removing {filter_id}"));
+            }
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&filter_id);
+            Ok(())
+        }
+    }
+
+    let defense = Arc::new(ToggleRemoveDefense::new());
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    // alert_timeout_ms = 200 -> expiry_interval = 50 ms for fast periodic sweep verification.
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            alert_timeout_ms: 200,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("b".repeat(64))),
+        Arc::new(MapLiveProcessInspector::new([])),
+    );
+    let sender = engine.sender();
+    let now_ms = current_unix_ms();
+    let base_100ns = 116_444_736_000_000_000u64 + ((now_ms - 5_000) as u64) * 10_000;
+
+    let wait_hp = |target: u64| {
+        let eng = Arc::clone(&engine);
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while eng.high_priority_processed.load(Ordering::Relaxed) < target {
+                assert!(tokio::time::Instant::now() < deadline, "wait_hp({target})");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+
+    // --- Sub-case A: ProcessStop arrives BEFORE sibling alert auto-resolve -> immediate removal ---
+    let exe_a = r"C:\Users\Alice\Downloads\sibling_stop_first_immediate.exe";
+    let id_a = ProcessIdentity::new(9310, base_100ns);
+    let inst_a = id_a.instance_id();
+
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: id_a,
+            parent_pid: 4,
+            exe_path: exe_a.to_string(),
+            command_line: "sibling_stop_first_immediate.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send start A");
+    wait_hp(hp + 1).await;
+    assert!(
+        try_has_active_wfp_filter(&engine, exe_a, None, false, Duration::from_secs(2))
+            .await
+            .expect("fw lock")
+    );
+
+    let mk_alert = |alert_id: &str,
+                    source_layer: &str,
+                    rule_id: &str,
+                    title: &str,
+                    proc_inst: &str,
+                    exe: &str| AlertRecord {
+        alert_id: alert_id.to_string(),
+        timestamp_ms: now_ms,
+        source_layer: source_layer.to_string(),
+        severity: AlertSeverity::High,
+        rule_id: rule_id.to_string(),
+        title: title.to_string(),
+        process_instance_id: Some(proc_inst.to_string()),
+        process_suspended: false,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({ "exe_path": exe }).to_string(),
+        resolved_at_ms: None,
+    };
+
+    // Record non-network Alert A1 (Sigma/Rule) and sibling network Alert A2 bound to Preemptive block.
+    let alert_a1 = mk_alert(
+        "ALT-SIB-A1",
+        "LAYER_1_PROCESS",
+        "SIGMA-TEST-A1",
+        "Test rule alert A1",
+        &inst_a,
+        exe_a,
+    );
+    let alert_a2 = mk_alert(
+        "ALT-SIB-A2",
+        "LAYER_3_NETWORK",
+        "WFP-PREEMPT-A2",
+        "Test network alert A2",
+        &inst_a,
+        exe_a,
+    );
+    engine.store.record_alert(&alert_a1).expect("record A1");
+    engine.store.record_alert(&alert_a2).expect("record A2");
+    {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.bind_alert_to_app_block(&alert_a2.alert_id, exe_a));
+    }
+
+    // ProcessStop arrives FIRST while Alert A2 is still unresolved & bound -> removal deferred.
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: id_a.pid,
+            exit_time_100ns: base_100ns + 10_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("send stop A");
+    wait_hp(hp + 1).await;
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            fw.has_active_filter(exe_a, None, false),
+            "bound alert A2 must keep Preemptive block active across ProcessStop"
+        );
+        assert!(
+            fw.has_deferred_preemptive_removal(exe_a),
+            "ProcessStop must record deferred removal while bound alert A2 blocks deletion"
+        );
+        assert!(
+            !fw.has_pending_preemptive_removal(exe_a),
+            "deferred removal must not populate pending_preemptive_removals while alert is open"
+        );
+    }
+
+    // User resolves non-network Alert A1 via TerminateAndBlock { add_block_rule: false }.
+    // `resolve_sibling_alerts_as_terminated` auto-resolves A2 and immediately removes the deferred block.
+    engine
+        .resolve_alert(
+            &alert_a1.alert_id,
+            ledr_proto::AlertDecision::TerminateAndBlock {
+                add_block_rule: false,
+            },
+        )
+        .expect("resolve A1");
+    assert_eq!(
+        engine
+            .store
+            .get_alert(&alert_a2.alert_id)
+            .expect("get A2")
+            .expect("A2 exists")
+            .status,
+        AlertStatus::TerminatedBlocked
+    );
+    assert!(
+        !try_has_active_wfp_filter(&engine, exe_a, None, false, Duration::from_secs(2))
+            .await
+            .expect("fw lock"),
+        "deferred Preemptive block must be removed immediately when sibling network alert A2 auto-resolves"
+    );
+    assert!(defense.active_handles().is_empty());
+
+    // --- Sub-case B: BFE fails during sibling auto-resolve -> queues into periodic sweep retry ---
+    let exe_b = r"C:\Users\Alice\Downloads\sibling_stop_first_bfe_retry.exe";
+    let id_b = ProcessIdentity::new(9311, base_100ns + 20_000);
+    let inst_b = id_b.instance_id();
+
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: id_b,
+            parent_pid: 4,
+            exe_path: exe_b.to_string(),
+            command_line: "sibling_stop_first_bfe_retry.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send start B");
+    wait_hp(hp + 1).await;
+
+    let alert_b1 = mk_alert(
+        "ALT-SIB-B1",
+        "LAYER_1_PROCESS",
+        "SIGMA-TEST-B1",
+        "Test rule alert B1",
+        &inst_b,
+        exe_b,
+    );
+    let alert_b2 = mk_alert(
+        "ALT-SIB-B2",
+        "LAYER_3_NETWORK",
+        "WFP-PREEMPT-B2",
+        "Test network alert B2",
+        &inst_b,
+        exe_b,
+    );
+    engine.store.record_alert(&alert_b1).expect("record B1");
+    engine.store.record_alert(&alert_b2).expect("record B2");
+    {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.bind_alert_to_app_block(&alert_b2.alert_id, exe_b));
+    }
+
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: id_b.pid,
+            exit_time_100ns: base_100ns + 30_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("send stop B");
+    wait_hp(hp + 1).await;
+
+    // Inject transient BFE failure before resolving B1 -> sibling auto-resolve must queue into
+    // `pending_preemptive_removals`, and periodic sweep must clean it up once BFE recovers.
+    defense.fail_removes.store(true, Ordering::Release);
+    engine
+        .resolve_alert(
+            &alert_b1.alert_id,
+            ledr_proto::AlertDecision::TerminateAndBlock {
+                add_block_rule: false,
+            },
+        )
+        .expect("resolve B1");
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.has_active_filter(exe_b, None, false));
+        assert!(
+            fw.has_pending_preemptive_removal(exe_b),
+            "BFE failure when releasing deferred Preemptive block must queue handle for periodic sweep"
+        );
+    }
+
+    defense.fail_removes.store(false, Ordering::Release);
+    let sweep_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while try_has_active_wfp_filter(&engine, exe_b, None, false, Duration::from_secs(2))
+        .await
+        .expect("fw lock")
+    {
+        assert!(
+            tokio::time::Instant::now() < sweep_deadline,
+            "periodic sweep must remove exe_b's queued Preemptive block once BFE recovers"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(defense.active_handles().is_empty());
+
+    // --- Sub-case C: Live sibling evicted from ActiveProcessTable must NOT lose its block ---
+    {
+        let mut table = engine
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *table = ActiveProcessTable::new(2);
+    }
+    let exe_c = r"C:\Users\Alice\Downloads\live_sibling_evicted.exe";
+    let pad1_c = r"C:\Program Files\BenignPad\pad1_c.exe";
+    let pad2_c = r"C:\Program Files\BenignPad\pad2_c.exe";
+    let id_c1 = ProcessIdentity::new(9320, base_100ns + 40_000);
+    let id_c2 = ProcessIdentity::new(9321, base_100ns + 50_000);
+    let inst_c2 = id_c2.instance_id();
+
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: id_c1,
+            parent_pid: 4,
+            exe_path: exe_c.to_string(),
+            command_line: "live_sibling_evicted.exe --worker-1".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start C1");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: id_c2,
+            parent_pid: 4,
+            exe_path: exe_c.to_string(),
+            command_line: "live_sibling_evicted.exe --worker-2".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start C2");
+    wait_hp(hp + 2).await;
+
+    let alert_c1 = mk_alert(
+        "ALT-SIB-C1",
+        "LAYER_1_PROCESS",
+        "SIGMA-TEST-C1",
+        "Test rule alert C1",
+        &inst_c2,
+        exe_c,
+    );
+    let alert_c2 = mk_alert(
+        "ALT-SIB-C2",
+        "LAYER_3_NETWORK",
+        "WFP-PREEMPT-C2",
+        "Test network alert C2",
+        &inst_c2,
+        exe_c,
+    );
+    engine.store.record_alert(&alert_c1).expect("record C1");
+    engine.store.record_alert(&alert_c2).expect("record C2");
+    {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.bind_alert_to_app_block(&alert_c2.alert_id, exe_c));
+    }
+
+    // C2 stops while live sibling C1 is STILL active -> ProcessStop must NOT mark deferred removal.
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: id_c2.pid,
+            exit_time_100ns: base_100ns + 60_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("stop C2");
+    wait_hp(hp + 1).await;
+
+    // Now evict live sibling C1 from ActiveProcessTable (cap=2) using two benign processes.
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(9322, base_100ns + 70_000),
+            parent_pid: 4,
+            exe_path: pad1_c.to_string(),
+            command_line: "pad1_c.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start pad1_c");
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(9323, base_100ns + 80_000),
+            parent_pid: 4,
+            exe_path: pad2_c.to_string(),
+            command_line: "pad2_c.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start pad2_c");
+    wait_hp(hp + 2).await;
+    {
+        let table = engine
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !table.has_active_exe_key(&WfpRuleManager::exe_key(exe_c)),
+            "capacity pressure must have evicted still-running C1 from ActiveProcessTable"
+        );
+    }
+
+    // Resolve C1 -> auto-resolves C2. Because ProcessStop never saw last-exit (C1 was active when
+    // C2 exited), C1's live Preemptive block MUST stay intact despite ActiveProcessTable eviction!
+    engine
+        .resolve_alert(
+            &alert_c1.alert_id,
+            ledr_proto::AlertDecision::TerminateAndBlock {
+                add_block_rule: false,
+            },
+        )
+        .expect("resolve C1");
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            fw.filter_origin(exe_c, None),
+            Some(&WfpFilterOrigin::Preemptive),
+            "evicted live sibling C1 must retain its Preemptive block after C2's sibling alert auto-resolves"
+        );
+        assert!(!fw.has_deferred_preemptive_removal(exe_c));
+        assert!(!fw.has_pending_preemptive_removal(exe_c));
+    }
+
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+}
+
+/// Regression test `WFP-ROLLBACK-02` (`PRRT_kwDOVyjVyM66kfDu`):
+/// verifies end-to-end `DaemonEngine::upsert_policy_rule` rollback when promoting a
+/// pending-removal `Preemptive` block to `PersistedPolicy` succeeds, while removing a conflicting
+/// `DomainPolicy` Permit filter in the same policy edit fails -> rollback must restore both the
+/// `Preemptive` origin AND its `pending_preemptive_removals` entry so periodic sweep cleans it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_upsert_rollback_restores_pending_preemptive_removal_for_periodic_sweep() {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use crate::engine::PolicyRuleError;
+    use crate::firewall::WfpFilterOrigin;
+
+    struct SelectiveFailRemoveDefense {
+        next_handle: AtomicU64,
+        fail_handles: Mutex<HashSet<u64>>,
+        active_handles: Mutex<HashSet<u64>>,
+    }
+
+    impl SelectiveFailRemoveDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(9400),
+                fail_handles: Mutex::new(HashSet::new()),
+                active_handles: Mutex::new(HashSet::new()),
+            }
+        }
+        fn set_fail_handle(&self, handle: u64, fail: bool) {
+            let mut set = self.fail_handles.lock().unwrap_or_else(|e| e.into_inner());
+            if fail {
+                set.insert(handle);
+            } else {
+                set.remove(&handle);
+            }
+        }
+    }
+
+    impl ActiveDefenseController for SelectiveFailRemoveDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(
+            &self,
+            _exe_path: &Path,
+            _remote_ip: Option<IpAddr>,
+            _allow: bool,
+        ) -> Result<u64, String> {
+            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(handle);
+            Ok(handle)
+        }
+        fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+            if self
+                .fail_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&filter_id)
+            {
+                return Err(format!("injected BFE remove failure for handle {filter_id}"));
+            }
+            self.active_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&filter_id);
+            Ok(())
+        }
+    }
+
+    let defense = Arc::new(SelectiveFailRemoveDefense::new());
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    // alert_timeout_ms = 200 -> expiry_interval = 50 ms.
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            alert_timeout_ms: 200,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("c".repeat(64))),
+        Arc::new(MapLiveProcessInspector::new([])),
+    );
+    let sender = engine.sender();
+    let now_ms = current_unix_ms();
+    let base_100ns = 116_444_736_000_000_000u64 + ((now_ms - 5_000) as u64) * 10_000;
+
+    let exe = r"C:\Users\Alice\Downloads\policy_rollback_sweep.exe";
+    let permit_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
+
+    // 1. Start and stop `exe` with remove failure on its Preemptive handle so it enters
+    //    `pending_preemptive_removals`.
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(9410, base_100ns),
+            parent_pid: 4,
+            exe_path: exe.to_string(),
+            command_line: "policy_rollback_sweep.exe".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("start exe");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < hp + 1 {
+        assert!(tokio::time::Instant::now() < deadline, "start exe");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let preempt_handle = {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        let (h, origin) = fw
+            .active_app_block(exe)
+            .expect("Preemptive block installed");
+        assert_eq!(origin, WfpFilterOrigin::Preemptive);
+        h
+    };
+    defense.set_fail_handle(preempt_handle, true);
+
+    let hp = engine.high_priority_processed.load(Ordering::Relaxed);
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid: 9410,
+            exit_time_100ns: base_100ns + 10_000,
+            exit_code: 0,
+        })
+        .await
+        .expect("stop exe");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.high_priority_processed.load(Ordering::Relaxed) < hp + 1 {
+        assert!(tokio::time::Instant::now() < deadline, "stop exe");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // 2. Install a `DomainPolicy` Permit on `(exe, permit_ip)` and inject BFE remove failure on
+    //    that permit handle so an app-wide `NetworkBlock` upsert promotes `preempt_handle` and
+    //    then fails removing the conflicting `DomainPolicy` Permit, triggering SQLite + WFP
+    //    rollback.
+    let permit_handle = {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(fw.has_pending_preemptive_removal(exe));
+        fw.ensure_ip_permit_for_domain_hints_prioritized(
+            exe,
+            permit_ip,
+            &["cdn.example.com"],
+            &[] as &[&str],
+            &*engine.defense,
+        )
+        .expect("install DomainPolicy permit")
+        .expect("new permit handle")
+    };
+    defense.set_fail_handle(permit_handle, true);
+
+    let block_rule = AllowlistRuleRecord {
+        rule_id: "R-BLK-ROLLBACK-02".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: now_ms,
+        created_by: "test".to_string(),
+    };
+    let err = engine
+        .upsert_policy_rule(&block_rule)
+        .expect_err("failed DomainPolicy permit removal must roll back NetworkBlock upsert");
+    assert!(
+        matches!(err, PolicyRuleError::FirewallSync(_)),
+        "expected FirewallSync rollback error, got: {err:?}"
+    );
+    assert!(
+        engine
+            .store
+            .get_rule(&block_rule.rule_id)
+            .expect("get_rule")
+            .is_none(),
+        "failed policy edit must be rolled back in SQLite"
+    );
+
+    // 3. Verify rollback restored BOTH `WfpFilterOrigin::Preemptive` AND
+    //    `pending_preemptive_removals` so periodic sweep cleans up once BFE recovers.
+    {
+        let fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            fw.filter_origin(exe, None),
+            Some(&WfpFilterOrigin::Preemptive),
+            "rollback must restore Preemptive origin"
+        );
+        assert!(
+            fw.has_pending_preemptive_removal(exe),
+            "rollback must restore pending_preemptive_removals entry cleared during promotion"
+        );
+    }
+
+    defense.set_fail_handle(preempt_handle, false);
+    let sweep_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while try_has_active_wfp_filter(&engine, exe, None, false, Duration::from_secs(2))
+        .await
+        .expect("fw lock")
+    {
+        assert!(
+            tokio::time::Instant::now() < sweep_deadline,
+            "periodic sweep must remove restored pending-removal Preemptive block after BFE recovery"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     engine.shutdown_and_flush().await.expect("shutdown engine");
 }

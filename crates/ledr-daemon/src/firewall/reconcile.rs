@@ -452,6 +452,7 @@ impl WfpRuleManager {
                         }
                         self.installed.remove(&key);
                         self.pending_preemptive_removals.remove(&entry.handle);
+                        self.deferred_preemptive_removals.remove(&entry.handle);
                         self.bound_alerts.retain(|_, k| k != &key);
                         report.removed += 1;
                     }
@@ -555,14 +556,19 @@ impl WfpRuleManager {
                     .filter(|(_, k)| *k == &key)
                     .map(|(alert_id, _)| alert_id.clone())
                     .collect();
+                let promoted_handle = entry.handle;
+                let prev_pending_removal_failures =
+                    self.pending_preemptive_removals.remove(&promoted_handle);
+                let prev_deferred_preemptive_removal =
+                    self.deferred_preemptive_removals.remove(&promoted_handle);
                 report.promoted_backups.push(PromotedFilterSnapshot {
                     key: key.clone(),
                     prev_origin: entry.origin.clone(),
                     bound_alert_ids,
+                    prev_pending_removal_failures,
+                    prev_deferred_preemptive_removal,
                 });
-                let promoted_handle = entry.handle;
                 entry.origin = WfpFilterOrigin::PersistedPolicy;
-                self.pending_preemptive_removals.remove(&promoted_handle);
                 report.promoted += 1;
             }
             self.bound_alerts.retain(|_, k| k != &key);
@@ -577,6 +583,8 @@ impl WfpRuleManager {
                     key: key.clone(),
                     prev_origin: entry.origin.clone(),
                     bound_alert_ids: Vec::new(),
+                    prev_pending_removal_failures: None,
+                    prev_deferred_preemptive_removal: false,
                 });
                 entry.origin = WfpFilterOrigin::Preemptive;
             }
@@ -591,6 +599,8 @@ impl WfpRuleManager {
                     key: key.clone(),
                     prev_origin: entry.origin.clone(),
                     bound_alert_ids: Vec::new(),
+                    prev_pending_removal_failures: None,
+                    prev_deferred_preemptive_removal: false,
                 });
                 entry.origin = WfpFilterOrigin::DomainPolicy {
                     domain_hints: surviving_hints,
@@ -650,15 +660,25 @@ impl WfpRuleManager {
         report
     }
 
-    /// Restores filter origins and alert containment bindings overwritten during a failed
-    /// reconciliation pass whose SQLite mutation was rolled back.
+    /// Restores filter origins, alert containment bindings, and pending/deferred preemptive
+    /// removal states overwritten during a failed reconciliation pass whose SQLite mutation was
+    /// rolled back (`PRRT_kwDOVyjVyM66kfDu`).
     pub fn restore_promoted_filter_states(&mut self, backups: &[PromotedFilterSnapshot]) {
         for snap in backups {
             if let Some(entry) = self.installed.get_mut(&snap.key) {
+                let handle = entry.handle;
                 entry.origin = snap.prev_origin.clone();
                 for alert_id in &snap.bound_alert_ids {
                     self.bound_alerts
                         .insert(alert_id.clone(), snap.key.clone());
+                }
+                if let Some(failures) = snap.prev_pending_removal_failures {
+                    self.pending_preemptive_removals
+                        .entry(handle)
+                        .or_insert(failures);
+                }
+                if snap.prev_deferred_preemptive_removal {
+                    self.deferred_preemptive_removals.insert(handle);
                 }
             }
         }

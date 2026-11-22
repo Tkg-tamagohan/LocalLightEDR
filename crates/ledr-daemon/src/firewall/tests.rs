@@ -1787,3 +1787,172 @@ fn firewall_p3_48a_shared_ip_authorizing_hint_retention_and_prioritized_cap() {
         .failure_summary_for_rules(&[&r_blk_other])
         .is_none());
 }
+
+/// Regression test `WFP-DEFERRED-01` (`PRRT_kwDOVyjVyM66kfDX`):
+/// verifies `deferred_preemptive_removals` lifecycle across alert-bound ProcessStop deferral,
+/// pending->deferred handoff on alert rebind, live process reclaim, and startup-pinning prune.
+#[test]
+fn firewall_deferred_preemptive_removal_tracks_bound_alert_and_reclaim_lifecycle() {
+    let mut fw = WfpRuleManager::new();
+    let defense = StubDefense::new();
+
+    // 1. ProcessStop attempts removal while an unresolved alert still references the Preemptive
+    //    block -> deferred marker is set, pending queue stays empty (sweep stays O(1)).
+    let exe_bound = r"C:\Users\Alice\Downloads\bound_then_stop.exe";
+    let h_bound = defense.add_wfp_app_rule(Path::new(exe_bound), None, false).unwrap();
+    assert!(fw.register_preemptive_block(exe_bound, h_bound, &defense));
+    assert!(fw.bind_alert_to_app_block("ALT-NET-1", exe_bound));
+    assert!(!fw.remove_preemptive_block_if_unused(exe_bound, &defense));
+    assert!(fw.has_deferred_preemptive_removal(exe_bound));
+    assert!(!fw.has_pending_preemptive_removal(exe_bound));
+    let mut probe_calls = 0usize;
+    assert_eq!(
+        fw.sweep_unused_preemptive_blocks(
+            |_| {
+                probe_calls += 1;
+                false
+            },
+            &defense
+        ),
+        0
+    );
+    assert_eq!(
+        probe_calls, 0,
+        "deferred removal while alert is bound must not break sweep's O(1) fast path"
+    );
+
+    // Releasing the last bound alert without removing the Preemptive filter keeps deferred flag
+    // until caller explicitly retries `remove_preemptive_block_if_unused`.
+    let (snap, was_bound) = fw
+        .release_transient_containment_for_alert("ALT-NET-1", Some(exe_bound), &defense)
+        .expect("release alert binding");
+    assert!(snap.is_none());
+    assert!(was_bound);
+    assert!(!fw.has_any_bound_alerts_for_exe(exe_bound));
+    assert!(fw.has_deferred_preemptive_removal(exe_bound));
+    assert!(fw.remove_preemptive_block_if_unused(exe_bound, &defense));
+    assert!(!fw.has_any_app_filter(exe_bound));
+    assert!(!fw.has_deferred_preemptive_removal(exe_bound));
+
+    // 2. Binding an alert to a handle already in `pending_preemptive_removals` moves it from
+    //    `pending` to `deferred` so periodic sweep skips it while bound, yet releasing the alert
+    //    retains the fact that ProcessStop already requested removal.
+    let exe_rebound = r"C:\Users\Alice\Downloads\pending_to_deferred.exe";
+    defense.set_fail_removes(true);
+    let h_rebound = defense
+        .add_wfp_app_rule(Path::new(exe_rebound), None, false)
+        .unwrap();
+    assert!(!fw.discard_obsolete_preemptive_block(exe_rebound, h_rebound, &defense));
+    defense.set_fail_removes(false);
+    assert!(fw.has_pending_preemptive_removal(exe_rebound));
+    assert!(fw.bind_alert_to_app_block("ALT-NET-2", exe_rebound));
+    assert!(!fw.has_pending_preemptive_removal(exe_rebound));
+    assert!(fw.has_deferred_preemptive_removal(exe_rebound));
+
+    // 3. Reclaiming the block for a newly started live process clears `deferred_preemptive_removals`.
+    assert!(fw.clear_pending_preemptive_removal(exe_rebound));
+    assert!(!fw.has_deferred_preemptive_removal(exe_rebound));
+
+    // 4. Startup-pinning prunes deferred removal.
+    let exe_pin = r"C:\Users\Alice\Downloads\deferred_then_pinned.exe";
+    let h_pin = defense.add_wfp_app_rule(Path::new(exe_pin), None, false).unwrap();
+    assert!(fw.register_preemptive_block(exe_pin, h_pin, &defense));
+    assert!(fw.bind_alert_to_app_block("ALT-NET-3", exe_pin));
+    assert!(!fw.remove_preemptive_block_if_unused(exe_pin, &defense));
+    assert!(fw.has_deferred_preemptive_removal(exe_pin));
+    fw.set_startup_preemptive_executables(&[exe_pin.to_string()]);
+    assert!(!fw.has_deferred_preemptive_removal(exe_pin));
+}
+
+/// Regression test `WFP-ROLLBACK-01` (`PRRT_kwDOVyjVyM66kfDu`):
+/// verifies `restore_promoted_filter_states` faithfully restores both
+/// `pending_preemptive_removals` (including consecutive backoff failure count) and
+/// `deferred_preemptive_removals` when a policy reconciliation pass rolls back.
+#[test]
+fn firewall_restore_promoted_filter_states_preserves_pending_and_deferred_preemptive_removals() {
+    let mut fw = WfpRuleManager::new();
+    let defense = StubDefense::new();
+    let inspector = StubInspector("a".repeat(64));
+
+    let pending_exe = r"C:\Users\Alice\Downloads\rollback_pending.exe";
+    let deferred_exe = r"C:\Users\Alice\Downloads\rollback_deferred.exe";
+
+    // Queue `pending_exe` into `pending_preemptive_removals` and accumulate 2 sweep failures.
+    defense.set_fail_removes(true);
+    let h_pending = defense
+        .add_wfp_app_rule(Path::new(pending_exe), None, false)
+        .unwrap();
+    assert!(!fw.discard_obsolete_preemptive_block(pending_exe, h_pending, &defense));
+    assert_eq!(fw.sweep_unused_preemptive_blocks(|_| false, &defense), 0);
+    assert_eq!(fw.sweep_unused_preemptive_blocks(|_| false, &defense), 0);
+    assert!(fw.has_pending_preemptive_removal(pending_exe));
+    defense.set_fail_removes(false);
+
+    // Queue `deferred_exe` into `deferred_preemptive_removals` while an alert is bound.
+    let h_deferred = defense
+        .add_wfp_app_rule(Path::new(deferred_exe), None, false)
+        .unwrap();
+    assert!(fw.register_preemptive_block(deferred_exe, h_deferred, &defense));
+    assert!(fw.bind_alert_to_app_block("ALT-ROLLBACK-1", deferred_exe));
+    assert!(!fw.remove_preemptive_block_if_unused(deferred_exe, &defense));
+    assert!(fw.has_deferred_preemptive_removal(deferred_exe));
+
+    // Reconcile promotes both Preemptive blocks to `PersistedPolicy`, clearing pending/deferred.
+    let rules = vec![
+        AllowlistRuleRecord {
+            rule_id: "R-BLK-PENDING".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: pending_exe.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 1,
+            created_by: "test".to_string(),
+        },
+        AllowlistRuleRecord {
+            rule_id: "R-BLK-DEFERRED".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: deferred_exe.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 2,
+            created_by: "test".to_string(),
+        },
+    ];
+    let report = fw.reconcile_persisted_rules(&rules, &[], &inspector, &defense);
+    assert_eq!(report.promoted, 2);
+    assert_eq!(
+        fw.filter_origin(pending_exe, None),
+        Some(&WfpFilterOrigin::PersistedPolicy)
+    );
+    assert_eq!(
+        fw.filter_origin(deferred_exe, None),
+        Some(&WfpFilterOrigin::PersistedPolicy)
+    );
+    assert!(!fw.has_pending_preemptive_removal(pending_exe));
+    assert!(!fw.has_deferred_preemptive_removal(deferred_exe));
+    assert!(!fw.is_alert_bound("ALT-ROLLBACK-1"));
+
+    // Roll back promotions -> origins, bound alerts, pending queue (with failure count), and
+    // deferred marker are all restored.
+    fw.restore_promoted_filter_states(&report.promoted_backups);
+    assert_eq!(
+        fw.filter_origin(pending_exe, None),
+        Some(&WfpFilterOrigin::Preemptive)
+    );
+    assert_eq!(
+        fw.filter_origin(deferred_exe, None),
+        Some(&WfpFilterOrigin::Preemptive)
+    );
+    assert!(fw.has_pending_preemptive_removal(pending_exe));
+    assert!(fw.has_deferred_preemptive_removal(deferred_exe));
+    assert!(fw.is_alert_bound("ALT-ROLLBACK-1"));
+
+    // Periodic sweep immediately recovers `pending_exe` (while leaving `deferred_exe` bound).
+    assert_eq!(fw.sweep_unused_preemptive_blocks(|_| false, &defense), 1);
+    assert!(!fw.has_any_app_filter(pending_exe));
+    assert!(fw.has_active_filter(deferred_exe, None, false));
+}

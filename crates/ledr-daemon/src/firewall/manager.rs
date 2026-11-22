@@ -1,6 +1,6 @@
 //! Core `WfpRuleManager` state definition, key normalization, `AllowOnce` tracking, and queries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use ledr_proto::{
@@ -25,6 +25,16 @@ pub struct WfpRuleManager {
     /// [`Self::sweep_unused_preemptive_blocks`], so active processes evicted from `ProcessTable`
     /// under capacity pressure never lose their live `Preemptive` block.
     pub(super) pending_preemptive_removals: HashMap<u64, u64>,
+    /// Tracks handles of non-startup `Preemptive` app-wide WFP blocks whose removal was explicitly
+    /// requested after the last active instance stopped (`remove_preemptive_block_if_unused`), or
+    /// that were previously pending sweep retry when an alert bound to them, and are waiting
+    /// solely for the last referencing alert in `bound_alerts` to be released
+    /// (`PRRT_kwDOVyjVyM66kfDX`).
+    ///
+    /// Kept separate from `pending_preemptive_removals` so [`Self::sweep_unused_preemptive_blocks`]
+    /// preserves its O(1) fast path while alerts are pending; cleared whenever a live process
+    /// reclaims the filter or the filter is removed, promoted, or startup-pinned.
+    pub(super) deferred_preemptive_removals: HashSet<u64>,
     pub(super) has_wildcard_network_rules: bool,
     pub(super) has_domain_network_rules: bool,
 }
@@ -54,6 +64,7 @@ impl WfpRuleManager {
                 .or_insert_with(|| trimmed.to_string());
         }
         self.prune_stale_pending_preemptive_removals();
+        self.prune_stale_deferred_preemptive_removals();
     }
 
     /// Returns `true` when `exe_path` is a startup-pinned pre-restricted executable.
@@ -164,13 +175,18 @@ impl WfpRuleManager {
         if self.startup_preemptive_exes.contains_key(&key.0) {
             return false;
         }
-        if self.bound_alerts.values().any(|k| k == &key) {
-            return false;
-        }
         let Some(entry) = self.installed.get(&key).cloned() else {
             return false;
         };
         if entry.allow || entry.origin != WfpFilterOrigin::Preemptive {
+            return false;
+        }
+        if self.bound_alerts.values().any(|k| k == &key) {
+            // ProcessStop (or TerminateAndBlock) confirmed no active instance remains while an
+            // unresolved alert still references this Preemptive block; remember the deferred
+            // removal so releasing the last bound alert can retry removal without relying on
+            // `ActiveProcessTable` capacity eviction (`PRRT_kwDOVyjVyM66kfDX`).
+            self.deferred_preemptive_removals.insert(entry.handle);
             return false;
         }
         if let Err(err) = defense.remove_wfp_rule(entry.handle) {
@@ -180,6 +196,7 @@ impl WfpRuleManager {
                 error = %err,
                 "failed to remove pre-emptive WFP block on ProcessStop; queuing handle for periodic sweep retry"
             );
+            self.deferred_preemptive_removals.remove(&entry.handle);
             self.pending_preemptive_removals
                 .entry(entry.handle)
                 .or_insert(0);
@@ -187,6 +204,7 @@ impl WfpRuleManager {
         }
         self.installed.remove(&key);
         self.pending_preemptive_removals.remove(&entry.handle);
+        self.deferred_preemptive_removals.remove(&entry.handle);
         true
     }
 
@@ -202,18 +220,67 @@ impl WfpRuleManager {
             .is_some_and(|entry| self.pending_preemptive_removals.contains_key(&entry.handle))
     }
 
-    /// Reclaims a pending-removal `Preemptive` app-wide block when a live process reuses it,
-    /// clearing it from periodic sweep retry so subsequent `ProcessTable` capacity eviction cannot
-    /// drop an active process's block. Returns `true` if a pending removal entry was cleared.
-    pub fn clear_pending_preemptive_removal(&mut self, exe_path: &str) -> bool {
-        if self.pending_preemptive_removals.is_empty() {
+    /// Returns `true` when the non-startup `Preemptive` app-wide filter currently installed for
+    /// `exe_path` had an explicit removal deferred while unresolved alerts still referenced it.
+    pub fn has_deferred_preemptive_removal(&self, exe_path: &str) -> bool {
+        if self.deferred_preemptive_removals.is_empty() {
+            return false;
+        }
+        let key = Self::target_key(exe_path, None);
+        if self.startup_preemptive_exes.contains_key(&key.0) {
+            return false;
+        }
+        self.installed.get(&key).is_some_and(|entry| {
+            !entry.allow
+                && entry.origin == WfpFilterOrigin::Preemptive
+                && self.deferred_preemptive_removals.contains(&entry.handle)
+        })
+    }
+
+    /// Clears a deferred unused-preemptive removal marker for `exe_path` (e.g., when a live
+    /// process is still active or reclaims the block).
+    pub fn clear_deferred_preemptive_removal(&mut self, exe_path: &str) -> bool {
+        if self.deferred_preemptive_removals.is_empty() {
             return false;
         }
         let key = Self::target_key(exe_path, None);
         let Some(handle) = self.installed.get(&key).map(|entry| entry.handle) else {
             return false;
         };
-        self.pending_preemptive_removals.remove(&handle).is_some()
+        self.deferred_preemptive_removals.remove(&handle)
+    }
+
+    /// Returns `true` when at least one unresolved alert is still bound to `exe_path`'s app-wide
+    /// block filter.
+    pub fn has_any_bound_alerts_for_exe(&self, exe_path: &str) -> bool {
+        let key = Self::target_key(exe_path, None);
+        self.bound_alerts.values().any(|k| k == &key)
+    }
+
+    /// Returns the concrete executable path of the installed app-wide filter currently bound to
+    /// `alert_id`, if any.
+    pub fn bound_alert_exe_path(&self, alert_id: &str) -> Option<String> {
+        let key = self.bound_alerts.get(alert_id)?;
+        self.installed.get(key).map(|entry| entry.exe_path.clone())
+    }
+
+    /// Reclaims a pending-removal or deferred-removal `Preemptive` app-wide block when a live
+    /// process reuses it, clearing it from periodic sweep retry and deferred alert-release
+    /// cleanup so subsequent `ProcessTable` capacity eviction cannot drop an active process's
+    /// block. Returns `true` if a pending or deferred removal entry was cleared.
+    pub fn clear_pending_preemptive_removal(&mut self, exe_path: &str) -> bool {
+        if self.pending_preemptive_removals.is_empty()
+            && self.deferred_preemptive_removals.is_empty()
+        {
+            return false;
+        }
+        let key = Self::target_key(exe_path, None);
+        let Some(handle) = self.installed.get(&key).map(|entry| entry.handle) else {
+            return false;
+        };
+        let cleared_pending = self.pending_preemptive_removals.remove(&handle).is_some();
+        let cleared_deferred = self.deferred_preemptive_removals.remove(&handle);
+        cleared_pending || cleared_deferred
     }
 
     fn is_sweepable_preemptive_entry(&self, key: &WfpTargetKey, entry: &InstalledWfpFilter) -> bool {
@@ -239,6 +306,23 @@ impl WfpRuleManager {
                     && entry.origin == WfpFilterOrigin::Preemptive
                     && !startup.contains_key(&key.0)
                     && !bound_alerts.values().any(|bound| bound == key)
+            })
+        });
+    }
+
+    fn prune_stale_deferred_preemptive_removals(&mut self) {
+        if self.deferred_preemptive_removals.is_empty() {
+            return;
+        }
+        let installed = &self.installed;
+        let startup = &self.startup_preemptive_exes;
+        self.deferred_preemptive_removals.retain(|handle| {
+            installed.iter().any(|(key, entry)| {
+                entry.handle == *handle
+                    && key.1.is_none()
+                    && !entry.allow
+                    && entry.origin == WfpFilterOrigin::Preemptive
+                    && !startup.contains_key(&key.0)
             })
         });
     }
@@ -288,6 +372,7 @@ impl WfpRuleManager {
         }
         for handle in reactivated_handles {
             self.pending_preemptive_removals.remove(&handle);
+            self.deferred_preemptive_removals.remove(&handle);
         }
 
         let mut removed = 0usize;
@@ -336,6 +421,7 @@ impl WfpRuleManager {
         }
 
         self.prune_stale_pending_preemptive_removals();
+        self.prune_stale_deferred_preemptive_removals();
         removed
     }
 

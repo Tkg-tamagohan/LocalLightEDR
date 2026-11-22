@@ -275,6 +275,14 @@ impl DaemonEngine {
             pruned_events: AtomicU64::new(0),
             alerts_emitted: AtomicU64::new(0),
             fail_record_alert_for_test: AtomicBool::new(false),
+            #[cfg(test)]
+            tier2c_periodic_sweeps: AtomicU64::new(0),
+            #[cfg(test)]
+            tier2c_periodic_sweep_removals: AtomicU64::new(0),
+            #[cfg(test)]
+            select_idle_periodic_sweeps: AtomicU64::new(0),
+            #[cfg(test)]
+            select_idle_periodic_sweep_removals: AtomicU64::new(0),
             worker_handle: tokio::sync::Mutex::new(None),
         });
 

@@ -4382,3 +4382,345 @@ async fn daemon_p4_cmd_03_live_enrichment_monotonic_cmdline_and_skips_redundant_
         .expect("live row persisted");
     assert_eq!(row.command_line.as_deref(), Some("tool.exe --enriched"));
 }
+
+/// `DAEMON-P4-CMD-04`: When BOTH the parent (`cmd.exe`) and short-lived child (`powershell.exe`)
+/// exit and are evicted from `ActiveProcessTable` before the delayed enriched `ProcessStart`
+/// arrives, bounded evicted history restores `parent_instance_id` and `parent_exe_path` so
+/// `LEDR-LOTL-001` still fires exactly once without resurrecting either entry or leaking WFP rules.
+#[tokio::test]
+async fn daemon_p4_cmd_04_evicted_parent_and_child_delayed_cmdline_fires_lotl_once() {
+    use crate::process_table::ActiveProcessTable;
+
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let rules_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/lotl_core.json");
+    let sigma = SigmaEngine::from_json_file(&rules_path).expect("load lotl_core.json");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        sigma,
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("a".repeat(64))),
+    );
+    if let Some(h) = engine.worker_handle.lock().await.take() {
+        h.abort();
+        let _ = h.await;
+    }
+
+    {
+        let mut guard = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = ActiveProcessTable::new(2);
+    }
+
+    let now_ms = current_unix_ms();
+    let parent_100ns = 116_444_736_000_000_000u64 + ((now_ms - 6_000) as u64) * 10_000;
+    let child_100ns = 116_444_736_000_000_000u64 + ((now_ms - 5_000) as u64) * 10_000;
+    let parent_stop_100ns = child_100ns + 200_000;
+    let child_stop_100ns = child_100ns + 400_000;
+    let filler1_100ns = 116_444_736_000_000_000u64 + ((now_ms - 3_000) as u64) * 10_000;
+    let filler2_100ns = 116_444_736_000_000_000u64 + ((now_ms - 2_000) as u64) * 10_000;
+
+    let cmd_parent = ProcessIdentity::new(8400, parent_100ns);
+    let ps_child = ProcessIdentity::new(8404, child_100ns);
+    let filler1 = ProcessIdentity::new(8408, filler1_100ns);
+    let filler2 = ProcessIdentity::new(8412, filler2_100ns);
+    let ps_exe = r"C:\Users\Public\Downloads\powershell.exe";
+    let ps_cmd = "powershell.exe -EncodedCommand SQBFAFgA";
+
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: cmd_parent,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\cmd.exe".to_string(),
+            command_line: "cmd.exe /c powershell.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_child,
+            parent_pid: cmd_parent.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: cmd_parent.pid,
+            exit_time_100ns: parent_stop_100ns,
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: ps_child.pid,
+            exit_time_100ns: child_stop_100ns,
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Evict BOTH cmd_parent and ps_child from the capacity-2 ActiveProcessTable.
+    for (ident, name) in [(filler1, "notepad.exe"), (filler2, "calc.exe")] {
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: ident,
+                parent_pid: 4,
+                exe_path: format!(r"C:\Windows\System32\{name}"),
+                command_line: name.to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+    }
+
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            table.get_by_instance_id(&cmd_parent.instance_id()).is_none(),
+            "parent cmd.exe must be evicted from active table"
+        );
+        assert!(
+            table.get_by_instance_id(&ps_child.instance_id()).is_none(),
+            "child powershell.exe must be evicted from active table"
+        );
+        assert_eq!(table.active_count(), 2);
+    }
+    assert_eq!(defense.wfp_blocks_added().len(), 1);
+    assert!(!engine.has_active_wfp_filter(ps_exe, None, false));
+
+    // Delayed enriched ProcessStart arrives AFTER both parent and child were evicted.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_child,
+            parent_pid: cmd_parent.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_cmd.to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(table.get_by_instance_id(&cmd_parent.instance_id()).is_none());
+        assert!(table.get_by_instance_id(&ps_child.instance_id()).is_none());
+        assert_eq!(table.active_count(), 2);
+    }
+    assert_eq!(defense.wfp_blocks_added().len(), 1);
+    assert!(!engine.has_active_wfp_filter(ps_exe, None, false));
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    let lotl = alerts
+        .iter()
+        .filter(|a| {
+            a.rule_id == "LEDR-LOTL-001"
+                && a.process_instance_id.as_deref() == Some(ps_child.instance_id().as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lotl.len(),
+        1,
+        "expected 1 LEDR-LOTL-001 alert after both parent and child eviction, got {alerts:?}"
+    );
+    assert!(!lotl[0].process_suspended);
+    let ctx: serde_json::Value =
+        serde_json::from_str(&lotl[0].context_json).expect("valid alert context_json");
+    assert_eq!(
+        ctx["parent_exe_path"].as_str(),
+        Some(r"C:\Windows\System32\cmd.exe")
+    );
+
+    // Duplicate delayed ProcessStart must NOT emit a duplicate LEDR-LOTL-001 alert.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_child,
+            parent_pid: cmd_parent.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_cmd.to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let alerts_after_dup = store.list_alerts(None, 20).expect("list alerts after dup");
+    assert_eq!(
+        alerts_after_dup
+            .iter()
+            .filter(|a| {
+                a.rule_id == "LEDR-LOTL-001"
+                    && a.process_instance_id.as_deref() == Some(ps_child.instance_id().as_str())
+            })
+            .count(),
+        1,
+        "duplicate delayed ProcessStart after parent+child eviction must not double-alert"
+    );
+
+    store.flush_batch().expect("flush sqlite");
+    let snap = store
+        .query_flight_recorder(50, Some(&ps_child.instance_id()))
+        .expect("query flight recorder");
+    let row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == ps_child.instance_id())
+        .expect("evicted child row persisted");
+    assert_eq!(row.command_line.as_deref(), Some(ps_cmd));
+    assert_eq!(
+        row.parent_instance_id.as_deref(),
+        Some(cmd_parent.instance_id().as_str())
+    );
+    assert!(row.exited_at_ms.is_some());
+}
+
+/// `DAEMON-P4-CMD-05`: When `CanaryFileAccess` arrives BEFORE `ProcessStart` for a high-risk
+/// binary, `finalize_canary_backfill` immediately applies preemptive WFP launch guards and marks
+/// `launch_guards_applied = true` so subsequent `ProcessStart` does not redundantly re-register;
+/// and defense-in-depth `launch_guards_applied == false` ensures any pre-existing table entry
+/// without applied guards still receives launch guards on `ProcessStart`.
+#[tokio::test]
+async fn daemon_p4_cmd_05_canary_backfill_before_process_start_applies_launch_guards() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+
+    let now_ms = current_unix_ms();
+    let canary_proc_100ns = 116_444_736_000_000_000u64 + ((now_ms - 1_000) as u64) * 10_000;
+    let pre_reg_100ns = 116_444_736_000_000_000u64 + ((now_ms - 500) as u64) * 10_000;
+
+    let canary_pid = 8500u32;
+    let canary_ident = ProcessIdentity::new(canary_pid, canary_proc_100ns);
+    let canary_exe = r"C:\Users\Public\Downloads\canary_first.exe";
+
+    let live_inspector = Arc::new(MapLiveProcessInspector::new([(
+        canary_pid,
+        ledr_sensor_win::etw::LiveProcessInfo {
+            create_time_100ns: canary_proc_100ns,
+            exe_path: Some(canary_exe.to_string()),
+            command_line: Some("canary_first.exe --steal".to_string()),
+        },
+    )]));
+
+    let engine = start_stopped_engine_with_live_inspector(
+        store.clone(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("b".repeat(64))),
+        Arc::clone(&live_inspector) as Arc<dyn crate::engine::LiveProcessInspector>,
+    )
+    .await;
+
+    // 1. CanaryFileAccess arrives BEFORE ProcessStart -> on-demand backfill registers process
+    //    AND immediately applies preemptive WFP launch guard.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::CanaryFileAccess {
+            pid: canary_pid,
+            target_path: r"C:\Users\Alice\Documents\_ledr_canary_01.txt".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x0000_0002,
+            is_write_or_delete: true,
+            timestamp_ms: now_ms,
+        },
+        EventLane::HighPriority,
+    );
+
+    assert_eq!(
+        defense.wfp_blocks_added().len(),
+        1,
+        "canary backfill must immediately apply preemptive WFP block for HighRiskPath"
+    );
+    assert!(
+        engine.has_active_wfp_filter(canary_exe, None, false),
+        "HighRiskPath process backfilled via canary must be blocked before ProcessStart arrives"
+    );
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = table
+            .get_by_instance_id(&canary_ident.instance_id())
+            .expect("canary-backfilled entry present");
+        assert!(
+            entry.launch_guards_applied,
+            "finalize_canary_backfill must mark launch_guards_applied = true"
+        );
+    }
+
+    // 2. Subsequent real ProcessStart sees `launch_guards_applied == true && !upgraded_exe`
+    //    and skips redundant WFP re-registration while preserving the active block.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: canary_ident,
+            parent_pid: 4,
+            exe_path: canary_exe.to_string(),
+            command_line: "canary_first.exe --steal".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(
+        defense.wfp_blocks_added().len(),
+        1,
+        "ProcessStart after canary backfill must not redundantly re-add WFP block"
+    );
+    assert!(engine.has_active_wfp_filter(canary_exe, None, false));
+
+    // 3. Defense-in-depth: if an active entry exists in ActiveProcessTable with exe_path set
+    //    but `launch_guards_applied == false`, arriving ProcessStart must NOT skip launch guards.
+    let pre_reg_ident = ProcessIdentity::new(8504, pre_reg_100ns);
+    let pre_reg_exe = r"C:\Users\Public\Downloads\pre_registered_no_guards.exe";
+    {
+        let mut table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let res = table.on_process_start(
+            pre_reg_ident,
+            4,
+            pre_reg_exe.to_string(),
+            String::new(),
+            None,
+            now_ms - 500,
+        );
+        assert!(!res.skip_launch_guards);
+        assert!(!table
+            .get_by_instance_id(&pre_reg_ident.instance_id())
+            .expect("pre-registered entry present")
+            .launch_guards_applied);
+    }
+    assert!(!engine.has_active_wfp_filter(pre_reg_exe, None, false));
+
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: pre_reg_ident,
+            parent_pid: 4,
+            exe_path: pre_reg_exe.to_string(),
+            command_line: "pre_registered_no_guards.exe --run".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(
+        defense.wfp_blocks_added().len(),
+        2,
+        "ProcessStart must apply launch guards when launch_guards_applied was false"
+    );
+    assert!(engine.has_active_wfp_filter(pre_reg_exe, None, false));
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            table
+                .get_by_instance_id(&pre_reg_ident.instance_id())
+                .expect("pre-registered entry present")
+                .launch_guards_applied
+        );
+    }
+}

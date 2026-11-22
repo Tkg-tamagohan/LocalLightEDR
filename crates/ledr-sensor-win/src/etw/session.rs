@@ -139,6 +139,58 @@ pub(super) struct ActiveAuxSession {
     pub(super) worker: Option<JoinHandle<()>>,
 }
 
+/// RAII rollback guard for an already-started auxiliary `SystemTrace` session while the
+/// main ETW session is still starting up. If any subsequent main-session startup step
+/// fails, dropping this guard signals shutdown, stops the auxiliary kernel session, and
+/// joins its consumer thread so no orphaned session or thread leaks.
+struct AuxStartupGuard<'a, F: FnMut(CONTROLTRACE_HANDLE, &[u16])> {
+    aux_session: Option<ActiveAuxSession>,
+    shutdown_initiated: &'a AtomicBool,
+    aux_active: &'a AtomicBool,
+    stop_requested: &'a AtomicBool,
+    stop_fn: F,
+}
+
+impl<'a, F: FnMut(CONTROLTRACE_HANDLE, &[u16])> AuxStartupGuard<'a, F> {
+    fn new(
+        aux_session: Option<ActiveAuxSession>,
+        shutdown_initiated: &'a AtomicBool,
+        aux_active: &'a AtomicBool,
+        stop_requested: &'a AtomicBool,
+        stop_fn: F,
+    ) -> Self {
+        Self {
+            aux_session,
+            shutdown_initiated,
+            aux_active,
+            stop_requested,
+            stop_fn,
+        }
+    }
+
+    fn disarm(mut self) -> Option<ActiveAuxSession> {
+        self.aux_session.take()
+    }
+}
+
+impl<F: FnMut(CONTROLTRACE_HANDLE, &[u16])> Drop for AuxStartupGuard<'_, F> {
+    fn drop(&mut self) {
+        if let Some(mut aux) = self.aux_session.take() {
+            self.shutdown_initiated.store(true, Ordering::Release);
+            self.aux_active.store(false, Ordering::Release);
+            self.stop_requested.store(true, Ordering::Release);
+            (self.stop_fn)(aux.session_handle, &aux.session_name_nul);
+            if let Some(handle) = aux.worker.take() {
+                let _ = handle.join();
+            }
+            tracing::info!(
+                session = %aux.session_name,
+                "rolled back auxiliary ETW system process session after main session startup failure"
+            );
+        }
+    }
+}
+
 pub(super) struct ActiveEtwSession {
     pub(super) session_handle: CONTROLTRACE_HANDLE,
     pub(super) session_name_nul: Vec<u16>,
@@ -351,6 +403,31 @@ impl SensorBackend for WindowsEtwSensor {
             .to_string());
         }
 
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_initiated = Arc::new(AtomicBool::new(false));
+        let cmdline_correlator = Arc::new(Mutex::new(ProcessCommandLineCorrelator::new()));
+        let aux_active = Arc::new(AtomicBool::new(false));
+
+        // Start auxiliary SystemTrace process session BEFORE enabling main-session providers
+        // so processes spawned immediately after startup already have kernel CommandLine coverage.
+        // If any main-session startup step fails below, `aux_guard` rolls back the auxiliary
+        // session and joins its consumer thread cleanly.
+        let aux_session = try_start_aux_system_process_session(
+            &self.session_name,
+            Arc::clone(&self.sink),
+            Arc::clone(&cmdline_correlator),
+            Arc::clone(&stop_requested),
+            Arc::clone(&shutdown_initiated),
+            Arc::clone(&aux_active),
+        );
+        let aux_guard = AuxStartupGuard::new(
+            aux_session,
+            &shutdown_initiated,
+            &aux_active,
+            &stop_requested,
+            stop_trace_session,
+        );
+
         let session_handle = start_or_restart_session(&self.session_name, &session_name_nul)
             .map_err(|e| e.to_string())?;
 
@@ -360,10 +437,6 @@ impl SensorBackend for WindowsEtwSensor {
         }
 
         let sink_clone = Arc::clone(&self.sink);
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let shutdown_initiated = Arc::new(AtomicBool::new(false));
-        let cmdline_correlator = Arc::new(Mutex::new(ProcessCommandLineCorrelator::new()));
-        let aux_active = Arc::new(AtomicBool::new(false));
         let mut ctx_box = Box::new(EtwCallbackContext {
             sink: sink_clone,
             dns_cache: Mutex::new(DnsResolutionCache::default()),
@@ -440,14 +513,7 @@ impl SensorBackend for WindowsEtwSensor {
                 .to_string()
             })?;
 
-        let aux_session = try_start_aux_system_process_session(
-            &self.session_name,
-            Arc::clone(&self.sink),
-            cmdline_correlator,
-            Arc::clone(&stop_requested),
-            Arc::clone(&shutdown_initiated),
-            Arc::clone(&aux_active),
-        );
+        let aux_session = aux_guard.disarm();
 
         *guard = Some(ActiveEtwSession {
             session_handle,
@@ -895,5 +961,90 @@ mod tests {
         );
         assert!(res_long.is_none());
         assert!(!aux_active.load(Ordering::Acquire));
+    }
+
+    /// `ETW-P4-CMD-08`: When the auxiliary SystemTrace session starts before the main ETW
+    /// session and a subsequent main-session startup step fails, `AuxStartupGuard` sets
+    /// `shutdown_initiated = true`, `aux_active = false`, `stop_requested = true`, invokes
+    /// `stop_trace_session` on the auxiliary handle, and joins the worker thread cleanly;
+    /// when disarmed on success, no rollback occurs.
+    #[test]
+    fn etw_p4_cmd_08_aux_startup_guard_rolls_back_on_error_and_disarms_on_success() {
+        let shutdown_initiated = Arc::new(AtomicBool::new(false));
+        let aux_active = Arc::new(AtomicBool::new(true));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let worker_finished_clone = Arc::clone(&worker_finished);
+        let worker = thread::spawn(move || {
+            let _ = release_rx.recv();
+            worker_finished_clone.store(true, Ordering::Release);
+        });
+
+        let stop_called = Arc::new(AtomicBool::new(false));
+        let stop_called_clone = Arc::clone(&stop_called);
+        let expected_handle = CONTROLTRACE_HANDLE { Value: 0xBEEF };
+        let expected_name_nul: Vec<u16> = "LocalEDR-Test-SysProc\0".encode_utf16().collect();
+
+        {
+            let aux = ActiveAuxSession {
+                session_name: "LocalEDR-Test-SysProc".to_string(),
+                session_handle: expected_handle,
+                session_name_nul: expected_name_nul.clone(),
+                worker: Some(worker),
+            };
+            let _guard = AuxStartupGuard::new(
+                Some(aux),
+                &shutdown_initiated,
+                &aux_active,
+                &stop_requested,
+                |handle, name_nul| {
+                    assert_eq!(handle.Value, expected_handle.Value);
+                    assert_eq!(name_nul, expected_name_nul.as_slice());
+                    assert!(shutdown_initiated.load(Ordering::Acquire));
+                    assert!(!aux_active.load(Ordering::Acquire));
+                    assert!(stop_requested.load(Ordering::Acquire));
+                    stop_called_clone.store(true, Ordering::Release);
+                    let _ = release_tx.send(());
+                },
+            );
+            // Guard drops here simulating main-session startup failure.
+        }
+
+        assert!(stop_called.load(Ordering::Acquire));
+        assert!(worker_finished.load(Ordering::Acquire));
+        assert!(shutdown_initiated.load(Ordering::Acquire));
+        assert!(!aux_active.load(Ordering::Acquire));
+        assert!(stop_requested.load(Ordering::Acquire));
+
+        // Disarm path: main session succeeds, so rollback must NOT fire.
+        let ok_shutdown = AtomicBool::new(false);
+        let ok_aux_active = AtomicBool::new(true);
+        let ok_stop_req = AtomicBool::new(false);
+        let ok_stop_called = AtomicBool::new(false);
+        let disarmed_aux = {
+            let aux = ActiveAuxSession {
+                session_name: "LocalEDR-Test-SysProc".to_string(),
+                session_handle: expected_handle,
+                session_name_nul: expected_name_nul,
+                worker: None,
+            };
+            let guard = AuxStartupGuard::new(
+                Some(aux),
+                &ok_shutdown,
+                &ok_aux_active,
+                &ok_stop_req,
+                |_, _| {
+                    ok_stop_called.store(true, Ordering::Release);
+                },
+            );
+            guard.disarm()
+        };
+        assert!(disarmed_aux.is_some());
+        assert!(!ok_stop_called.load(Ordering::Acquire));
+        assert!(!ok_shutdown.load(Ordering::Acquire));
+        assert!(ok_aux_active.load(Ordering::Acquire));
+        assert!(!ok_stop_req.load(Ordering::Acquire));
     }
 }

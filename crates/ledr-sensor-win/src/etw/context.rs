@@ -95,7 +95,11 @@ pub(super) struct AuxSystemProcessContext {
 
 impl AuxSystemProcessContext {
     /// Emits an enriched `ProcessStart` event directly to the bounded downstream sink.
-    /// Non-blocking; marks `stop_requested` only when the downstream sink closes.
+    ///
+    /// Mirrors [`EtwCallbackContext::dispatch_event`]: delegates backpressure to the
+    /// downstream sink (in production, `TwoLaneSender::blocking_send` on the non-dropping
+    /// `L-10` high-priority lane), and marks `stop_requested` / clears `aux_active` only
+    /// when the downstream sink closes.
     pub(super) fn dispatch_event(&self, event: SensorEvent) -> bool {
         if self.stop_requested.load(Ordering::Acquire) {
             return false;

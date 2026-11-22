@@ -309,8 +309,11 @@ impl DaemonEngine {
                 self.prepare_canary_backfill_sync(event, &proc_ctx, event_ts_ms)
             {
                 if proc_ctx.origin_url.is_none()
+                    && prepared.res.exited_at_ms.is_none()
                     && !prepared.exe_path.is_empty()
                     && !prepared.res.skip_store_ingest
+                    && !prepared.res.skip_launch_guards
+                    && !self.is_self_process(pid, &prepared.exe_path)
                 {
                     if let Some(motw) = self.resolve_process_motw(
                         &prepared.exe_path,
@@ -436,20 +439,12 @@ impl DaemonEngine {
                         .proc_exe_path
                         .as_deref()
                         .unwrap_or(exe_path.as_str());
-                    let is_self = self.is_self_process(identity.pid, effective_exe);
-                    if is_self
-                        || classify_outbound_risk(effective_exe) == OutboundRiskClass::ProtectedOs
-                    {
-                        self.outbound_classifier.mark_protected_os(identity.pid);
-                    } else {
-                        self.outbound_classifier.remove_pid(identity.pid);
-                    }
-                    if self.config.outbound_firewall_enabled && !is_self {
-                        self.maybe_apply_preemptive_wfp_block_with_motw(
-                            effective_exe,
-                            proc_ctx.origin_url.is_some(),
-                        );
-                    }
+                    self.apply_process_launch_guards(
+                        identity.pid,
+                        proc_ctx.proc_instance_id.as_deref(),
+                        effective_exe,
+                        proc_ctx.origin_url.is_some(),
+                    );
                 }
                 "OBSERVED"
             }
@@ -633,8 +628,11 @@ impl DaemonEngine {
             return;
         };
         if proc_ctx.origin_url.is_none()
+            && prepared.res.exited_at_ms.is_none()
             && !prepared.exe_path.is_empty()
             && !prepared.res.skip_store_ingest
+            && !prepared.res.skip_launch_guards
+            && !self.is_self_process(pid, &prepared.exe_path)
         {
             if let Some(motw) = self
                 .resolve_process_motw_budgeted(
@@ -813,6 +811,34 @@ impl DaemonEngine {
         ))
     }
 
+    fn apply_process_launch_guards(
+        &self,
+        pid: u32,
+        instance_id: Option<&str>,
+        effective_exe: &str,
+        has_motw: bool,
+    ) {
+        let is_self = self.is_self_process(pid, effective_exe);
+        if is_self || classify_outbound_risk(effective_exe) == OutboundRiskClass::ProtectedOs {
+            self.outbound_classifier.mark_protected_os(pid);
+        } else {
+            self.outbound_classifier.remove_pid(pid);
+        }
+        if effective_exe.trim().is_empty() {
+            return;
+        }
+        if self.config.outbound_firewall_enabled && !is_self {
+            self.maybe_apply_preemptive_wfp_block_with_motw(effective_exe, has_motw);
+        }
+        if let Some(inst_id) = instance_id {
+            let mut table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            table.mark_launch_guards_applied(inst_id);
+        }
+    }
+
     fn finalize_canary_backfill(
         &self,
         pid: u32,
@@ -827,6 +853,15 @@ impl DaemonEngine {
             command_line,
             res,
         } = prepared;
+
+        if res.exited_at_ms.is_none() && !res.skip_store_ingest && !res.skip_launch_guards {
+            self.apply_process_launch_guards(
+                ident.pid,
+                Some(&res.instance_id),
+                &exe_path,
+                proc_ctx.origin_url.is_some(),
+            );
+        }
 
         let synthetic_start = SensorEvent::ProcessStart {
             identity: ident,
@@ -1333,12 +1368,9 @@ impl DaemonEngine {
                 };
                 let (parent_exe, parent_cmd) = parent_instance_id
                     .as_deref()
-                    .and_then(|parent_id| table.get_by_instance_id(parent_id))
-                    .map(|p| {
-                        (
-                            Some(p.exe_path.clone()),
-                            (!p.command_line.is_empty()).then(|| p.command_line.clone()),
-                        )
+                    .map(|parent_id| {
+                        let (_, p_exe, p_cmd) = table.parent_metadata_by_id(parent_id);
+                        (p_exe, p_cmd)
                     })
                     .unwrap_or((None, None));
                 ResolvedProcessContext {

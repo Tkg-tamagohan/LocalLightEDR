@@ -153,6 +153,7 @@ impl DaemonEngine {
             if proc_ctx.origin_url.is_none()
                 && proc_ctx.exited_at_ms.is_none()
                 && !proc_ctx.skip_store_ingest
+                && !proc_ctx.skip_launch_guards
             {
                 match (
                     proc_ctx.proc_instance_id.as_deref(),
@@ -226,6 +227,7 @@ impl DaemonEngine {
             if proc_ctx.origin_url.is_none()
                 && proc_ctx.exited_at_ms.is_none()
                 && !proc_ctx.skip_store_ingest
+                && !proc_ctx.skip_launch_guards
             {
                 if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
                     if !self.is_self_process(identity.pid, effective_exe) {
@@ -285,6 +287,7 @@ impl DaemonEngine {
             if proc_ctx.origin_url.is_none()
                 && proc_ctx.exited_at_ms.is_none()
                 && !proc_ctx.skip_store_ingest
+                && !proc_ctx.skip_launch_guards
             {
                 if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
                     if !self.is_self_process(identity.pid, effective_exe) {
@@ -425,7 +428,10 @@ impl DaemonEngine {
             SensorEvent::ProcessStart {
                 identity, exe_path, ..
             } => {
-                if proc_ctx.exited_at_ms.is_none() && !proc_ctx.skip_store_ingest {
+                if proc_ctx.exited_at_ms.is_none()
+                    && !proc_ctx.skip_store_ingest
+                    && !proc_ctx.skip_launch_guards
+                {
                     let effective_exe = proc_ctx
                         .proc_exe_path
                         .as_deref()
@@ -1253,6 +1259,7 @@ impl DaemonEngine {
                     exited_at_ms: res.exited_at_ms,
                     superseded_exit: res.superseded_exit,
                     skip_store_ingest: res.skip_store_ingest,
+                    skip_launch_guards: res.skip_launch_guards,
                     effective_process_start,
                     origin_url,
                     motw_source,
@@ -1280,6 +1287,7 @@ impl DaemonEngine {
                     exited_at_ms: None,
                     superseded_exit: None,
                     skip_store_ingest: false,
+                    skip_launch_guards: false,
                     effective_process_start: None,
                     origin_url: None,
                     motw_source: None,
@@ -1345,6 +1353,7 @@ impl DaemonEngine {
                     exited_at_ms: None,
                     superseded_exit: None,
                     skip_store_ingest: false,
+                    skip_launch_guards: false,
                     effective_process_start: None,
                     origin_url,
                     motw_source,
@@ -1390,6 +1399,8 @@ pub(super) struct ResolvedProcessContext {
     /// `true` when an unverified `create_time_100ns == 0` snapshot was absorbed into an active
     /// verified process without adding any new metadata and must not write a `pid:0` row.
     pub(super) skip_store_ingest: bool,
+    /// `true` when a re-enrichment `ProcessStart` must not re-run MOTW or preemptive WFP guards.
+    pub(super) skip_launch_guards: bool,
     /// Merged `ProcessStart` carrying the table's consolidated identity and non-clobbering
     /// metadata whenever the normalized in-memory entry differs from the incoming `ProcessStart`
     /// event, so `EarlyPruner`, `SigmaEngine`, alert context, and SQLite ingestion evaluate the
@@ -1417,6 +1428,7 @@ impl Default for ResolvedProcessContext {
             exited_at_ms: None,
             superseded_exit: None,
             skip_store_ingest: false,
+            skip_launch_guards: false,
             effective_process_start: None,
             origin_url: None,
             motw_source: None,

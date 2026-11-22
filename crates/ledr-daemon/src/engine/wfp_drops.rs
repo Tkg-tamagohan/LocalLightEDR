@@ -643,6 +643,7 @@ impl DaemonEngine {
             exited_at_ms: None,
             superseded_exit: None,
             skip_store_ingest: false,
+            skip_launch_guards: false,
             effective_process_start: None,
             origin_url: cand.origin_url.clone(),
             motw_source: cand.motw_source.clone(),

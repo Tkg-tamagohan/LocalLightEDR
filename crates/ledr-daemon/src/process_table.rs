@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use ledr_proto::{is_never_suspend_process, ProcessIdentity, ACTIVE_PROCESS_TABLE_CAPACITY};
 
+const MAX_EVICTED_EXITED_HISTORY: usize = 1024;
+
 /// Process metadata cached in memory for O(1) parent context lookup during rule evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveProcessEntry {
@@ -48,8 +50,18 @@ pub struct ProcessStartResolution {
     /// running verified process without enriching any missing metadata, so persisting a synthetic
     /// `pid:0` row into SQLite must be skipped.
     pub skip_store_ingest: bool,
+    /// `true` when this `ProcessStart` is a metadata re-enrichment on an already-tracked (or
+    /// previously exited and evicted) instance that did not newly supply `exe_path`, so launch-time
+    /// MOTW and preemptive WFP guards must not re-fire.
+    pub skip_launch_guards: bool,
     /// `process_instance_id` values evicted from memory to stay within `capacity`.
     pub evicted_instance_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EvictedExitedRecord {
+    exited_at_ms: i64,
+    emitted_rule_ids: HashSet<String>,
 }
 
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
@@ -61,6 +73,8 @@ pub struct ActiveProcessTable {
     entries: HashMap<String, ActiveProcessEntry>,
     exited_fifo: VecDeque<String>,
     insertion_fifo: VecDeque<String>,
+    evicted_exited: HashMap<String, EvictedExitedRecord>,
+    evicted_exited_fifo: VecDeque<String>,
     active_count: usize,
 }
 
@@ -80,6 +94,8 @@ impl ActiveProcessTable {
             entries: HashMap::with_capacity(cap.min(1024)),
             exited_fifo: VecDeque::new(),
             insertion_fifo: VecDeque::new(),
+            evicted_exited: HashMap::new(),
+            evicted_exited_fifo: VecDeque::new(),
             active_count: 0,
         }
     }
@@ -142,6 +158,7 @@ impl ActiveProcessTable {
                             exited_at_ms: None,
                             superseded_exit: None,
                             skip_store_ingest: true,
+                            skip_launch_guards: true,
                             evicted_instance_ids: Vec::new(),
                         };
                     }
@@ -209,6 +226,7 @@ impl ActiveProcessTable {
                         exited_at_ms: None,
                         superseded_exit: None,
                         skip_store_ingest: !enriched,
+                        skip_launch_guards: !upgraded_exe,
                         evicted_instance_ids: Vec::new(),
                     };
                 }
@@ -270,6 +288,7 @@ impl ActiveProcessTable {
                 existing.user_sid = user_sid;
             }
             let is_active = existing.exited_at_ms.is_none();
+            let existing_exited_at_ms = existing.exited_at_ms;
             let resolved_parent_id = existing.parent_instance_id.clone();
             if is_active {
                 self.pid_to_identity.insert(identity.pid, identity);
@@ -281,11 +300,33 @@ impl ActiveProcessTable {
                 parent_exe_path,
                 parent_command_line,
                 should_evaluate_sigma,
-                exited_at_ms: None,
+                exited_at_ms: existing_exited_at_ms,
                 superseded_exit: None,
                 skip_store_ingest: false,
+                skip_launch_guards: !upgraded_exe,
                 evicted_instance_ids: Vec::new(),
             };
+        }
+
+        if identity.create_time_100ns != 0 {
+            if let Some(evicted) = self.evicted_exited.get(&instance_id) {
+                let evicted_exit_ms = evicted.exited_at_ms;
+                let (parent_instance_id, parent_exe_path, parent_command_line) =
+                    self.lookup_parent_for(parent_pid, identity, created_at_ms, true);
+                return ProcessStartResolution {
+                    resolved_identity: identity,
+                    instance_id,
+                    parent_instance_id,
+                    parent_exe_path,
+                    parent_command_line,
+                    should_evaluate_sigma: true,
+                    exited_at_ms: Some(evicted_exit_ms),
+                    superseded_exit: None,
+                    skip_store_ingest: false,
+                    skip_launch_guards: true,
+                    evicted_instance_ids: Vec::new(),
+                };
+            }
         }
 
         let (parent_instance_id, parent_exe_path, parent_command_line) =
@@ -342,6 +383,7 @@ impl ActiveProcessTable {
                         exited_at_ms: Some(inferred_exit_ms),
                         superseded_exit: None,
                         skip_store_ingest: false,
+                        skip_launch_guards: true,
                         evicted_instance_ids,
                     };
                 }
@@ -400,6 +442,7 @@ impl ActiveProcessTable {
             exited_at_ms: None,
             superseded_exit,
             skip_store_ingest: false,
+            skip_launch_guards: false,
             evicted_instance_ids,
         }
     }
@@ -616,19 +659,25 @@ impl ActiveProcessTable {
     /// Marks `rule_id` as having emitted an alert for `instance_id`, returning `true` only on
     /// the first alert for that `(instance_id, rule_id)` pair (or when `instance_id` is uncached).
     pub fn mark_rule_alert_emitted(&mut self, instance_id: &str, rule_id: &str) -> bool {
-        match self.entries.get_mut(instance_id) {
-            Some(entry) => entry.emitted_rule_ids.insert(rule_id.to_string()),
-            None => true,
+        if let Some(entry) = self.entries.get_mut(instance_id) {
+            return entry.emitted_rule_ids.insert(rule_id.to_string());
         }
+        if let Some(evicted) = self.evicted_exited.get_mut(instance_id) {
+            return evicted.emitted_rule_ids.insert(rule_id.to_string());
+        }
+        true
     }
 
     /// Clears a previously emitted `(instance_id, rule_id)` alert deduplication mark so
     /// subsequent matches for that rule/canary target can re-evaluate (`BUG_0006` / `BUG_0004`).
     pub fn clear_rule_alert_emitted(&mut self, instance_id: &str, rule_id: &str) -> bool {
-        match self.entries.get_mut(instance_id) {
-            Some(entry) => entry.emitted_rule_ids.remove(rule_id),
-            None => false,
+        if let Some(entry) = self.entries.get_mut(instance_id) {
+            return entry.emitted_rule_ids.remove(rule_id);
         }
+        if let Some(evicted) = self.evicted_exited.get_mut(instance_id) {
+            return evicted.emitted_rule_ids.remove(rule_id);
+        }
+        false
     }
 
     /// Returns `true` when `rule_id` was already marked emitted for `instance_id`
@@ -637,6 +686,10 @@ impl ActiveProcessTable {
         self.entries
             .get(instance_id)
             .is_some_and(|entry| entry.emitted_rule_ids.contains(rule_id))
+            || self
+                .evicted_exited
+                .get(instance_id)
+                .is_some_and(|evicted| evicted.emitted_rule_ids.contains(rule_id))
     }
 
     /// Collects unexited, non-protected descendant [`ProcessIdentity`] values of `root`
@@ -811,7 +864,27 @@ impl ActiveProcessTable {
 
     fn remove_entry(&mut self, instance_id: &str) {
         if let Some(removed) = self.entries.remove(instance_id) {
-            if removed.exited_at_ms.is_none() {
+            if let Some(exit_ms) = removed.exited_at_ms {
+                if removed.identity.create_time_100ns != 0 {
+                    let record = EvictedExitedRecord {
+                        exited_at_ms: exit_ms,
+                        emitted_rule_ids: removed.emitted_rule_ids,
+                    };
+                    if self
+                        .evicted_exited
+                        .insert(removed.instance_id.clone(), record)
+                        .is_none()
+                    {
+                        self.evicted_exited_fifo.push_back(removed.instance_id);
+                        while self.evicted_exited.len() > MAX_EVICTED_EXITED_HISTORY {
+                            let Some(oldest_id) = self.evicted_exited_fifo.pop_front() else {
+                                break;
+                            };
+                            self.evicted_exited.remove(&oldest_id);
+                        }
+                    }
+                }
+            } else {
                 self.active_count = self.active_count.saturating_sub(1);
             }
             if self.pid_to_identity.get(&removed.pid) == Some(&removed.identity) {

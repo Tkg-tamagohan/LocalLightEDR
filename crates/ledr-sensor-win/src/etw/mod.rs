@@ -5,6 +5,7 @@
 pub mod file_canary;
 pub(crate) mod tdh;
 
+mod cmdline_correlator;
 mod context;
 mod handlers;
 mod registry;

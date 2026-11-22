@@ -3932,3 +3932,453 @@ async fn daemon_perf_fastpath_01_verified_app_wide_allow_fast_path_and_invalidat
         "deleted app-wide NetworkAllow must NEVER populate verified_app_wide_allows"
     );
 }
+
+/// `DAEMON-P4-CMD-01`: Short-lived LOTL chain (`cmd.exe` -> `powershell.exe`) where the initial
+/// `ProcessStart` arrives with an empty `command_line`, the process exits (`ProcessStop`), and
+/// a delayed enriched `ProcessStart` (`-EncodedCommand`) arrives afterward:
+/// - `LEDR-LOTL-001` fires once (`process_suspended == false`),
+/// - SQLite `processes` row preserves `exited_at_ms` AND stores the delayed `command_line`,
+/// - Preemptive WFP block is NOT re-applied/leaked for the already-exited process.
+#[tokio::test]
+async fn daemon_p4_cmd_01_exited_short_lived_delayed_cmdline_fires_lotl_without_wfp_leak() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let rules_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/lotl_core.json");
+    let sigma = SigmaEngine::from_json_file(&rules_path).expect("load lotl_core.json");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        sigma,
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("7".repeat(64))),
+    );
+    if let Some(h) = engine.worker_handle.lock().await.take() {
+        h.abort();
+        let _ = h.await;
+    }
+
+    let now_ms = current_unix_ms();
+    let parent_100ns = 116_444_736_000_000_000u64 + ((now_ms - 2_000) as u64) * 10_000;
+    let child_100ns = 116_444_736_000_000_000u64 + ((now_ms - 1_000) as u64) * 10_000;
+    let stop_100ns = child_100ns + 400_000; // 40 ms later
+
+    let cmd_parent = ProcessIdentity::new(8100, parent_100ns);
+    let ps_child = ProcessIdentity::new(8104, child_100ns);
+    let ps_exe = r"C:\Users\Public\Downloads\powershell.exe";
+    let ps_cmd = "powershell.exe -EncodedCommand SQBFAFgA";
+
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: cmd_parent,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\cmd.exe".to_string(),
+            command_line: "cmd.exe /c powershell.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    // 1. Initial ProcessStart with empty command_line adds preemptive block for HighRiskPath.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_child,
+            parent_pid: cmd_parent.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(defense.wfp_blocks_added().len(), 1);
+    assert!(engine.has_active_wfp_filter(ps_exe, None, false));
+    assert!(store.list_alerts(None, 20).expect("list alerts").is_empty());
+
+    // 2. Short-lived process exits -> preemptive block is removed.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: ps_child.pid,
+            exit_time_100ns: stop_100ns,
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+    assert!(!engine.has_active_wfp_filter(ps_exe, None, false));
+
+    // 3. Delayed SystemTrace enrichment arrives with full command_line.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_child,
+            parent_pid: cmd_parent.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_cmd.to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Preemptive WFP filter must NOT be re-added after exit.
+    assert_eq!(defense.wfp_blocks_added().len(), 1);
+    assert!(!engine.has_active_wfp_filter(ps_exe, None, false));
+    assert!(defense.suspended().is_empty());
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    let lotl = alerts
+        .iter()
+        .filter(|a| {
+            a.rule_id == "LEDR-LOTL-001"
+                && a.process_instance_id.as_deref() == Some(ps_child.instance_id().as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lotl.len(), 1, "expected 1 LEDR-LOTL-001 alert, got {alerts:?}");
+    assert!(!lotl[0].process_suspended);
+
+    store.flush_batch().expect("flush sqlite");
+    let snap = store
+        .query_flight_recorder(50, Some(&ps_child.instance_id()))
+        .expect("query flight recorder");
+    let row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == ps_child.instance_id())
+        .expect("child process row persisted");
+    assert_eq!(row.command_line.as_deref(), Some(ps_cmd));
+    assert!(row.exited_at_ms.is_some(), "exited_at_ms must stay set");
+}
+
+/// `DAEMON-P4-CMD-02`: Even after a short-lived exited process is evicted from `ActiveProcessTable`
+/// capacity, a delayed enriched `ProcessStart` does not resurrect it as active, does not fire
+/// WFP/MOTW guards, preserves `exited_at_ms` + `command_line` in SQLite, and fires `LEDR-LOTL-001`.
+#[tokio::test]
+async fn daemon_p4_cmd_02_evicted_exited_process_delayed_cmdline_does_not_resurrect() {
+    use crate::process_table::ActiveProcessTable;
+
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let rules_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/lotl_core.json");
+    let sigma = SigmaEngine::from_json_file(&rules_path).expect("load lotl_core.json");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        sigma,
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("8".repeat(64))),
+    );
+    if let Some(h) = engine.worker_handle.lock().await.take() {
+        h.abort();
+        let _ = h.await;
+    }
+
+    // Replace process_table with a tiny capacity (2) so the exited child is immediately evicted
+    // while cmd.exe stays active as parent.
+    {
+        let mut guard = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = ActiveProcessTable::new(2);
+    }
+
+    let now_ms = current_unix_ms();
+    let parent_100ns = 116_444_736_000_000_000u64 + ((now_ms - 5_000) as u64) * 10_000;
+    let child_100ns = 116_444_736_000_000_000u64 + ((now_ms - 4_000) as u64) * 10_000;
+    let stop_100ns = child_100ns + 350_000;
+    let filler_100ns = 116_444_736_000_000_000u64 + ((now_ms - 3_000) as u64) * 10_000;
+
+    let cmd_parent = ProcessIdentity::new(8200, parent_100ns);
+    let ps_child = ProcessIdentity::new(8204, child_100ns);
+    let filler = ProcessIdentity::new(8208, filler_100ns);
+    let ps_exe = r"C:\Users\Public\Downloads\powershell.exe";
+    let ps_cmd = "powershell.exe -EncodedCommand SQBFAFgA";
+
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: cmd_parent,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\cmd.exe".to_string(),
+            command_line: "cmd.exe /c powershell.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_child,
+            parent_pid: cmd_parent.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: ps_child.pid,
+            exit_time_100ns: stop_100ns,
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+    // Starting filler evicts the exited `ps_child` from capacity-2 `ActiveProcessTable`.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: filler,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\notepad.exe".to_string(),
+            command_line: "notepad.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(table.get_by_instance_id(&ps_child.instance_id()).is_none());
+        assert_eq!(table.active_count(), 2);
+    }
+    assert_eq!(defense.wfp_blocks_added().len(), 1);
+    assert!(!engine.has_active_wfp_filter(ps_exe, None, false));
+
+    // Delayed enriched ProcessStart arrives AFTER eviction.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_child,
+            parent_pid: cmd_parent.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_cmd.to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            table.get_by_instance_id(&ps_child.instance_id()).is_none(),
+            "evicted exited process must NOT be resurrected into active table"
+        );
+        assert!(table.lookup_by_pid(ps_child.pid).is_none());
+        assert_eq!(table.active_count(), 2);
+    }
+    assert_eq!(defense.wfp_blocks_added().len(), 1);
+    assert!(!engine.has_active_wfp_filter(ps_exe, None, false));
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    let lotl = alerts
+        .iter()
+        .filter(|a| {
+            a.rule_id == "LEDR-LOTL-001"
+                && a.process_instance_id.as_deref() == Some(ps_child.instance_id().as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lotl.len(), 1, "expected 1 LEDR-LOTL-001 alert, got {alerts:?}");
+    assert!(!lotl[0].process_suspended);
+
+    // Duplicate delayed ProcessStart after eviction must NOT emit a duplicate LEDR-LOTL-001 alert.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ps_child,
+            parent_pid: cmd_parent.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: ps_cmd.to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let alerts_after_dup = store.list_alerts(None, 20).expect("list alerts after dup");
+    assert_eq!(
+        alerts_after_dup
+            .iter()
+            .filter(|a| {
+                a.rule_id == "LEDR-LOTL-001"
+                    && a.process_instance_id.as_deref() == Some(ps_child.instance_id().as_str())
+            })
+            .count(),
+        1,
+        "evicted_exited must preserve emitted_rule_ids across duplicate delayed ProcessStart"
+    );
+
+    // Unverified `pid:0` entry that exits and is evicted must NEVER poison future `pid:0` starts.
+    let unverified_pid = 8299;
+    let unverified_id = ProcessIdentity::new(unverified_pid, 0);
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: unverified_id,
+            parent_pid: 4,
+            exe_path: r"C:\Tools\tmp.exe".to_string(),
+            command_line: "tmp.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: unverified_pid,
+            exit_time_100ns: 116_444_736_000_000_000u64 + ((now_ms + 500) as u64) * 10_000,
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+    // Evict unverified_id by inserting another active process into capacity-2 table.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(8296, filler_100ns + 10_000),
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\notepad.exe".to_string(),
+            command_line: "notepad.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            table.get_by_instance_id(&unverified_id.instance_id()).is_none(),
+            "exited pid:0 entry must be evicted before testing reuse"
+        );
+    }
+    // Reusing `pid:0` for a HighRiskPath binary must register normally and apply preemptive WFP block.
+    let reused_unverified_exe = r"C:\Users\Public\Downloads\reused_zero.exe";
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: unverified_id,
+            parent_pid: 4,
+            exe_path: reused_unverified_exe.to_string(),
+            command_line: "reused_zero.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = table
+            .get_by_instance_id(&unverified_id.instance_id())
+            .expect("new pid:0 process must be tracked as active");
+        assert_eq!(entry.exe_path, reused_unverified_exe);
+        assert!(entry.exited_at_ms.is_none());
+    }
+    assert!(engine.has_active_wfp_filter(reused_unverified_exe, None, false));
+
+    store.flush_batch().expect("flush sqlite");
+    let snap = store
+        .query_flight_recorder(50, Some(&ps_child.instance_id()))
+        .expect("query flight recorder");
+    let row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == ps_child.instance_id())
+        .expect("evicted child row persisted");
+    assert_eq!(row.command_line.as_deref(), Some(ps_cmd));
+    assert!(row.exited_at_ms.is_some());
+}
+
+/// `DAEMON-P4-CMD-03`: Live process receiving delayed enriched `ProcessStart` (`!upgraded_exe`)
+/// updates `command_line` monotonically (non-empty never overwritten by `""`) and sets
+/// `skip_launch_guards == true` so WFP/MOTW guards are not re-triggered.
+#[tokio::test]
+async fn daemon_p4_cmd_03_live_enrichment_monotonic_cmdline_and_skips_redundant_launch_guards() {
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let engine = start_stopped_engine(
+        store.clone(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(FixedShaInspector("9".repeat(64))),
+    )
+    .await;
+
+    let now_ms = current_unix_ms();
+    let proc_100ns = 116_444_736_000_000_000u64 + ((now_ms - 1_000) as u64) * 10_000;
+    let live_proc = ProcessIdentity::new(8300, proc_100ns);
+    let live_exe = r"C:\Users\Public\Downloads\tool.exe";
+
+    // 1. Initial live ProcessStart with empty command_line -> adds 1 preemptive WFP block.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: live_proc,
+            parent_pid: 4,
+            exe_path: live_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(defense.wfp_blocks_added().len(), 1);
+    assert!(engine.has_active_wfp_filter(live_exe, None, false));
+
+    // Manually clear the preemptive WFP handle inside firewall to prove the 2nd enrichment
+    // `ProcessStart` sets `skip_launch_guards == true` and does NOT call `add_wfp_app_rule` again.
+    {
+        let mut fw = engine.firewall.lock().unwrap_or_else(|e| e.into_inner());
+        fw.remove_preemptive_block_if_unused(live_exe, &*engine.defense);
+    }
+    assert!(!engine.has_active_wfp_filter(live_exe, None, false));
+
+    // Verify table resolution sets skip_launch_guards=true on !upgraded_exe enrichment,
+    // and check monotonic command_line update.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: live_proc,
+            parent_pid: 4,
+            exe_path: live_exe.to_string(),
+            command_line: "tool.exe --enriched".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(
+        defense.wfp_blocks_added().len(),
+        1,
+        "2nd ProcessStart with !upgraded_exe must skip preemptive WFP re-registration"
+    );
+    assert!(!engine.has_active_wfp_filter(live_exe, None, false));
+
+    // 3. Subsequent stale ProcessStart with empty command_line through the full engine pipeline
+    // must NEVER clobber existing cmdline in memory or SQLite and must keep skip_launch_guards.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: live_proc,
+            parent_pid: 4,
+            exe_path: live_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(defense.wfp_blocks_added().len(), 1);
+    assert!(!engine.has_active_wfp_filter(live_exe, None, false));
+
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = table
+            .get_by_instance_id(&live_proc.instance_id())
+            .expect("live entry still present");
+        assert_eq!(entry.command_line, "tool.exe --enriched");
+        assert!(entry.exited_at_ms.is_none());
+    }
+
+    store.flush_batch().expect("flush sqlite");
+    let snap = store
+        .query_flight_recorder(50, Some(&live_proc.instance_id()))
+        .expect("query flight recorder");
+    let row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == live_proc.instance_id())
+        .expect("live row persisted");
+    assert_eq!(row.command_line.as_deref(), Some("tool.exe --enriched"));
+}

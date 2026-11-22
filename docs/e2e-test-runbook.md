@@ -693,7 +693,7 @@ if ($LASTEXITCODE -ne 0) { throw "外部 TCP 接続に失敗しました (target
 
 4. `` `View 3: 防御ポリシー・カナリア・ブラウザシールド` `` を開き、作成した `NetworkAllow` ルールが一覧にあること、右側の `カナリア・おとり配置状態` が `3/3 deployed`（3 箇所のファイルサイズ付き）であること、および `Tier 1 Protected Templates` が表示されていることを確認する。
 5. **IP 許可ルールの削除と遮断復帰の確認（ドメイン許可検証との分離）**：手順 2 で作成した `$targetIp` 宛ての IP `NetworkAllow` ルールが残ったままだと、続く手順 7 の `example.com` 接続が残存 IP 許可だけで通過してしまうため、ここで手順 2 の IP `NetworkAllow` ルール行の `Delete` ボタンを押して削除する。
-   削除後は単一インスタンスの 32 ビット版 PowerShell が WFP ドロップで凍結される可能性があるため、ウィンドウ B から `Start-Process -PassThru` で非同期に `$targetIp` ポート `80` へ接続試行させ、3 秒後に `Suspended` または `BLOCKED:AccessDenied`（`WSAEACCES`、タイムアウト `BLOCKED:TimedOut` は不可）を確認したうえで子プロセスを `Stop-Process -Force` で回収する。
+   削除後は単一インスタンスの 32 ビット版 PowerShell が WFP ドロップで凍結される可能性があるため、ウィンドウ B から `Start-Process -PassThru` で非同期に `$targetIp` ポート `80` へ接続試行させ、最大 5 秒待機（子側の接続タイムアウト 3 秒より長く設定）したうえで `Suspended` または `BLOCKED:AccessDenied`（`WSAEACCES`、タイムアウト `BLOCKED:TimedOut` は不可）を確認し、子プロセスを `Stop-Process -Force` で回収する。
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）: 非同期起動で WFP 遮断復帰（Suspended または AccessDenied）を確認し、凍結子を回収
@@ -729,9 +729,10 @@ try {
 $chkOut = Join-Path $adminDir "p3_04_step5_block.txt"
 Remove-Item -LiteralPath $chkOut -ErrorAction SilentlyContinue
 $chkProc = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$chkPath`"", "-OutFile", "`"$chkOut`"", "-TargetHost", $targetIp -PassThru
-Start-Sleep -Seconds 3
+[void]$chkProc.WaitForExit(5000)
 $isSuspended = [bool]((Get-Process -Id $chkProc.Id -ErrorAction SilentlyContinue).Threads | Where-Object { $_.WaitReason -eq 'Suspended' })
-$resultText = if (Test-Path -LiteralPath $chkOut) { (Get-Content -Encoding UTF8 $chkOut -Raw).Trim() } else { "" }
+$rawOut = if (Test-Path -LiteralPath $chkOut) { Get-Content -Encoding UTF8 -LiteralPath $chkOut -Raw } else { $null }
+$resultText = if ($rawOut) { $rawOut.Trim() } else { "" }
 if (-not $chkProc.HasExited) { Stop-Process -Id $chkProc.Id -Force -ErrorAction SilentlyContinue }
 Write-Output "Step5 Suspended=$isSuspended Result=$resultText"
 if ($resultText -eq 'UNEXPECTED_SUCCESS') { throw "IP 許可ルール削除後に WFP 遮断へ戻りませんでした (target=$targetIp)." }
@@ -762,9 +763,10 @@ $chkPath = Join-Path $adminDir "p3_04_block_check.ps1"
 $chkOut = Join-Path $adminDir "p3_04_step9_block.txt"
 Remove-Item -LiteralPath $chkOut -ErrorAction SilentlyContinue
 $chkProc = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$chkPath`"", "-OutFile", "`"$chkOut`"", "-TargetHost", "example.com" -PassThru
-Start-Sleep -Seconds 3
+[void]$chkProc.WaitForExit(5000)
 $isSuspended = [bool]((Get-Process -Id $chkProc.Id -ErrorAction SilentlyContinue).Threads | Where-Object { $_.WaitReason -eq 'Suspended' })
-$resultText = if (Test-Path -LiteralPath $chkOut) { (Get-Content -Encoding UTF8 $chkOut -Raw).Trim() } else { "" }
+$rawOut = if (Test-Path -LiteralPath $chkOut) { Get-Content -Encoding UTF8 -LiteralPath $chkOut -Raw } else { $null }
+$resultText = if ($rawOut) { $rawOut.Trim() } else { "" }
 if (-not $chkProc.HasExited) { Stop-Process -Id $chkProc.Id -Force -ErrorAction SilentlyContinue }
 Write-Output "Step9 Suspended=$isSuspended Result=$resultText"
 if ($resultText -eq 'UNEXPECTED_SUCCESS') { throw "NetworkBlock 追加後に WFP 遮断へ戻りませんでした (target=example.com)." }
@@ -782,9 +784,10 @@ $chkPath = Join-Path $adminDir "p3_04_block_check.ps1"
 $chkOut = Join-Path $adminDir "p3_04_step10_block.txt"
 Remove-Item -LiteralPath $chkOut -ErrorAction SilentlyContinue
 $chkProc = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$chkPath`"", "-OutFile", "`"$chkOut`"", "-TargetHost", $targetIp -PassThru
-Start-Sleep -Seconds 3
+[void]$chkProc.WaitForExit(5000)
 $isSuspended = [bool]((Get-Process -Id $chkProc.Id -ErrorAction SilentlyContinue).Threads | Where-Object { $_.WaitReason -eq 'Suspended' })
-$resultText = if (Test-Path -LiteralPath $chkOut) { (Get-Content -Encoding UTF8 $chkOut -Raw).Trim() } else { "" }
+$rawOut = if (Test-Path -LiteralPath $chkOut) { Get-Content -Encoding UTF8 -LiteralPath $chkOut -Raw } else { $null }
+$resultText = if ($rawOut) { $rawOut.Trim() } else { "" }
 if (-not $chkProc.HasExited) { Stop-Process -Id $chkProc.Id -Force -ErrorAction SilentlyContinue }
 Write-Output "Step10 Suspended=$isSuspended Result=$resultText"
 if ($resultText -eq 'UNEXPECTED_SUCCESS') { throw "ルール削除後に WFP 遮断へ戻りませんでした (target=$targetIp)." }

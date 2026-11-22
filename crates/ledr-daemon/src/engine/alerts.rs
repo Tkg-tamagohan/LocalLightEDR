@@ -757,13 +757,15 @@ impl DaemonEngine {
                         }
                     }
                 } else if is_network_alert && self.config.outbound_firewall_enabled {
-                    let release_res = {
+                    let (release_res, bound_exe) = {
                         let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                        fw.release_transient_containment_for_alert(
+                        let bound_exe = fw.bound_alert_exe_path(alert_id);
+                        let res = fw.release_transient_containment_for_alert(
                             alert_id,
                             exe_path.as_deref(),
                             &*self.defense,
-                        )
+                        );
+                        (res, bound_exe)
                     };
                     if let Err(err) = release_res {
                         tracing::warn!(
@@ -772,7 +774,7 @@ impl DaemonEngine {
                             "best-effort transient WFP release after terminate without block failed"
                         );
                     }
-                    if let Some(ref exe) = exe_path {
+                    if let Some(exe) = exe_path.as_deref().or(bound_exe.as_deref()) {
                         let target_key = WfpRuleManager::exe_key(exe);
                         // Lock order: `firewall` -> `process_table` (unified with `wfp_premat.rs`
                         // and `events.rs`).
@@ -834,6 +836,12 @@ impl DaemonEngine {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clear_key(&WfpRuleManager::exe_key(exe), dst_ip);
+            }
+            if self.config.outbound_firewall_enabled {
+                if let Some(ref exe) = exe_path {
+                    let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                    self.retry_deferred_preemptive_removal_locked(&mut fw, exe);
+                }
             }
         }
         if let Some(ref proc_inst_id) = alert.process_instance_id {
@@ -1165,6 +1173,39 @@ impl DaemonEngine {
         Ok(())
     }
 
+    /// Retries removal of a non-startup `Preemptive` app-wide WFP block whose `ProcessStop`
+    /// cleanup was deferred while unresolved alerts still referenced it (`PRRT_kwDOVyjVyM66kfDX`).
+    ///
+    /// Only acts when `has_deferred_preemptive_removal` is set, all bound alerts for `exe_path`
+    /// have been released, and `process_table.has_active_exe_key` (which also tracks live
+    /// instances displaced from `entries` into `evicted_live` / overflow fail-closed sets,
+    /// `PRRT_kwDOVyjVyM66ksZW`) confirms no live instance remains.
+    /// Lock order: caller holds `firewall` -> briefly acquires and drops `process_table` before
+    /// calling `remove_wfp_rule`.
+    pub(super) fn retry_deferred_preemptive_removal_locked(
+        &self,
+        fw: &mut WfpRuleManager,
+        exe_path: &str,
+    ) {
+        if !self.config.outbound_firewall_enabled
+            || !fw.has_deferred_preemptive_removal(exe_path)
+            || fw.has_any_bound_alerts_for_exe(exe_path)
+        {
+            return;
+        }
+        let target_key = WfpRuleManager::exe_key(exe_path);
+        let still_active = self
+            .process_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_active_exe_key(&target_key);
+        if still_active {
+            fw.clear_deferred_preemptive_removal(exe_path);
+        } else {
+            fw.remove_preemptive_block_if_unused(exe_path, &*self.defense);
+        }
+    }
+
     fn resolve_sibling_alerts_as_terminated(
         &self,
         resolved_alert_id: &str,
@@ -1192,12 +1233,17 @@ impl DaemonEngine {
                         if other.source_layer == "LAYER_3_NETWORK"
                             && self.config.outbound_firewall_enabled
                         {
+                            let exe_opt = json_non_empty_str(&ctx, "/exe_path");
                             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                            let bound_exe = fw.bound_alert_exe_path(&other.alert_id);
                             let _ = fw.release_transient_containment_for_alert(
                                 &other.alert_id,
-                                json_non_empty_str(&ctx, "/exe_path").as_deref(),
+                                exe_opt.as_deref(),
                                 &*self.defense,
                             );
+                            if let Some(ref exe) = exe_opt.or(bound_exe) {
+                                self.retry_deferred_preemptive_removal_locked(&mut fw, exe);
+                            }
                         }
                     }
                     Ok(false) => {}

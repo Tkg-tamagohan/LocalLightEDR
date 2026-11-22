@@ -46,12 +46,24 @@ pub struct InstalledWfpFilter {
 }
 
 /// Snapshot of a temporarily removed block filter used to compensate if alert resolution fails
-/// during process resume or alert status persistence.
+/// during process resume or alert status persistence (preserving pending/deferred preemptive
+/// removal state across rollback, `PRRT_kwDOVyjVyM66ksZF`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedBlockSnapshot {
     pub key: WfpTargetKey,
     pub exe_path: String,
     pub origin: WfpFilterOrigin,
+    pub prev_pending_removal_failures: Option<u64>,
+    pub prev_deferred_preemptive_removal: bool,
+}
+
+/// Snapshot of a non-persisted app-wide block (`Preemptive` or `TransientContainment`) and its
+/// alert containment bindings removed during reconciliation so SQLite rollback can restore the
+/// block, its bindings, and its pending/deferred removal state (`PRRT_kwDOVyjVyM66ksZF`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedAppBlockSnapshot {
+    pub block: RemovedBlockSnapshot,
+    pub bound_alert_ids: Vec<String>,
 }
 
 /// Individual WFP filter operation failure captured during reconciliation (`#4`).
@@ -68,12 +80,15 @@ pub struct WfpFailedOp {
 }
 
 /// Snapshot of a filter origin promoted/demoted during reconciliation (plus any alert containment
-/// bindings cleared on promotion) so SQLite rollback can restore the exact pre-reconcile state.
+/// bindings and pending/deferred preemptive removal states cleared on promotion) so SQLite
+/// rollback can restore the exact pre-reconcile state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromotedFilterSnapshot {
     pub key: WfpTargetKey,
     pub prev_origin: WfpFilterOrigin,
     pub bound_alert_ids: Vec<String>,
+    pub prev_pending_removal_failures: Option<u64>,
+    pub prev_deferred_preemptive_removal: bool,
 }
 
 /// Snapshot of a [`WfpFilterOrigin::DomainPolicy`] filter removed during reconciliation so
@@ -112,6 +127,7 @@ pub struct WfpReconcileReport {
     pub failed_ops: Vec<WfpFailedOp>,
     pub promoted_backups: Vec<PromotedFilterSnapshot>,
     pub removed_domain_filters: Vec<RemovedDomainFilterSnapshot>,
+    pub removed_app_blocks: Vec<RemovedAppBlockSnapshot>,
 }
 
 /// Parses an optional `allowed_target` string into a canonical [`IpAddr`] when applicable

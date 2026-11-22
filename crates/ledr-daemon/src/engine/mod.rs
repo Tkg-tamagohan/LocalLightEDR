@@ -117,6 +117,14 @@ pub struct DaemonEngine {
     pruned_events: AtomicU64,
     alerts_emitted: AtomicU64,
     fail_record_alert_for_test: AtomicBool,
+    #[cfg(test)]
+    pub(super) tier2c_periodic_sweeps: AtomicU64,
+    #[cfg(test)]
+    pub(super) tier2c_periodic_sweep_removals: AtomicU64,
+    #[cfg(test)]
+    pub(super) select_idle_periodic_sweeps: AtomicU64,
+    #[cfg(test)]
+    pub(super) select_idle_periodic_sweep_removals: AtomicU64,
     worker_handle: tokio::sync::Mutex<Option<JoinHandle<Result<(), StoreError>>>>,
 }
 

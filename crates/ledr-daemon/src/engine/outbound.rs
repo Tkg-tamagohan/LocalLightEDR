@@ -1275,10 +1275,9 @@ impl DaemonEngine {
                                 &*self.defense,
                             );
                     } else if bound_existing_alert {
-                        self.firewall
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .unbind_alert(&alert_id);
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        fw.unbind_alert(&alert_id);
+                        self.retry_deferred_preemptive_removal_locked(&mut fw, exe_path);
                     }
                     if let Some(ref inst_id) = proc_ctx.proc_instance_id {
                         self.clear_rule_alert(inst_id, outbound_dedup_key);

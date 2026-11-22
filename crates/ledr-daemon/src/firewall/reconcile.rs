@@ -15,8 +15,9 @@ use super::hints::{
 };
 use super::manager::WfpRuleManager;
 use super::types::{
-    InstalledWfpFilter, PromotedFilterSnapshot, RemovedDomainFilterSnapshot, WfpFailedOp,
-    WfpFilterOrigin, WfpReconcileDnsContext, WfpReconcileReport, WfpTargetKey,
+    InstalledWfpFilter, PromotedFilterSnapshot, RemovedAppBlockSnapshot, RemovedBlockSnapshot,
+    RemovedDomainFilterSnapshot, WfpFailedOp, WfpFilterOrigin, WfpReconcileDnsContext,
+    WfpReconcileReport, WfpTargetKey,
 };
 
 impl WfpRuleManager {
@@ -451,7 +452,36 @@ impl WfpRuleManager {
                             }
                         }
                         self.installed.remove(&key);
+                        let prev_pending_removal_failures =
+                            self.pending_preemptive_removals.remove(&entry.handle);
+                        let prev_deferred_preemptive_removal =
+                            self.deferred_preemptive_removals.remove(&entry.handle);
+                        let bound_alert_ids: Vec<String> = self
+                            .bound_alerts
+                            .iter()
+                            .filter(|(_, k)| *k == &key)
+                            .map(|(id, _)| id.clone())
+                            .collect();
                         self.bound_alerts.retain(|_, k| k != &key);
+                        if !entry.allow
+                            && matches!(
+                                entry.origin,
+                                WfpFilterOrigin::Preemptive | WfpFilterOrigin::TransientContainment
+                            )
+                            && (prev_pending_removal_failures.is_none()
+                                || !bound_alert_ids.is_empty())
+                        {
+                            report.removed_app_blocks.push(RemovedAppBlockSnapshot {
+                                block: RemovedBlockSnapshot {
+                                    key: key.clone(),
+                                    exe_path: entry.exe_path.clone(),
+                                    origin: entry.origin.clone(),
+                                    prev_pending_removal_failures,
+                                    prev_deferred_preemptive_removal,
+                                },
+                                bound_alert_ids,
+                            });
+                        }
                         report.removed += 1;
                     }
                     Err(err) => {
@@ -554,10 +584,17 @@ impl WfpRuleManager {
                     .filter(|(_, k)| *k == &key)
                     .map(|(alert_id, _)| alert_id.clone())
                     .collect();
+                let promoted_handle = entry.handle;
+                let prev_pending_removal_failures =
+                    self.pending_preemptive_removals.remove(&promoted_handle);
+                let prev_deferred_preemptive_removal =
+                    self.deferred_preemptive_removals.remove(&promoted_handle);
                 report.promoted_backups.push(PromotedFilterSnapshot {
                     key: key.clone(),
                     prev_origin: entry.origin.clone(),
                     bound_alert_ids,
+                    prev_pending_removal_failures,
+                    prev_deferred_preemptive_removal,
                 });
                 entry.origin = WfpFilterOrigin::PersistedPolicy;
                 report.promoted += 1;
@@ -574,6 +611,8 @@ impl WfpRuleManager {
                     key: key.clone(),
                     prev_origin: entry.origin.clone(),
                     bound_alert_ids: Vec::new(),
+                    prev_pending_removal_failures: None,
+                    prev_deferred_preemptive_removal: false,
                 });
                 entry.origin = WfpFilterOrigin::Preemptive;
             }
@@ -588,6 +627,8 @@ impl WfpRuleManager {
                     key: key.clone(),
                     prev_origin: entry.origin.clone(),
                     bound_alert_ids: Vec::new(),
+                    prev_pending_removal_failures: None,
+                    prev_deferred_preemptive_removal: false,
                 });
                 entry.origin = WfpFilterOrigin::DomainPolicy {
                     domain_hints: surviving_hints,
@@ -647,15 +688,25 @@ impl WfpRuleManager {
         report
     }
 
-    /// Restores filter origins and alert containment bindings overwritten during a failed
-    /// reconciliation pass whose SQLite mutation was rolled back.
+    /// Restores filter origins, alert containment bindings, and pending/deferred preemptive
+    /// removal states overwritten during a failed reconciliation pass whose SQLite mutation was
+    /// rolled back (`PRRT_kwDOVyjVyM66kfDu`).
     pub fn restore_promoted_filter_states(&mut self, backups: &[PromotedFilterSnapshot]) {
         for snap in backups {
             if let Some(entry) = self.installed.get_mut(&snap.key) {
+                let handle = entry.handle;
                 entry.origin = snap.prev_origin.clone();
                 for alert_id in &snap.bound_alert_ids {
                     self.bound_alerts
                         .insert(alert_id.clone(), snap.key.clone());
+                }
+                if let Some(failures) = snap.prev_pending_removal_failures {
+                    self.pending_preemptive_removals
+                        .entry(handle)
+                        .or_insert(failures);
+                }
+                if snap.prev_deferred_preemptive_removal {
+                    self.deferred_preemptive_removals.insert(handle);
                 }
             }
         }
@@ -696,6 +747,48 @@ impl WfpRuleManager {
                         "failed to restore removed DomainPolicy WFP filter during rollback"
                     );
                 }
+            }
+        }
+    }
+
+    /// Best-effort restoration of non-persisted app-wide block filters (`Preemptive` or
+    /// `TransientContainment`) removed during reconciliation before a subsequent failure caused
+    /// SQLite rollback, preserving alert containment bindings and pending/deferred preemptive
+    /// removal state (`PRRT_kwDOVyjVyM66ksZF`, `PRRT_kwDOVyjVyM66k6kK`).
+    ///
+    /// For non-startup `Preemptive` blocks, re-verifies executable liveness via `is_exe_active`
+    /// (called under `firewall -> process_table` order and releasing any `process_table` lock
+    /// before BFE I/O):
+    /// - if no active process remains and no alert is bound, skips restoration so an already-exited
+    ///   executable does not resurrect an orphaned `Preemptive` block;
+    /// - if no active process remains while alerts remain bound, restores the block with
+    ///   `prev_deferred_preemptive_removal = true` so resolving the final bound alert cleans it up.
+    pub fn restore_removed_app_blocks<F>(
+        &mut self,
+        removed: &[RemovedAppBlockSnapshot],
+        mut is_exe_active: F,
+        defense: &dyn ActiveDefenseController,
+    ) where
+        F: FnMut(&str) -> bool,
+    {
+        for snap in removed {
+            let is_non_startup_preemptive = snap.block.origin == WfpFilterOrigin::Preemptive
+                && !self.startup_preemptive_exes.contains_key(&snap.block.key.0);
+            let mut block = snap.block.clone();
+            if is_non_startup_preemptive {
+                let has_bound_alerts = !snap.bound_alert_ids.is_empty()
+                    || self.bound_alerts.values().any(|k| k == &snap.block.key);
+                let still_active = is_exe_active(&snap.block.key.0);
+                if !still_active {
+                    if !has_bound_alerts {
+                        continue;
+                    }
+                    block.prev_deferred_preemptive_removal = true;
+                }
+            }
+            self.restore_lifted_block(None, block, defense);
+            for alert_id in &snap.bound_alert_ids {
+                self.bind_alert_to_app_block(alert_id, &snap.block.exe_path);
             }
         }
     }

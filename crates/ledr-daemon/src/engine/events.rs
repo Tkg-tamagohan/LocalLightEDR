@@ -459,69 +459,10 @@ impl DaemonEngine {
             SensorEvent::ProcessStop { pid, .. } => {
                 if let Some(ref inst_id) = proc_ctx.proc_instance_id {
                     self.outbound_classifier.remove_pid(*pid);
-                    self.verified_app_wide_allows
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(inst_id);
-                    self.process_dns_history
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove_process(inst_id);
-                    // Lock order: `firewall` -> `process_table` (unified with `wfp_premat.rs`
-                    // and `alerts.rs`) so preemptive removal and concurrent launch-guard commits
-                    // serialize atomically without TOCTOU leaks.
-                    let restore_preemptive_exe: Option<String> = {
-                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                        let was_once_allowed = fw.on_process_stop(inst_id);
-                        if self.config.outbound_firewall_enabled {
-                            if let Some(ref exe_path) = proc_ctx.proc_exe_path {
-                                let exe_k = WfpRuleManager::exe_key(exe_path);
-                                let is_startup_pinned = fw.is_startup_preemptive(exe_path);
-                                let is_preemptive = fw
-                                    .active_app_block(exe_path)
-                                    .is_some_and(|(_, origin)| {
-                                        origin == WfpFilterOrigin::Preemptive
-                                    });
-                                let has_any_filter = fw.has_any_app_filter(exe_path);
-                                let has_other_once_allowed = fw.has_once_allowed_for_exe(&exe_k);
-
-                                if is_preemptive && !is_startup_pinned {
-                                    let still_active = self
-                                        .process_table
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .has_active_exe_key(&exe_k);
-                                    if !still_active {
-                                        fw.remove_preemptive_block_if_unused(
-                                            exe_path,
-                                            &*self.defense,
-                                        );
-                                    }
-                                    None
-                                } else if was_once_allowed
-                                    && !has_any_filter
-                                    && !has_other_once_allowed
-                                {
-                                    let should_restore = is_startup_pinned
-                                        || self
-                                            .process_table
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .has_active_exe_key(&exe_k);
-                                    should_restore.then(|| exe_path.clone())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(ref exe_path) = restore_preemptive_exe {
-                        self.maybe_apply_preemptive_wfp_block(exe_path);
-                    }
+                    self.cleanup_firewall_for_stopped_instance(
+                        inst_id,
+                        proc_ctx.proc_exe_path.as_deref(),
+                    );
                 }
                 "OBSERVED"
             }
@@ -818,6 +759,12 @@ impl DaemonEngine {
             for evicted_id in &res.evicted_instance_ids {
                 cache.remove(evicted_id);
             }
+        }
+        for (prev_id, prev_exe) in &res.superseded_exited_processes {
+            self.cleanup_firewall_for_stopped_instance(
+                prev_id,
+                (!prev_exe.trim().is_empty()).then_some(prev_exe.as_str()),
+            );
         }
 
         Some((
@@ -1246,12 +1193,74 @@ impl DaemonEngine {
         table.clear_rule_alert_emitted(instance_id, rule_id)
     }
 
+    /// Releases per-process firewall/DNS state and cleans up or restores non-startup `Preemptive`
+    /// WFP blocks after a process instance stops (either via explicit `ProcessStop` or via PID
+    /// reuse superseding an active or evicted-live record, `PRRT_kwDOVyjVyM66k6ks`).
+    ///
+    /// Lock order: `firewall` -> `process_table` (unified with `wfp_premat.rs` and `alerts.rs`).
+    /// Must be called without holding `process_table` or `firewall`.
+    fn cleanup_firewall_for_stopped_instance(&self, inst_id: &str, exe_path: Option<&str>) {
+        self.verified_app_wide_allows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(inst_id);
+        self.process_dns_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_process(inst_id);
+        let restore_preemptive_exe: Option<String> = {
+            let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+            let was_once_allowed = fw.on_process_stop(inst_id);
+            if self.config.outbound_firewall_enabled {
+                if let Some(exe_path) = exe_path.filter(|p| !p.trim().is_empty()) {
+                    let exe_k = WfpRuleManager::exe_key(exe_path);
+                    let is_startup_pinned = fw.is_startup_preemptive(exe_path);
+                    let is_preemptive = fw
+                        .active_app_block(exe_path)
+                        .is_some_and(|(_, origin)| origin == WfpFilterOrigin::Preemptive);
+                    let has_any_filter = fw.has_any_app_filter(exe_path);
+                    let has_other_once_allowed = fw.has_once_allowed_for_exe(&exe_k);
+
+                    if is_preemptive && !is_startup_pinned {
+                        let still_active = self
+                            .process_table
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .has_active_exe_key(&exe_k);
+                        if !still_active {
+                            fw.remove_preemptive_block_if_unused(exe_path, &*self.defense);
+                        }
+                        None
+                    } else if was_once_allowed && !has_any_filter && !has_other_once_allowed {
+                        let should_restore = is_startup_pinned
+                            || self
+                                .process_table
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .has_active_exe_key(&exe_k);
+                        should_restore.then(|| exe_path.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(ref exe_path) = restore_preemptive_exe {
+            self.maybe_apply_preemptive_wfp_block(exe_path);
+        }
+    }
+
     pub(super) fn resolve_process_context(
         &self,
         event: &SensorEvent,
         event_ts_ms: i64,
     ) -> ResolvedProcessContext {
         let mut evicted_instance_ids: Vec<String> = Vec::new();
+        let mut superseded_exited_processes: Vec<(String, String)> = Vec::new();
         let ctx = {
             let mut table = self
                 .process_table
@@ -1275,6 +1284,7 @@ impl DaemonEngine {
                         event_ts_ms,
                     );
                     evicted_instance_ids = res.evicted_instance_ids;
+                    superseded_exited_processes = res.superseded_exited_processes;
                 let (
                     resolved_exe,
                     resolved_cmd,
@@ -1342,11 +1352,10 @@ impl DaemonEngine {
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
-                let id = table.on_process_stop(*pid, event_ts_ms);
-                let exe_path = id
-                    .as_deref()
-                    .and_then(|inst_id| table.get_by_instance_id(inst_id))
-                    .map(|entry| entry.exe_path.clone());
+                let (id, exe_path) = match table.on_process_stop_with_exe(*pid, event_ts_ms) {
+                    Some((inst_id, exe)) => (Some(inst_id), Some(exe)),
+                    None => (None, None),
+                };
                 ResolvedProcessContext {
                     proc_identity: None,
                     proc_instance_id: id.clone(),
@@ -1445,6 +1454,12 @@ impl DaemonEngine {
             for evicted_id in &evicted_instance_ids {
                 cache.remove(evicted_id);
             }
+        }
+        for (prev_id, prev_exe) in &superseded_exited_processes {
+            self.cleanup_firewall_for_stopped_instance(
+                prev_id,
+                (!prev_exe.trim().is_empty()).then_some(prev_exe.as_str()),
+            );
         }
         ctx
     }

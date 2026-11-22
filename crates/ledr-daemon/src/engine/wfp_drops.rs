@@ -1044,10 +1044,9 @@ impl DaemonEngine {
                 "failed to record app-level ambiguous WFP drop alert"
             );
             if bound_existing {
-                self.firewall
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .unbind_alert(&alert_id);
+                let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                fw.unbind_alert(&alert_id);
+                self.retry_deferred_preemptive_removal_locked(&mut fw, canonical_exe);
             }
             self.app_wfp_alert_dedup
                 .lock()

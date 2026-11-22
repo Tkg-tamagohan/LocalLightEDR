@@ -753,54 +753,98 @@ if (-not $isSuspended -and $resultText -ne 'BLOCKED:AccessDenied') { throw "WFP 
    - **Executable Path \***：`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`
    - **Target IP / Domain / Path**：`example.com`
    - **SHA-256**：ウィンドウ B で `(Get-FileHash C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe).Hash.ToLowerInvariant()` を実行して得た値（または手順 4 で確認した署名ルールの `Signer Subject` と `Root Thumbprint` を控えて指定してもよい）
-7. ルール行にドメイン由来ルールを示す静的な `IP-resolved` バッジ（解決済み IP を WFP へ適用するルールであることを示す表示）が付いていることを確認したうえで、ウィンドウ B から 32 ビット版 PowerShell で `example.com` の IPv4 アドレスを解決し（ETW `DNS-Client` の `FlushTimer = 1` 秒を見込んで 1.5 秒待機）、プロキシを経由しない直接 TCP ポート `80` 接続が成功することを確認して接続先 IPv4 を `$adminDir\p3_04_domain_ip.txt` へ記録する。
+7. ルール行にドメイン由来ルールを示す静的な `IP-resolved` バッジ（解決済み IP を WFP へ適用するルールであることを示す表示）が付いていることを確認したうえで、ウィンドウ B から 32 ビット版 PowerShell を非同期起動して `example.com` の IPv4 候補を解決し（ETW `DNS-Client` の `FlushTimer = 1` 秒を見込んで 1.5 秒待機）、続けて各候補 IPv4 に対して 1 件ずつ非同期の直接 TCP ポート `80` 接続（プロキシ非経由、1 候補あたり最大 6 秒待機し未終了子は `Stop-Process -Force` で回収）を試行して接続成功した IPv4 を `$adminDir\p3_04_domain_ip.txt` へ記録する。
 
 ```powershell
-# ウィンドウ B（管理者 PowerShell）: example.com を解決し、プロキシ非経由の直接 TCP:80 接続成功と接続先 IPv4 を確認・記録
+# ウィンドウ B（管理者 PowerShell）: example.com を解決し、各 IPv4 候補へ非同期で直接 TCP:80 接続して成功 IPv4 を記録
 $adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 $targetIp = (Get-Content -Encoding UTF8 -LiteralPath (Join-Path $adminDir "p3_target_ip.txt") -Raw).Trim()
+$candFile = Join-Path $adminDir "p3_04_domain_candidates.txt"
 $domainIpFile = Join-Path $adminDir "p3_04_domain_ip.txt"
-Remove-Item -LiteralPath $domainIpFile -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $candFile, $domainIpFile -ErrorAction SilentlyContinue
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-$allowPath = Join-Path $adminDir "p3_04_domain_allow_check.ps1"
-$allowScript = @'
-param([string]$OutFile, [string]$PreferredIp)
-$ErrorActionPreference = 'Stop'
+
+$resolvePath = Join-Path $adminDir "p3_04_domain_resolve.ps1"
+$resolveScript = @'
+param([string]$OutFile)
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $ipv4s = @([System.Net.Dns]::GetHostAddresses('example.com') |
     Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
     ForEach-Object { $_.IPAddressToString } | Select-Object -Unique)
-if ($ipv4s.Count -eq 0) { throw "Failed to resolve any IPv4 address for example.com." }
-Start-Sleep -Milliseconds 1500
-$ordered = @()
-if ($PreferredIp -and ($ipv4s -contains $PreferredIp)) { $ordered += $PreferredIp }
-$ordered += @($ipv4s | Where-Object { $_ -ne $PreferredIp })
-$connectedIp = $null
-foreach ($ip in $ordered) {
-    $c = [System.Net.Sockets.TcpClient]::new()
-    try {
-        $ar = $c.BeginConnect($ip, 80, $null, $null)
-        if ($ar.AsyncWaitHandle.WaitOne(3000)) {
-            $c.EndConnect($ar)
-            if ($c.Connected) { $connectedIp = $ip; break }
-        }
-    } catch {
-        # Try next IPv4 candidate
-    } finally {
-        $c.Close()
-    }
+if ($ipv4s.Count -gt 0) {
+    [System.IO.File]::WriteAllText($OutFile, [string]::Join([Environment]::NewLine, $ipv4s), $utf8NoBom)
 }
-if (-not $connectedIp) { throw "Direct TCP:80 connect failed for all resolved example.com IPv4 candidates ($($ordered -join ','))." }
-[System.IO.File]::WriteAllText($OutFile, $connectedIp, $utf8NoBom)
-Write-Output "Domain direct TCP connect succeeded: $($connectedIp):80"
+Start-Sleep -Milliseconds 1500
+'@
+[System.IO.File]::WriteAllText($resolvePath, $resolveScript, [System.Text.UTF8Encoding]::new($false))
+
+$resProc = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$resolvePath`"", "-OutFile", "`"$candFile`"" -PassThru
+[void]$resProc.WaitForExit(8000)
+if (-not $resProc.HasExited) { Stop-Process -Id $resProc.Id -Force -ErrorAction SilentlyContinue }
+$rawCands = if (Test-Path -LiteralPath $candFile) { Get-Content -Encoding UTF8 -LiteralPath $candFile -Raw } else { $null }
+$ipv4s = @()
+if ($rawCands) {
+    $ipv4s = @($rawCands -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
+}
+if ($ipv4s.Count -eq 0) { throw "example.com の IPv4 アドレスを解決できませんでした。" }
+
+$allowPath = Join-Path $adminDir "p3_04_domain_allow_check.ps1"
+$allowScript = @'
+param([string]$OutFile, [string]$TargetIp)
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$c = [System.Net.Sockets.TcpClient]::new()
+$res = ""
+try {
+    $ar = $c.BeginConnect($TargetIp, 80, $null, $null)
+    if ($ar.AsyncWaitHandle.WaitOne(3000)) {
+        $c.EndConnect($ar)
+        if ($c.Connected) { $res = "CONNECTED" } else { $res = "NOT_CONNECTED" }
+    } else {
+        $res = "TIMED_OUT"
+    }
+} catch {
+    $ex = $_.Exception
+    while ($ex -and -not ($ex -is [System.Net.Sockets.SocketException])) { $ex = $ex.InnerException }
+    $code = if ($ex -is [System.Net.Sockets.SocketException]) { $ex.SocketErrorCode.ToString() } else { $_.Exception.GetType().Name }
+    $res = "FAILED:" + $code
+} finally {
+    $c.Close()
+}
+[System.IO.File]::WriteAllText($OutFile, $res, $utf8NoBom)
 '@
 [System.IO.File]::WriteAllText($allowPath, $allowScript, [System.Text.UTF8Encoding]::new($false))
-& $ps32 -NoProfile -ExecutionPolicy Bypass -File $allowPath -OutFile $domainIpFile -PreferredIp $targetIp
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $domainIpFile)) {
-    throw "example.com ドメイン許可下の直接 TCP:80 接続確認に失敗しました (exit code: $LASTEXITCODE)."
+
+$ordered = @()
+if ($targetIp -and ($ipv4s -contains $targetIp)) { $ordered += $targetIp }
+$ordered += @($ipv4s | Where-Object { $_ -ne $targetIp })
+$connectedIp = $null
+$attempts = @()
+foreach ($ip in $ordered) {
+    $allowOut = Join-Path $adminDir "p3_04_step7_allow.txt"
+    Remove-Item -LiteralPath $allowOut -ErrorAction SilentlyContinue
+    $allowProc = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$allowPath`"", "-OutFile", "`"$allowOut`"", "-TargetIp", $ip -PassThru
+    [void]$allowProc.WaitForExit(6000)
+    $isSuspended = $false
+    if (-not $allowProc.HasExited) {
+        $liveProc = Get-Process -Id $allowProc.Id -ErrorAction SilentlyContinue
+        if ($liveProc) {
+            $isSuspended = [bool]($liveProc.Threads | Where-Object { $_.ThreadState -eq 'Wait' -and $_.WaitReason -eq 'Suspended' })
+        }
+        Stop-Process -Id $allowProc.Id -Force -ErrorAction SilentlyContinue
+    }
+    $rawAllow = if (Test-Path -LiteralPath $allowOut) { Get-Content -Encoding UTF8 -LiteralPath $allowOut -Raw } else { $null }
+    $allowResult = if ($rawAllow) { $rawAllow.Trim() } else { "" }
+    $attempts += "${ip}:Suspended=$isSuspended,Result=$allowResult"
+    if ($allowResult -eq 'CONNECTED') {
+        $connectedIp = $ip
+        break
+    }
 }
-$domainIp = (Get-Content -Encoding UTF8 -LiteralPath $domainIpFile -Raw).Trim()
-if (-not $domainIp) { throw "p3_04_domain_ip.txt が空です。" }
+if (-not $connectedIp) {
+    throw "example.com ドメイン許可下の直接 TCP:80 接続確認に失敗しました ($($attempts -join '; '))."
+}
+[System.IO.File]::WriteAllText($domainIpFile, $connectedIp, [System.Text.UTF8Encoding]::new($false))
+Write-Output "Domain direct TCP connect succeeded: ${connectedIp}:80"
 ```
 
 8. Deny 優先（検証 B）のため、再び `+ Add Rule` を押し、同じ `Executable Path *`（`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`）と `Target IP / Domain / Path`（`example.com`）に対し `Scope` を `NetworkBlock (WFP Deny)` として `Save Rule` を押す。

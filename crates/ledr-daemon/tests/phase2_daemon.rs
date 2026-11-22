@@ -1316,6 +1316,52 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
 }
 
 #[tokio::test]
+async fn ipc_dacl_01_dev_bypass_with_strict_pipe_dacl_allows_client_roundtrip() {
+    let strict_pipe = unique_test_pipe_name();
+    let store = LedrStore::open_in_memory().expect("open store");
+    let engine = DaemonEngine::start(
+        store,
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: strict_pipe.clone(),
+            dev_mode_bypass_ui_auth: true,
+            strict_pipe_dacl: true,
+            ..DaemonConfig::default()
+        },
+    );
+    let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("bind strict SDDL Named Pipe");
+
+    let pipe_client = strict_pipe.clone();
+    let (ping_resp, resolve_resp) = tokio::task::spawn_blocking(move || {
+        // `send_pipe_request` uses `open_pipe_with_retry` with access_mode(0x0012_019B).
+        let ping = send_pipe_request(&pipe_client, &IpcRequest::Ping);
+        let resolve = send_pipe_request(
+            &pipe_client,
+            &IpcRequest::ResolveAlert {
+                alert_id: "nonexistent-alert-id".to_string(),
+                decision: AlertDecision::AllowOnce,
+            },
+        );
+        (ping, resolve)
+    })
+    .await
+    .expect("join strict IPC client under dev bypass");
+
+    assert!(matches!(ping_resp, IpcResponse::Pong { .. }));
+    assert!(
+        matches!(
+            resolve_resp,
+            IpcResponse::Error { ref code, .. } if code == "NOT_FOUND"
+        ),
+        "expected NOT_FOUND (not UNAUTHORIZED) when dev_mode_bypass_ui_auth=true & strict_pipe_dacl=true, got {resolve_resp:?}"
+    );
+
+    ipc_handle.shutdown().await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn daemon_p2_07_default_allowlist_does_not_bypass_canary_for_system32_lolbins() {
     let allowlist_json = include_str!("../../../rules/default_allowlist.json");
     let cfg = AllowlistConfig::from_json_str(allowlist_json).expect("parse default_allowlist.json");

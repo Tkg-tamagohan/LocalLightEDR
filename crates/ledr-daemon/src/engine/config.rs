@@ -62,8 +62,11 @@ pub struct DaemonConfig {
     /// `C:\Program Files\LocalEDR\ledr-ui.exe` install-path check while still inspecting
     /// and logging caller process identity.
     pub dev_mode_bypass_ui_auth: bool,
-    /// When `true` (strict mode, default unless `--dev-bypass-auth` is set), applies `SERVICE_PIPE_SDDL`
+    /// When `true`, applies `SERVICE_PIPE_SDDL`
     /// (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)`) when creating the Named Pipe.
+    /// The `ledr-daemon` CLI always sets this to `true` (including under `--dev-bypass-auth`)
+    /// so an elevated daemon grants Interactive Users `0x12019B` read/write access;
+    /// `DaemonConfig::default()` keeps `false` for same-privilege unit/integration tests.
     pub strict_pipe_dacl: bool,
     /// Optional expected lowercase SHA-256 hex digest for the authorized UI binary (`L-09`).
     pub authorized_ui_sha256: Option<String>,

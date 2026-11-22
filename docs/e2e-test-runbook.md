@@ -633,6 +633,7 @@ Set-Location $repoRoot
 1. `View 1: アラートトリアージ` で、`E2E-P3-01` で発生した単一インスタンス側の `SysWOW64\...\powershell.exe` アラート（`LEDR-NET-SCRIPT-INTERPRETER`）を選択する。
 2. 右下の `Allow Permanent Rule` カードで `Target scope (optional)` に `93.184.216.34` を入力し、`Match Authenticode signer` がオンの状態で `Allow Permanent Rule` ボタンを押す（5 秒以内に先ほどの凍結中 `$ps32Proc1` が再開して終了することを確認し、残っていれば `Stop-Process` で停止する）。
 3. ウィンドウ B から 32 ビット版 PowerShell で `93.184.216.34:80` へ再接続し、`External connect succeeded` が出力されて通信が通ることを確認する。
+   なお、`93.184.216.34:80` のリモート側が応答せずタイムアウト（`WSAETIMEDOUT`）になった場合でも、WFP 遮断時の即座の拒否（`WSAEACCES`、「アクセス許可で禁じられた方法でソケットにアクセスしようとしました」）が消えて外部タイムアウトへ変化していれば WFP 許可の適用は確認でき、直接の HTTP 200 疎通は手順 5 と 6 の `example.com` で確認する。
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
@@ -727,7 +728,7 @@ $stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
 $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Get-Item (Join-Path $runDir "nrd_hang.db-wal") -ErrorAction SilentlyContinue | Select-Object Name, Length
 $nrdHangDb = Join-Path $runDir "nrd_hang.db"
-python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print('processes=', c.execute('SELECT count(*) FROM processes').fetchone()[0]); print(c.execute('SELECT pid, exe_path, command_line FROM processes ORDER BY rowid DESC LIMIT 3').fetchall())" $nrdHangDb
+python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print('processes=', c.execute('SELECT count(*) FROM processes').fetchone()[0]); print(c.execute('SELECT pid, exe_path, command_line FROM processes ORDER BY created_at_ms DESC LIMIT 3').fetchall())" $nrdHangDb
 ```
 
 ### E2E-P3-07：`taskkill /F` 強制終了時の動的 WFP フィルタ 0 件自動消去
@@ -768,6 +769,7 @@ if ($LASTEXITCODE -ne 0) { throw "強制終了後の外部 TCP 接続回復に�
 ```
 
 `Select-String` の一致件数が **0 件** になり、そのまま `External connect succeeded` で外部通信が回復していれば、動的セッション（`FWPM_SESSION_FLAG_DYNAMIC`）による異常終了時の通信不能回避は合格です。
+なお、`93.184.216.34:80` のリモート側が応答せず `WSAETIMEDOUT` になる環境では、`WSAEACCES` が消えて接続試行が外部へ出たことを確認したうえで、`Invoke-WebRequest -UseBasicParsing http://example.com -TimeoutSec 5` で HTTP 200 を確認してください。
 
 ## 4. Track B：Phase 4 実機 Chrome E2E 検証（FU-E2E-02）
 
@@ -1512,6 +1514,8 @@ Get-Item "$env:USERPROFILE\Downloads\localedr-e2e-sample*.exe", "$env:USERPROFIL
 | 同じブラウザ操作を再試行しても View 1 に記録が増えない | `L-19` の 30 秒重複抑止（上限 256 件）が働いている | 30 秒以上待つか、別サブドメイン（`pastejack-sim` 等）で開き、`ledr-ui` 上部の `Refresh` を押す |
 | View 2 に全体のダウンロード履歴が見えない | 左ペインで特定プロセスが選択されたままになっている | 左ペイン上部の `All` を押して `Scope: All Processes` へ戻し、`Canary & Downloads` タブを見る |
 | 移動した `localedr-e2e-sample.exe` が WFP 遮断されない | 移動前に Chrome ダウンロード通知の SHA-256 算出と記録が終わっていない | 一度削除してダウンロードし直し、移動前に View 2 記録を確認してから移動する |
+| `Microsoft-Windows-Kernel-Process` のイベントが 1 件も届かず新規プロセス登録や WFP ドロップ相関が機能しない | Windows の ETW 1 プロバイダ上限（8 セッション）に到達し、終了済みアプリの残留セッション等が配信枠を占有している | `logman query -ets` で `Microsoft-Windows-Kernel-Process` 購読セッションを確認し、不要な残留セッションを `logman stop <セッション名> -ets` で停止したうえで `ledr-daemon.exe` を再起動する |
+| Track B で `E2E-P4-03` または `E2E-P4-04` が発火しない、または検証ページが読み込み中のまま開かない | 前ステップのホスト名（`clickfix-sim` 等）のまま操作している、またはローカル HTTP サーバの `python.exe` が別インスタンス由来の WFP ドロップで凍結されている | ページ表示の `Hostname:` が対象ドメインであることを確認し、読み込み停止時は `View 1` で `python.exe` の凍結アラートを `Allow Once` で再開するか `local_server.py` を再起動する |
 
 ### ルート別完了判定基準
 

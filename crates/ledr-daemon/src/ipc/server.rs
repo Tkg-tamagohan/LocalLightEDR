@@ -75,8 +75,9 @@ fn create_pipe_server(
 /// Binds the initial Named Pipe instance synchronously (preventing client connection races)
 /// and spawns an asynchronous accept loop serving 4-byte LE JSON frames.
 ///
-/// In `--foreground` dev mode (`strict_pipe_dacl: false`), uses the process default security
-/// descriptor. In `--service-strict` mode (`strict_pipe_dacl: true`), applies
+/// In same-privilege test harnesses (`strict_pipe_dacl: false`), uses the process default
+/// security descriptor. The `ledr-daemon` CLI always sets `strict_pipe_dacl: true` (both
+/// under `--foreground --dev-bypass-auth` and `--service-strict`), applying
 /// [`SERVICE_PIPE_SDDL`] restricting access to `SYSTEM`, `Administrators`, and `Interactive`
 /// users (`決定記録 L-09`).
 pub fn start_ipc_server(engine: Arc<DaemonEngine>) -> std::io::Result<IpcServerHandle> {

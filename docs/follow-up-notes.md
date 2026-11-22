@@ -11,6 +11,9 @@
 | `FU-P4-01` | 副次改善 | Phase 4 | `ledr-bridge-nm` の `HKLM` 登録および確認における 32 ビットレジストリビュー（`KEY_WOW64_32KEY`）対応 | 次回 `crates/ledr-bridge-nm/` 改修または後続整備 PR |
 | `FU-E2E-01` | 実機 E2E 検証 | Phase 2、Phase 3 | Windows 10 および Windows 11 クライアント SKU 管理者環境での実機検証 | 独立した実機 E2E 検証 PR |
 | `FU-E2E-02` | 実機 E2E 検証 | Phase 4 | Windows 10 および Windows 11 クライアント SKU 上での Chrome 拡張、Native Messaging、MOTW、および UI 終了の実機検証 | 独立した実機 E2E 検証 PR |
+| `FU-E2E-03` | 性能最適化 | Phase 3、Phase 4 | `E2E-PERF-01` の `WorkingSet64` 基準（20 MB 以下）超過（アイドル最新 `28.59 MB`、ピーク `108.71 MB`、高負荷最新 `51.80 MB`、ピーク `64.34 MB`）の原因分析とメモリ削減 | 次回性能改善 PR |
+| `FU-E2E-04` | 検知改善 | Phase 1、Phase 3 | 短命プロセス（約 40 ms）での PEB 補完欠落による `command_line` 欠落と `LEDR-LOTL-001` 未発火の解消 | 次回センサーおよび ETW 改善 PR |
+| `FU-E2E-05` | 境界改善 | Phase 3 | WFP ドロップの終了済み兄弟プロセス由来の誤帰属抑止および `E2E-P3-06` 停止予算超過時の残余書き込みによる `-wal` 再生成の整理 | 次回デーモン境界改善 PR |
 
 ## FU-P3-01 満杯 32 件時の非許可同居ヒント再挿入の抑制
 
@@ -81,9 +84,18 @@ Phase 2 は PR #3（ブランチ `phase-2-canary-suspend`、マージコミッ�
 
 Phase 2 と Phase 3 の実装は静的検査（`cargo clippy --workspace --all-targets --locked -- -D warnings`）、ワークスペース全体の単体および統合テスト（`cargo test --workspace --locked`）、バースト負荷テスト（`burst_budget`）、および TTL 回帰テスト（`ttl_purge_lineage`）に合格して `main` へマージ済みである。
 
-#### 未検証の残存範囲
+2026 年 11 月 22 日に `Windows 11 Home`（`10.0.26300`、`ProductType = 1`、基盤コミット `9c8373e` に `fix/e2e-pipe-dacl-dev-bypass` の Named Pipe DACL 修正を加えた構成）で [e2e-test-runbook.md](e2e-test-runbook.md) のルート 1 を実施し、Track A の以下を確認した。
 
-管理者昇格した Windows 10 または Windows 11（x86_64）クライアント SKU 実機での実 ETW 配送、実カーネル BFE 動的フィルタ登録と強制終了時の自動消去、実プロセスの非同期ツリー終了、Session 0 から対話ユーザーセッションへのトースト起動、および応答しない実 UNC や SMB 共有での NRD 読み取り停止は未実施である。
+- `PREP-01` から `PREP-04`、`E2E-P2-01` から `E2E-P2-06`、`E2E-P3-01`、`E2E-P3-02`、`E2E-P3-04`、`E2E-P3-05`（公開 2 フィード `feeds_succeeded = 2`、`feeds_failed = 0`、`entries = 50000`）、`E2E-P3-06`（`wal_checkpoint(TRUNCATE)` の NRD デタッチ先行とマーカー行永続化）、`E2E-P3-07`（`taskkill /F` 後の WFP フィルタ 0 件消去）、および `E2E-UI-01`（0 プロセス終了）が実機で通過した。
+- `E2E-PERF-01` の定常 CPU 使用率はアイドル 600 秒で `0.2876%`、高負荷 60 秒で `0.3076%` となり、0.5% 未満の基準を満たした。
+
+#### 未検証および残存の課題
+
+- `E2E-PERF-01` の `WorkingSet64` が 20 MB 以下の基準を超過したため、`FU-E2E-03` へ切り出した。
+- `E2E-P3-03` の `ledr-sim.exe --scenario lotl`（約 40 ms の短命プロセス）で親子系譜と `example.com` DNS 相関は通過した一方、`command_line` が `None` となり `LEDR-LOTL-001` が発火しなかったため、`FU-E2E-04` へ切り出した。
+- `E2E-P3-06` で 3 秒停止予算を超過した後に残余パイプラインが 2 件書き込み、終了後の `-wal` に `111,272` バイトが再生成された点（シェル復帰まで計約 8 秒）と、WFP ドロップが終了済み兄弟由来の生存 `python.exe` へ単一帰属された実機エッジケースを `FU-E2E-05` へ切り出した。
+- 開発ホスト PC 上での実施のため、専用環境向けの任意項目（`E2E-OPT-01` から `E2E-OPT-03`）は未実施である。
+- 上記の基準未達および差異が残るため、[implementation-plan.md](implementation-plan.md) の `[x]` チェックリストは未更新としている。
 
 ### 検証内容
 
@@ -134,13 +146,12 @@ Phase 4 は [decision-records.md](decision-records.md) の `L-17` に従い、PR
 - PR 4C の `apps/ledr-ui`（`HKCU` と `HKLM` 両プローブ、WOW64 32 ビット優先探索、ホワイトリストによるマニフェスト検証、View 1〜3 の表示と操作制約）のうち、Rust 単体テスト（`UI-P4-01` から `UI-P4-04`、`UI-P4-11` から `UI-P4-13`）と JS 構文検査（`node --check`）は PR #28（`331602d`）の CI で合格を確認した。
   PR #28（`331602d`）および PR #29 時点の `static-checks` ジョブは Node テストとして `extensions/ledr-chrome-mv3/tests/*.test.mjs` のみを実行していたため、Node モック DOM テスト（`apps/ledr-ui/js-tests/phase4_ui.test.mjs` の `UI-P4-05` から `UI-P4-10`、`PR27-REG-01`、`CSP-01`）はローカルの Node 22 で別途実行し、PR #28 最終コミット `4513044` の検証記録および PR #29 の再実行（Node `v22.18.0`、8/8 合格）にて合格を確認した。
   現在は `.github/workflows/ci.yml` の `static-checks` ジョブでも `apps/ledr-ui/js-tests/*.test.mjs` を自動実行する構成へ拡張している。
+- 2026 年 11 月 22 日に `Windows 11 Home`（`10.0.26300`、`ProductType = 1`、Chrome `157.0.8103.79`、基盤コミット `9c8373e` に Named Pipe DACL 修正を加えた `fix/e2e-pipe-dacl-dev-bypass`）でルート 1 の Track B および Track C を実施し、`E2E-P4-00`（`--scope user`、Chrome）から `E2E-P4-07`（`LAYER_4_BROWSER` 6 件すべて `APPROVED_ONCE` へ遷移、`download_origins = 1`、移動後の MOTW 起因事前 WFP 遮断および SHA-256 と Zone 3 の紐付け）と `E2E-UI-01`（`ledr-ui` 1 件から 0 件、`msedgewebview2.exe` 6 件から 0 件）の通過を確認した。
 
-#### 未検証の残存範囲
+#### 未検証および残存の課題
 
-- 実 Windows 10 または 11（x86_64）クライアント SKU での `--scope user` および管理者昇格 `--scope machine` 登録と `ledr-ui` View 3 表示の一致。
-- Chrome の `chrome://extensions` デベロッパーモード読み込み時の固定拡張 ID 一致、ポップアップからの `Ping` 往復、および実ブラウザ内 Shadow DOM 警告描画。
-- `--host-resolver-rules="MAP *.localedr.invalid 127.0.0.1"` 下での ClickFix、Pastejacking、通常コピー非発火、NRD とホモグラフのパスワード警告、および DNR 遮断の実動作。
-- Chrome 実ダウンロード完了後の `:Zone.Identifier` 付与、別フォルダ移動後の実行における 3 段階 MOTW 紐付け（View 1 と View 2 表示）、および `ledr-ui` 閉鎖時の `ledr-ui` と WebView2 プロセス 0 件終了（`L-08`）。
+- `--scope machine` の登録および復元、Microsoft Edge 実ブラウザでの拡張動作確認、および専用環境向けの任意項目（`E2E-OPT-01` から `E2E-OPT-03`）は未実施である。
+- Phase 4 機能追加後の常駐性能回帰確認（`E2E-PERF-01`）は `WorkingSet64` 基準を超過したため `FU-E2E-03` へ切り出しており、[implementation-plan.md](implementation-plan.md) の `[x]` チェックリストは未更新としている。
 
 ### 対応予定タイミング
 
@@ -169,3 +180,81 @@ x64 Windows 上の `ledr-bridge-nm` は `RegKey::predef(HKEY_LOCAL_MACHINE)` に
 ### 対応予定タイミング
 
 次回の `crates/ledr-bridge-nm/` 改修時、または Phase 4 以降の保守整備 PR で対応する。
+
+## FU-E2E-03 E2E-PERF-01 の WorkingSet64 超過に対する原因分析とメモリ削減
+
+### 対象ファイル
+
+- Authenticode 署名検証経路：[authenticode.rs](../crates/ledr-rules/src/allowlist/authenticode.rs#L235-L246)（`WinVerifyTrust` 呼び出し）
+- 永続化とバッチバッファ：[crates/ledr-store/src/lib.rs](../crates/ledr-store/src/lib.rs)
+- NRD キャッシュとデーモン起動構成：[crates/ledr-daemon/src/engine/lifecycle.rs](../crates/ledr-daemon/src/engine/lifecycle.rs)
+
+### 背景と出典
+
+2026 年 11 月 22 日に実施したルート 1 実機 E2E（[e2e-test-runbook.md](e2e-test-runbook.md)、`E2E-PERF-01`、公開 2 フィード 50,000 件の実 NRD キャッシュ読み込み時）で、Release 版 `ledr-daemon.exe` の `WorkingSet64` が目標上限の 20.0 MB 以下を超過した。
+
+### 現行挙動と実測値
+
+- 600 秒アイドル計測（10 分間の開発ホスト背景負荷：`processes = 1,037`、`dns_queries = 563`、`network_events = 44,496`、`alerts = 15`）：`AvgCpuPercent = 0.2876%`（基準 `< 0.5%` 合格）、`LatestWorkingSetMB = 28.59 MB`、`PeakWorkingSetMB = 108.71 MB`、直後確認時の `PrivateMemorySize64 = 17.15 MB`。
+- 60 秒高負荷計測（ブラウザ閲覧とビルド負荷併用）：`AvgCpuPercent = 0.3076%`、`LatestWorkingSetMB = 51.80 MB`、`PeakWorkingSetMB = 64.34 MB`。
+- `PrivateMemorySize64` は 20 MB 以内に収まっていた一方、共有ページを含む `WorkingSet64` に一時的な 108.71 MB スパイクと定常 28 MB 以上の滞在が見られた。
+  大容量バイナリやシステムカタログに対する `WinVerifyTrust` のファイルマッピング、SQLite ページキャッシュ、またはイベント受信時のバッファ保持が寄与している可能性があると推測するが、ヒープおよびページプロファイラによる内訳の切り分けは未実施である。
+
+### 改善方針
+
+Windows 実機上でメモリプロファイラ（VMMap や WPA 等）を用いて `WorkingSet64` の内訳（プライベート作業領域、メモリマップドファイル、共有 DLL）と `108.71 MB` ピークの発生契機を特定し、署名キャッシュの保持上限や SQLite `cache_size` 等の調整とあわせて実測再検証を行う。
+
+### 対応予定タイミング
+
+次回性能改善 PR で対応する。
+
+## FU-E2E-04 短命プロセスでの PEB 補完欠落による command_line 欠落と LEDR-LOTL-001 未発火
+
+### 対象ファイル
+
+- ETW ProcessStart 処理：[handlers.rs](../crates/ledr-sensor-win/src/etw/handlers.rs#L169-L309)（`build_process_start_event`）
+- ライブプロセス PEB 参照：[process.rs](../crates/ledr-sensor-win/src/etw/tdh/process.rs#L82-L120)（`inspect_process_by_pid`）
+
+### 背景と出典
+
+2026 年 11 月 22 日に実施したルート 1 実機 E2E の `E2E-P3-03`（`ledr-sim.exe --scenario lotl`、初回および再試行の計 2 回）で、親子系譜（`powershell.exe` から `ledr-sim.exe`、`cmd.exe`、`powershell.exe` への連鎖）は記録された一方、`command_line` が欠落して `LEDR-LOTL-001` が発火しなかった。
+
+### 現行挙動と実測値
+
+- `e2e.db` 確認で、短命終了した `ledr-sim.exe`（初回 PID `31720`、再試行 PID `32996`、生存時間約 40 ms）、`cmd.exe`（PID `19680`）、および `powershell.exe`（PID `31672`）の `command_line` がいずれも `None` であり、`LEDR-LOTL-001` アラートが 0 件となった。
+- 一方、60 秒間待機した `E2E-P3-01` の `powershell.exe`（PID `17296`）では `Command Line` が欠落せず取得できた。
+- `Microsoft-Windows-Kernel-Process` のイベント 1 が環境やバージョンによって `CommandLine` を含まない場合、`build_process_start_event` が ETW 消費者スレッド上で `inspect_process_by_pid` による補完を試みるが、`FlushTimer = 1` 秒等の配送遅延の間に終了した短命プロセスでは、補完時点で既にプロセスが終了しており PEB を読めない可能性があると推測する。
+
+### 改善方針
+
+`Microsoft-Windows-Kernel-Process` 実イベントの TDH プロパティ有無、ならびに `CommandLine` を取得可能な代替プロバイダ（カーネル監査ログや PowerShell 4104 との相関等）や ETW フラッシュ遅延の短縮余地を実機で計測し、短命 LOTL プロセスでも `LEDR-LOTL-001` が発火する取得経路を検討する。
+
+### 対応予定タイミング
+
+次回センサーおよび ETW 改善 PR で対応する。
+
+## FU-E2E-05 WFP ドロップ誤帰属抑止と停止予算超過時の残余書き込み整理
+
+### 対象ファイル
+
+- WFP ドロップ帰属：[wfp_drops.rs](../crates/ledr-daemon/src/engine/wfp_drops.rs#L607-L660)（`handle_wfp_drop_event_now`）
+- 停止時ドレインとチェックポイント：[lifecycle.rs](../crates/ledr-daemon/src/engine/lifecycle.rs#L439-L510)（`shutdown_and_flush`）
+
+### 背景と出典
+
+2026 年 11 月 22 日に実施したルート 1 実機 E2E において、Track B 中にローカル HTTP サーバの `python.exe` が凍結した事象と、`E2E-P3-06` の停止時に `-wal` が再生成された事象の 2 点を観測した。
+
+### 現行挙動と実測値
+
+- WFP ドロップ帰属：`E2E-P4-03` と `E2E-P4-04` の実行中、ローカル HTTP サーバ用の `python.exe`（PID `17004`）が、背景で動いて終了した別 `python.exe` インスタンス由来の `2001:4860:4840:400:::443` 宛てドロップによって単一生存候補と判定され、`NtSuspendProcess` で凍結された。
+  `WfpDropEvent` 自体は OS 仕様上 PID を持たず実行ファイル単位で帰属するため、短命の兄弟プロセスが直前に終了して同一 `exe_key` の生存候補が 1 件だけ残った場合に他インスタンスへ帰属される挙動となる。
+- 停止時残余書き込み：`E2E-P3-06`（`nrd_hang.db`）で `Ctrl+C` 受信後 3 秒の予算内に `completed wal_checkpoint(TRUNCATE)` と NRD スレッドのデタッチまでは完了したものの、予算超過により切り離されたパイプラインタスクがデタッチ直後に 2 件のアウトバウンド観測を書き込み、シェル復帰まで計約 8 秒かかり、終了後の `nrd_hang.db-wal` に `111,272` バイトが再生成された。
+
+### 改善方針
+
+1. `WfpDropEvent` 帰属時の候補抽出（`collect_wfp_candidates`）で、直近に終了した同一 `exe_key` プロセスを含めた曖昧性判定ウィンドウや `NetEvent` との相関条件を見直し、終了済み短命兄弟のドロップによる生存プロセスの誤凍結を抑止する。
+2. `shutdown_and_flush` で 3 秒予算超過後に残余パイプラインタスクをそのまま生かして後続イベントを書き込ませるか、予算超過時点で書き込みを止めて最終チェックポイントの 0 バイト維持を優先するかを整理し、テストと整合させる。
+
+### 対応予定タイミング
+
+次回デーモン境界改善 PR で対応する。

@@ -1364,9 +1364,9 @@ pub(super) fn resolve_process_motw_core(
     download_hash_max_bytes: u64,
     exe_path: &str,
     exited_at_ms: Option<i64>,
-    skip_store_ingest: bool,
+    skip_launch_guards: bool,
 ) -> Option<MotwAttribution> {
-    if exited_at_ms.is_some() || skip_store_ingest {
+    if exited_at_ms.is_some() || skip_launch_guards {
         return None;
     }
     let normalized_exe = normalize_windows_path(exe_path);
@@ -1713,12 +1713,12 @@ impl DaemonEngine {
     ///    SHA-256 and caching SQLite lookup results by `(sha256, generation)`)
     /// 3. NTFS `:Zone.Identifier` ADS (`ZoneId >= 3`)
     ///
-    /// Skips exited snapshots, `skip_store_ingest` absorbs, empty paths, and `ProtectedOs` binaries.
+    /// Skips exited snapshots, `skip_launch_guards` events, empty paths, and `ProtectedOs` binaries.
     pub fn resolve_process_motw(
         &self,
         exe_path: &str,
         exited_at_ms: Option<i64>,
-        skip_store_ingest: bool,
+        skip_launch_guards: bool,
     ) -> Option<MotwAttribution> {
         resolve_process_motw_core(
             &self.store,
@@ -1729,16 +1729,16 @@ impl DaemonEngine {
             self.config.download_hash_max_bytes,
             exe_path,
             exited_at_ms,
-            skip_store_ingest,
+            skip_launch_guards,
         )
     }
 
     pub(super) fn should_schedule_process_motw(
         exe_path: &str,
         exited_at_ms: Option<i64>,
-        skip_store_ingest: bool,
+        skip_launch_guards: bool,
     ) -> Option<String> {
-        if exited_at_ms.is_some() || skip_store_ingest {
+        if exited_at_ms.is_some() || skip_launch_guards {
             return None;
         }
         let normalized = normalize_windows_path(exe_path);
@@ -1755,10 +1755,10 @@ impl DaemonEngine {
         instance_id: Option<&str>,
         exe_path: &str,
         exited_at_ms: Option<i64>,
-        skip_store_ingest: bool,
+        skip_launch_guards: bool,
     ) -> Option<MotwAttribution> {
         let normalized_exe =
-            Self::should_schedule_process_motw(exe_path, exited_at_ms, skip_store_ingest)?;
+            Self::should_schedule_process_motw(exe_path, exited_at_ms, skip_launch_guards)?;
         let inst_id = instance_id.unwrap_or_default().to_string();
         let budget_ms = self.config.motw_sync_wait_budget_ms;
         match self.motw_pool.submit_process_motw(

@@ -4600,15 +4600,29 @@ async fn daemon_p4_cmd_05_canary_backfill_before_process_start_applies_launch_gu
     let canary_pid = 8500u32;
     let canary_ident = ProcessIdentity::new(canary_pid, canary_proc_100ns);
     let canary_exe = r"C:\Users\Public\Downloads\canary_first.exe";
+    let empty_exe_canary_pid = 8512u32;
+    let empty_exe_canary_100ns = 116_444_736_000_000_000u64 + ((now_ms - 400) as u64) * 10_000;
+    let empty_exe_canary_ident = ProcessIdentity::new(empty_exe_canary_pid, empty_exe_canary_100ns);
+    let empty_exe_canary_path = r"C:\Users\Public\Downloads\empty_live_exe_canary.exe";
 
-    let live_inspector = Arc::new(MapLiveProcessInspector::new([(
-        canary_pid,
-        ledr_sensor_win::etw::LiveProcessInfo {
-            create_time_100ns: canary_proc_100ns,
-            exe_path: Some(canary_exe.to_string()),
-            command_line: Some("canary_first.exe --steal".to_string()),
-        },
-    )]));
+    let live_inspector = Arc::new(MapLiveProcessInspector::new([
+        (
+            canary_pid,
+            ledr_sensor_win::etw::LiveProcessInfo {
+                create_time_100ns: canary_proc_100ns,
+                exe_path: Some(canary_exe.to_string()),
+                command_line: Some("canary_first.exe --steal".to_string()),
+            },
+        ),
+        (
+            empty_exe_canary_pid,
+            ledr_sensor_win::etw::LiveProcessInfo {
+                create_time_100ns: empty_exe_canary_100ns,
+                exe_path: None,
+                command_line: None,
+            },
+        ),
+    ]));
 
     let engine = start_stopped_engine_with_live_inspector(
         store.clone(),
@@ -4723,4 +4737,567 @@ async fn daemon_p4_cmd_05_canary_backfill_before_process_start_applies_launch_gu
                 .launch_guards_applied
         );
     }
+
+    // 4. Non-enriching `pid:0` snapshot (`skip_store_ingest == true`, `skip_launch_guards == false`)
+    //    for an active verified entry with `launch_guards_applied == false` MUST still apply
+    //    preemptive WFP launch guards and mark `launch_guards_applied = true`.
+    let snap_pid = 8508u32;
+    let snap_ident = ProcessIdentity::new(
+        snap_pid,
+        116_444_736_000_000_000u64 + ((now_ms - 450) as u64) * 10_000,
+    );
+    let snap_exe = r"C:\Users\Public\Downloads\snap_unapplied_guards.exe";
+    {
+        let mut table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        let res = table.on_process_start(
+            snap_ident,
+            4,
+            snap_exe.to_string(),
+            "snap_unapplied_guards.exe".to_string(),
+            Some("S-1-5-21-42".to_string()),
+            now_ms - 450,
+        );
+        assert!(!res.skip_launch_guards);
+    }
+    assert!(!engine.has_active_wfp_filter(snap_exe, None, false));
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(snap_pid, 0),
+            parent_pid: 4,
+            exe_path: snap_exe.to_string(),
+            command_line: "snap_unapplied_guards.exe".to_string(),
+            user_sid: Some("S-1-5-21-42".to_string()),
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(
+        defense.wfp_blocks_added().len(),
+        3,
+        "non-enriching pid:0 snapshot must still apply launch guards when launch_guards_applied was false"
+    );
+    assert!(engine.has_active_wfp_filter(snap_exe, None, false));
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            table
+                .get_by_instance_id(&snap_ident.instance_id())
+                .expect("snap entry present")
+                .launch_guards_applied
+        );
+    }
+
+    // 5. Canary backfill with `live.exe_path == None` (empty exe_path) must NOT mark
+    //    `launch_guards_applied = true`; subsequent `ProcessStart` with HighRiskPath applies WFP.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::CanaryFileAccess {
+            pid: empty_exe_canary_pid,
+            target_path: r"C:\Users\Alice\Documents\_ledr_canary_02.txt".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x0000_0002,
+            is_write_or_delete: true,
+            timestamp_ms: now_ms,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(defense.wfp_blocks_added().len(), 3);
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !table
+                .get_by_instance_id(&empty_exe_canary_ident.instance_id())
+                .expect("empty-exe canary entry present")
+                .launch_guards_applied,
+            "empty exe_path backfill must leave launch_guards_applied = false"
+        );
+    }
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: empty_exe_canary_ident,
+            parent_pid: 4,
+            exe_path: empty_exe_canary_path.to_string(),
+            command_line: "empty_live_exe_canary.exe".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    assert_eq!(
+        defense.wfp_blocks_added().len(),
+        4,
+        "ProcessStart upgrading empty exe_path after canary backfill must apply WFP block"
+    );
+    assert!(engine.has_active_wfp_filter(empty_exe_canary_path, None, false));
+    {
+        let table = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            table
+                .get_by_instance_id(&empty_exe_canary_ident.instance_id())
+                .expect("empty-exe canary entry present")
+                .launch_guards_applied
+        );
+    }
+}
+
+/// `DAEMON-P4-CMD-04b`: Oversized evicted parent `command_line` (> 4096 bytes) must be omitted
+/// from `ParentCommandLine` evaluation on BOTH normal eviction and delayed enrichment of an
+/// evicted parent so Sigma `endswith` rules never false-positive at the truncation boundary,
+/// while within-budget evicted parent `command_line` still matches normally.
+#[tokio::test]
+async fn daemon_p4_cmd_04b_evicted_oversized_parent_cmdline_omitted_prevents_sigma_endswith_fp() {
+    use crate::process_table::ActiveProcessTable;
+    use ledr_rules::{FieldCondition, MatchModifier, SigmaField, SigmaRule};
+
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let rule = SigmaRule {
+        id: "TEST-PARENT-ENDSWITH-001".to_string(),
+        title: "Parent CommandLine EndsWith Encoded".to_string(),
+        severity: AlertSeverity::High,
+        description: None,
+        conditions: vec![
+            FieldCondition {
+                field: SigmaField::ParentCommandLine,
+                modifier: MatchModifier::EndsWith,
+                values: vec![" --encoded".to_string()],
+            },
+            FieldCondition {
+                field: SigmaField::Image,
+                modifier: MatchModifier::EndsWith,
+                values: vec!["\\powershell.exe".to_string()],
+            },
+            FieldCondition {
+                field: SigmaField::CommandLine,
+                modifier: MatchModifier::Contains,
+                values: vec!["-NoProfile".to_string()],
+            },
+        ],
+    };
+    let sigma = SigmaEngine::from_rules(vec![rule]).expect("compile test sigma rule");
+
+    let engine = DaemonEngine::start_with_dependencies(
+        store.clone(),
+        sigma,
+        EarlyPruner::default(),
+        DaemonConfig::default(),
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("c".repeat(64))),
+    );
+    if let Some(h) = engine.worker_handle.lock().await.take() {
+        h.abort();
+        let _ = h.await;
+    }
+    {
+        let mut guard = engine.process_table.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = ActiveProcessTable::new(2);
+    }
+
+    let now_ms = current_unix_ms();
+    let ts_100ns = |offset_ms: i64| 116_444_736_000_000_000u64 + ((now_ms + offset_ms) as u64) * 10_000;
+    let ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    let cmd_exe = r"C:\Windows\System32\cmd.exe";
+
+    // Build an oversized command line (> 4096 bytes) whose first 4096 bytes end with " --encoded"
+    // followed by " --profile normal". Truncation at 4096 bytes would falsely satisfy EndsWith.
+    let suffix = " --encoded";
+    let oversized_parent_cmd = format!("{}{} --profile normal", "x".repeat(4096 - suffix.len()), suffix);
+    assert!(oversized_parent_cmd.len() > 4096);
+    assert!(oversized_parent_cmd[..4096].ends_with(suffix));
+
+    // Case A: Normal eviction of parent with oversized command_line.
+    let p_a = ProcessIdentity::new(8600, ts_100ns(-9_000));
+    let c_a = ProcessIdentity::new(8604, ts_100ns(-8_500));
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: p_a,
+            parent_pid: 4,
+            exe_path: cmd_exe.to_string(),
+            command_line: oversized_parent_cmd.clone(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: c_a,
+            parent_pid: p_a.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: p_a.pid,
+            exit_time_100ns: ts_100ns(-8_400),
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: c_a.pid,
+            exit_time_100ns: ts_100ns(-8_300),
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Case B: Parent evicted with empty command_line, later enriched with oversized command_line.
+    let p_b = ProcessIdentity::new(8608, ts_100ns(-7_000));
+    let c_b = ProcessIdentity::new(8612, ts_100ns(-6_500));
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: p_b,
+            parent_pid: 4,
+            exe_path: cmd_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: c_b,
+            parent_pid: p_b.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: p_b.pid,
+            exit_time_100ns: ts_100ns(-6_400),
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: c_b.pid,
+            exit_time_100ns: ts_100ns(-6_300),
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Case C (control): Parent evicted with within-budget command_line truly ending with " --encoded".
+    let p_c = ProcessIdentity::new(8616, ts_100ns(-5_000));
+    let c_c = ProcessIdentity::new(8620, ts_100ns(-4_500));
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: p_c,
+            parent_pid: 4,
+            exe_path: cmd_exe.to_string(),
+            command_line: "cmd.exe /c powershell.exe --encoded".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: c_c,
+            parent_pid: p_c.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: String::new(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: p_c.pid,
+            exit_time_100ns: ts_100ns(-4_400),
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStop {
+            pid: c_c.pid,
+            exit_time_100ns: ts_100ns(-4_300),
+            exit_code: 0,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Evict Case C as well so all 3 parent+child pairs are in `evicted_exited`.
+    for (pid, off) in [(8624, -2_000), (8628, -1_500)] {
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(pid, ts_100ns(off)),
+                parent_pid: 4,
+                exe_path: r"C:\Windows\System32\notepad.exe".to_string(),
+                command_line: "notepad.exe".to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+    }
+
+    // Delayed enrichment on Case A child -> must NOT false-positive on truncated boundary.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: c_a,
+            parent_pid: p_a.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: "powershell.exe -NoProfile".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    // Delayed oversized enrichment on Case B parent, then delayed enrichment on Case B child ->
+    // must NOT false-positive either.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: p_b,
+            parent_pid: 4,
+            exe_path: cmd_exe.to_string(),
+            command_line: oversized_parent_cmd,
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: c_b,
+            parent_pid: p_b.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: "powershell.exe -NoProfile".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+
+    let alerts_before_control = store.list_alerts(None, 20).expect("list alerts");
+    assert!(
+        alerts_before_control.is_empty(),
+        "oversized evicted parent command_line must not trigger EndsWith false positive: {:?}",
+        alerts_before_control
+    );
+
+    // Control Case C: within-budget evicted parent command_line truly ending in " --encoded" fires once.
+    let _ = engine.process_event_with_lane(
+        &SensorEvent::ProcessStart {
+            identity: c_c,
+            parent_pid: p_c.pid,
+            exe_path: ps_exe.to_string(),
+            command_line: "powershell.exe -NoProfile".to_string(),
+            user_sid: None,
+        },
+        EventLane::HighPriority,
+    );
+    let alerts_after_control = store.list_alerts(None, 20).expect("list alerts");
+    assert_eq!(alerts_after_control.len(), 1);
+    assert_eq!(alerts_after_control[0].rule_id, "TEST-PARENT-ENDSWITH-001");
+    assert_eq!(
+        alerts_after_control[0].process_instance_id.as_deref(),
+        Some(c_c.instance_id().as_str())
+    );
+}
+
+/// `DAEMON-P4-CMD-06`: When `CanaryFileAccess` arrives BEFORE `ProcessStart` for a normal-folder
+/// (non-HighRiskPath) binary with MOTW whose ADS resolution exceeds `motw_sync_wait_budget_ms`,
+/// `backfill_canary_process_context_if_missing_async` completes without stalling, and once the
+/// MOTW worker finishes, `apply_late_motw_attribution` applies the preemptive WFP block and
+/// backfills SQLite `origin_url`.
+#[tokio::test]
+async fn daemon_p4_cmd_06_canary_first_delayed_motw_exceeding_budget_applies_wfp_for_normal_folder()
+{
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Condvar;
+    use std::time::Duration;
+
+    use crate::engine::MotwInspector;
+    use ledr_sensor_win::MotwZoneInfo;
+
+    struct GatedMotwInspector {
+        entered: Arc<AtomicBool>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+        zone: MotwZoneInfo,
+    }
+
+    impl MotwInspector for GatedMotwInspector {
+        fn read_zone_identifier(&self, _path: &Path) -> Option<MotwZoneInfo> {
+            self.entered.store(true, Ordering::Release);
+            {
+                let (lock, cvar) = &*self.released;
+                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while !*guard {
+                    guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+            Some(self.zone.clone())
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (lock, cvar) = &*self.0;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = true;
+            cvar.notify_all();
+        }
+    }
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let _release_guard = ReleaseOnDrop(Arc::clone(&released));
+
+    let motw_url = "https://downloads.example.invalid/moved_canary_app.exe";
+    let gated_motw = Arc::new(GatedMotwInspector {
+        entered: Arc::clone(&entered),
+        released: Arc::clone(&released),
+        zone: MotwZoneInfo {
+            zone_id: 3,
+            host_url: Some(motw_url.to_string()),
+            referrer_url: Some("https://portal.example.invalid/".to_string()),
+        },
+    });
+
+    let store = LedrStore::open_in_memory().expect("in-memory store");
+    let defense = Arc::new(RecordingDefense::new());
+    let now_ms = current_unix_ms();
+    let proc_100ns = 116_444_736_000_000_000u64 + ((now_ms - 1_000) as u64) * 10_000;
+    let pid = 8700u32;
+    let ident = ProcessIdentity::new(pid, proc_100ns);
+    // Normal folder (GeneralUnknown, NOT HighRiskPath): preemptive WFP block depends solely on MOTW.
+    let normal_exe = r"C:\Tools\moved_canary_app.exe";
+
+    let live_inspector = Arc::new(MapLiveProcessInspector::new([(
+        pid,
+        ledr_sensor_win::etw::LiveProcessInfo {
+            create_time_100ns: proc_100ns,
+            exe_path: Some(normal_exe.to_string()),
+            command_line: Some("moved_canary_app.exe --quiet".to_string()),
+        },
+    )]));
+
+    let engine = DaemonEngine::start_with_motw_inspector(
+        store.clone(),
+        SigmaEngine::default(),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            motw_sync_wait_budget_ms: 20,
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(StubNotifier),
+        Arc::new(FixedShaInspector("d".repeat(64))),
+        live_inspector,
+        gated_motw,
+    );
+
+    let sender = engine.sender();
+    // 1. CanaryFileAccess arrives BEFORE ProcessStart.
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid,
+            target_path: r"C:\Users\Alice\Documents\_ledr_canary_03.txt".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x0000_0002,
+            is_write_or_delete: true,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send CanaryFileAccess");
+
+    // Confirm the MOTW worker entered `read_zone_identifier` (and is blocked on our gate).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if entered.load(Ordering::Acquire) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "MOTW worker must enter gated read_zone_identifier"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Even while MOTW is blocked beyond the 20 ms budget, canary backfill + suspension must finish.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !defense.suspended().is_empty()
+            && engine.high_priority_processed.load(Ordering::Relaxed) >= 1
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "canary event must complete past MOTW wait budget without stalling"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !engine.has_active_wfp_filter(normal_exe, None, false),
+        "normal-folder binary must not have WFP block before delayed MOTW completes"
+    );
+
+    // 2. Subsequent real ProcessStart arrives while delayed MOTW is still in flight.
+    sender
+        .send(SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: normal_exe.to_string(),
+            command_line: "moved_canary_app.exe --quiet".to_string(),
+            user_sid: None,
+        })
+        .await
+        .expect("send ProcessStart");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if engine.high_priority_processed.load(Ordering::Relaxed) >= 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ProcessStart must complete while MOTW is still gated"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // 3. Release MOTW gate -> late attribution must apply preemptive WFP block & backfill SQLite.
+    {
+        let (lock, cvar) = &*released;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = true;
+        cvar.notify_all();
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if engine.has_active_wfp_filter(normal_exe, None, false) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "delayed MOTW completion must apply preemptive WFP block for normal-folder binary"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        defense.wfp_blocks_added().len(),
+        1,
+        "delayed MOTW must apply preemptive WFP block exactly once"
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+
+    let snap = store
+        .query_flight_recorder(50, Some(&ident.instance_id()))
+        .expect("query flight recorder");
+    let row = snap
+        .processes
+        .iter()
+        .find(|p| p.process_instance_id == ident.instance_id())
+        .expect("process row persisted");
+    assert_eq!(row.origin_url.as_deref(), Some(motw_url));
 }

@@ -60,6 +60,21 @@ impl DaemonEngine {
                     motw.zone_id,
                 );
         }
+        if proc_ctx.skip_store_ingest {
+            if let Some(inst_id) = instance_id {
+                if let Err(err) = self.store.update_process_motw_metadata(
+                    inst_id,
+                    Some(&motw.origin_url),
+                    motw.sha256.as_deref(),
+                ) {
+                    tracing::warn!(
+                        process_instance_id = %inst_id,
+                        error = %err,
+                        "failed backfilling MOTW metadata on skip_store_ingest event"
+                    );
+                }
+            }
+        }
         proc_ctx.origin_url = Some(motw.origin_url);
         proc_ctx.motw_source = Some(motw_source_str);
         proc_ctx.motw_referrer = motw.referrer_url;
@@ -152,7 +167,6 @@ impl DaemonEngine {
         let motw_candidate = if let SensorEvent::ProcessStart { identity, .. } = event {
             if proc_ctx.origin_url.is_none()
                 && proc_ctx.exited_at_ms.is_none()
-                && !proc_ctx.skip_store_ingest
                 && !proc_ctx.skip_launch_guards
             {
                 match (
@@ -165,7 +179,7 @@ impl DaemonEngine {
                         Self::should_schedule_process_motw(
                             effective_exe,
                             proc_ctx.exited_at_ms,
-                            proc_ctx.skip_store_ingest,
+                            proc_ctx.skip_launch_guards,
                         )
                         .map(|normalized_exe| (inst_id.to_string(), normalized_exe))
                     }
@@ -226,7 +240,6 @@ impl DaemonEngine {
         if let SensorEvent::ProcessStart { identity, .. } = event {
             if proc_ctx.origin_url.is_none()
                 && proc_ctx.exited_at_ms.is_none()
-                && !proc_ctx.skip_store_ingest
                 && !proc_ctx.skip_launch_guards
             {
                 if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
@@ -236,7 +249,7 @@ impl DaemonEngine {
                                 proc_ctx.proc_instance_id.as_deref(),
                                 effective_exe,
                                 proc_ctx.exited_at_ms,
-                                proc_ctx.skip_store_ingest,
+                                proc_ctx.skip_launch_guards,
                             )
                             .await
                         {
@@ -286,7 +299,6 @@ impl DaemonEngine {
         if let SensorEvent::ProcessStart { identity, .. } = event {
             if proc_ctx.origin_url.is_none()
                 && proc_ctx.exited_at_ms.is_none()
-                && !proc_ctx.skip_store_ingest
                 && !proc_ctx.skip_launch_guards
             {
                 if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
@@ -294,7 +306,7 @@ impl DaemonEngine {
                         if let Some(motw) = self.resolve_process_motw(
                             effective_exe,
                             proc_ctx.exited_at_ms,
-                            proc_ctx.skip_store_ingest,
+                            proc_ctx.skip_launch_guards,
                         ) {
                             let inst_id = proc_ctx.proc_instance_id.clone();
                             self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
@@ -311,14 +323,13 @@ impl DaemonEngine {
                 if proc_ctx.origin_url.is_none()
                     && prepared.res.exited_at_ms.is_none()
                     && !prepared.exe_path.is_empty()
-                    && !prepared.res.skip_store_ingest
                     && !prepared.res.skip_launch_guards
                     && !self.is_self_process(pid, &prepared.exe_path)
                 {
                     if let Some(motw) = self.resolve_process_motw(
                         &prepared.exe_path,
                         prepared.res.exited_at_ms,
-                        prepared.res.skip_store_ingest,
+                        prepared.res.skip_launch_guards,
                     ) {
                         self.attach_motw_to_proc_ctx(
                             Some(&prepared.res.instance_id),
@@ -431,10 +442,7 @@ impl DaemonEngine {
             SensorEvent::ProcessStart {
                 identity, exe_path, ..
             } => {
-                if proc_ctx.exited_at_ms.is_none()
-                    && !proc_ctx.skip_store_ingest
-                    && !proc_ctx.skip_launch_guards
-                {
+                if proc_ctx.exited_at_ms.is_none() && !proc_ctx.skip_launch_guards {
                     let effective_exe = proc_ctx
                         .proc_exe_path
                         .as_deref()
@@ -630,7 +638,6 @@ impl DaemonEngine {
         if proc_ctx.origin_url.is_none()
             && prepared.res.exited_at_ms.is_none()
             && !prepared.exe_path.is_empty()
-            && !prepared.res.skip_store_ingest
             && !prepared.res.skip_launch_guards
             && !self.is_self_process(pid, &prepared.exe_path)
         {
@@ -639,7 +646,7 @@ impl DaemonEngine {
                     Some(&prepared.res.instance_id),
                     &prepared.exe_path,
                     prepared.res.exited_at_ms,
-                    prepared.res.skip_store_ingest,
+                    prepared.res.skip_launch_guards,
                 )
                 .await
             {
@@ -854,7 +861,7 @@ impl DaemonEngine {
             res,
         } = prepared;
 
-        if res.exited_at_ms.is_none() && !res.skip_store_ingest && !res.skip_launch_guards {
+        if res.exited_at_ms.is_none() && !res.skip_launch_guards {
             self.apply_process_launch_guards(
                 ident.pid,
                 Some(&res.instance_id),

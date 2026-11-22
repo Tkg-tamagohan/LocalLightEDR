@@ -591,18 +591,12 @@ impl DaemonEngine {
             Ok(handle) => {
                 // Re-verify process liveness atomically under `firewall` -> `process_table` before
                 // committing `handle` so a concurrent `ProcessStop` cleanup cannot leave an
-                // orphaned preemptive block for an already-exited executable.
+                // orphaned preemptive block for an already-exited executable. If removal fails
+                // while the slot is vacant, `discard_obsolete_preemptive_block` retains `handle`
+                // in `WfpRuleManager` so subsequent cleanup or policy reconciliation can retry.
                 let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
                 if !is_preemptive_still_needed(&fw) {
-                    drop(fw);
-                    if let Err(err) = self.defense.remove_wfp_rule(handle) {
-                        tracing::warn!(
-                            exe_path = %trimmed,
-                            wfp_handle = handle,
-                            error = %err,
-                            "failed removing obsolete pre-emptive WFP handle after concurrent process exit"
-                        );
-                    }
+                    fw.discard_obsolete_preemptive_block(trimmed, handle, &*self.defense);
                 } else if fw.register_preemptive_block(trimmed, handle, &*self.defense) {
                     tracing::info!(
                         exe_path = %trimmed,

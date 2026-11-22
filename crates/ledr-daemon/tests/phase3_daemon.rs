@@ -8646,3 +8646,383 @@ async fn daemon_p3_48_shared_ip_migrated_allow_permit_preservation_and_security_
         );
     }
 }
+
+#[tokio::test]
+async fn daemon_p3_49_self_process_outbound_exclusion_boundaries() {
+    let self_pid = std::process::id();
+    let other_pid = if self_pid == u32::MAX {
+        self_pid - 1
+    } else {
+        self_pid + 1
+    };
+    let raw_self_exe = std::env::current_exe()
+        .expect("resolve current_exe")
+        .to_string_lossy()
+        .into_owned();
+    let bare_self_exe = raw_self_exe
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&raw_self_exe)
+        .to_string();
+
+    // Part 1: Self process with exact path, extended Win32 (`\\?\`), NT (`\??\`), and case/slash
+    // variants must be excluded from outbound alerts, suspends, and WFP filters.
+    let self_variants = vec![
+        ("exact", raw_self_exe.clone()),
+        ("win32_extended", format!(r"\\?\{bare_self_exe}")),
+        ("nt_prefix", format!(r"\??\{bare_self_exe}")),
+        (
+            "nt_mixed_slash",
+            format!(r"\??/{}", bare_self_exe.replace('\\', "/")),
+        ),
+        (
+            "case_and_slash",
+            bare_self_exe.to_uppercase().replace('\\', "/"),
+        ),
+    ];
+
+    for (label, exe_variant) in self_variants {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+        let mut cfg = default_test_config();
+        cfg.outbound_firewall_enabled = true;
+        cfg.outbound_enforcement_mode = ledr_daemon::OutboundEnforcementMode::Enforce;
+
+        let engine = start_test_engine(
+            store.clone(),
+            cfg,
+            defense.clone(),
+            notifier.clone(),
+            inspector,
+        );
+        let sender = engine.sender();
+        let classified = engine.classified_sender();
+        let base_ts = current_unix_ms();
+
+        send_process_start(
+            &sender,
+            ProcessIdentity::new(self_pid, unix_ms_to_filetime(base_ts)),
+            &exe_variant,
+        )
+        .await;
+        assert!(
+            wait_until(2000, || engine.metrics().high_priority_processed >= 1).await,
+            "self variant `{label}` ProcessStart should be processed"
+        );
+
+        // Via `classified_sender`, self_pid must stay on Telemetry lane (not promoted).
+        classified
+            .send(SensorEvent::NetworkConnect {
+                pid: self_pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+                dst_port: 443,
+                domain_hint: Some("ctldl.windowsupdate.com".to_string()),
+                timestamp_ms: base_ts + 50,
+            })
+            .await
+            .expect("send self NetworkConnect via classified_sender");
+        assert!(
+            wait_until(2000, || engine.metrics().telemetry_processed >= 1).await,
+            "self variant `{label}` NetworkConnect should remain on telemetry lane"
+        );
+
+        // Also test direct high-priority submission to confirm `handle_network_connect` itself
+        // excludes the self process regardless of lane classification.
+        sender
+            .send_high_priority(SensorEvent::NetworkConnect {
+                pid: self_pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)),
+                dst_port: 80,
+                domain_hint: None,
+                timestamp_ms: base_ts + 60,
+            })
+            .await
+            .expect("send self NetworkConnect via high-priority lane");
+        assert!(
+            wait_until(2000, || engine.metrics().high_priority_processed >= 2).await,
+            "self variant `{label}` direct HP NetworkConnect should be processed"
+        );
+
+        assert!(
+            store.list_alerts(None, 20).expect("list alerts").is_empty(),
+            "self variant `{label}` must emit 0 outbound alerts"
+        );
+        assert!(
+            defense.suspends().is_empty(),
+            "self variant `{label}` must not suspend self process"
+        );
+        assert!(
+            defense.added_wfp().is_empty(),
+            "self variant `{label}` must not install WFP rules for self process"
+        );
+
+        engine.shutdown_and_flush().await.expect("shutdown engine");
+    }
+
+    // Part 2: Non-matching boundaries must NOT be excluded:
+    // (a) Same PID as daemon but different executable path (`C:\Temp\fake\ledr-daemon.exe`).
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+        let mut cfg = default_test_config();
+        cfg.outbound_firewall_enabled = true;
+        cfg.outbound_enforcement_mode = ledr_daemon::OutboundEnforcementMode::Enforce;
+
+        let engine = start_test_engine(
+            store.clone(),
+            cfg,
+            defense.clone(),
+            notifier,
+            inspector,
+        );
+        let sender = engine.sender();
+        let classified = engine.classified_sender();
+        let base_ts = current_unix_ms();
+
+        send_process_start(
+            &sender,
+            ProcessIdentity::new(self_pid, unix_ms_to_filetime(base_ts)),
+            r"C:\Temp\fake\ledr-daemon.exe",
+        )
+        .await;
+        assert!(wait_until(2000, || engine.metrics().high_priority_processed >= 1).await);
+
+        classified
+            .send(SensorEvent::NetworkConnect {
+                pid: self_pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+                dst_port: 443,
+                domain_hint: None,
+                timestamp_ms: base_ts + 50,
+            })
+            .await
+            .expect("send fake-path NetworkConnect");
+        assert!(
+            wait_until(2000, || engine.metrics().high_priority_processed >= 2).await,
+            "(self_pid, fake exe) must be promoted to high-priority lane and evaluated"
+        );
+        let alerts = store.list_alerts(None, 20).expect("list alerts");
+        assert!(
+            !alerts.is_empty(),
+            "(self_pid, fake exe) must NOT be excluded from outbound alerting"
+        );
+        assert!(
+            !defense.suspends().is_empty(),
+            "(self_pid, fake exe) must still be suspended in Enforce mode"
+        );
+
+        engine.shutdown_and_flush().await.expect("shutdown engine");
+    }
+
+    // (b) Different PID running the same executable path (`current_exe`).
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+        let mut cfg = default_test_config();
+        cfg.outbound_firewall_enabled = true;
+        cfg.outbound_enforcement_mode = ledr_daemon::OutboundEnforcementMode::Enforce;
+
+        let engine = start_test_engine(
+            store.clone(),
+            cfg,
+            defense.clone(),
+            notifier,
+            inspector,
+        );
+        let sender = engine.sender();
+        let classified = engine.classified_sender();
+        let base_ts = current_unix_ms();
+
+        send_process_start(
+            &sender,
+            ProcessIdentity::new(other_pid, unix_ms_to_filetime(base_ts)),
+            &bare_self_exe,
+        )
+        .await;
+        assert!(wait_until(2000, || engine.metrics().high_priority_processed >= 1).await);
+
+        classified
+            .send(SensorEvent::NetworkConnect {
+                pid: other_pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 21)),
+                dst_port: 443,
+                domain_hint: None,
+                timestamp_ms: base_ts + 50,
+            })
+            .await
+            .expect("send other_pid NetworkConnect");
+        assert!(
+            wait_until(2000, || engine.metrics().high_priority_processed >= 2).await,
+            "(other_pid, current_exe) must be promoted and evaluated"
+        );
+        let alerts = store.list_alerts(None, 20).expect("list alerts");
+        assert!(
+            !alerts.is_empty(),
+            "(other_pid, current_exe) must NOT be excluded from outbound alerting"
+        );
+        assert!(
+            !defense.suspends().is_empty(),
+            "(other_pid, current_exe) must still be suspended in Enforce mode"
+        );
+
+        engine.shutdown_and_flush().await.expect("shutdown engine");
+    }
+
+    // (c) Empty executable path on `self_pid` must NOT be treated as self-process (clears
+    // `outbound_classifier` protected marker so subsequent external connect promotes to HP).
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+        let mut cfg = default_test_config();
+        cfg.outbound_firewall_enabled = true;
+        cfg.outbound_enforcement_mode = ledr_daemon::OutboundEnforcementMode::Enforce;
+
+        let engine = start_test_engine(store, cfg, defense, notifier, inspector);
+        let sender = engine.sender();
+        let classified = engine.classified_sender();
+        let base_ts = current_unix_ms();
+
+        send_process_start(
+            &sender,
+            ProcessIdentity::new(self_pid, unix_ms_to_filetime(base_ts)),
+            "   ",
+        )
+        .await;
+        assert!(wait_until(2000, || engine.metrics().high_priority_processed >= 1).await);
+
+        classified
+            .send(SensorEvent::NetworkConnect {
+                pid: self_pid,
+                protocol: 6,
+                dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 22)),
+                dst_port: 443,
+                domain_hint: None,
+                timestamp_ms: base_ts + 50,
+            })
+            .await
+            .expect("send empty-exe NetworkConnect");
+        assert!(
+            wait_until(2000, || engine.metrics().high_priority_processed >= 2).await,
+            "(self_pid, empty exe_path) must NOT remain marked as protected self process"
+        );
+        assert_eq!(engine.metrics().telemetry_processed, 0);
+
+        engine.shutdown_and_flush().await.expect("shutdown engine");
+    }
+}
+
+#[tokio::test]
+async fn daemon_p3_50_self_process_skips_dns_wfp_prematerialization() {
+    let self_pid = std::process::id();
+    let other_pid = if self_pid == u32::MAX {
+        self_pid - 1
+    } else {
+        self_pid + 1
+    };
+    let raw_self_exe = std::env::current_exe()
+        .expect("resolve current_exe")
+        .to_string_lossy()
+        .into_owned();
+    let bare_self_exe = raw_self_exe
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&raw_self_exe)
+        .to_string();
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockWfpDefense::new());
+    let notifier = Arc::new(MockNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+    let mut cfg = default_test_config();
+    cfg.outbound_firewall_enabled = true;
+    cfg.outbound_enforcement_mode = ledr_daemon::OutboundEnforcementMode::Enforce;
+
+    let engine = start_test_engine(store, cfg, defense.clone(), notifier, inspector);
+
+    // Install a wildcard domain-scoped NetworkBlock rule so any non-exempt process resolving
+    // `blocked.example.invalid` triggers DNS WFP filter pre-materialization.
+    let block_rule = AllowlistRuleRecord {
+        rule_id: "rule-wildcard-domain-block-self-check".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: "*".to_string(),
+        signer_subject: None,
+        root_thumbprint: None,
+        sha256: None,
+        allowed_target: Some("blocked.example.invalid".to_string()),
+        created_at_ms: current_unix_ms(),
+        created_by: "test".to_string(),
+    };
+    engine
+        .upsert_policy_rule(&block_rule)
+        .expect("upsert wildcard domain block rule");
+
+    let sender = engine.sender();
+    let base_ts = current_unix_ms();
+
+    // 1. Self process resolving the blocked domain must NOT pre-materialize a WFP block filter.
+    send_process_start(
+        &sender,
+        ProcessIdentity::new(self_pid, unix_ms_to_filetime(base_ts)),
+        &bare_self_exe,
+    )
+    .await;
+    assert!(wait_until(2000, || engine.metrics().high_priority_processed >= 1).await);
+
+    sender
+        .send_high_priority(SensorEvent::DnsQuery {
+            pid: self_pid,
+            query_name: "blocked.example.invalid".to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77))],
+            timestamp_ms: base_ts + 25,
+        })
+        .await
+        .expect("send self DnsQuery");
+    assert!(wait_until(2000, || engine.metrics().high_priority_processed >= 2).await);
+    assert!(
+        defense.added_wfp().is_empty(),
+        "self-process DnsQuery must not pre-materialize WFP block filters: {:?}",
+        defense.added_wfp()
+    );
+
+    // 2. Non-self PID running the same binary resolving the same domain MUST pre-materialize it.
+    send_process_start(
+        &sender,
+        ProcessIdentity::new(other_pid, unix_ms_to_filetime(base_ts + 30)),
+        &bare_self_exe,
+    )
+    .await;
+    assert!(wait_until(2000, || engine.metrics().high_priority_processed >= 3).await);
+
+    sender
+        .send_high_priority(SensorEvent::DnsQuery {
+            pid: other_pid,
+            query_name: "blocked.example.invalid".to_string(),
+            query_type: 1,
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77))],
+            timestamp_ms: base_ts + 40,
+        })
+        .await
+        .expect("send other_pid DnsQuery");
+    assert!(wait_until(2000, || engine.metrics().high_priority_processed >= 4).await);
+    assert!(
+        defense
+            .added_wfp()
+            .iter()
+            .any(|f| !f.allow && f.remote_ip == Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77)))),
+        "non-self PID DnsQuery must still pre-materialize domain WFP block filter: {:?}",
+        defense.added_wfp()
+    );
+
+    engine.shutdown_and_flush().await.expect("shutdown engine");
+}

@@ -20,7 +20,9 @@ pub use lotl::{
     LOTL_HARMLESS_SCRIPT, build_lotl_cmd_args, encode_powershell_command_utf16le,
     run_lotl_scenario,
 };
-pub use net::{run_dns_tcp_scenario, run_loopback_tcp_exchange};
+pub use net::{
+    run_dns_tcp_scenario, run_dns_tcp_scenario_with_hold, run_loopback_tcp_exchange,
+};
 pub use types::{
     CliAction, CookiesOpenOutcome, DnsTcpOutcome, HoneypotWriteOutcome, LotlOutcome,
     MotwDownloadOutcome, PrepareDirOutcome, Scenario, SimConfig, SimReport,
@@ -64,9 +66,15 @@ async fn main() -> Result<()> {
     };
 
     let dns_tcp = match config.scenario {
-        Scenario::DnsTcp | Scenario::All => {
-            Some(run_dns_tcp_scenario(&config.domain, config.port, config.loopback).await?)
-        }
+        Scenario::DnsTcp | Scenario::All => Some(
+            run_dns_tcp_scenario_with_hold(
+                &config.domain,
+                config.port,
+                config.loopback,
+                config.hold_ms,
+            )
+            .await?,
+        ),
         Scenario::Lotl
         | Scenario::CookiesOpen
         | Scenario::HoneypotWrite

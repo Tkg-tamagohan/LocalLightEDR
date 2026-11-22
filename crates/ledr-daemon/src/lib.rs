@@ -18,7 +18,8 @@ pub use engine::{
     BinaryInspector, BrowserEventOutcome, BrowserReportError, DaemonConfig, DaemonEngine,
     LiveProcessInspector, MotwAttribution, MotwInspector, MotwMatchStage,
     OutboundEnforcementMode, PolicyRuleError, WindowsBinaryInspector, WindowsLiveProcessInspector,
-    WindowsMotwInspector, MAX_BROWSER_EVENT_DETAILS_BYTES, MAX_DOWNLOAD_HASH_BYTES,
+    WindowsMotwInspector, DEFAULT_MAX_CONCURRENT_IPC_CLIENTS, MAX_BROWSER_EVENT_DETAILS_BYTES,
+    MAX_DOWNLOAD_HASH_BYTES,
 };
 pub use firewall::{
     InstalledWfpFilter, WfpFailedOp, WfpFilterOrigin, WfpReconcileReport, WfpRuleManager,

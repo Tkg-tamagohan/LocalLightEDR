@@ -542,3 +542,102 @@ fn sim_p4_04_motw_download_refuses_overwrite_and_cleans_up_new_file_on_failure()
         "newly created dummy file must be removed when ADS write fails"
     );
 }
+
+#[tokio::test]
+async fn sim_p4_05_dns_tcp_hold_ms_and_pre_sleep_socket_close() {
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::TcpListener;
+
+    // 0. CLI parses `--hold-ms` cleanly for `dns-tcp`.
+    assert_eq!(
+        parse_cli_args([
+            "--scenario",
+            "dns-tcp",
+            "--domain",
+            "example.com",
+            "--port",
+            "443",
+            "--hold-ms",
+            "120000",
+            "--json",
+        ])
+        .expect("parse dns-tcp with --hold-ms"),
+        CliAction::Run(SimConfig {
+            scenario: Scenario::DnsTcp,
+            domain: "example.com".to_string(),
+            port: 443,
+            loopback: false,
+            json_output: true,
+            hold_ms: 120_000,
+            prepare_dir: None,
+            base_dir: None,
+        })
+    );
+
+    // 1. hold_ms = 0 returns promptly in loopback mode.
+    let fast_start = Instant::now();
+    let fast_out = run_dns_tcp_scenario_with_hold("example.com", 443, true, 0)
+        .await
+        .expect("loopback dns-tcp with hold_ms=0");
+    assert!(fast_out.used_loopback);
+    assert!(fast_out.connected);
+    assert!(
+        fast_start.elapsed() < Duration::from_millis(2_000),
+        "hold_ms=0 should return promptly, took {:?}",
+        fast_start.elapsed()
+    );
+
+    // 2. hold_ms = 120 waits >= 100 ms and succeeds in loopback mode.
+    let hold_start = Instant::now();
+    let hold_out = run_dns_tcp_scenario_with_hold("example.com", 443, true, 120)
+        .await
+        .expect("loopback dns-tcp with hold_ms=120");
+    let hold_elapsed = hold_start.elapsed();
+    assert!(hold_out.used_loopback);
+    assert!(hold_out.connected);
+    assert!(
+        hold_elapsed >= Duration::from_millis(100),
+        "expected hold_ms=120 to sleep at least 100ms, elapsed={hold_elapsed:?}"
+    );
+
+    // 3. External TCP connect path against a local TcpListener: peer must observe EOF
+    // BEFORE hold_ms elapses, proving stream.shutdown() + drop(stream) ran prior to sleeping.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local test listener");
+    let bound_port = listener.local_addr().expect("listener local_addr").port();
+    let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<Instant>();
+    let server = tokio::spawn(async move {
+        let (mut sock, _peer) = listener.accept().await.expect("accept client");
+        let mut buf = [0u8; 16];
+        let n = sock.read(&mut buf).await.expect("read until EOF");
+        assert_eq!(n, 0, "expected clean EOF from closed client socket");
+        let _ = eof_tx.send(Instant::now());
+    });
+
+    let hold_ms = 300;
+    let connect_start = Instant::now();
+    let direct_out = run_dns_tcp_scenario_with_hold("127.0.0.1", bound_port, false, hold_ms)
+        .await
+        .expect("direct TCP connect with hold_ms");
+    let total_elapsed = connect_start.elapsed();
+    let eof_at = eof_rx.await.expect("receive peer EOF timestamp");
+    server.await.expect("server task join");
+
+    let eof_elapsed = eof_at.saturating_duration_since(connect_start);
+    assert!(!direct_out.used_loopback);
+    assert!(direct_out.connected);
+    assert_eq!(
+        direct_out.connected_addr.as_deref(),
+        Some(format!("127.0.0.1:{bound_port}").as_str())
+    );
+    assert!(
+        total_elapsed >= Duration::from_millis(250),
+        "expected total duration to honor hold_ms={hold_ms}, got {total_elapsed:?}"
+    );
+    assert!(
+        eof_elapsed + Duration::from_millis(100) < total_elapsed,
+        "peer must observe EOF well before hold_ms finishes (eof={eof_elapsed:?}, total={total_elapsed:?})"
+    );
+}

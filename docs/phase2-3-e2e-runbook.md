@@ -1,8 +1,12 @@
 # LocalEDR Phase 2 と Phase 3 実機 E2E 検証手順書
 
+> [!NOTE]
+> Phase 1 から Phase 4 までを一気通貫で実施する場合、および最新の統合版手順（Track A と Track C）を参照する場合は [e2e-test-runbook.md](e2e-test-runbook.md) を使用してください。
+> 本書は `FU-E2E-01` 単独実施向けの従来手順書として保持しています。
+
 この手順書は、[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` および [implementation-plan.md](implementation-plan.md) に基づき、Phase 2 と Phase 3 の実機受け入れ項目を Windows 10 または Windows 11（x86_64）クライアント SKU の管理者環境で検証するための手順をまとめたものである。
 
-現在の作業ブランチ（`fix/e2e-blockers-v2`、`main` ベース）では、非管理者セッションで完結するビルド、Clippy 静的検査（警告 0 件）、ワークスペース自動テスト（`e2e_blockers` 回帰テスト、`burst_budget` 11/11、および `ttl_purge_lineage` 9/9 を含む）が通過している。
+現在の `main` ブランチでは、非管理者セッションで完結するビルド、Clippy 静的検査（警告 0 件）、ワークスペース自動テスト（`e2e_blockers` 回帰テスト、`burst_budget`、`ttl_purge_lineage` を含む）が通過している。
 したがって、ここでは管理者権限または対話デスクトップ環境が必要なカーネル境界（実 ETW、実 `NtSuspendProcess` とツリー終了、実 BFE 動的 WFP フィルタと `FwpmNetEventSubscribe1`）、WinRT トースト通知と `ledr://` URI 起動、応答しない実 UNC 共有での NRD 更新と 3 秒停止予算、WebView2 上の対話操作、および常駐リソース計測を対象とする。
 
 ## 作業分担表
@@ -12,9 +16,8 @@
 
 | 担当 | 作業項目 | 実施状態 |
 | :--- | :--- | :--- |
-| エージェント | `fix/e2e-blockers-v2` でのビルド（`ledr-daemon.exe`、`ledr-ui.exe`、`ledr-sim.exe`） | 完了済み |
-| エージェント | `cargo clippy`（警告 0 件）、ワークスペース自動テスト、`burst_budget`（11/11）、`ttl_purge_lineage`（9/9）の確認 | 完了済み |
-| エージェント | 実機の OS バージョンと SKU（`Microsoft Windows 11 Home`、`10.0.26300`、`ProductType=1`）および `BFE` 稼働状態の確認 | 完了済み |
+| CI と自動テスト | `main` 上での `cargo clippy`（警告 0 件）、ワークスペース自動テスト、`burst_budget`、`ttl_purge_lineage` の確認 | 完了済み |
+| ユーザー（通常または管理者） | `main` からのデバッグビルド（`cargo build --workspace --locked`：`ledr-daemon.exe`、`ledr-ui.exe`、`ledr-sim.exe`）と OS SKU（`ProductType=1`）および `BFE` 稼働状態の確認 | 実施前に確認 |
 | ユーザー（通常） | `ledr-ui.exe --register-uri` による `HKCU` プロトコル・AUMID 登録、`ToastEnabled` 確認、WebView2 上での View 1 から View 3 までの対話操作、通知クリック確認 | 本手順書で実施 |
 | ユーザー（管理者） | Phase 2 実機検証（読み取り非発火、`Cookies` 凍結、おとりツリー凍結と一括終了、60 秒 `EXPIRED_SUSPENDED`、Never-Suspend、`Kernel-Registry` と `CloseKey`） | 本手順書で実施 |
 | ユーザー（管理者） | Phase 3 実機検証（WFP 動的セッション、事前制限、`FwpmNetEventSubscribe1` と曖昧 PID、`ledr-sim` 相関、ドメイン許可と Deny 優先、NRD と 3 秒 WAL チェックポイント、`taskkill /F` 消去） | 本手順書で実施 |

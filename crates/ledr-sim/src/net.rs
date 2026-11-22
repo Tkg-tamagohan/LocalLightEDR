@@ -18,24 +18,41 @@ pub async fn run_dns_tcp_scenario(
     port: u16,
     force_loopback: bool,
 ) -> Result<DnsTcpOutcome> {
+    run_dns_tcp_scenario_with_hold(domain, port, force_loopback, 0).await
+}
+
+/// Like [`run_dns_tcp_scenario`], holding the process alive for `hold_ms` milliseconds
+/// after closing the TCP connection so asynchronous ETW + WFP containment can be observed.
+pub async fn run_dns_tcp_scenario_with_hold(
+    domain: &str,
+    port: u16,
+    force_loopback: bool,
+    hold_ms: u64,
+) -> Result<DnsTcpOutcome> {
     if force_loopback {
-        return run_loopback_tcp_exchange("forced --loopback mode").await;
+        let outcome = run_loopback_tcp_exchange("forced --loopback mode").await?;
+        wait_hold_ms(hold_ms).await;
+        return Ok(outcome);
     }
 
     let lookup_res = tokio::time::timeout(NETWORK_TIMEOUT, lookup_host((domain, port))).await;
     let addrs: Vec<SocketAddr> = match lookup_res {
         Ok(Ok(iter)) => iter.collect(),
         Ok(Err(err)) => {
-            return run_loopback_tcp_exchange(&format!(
+            let outcome = run_loopback_tcp_exchange(&format!(
                 "DNS lookup for `{domain}:{port}` unavailable ({err}); fell back to loopback"
             ))
-            .await;
+            .await?;
+            wait_hold_ms(hold_ms).await;
+            return Ok(outcome);
         }
         Err(_) => {
-            return run_loopback_tcp_exchange(&format!(
+            let outcome = run_loopback_tcp_exchange(&format!(
                 "DNS lookup for `{domain}:{port}` timed out; fell back to loopback"
             ))
-            .await;
+            .await?;
+            wait_hold_ms(hold_ms).await;
+            return Ok(outcome);
         }
     };
 
@@ -51,6 +68,8 @@ pub async fn run_dns_tcp_scenario(
             tokio::time::timeout(NETWORK_TIMEOUT, TcpStream::connect(addr)).await
         {
             let _ = stream.shutdown().await;
+            drop(stream);
+            wait_hold_ms(hold_ms).await;
             return Ok(DnsTcpOutcome {
                 domain: domain.to_string(),
                 resolved_ips,
@@ -62,10 +81,27 @@ pub async fn run_dns_tcp_scenario(
         }
     }
 
-    run_loopback_tcp_exchange(&format!(
+    let outcome = run_loopback_tcp_exchange(&format!(
         "TCP connect to `{domain}:{port}` unreachable offline; fell back to loopback"
     ))
-    .await
+    .await?;
+    wait_hold_ms(hold_ms).await;
+    Ok(outcome)
+}
+
+async fn wait_hold_ms(hold_ms: u64) {
+    if hold_ms == 0 {
+        return;
+    }
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(hold_ms)) => {}
+        _ = ctrl_c => {}
+    }
 }
 
 /// Runs a self-contained loopback TCP listener + client exchange for offline validation.

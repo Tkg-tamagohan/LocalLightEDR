@@ -2605,3 +2605,48 @@ fn rules_nrd_mem_01_flat_sorted_arena_50k_compact_lookup_roundtrip_and_edges() {
         vec!["b-one.xyz", "c-two.xyz", "d-three.xyz"]
     );
 }
+
+#[test]
+fn rules_p4_01_local_cert_chain_flags_offline_and_verifies_cmd_exe() {
+    // Verify Windows SDK (`wincrypt.h`) bitmask values for offline-only chain building.
+    const EXPECTED_CACHE_END_CERT: u32 = 0x0000_0001;
+    const EXPECTED_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_0004;
+    const EXPECTED_DISABLE_AUTH_ROOT_AUTO_UPDATE: u32 = 0x0000_0100;
+
+    let flags = allowlist::LOCAL_CERT_CHAIN_FLAGS;
+    assert_ne!(flags & EXPECTED_CACHE_END_CERT, 0);
+    assert_ne!(flags & EXPECTED_CACHE_ONLY_URL_RETRIEVAL, 0);
+    assert_ne!(flags & EXPECTED_DISABLE_AUTH_ROOT_AUTO_UPDATE, 0);
+    assert_eq!(
+        flags,
+        EXPECTED_CACHE_END_CERT
+            | EXPECTED_CACHE_ONLY_URL_RETRIEVAL
+            | EXPECTED_DISABLE_AUTH_ROOT_AUTO_UPDATE
+    );
+
+    let cmd_exe = Path::new(r"C:\Windows\System32\cmd.exe");
+    assert!(
+        cmd_exe.is_file(),
+        "expected Windows system binary {} to exist",
+        cmd_exe.display()
+    );
+    let auth = inspect_authenticode(cmd_exe)
+        .expect("cmd.exe should verify locally with offline cert chain flags");
+    assert!(
+        !auth.signer_subject.trim().is_empty(),
+        "expected non-empty signer_subject for cmd.exe"
+    );
+    assert_eq!(
+        auth.root_thumbprint.len(),
+        40,
+        "expected 40-char SHA-1 root_thumbprint, got {:?}",
+        auth.root_thumbprint
+    );
+    assert!(
+        auth.root_thumbprint
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
+        "expected uppercase hex root_thumbprint, got {:?}",
+        auth.root_thumbprint
+    );
+}

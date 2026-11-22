@@ -528,10 +528,10 @@ Background Service Worker は `chrome.downloads.onCreated` と完了遷移の `o
 - [x] `crates/ledr-store` に `file_canary_events`、`alerts`、`allowlist_rules` の永続化と状態更新クエリを実装する
 - [x] `apps/ledr-ui` に `--notify <alert_id>` トースト通知発行モードと View 1（アラートトリアージビュー）での 3 段階解決操作（強制終了と遮断、今回のみ許可、永続ルール許可）を実装する
 - [x] `crates/ledr-sim` にダミー `Cookies` Open およびおとりファイル 1 バイト書込シナリオを追加する
-- [ ] 実機 E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` 参照）
+- [ ] 実機 E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[e2e-test-runbook.md](e2e-test-runbook.md) の Track A と Track C および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` 参照）
 
 受け入れ条件として、非許可の `ledr-sim` によるダミー機密ファイル Open またはおとりファイル書込時に即座にサスペンドされ、1 秒以内にトースト通知が出て、クリック後 1,000 ms 以内に View 1 から 5 秒以内で強制終了または再開が完了すること、かつ `explorer.exe` 等の除外プロセスが一切停止しないことを確認する。
-Phase 2 の実装項目 5 件は合成自動テストに合格して `main` へマージ済み（PR #3、`a68bce5`）であり、実機依存の受け入れ検証項目のみ未完了（`[ ]`）として独立した実機 E2E 検証 PR で実施する予定である（[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` 参照）。
+Phase 2 の実装項目 5 件は合成自動テストに合格して `main` へマージ済み（PR #3、`a68bce5`）であり、実機依存の受け入れ検証項目のみ未完了（`[ ]`）として独立した実機 E2E 検証 PR で実施する予定である（[e2e-test-runbook.md](e2e-test-runbook.md) および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` 参照）。
 
 ### Phase 3 未知プロセスのアウトバウンド通信制御
 
@@ -539,10 +539,10 @@ Phase 2 の実装項目 5 件は合成自動テストに合格して `main` へ�
 - [x] `crates/ledr-rules` と `crates/ledr-daemon` に高リスクパスおよびスクリプトインタプリタの事前制限、未知プロセスの初発外部通信時サスペンドと WFP ブロック連動、日次 NRD フィードキャッシュ、および起動時ルール再展開を実装する
 - [x] `crates/ledr-store` にファイアウォール許可および遮断ルールの CRUD クエリを実装する
 - [x] `apps/ledr-ui` に View 3（防御ポリシー、カナリア、ブラウザシールド管理ビュー）と View 1 からの通信許可ルール保存連携を実装する
-- [ ] 実機 E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` 参照）
+- [ ] 実機 E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[e2e-test-runbook.md](e2e-test-runbook.md) の Track A と Track C および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` 参照）
 
 受け入れ条件として、未許可の `ledr-sim` またはスクリプトインタプリタの外部通信が遮断および凍結され、View 1 で許可登録後に再開および通信が成立すること、View 3 でルールの参照と削除ができること、およびデーモン強制終了時に動的 WFP フィルタが自動消去されて通信不能にならないことを確認する。
-Phase 3 の実装項目 4 件は合成自動テストに合格して `main` へマージ済み（PR #5、`3fe1031`）であり、実機依存の受け入れ検証項目のみ未完了（`[ ]`）として独立した実機 E2E 検証 PR で実施する予定である（[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01` および副次申し送り `FU-P3-01` 参照）。
+Phase 3 の実装項目 4 件は合成自動テストに合格して `main` へマージ済み（PR #5、`3fe1031`）であり、実機依存の受け入れ検証項目のみ未完了（`[ ]`）として独立した実機 E2E 検証 PR で実施する予定である（[e2e-test-runbook.md](e2e-test-runbook.md)、[follow-up-notes.md](follow-up-notes.md) の `FU-E2E-01`、および副次申し送り `FU-P3-01` 参照）。
 
 ### Phase 4 Chrome 拡張と Native Messaging の統合
 
@@ -550,10 +550,10 @@ Phase 3 の実装項目 4 件は合成自動テストに合格して `main` へ�
 - [x] `extensions/ledr-chrome-mv3` に固定公開鍵 ID、DNR ブロックルール、ClickFix と Pastejacking の検知、NRD やホモグラフ URL 上のパスワード入力警告、および `downloads.onCreated` と `onChanged` の連携を実装する（PR #26、`6bb8bd3` にて `main` マージ済み）
 - [x] `crates/ledr-sensor-win`、`crates/ledr-daemon`、`crates/ledr-store` に `:Zone.Identifier` 読み取り、`download_origins` 保存、および 3 段階 MOTW 紐付けを実装する（PR #25、`cf7e866` にて `main` マージ済み）
 - [x] `apps/ledr-ui` の View 1〜3 へブラウザ由来のダウンロード元 URL、リファラ、および拡張ステータス表示を統合する（PR #28、`331602d` にて `main` マージ済み）
-- [ ] 実機 Chrome E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[phase4-e2e-runbook.md](phase4-e2e-runbook.md) および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-02` 参照）
+- [ ] 実機 Chrome E2E による受け入れ検証を完了する（Windows 10 または Windows 11 クライアント SKU の管理者昇格環境で未実施、[e2e-test-runbook.md](e2e-test-runbook.md) の Track B と Track C、[phase4-e2e-runbook.md](phase4-e2e-runbook.md)、および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-02` 参照）
 
 受け入れ条件として、ローカルテストページでの疑似 ClickFix コピー試行および NRD パスワード入力時にブラウザ内警告とデーモン記録が動作すること、また Chrome でダウンロードしたテストバイナリの起動時にダウンロード元 URL とリファラが自動紐付けされて UI へ表示されることを確認する。
-Phase 4 の実装項目 4 件は合成自動テストに合格して `main` へマージ済み（PR #25 `cf7e866`、PR #26 `6bb8bd3`、PR #28 `331602d`）であり、実機依存の受け入れ検証項目のみ未完了（`[ ]`）として独立した実機 E2E 検証 PR で実施する予定である（[phase4-e2e-runbook.md](phase4-e2e-runbook.md) および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-02`、副次申し送り `FU-P4-01` 参照）。
+Phase 4 の実装項目 4 件は合成自動テストに合格して `main` へマージ済み（PR #25 `cf7e866`、PR #26 `6bb8bd3`、PR #28 `331602d`）であり、実機依存の受け入れ検証項目のみ未完了（`[ ]`）として独立した実機 E2E 検証 PR で実施する予定である（[e2e-test-runbook.md](e2e-test-runbook.md)、[phase4-e2e-runbook.md](phase4-e2e-runbook.md)、および [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-02`、副次申し送り `FU-P4-01` 参照）。
 
 ## 検証計画
 
@@ -594,9 +594,11 @@ if ($LASTEXITCODE -ne 0) { throw "Tauri UI mock DOM tests failed (exit code: $LA
 
 ### 実機検証
 
-1. 疑似攻撃シナリオ検証（Windows 10/11 の管理者昇格 PowerShell で実行）では、`ledr-daemon.exe` を稼働させた状態で `ledr-sim.exe run-all` を実行し、Phase 1〜3 の受け入れ条件（親子系譜記録、ダミー機密ファイルアクセス時のサスペンドと再開、おとり書込によるツリー封じ込め、WFP 動的遮断と強制終了時の通信不能回避）を確認する。なお、トースト通知（`ledr://alert/<id>`）クリック起動の検証にはユーザー単位の `HKCU\Software\Classes\ledr` 登録（`--notify` 実行時の自動登録または `ledr-ui --register-uri` の事前実行）を用い、システム全体のレジストリ登録は Phase 4 インストーラ（`AUTO-14`）で実施する。
-2. リソース上限の計測（10 分間アイドルおよび `cargo build` 負荷計測）では、ウィンドウ閉鎖状態で `Get-Process ledr-ui -ErrorAction SilentlyContinue` が 0 件（UI メモリ 0 MB）であること、`Get-Process ledr-daemon` の Working Set が 20 MB 以下かつ定常時 CPU 平均使用率が 0.5% 未満であることを確認する。
-3. Chrome 拡張 E2E 検証（Phase 4）では、[phase4-e2e-runbook.md](phase4-e2e-runbook.md) に従い `extensions/ledr-chrome-mv3` を Chrome のデベロッパーモードで読み込み、[phase4-browser-test.html](fixtures/phase4-browser-test.html) 上で ClickFix 疑似ボタンと疑似 NRD パスワードフォームを操作してブラウザ警告と `ledr-ui` の記録を確認し、さらにローカルサーバーからダウンロードしたテスト実行ファイルの起動時にオリジン URL が View 1 と View 2 に表示されることを確認する。
+実機 E2E 検証の統合手順は [e2e-test-runbook.md](e2e-test-runbook.md) にまとめる。
+
+1. 疑似攻撃シナリオ検証（Windows 10/11 の管理者昇格 PowerShell で実行）では、[e2e-test-runbook.md](e2e-test-runbook.md) の Track A（または [phase2-3-e2e-runbook.md](phase2-3-e2e-runbook.md)）に従い、`ledr-daemon.exe` を稼働させた状態で `ledr-sim.exe` 等を実行し、Phase 1〜3 の受け入れ条件（親子系譜記録、ダミー機密ファイルアクセス時のサスペンドと再開、おとり書込によるツリー封じ込め、WFP 動的遮断と強制終了時の通信不能回避）を確認する。なお、トースト通知（`ledr://alert/<id>`）クリック起動の検証にはユーザー単位の `HKCU\Software\Classes\ledr` 登録（`--notify` 実行時の自動登録または `ledr-ui --register-uri` の事前実行）を用い、システム全体のレジストリ登録は Phase 4 インストーラ（`AUTO-14`）で実施する。
+2. リソース上限の計測（10 分間アイドルおよび `cargo build` 負荷計測）では、[e2e-test-runbook.md](e2e-test-runbook.md) の Track C に従い、ウィンドウ閉鎖状態で `Get-Process ledr-ui -ErrorAction SilentlyContinue` が 0 件（UI メモリ 0 MB）であること、`Get-Process ledr-daemon` の Working Set が 20 MB 以下かつ定常時 CPU 平均使用率が 0.5% 未満であることを確認する。
+3. Chrome 拡張 E2E 検証（Phase 4）では、[e2e-test-runbook.md](e2e-test-runbook.md) の Track B（または [phase4-e2e-runbook.md](phase4-e2e-runbook.md)）に従い `extensions/ledr-chrome-mv3` を Chrome のデベロッパーモードで読み込み、[phase4-browser-test.html](fixtures/phase4-browser-test.html) 上で ClickFix 疑似ボタンと疑似 NRD パスワードフォームを操作してブラウザ警告と `ledr-ui` の記録を確認し、さらにローカルサーバーからダウンロードしたテスト実行ファイルの起動時にオリジン URL が View 1 と View 2 に表示されることを確認する。
 
 ## 引き継ぎと次セッションへの移行手順
 
@@ -624,11 +626,11 @@ ETW、WFP、Named Pipe DACL、`NtSuspendProcess`、`CreateProcessAsUser`、お�
 #### Phase 4 実機 Chrome E2E 検証（`FU-E2E-02`）用
 
 ```text
-docs/phase4-e2e-runbook.md、docs/follow-up-notes.md の FU-E2E-02、docs/decision-records.md（L-01〜L-21）、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU 環境で Phase 4 の実機 Chrome E2E 検証を実施し、検証結果と合否記録を独立した PR としてまとめてください。
+docs/e2e-test-runbook.md（Track B および Track C）、docs/phase4-e2e-runbook.md、docs/follow-up-notes.md の FU-E2E-02、docs/decision-records.md（L-01〜L-21）、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU 環境で Phase 4 の実機 Chrome E2E 検証を実施し、検証結果と合否記録を独立した PR としてまとめてください。
 ```
 
 #### Phase 2〜3 実機 E2E 検証（`FU-E2E-01`）用
 
 ```text
-docs/follow-up-notes.md の FU-E2E-01、docs/implementation-plan.md、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU の管理者昇格環境で Phase 2 および Phase 3 の実機 E2E 検証を実施し、検証結果と必要に応じた調整を独立した PR としてまとめてください。
+docs/e2e-test-runbook.md（Track A および Track C）、docs/follow-up-notes.md の FU-E2E-01、docs/implementation-plan.md、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU の管理者昇格環境で Phase 2 および Phase 3 の実機 E2E 検証を実施し、検証結果と必要に応じた調整を独立した PR としてまとめてください。
 ```

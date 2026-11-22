@@ -24,7 +24,9 @@ pub(super) const CERT_NAME_SIMPLE_DISPLAY_TYPE: u32 = 4;
 pub(super) const CERT_X500_NAME_STR: u32 = 3;
 pub(super) const CERT_NAME_STR_REVERSE_FLAG: u32 = 0x0200_0000;
 pub(super) const CERT_SHA1_HASH_PROP_ID: u32 = 3;
-pub(super) const CERT_CHAIN_CACHE_END_CERT: u32 = 1;
+pub(super) const CERT_CHAIN_CACHE_END_CERT: u32 = 0x0000_0001;
+pub(super) const CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_0004;
+pub(super) const CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE: u32 = 0x0000_0100;
 
 #[allow(clippy::upper_case_acronyms)]
 #[repr(C)]

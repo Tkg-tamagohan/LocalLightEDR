@@ -222,8 +222,9 @@ impl DaemonEngine {
             return ("OBSERVED", false);
         };
 
-        let risk = classify_outbound_risk(exe_path);
-        if risk == OutboundRiskClass::ProtectedOs {
+        if self.is_self_process(*pid, exe_path)
+            || classify_outbound_risk(exe_path) == OutboundRiskClass::ProtectedOs
+        {
             self.outbound_classifier.mark_protected_os(*pid);
             return ("OBSERVED", false);
         }
@@ -379,6 +380,10 @@ impl DaemonEngine {
         domain_candidates: &[(String, i64)],
         event_ts_ms: i64,
     ) -> (&'static str, bool) {
+        if self.is_self_process(pid, exe_path) {
+            self.outbound_classifier.mark_protected_os(pid);
+            return ("OBSERVED", false);
+        }
         let risk = classify_outbound_risk(exe_path);
         let is_motw_origin = proc_ctx.origin_url.is_some();
         let effective_risk = if is_motw_origin && risk == OutboundRiskClass::GeneralUnknown {

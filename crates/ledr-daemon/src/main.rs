@@ -3,9 +3,12 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::Context as _;
 use ledr_daemon::{
     start_ipc_server, DaemonConfig, DaemonEngine, OutboundEnforcementMode, Session0ToastLauncher,
+    DEFAULT_MAX_CONCURRENT_IPC_CLIENTS,
 };
 use ledr_proto::{
     AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, IPC_PIPE_NAME, PROGRAM_DATA_DIR,
@@ -351,8 +354,22 @@ fn resolve_ui_exe_path(foreground: bool) -> PathBuf {
     PathBuf::from(AUTHORIZED_UI_EXE_PATH)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+const DAEMON_TOKIO_WORKER_THREADS: usize = 2;
+const DAEMON_TOKIO_MAX_BLOCKING_THREADS: usize = DEFAULT_MAX_CONCURRENT_IPC_CLIENTS + 4;
+const DAEMON_TOKIO_BLOCKING_KEEP_ALIVE_SECS: u64 = 10;
+
+fn build_daemon_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(DAEMON_TOKIO_WORKER_THREADS)
+        .max_blocking_threads(DAEMON_TOKIO_MAX_BLOCKING_THREADS)
+        .thread_keep_alive(Duration::from_secs(DAEMON_TOKIO_BLOCKING_KEEP_ALIVE_SECS))
+        .thread_name("ledr-tokio")
+        .enable_all()
+        .build()
+        .context("failed to build Tokio runtime for ledr-daemon")
+}
+
+fn main() -> anyhow::Result<()> {
     let cli = parse_cli_args(std::env::args_os())?;
     if cli.show_help {
         println!(
@@ -361,6 +378,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let runtime = build_daemon_runtime()?;
+    runtime.block_on(run_daemon(cli))
+}
+
+async fn run_daemon(cli: CliArgs) -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
@@ -883,5 +905,24 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn daemon_rt_01_build_daemon_runtime_is_bounded_multithread() {
+        assert_eq!(DAEMON_TOKIO_WORKER_THREADS, 2);
+        assert_eq!(
+            DAEMON_TOKIO_MAX_BLOCKING_THREADS,
+            DEFAULT_MAX_CONCURRENT_IPC_CLIENTS + 4
+        );
+        assert_eq!(DAEMON_TOKIO_MAX_BLOCKING_THREADS, 20);
+        assert_eq!(DAEMON_TOKIO_BLOCKING_KEEP_ALIVE_SECS, 10);
+
+        let rt = build_daemon_runtime().expect("build bounded daemon runtime");
+        let handle = rt.handle();
+        assert_eq!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        );
+        assert_eq!(rt.metrics().num_workers(), DAEMON_TOKIO_WORKER_THREADS);
     }
 }

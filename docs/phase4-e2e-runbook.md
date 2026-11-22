@@ -1,5 +1,8 @@
 # Phase 4 実機 Chrome E2E 検証手順書
 
+> [!NOTE]
+> Phase 1 から Phase 4 までを一気通貫で実施する場合、および最新の統合版手順（Track B と Track C）を参照する場合は [e2e-test-runbook.md](e2e-test-runbook.md) を使用してください。
+
 本書は LocalEDR の Phase 4（Native Messaging ブリッジ、Chrome Manifest V3 拡張、MOTW 3 段階紐付け、`ledr-ui` View 1〜3 統合）を Windows 10 または Windows 11（x86_64）クライアント SKU 実機で検証する手順を定める。
 作業は [follow-up-notes.md](follow-up-notes.md) の `FU-E2E-02` に対応し、外部ネットワークへ接続せずローカル環境のみで完結する。
 
@@ -137,7 +140,7 @@ Write-Output ("AdminBackupDir=" + $adminBackupDir)
 # ウィンドウ A（管理者 PowerShell）
 $runDir = "<ウィンドウ B で表示された RunDir の絶対パス>"
 $nrdUrl = ([Uri]"$runDir\nrd-test-feed.txt").AbsoluteUri
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --db "$runDir\ledr.db" --nrd-feed-url $nrdUrl --nrd-cache "$runDir\nrd-cache.txt"
+.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db "$runDir\ledr.db" --nrd-feed-url $nrdUrl --nrd-cache "$runDir\nrd-cache.txt"
 ```
 
 `View 3` のブラウザシールド欄に次の項目が表示されていれば登録確認は完了です。
@@ -176,12 +179,19 @@ $servePath = Join-Path $runDir "local_server.py"
 [System.IO.File]::WriteAllText($servePath, $serveScript, [System.Text.UTF8Encoding]::new($false))
 $serverProc = Start-Process -FilePath python -ArgumentList @($servePath, "$runDir\site") -PassThru -WindowStyle Minimized
 
-$chromeExe = "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"
-if (-not (Test-Path $chromeExe)) { $chromeExe = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe" }
+$chromeCandidates = @(
+    "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
+    "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+    "${env:LOCALAPPDATA}\Google\Chrome\Application\chrome.exe"
+)
+$chromeExe = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $chromeExe) {
+    throw "chrome.exe が見つかりません（Program Files / Program Files (x86) / LOCALAPPDATA を確認してください）。"
+}
 & $chromeExe `
   --user-data-dir="$runDir\chrome-profile" `
   --host-resolver-rules="MAP *.localedr.invalid 127.0.0.1" `
-  --unsafely-treat-insecure-origin-as-secure="http://clickfix-sim.localedr.invalid:8765,http://nrd-sim.localedr.invalid:8765,http://login-paypa1.localedr.invalid:8765" `
+  --unsafely-treat-insecure-origin-as-secure="http://clickfix-sim.localedr.invalid:8765,http://pastejack-sim.localedr.invalid:8765,http://nrd-sim.localedr.invalid:8765,http://login-paypa1.localedr.invalid:8765,http://safe-sim.localedr.invalid:8765,http://c2-sim.localedr.invalid:8765,http://blocked-test.localedr.invalid:8765" `
   "chrome://extensions"
 ```
 
@@ -197,7 +207,7 @@ if (-not (Test-Path $chromeExe)) { $chromeExe = "${env:ProgramFiles(x86)}\Google
 | ID | 対象URLと操作 | 期待結果 |
 | :--- | :--- | :--- |
 | `E2E-P4-01` | `http://clickfix-sim.localedr.invalid:8765/phase4-browser-test.html` で `Copy Verification Command` を押下し、`ledr-ui` で `Refresh` を押下 | ブラウザ内 Shadow DOM に ClickFix 警告が表示され、`ledr-ui` View 1 に `LAYER_4_BROWSER`（`ClickFixPastejacking`）が記録され、`Acknowledge` のみ有効で解決できる |
-| `E2E-P4-02` | 同ページの領域 2（`echo hello-localedr`）を選択して `Ctrl+C` し、`ledr-ui` で `Refresh` を押下 | ブラウザ内に Pastejacking 警告が表示され、領域 3（`Copy Snippet` と通常選択コピー）では警告が発火しない |
+| `E2E-P4-02` | `http://pastejack-sim.localedr.invalid:8765/phase4-browser-test.html` の領域 2（`echo hello-localedr`）を選択して `Ctrl+C` し、`ledr-ui` で `Refresh` を押下 | ブラウザ内に Pastejacking 警告が表示され（30 秒重複抑止を避け View 1 に記録され）、領域 3（`Copy Snippet` と通常選択コピー）では警告が発火しない |
 | `E2E-P4-03` | `http://nrd-sim.localedr.invalid:8765/phase4-browser-test.html` の `Password` 欄へフォーカスして 1 文字入力し、`ledr-ui` で `Refresh` を押下 | ブラウザ内に NRD 警告が表示され、View 1 に `NrdPasswordWarning` が記録される |
 | `E2E-P4-04` | `http://login-paypa1.localedr.invalid:8765/phase4-browser-test.html` の `Password` 欄へフォーカスして 1 文字入力し、`ledr-ui` で `Refresh` を押下 | ブラウザ内にホモグラフ警告（対象ブランド `paypal`）が表示され、View 1 に `HomographWarning` が記録される |
 | `E2E-P4-05` | `Fetch safe-sim.localedr.invalid` と `Fetch c2-sim.localedr.invalid` を順に押下し、`ledr-ui` で `Refresh` を押下 | `safe-sim` は `HTTP 200` で成功し、`c2-sim` と `blocked-test` は DNR 静的ルールで即座に遮断され、`DnrBlockedRequest` が記録される |
@@ -205,13 +215,16 @@ if (-not (Test-Path $chromeExe)) { $chromeExe = "${env:ProgramFiles(x86)}\Google
 | `E2E-P4-07` | View 1 の未解決 `LAYER_4_BROWSER` アラートを `Acknowledge` で解決後、`ledr-ui` ウィンドウを閉じる | View 1 で解決状態へ遷移し、ウィンドウ閉鎖後に `ledr-ui` と WebView2 の残留プロセスが 0 件になる |
 
 `E2E-P4-06` では、拡張機能のダウンロード完了通知とデーモン側の SHA-256 算出が非同期で走るため、**移動コマンドを実行する前に** `ledr-ui` 上部の `Refresh` を押し、View 2 の `Canary & Downloads` タブ（`Scope: All Processes`）に `Downloads\localedr-e2e-sample.exe` と短縮 `sha256` が記録されたことを確かめてください（View 3 の `Tracked Downloads` は件数表示のみのため、パスと `sha256` の確認は必ず View 2 で行います）。
-記録を確認してから、ウィンドウ B で移動とダミーカナリア起動を実行します。
+記録を確認してから、ウィンドウ B で移動と起動時事前 WFP ブロック（`L-18`）およびダミーカナリア起動を実行します。
 `localedr-e2e-sample.exe` は検知直後に凍結されるため、`Start-Process -PassThru` で別プロセスとして起動し、再度 `Refresh` を押して View 1 と View 2 を確認したあとに `Allow Once` で再開します。
 
 ```powershell
 # ウィンドウ B（通常ユーザー PowerShell）: View 2 の Canary & Downloads タブで元パスと SHA-256 の記録を確認した後に実行
 New-Item -ItemType Directory -Force -Path "$runDir\moved" | Out-Null
 Move-Item "$env:USERPROFILE\Downloads\localedr-e2e-sample.exe" "$runDir\moved\localedr-e2e-sample.exe" -Force
+# L-18 確認: 移動後でも MOTW による事前 WFP ブロックで外部 TCP が遮断され、View 1 に LEDR-NET-HIGH-RISK-PATH と MOTW カードが記録される
+$simNet = Start-Process -FilePath "$runDir\moved\localedr-e2e-sample.exe" -ArgumentList "--scenario", "dns-tcp", "--domain", "93.184.216.34", "--port", "80", "--json" -PassThru
+Start-Sleep -Seconds 3
 $simMotw = Start-Process -FilePath "$runDir\moved\localedr-e2e-sample.exe" -ArgumentList "--scenario", "cookies-open", "--base-dir", "$runDir\canary_dir", "--hold-ms", "120000", "--json" -PassThru
 ```
 
@@ -228,14 +241,14 @@ Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object
 
 続いて `ledr-daemon` の常駐メモリと CPU 使用率を計測する。
 `Get-Process` の `CPU` は起動後の累積 CPU 秒であり、`WorkingSet64` も取得時点の単発値になるため、[phase2-3-e2e-runbook.md](phase2-3-e2e-runbook.md) と同じく `--release` ビルドを用いて測定区間の CPU 差分とピーク Working Set を取得してください。
-まずウィンドウ A でデバッグ版 `ledr-daemon.exe` を `Ctrl+C` で終了し、リリースビルドを作成してリリース版 `ledr-daemon.exe` を起動します。
+`SEC_0003` の兄弟パス検証により Debug 版 `ledr-bridge-nm.exe` が登録されている状態では Release 版 `ledr-daemon.exe` への IPC が拒否されるため、手順 3 の Chrome 拡張操作をすべて終えて検証用 Chrome ウィンドウを閉じてから、ウィンドウ A でデバッグ版 `ledr-daemon.exe` を `Ctrl+C` で終了し、リリース版を起動します。
 
 ```powershell
-# ウィンドウ A（管理者 PowerShell）: デバッグ版停止後にリリース版で起動
+# ウィンドウ A（管理者 PowerShell）: 検証用 Chrome 終了・デバッグ版停止後にリリース版で起動
 cd e:\Documents\code\LocalEDR
 cargo build --workspace --release --locked
 $nrdUrl = ([Uri]"$runDir\nrd-test-feed.txt").AbsoluteUri
-.\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --db "$runDir\ledr.db" --nrd-feed-url $nrdUrl --nrd-cache "$runDir\nrd-cache.txt"
+.\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db "$runDir\ledr.db" --nrd-feed-url $nrdUrl --nrd-cache "$runDir\nrd-cache.txt"
 ```
 
 ウィンドウ A のログに初期化完了と NRD キャッシュ読み込みが出力されたら、ウィンドウ B で次の計測スクリプトを実行してください。

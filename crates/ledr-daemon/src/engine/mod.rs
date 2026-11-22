@@ -22,7 +22,7 @@ pub use alerts::ResolvedAlertOutcome;
 pub use binary_inspector::{
     BinaryInspector, LiveProcessInspector, WindowsBinaryInspector, WindowsLiveProcessInspector,
 };
-pub use config::{DaemonConfig, OutboundEnforcementMode};
+pub use config::{DaemonConfig, OutboundEnforcementMode, DEFAULT_MAX_CONCURRENT_IPC_CLIENTS};
 pub use motw::{
     BrowserEventOutcome, BrowserReportError, MotwAttribution, MotwInspector, MotwMatchStage,
     WindowsMotwInspector, MAX_BROWSER_EVENT_DETAILS_BYTES, MAX_DOWNLOAD_HASH_BYTES,
@@ -71,6 +71,8 @@ const AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS: i64 = 60_000;
 /// Resident Layer 2 detection and persistence pipeline engine.
 pub struct DaemonEngine {
     config: DaemonConfig,
+    self_pid: u32,
+    self_exe_normalized: Option<String>,
     store: LedrStore,
     sigma: SigmaEngine,
     pruner: EarlyPruner,
@@ -211,6 +213,37 @@ impl DaemonEngine {
             .map(|t| t.total_len())
             .unwrap_or(0)
     }
+
+    /// Returns `true` iff `(pid, exe_path)` matches the running daemon's own PID and normalized
+    /// executable path (fail-closed when `self_exe_normalized` is `None` or `exe_path` is empty).
+    pub(super) fn is_self_process(&self, pid: u32, exe_path: &str) -> bool {
+        if pid != self.self_pid || exe_path.trim().is_empty() {
+            return false;
+        }
+        let Some(ref self_exe) = self.self_exe_normalized else {
+            return false;
+        };
+        normalize_exe_path_for_self_check(exe_path) == *self_exe
+    }
+}
+
+pub(super) fn normalize_exe_path_for_self_check(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let slash_norm = trimmed.replace('/', "\\");
+    let without_nt = if slash_norm
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\??\UNC\"))
+    {
+        format!(r"\\{}", &slash_norm[8..])
+    } else if slash_norm.get(..4).is_some_and(|p| p == r"\??\") {
+        slash_norm[4..].to_string()
+    } else {
+        slash_norm
+    };
+    motw::normalize_windows_path(&without_nt).to_lowercase()
 }
 
 pub(crate) fn current_unix_ms() -> i64 {

@@ -397,6 +397,8 @@ extern "system" {
         string_security_descriptor_len: *mut u32,
     ) -> i32;
     fn ConvertSidToStringSidW(sid: *const c_void, string_sid: *mut *mut u16) -> i32;
+    #[cfg(test)]
+    fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut *mut c_void) -> i32;
     fn GetSecurityInfo(
         handle: *mut c_void,
         object_type: u32,
@@ -412,6 +414,33 @@ extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolve_sddl_alias_to_numeric_sid(alias: &str) -> String {
+        let alias_w: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut raw_sid: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `alias_w` is NUL-terminated UTF-16; `raw_sid` is freed by `LocalVoidGuard`.
+        let ok = unsafe { ConvertStringSidToSidW(alias_w.as_ptr(), &mut raw_sid) };
+        assert!(
+            ok != 0 && !raw_sid.is_null(),
+            "ConvertStringSidToSidW({alias:?}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let _sid_guard = LocalVoidGuard(raw_sid);
+
+        let mut string_sid: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `raw_sid` is a valid SID allocated by `ConvertStringSidToSidW`; `string_sid` is freed by `LocalWideGuard`.
+        let ok = unsafe { ConvertSidToStringSidW(raw_sid, &mut string_sid) };
+        assert!(
+            ok != 0 && !string_sid.is_null(),
+            "ConvertSidToStringSidW({alias:?}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let _str_guard = LocalWideGuard(string_sid);
+        let sid_pwstr = PWSTR(string_sid);
+        // SAFETY: `ConvertSidToStringSidW` returns a NUL-terminated UTF-16 string.
+        let wide = unsafe { sid_pwstr.as_wide() };
+        String::from_utf16_lossy(wide)
+    }
 
     fn parse_ace_hex_mask(sddl: &str, trustee: &str) -> u32 {
         let suffix = format!(";;;{trustee})");
@@ -504,25 +533,29 @@ mod tests {
             assert_eq!(live_mask & 0x0012_019B, 0x0012_019B);
         }
 
-        // Explicitly exercise the local machine's built-in Administrator SID (`...-500` -> `LA`)
-        // when running under a standard S-1-5-21-* account so CI `runneradmin` canonicalization
-        // is verified on developer workstations too.
-        let parts: Vec<&str> = current_sid.split('-').collect();
-        if parts.len() == 8 && parts[0] == "S" && parts[1] == "1" && parts[2] == "5" && parts[3] == "21" {
-            let local_admin_sid = format!(
-                "S-1-5-21-{}-{}-{}-500",
-                parts[4], parts[5], parts[6]
-            );
-            let la_trustee = canonical_sddl_trustee_for_sid(&local_admin_sid)
-                .expect("canonicalize local built-in admin SID");
-            let la_sd = build_dev_bypass_pipe_security_descriptor_for_sid(&local_admin_sid)
-                .expect("build dev-bypass SD for local built-in admin SID");
-            let la_sddl = la_sd.to_sddl_string().expect("roundtrip local admin SDDL");
-            assert!(!la_sddl.contains(";;;IU)"));
-            let la_mask = parse_ace_hex_mask(&la_sddl, &la_trustee);
-            assert_eq!(la_mask & 0x0004, 0);
-            assert_eq!(la_mask & 0x0012_019B, 0x0012_019B);
-        }
+        // Explicitly resolve this machine's true built-in Local Administrator SID (`LA` ->
+        // `S-1-5-21-<machine-domain>-500`) via `ConvertStringSidToSidW("LA")` so the `LA`
+        // canonicalization path (used by CI `runneradmin`) is unconditionally verified on
+        // standalone, domain-joined, and Entra ID workstations alike.
+        let local_admin_sid = resolve_sddl_alias_to_numeric_sid("LA");
+        assert!(
+            is_valid_numeric_sid(&local_admin_sid) && local_admin_sid.ends_with("-500"),
+            "unexpected local built-in Administrator SID resolved from LA: {local_admin_sid}"
+        );
+        let la_trustee = canonical_sddl_trustee_for_sid(&local_admin_sid)
+            .expect("canonicalize local built-in admin SID");
+        assert_eq!(
+            la_trustee, "LA",
+            "local built-in Administrator SID {local_admin_sid} must canonicalize to LA"
+        );
+        let la_sd = build_dev_bypass_pipe_security_descriptor_for_sid(&local_admin_sid)
+            .expect("build dev-bypass SD for local built-in admin SID");
+        let la_sddl = la_sd.to_sddl_string().expect("roundtrip local admin SDDL");
+        assert!(!la_sddl.contains(";;;IU)"));
+        assert_eq!(la_sddl.matches('(').count(), 3);
+        let la_mask = parse_ace_hex_mask(&la_sddl, "LA");
+        assert_eq!(la_mask & 0x0004, 0);
+        assert_eq!(la_mask & 0x0012_019B, 0x0012_019B);
     }
 
     #[test]

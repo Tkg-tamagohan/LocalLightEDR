@@ -200,7 +200,7 @@ if ($targetIp) {
     [System.IO.File]::WriteAllText($targetIpFile, $targetIp, [System.Text.UTF8Encoding]::new($false))
     Write-Output "Reachable example.com IPv4 (TCP:80): $targetIp"
 } else {
-    Write-Warning "example.com の TCP:80 到達可能な IPv4 アドレスを確定できませんでした（オフライン環境の場合は E2E-P3-01/04/07 を BLOCKED として記録してください）。"
+    Write-Warning "example.com の TCP:80 到達可能な IPv4 アドレスを確定できませんでした（オフライン環境の場合は E2E-P3-01/02/04/07 を BLOCKED として記録してください）。"
 }
 
 cargo build --workspace --locked
@@ -692,15 +692,50 @@ if ($LASTEXITCODE -ne 0) { throw "外部 TCP 接続に失敗しました (target
 ```
 
 4. `` `View 3: 防御ポリシー・カナリア・ブラウザシールド` `` を開き、作成した `NetworkAllow` ルールが一覧にあること、右側の `カナリア・おとり配置状態` が `3/3 deployed`（3 箇所のファイルサイズ付き）であること、および `Tier 1 Protected Templates` が表示されていることを確認する。
-5. **IP 許可ルールの削除と遮断復帰の確認（ドメイン許可検証との分離）**：手順 2 で作成した `$targetIp` 宛ての IP `NetworkAllow` ルールが残ったままだと、続く手順 7 の `example.com` 接続がドメイン許可ではなく残存 IP 許可だけで通過してしまうため、ここで手順 2 の IP `NetworkAllow` ルール行の `Delete` ボタンを押して削除し、ウィンドウ B から `$targetIp` ポート `80` へ再接続して再び WFP 遮断（`WSAEACCES` 等）へ戻ることを確認する。
+5. **IP 許可ルールの削除と遮断復帰の確認（ドメイン許可検証との分離）**：手順 2 で作成した `$targetIp` 宛ての IP `NetworkAllow` ルールが残ったままだと、続く手順 7 の `example.com` 接続が残存 IP 許可だけで通過してしまうため、ここで手順 2 の IP `NetworkAllow` ルール行の `Delete` ボタンを押して削除する。
+   削除後は単一インスタンスの 32 ビット版 PowerShell が WFP ドロップで凍結される可能性があるため、ウィンドウ B から `Start-Process -PassThru` で非同期に `$targetIp` ポート `80` へ接続試行させ、3 秒後に `Suspended` または `BLOCKED:AccessDenied`（`WSAEACCES`、タイムアウト `BLOCKED:TimedOut` は不可）を確認したうえで子プロセスを `Stop-Process -Force` で回収する。
 
 ```powershell
-# ウィンドウ B（管理者 PowerShell）: IP 許可ルール削除後に $targetIp:80 が再び WFP 遮断へ戻ることを確認
+# ウィンドウ B（管理者 PowerShell）: 非同期起動で WFP 遮断復帰（Suspended または AccessDenied）を確認し、凍結子を回収
 $adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 $targetIp = (Get-Content -Encoding UTF8 (Join-Path $adminDir "p3_target_ip.txt") -Raw).Trim()
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-& $ps32 -NoProfile -Command "`$c = [System.Net.Sockets.TcpClient]::new(); try { `$c.Connect('$targetIp', 80); Write-Output 'UNEXPECTED_SUCCESS'; exit 1 } catch { Write-Output ('Blocked again: ' + `$_.Exception.Message); exit 0 } finally { `$c.Close() }"
-if ($LASTEXITCODE -ne 0) { throw "IP 許可ルール削除後に WFP 遮断へ戻りませんでした (target=$targetIp)." }
+$chkPath = Join-Path $adminDir "p3_04_block_check.ps1"
+$chkScript = @'
+param([string]$OutFile, [string]$TargetHost)
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$c = [System.Net.Sockets.TcpClient]::new()
+$res = ""
+try {
+    $ar = $c.BeginConnect($TargetHost, 80, $null, $null)
+    if ($ar.AsyncWaitHandle.WaitOne(3000)) {
+        $c.EndConnect($ar)
+        $res = "UNEXPECTED_SUCCESS"
+    } else {
+        $res = "BLOCKED:TimedOut"
+    }
+} catch {
+    $ex = $_.Exception
+    while ($ex -and -not ($ex -is [System.Net.Sockets.SocketException])) { $ex = $ex.InnerException }
+    $code = if ($ex -is [System.Net.Sockets.SocketException]) { $ex.SocketErrorCode.ToString() } else { $_.Exception.GetType().Name }
+    $res = "BLOCKED:" + $code
+} finally {
+    $c.Close()
+}
+[System.IO.File]::WriteAllText($OutFile, $res, $utf8NoBom)
+'@
+[System.IO.File]::WriteAllText($chkPath, $chkScript, [System.Text.UTF8Encoding]::new($false))
+
+$chkOut = Join-Path $adminDir "p3_04_step5_block.txt"
+Remove-Item -LiteralPath $chkOut -ErrorAction SilentlyContinue
+$chkProc = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$chkPath`"", "-OutFile", "`"$chkOut`"", "-TargetHost", $targetIp -PassThru
+Start-Sleep -Seconds 3
+$isSuspended = [bool]((Get-Process -Id $chkProc.Id -ErrorAction SilentlyContinue).Threads | Where-Object { $_.WaitReason -eq 'Suspended' })
+$resultText = if (Test-Path -LiteralPath $chkOut) { (Get-Content -Encoding UTF8 $chkOut -Raw).Trim() } else { "" }
+if (-not $chkProc.HasExited) { Stop-Process -Id $chkProc.Id -Force -ErrorAction SilentlyContinue }
+Write-Output "Step5 Suspended=$isSuspended Result=$resultText"
+if ($resultText -eq 'UNEXPECTED_SUCCESS') { throw "IP 許可ルール削除後に WFP 遮断へ戻りませんでした (target=$targetIp)." }
+if (-not $isSuspended -and $resultText -ne 'BLOCKED:AccessDenied') { throw "WFP 拒否（Suspended または AccessDenied）を確認できませんでした (Result=$resultText)." }
 ```
 
 6. ドメイン許可（検証 A）のため、View 3 の `+ Add Rule` を押して次の値を入力し `Save Rule` を押す（`Save Rule` 成功後は View 3 のルール一覧が自動再読込されるため手動 `Refresh` は不要）。
@@ -717,16 +752,43 @@ $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
 ```
 
 8. Deny 優先（検証 B）のため、再び `+ Add Rule` を押し、同じ `Executable Path *`（`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`）と `Target IP / Domain / Path`（`example.com`）に対し `Scope` を `NetworkBlock (WFP Deny)` として `Save Rule` を押す。
-9. ウィンドウ B から再び上記 `example.com` 接続を実行し、遮断へ戻る（`NetworkBlock > NetworkAllow`）ことを確かめる。
-10. 最後に、検証で作成した `example.com` の `NetworkBlock` と `NetworkAllow` の各ルール行の `Delete` ボタンをすべて押し、ウィンドウ B から 32 ビット版 PowerShell で `$targetIp` ポート `80` へ再接続すると引き続き WFP 遮断（`WSAEACCES` 等による接続拒否）が維持されることを確認する。
+9. ウィンドウ B から手順 5 で作成した `$chkPath` を使って非同期に `example.com` へ接続試行させ、`Suspended` または `BLOCKED:AccessDenied` で遮断へ戻る（`NetworkBlock > NetworkAllow`）ことを確かめ、子プロセスを回収する。
 
 ```powershell
-# ウィンドウ B（管理者 PowerShell）: ルール削除後に $targetIp:80 の WFP 遮断が維持されることを確認
+# ウィンドウ B（管理者 PowerShell）: NetworkBlock > NetworkAllow による遮断復帰を確認（非同期）
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+$chkPath = Join-Path $adminDir "p3_04_block_check.ps1"
+$chkOut = Join-Path $adminDir "p3_04_step9_block.txt"
+Remove-Item -LiteralPath $chkOut -ErrorAction SilentlyContinue
+$chkProc = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$chkPath`"", "-OutFile", "`"$chkOut`"", "-TargetHost", "example.com" -PassThru
+Start-Sleep -Seconds 3
+$isSuspended = [bool]((Get-Process -Id $chkProc.Id -ErrorAction SilentlyContinue).Threads | Where-Object { $_.WaitReason -eq 'Suspended' })
+$resultText = if (Test-Path -LiteralPath $chkOut) { (Get-Content -Encoding UTF8 $chkOut -Raw).Trim() } else { "" }
+if (-not $chkProc.HasExited) { Stop-Process -Id $chkProc.Id -Force -ErrorAction SilentlyContinue }
+Write-Output "Step9 Suspended=$isSuspended Result=$resultText"
+if ($resultText -eq 'UNEXPECTED_SUCCESS') { throw "NetworkBlock 追加後に WFP 遮断へ戻りませんでした (target=example.com)." }
+if (-not $isSuspended -and $resultText -ne 'BLOCKED:AccessDenied') { throw "WFP 拒否（Suspended または AccessDenied）を確認できませんでした (Result=$resultText)." }
+```
+
+10. 最後に、検証で作成した `example.com` の `NetworkBlock` と `NetworkAllow` の各ルール行の `Delete` ボタンをすべて押し、ウィンドウ B から同じ `$chkPath` で `$targetIp` ポート `80` へ非同期に接続試行させ、引き続き WFP 遮断（`Suspended` または `BLOCKED:AccessDenied`）が維持されることを確認して子プロセスを回収する。
+
+```powershell
+# ウィンドウ B（管理者 PowerShell）: ルール削除後に $targetIp:80 の WFP 遮断維持を確認（非同期）
 $adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 $targetIp = (Get-Content -Encoding UTF8 (Join-Path $adminDir "p3_target_ip.txt") -Raw).Trim()
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-& $ps32 -NoProfile -Command "`$c = [System.Net.Sockets.TcpClient]::new(); try { `$c.Connect('$targetIp', 80); Write-Output 'UNEXPECTED_SUCCESS'; exit 1 } catch { Write-Output ('Blocked again: ' + `$_.Exception.Message); exit 0 } finally { `$c.Close() }"
-if ($LASTEXITCODE -ne 0) { throw "ルール削除後に WFP 遮断へ戻りませんでした (target=$targetIp)." }
+$chkPath = Join-Path $adminDir "p3_04_block_check.ps1"
+$chkOut = Join-Path $adminDir "p3_04_step10_block.txt"
+Remove-Item -LiteralPath $chkOut -ErrorAction SilentlyContinue
+$chkProc = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$chkPath`"", "-OutFile", "`"$chkOut`"", "-TargetHost", $targetIp -PassThru
+Start-Sleep -Seconds 3
+$isSuspended = [bool]((Get-Process -Id $chkProc.Id -ErrorAction SilentlyContinue).Threads | Where-Object { $_.WaitReason -eq 'Suspended' })
+$resultText = if (Test-Path -LiteralPath $chkOut) { (Get-Content -Encoding UTF8 $chkOut -Raw).Trim() } else { "" }
+if (-not $chkProc.HasExited) { Stop-Process -Id $chkProc.Id -Force -ErrorAction SilentlyContinue }
+Write-Output "Step10 Suspended=$isSuspended Result=$resultText"
+if ($resultText -eq 'UNEXPECTED_SUCCESS') { throw "ルール削除後に WFP 遮断へ戻りませんでした (target=$targetIp)." }
+if (-not $isSuspended -and $resultText -ne 'BLOCKED:AccessDenied') { throw "WFP 拒否（Suspended または AccessDenied）を確認できませんでした (Result=$resultText)." }
 ```
 
 ### E2E-P3-05：実 WinHTTP NRD 取得と View 3 ドメイン診断

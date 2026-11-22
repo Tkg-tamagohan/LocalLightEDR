@@ -62,11 +62,17 @@ pub struct DaemonConfig {
     /// `C:\Program Files\LocalEDR\ledr-ui.exe` install-path check while still inspecting
     /// and logging caller process identity.
     pub dev_mode_bypass_ui_auth: bool,
-    /// When `true`, applies `SERVICE_PIPE_SDDL`
-    /// (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)`) when creating the Named Pipe.
+    /// When `true`, applies a strict Named Pipe DACL when creating the IPC endpoint:
+    /// - Production (`dev_mode_bypass_ui_auth == false`): applies `SERVICE_PIPE_SDDL`
+    ///   (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)`) together with `L-09` binary verification.
+    /// - Dev bypass (`dev_mode_bypass_ui_auth == true`): omits `IU` and grants `0x12019B` only
+    ///   to the launching process's current user SID (failing closed to `SY`/`BA` only under
+    ///   `S-1-5-18` `LocalSystem`) so other interactive accounts cannot mutate rules.
+    ///
     /// The `ledr-daemon` CLI always sets this to `true` (including under `--dev-bypass-auth`)
-    /// so an elevated daemon grants Interactive Users `0x12019B` read/write access;
-    /// `DaemonConfig::default()` keeps `false` for same-privilege unit/integration tests.
+    /// so an elevated daemon grants the launching user's non-elevated `ledr-ui.exe` and
+    /// `ledr-bridge-nm.exe` `0x12019B` read/write access; `DaemonConfig::default()` keeps `false`
+    /// for same-privilege unit/integration tests.
     pub strict_pipe_dacl: bool,
     /// Optional expected lowercase SHA-256 hex digest for the authorized UI binary (`L-09`).
     pub authorized_ui_sha256: Option<String>,

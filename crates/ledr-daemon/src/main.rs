@@ -384,9 +384,13 @@ fn main() -> anyhow::Result<()> {
 
 /// Builds the [`DaemonConfig`] for `ledr-daemon` CLI execution.
 ///
-/// Always enables `strict_pipe_dacl` (`SERVICE_PIPE_SDDL`) even when `--dev-bypass-auth`
-/// is set, so an elevated daemon grants Interactive Users (`ledr-ui.exe` / `ledr-bridge-nm.exe`)
-/// read/write access (`0x12019B`) across elevation boundaries.
+/// Always enables `strict_pipe_dacl` even when `--dev-bypass-auth` is set:
+/// - Production (`--dev-bypass-auth` unset): applies `SERVICE_PIPE_SDDL` (`SY`, `BA`, `IU`)
+///   alongside `L-09` caller binary verification.
+/// - Dev bypass (`--dev-bypass-auth` set): restricts `0x12019B` read/write access to the
+///   launching user's current SID (without `IU`, failing closed to `SY`/`BA` under `S-1-5-18`)
+///   so non-elevated `ledr-ui.exe` / `ledr-bridge-nm.exe` running as the same user can connect
+///   across UAC elevation boundaries while blocking other interactive accounts.
 fn build_daemon_config(
     cli: &CliArgs,
     authorized_ui_sha256: Option<String>,

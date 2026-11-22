@@ -503,7 +503,8 @@ Select-String -Path $activeFiltersXml -Pattern "LocalEDR" -ErrorAction Stop | Se
 
 出力に `LocalEDR Outbound SubLayer`、`LocalEDR Loopback Permit (v4)`、`LocalEDR Loopback Permit (v6)`、および事前制限インタプリタ（`System32\WindowsPowerShell\v1.0\powershell.exe` と `SysWOW64\WindowsPowerShell\v1.0\powershell.exe` 等）に対する `LocalEDR Block` フィルタが含まれていれば事前制限が有効です。
 
-続けて、操作用のウィンドウ A/B/C（64 ビット版 `System32\...\powershell.exe`）と実行ファイルパスが重複しない **32 ビット版 PowerShell（`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`）** を 1 インスタンスだけ別プロセスで起動し、ローカル接続（`127.0.0.1`）の成功と外部接続（`93.184.216.34` ポート `80`）の遮断および単一インスタンス凍結を確認します。
+続けて、操作用のウィンドウ A/B/C（64 ビット版 `System32\...\powershell.exe`）と実行ファイルパスが重複しない **32 ビット版 PowerShell（`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`）** を 1 インスタンスだけ別プロセスで起動し、ローカル接続（`127.0.0.1`）の成功と外部接続（`example.com` から解決した到達可能な IPv4 アドレス `$targetIp` のポート `80`）の遮断および単一インスタンス凍結を確認します。
+解決した `$targetIp` は `$adminDir\p3_target_ip.txt` へ保存し、続く `E2E-P3-02`、`E2E-P3-04`、および `E2E-P3-07` で一貫して同じ宛先を使います。
 もし外部への TCP 経路がない完全オフライン環境の場合は、外部接続の代替条件がないため `BLOCKED（オフライン環境）` と記録してください。
 
 ```powershell
@@ -512,10 +513,16 @@ $adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $ps32)) { throw "32 ビット版 PowerShell が見つかりません: $ps32" }
 
+$ipv4List = @([System.Net.Dns]::GetHostAddresses("example.com") | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork })
+if ($ipv4List.Count -eq 0) { throw "example.com の IPv4 アドレスを解決できませんでした。" }
+$targetIp = $ipv4List[0].IPAddressToString
+[System.IO.File]::WriteAllText((Join-Path $adminDir "p3_target_ip.txt"), $targetIp, [System.Text.UTF8Encoding]::new($false))
+Write-Output "Target IPv4 (example.com): $targetIp"
+
 $probeOut = Join-Path $adminDir "p3_01_probe.txt"
 Remove-Item -LiteralPath $probeOut -ErrorAction SilentlyContinue
 $probeScript = @'
-param([string]$OutFile)
+param([string]$OutFile, [string]$TargetIp)
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
 $listener.Start()
@@ -529,7 +536,7 @@ $listener.Stop()
 $ext = [System.Net.Sockets.TcpClient]::new()
 $line2 = ""
 try {
-    $ar = $ext.BeginConnect("93.184.216.34", 80, $null, $null)
+    $ar = $ext.BeginConnect($TargetIp, 80, $null, $null)
     if ($ar.AsyncWaitHandle.WaitOne(3000)) {
         $ext.EndConnect($ar)
         $line2 = "External connect succeeded"
@@ -547,7 +554,7 @@ Start-Sleep -Seconds 60
 $probePath = Join-Path $adminDir "p3_01_probe.ps1"
 [System.IO.File]::WriteAllText($probePath, $probeScript, [System.Text.UTF8Encoding]::new($false))
 
-$ps32Proc1 = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$probePath`"", "-OutFile", "`"$probeOut`"" -PassThru
+$ps32Proc1 = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$probePath`"", "-OutFile", "`"$probeOut`"", "-TargetIp", $targetIp -PassThru
 Start-Sleep -Seconds 5
 if (Test-Path -LiteralPath $probeOut) { Get-Content -Encoding UTF8 -LiteralPath $probeOut }
 (Get-Process -Id $ps32Proc1.Id -ErrorAction SilentlyContinue).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
@@ -568,13 +575,14 @@ if (Test-Path -LiteralPath $probeOut) { Get-Content -Encoding UTF8 -LiteralPath 
 # ウィンドウ B（管理者 PowerShell）
 $adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+$targetIp = (Get-Content -Encoding UTF8 (Join-Path $adminDir "p3_target_ip.txt") -Raw).Trim()
 $ambOut = Join-Path $adminDir "p3_02_ambig.txt"
 Remove-Item -LiteralPath $ambOut -ErrorAction SilentlyContinue
 $ambScript = @'
-param([string]$OutFile)
+param([string]$OutFile, [string]$TargetIp)
 $ext = [System.Net.Sockets.TcpClient]::new()
 $msg = try {
-    $ext.Connect("93.184.216.34", 80)
+    $ext.Connect($TargetIp, 80)
     "Succeeded"
 } catch {
     "Blocked: " + $_.Exception.Message
@@ -588,7 +596,7 @@ $ambPath = Join-Path $adminDir "p3_02_ambig.ps1"
 [System.IO.File]::WriteAllText($ambPath, $ambScript, [System.Text.UTF8Encoding]::new($false))
 
 Start-Sleep -Milliseconds 400
-$ps32Proc2 = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$ambPath`"", "-OutFile", "`"$ambOut`"" -PassThru
+$ps32Proc2 = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$ambPath`"", "-OutFile", "`"$ambOut`"", "-TargetIp", $targetIp -PassThru
 Start-Sleep -Seconds 3
 if (Test-Path -LiteralPath $ambOut) { Get-Content -Encoding UTF8 -LiteralPath $ambOut }
 (Get-Process -Id $ps32Proc2.Id -ErrorAction SilentlyContinue).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
@@ -631,16 +639,18 @@ Set-Location $repoRoot
 ウィンドウ C の `ledr-ui.exe` で `Refresh` を押し、次の順で操作してください（標的は先ほど `E2E-P3-01` で使った 32 ビット版 `C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe` です）。
 
 1. `View 1: アラートトリアージ` で、`E2E-P3-01` で発生した単一インスタンス側の `SysWOW64\...\powershell.exe` アラート（`LEDR-NET-SCRIPT-INTERPRETER`）を選択する。
-2. 右下の `Allow Permanent Rule` カードで `Target scope (optional)` に `93.184.216.34` を入力し、`Match Authenticode signer` がオンの状態で `Allow Permanent Rule` ボタンを押す（5 秒以内に先ほどの凍結中 `$ps32Proc1` が再開して終了することを確認し、残っていれば `Stop-Process` で停止する）。
-3. ウィンドウ B から 32 ビット版 PowerShell で `93.184.216.34:80` へ再接続し、`External connect succeeded` が出力されて通信が通ることを確認する。
-   なお、`93.184.216.34:80` のリモート側が応答せずタイムアウト（`WSAETIMEDOUT`）になった場合でも、WFP 遮断時の即座の拒否（`WSAEACCES`、「アクセス許可で禁じられた方法でソケットにアクセスしようとしました」）が消えて外部タイムアウトへ変化していれば WFP 許可の適用は確認でき、直接の HTTP 200 疎通は手順 5 と 6 の `example.com` で確認する。
+2. 右下の `Allow Permanent Rule` カードで `Target scope (optional)` に `E2E-P3-01` で保存した到達可能な IPv4 アドレス（`$targetIp`、確認する場合は `Get-Content -Encoding UTF8 "$env:ProgramData\LocalEDR-e2e-admin\p3_target_ip.txt"`）を入力し、`Match Authenticode signer` がオンの状態で `Allow Permanent Rule` ボタンを押す（5 秒以内に先ほどの凍結中 `$ps32Proc1` が再開して終了することを確認し、残っていれば `Stop-Process` で停止する）。
+3. ウィンドウ B から 32 ビット版 PowerShell で `$targetIp` のポート `80` へ再接続し、`External connect succeeded`（終了コード `0`）が出力されて実通信が成立することを確認する。
+   タイムアウト（`WSAETIMEDOUT`）は WFP 許可の証拠として扱わず、非ゼロ終了時は失敗とする。
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
 if ($ps32Proc1) { Stop-Process -Id $ps32Proc1.Id -Force -ErrorAction SilentlyContinue }
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$targetIp = (Get-Content -Encoding UTF8 (Join-Path $adminDir "p3_target_ip.txt") -Raw).Trim()
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-& $ps32 -NoProfile -Command '$ErrorActionPreference = ''Stop''; $c = [System.Net.Sockets.TcpClient]::new(); try { $c.Connect(''93.184.216.34'', 80); Write-Output ''External connect succeeded'' } finally { $c.Close() }'
-if ($LASTEXITCODE -ne 0) { throw "外部 TCP 接続に失敗しました (exit code: $LASTEXITCODE)." }
+& $ps32 -NoProfile -Command "`$ErrorActionPreference = 'Stop'; `$c = [System.Net.Sockets.TcpClient]::new(); try { `$c.Connect('$targetIp', 80); Write-Output 'External connect succeeded' } finally { `$c.Close() }"
+if ($LASTEXITCODE -ne 0) { throw "外部 TCP 接続に失敗しました (target=$targetIp, exit code: $LASTEXITCODE)." }
 ```
 
 4. `` `View 3: 防御ポリシー・カナリア・ブラウザシールド` `` を開き、作成した `NetworkAllow` ルールが一覧にあること、右側の `カナリア・おとり配置状態` が `3/3 deployed`（3 箇所のファイルサイズ付き）であること、および `Tier 1 Protected Templates` が表示されていることを確認する。
@@ -659,7 +669,16 @@ $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
 
 7. Deny 優先（検証 B）のため、再び `+ Add Rule` を押し、同じ `Executable Path *`（`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`）と `Target IP / Domain / Path`（`example.com`）に対し `Scope` を `NetworkBlock (WFP Deny)` として `Save Rule` を押す。
 8. ウィンドウ B から再び上記 `example.com` 接続を実行し、遮断へ戻る（`NetworkBlock > NetworkAllow`）ことを確かめる。
-9. 最後に、検証で作成した `NetworkBlock` と `NetworkAllow` の各ルール行の `Delete` ボタンをすべて押し、ウィンドウ B から 32 ビット版 PowerShell で `93.184.216.34` ポート `80` へ接続すると再び WFP 遮断へ戻ることを確認する。
+9. 最後に、検証で作成した `NetworkBlock` と `NetworkAllow` の各ルール行の `Delete` ボタンをすべて押し、ウィンドウ B から 32 ビット版 PowerShell で `$targetIp` ポート `80` へ再接続すると再び WFP 遮断（`WSAEACCES` 等による接続拒否）へ戻ることを確認する。
+
+```powershell
+# ウィンドウ B（管理者 PowerShell）: 削除後に $targetIp:80 が再び WFP 遮断へ戻ることを確認
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$targetIp = (Get-Content -Encoding UTF8 (Join-Path $adminDir "p3_target_ip.txt") -Raw).Trim()
+$ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+& $ps32 -NoProfile -Command "`$c = [System.Net.Sockets.TcpClient]::new(); try { `$c.Connect('$targetIp', 80); Write-Output 'UNEXPECTED_SUCCESS'; exit 1 } catch { Write-Output ('Blocked again: ' + `$_.Exception.Message); exit 0 } finally { `$c.Close() }"
+if ($LASTEXITCODE -ne 0) { throw "ルール削除後に WFP 遮断へ戻りませんでした (target=$targetIp)." }
+```
 
 ### E2E-P3-05：実 WinHTTP NRD 取得と View 3 ドメイン診断
 
@@ -728,7 +747,7 @@ $stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
 $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Get-Item (Join-Path $runDir "nrd_hang.db-wal") -ErrorAction SilentlyContinue | Select-Object Name, Length
 $nrdHangDb = Join-Path $runDir "nrd_hang.db"
-python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print('processes=', c.execute('SELECT count(*) FROM processes').fetchone()[0]); print(c.execute('SELECT pid, exe_path, command_line FROM processes ORDER BY created_at_ms DESC LIMIT 3').fetchall())" $nrdHangDb
+python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print('processes=', c.execute('SELECT count(*) FROM processes').fetchone()[0]); print(c.execute('SELECT pid, exe_path, command_line FROM processes ORDER BY created_at_ms DESC, process_instance_id DESC LIMIT 3').fetchall())" $nrdHangDb
 ```
 
 ### E2E-P3-07：`taskkill /F` 強制終了時の動的 WFP フィルタ 0 件自動消去
@@ -763,13 +782,21 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $afterKillFiltersXml)) 
 }
 Select-String -Path $afterKillFiltersXml -Pattern "LocalEDR" -ErrorAction Stop
 
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$targetIpFile = Join-Path $adminDir "p3_target_ip.txt"
+if (Test-Path -LiteralPath $targetIpFile) {
+    $targetIp = (Get-Content -Encoding UTF8 $targetIpFile -Raw).Trim()
+} else {
+    $ipv4List = @([System.Net.Dns]::GetHostAddresses("example.com") | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork })
+    if ($ipv4List.Count -eq 0) { throw "example.com の IPv4 アドレスを解決できませんでした。" }
+    $targetIp = $ipv4List[0].IPAddressToString
+}
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-& $ps32 -NoProfile -Command '$ErrorActionPreference = ''Stop''; $c = [System.Net.Sockets.TcpClient]::new(); try { $c.Connect(''93.184.216.34'', 80); Write-Output ''External connect succeeded'' } finally { $c.Close() }'
-if ($LASTEXITCODE -ne 0) { throw "強制終了後の外部 TCP 接続回復に失敗しました (exit code: $LASTEXITCODE)." }
+& $ps32 -NoProfile -Command "`$ErrorActionPreference = 'Stop'; `$c = [System.Net.Sockets.TcpClient]::new(); try { `$c.Connect('$targetIp', 80); Write-Output 'External connect succeeded' } finally { `$c.Close() }"
+if ($LASTEXITCODE -ne 0) { throw "強制終了後の外部 TCP 接続回復に失敗しました (target=$targetIp, exit code: $LASTEXITCODE)." }
 ```
 
-`Select-String` の一致件数が **0 件** になり、そのまま `External connect succeeded` で外部通信が回復していれば、動的セッション（`FWPM_SESSION_FLAG_DYNAMIC`）による異常終了時の通信不能回避は合格です。
-なお、`93.184.216.34:80` のリモート側が応答せず `WSAETIMEDOUT` になる環境では、`WSAEACCES` が消えて接続試行が外部へ出たことを確認したうえで、`Invoke-WebRequest -UseBasicParsing http://example.com -TimeoutSec 5` で HTTP 200 を確認してください。
+`Select-String` の一致件数が **0 件** になり、そのまま 32 ビット版 PowerShell から到達可能な `$targetIp` ポート `80` へ `External connect succeeded`（終了コード `0`）で実接続できれば、動的セッション（`FWPM_SESSION_FLAG_DYNAMIC`）による異常終了時の通信不能回避は合格です（タイムアウトは許可または回復の証拠とみなしません）。
 
 ## 4. Track B：Phase 4 実機 Chrome E2E 検証（FU-E2E-02）
 
@@ -1268,18 +1295,23 @@ if ($LASTEXITCODE -ne 0) { throw "Program Files ブリッジの一時登録に�
 
 Windows Service SCM エントリポイントが未実装の段階でも、Sysinternals `PsExec64.exe` を用いて `LocalSystem` 権限（Session 0）からデーモンを起動し、`WTSQueryUserToken` と `CreateProcessAsUserW` による対話セッションへの `--notify` 起動を確認できます。
 なお、デーモンは `SEC_0004` に基づき Session 0 で動作している間は `--foreground` が指定されていてもフォアグラウンド代替起動を拒否するため、本手順でトーストが表示されれば `WTSQueryUserToken` と `CreateProcessAsUserW` の実経路が通ったことを確認できます。
-`E2E-OPT-02` で作成した `C:\Program Files\LocalEDR\`（未作成の場合は `E2E-OPT-02` 前半で配置してください）が存在する状態で、ウィンドウ A を `Ctrl+C` で止めてからウィンドウ B で Session 0 起動を実行してください。
+`E2E-OPT-02` で作成した `C:\Program Files\LocalEDR\` と `$adminDir\ui-sha256.txt` および `bridge-sha256.txt`（未作成の場合は `E2E-OPT-02` 前半で配置してください）が存在する状態で、ウィンドウ A を `Ctrl+C` で止めてからウィンドウ B で Session 0 起動を実行してください。
+なお、`LocalSystem`（`S-1-5-18`）で `--dev-bypass-auth` を指定すると Named Pipe DACL が `SYSTEM` と `Administrators` のみ（`D:P(A;;GA;;;SY)(A;;GA;;;BA)`）へフェイルクローズされ、対話ユーザーの非昇格 `ledr-ui.exe` から IPC 接続できなくなるため、本手順では `--dev-bypass-auth` を付けず `--ui-sha256` と `--bridge-sha256` による本番 DACL（`SERVICE_PIPE_SDDL`）と `L-09` バイナリ検証で起動します。
 
 ```powershell
 # ウィンドウ B（64 ビット版管理者 PowerShell・PsExec64.exe が PATH または作業フォルダにある前提）
 $stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+$uiHash = (Get-Content -Encoding UTF8 (Join-Path $adminDir "ui-sha256.txt") -Raw).Trim()
+$bridgeHash = (Get-Content -Encoding UTF8 (Join-Path $adminDir "bridge-sha256.txt") -Raw).Trim()
 $psexec = Get-Command PsExec64.exe -ErrorAction Stop
 $svcDb = Join-Path $runDir "svc.db"
 Start-Process -FilePath $psexec.Source -ArgumentList @(
     "-accepteula", "-s", "-i", "0", "-d",
     "`"C:\Program Files\LocalEDR\ledr-daemon.exe`"",
-    "--foreground", "--dev-bypass-auth", "--outbound-mode", "preemptive-only",
+    "--foreground", "--ui-sha256", $uiHash, "--bridge-sha256", $bridgeHash,
+    "--outbound-mode", "preemptive-only",
     "--resume-suspended-on-shutdown", "--disable-nrd-refresh",
     "--db", "`"$svcDb`""
 )
@@ -1314,7 +1346,7 @@ Remove-Item -LiteralPath (Join-Path $adminDir "ui-sha256.txt"), (Join-Path $admi
 
 ## 7. 共通後片付けと復元検証
 
-管理者権限で起動した `--dev-bypass-auth` 付き `ledr-daemon.exe` が稼働したままだと、同じセッション内のプロセスが認証なしで防御ルールを変更できる状態が残ります。
+管理者権限で起動した `--dev-bypass-auth` 付き `ledr-daemon.exe` が稼働したままだと、起動元と同じユーザーアカウントのプロセスがバイナリ認証なしで防御ルールを変更できる状態が残ります。
 後片付けは必ずデーモンの停止から始めてください。
 
 ### CLEAN-01：デーモン停止と WFP 動的フィルタ残存 0 件確認（ウィンドウ A と B）
@@ -1514,8 +1546,8 @@ Get-Item "$env:USERPROFILE\Downloads\localedr-e2e-sample*.exe", "$env:USERPROFIL
 | 同じブラウザ操作を再試行しても View 1 に記録が増えない | `L-19` の 30 秒重複抑止（上限 256 件）が働いている | 30 秒以上待つか、別サブドメイン（`pastejack-sim` 等）で開き、`ledr-ui` 上部の `Refresh` を押す |
 | View 2 に全体のダウンロード履歴が見えない | 左ペインで特定プロセスが選択されたままになっている | 左ペイン上部の `All` を押して `Scope: All Processes` へ戻し、`Canary & Downloads` タブを見る |
 | 移動した `localedr-e2e-sample.exe` が WFP 遮断されない | 移動前に Chrome ダウンロード通知の SHA-256 算出と記録が終わっていない | 一度削除してダウンロードし直し、移動前に View 2 記録を確認してから移動する |
-| `Microsoft-Windows-Kernel-Process` のイベントが 1 件も届かず新規プロセス登録や WFP ドロップ相関が機能しない | Windows の ETW 1 プロバイダ上限（8 セッション）に到達し、終了済みアプリの残留セッション等が配信枠を占有している | `logman query -ets` で `Microsoft-Windows-Kernel-Process` 購読セッションを確認し、不要な残留セッションを `logman stop <セッション名> -ets` で停止したうえで `ledr-daemon.exe` を再起動する |
-| Track B で `E2E-P4-03` または `E2E-P4-04` が発火しない、または検証ページが読み込み中のまま開かない | 前ステップのホスト名（`clickfix-sim` 等）のまま操作している、またはローカル HTTP サーバの `python.exe` が別インスタンス由来の WFP ドロップで凍結されている | ページ表示の `Hostname:` が対象ドメインであることを確認し、読み込み停止時は `View 1` で `python.exe` の凍結アラートを `Allow Once` で再開するか `local_server.py` を再起動する |
+| `Microsoft-Windows-Kernel-Process` のイベントが 1 件も届かず新規プロセス登録や WFP ドロップ相関が機能しない | Windows の ETW 1 プロバイダ上限（8 セッション）に到達し、終了済みアプリの残留セッション等が配信枠を占有している | `logman query -ets` で一覧を確認したあと、各候補へ `logman query <セッション名> -ets` を実行して `Microsoft-Windows-Kernel-Process` 購読有無を特定し、終了済みアプリの不要な残留セッションだけを `logman stop <セッション名> -ets` で停止して `ledr-daemon.exe` を再起動する（`EventLog-System` や `DiagLog` など OS 標準セッションは停止しない） |
+| Track B で `E2E-P4-03` または `E2E-P4-04` が発火しない、または検証ページが読み込み中のまま開かない | 前ステップのホスト名（`clickfix-sim` 等）のまま操作している、またはローカル HTTP サーバの `python.exe` が別インスタンス由来の WFP ドロップで凍結されている | ページ表示の `Hostname:` が対象ドメインであることを確認し、読み込み停止時は `View 1` で `python.exe` の凍結アラートを `Allow Once` で再開する。`local_server.py` を再起動する場合は、ポート `8765` の占有を残さないよう凍結中の旧 `python.exe` を先に終了してから再起動する |
 
 ### ルート別完了判定基準
 

@@ -46,6 +46,51 @@ impl WfpRuleManager {
         true
     }
 
+    /// Removes an obsolete pre-emptive app-wide WFP handle that became unnecessary before commit
+    /// (for example, all qualifying process instances exited while `add_wfp_app_rule` was in
+    /// flight).
+    ///
+    /// If `remove_wfp_rule` fails and no filter currently occupies `(exe_path, None)` in
+    /// `self.installed`, retains `handle` as a tracked `Preemptive` filter (consistent with
+    /// [`Self::remove_preemptive_block_if_unused`]) so subsequent `ProcessStop`, `AllowOnce`,
+    /// `TerminateAndBlock`, or persisted-policy reconciliation can retry removal instead of
+    /// leaking an untracked OS BFE block.
+    pub fn discard_obsolete_preemptive_block(
+        &mut self,
+        exe_path: &str,
+        handle: u64,
+        defense: &dyn ActiveDefenseController,
+    ) -> bool {
+        match defense.remove_wfp_rule(handle) {
+            Ok(()) => true,
+            Err(err) => {
+                let key = Self::target_key(exe_path, None);
+                if let std::collections::hash_map::Entry::Vacant(slot) = self.installed.entry(key) {
+                    tracing::warn!(
+                        exe_path = %exe_path,
+                        wfp_handle = handle,
+                        error = %err,
+                        "failed removing obsolete pre-emptive WFP handle after concurrent process exit; retaining handle in WfpRuleManager for retry"
+                    );
+                    slot.insert(InstalledWfpFilter {
+                        handle,
+                        exe_path: exe_path.to_string(),
+                        allow: false,
+                        origin: WfpFilterOrigin::Preemptive,
+                    });
+                } else {
+                    tracing::warn!(
+                        exe_path = %exe_path,
+                        wfp_handle = handle,
+                        error = %err,
+                        "failed removing obsolete pre-emptive WFP handle after concurrent process exit while another filter already occupies slot"
+                    );
+                }
+                false
+            }
+        }
+    }
+
     /// Records a newly installed transient containment WFP Block handle bound to `alert_id`.
     ///
     /// If another thread concurrently installed a filter for `exe_path`, removes the redundant

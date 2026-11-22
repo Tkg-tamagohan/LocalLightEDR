@@ -60,6 +60,21 @@ impl DaemonEngine {
                     motw.zone_id,
                 );
         }
+        if proc_ctx.skip_store_ingest {
+            if let Some(inst_id) = instance_id {
+                if let Err(err) = self.store.update_process_motw_metadata(
+                    inst_id,
+                    Some(&motw.origin_url),
+                    motw.sha256.as_deref(),
+                ) {
+                    tracing::warn!(
+                        process_instance_id = %inst_id,
+                        error = %err,
+                        "failed backfilling MOTW metadata on skip_store_ingest event"
+                    );
+                }
+            }
+        }
         proc_ctx.origin_url = Some(motw.origin_url);
         proc_ctx.motw_source = Some(motw_source_str);
         proc_ctx.motw_referrer = motw.referrer_url;
@@ -152,7 +167,7 @@ impl DaemonEngine {
         let motw_candidate = if let SensorEvent::ProcessStart { identity, .. } = event {
             if proc_ctx.origin_url.is_none()
                 && proc_ctx.exited_at_ms.is_none()
-                && !proc_ctx.skip_store_ingest
+                && !proc_ctx.skip_launch_guards
             {
                 match (
                     proc_ctx.proc_instance_id.as_deref(),
@@ -164,7 +179,7 @@ impl DaemonEngine {
                         Self::should_schedule_process_motw(
                             effective_exe,
                             proc_ctx.exited_at_ms,
-                            proc_ctx.skip_store_ingest,
+                            proc_ctx.skip_launch_guards,
                         )
                         .map(|normalized_exe| (inst_id.to_string(), normalized_exe))
                     }
@@ -225,7 +240,7 @@ impl DaemonEngine {
         if let SensorEvent::ProcessStart { identity, .. } = event {
             if proc_ctx.origin_url.is_none()
                 && proc_ctx.exited_at_ms.is_none()
-                && !proc_ctx.skip_store_ingest
+                && !proc_ctx.skip_launch_guards
             {
                 if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
                     if !self.is_self_process(identity.pid, effective_exe) {
@@ -234,7 +249,7 @@ impl DaemonEngine {
                                 proc_ctx.proc_instance_id.as_deref(),
                                 effective_exe,
                                 proc_ctx.exited_at_ms,
-                                proc_ctx.skip_store_ingest,
+                                proc_ctx.skip_launch_guards,
                             )
                             .await
                         {
@@ -284,14 +299,14 @@ impl DaemonEngine {
         if let SensorEvent::ProcessStart { identity, .. } = event {
             if proc_ctx.origin_url.is_none()
                 && proc_ctx.exited_at_ms.is_none()
-                && !proc_ctx.skip_store_ingest
+                && !proc_ctx.skip_launch_guards
             {
                 if let Some(effective_exe) = proc_ctx.proc_exe_path.as_deref() {
                     if !self.is_self_process(identity.pid, effective_exe) {
                         if let Some(motw) = self.resolve_process_motw(
                             effective_exe,
                             proc_ctx.exited_at_ms,
-                            proc_ctx.skip_store_ingest,
+                            proc_ctx.skip_launch_guards,
                         ) {
                             let inst_id = proc_ctx.proc_instance_id.clone();
                             self.attach_motw_to_proc_ctx(inst_id.as_deref(), &mut proc_ctx, motw);
@@ -306,13 +321,15 @@ impl DaemonEngine {
                 self.prepare_canary_backfill_sync(event, &proc_ctx, event_ts_ms)
             {
                 if proc_ctx.origin_url.is_none()
+                    && prepared.res.exited_at_ms.is_none()
                     && !prepared.exe_path.is_empty()
-                    && !prepared.res.skip_store_ingest
+                    && !prepared.res.skip_launch_guards
+                    && !self.is_self_process(pid, &prepared.exe_path)
                 {
                     if let Some(motw) = self.resolve_process_motw(
                         &prepared.exe_path,
                         prepared.res.exited_at_ms,
-                        prepared.res.skip_store_ingest,
+                        prepared.res.skip_launch_guards,
                     ) {
                         self.attach_motw_to_proc_ctx(
                             Some(&prepared.res.instance_id),
@@ -425,25 +442,17 @@ impl DaemonEngine {
             SensorEvent::ProcessStart {
                 identity, exe_path, ..
             } => {
-                if proc_ctx.exited_at_ms.is_none() && !proc_ctx.skip_store_ingest {
+                if proc_ctx.exited_at_ms.is_none() && !proc_ctx.skip_launch_guards {
                     let effective_exe = proc_ctx
                         .proc_exe_path
                         .as_deref()
                         .unwrap_or(exe_path.as_str());
-                    let is_self = self.is_self_process(identity.pid, effective_exe);
-                    if is_self
-                        || classify_outbound_risk(effective_exe) == OutboundRiskClass::ProtectedOs
-                    {
-                        self.outbound_classifier.mark_protected_os(identity.pid);
-                    } else {
-                        self.outbound_classifier.remove_pid(identity.pid);
-                    }
-                    if self.config.outbound_firewall_enabled && !is_self {
-                        self.maybe_apply_preemptive_wfp_block_with_motw(
-                            effective_exe,
-                            proc_ctx.origin_url.is_some(),
-                        );
-                    }
+                    self.apply_process_launch_guards(
+                        identity.pid,
+                        proc_ctx.proc_instance_id.as_deref(),
+                        effective_exe,
+                        proc_ctx.origin_url.is_some(),
+                    );
                 }
                 "OBSERVED"
             }
@@ -458,45 +467,60 @@ impl DaemonEngine {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove_process(inst_id);
-                    let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                    let was_once_allowed = fw.on_process_stop(inst_id);
-                    if self.config.outbound_firewall_enabled {
-                        if let Some(ref exe_path) = proc_ctx.proc_exe_path {
-                            let exe_k = WfpRuleManager::exe_key(exe_path);
-                            let is_startup_pinned = fw.is_startup_preemptive(exe_path);
-                            let is_preemptive = fw
-                                .active_app_block(exe_path)
-                                .is_some_and(|(_, origin)| origin == WfpFilterOrigin::Preemptive);
-                            let has_any_filter = fw.has_any_app_filter(exe_path);
-                            let has_other_once_allowed = fw.has_once_allowed_for_exe(&exe_k);
-                            drop(fw);
+                    // Lock order: `firewall` -> `process_table` (unified with `wfp_premat.rs`
+                    // and `alerts.rs`) so preemptive removal and concurrent launch-guard commits
+                    // serialize atomically without TOCTOU leaks.
+                    let restore_preemptive_exe: Option<String> = {
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        let was_once_allowed = fw.on_process_stop(inst_id);
+                        if self.config.outbound_firewall_enabled {
+                            if let Some(ref exe_path) = proc_ctx.proc_exe_path {
+                                let exe_k = WfpRuleManager::exe_key(exe_path);
+                                let is_startup_pinned = fw.is_startup_preemptive(exe_path);
+                                let is_preemptive = fw
+                                    .active_app_block(exe_path)
+                                    .is_some_and(|(_, origin)| {
+                                        origin == WfpFilterOrigin::Preemptive
+                                    });
+                                let has_any_filter = fw.has_any_app_filter(exe_path);
+                                let has_other_once_allowed = fw.has_once_allowed_for_exe(&exe_k);
 
-                            if is_preemptive && !is_startup_pinned {
-                                let still_active = self
-                                    .process_table
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .has_active_exe_key(&exe_k);
-                                if !still_active {
-                                    let mut fw =
-                                        self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                                    fw.remove_preemptive_block_if_unused(exe_path, &*self.defense);
-                                }
-                            } else if was_once_allowed
-                                && !has_any_filter
-                                && !has_other_once_allowed
-                            {
-                                let should_restore = is_startup_pinned
-                                    || self
+                                if is_preemptive && !is_startup_pinned {
+                                    let still_active = self
                                         .process_table
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner())
                                         .has_active_exe_key(&exe_k);
-                                if should_restore {
-                                    self.maybe_apply_preemptive_wfp_block(exe_path);
+                                    if !still_active {
+                                        fw.remove_preemptive_block_if_unused(
+                                            exe_path,
+                                            &*self.defense,
+                                        );
+                                    }
+                                    None
+                                } else if was_once_allowed
+                                    && !has_any_filter
+                                    && !has_other_once_allowed
+                                {
+                                    let should_restore = is_startup_pinned
+                                        || self
+                                            .process_table
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .has_active_exe_key(&exe_k);
+                                    should_restore.then(|| exe_path.clone())
+                                } else {
+                                    None
                                 }
+                            } else {
+                                None
                             }
+                        } else {
+                            None
                         }
+                    };
+                    if let Some(ref exe_path) = restore_preemptive_exe {
+                        self.maybe_apply_preemptive_wfp_block(exe_path);
                     }
                 }
                 "OBSERVED"
@@ -627,15 +651,17 @@ impl DaemonEngine {
             return;
         };
         if proc_ctx.origin_url.is_none()
+            && prepared.res.exited_at_ms.is_none()
             && !prepared.exe_path.is_empty()
-            && !prepared.res.skip_store_ingest
+            && !prepared.res.skip_launch_guards
+            && !self.is_self_process(pid, &prepared.exe_path)
         {
             if let Some(motw) = self
                 .resolve_process_motw_budgeted(
                     Some(&prepared.res.instance_id),
                     &prepared.exe_path,
                     prepared.res.exited_at_ms,
-                    prepared.res.skip_store_ingest,
+                    prepared.res.skip_launch_guards,
                 )
                 .await
             {
@@ -807,6 +833,49 @@ impl DaemonEngine {
         ))
     }
 
+    fn apply_process_launch_guards(
+        &self,
+        pid: u32,
+        instance_id: Option<&str>,
+        effective_exe: &str,
+        has_motw: bool,
+    ) {
+        // Active-only entry guard: skip already-exited (or evicted) instances so a delayed
+        // startup snapshot or async MOTW path cannot clobber `outbound_classifier` or arm WFP
+        // for a dead process. Intentionally does NOT gate on `launch_guards_applied` so
+        // `upgraded_exe` (`PRG-001`) and delayed `L-18` MOTW promotion still apply.
+        if let Some(inst_id) = instance_id {
+            let is_active = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_by_instance_id(inst_id)
+                .is_some_and(|e| e.exited_at_ms.is_none());
+            if !is_active {
+                return;
+            }
+        }
+        let is_self = self.is_self_process(pid, effective_exe);
+        if is_self || classify_outbound_risk(effective_exe) == OutboundRiskClass::ProtectedOs {
+            self.outbound_classifier.mark_protected_os(pid);
+        } else {
+            self.outbound_classifier.remove_pid(pid);
+        }
+        if effective_exe.trim().is_empty() {
+            return;
+        }
+        if self.config.outbound_firewall_enabled && !is_self {
+            self.maybe_apply_preemptive_wfp_block_with_motw(effective_exe, has_motw);
+        }
+        if let Some(inst_id) = instance_id {
+            let mut table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            table.mark_launch_guards_applied(inst_id);
+        }
+    }
+
     fn finalize_canary_backfill(
         &self,
         pid: u32,
@@ -821,6 +890,15 @@ impl DaemonEngine {
             command_line,
             res,
         } = prepared;
+
+        if res.exited_at_ms.is_none() && !res.skip_launch_guards {
+            self.apply_process_launch_guards(
+                ident.pid,
+                Some(&res.instance_id),
+                &exe_path,
+                proc_ctx.origin_url.is_some(),
+            );
+        }
 
         let synthetic_start = SensorEvent::ProcessStart {
             identity: ident,
@@ -1253,6 +1331,7 @@ impl DaemonEngine {
                     exited_at_ms: res.exited_at_ms,
                     superseded_exit: res.superseded_exit,
                     skip_store_ingest: res.skip_store_ingest,
+                    skip_launch_guards: res.skip_launch_guards,
                     effective_process_start,
                     origin_url,
                     motw_source,
@@ -1280,6 +1359,7 @@ impl DaemonEngine {
                     exited_at_ms: None,
                     superseded_exit: None,
                     skip_store_ingest: false,
+                    skip_launch_guards: false,
                     effective_process_start: None,
                     origin_url: None,
                     motw_source: None,
@@ -1325,12 +1405,9 @@ impl DaemonEngine {
                 };
                 let (parent_exe, parent_cmd) = parent_instance_id
                     .as_deref()
-                    .and_then(|parent_id| table.get_by_instance_id(parent_id))
-                    .map(|p| {
-                        (
-                            Some(p.exe_path.clone()),
-                            (!p.command_line.is_empty()).then(|| p.command_line.clone()),
-                        )
+                    .map(|parent_id| {
+                        let (_, p_exe, p_cmd) = table.parent_metadata_by_id(parent_id);
+                        (p_exe, p_cmd)
                     })
                     .unwrap_or((None, None));
                 ResolvedProcessContext {
@@ -1345,6 +1422,7 @@ impl DaemonEngine {
                     exited_at_ms: None,
                     superseded_exit: None,
                     skip_store_ingest: false,
+                    skip_launch_guards: false,
                     effective_process_start: None,
                     origin_url,
                     motw_source,
@@ -1390,6 +1468,8 @@ pub(super) struct ResolvedProcessContext {
     /// `true` when an unverified `create_time_100ns == 0` snapshot was absorbed into an active
     /// verified process without adding any new metadata and must not write a `pid:0` row.
     pub(super) skip_store_ingest: bool,
+    /// `true` when a re-enrichment `ProcessStart` must not re-run MOTW or preemptive WFP guards.
+    pub(super) skip_launch_guards: bool,
     /// Merged `ProcessStart` carrying the table's consolidated identity and non-clobbering
     /// metadata whenever the normalized in-memory entry differs from the incoming `ProcessStart`
     /// event, so `EarlyPruner`, `SigmaEngine`, alert context, and SQLite ingestion evaluate the
@@ -1417,6 +1497,7 @@ impl Default for ResolvedProcessContext {
             exited_at_ms: None,
             superseded_exit: None,
             skip_store_ingest: false,
+            skip_launch_guards: false,
             effective_process_start: None,
             origin_url: None,
             motw_source: None,

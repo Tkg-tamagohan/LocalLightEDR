@@ -14,22 +14,25 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
-    TRACE_LEVEL_INFORMATION, TRACE_LEVEL_VERBOSE, WNODE_FLAG_TRACED_GUID,
+    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE,
+    EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
+    PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW, TRACE_LEVEL_INFORMATION, TRACE_LEVEL_VERBOSE,
+    WNODE_FLAG_TRACED_GUID,
 };
 
 use crate::dns_cache::DnsResolutionCache;
 use crate::path_norm::DosVolumeMap;
 use crate::SensorError;
 
-use super::context::{EtwCallbackContext, HoneypotHandleTracker};
+use super::cmdline_correlator::ProcessCommandLineCorrelator;
+use super::context::{AuxSystemProcessContext, EtwCallbackContext, HoneypotHandleTracker};
 use super::file_canary::CanaryMatcher;
 use super::handlers::{
     AMSI_GUID, DNS_CLIENT_GUID, KERNEL_FILE_GUID, KERNEL_FILE_KEYWORDS, KERNEL_NETWORK_GUID,
     KERNEL_PROCESS_GUID, KERNEL_REGISTRY_GUID, KERNEL_REGISTRY_KEYWORDS, POWERSHELL_GUID,
-    WINEVENT_KEYWORD_PROCESS, buffer_callback, event_record_callback,
+    WINEVENT_KEYWORD_PROCESS, aux_buffer_callback, aux_system_process_callback, buffer_callback,
+    event_record_callback,
 };
 
 /// Default Windows ETW trace session name for LocalEDR real-time telemetry.
@@ -91,6 +94,31 @@ impl TracePropertiesBuffer {
         buf
     }
 
+    fn new_system_process_realtime(session_name_nul: &[u16]) -> Self {
+        let mut buf = Self {
+            props: EVENT_TRACE_PROPERTIES::default(),
+            logger_name: [0u16; MAX_SESSION_NAME_CHARS],
+            log_file_name: [0u16; MAX_LOGFILE_NAME_CHARS],
+        };
+        buf.props.Wnode.BufferSize = std::mem::size_of::<Self>() as u32;
+        buf.props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        // ClientContext = 2 selects system time (FILETIME 100ns) matching the main session.
+        buf.props.Wnode.ClientContext = 2;
+        buf.props.Wnode.Guid = GUID::zeroed();
+        buf.props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
+        buf.props.EnableFlags = EVENT_TRACE_FLAG_PROCESS;
+        buf.props.FlushTimer = 1;
+        buf.props.BufferSize = 64;
+        buf.props.MinimumBuffers = 4;
+        buf.props.MaximumBuffers = 8;
+        buf.props.LoggerNameOffset = std::mem::offset_of!(Self, logger_name) as u32;
+        buf.props.LogFileNameOffset = 0;
+
+        let copy_len = session_name_nul.len().min(MAX_SESSION_NAME_CHARS);
+        buf.logger_name[..copy_len].copy_from_slice(&session_name_nul[..copy_len]);
+        buf
+    }
+
     fn new_control() -> Self {
         let mut buf = Self {
             props: EVENT_TRACE_PROPERTIES::default(),
@@ -104,11 +132,73 @@ impl TracePropertiesBuffer {
     }
 }
 
+pub(super) struct ActiveAuxSession {
+    pub(super) session_name: String,
+    pub(super) session_handle: CONTROLTRACE_HANDLE,
+    pub(super) session_name_nul: Vec<u16>,
+    pub(super) worker: Option<JoinHandle<()>>,
+}
+
+/// RAII rollback guard for an already-started auxiliary `SystemTrace` session while the
+/// main ETW session is still starting up. If any subsequent main-session startup step
+/// fails, dropping this guard signals shutdown, stops the auxiliary kernel session, and
+/// joins its consumer thread so no orphaned session or thread leaks.
+struct AuxStartupGuard<'a, F: FnMut(CONTROLTRACE_HANDLE, &[u16])> {
+    aux_session: Option<ActiveAuxSession>,
+    shutdown_initiated: &'a AtomicBool,
+    aux_active: &'a AtomicBool,
+    stop_requested: &'a AtomicBool,
+    stop_fn: F,
+}
+
+impl<'a, F: FnMut(CONTROLTRACE_HANDLE, &[u16])> AuxStartupGuard<'a, F> {
+    fn new(
+        aux_session: Option<ActiveAuxSession>,
+        shutdown_initiated: &'a AtomicBool,
+        aux_active: &'a AtomicBool,
+        stop_requested: &'a AtomicBool,
+        stop_fn: F,
+    ) -> Self {
+        Self {
+            aux_session,
+            shutdown_initiated,
+            aux_active,
+            stop_requested,
+            stop_fn,
+        }
+    }
+
+    fn disarm(mut self) -> Option<ActiveAuxSession> {
+        self.aux_session.take()
+    }
+}
+
+impl<F: FnMut(CONTROLTRACE_HANDLE, &[u16])> Drop for AuxStartupGuard<'_, F> {
+    fn drop(&mut self) {
+        if let Some(mut aux) = self.aux_session.take() {
+            self.shutdown_initiated.store(true, Ordering::Release);
+            self.aux_active.store(false, Ordering::Release);
+            self.stop_requested.store(true, Ordering::Release);
+            (self.stop_fn)(aux.session_handle, &aux.session_name_nul);
+            if let Some(handle) = aux.worker.take() {
+                let _ = handle.join();
+            }
+            tracing::info!(
+                session = %aux.session_name,
+                "rolled back auxiliary ETW system process session after main session startup failure"
+            );
+        }
+    }
+}
+
 pub(super) struct ActiveEtwSession {
     pub(super) session_handle: CONTROLTRACE_HANDLE,
     pub(super) session_name_nul: Vec<u16>,
     pub(super) stop_requested: Arc<AtomicBool>,
+    pub(super) shutdown_initiated: Arc<AtomicBool>,
+    pub(super) aux_active: Arc<AtomicBool>,
     pub(super) worker: Option<JoinHandle<()>>,
+    pub(super) aux_session: Option<ActiveAuxSession>,
 }
 
 /// Real-time Windows ETW sensor backend subscribing to Process, File, Registry, DNS, Network,
@@ -234,14 +324,47 @@ impl WindowsEtwSensor {
         };
 
         if let Some(mut session) = active {
+            session.shutdown_initiated.store(true, Ordering::Release);
             if abort_immediately {
                 // Only abort in-flight callbacks on explicit force-abort; graceful stop()
                 // lets ControlTraceW flush buffered events to ProcessTrace before exiting.
+                session.aux_active.store(false, Ordering::Release);
                 session.stop_requested.store(true, Ordering::Release);
-            }
-            stop_trace_session(session.session_handle, &session.session_name_nul);
-            if let Some(handle) = session.worker.take() {
-                let _ = handle.join();
+                if let Some(mut aux) = session.aux_session.take() {
+                    stop_trace_session(aux.session_handle, &aux.session_name_nul);
+                    if let Some(handle) = aux.worker.take() {
+                        let _ = handle.join();
+                    }
+                    tracing::info!(
+                        session = %aux.session_name,
+                        abort_immediately,
+                        "ETW auxiliary system process sensor stopped"
+                    );
+                }
+                stop_trace_session(session.session_handle, &session.session_name_nul);
+                if let Some(handle) = session.worker.take() {
+                    let _ = handle.join();
+                }
+            } else {
+                // On graceful stop, drain main Kernel-Process first while `aux_active` stays
+                // true so flushed Kernel-Process events can still register PendingKernelStart,
+                // then flush and join aux SystemTrace so pending starts resolve cleanly.
+                stop_trace_session(session.session_handle, &session.session_name_nul);
+                if let Some(handle) = session.worker.take() {
+                    let _ = handle.join();
+                }
+                if let Some(mut aux) = session.aux_session.take() {
+                    stop_trace_session(aux.session_handle, &aux.session_name_nul);
+                    if let Some(handle) = aux.worker.take() {
+                        let _ = handle.join();
+                    }
+                    tracing::info!(
+                        session = %aux.session_name,
+                        abort_immediately,
+                        "ETW auxiliary system process sensor stopped"
+                    );
+                }
+                session.aux_active.store(false, Ordering::Release);
             }
             tracing::info!(
                 session = %self.session_name,
@@ -280,6 +403,31 @@ impl SensorBackend for WindowsEtwSensor {
             .to_string());
         }
 
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_initiated = Arc::new(AtomicBool::new(false));
+        let cmdline_correlator = Arc::new(Mutex::new(ProcessCommandLineCorrelator::new()));
+        let aux_active = Arc::new(AtomicBool::new(false));
+
+        // Start auxiliary SystemTrace process session BEFORE enabling main-session providers
+        // so processes spawned immediately after startup already have kernel CommandLine coverage.
+        // If any main-session startup step fails below, `aux_guard` rolls back the auxiliary
+        // session and joins its consumer thread cleanly.
+        let aux_session = try_start_aux_system_process_session(
+            &self.session_name,
+            Arc::clone(&self.sink),
+            Arc::clone(&cmdline_correlator),
+            Arc::clone(&stop_requested),
+            Arc::clone(&shutdown_initiated),
+            Arc::clone(&aux_active),
+        );
+        let aux_guard = AuxStartupGuard::new(
+            aux_session,
+            &shutdown_initiated,
+            &aux_active,
+            &stop_requested,
+            stop_trace_session,
+        );
+
         let session_handle = start_or_restart_session(&self.session_name, &session_name_nul)
             .map_err(|e| e.to_string())?;
 
@@ -289,7 +437,6 @@ impl SensorBackend for WindowsEtwSensor {
         }
 
         let sink_clone = Arc::clone(&self.sink);
-        let stop_requested = Arc::new(AtomicBool::new(false));
         let mut ctx_box = Box::new(EtwCallbackContext {
             sink: sink_clone,
             dns_cache: Mutex::new(DnsResolutionCache::default()),
@@ -298,6 +445,8 @@ impl SensorBackend for WindowsEtwSensor {
             honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
             has_honeypot_handles: AtomicBool::new(false),
             registry_kcb_names: Mutex::new(HashMap::new()),
+            cmdline_correlator: Arc::clone(&cmdline_correlator),
+            aux_active: Arc::clone(&aux_active),
             stop_requested: Arc::clone(&stop_requested),
             session_name_nul: session_name_nul.clone(),
         });
@@ -364,11 +513,16 @@ impl SensorBackend for WindowsEtwSensor {
                 .to_string()
             })?;
 
+        let aux_session = aux_guard.disarm();
+
         *guard = Some(ActiveEtwSession {
             session_handle,
             session_name_nul,
             stop_requested,
+            shutdown_initiated,
+            aux_active,
             worker: Some(worker),
+            aux_session,
         });
 
         tracing::info!(session = %self.session_name, "ETW real-time sensor started");
@@ -528,6 +682,220 @@ fn enable_all_providers(
     Ok(())
 }
 
+fn build_aux_session_name(main_session_name: &str) -> Option<(String, Vec<u16>)> {
+    let aux_name = format!("{main_session_name}-SysProc");
+    let aux_name_nul: Vec<u16> = aux_name.encode_utf16().chain(std::iter::once(0u16)).collect();
+    if aux_name_nul.len() > MAX_SESSION_NAME_CHARS {
+        return None;
+    }
+    Some((aux_name, aux_name_nul))
+}
+
+fn start_or_restart_system_process_session(
+    session_name: &str,
+    session_name_nul: &[u16],
+) -> Result<CONTROLTRACE_HANDLE, SensorError> {
+    let mut props = Box::new(TracePropertiesBuffer::new_system_process_realtime(
+        session_name_nul,
+    ));
+    let mut handle = CONTROLTRACE_HANDLE::default();
+
+    // SAFETY: `handle`, `session_name_nul`, and `props` are properly aligned and sized.
+    let mut status = unsafe {
+        StartTraceW(
+            &mut handle,
+            PCWSTR(session_name_nul.as_ptr()),
+            &mut props.props,
+        )
+    };
+
+    if status == ERROR_ALREADY_EXISTS {
+        tracing::warn!(
+            session = session_name,
+            "stopping stale auxiliary ETW system process session before restarting"
+        );
+        stop_trace_session(CONTROLTRACE_HANDLE::default(), session_name_nul);
+        *props = TracePropertiesBuffer::new_system_process_realtime(session_name_nul);
+        handle = CONTROLTRACE_HANDLE::default();
+        // SAFETY: same preconditions as initial `StartTraceW`.
+        status = unsafe {
+            StartTraceW(
+                &mut handle,
+                PCWSTR(session_name_nul.as_ptr()),
+                &mut props.props,
+            )
+        };
+    }
+
+    if status != ERROR_SUCCESS {
+        return Err(SensorError::Win32 {
+            api: "StartTraceW",
+            message: format!("Win32 error {} for auxiliary session `{session_name}`", status.0),
+        });
+    }
+
+    Ok(handle)
+}
+
+fn try_start_aux_system_process_session(
+    main_session_name: &str,
+    sink: EventSinkFn,
+    cmdline_correlator: Arc<Mutex<ProcessCommandLineCorrelator>>,
+    stop_requested: Arc<AtomicBool>,
+    shutdown_initiated: Arc<AtomicBool>,
+    aux_active: Arc<AtomicBool>,
+) -> Option<ActiveAuxSession> {
+    try_start_aux_system_process_session_with(
+        main_session_name,
+        sink,
+        cmdline_correlator,
+        stop_requested,
+        shutdown_initiated,
+        aux_active,
+        start_or_restart_system_process_session,
+    )
+}
+
+fn try_start_aux_system_process_session_with<F>(
+    main_session_name: &str,
+    sink: EventSinkFn,
+    cmdline_correlator: Arc<Mutex<ProcessCommandLineCorrelator>>,
+    stop_requested: Arc<AtomicBool>,
+    shutdown_initiated: Arc<AtomicBool>,
+    aux_active: Arc<AtomicBool>,
+    start_fn: F,
+) -> Option<ActiveAuxSession>
+where
+    F: FnOnce(&str, &[u16]) -> Result<CONTROLTRACE_HANDLE, SensorError>,
+{
+    let Some((aux_name, aux_name_nul)) = build_aux_session_name(main_session_name) else {
+        tracing::warn!(
+            session = main_session_name,
+            max_chars = MAX_SESSION_NAME_CHARS,
+            "auxiliary system process ETW session name exceeds limit; falling back to PEB inspection"
+        );
+        aux_active.store(false, Ordering::Release);
+        return None;
+    };
+
+    let aux_handle = match start_fn(&aux_name, &aux_name_nul) {
+        Ok(h) => h,
+        Err(err) => {
+            tracing::warn!(
+                session = %aux_name,
+                error = %err,
+                "failed to start auxiliary SystemTrace process session; falling back to PEB inspection"
+            );
+            aux_active.store(false, Ordering::Release);
+            return None;
+        }
+    };
+
+    let mut ctx_box = Box::new(AuxSystemProcessContext {
+        sink,
+        cmdline_correlator,
+        stop_requested: Arc::clone(&stop_requested),
+        aux_active: Arc::clone(&aux_active),
+        session_name_nul: aux_name_nul.clone(),
+    });
+    let logger_name_ptr = ctx_box.session_name_nul.as_mut_ptr();
+    let ctx_raw = Box::into_raw(ctx_box);
+
+    let mut logfile = EVENT_TRACE_LOGFILEW {
+        LoggerName: PWSTR(logger_name_ptr),
+        BufferCallback: Some(aux_buffer_callback),
+        Context: ctx_raw.cast::<c_void>(),
+        ..Default::default()
+    };
+    logfile.Anonymous1.ProcessTraceMode =
+        PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    logfile.Anonymous2.EventRecordCallback = Some(aux_system_process_callback);
+
+    // SAFETY: `logfile` points to live `session_name_nul` and `ctx_raw` for the call duration.
+    let trace_handle = unsafe { OpenTraceW(&mut logfile) };
+    if trace_handle.Value == u64::MAX || trace_handle.Value == 0 {
+        // SAFETY: `OpenTraceW` failed before consumer thread started; reclaim `ctx_raw`.
+        unsafe { drop(Box::from_raw(ctx_raw)) };
+        stop_trace_session(aux_handle, &aux_name_nul);
+        tracing::warn!(
+            session = %aux_name,
+            "OpenTraceW failed for auxiliary SystemTrace process session; falling back to PEB inspection"
+        );
+        aux_active.store(false, Ordering::Release);
+        return None;
+    }
+
+    let ctx_addr = ctx_raw as usize;
+    let trace_val = trace_handle.Value;
+    let aux_label = aux_name.clone();
+    let worker_aux_name_nul = aux_name_nul.clone();
+    let worker_aux_active = Arc::clone(&aux_active);
+    let worker_stop_requested = Arc::clone(&stop_requested);
+    let worker_shutdown_initiated = Arc::clone(&shutdown_initiated);
+
+    // Mark active before spawning consumer so early main-session events begin correlating.
+    aux_active.store(true, Ordering::Release);
+    let worker = match thread::Builder::new()
+        .name(format!("ledr-etw-sysproc-{}", main_session_name))
+        .spawn(move || {
+            let handles = [PROCESSTRACE_HANDLE { Value: trace_val }];
+            // SAFETY: `handles` holds a valid `PROCESSTRACE_HANDLE` and `ctx_addr` remains
+            // valid until after `ProcessTrace` and `CloseTrace` complete.
+            let status = unsafe { ProcessTrace(&handles, None, None) };
+            worker_aux_active.store(false, Ordering::Release);
+            if !worker_shutdown_initiated.load(Ordering::Acquire) {
+                stop_trace_session(aux_handle, &worker_aux_name_nul);
+            }
+            if !worker_shutdown_initiated.load(Ordering::Acquire)
+                && !worker_stop_requested.load(Ordering::Acquire)
+            {
+                tracing::warn!(
+                    session = %aux_label,
+                    status = status.0,
+                    "auxiliary SystemTrace process session exited unexpectedly; degraded to PEB inspection"
+                );
+            } else if status != ERROR_SUCCESS {
+                tracing::debug!(
+                    session = %aux_label,
+                    status = status.0,
+                    "auxiliary SystemTrace ProcessTrace exited"
+                );
+            }
+            // SAFETY: `trace_val` was opened via `OpenTraceW` and is closed once here.
+            let _ = unsafe { CloseTrace(PROCESSTRACE_HANDLE { Value: trace_val }) };
+            // SAFETY: `ProcessTrace` has returned and callbacks can no longer run.
+            unsafe { drop(Box::from_raw(ctx_addr as *mut AuxSystemProcessContext)) };
+        }) {
+        Ok(handle) => handle,
+        Err(err) => {
+            aux_active.store(false, Ordering::Release);
+            // SAFETY: worker failed to spawn; close trace handle and reclaim `ctx_raw`.
+            unsafe {
+                let _ = CloseTrace(trace_handle);
+                drop(Box::from_raw(ctx_raw));
+            }
+            stop_trace_session(aux_handle, &aux_name_nul);
+            tracing::warn!(
+                session = %aux_name,
+                error = %err,
+                "failed to spawn auxiliary SystemTrace consumer thread; falling back to PEB inspection"
+            );
+            return None;
+        }
+    };
+
+    tracing::info!(
+        session = %aux_name,
+        "ETW auxiliary system process session started"
+    );
+    Some(ActiveAuxSession {
+        session_name: aux_name,
+        session_handle: aux_handle,
+        session_name_nul: aux_name_nul,
+        worker: Some(worker),
+    })
+}
+
 fn stop_trace_session(session_handle: CONTROLTRACE_HANDLE, session_name_nul: &[u16]) {
     let mut stop_props = Box::new(TracePropertiesBuffer::new_control());
     // SAFETY: `stop_props` is properly sized with `LoggerNameOffset` / `LogFileNameOffset`.
@@ -541,5 +909,142 @@ fn stop_trace_session(session_handle: CONTROLTRACE_HANDLE, session_name_nul: &[u
     };
     if status != ERROR_SUCCESS && status.0 != ERROR_WMI_INSTANCE_NOT_FOUND_CODE {
         tracing::debug!(status = status.0, "ControlTraceW stop returned non-zero");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ETW-P4-CMD-07` (session startup fallback & name bound):
+    /// When auxiliary system-logger startup fails (e.g., `ERROR_NO_SYSTEM_RESOURCES = 1450`) or
+    /// the derived `-SysProc` session name exceeds `MAX_SESSION_NAME_CHARS`, startup degrades
+    /// cleanly to `None` with `aux_active = false` so the main ETW session continues with PEB.
+    #[test]
+    fn etw_p4_cmd_07_aux_session_startup_failure_and_name_limit_degrade_cleanly() {
+        let sink: EventSinkFn = Arc::new(|_| true);
+        let correlator = Arc::new(Mutex::new(ProcessCommandLineCorrelator::new()));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_initiated = Arc::new(AtomicBool::new(false));
+        let aux_active = Arc::new(AtomicBool::new(true));
+
+        let res = try_start_aux_system_process_session_with(
+            "LocalEDR-Test",
+            Arc::clone(&sink),
+            Arc::clone(&correlator),
+            Arc::clone(&stop_requested),
+            Arc::clone(&shutdown_initiated),
+            Arc::clone(&aux_active),
+            |_, _| {
+                Err(SensorError::Win32 {
+                    api: "StartTraceW",
+                    message: "Win32 error 1450 (ERROR_NO_SYSTEM_RESOURCES)".to_string(),
+                })
+            },
+        );
+        assert!(res.is_none());
+        assert!(!aux_active.load(Ordering::Acquire));
+
+        // Main session name is valid (< MAX_SESSION_NAME_CHARS), but adding `-SysProc` + NUL overflows.
+        let long_name = "x".repeat(MAX_SESSION_NAME_CHARS - 5);
+        assert!(long_name.encode_utf16().count() + 1 < MAX_SESSION_NAME_CHARS);
+        assert!(build_aux_session_name(&long_name).is_none());
+        aux_active.store(true, Ordering::Release);
+        let res_long = try_start_aux_system_process_session_with(
+            &long_name,
+            sink,
+            correlator,
+            stop_requested,
+            shutdown_initiated,
+            Arc::clone(&aux_active),
+            |_, _| panic!("must not invoke StartTraceW when aux session name exceeds buffer"),
+        );
+        assert!(res_long.is_none());
+        assert!(!aux_active.load(Ordering::Acquire));
+    }
+
+    /// `ETW-P4-CMD-08`: When the auxiliary SystemTrace session starts before the main ETW
+    /// session and a subsequent main-session startup step fails, `AuxStartupGuard` sets
+    /// `shutdown_initiated = true`, `aux_active = false`, `stop_requested = true`, invokes
+    /// `stop_trace_session` on the auxiliary handle, and joins the worker thread cleanly;
+    /// when disarmed on success, no rollback occurs.
+    #[test]
+    fn etw_p4_cmd_08_aux_startup_guard_rolls_back_on_error_and_disarms_on_success() {
+        let shutdown_initiated = Arc::new(AtomicBool::new(false));
+        let aux_active = Arc::new(AtomicBool::new(true));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let worker_finished_clone = Arc::clone(&worker_finished);
+        let worker = thread::spawn(move || {
+            let _ = release_rx.recv();
+            worker_finished_clone.store(true, Ordering::Release);
+        });
+
+        let stop_called = Arc::new(AtomicBool::new(false));
+        let stop_called_clone = Arc::clone(&stop_called);
+        let expected_handle = CONTROLTRACE_HANDLE { Value: 0xBEEF };
+        let expected_name_nul: Vec<u16> = "LocalEDR-Test-SysProc\0".encode_utf16().collect();
+
+        {
+            let aux = ActiveAuxSession {
+                session_name: "LocalEDR-Test-SysProc".to_string(),
+                session_handle: expected_handle,
+                session_name_nul: expected_name_nul.clone(),
+                worker: Some(worker),
+            };
+            let _guard = AuxStartupGuard::new(
+                Some(aux),
+                &shutdown_initiated,
+                &aux_active,
+                &stop_requested,
+                |handle, name_nul| {
+                    assert_eq!(handle.Value, expected_handle.Value);
+                    assert_eq!(name_nul, expected_name_nul.as_slice());
+                    assert!(shutdown_initiated.load(Ordering::Acquire));
+                    assert!(!aux_active.load(Ordering::Acquire));
+                    assert!(stop_requested.load(Ordering::Acquire));
+                    stop_called_clone.store(true, Ordering::Release);
+                    let _ = release_tx.send(());
+                },
+            );
+            // Guard drops here simulating main-session startup failure.
+        }
+
+        assert!(stop_called.load(Ordering::Acquire));
+        assert!(worker_finished.load(Ordering::Acquire));
+        assert!(shutdown_initiated.load(Ordering::Acquire));
+        assert!(!aux_active.load(Ordering::Acquire));
+        assert!(stop_requested.load(Ordering::Acquire));
+
+        // Disarm path: main session succeeds, so rollback must NOT fire.
+        let ok_shutdown = AtomicBool::new(false);
+        let ok_aux_active = AtomicBool::new(true);
+        let ok_stop_req = AtomicBool::new(false);
+        let ok_stop_called = AtomicBool::new(false);
+        let disarmed_aux = {
+            let aux = ActiveAuxSession {
+                session_name: "LocalEDR-Test-SysProc".to_string(),
+                session_handle: expected_handle,
+                session_name_nul: expected_name_nul,
+                worker: None,
+            };
+            let guard = AuxStartupGuard::new(
+                Some(aux),
+                &ok_shutdown,
+                &ok_aux_active,
+                &ok_stop_req,
+                |_, _| {
+                    ok_stop_called.store(true, Ordering::Release);
+                },
+            );
+            guard.disarm()
+        };
+        assert!(disarmed_aux.is_some());
+        assert!(!ok_stop_called.load(Ordering::Acquire));
+        assert!(!ok_shutdown.load(Ordering::Acquire));
+        assert!(ok_aux_active.load(Ordering::Acquire));
+        assert!(!ok_stop_req.load(Ordering::Acquire));
     }
 }

@@ -131,6 +131,67 @@ fn firewall_register_preemptive_block_respects_active_allow_once() {
 }
 
 #[test]
+fn firewall_discard_obsolete_preemptive_block_retains_handle_on_remove_failure() {
+    let mut fw = WfpRuleManager::new();
+    let defense = StubDefense::new();
+    let exe = r"C:\Users\Alice\Downloads\obsolete_race.exe";
+
+    // 1. Clean removal leaves nothing tracked.
+    let h1 = defense
+        .add_wfp_app_rule(Path::new(exe), None, false)
+        .unwrap();
+    assert!(fw.discard_obsolete_preemptive_block(exe, h1, &defense));
+    assert_eq!(fw.active_filter_count(), 0);
+    assert_eq!(*defense.removed.lock().unwrap(), vec![h1]);
+
+    // 2. Transient remove failure on vacant slot retains handle as Preemptive for retry.
+    defense.set_fail_removes(true);
+    let h2 = defense
+        .add_wfp_app_rule(Path::new(exe), None, false)
+        .unwrap();
+    assert!(!fw.discard_obsolete_preemptive_block(exe, h2, &defense));
+    assert!(fw.has_active_filter(exe, None, false));
+    assert_eq!(
+        fw.filter_origin(exe, None),
+        Some(&WfpFilterOrigin::Preemptive)
+    );
+    assert_eq!(fw.active_app_block(exe), Some((h2, WfpFilterOrigin::Preemptive)));
+
+    // Subsequent cleanup retries and clears the retained handle once BFE recovers.
+    defense.set_fail_removes(false);
+    assert!(fw.remove_preemptive_block_if_unused(exe, &defense));
+    assert!(!fw.has_any_app_filter(exe));
+    assert_eq!(*defense.removed.lock().unwrap(), vec![h1, h2]);
+
+    // 3. Remove failure when another filter already occupies the slot must NOT clobber it.
+    let policy_exe = r"C:\Users\Alice\Downloads\occupied_slot.exe";
+    let inspector = StubInspector("b".repeat(64));
+    let report = fw.reconcile_persisted_rules(
+        &[make_network_rule(
+            "R-OCC",
+            RuleScope::NetworkBlock,
+            policy_exe,
+            None,
+            None,
+            1,
+        )],
+        &[],
+        &inspector,
+        &defense,
+    );
+    assert_eq!(report.applied, 1);
+    let existing = fw.active_app_block(policy_exe).expect("policy block");
+    assert_eq!(existing.1, WfpFilterOrigin::PersistedPolicy);
+
+    defense.set_fail_removes(true);
+    let h3 = defense
+        .add_wfp_app_rule(Path::new(policy_exe), None, false)
+        .unwrap();
+    assert!(!fw.discard_obsolete_preemptive_block(policy_exe, h3, &defense));
+    assert_eq!(fw.active_app_block(policy_exe), Some(existing));
+}
+
+#[test]
 fn firewall_reconcile_distinguishes_startup_preemptive_and_policy_failures() {
     let mut fw = WfpRuleManager::new();
     let defense = StubDefense::new();

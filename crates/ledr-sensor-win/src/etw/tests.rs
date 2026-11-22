@@ -1,4 +1,5 @@
 use super::*;
+use super::cmdline_correlator::ProcessCommandLineCorrelator;
 use super::context::{EtwCallbackContext, HoneypotHandleTracker, lookup_registry_key};
 use super::handlers::buffer_callback;
 use super::registry::{RegistryEventFacts, RegistryKeyName, decide_registry_event};
@@ -139,6 +140,8 @@ fn sens_06_custom_sink_and_graceful_stop_drain() {
         honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
         has_honeypot_handles: AtomicBool::new(false),
         registry_kcb_names: Mutex::new(HashMap::new()),
+        cmdline_correlator: Arc::new(Mutex::new(ProcessCommandLineCorrelator::new())),
+        aux_active: AtomicBool::new(false).into(),
         stop_requested: Arc::clone(&stop_requested),
         session_name_nul: session_name_nul.clone(),
     };
@@ -170,7 +173,10 @@ fn sens_06_custom_sink_and_graceful_stop_drain() {
             session_handle: CONTROLTRACE_HANDLE::default(),
             session_name_nul: session_name_nul.clone(),
             stop_requested: Arc::clone(&stop_requested),
+            shutdown_initiated: Arc::new(AtomicBool::new(false)),
+            aux_active: Arc::new(AtomicBool::new(false)),
             worker: Some(worker),
+            aux_session: None,
         });
     }
 
@@ -197,6 +203,8 @@ fn sens_06_custom_sink_and_graceful_stop_drain() {
         honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
         has_honeypot_handles: AtomicBool::new(false),
         registry_kcb_names: Mutex::new(HashMap::new()),
+        cmdline_correlator: Arc::new(Mutex::new(ProcessCommandLineCorrelator::new())),
+        aux_active: Arc::new(AtomicBool::new(false)),
         stop_requested: Arc::clone(&stop_requested),
         session_name_nul: session_name_nul.clone(),
     });
@@ -239,7 +247,10 @@ fn sens_06_custom_sink_and_graceful_stop_drain() {
             session_handle: CONTROLTRACE_HANDLE::default(),
             session_name_nul,
             stop_requested: Arc::clone(&abort_flag),
+            shutdown_initiated: Arc::new(AtomicBool::new(false)),
+            aux_active: Arc::new(AtomicBool::new(false)),
             worker: Some(thread::spawn(|| {})),
+            aux_session: None,
         });
     }
     sensor.force_abort();
@@ -531,6 +542,8 @@ fn sens_p3_08_etw_per_pid_dns_isolation_and_pid_reuse_eviction() {
         honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
         has_honeypot_handles: AtomicBool::new(false),
         registry_kcb_names: Mutex::new(HashMap::new()),
+        cmdline_correlator: Arc::new(Mutex::new(ProcessCommandLineCorrelator::new())),
+        aux_active: Arc::new(AtomicBool::new(false)),
         stop_requested: Arc::new(AtomicBool::new(false)),
         session_name_nul: vec![0],
     };

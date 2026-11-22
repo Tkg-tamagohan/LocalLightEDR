@@ -4,6 +4,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use ledr_proto::{is_never_suspend_process, ProcessIdentity, ACTIVE_PROCESS_TABLE_CAPACITY};
 
+const MAX_EVICTED_EXITED_HISTORY: usize = 1024;
+const MAX_EVICTED_CMDLINE_BYTES: usize = 4096;
+
 /// Process metadata cached in memory for O(1) parent context lookup during rule evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveProcessEntry {
@@ -18,6 +21,7 @@ pub struct ActiveProcessEntry {
     pub created_at_ms: i64,
     pub exited_at_ms: Option<i64>,
     pub sigma_evaluated: bool,
+    pub launch_guards_applied: bool,
     pub emitted_rule_ids: HashSet<String>,
     pub origin_url: Option<String>,
     pub motw_referrer: Option<String>,
@@ -48,8 +52,53 @@ pub struct ProcessStartResolution {
     /// running verified process without enriching any missing metadata, so persisting a synthetic
     /// `pid:0` row into SQLite must be skipped.
     pub skip_store_ingest: bool,
+    /// `true` when launch-time MOTW and preemptive WFP guards must not run on this `ProcessStart`
+    /// (for example, an already-exited/evicted process, or an active process whose launch guards
+    /// have already been applied and whose `exe_path` did not newly upgrade from empty).
+    pub skip_launch_guards: bool,
     /// `process_instance_id` values evicted from memory to stay within `capacity`.
     pub evicted_instance_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EvictedCommandLine {
+    Empty,
+    /// Full command line retained only when its UTF-8 byte length fits within
+    /// `MAX_EVICTED_CMDLINE_BYTES` so Sigma `endswith`/exact rules never see a truncated prefix.
+    Complete(String),
+    /// Original command line exceeded `MAX_EVICTED_CMDLINE_BYTES`; omitted from Sigma evaluation
+    /// and never overwritten by subsequent delayed events.
+    Oversized,
+}
+
+impl EvictedCommandLine {
+    fn from_owned(cmd: String) -> Self {
+        if cmd.is_empty() {
+            Self::Empty
+        } else if cmd.len() <= MAX_EVICTED_CMDLINE_BYTES {
+            Self::Complete(cmd)
+        } else {
+            Self::Oversized
+        }
+    }
+
+    fn as_complete(&self) -> Option<&str> {
+        match self {
+            Self::Complete(cmd) => Some(cmd.as_str()),
+            Self::Empty | Self::Oversized => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EvictedExitedRecord {
+    identity: ProcessIdentity,
+    created_at_ms: i64,
+    exited_at_ms: i64,
+    parent_instance_id: Option<String>,
+    exe_path: String,
+    command_line: EvictedCommandLine,
+    emitted_rule_ids: HashSet<String>,
 }
 
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
@@ -61,6 +110,8 @@ pub struct ActiveProcessTable {
     entries: HashMap<String, ActiveProcessEntry>,
     exited_fifo: VecDeque<String>,
     insertion_fifo: VecDeque<String>,
+    evicted_exited: HashMap<String, EvictedExitedRecord>,
+    evicted_exited_fifo: VecDeque<String>,
     active_count: usize,
 }
 
@@ -80,6 +131,8 @@ impl ActiveProcessTable {
             entries: HashMap::with_capacity(cap.min(1024)),
             exited_fifo: VecDeque::new(),
             insertion_fifo: VecDeque::new(),
+            evicted_exited: HashMap::new(),
+            evicted_exited_fifo: VecDeque::new(),
             active_count: 0,
         }
     }
@@ -142,6 +195,7 @@ impl ActiveProcessTable {
                             exited_at_ms: None,
                             superseded_exit: None,
                             skip_store_ingest: true,
+                            skip_launch_guards: true,
                             evicted_instance_ids: Vec::new(),
                         };
                     }
@@ -209,6 +263,7 @@ impl ActiveProcessTable {
                         exited_at_ms: None,
                         superseded_exit: None,
                         skip_store_ingest: !enriched,
+                        skip_launch_guards: prev_entry.launch_guards_applied && !upgraded_exe,
                         evicted_instance_ids: Vec::new(),
                     };
                 }
@@ -270,7 +325,10 @@ impl ActiveProcessTable {
                 existing.user_sid = user_sid;
             }
             let is_active = existing.exited_at_ms.is_none();
+            let existing_exited_at_ms = existing.exited_at_ms;
             let resolved_parent_id = existing.parent_instance_id.clone();
+            let skip_launch_guards =
+                !is_active || (existing.launch_guards_applied && !upgraded_exe);
             if is_active {
                 self.pid_to_identity.insert(identity.pid, identity);
             }
@@ -281,11 +339,53 @@ impl ActiveProcessTable {
                 parent_exe_path,
                 parent_command_line,
                 should_evaluate_sigma,
-                exited_at_ms: None,
+                exited_at_ms: existing_exited_at_ms,
                 superseded_exit: None,
                 skip_store_ingest: false,
+                skip_launch_guards,
                 evicted_instance_ids: Vec::new(),
             };
+        }
+
+        if identity.create_time_100ns != 0 {
+            if let Some((evicted_exit_ms, saved_parent_id)) = self
+                .evicted_exited
+                .get(&instance_id)
+                .map(|ev| (ev.exited_at_ms, ev.parent_instance_id.clone()))
+            {
+                let (parent_instance_id, parent_exe_path, parent_command_line) =
+                    if let Some(ref existing_parent_id) = saved_parent_id {
+                        self.parent_metadata_by_id(existing_parent_id)
+                    } else {
+                        self.lookup_parent_for(parent_pid, identity, created_at_ms, true)
+                    };
+                if let Some(evicted) = self.evicted_exited.get_mut(&instance_id) {
+                    if evicted.parent_instance_id.is_none() {
+                        evicted.parent_instance_id = parent_instance_id.clone();
+                    }
+                    if evicted.exe_path.is_empty() && !exe_path.is_empty() {
+                        evicted.exe_path = exe_path;
+                    }
+                    if matches!(evicted.command_line, EvictedCommandLine::Empty)
+                        && !command_line.is_empty()
+                    {
+                        evicted.command_line = EvictedCommandLine::from_owned(command_line);
+                    }
+                }
+                return ProcessStartResolution {
+                    resolved_identity: identity,
+                    instance_id,
+                    parent_instance_id,
+                    parent_exe_path,
+                    parent_command_line,
+                    should_evaluate_sigma: true,
+                    exited_at_ms: Some(evicted_exit_ms),
+                    superseded_exit: None,
+                    skip_store_ingest: false,
+                    skip_launch_guards: true,
+                    evicted_instance_ids: Vec::new(),
+                };
+            }
         }
 
         let (parent_instance_id, parent_exe_path, parent_command_line) =
@@ -321,6 +421,7 @@ impl ActiveProcessTable {
                             created_at_ms,
                             exited_at_ms: Some(inferred_exit_ms),
                             sigma_evaluated: true,
+                            launch_guards_applied: false,
                             emitted_rule_ids: HashSet::new(),
                             origin_url: None,
                             motw_referrer: None,
@@ -342,6 +443,7 @@ impl ActiveProcessTable {
                         exited_at_ms: Some(inferred_exit_ms),
                         superseded_exit: None,
                         skip_store_ingest: false,
+                        skip_launch_guards: true,
                         evicted_instance_ids,
                     };
                 }
@@ -377,6 +479,7 @@ impl ActiveProcessTable {
                 created_at_ms,
                 exited_at_ms: None,
                 sigma_evaluated: true,
+                launch_guards_applied: false,
                 emitted_rule_ids: HashSet::new(),
                 origin_url: None,
                 motw_referrer: None,
@@ -400,6 +503,7 @@ impl ActiveProcessTable {
             exited_at_ms: None,
             superseded_exit,
             skip_store_ingest: false,
+            skip_launch_guards: false,
             evicted_instance_ids,
         }
     }
@@ -558,6 +662,15 @@ impl ActiveProcessTable {
         self.entries.get(instance_id)
     }
 
+    /// Marks launch-time outbound/WFP guards as applied for `instance_id`.
+    pub fn mark_launch_guards_applied(&mut self, instance_id: &str) -> bool {
+        let Some(entry) = self.entries.get_mut(instance_id) else {
+            return false;
+        };
+        entry.launch_guards_applied = true;
+        true
+    }
+
     /// Attaches resolved MOTW origin metadata to an existing entry in the process table.
     pub fn set_motw_metadata(
         &mut self,
@@ -616,19 +729,25 @@ impl ActiveProcessTable {
     /// Marks `rule_id` as having emitted an alert for `instance_id`, returning `true` only on
     /// the first alert for that `(instance_id, rule_id)` pair (or when `instance_id` is uncached).
     pub fn mark_rule_alert_emitted(&mut self, instance_id: &str, rule_id: &str) -> bool {
-        match self.entries.get_mut(instance_id) {
-            Some(entry) => entry.emitted_rule_ids.insert(rule_id.to_string()),
-            None => true,
+        if let Some(entry) = self.entries.get_mut(instance_id) {
+            return entry.emitted_rule_ids.insert(rule_id.to_string());
         }
+        if let Some(evicted) = self.evicted_exited.get_mut(instance_id) {
+            return evicted.emitted_rule_ids.insert(rule_id.to_string());
+        }
+        true
     }
 
     /// Clears a previously emitted `(instance_id, rule_id)` alert deduplication mark so
     /// subsequent matches for that rule/canary target can re-evaluate (`BUG_0006` / `BUG_0004`).
     pub fn clear_rule_alert_emitted(&mut self, instance_id: &str, rule_id: &str) -> bool {
-        match self.entries.get_mut(instance_id) {
-            Some(entry) => entry.emitted_rule_ids.remove(rule_id),
-            None => false,
+        if let Some(entry) = self.entries.get_mut(instance_id) {
+            return entry.emitted_rule_ids.remove(rule_id);
         }
+        if let Some(evicted) = self.evicted_exited.get_mut(instance_id) {
+            return evicted.emitted_rule_ids.remove(rule_id);
+        }
+        false
     }
 
     /// Returns `true` when `rule_id` was already marked emitted for `instance_id`
@@ -637,6 +756,10 @@ impl ActiveProcessTable {
         self.entries
             .get(instance_id)
             .is_some_and(|entry| entry.emitted_rule_ids.contains(rule_id))
+            || self
+                .evicted_exited
+                .get(instance_id)
+                .is_some_and(|evicted| evicted.emitted_rule_ids.contains(rule_id))
     }
 
     /// Collects unexited, non-protected descendant [`ProcessIdentity`] values of `root`
@@ -703,12 +826,26 @@ impl ActiveProcessTable {
         )
     }
 
-    fn parent_metadata_by_id(
+    fn parent_metadata_from_evicted(
+        evicted: &EvictedExitedRecord,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            Some(evicted.identity.instance_id()),
+            (!evicted.exe_path.is_empty()).then(|| evicted.exe_path.clone()),
+            evicted.command_line.as_complete().map(str::to_string),
+        )
+    }
+
+    /// Looks up `(parent_instance_id, parent_exe_path, parent_command_line)` by `parent_id`,
+    /// checking active/cached entries first and falling back to bounded evicted-exited history.
+    pub fn parent_metadata_by_id(
         &self,
         parent_id: &str,
     ) -> (Option<String>, Option<String>, Option<String>) {
         if let Some(parent_entry) = self.entries.get(parent_id) {
             Self::parent_metadata_from_entry(parent_entry)
+        } else if let Some(evicted_parent) = self.evicted_exited.get(parent_id) {
+            Self::parent_metadata_from_evicted(evicted_parent)
         } else {
             (Some(parent_id.to_string()), None, None)
         }
@@ -746,20 +883,39 @@ impl ActiveProcessTable {
                     .max_by_key(|e| (e.created_at_ms, e.identity.create_time_100ns))
             });
 
-        let parent_opt = verified_parent.or_else(|| {
-            allow_unverified_parent
-                .then(|| {
-                    self.lookup_by_pid(parent_pid).filter(|entry| {
-                        entry.identity.create_time_100ns == 0
-                            && entry
-                                .exited_at_ms
-                                .is_none_or(|exit_ts| child_created_at_ms <= exit_ts)
-                    })
-                })
-                .flatten()
-        });
+        if let Some(entry) = verified_parent {
+            return Self::parent_metadata_from_entry(entry);
+        }
 
-        parent_opt.map_or((None, None, None), Self::parent_metadata_from_entry)
+        let evicted_parent = self
+            .evicted_exited
+            .values()
+            .filter(|ev| {
+                ev.identity.pid == parent_pid
+                    && ev.identity.create_time_100ns != 0
+                    && ev.created_at_ms <= child_created_at_ms
+                    && child_created_at_ms <= ev.exited_at_ms
+                    && (child_identity.create_time_100ns == 0
+                        || ev.identity.create_time_100ns <= child_identity.create_time_100ns)
+            })
+            .max_by_key(|ev| (ev.created_at_ms, ev.identity.create_time_100ns));
+
+        if let Some(ev) = evicted_parent {
+            return Self::parent_metadata_from_evicted(ev);
+        }
+
+        let unverified_parent = allow_unverified_parent
+            .then(|| {
+                self.lookup_by_pid(parent_pid).filter(|entry| {
+                    entry.identity.create_time_100ns == 0
+                        && entry
+                            .exited_at_ms
+                            .is_none_or(|exit_ts| child_created_at_ms <= exit_ts)
+                })
+            })
+            .flatten();
+
+        unverified_parent.map_or((None, None, None), Self::parent_metadata_from_entry)
     }
 
     fn evict_if_over_capacity(&mut self, protect_id: &str) -> Vec<String> {
@@ -811,7 +967,32 @@ impl ActiveProcessTable {
 
     fn remove_entry(&mut self, instance_id: &str) {
         if let Some(removed) = self.entries.remove(instance_id) {
-            if removed.exited_at_ms.is_none() {
+            if let Some(exit_ms) = removed.exited_at_ms {
+                if removed.identity.create_time_100ns != 0 {
+                    let record = EvictedExitedRecord {
+                        identity: removed.identity,
+                        created_at_ms: removed.created_at_ms,
+                        exited_at_ms: exit_ms,
+                        parent_instance_id: removed.parent_instance_id,
+                        exe_path: removed.exe_path,
+                        command_line: EvictedCommandLine::from_owned(removed.command_line),
+                        emitted_rule_ids: removed.emitted_rule_ids,
+                    };
+                    if self
+                        .evicted_exited
+                        .insert(removed.instance_id.clone(), record)
+                        .is_none()
+                    {
+                        self.evicted_exited_fifo.push_back(removed.instance_id);
+                        while self.evicted_exited.len() > MAX_EVICTED_EXITED_HISTORY {
+                            let Some(oldest_id) = self.evicted_exited_fifo.pop_front() else {
+                                break;
+                            };
+                            self.evicted_exited.remove(&oldest_id);
+                        }
+                    }
+                }
+            } else {
                 self.active_count = self.active_count.saturating_sub(1);
             }
             if self.pid_to_identity.get(&removed.pid) == Some(&removed.identity) {
@@ -1302,5 +1483,278 @@ mod tests {
             entry.parent_instance_id = Some(unrelated_c.instance_id());
         }
         assert!(table.collect_unexited_descendants(&unrelated_c).is_empty());
+    }
+
+    #[test]
+    fn launch_guards_applied_controls_skip_launch_guards_on_reentry_and_snapshot_absorption() {
+        let mut table = ActiveProcessTable::new(16);
+        let ident = ProcessIdentity::new(500, 1_000_000);
+        let exe = r"C:\Users\Public\Downloads\probe.exe".to_string();
+
+        // 1. Initial registration starts with `launch_guards_applied == false`.
+        let first = table.on_process_start(ident, 4, exe.clone(), String::new(), None, 100);
+        assert!(!first.skip_launch_guards);
+        assert!(!table
+            .get_by_instance_id(&first.instance_id)
+            .expect("entry present")
+            .launch_guards_applied);
+
+        // 2. Re-entry BEFORE launch guards are marked applied must NOT skip launch guards.
+        let before_mark = table.on_process_start(
+            ident,
+            4,
+            exe.clone(),
+            "probe.exe --arg".to_string(),
+            None,
+            100,
+        );
+        assert!(!before_mark.skip_launch_guards);
+
+        // 3. `pid:0` snapshot absorption BEFORE launch guards are marked applied must NOT skip,
+        //    both when enriching metadata (`skip_store_ingest == false`) and when non-enriching
+        //    (`skip_store_ingest == true`).
+        let snap_before = table.on_process_start(
+            ProcessIdentity::new(500, 0),
+            4,
+            exe.clone(),
+            String::new(),
+            Some("S-1-5-21-1".to_string()),
+            150,
+        );
+        assert!(!snap_before.skip_store_ingest);
+        assert!(!snap_before.skip_launch_guards);
+
+        let snap_non_enriching_before = table.on_process_start(
+            ProcessIdentity::new(500, 0),
+            4,
+            exe.clone(),
+            String::new(),
+            None,
+            160,
+        );
+        assert!(snap_non_enriching_before.skip_store_ingest);
+        assert!(!snap_non_enriching_before.skip_launch_guards);
+
+        // 4. Once marked applied, both same-instance re-entry and `pid:0` absorption skip guards
+        //    when `exe_path` did not newly upgrade from empty.
+        assert!(table.mark_launch_guards_applied(&first.instance_id));
+        let after_mark = table.on_process_start(
+            ident,
+            4,
+            exe.clone(),
+            "probe.exe --arg2".to_string(),
+            None,
+            100,
+        );
+        assert!(after_mark.skip_launch_guards);
+
+        let snap_after = table.on_process_start(
+            ProcessIdentity::new(500, 0),
+            4,
+            exe,
+            String::new(),
+            None,
+            200,
+        );
+        assert!(snap_after.skip_launch_guards);
+    }
+
+    #[test]
+    fn evicted_parent_and_child_preserve_within_budget_and_omit_oversized_cmdline() {
+        let mut table = ActiveProcessTable::new(2);
+
+        // 1. Within-budget command_line (<= MAX_EVICTED_CMDLINE_BYTES) is preserved completely.
+        let parent_ok = ProcessIdentity::new(600, 1_000_000);
+        let child_ok = ProcessIdentity::new(604, 1_100_000);
+        let ok_cmd = "cmd.exe /c echo あいうえお --encoded".to_string();
+        assert!(ok_cmd.len() <= MAX_EVICTED_CMDLINE_BYTES);
+        table.on_process_start(
+            parent_ok,
+            4,
+            r"C:\Windows\System32\cmd.exe".to_string(),
+            ok_cmd.clone(),
+            None,
+            100,
+        );
+        let initial_child_ok = table.on_process_start(
+            child_ok,
+            600,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            String::new(),
+            None,
+            150,
+        );
+        assert_eq!(
+            initial_child_ok.parent_instance_id.as_deref(),
+            Some(parent_ok.instance_id().as_str())
+        );
+        assert_eq!(table.on_process_stop(600, 200), Some(parent_ok.instance_id()));
+        assert_eq!(table.on_process_stop(604, 210), Some(child_ok.instance_id()));
+
+        // 2. Oversized command_line (> MAX_EVICTED_CMDLINE_BYTES) whose 4096-byte prefix ends with
+        //    " --encoded" followed by " --profile normal" MUST be omitted (`None`) on eviction
+        //    so Sigma `endswith` rules never false-positive on an artificial truncation boundary.
+        let parent_big = ProcessIdentity::new(608, 1_200_000);
+        let child_big = ProcessIdentity::new(612, 1_300_000);
+        let suffix_at_boundary = " --encoded";
+        let pad_len = MAX_EVICTED_CMDLINE_BYTES - suffix_at_boundary.len();
+        let oversized_cmd = format!(
+            "{}{} --profile normal",
+            "a".repeat(pad_len),
+            suffix_at_boundary
+        );
+        assert!(oversized_cmd.len() > MAX_EVICTED_CMDLINE_BYTES);
+        assert!(oversized_cmd[..MAX_EVICTED_CMDLINE_BYTES].ends_with(suffix_at_boundary));
+
+        table.on_process_start(
+            parent_big,
+            4,
+            r"C:\Windows\System32\cmd.exe".to_string(),
+            oversized_cmd.clone(),
+            None,
+            300,
+        );
+        table.on_process_start(
+            child_big,
+            608,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            String::new(),
+            None,
+            350,
+        );
+        assert!(table.get_by_instance_id(&parent_ok.instance_id()).is_none());
+        assert!(table.get_by_instance_id(&child_ok.instance_id()).is_none());
+        assert_eq!(table.on_process_stop(608, 400), Some(parent_big.instance_id()));
+        assert_eq!(table.on_process_stop(612, 410), Some(child_big.instance_id()));
+
+        // 3. Evicted parent initially missing command_line, then receiving an oversized delayed
+        //    ProcessStart, must ALSO omit `parent_command_line` rather than storing a prefix.
+        let parent_late = ProcessIdentity::new(616, 1_400_000);
+        let child_late = ProcessIdentity::new(620, 1_500_000);
+        table.on_process_start(
+            parent_late,
+            4,
+            r"C:\Windows\System32\cmd.exe".to_string(),
+            String::new(),
+            None,
+            500,
+        );
+        table.on_process_start(
+            child_late,
+            616,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            String::new(),
+            None,
+            550,
+        );
+        assert!(table.get_by_instance_id(&parent_big.instance_id()).is_none());
+        assert!(table.get_by_instance_id(&child_big.instance_id()).is_none());
+        assert_eq!(
+            table.on_process_stop(616, 600),
+            Some(parent_late.instance_id())
+        );
+        assert_eq!(
+            table.on_process_stop(620, 610),
+            Some(child_late.instance_id())
+        );
+
+        // Evict parent_late and child_late too.
+        table.on_process_start(
+            ProcessIdentity::new(624, 1_600_000),
+            4,
+            "f1.exe".to_string(),
+            String::new(),
+            None,
+            700,
+        );
+        table.on_process_start(
+            ProcessIdentity::new(628, 1_700_000),
+            4,
+            "f2.exe".to_string(),
+            String::new(),
+            None,
+            710,
+        );
+        assert!(table.get_by_instance_id(&parent_late.instance_id()).is_none());
+        assert!(table.get_by_instance_id(&child_late.instance_id()).is_none());
+
+        // Verify Case 1 (within-budget): complete parent cmdline recovered verbatim.
+        let delayed_ok = table.on_process_start(
+            child_ok,
+            600,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            "powershell.exe -EncodedCommand SQBFAFgA".to_string(),
+            None,
+            150,
+        );
+        assert_eq!(delayed_ok.exited_at_ms, Some(210));
+        assert!(delayed_ok.skip_launch_guards);
+        assert_eq!(
+            delayed_ok.parent_instance_id.as_deref(),
+            Some(parent_ok.instance_id().as_str())
+        );
+        assert_eq!(
+            delayed_ok.parent_exe_path.as_deref(),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(delayed_ok.parent_command_line.as_deref(), Some(ok_cmd.as_str()));
+
+        // Verify Case 2 (oversized on eviction): parent_exe_path preserved, parent_command_line omitted.
+        let delayed_big = table.on_process_start(
+            child_big,
+            608,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            "powershell.exe -EncodedCommand SQBFAFgA".to_string(),
+            None,
+            350,
+        );
+        assert_eq!(
+            delayed_big.parent_instance_id.as_deref(),
+            Some(parent_big.instance_id().as_str())
+        );
+        assert_eq!(
+            delayed_big.parent_exe_path.as_deref(),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(delayed_big.parent_command_line, None);
+
+        // Oversized state must remain immutable even if a shorter delayed event arrives for parent_big.
+        let _ = table.on_process_start(
+            parent_big,
+            4,
+            r"C:\Windows\System32\cmd.exe".to_string(),
+            "cmd.exe --encoded".to_string(),
+            None,
+            300,
+        );
+        let (_, _, after_retry_cmd) = table.parent_metadata_by_id(&parent_big.instance_id());
+        assert_eq!(after_retry_cmd, None);
+
+        // Verify Case 3 (oversized on delayed enrichment of evicted parent): omitted (`None`).
+        let _ = table.on_process_start(
+            parent_late,
+            4,
+            r"C:\Windows\System32\cmd.exe".to_string(),
+            oversized_cmd,
+            None,
+            500,
+        );
+        let delayed_late = table.on_process_start(
+            child_late,
+            616,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            "powershell.exe -NoProfile".to_string(),
+            None,
+            550,
+        );
+        assert_eq!(
+            delayed_late.parent_instance_id.as_deref(),
+            Some(parent_late.instance_id().as_str())
+        );
+        assert_eq!(
+            delayed_late.parent_exe_path.as_deref(),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(delayed_late.parent_command_line, None);
     }
 }

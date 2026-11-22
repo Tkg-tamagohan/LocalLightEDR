@@ -10,6 +10,7 @@ use ledr_proto::SensorEvent;
 use crate::dns_cache::DnsResolutionCache;
 use crate::path_norm::DosVolumeMap;
 
+use super::cmdline_correlator::ProcessCommandLineCorrelator;
 use super::file_canary::CanaryMatcher;
 use super::session::EventSinkFn;
 
@@ -76,8 +77,40 @@ pub(super) struct EtwCallbackContext {
     pub(super) honeypot_handles: Mutex<HoneypotHandleTracker>,
     pub(super) has_honeypot_handles: AtomicBool,
     pub(super) registry_kcb_names: Mutex<HashMap<u64, String>>,
+    pub(super) cmdline_correlator: Arc<Mutex<ProcessCommandLineCorrelator>>,
+    pub(super) aux_active: Arc<AtomicBool>,
     pub(super) stop_requested: Arc<AtomicBool>,
     pub(super) session_name_nul: Vec<u16>,
+}
+
+/// Lightweight ETW callback context for the auxiliary `EVENT_TRACE_SYSTEM_LOGGER_MODE`
+/// (`EVENT_TRACE_FLAG_PROCESS`) session supplying kernel-captured `CommandLine` values.
+pub(super) struct AuxSystemProcessContext {
+    pub(super) sink: EventSinkFn,
+    pub(super) cmdline_correlator: Arc<Mutex<ProcessCommandLineCorrelator>>,
+    pub(super) stop_requested: Arc<AtomicBool>,
+    pub(super) aux_active: Arc<AtomicBool>,
+    pub(super) session_name_nul: Vec<u16>,
+}
+
+impl AuxSystemProcessContext {
+    /// Emits an enriched `ProcessStart` event directly to the bounded downstream sink.
+    ///
+    /// Mirrors [`EtwCallbackContext::dispatch_event`]: delegates backpressure to the
+    /// downstream sink (in production, `TwoLaneSender::blocking_send` on the non-dropping
+    /// `L-10` high-priority lane), and marks `stop_requested` / clears `aux_active` only
+    /// when the downstream sink closes.
+    pub(super) fn dispatch_event(&self, event: SensorEvent) -> bool {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        if !(self.sink)(event) {
+            self.stop_requested.store(true, Ordering::Release);
+            self.aux_active.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
 }
 
 /// Bound on the cached `KeyObject` -> key-path map for autorun registry keys.

@@ -6,7 +6,10 @@ use ledr_proto::{CanaryCategory, ProcessIdentity, ScriptSource, SensorEvent};
 use windows::core::GUID;
 use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, EVENT_TRACE_LOGFILEW};
 
-use super::context::EtwCallbackContext;
+use super::cmdline_correlator::{
+    PendingKernelStart, SystemProcessCommandLine, TakeOrRegisterOutcome,
+};
+use super::context::{AuxSystemProcessContext, EtwCallbackContext};
 use super::registry::handle_kernel_registry;
 use super::tdh::{
     ProcessInspectInfo, TdhEventInfo, filetime_100ns_to_unix_ms, inspect_process_by_pid,
@@ -17,6 +20,9 @@ static KERNEL_PROCESS_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static KERNEL_PROCESS_TDH_FAILURES: AtomicU64 = AtomicU64::new(0);
 static KERNEL_PROCESS_START_EMITTED: AtomicU64 = AtomicU64::new(0);
 static KERNEL_PROCESS_STOP_EMITTED: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_PROCESS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_PROCESS_TDH_FAILURES: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_PROCESS_CORRELATED: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn read_raw_userdata_u32_at_0(record: &EVENT_RECORD) -> Option<u32> {
@@ -47,6 +53,23 @@ pub(super) const KERNEL_NETWORK_GUID: GUID = GUID::from_u128(0x7dd42a49_5329_483
 pub(super) const AMSI_GUID: GUID = GUID::from_u128(0x2a576b87_09a7_520e_c21a_4942f0271d67);
 /// `Microsoft-Windows-PowerShell` (`{A0C1853B-5C40-4B15-8766-3CF1C58F985A}`).
 pub(super) const POWERSHELL_GUID: GUID = GUID::from_u128(0xa0c1853b_5c40_4b15_8766_3cf1c58f985a);
+/// Classic kernel MOF `Process` provider (`{3D6FA8D0-FE05-11D0-9DDA-00C04FD7BA7C}`).
+pub(super) const SYSTEM_PROCESS_MOF_GUID: GUID =
+    GUID::from_u128(0x3d6fa8d0_fe05_11d0_9dda_00c04fd7ba7c);
+
+#[inline]
+fn log_correlated_cmdline(path_label: &'static str, pid: u32, delta_100ns: i128) {
+    let count = SYSTEM_PROCESS_CORRELATED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        tracing::debug!(
+            correlated = count,
+            path = path_label,
+            pid,
+            delta_ms = (delta_100ns as f64) / 10_000.0,
+            "correlated SystemTrace kernel CommandLine with Kernel-Process ProcessStart"
+        );
+    }
+}
 
 pub(super) unsafe extern "system" fn buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {
     if logfile.is_null() {
@@ -99,8 +122,13 @@ pub(super) unsafe extern "system" fn event_record_callback(event_record: *mut EV
                 "received Microsoft-Windows-Kernel-Process ETW event"
             );
         }
+        if event_id == 1 {
+            if let Some(event) = handle_process_start(record, ctx) {
+                dispatch_process_start_with_correlator(ctx, event);
+            }
+            return;
+        }
         match event_id {
-            1 => handle_process_start(record, ctx),
             2 => handle_process_stop(record, ctx),
             _ => None,
         }
@@ -242,6 +270,20 @@ where
 
     ctx.evict_dns_pid(pid);
 
+    if command_line.is_empty() && create_time_100ns != 0 {
+        let matched = {
+            let mut correlator = ctx
+                .cmdline_correlator
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            correlator.take_matching_command_line(pid, parent_pid, create_time_100ns, &exe_path)
+        };
+        if let Some(matched) = matched {
+            command_line = matched.command_line;
+            log_correlated_cmdline("path_a_fast", pid, matched.delta_100ns);
+        }
+    }
+
     let needs_inspect = parent_pid == 0
         || create_time_100ns == 0
         || exe_path.is_empty()
@@ -285,6 +327,20 @@ where
 
     if create_time_100ns == 0 && record.EventHeader.TimeStamp > 0 {
         create_time_100ns = record.EventHeader.TimeStamp as u64;
+    }
+
+    if command_line.is_empty() && create_time_100ns != 0 {
+        let matched = {
+            let mut correlator = ctx
+                .cmdline_correlator
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            correlator.take_matching_command_line(pid, parent_pid, create_time_100ns, &exe_path)
+        };
+        if let Some(matched) = matched {
+            command_line = matched.command_line;
+            log_correlated_cmdline("path_a_post_inspect", pid, matched.delta_100ns);
+        }
     }
 
     let emitted = KERNEL_PROCESS_START_EMITTED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -562,6 +618,200 @@ fn handle_kernel_file(
     }
 }
 
+fn dispatch_process_start_with_correlator(ctx: &EtwCallbackContext, event: SensorEvent) {
+    let pending = match &event {
+        SensorEvent::ProcessStart {
+            identity,
+            parent_pid,
+            exe_path,
+            command_line,
+            user_sid,
+        } if command_line.is_empty()
+            && identity.create_time_100ns != 0
+            && ctx.aux_active.load(Ordering::Acquire) =>
+        {
+            Some(PendingKernelStart {
+                pid: identity.pid,
+                create_time_100ns: identity.create_time_100ns,
+                parent_pid: *parent_pid,
+                exe_path: exe_path.clone(),
+                user_sid: user_sid.clone(),
+            })
+        }
+        _ => None,
+    };
+
+    if !ctx.dispatch_event(event) {
+        return;
+    }
+
+    if let Some(pending) = pending {
+        let outcome = {
+            let mut correlator = ctx
+                .cmdline_correlator
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            correlator.take_or_register_pending_start(pending)
+        };
+        if let TakeOrRegisterOutcome::Matched { pending, matched } = outcome {
+            log_correlated_cmdline("path_b_race_resolved", pending.pid, matched.delta_100ns);
+            let enriched = SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(pending.pid, pending.create_time_100ns),
+                parent_pid: pending.parent_pid,
+                exe_path: pending.exe_path,
+                command_line: matched.command_line,
+                user_sid: pending.user_sid,
+            };
+            let _ = ctx.dispatch_event(enriched);
+        }
+    }
+}
+
+trait SystemProcessPropertySource {
+    fn get_u32(&self, name: &str) -> Option<u32>;
+    fn get_string(&self, name: &str) -> Option<String>;
+}
+
+impl SystemProcessPropertySource for TdhEventInfo<'_> {
+    fn get_u32(&self, name: &str) -> Option<u32> {
+        TdhEventInfo::get_u32(self, name)
+    }
+
+    fn get_string(&self, name: &str) -> Option<String> {
+        TdhEventInfo::get_string(self, name)
+    }
+}
+
+pub(super) unsafe extern "system" fn aux_buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {
+    if logfile.is_null() {
+        return 0;
+    }
+    // SAFETY: `logfile` is non-null and provided by ETW runtime.
+    let ctx_ptr = unsafe { (*logfile).Context.cast::<AuxSystemProcessContext>() };
+    if ctx_ptr.is_null() {
+        return 1;
+    }
+    // SAFETY: `ctx_ptr` remains valid for the lifetime of auxiliary `ProcessTrace`.
+    let ctx = unsafe { &*ctx_ptr };
+    if ctx.stop_requested.load(Ordering::Acquire) {
+        0
+    } else {
+        1
+    }
+}
+
+pub(super) unsafe extern "system" fn aux_system_process_callback(event_record: *mut EVENT_RECORD) {
+    if event_record.is_null() {
+        return;
+    }
+    // SAFETY: `event_record` is non-null and valid for the callback duration.
+    let record = unsafe { &*event_record };
+    let ctx_ptr = record.UserContext.cast::<AuxSystemProcessContext>();
+    if ctx_ptr.is_null() {
+        return;
+    }
+    // SAFETY: `ctx_ptr` remains valid until after auxiliary `ProcessTrace` exits.
+    let ctx = unsafe { &*ctx_ptr };
+    if ctx.stop_requested.load(Ordering::Acquire) {
+        return;
+    }
+    if record.EventHeader.ProviderId != SYSTEM_PROCESS_MOF_GUID
+        || record.EventHeader.EventDescriptor.Opcode != 1
+    {
+        return;
+    }
+
+    let received = SYSTEM_PROCESS_RECEIVED.fetch_add(1, Ordering::Relaxed) + 1;
+    if received.is_power_of_two() {
+        tracing::debug!(
+            received,
+            version = record.EventHeader.EventDescriptor.Version,
+            user_data_len = record.UserDataLength,
+            "received SystemTrace Process Start ETW event"
+        );
+    }
+
+    if let Some(enriched) =
+        handle_system_process_start(record, ctx, TdhEventInfo::from_record_with_status(record))
+    {
+        let _ = ctx.dispatch_event(enriched);
+    }
+}
+
+fn handle_system_process_start<S>(
+    record: &EVENT_RECORD,
+    ctx: &AuxSystemProcessContext,
+    tdh_result: Result<S, u32>,
+) -> Option<SensorEvent>
+where
+    S: SystemProcessPropertySource,
+{
+    let info = match tdh_result {
+        Ok(info) => info,
+        Err(tdh_status) => {
+            let fail_count = SYSTEM_PROCESS_TDH_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if fail_count.is_power_of_two() {
+                tracing::warn!(
+                    tdh_status,
+                    fail_count,
+                    version = record.EventHeader.EventDescriptor.Version,
+                    user_data_len = record.UserDataLength,
+                    "TdhGetEventInformation failed for SystemTrace Process Start; dropping event"
+                );
+            }
+            return None;
+        }
+    };
+
+    if record.EventHeader.TimeStamp <= 0 {
+        return None;
+    }
+    let event_ts_100ns = record.EventHeader.TimeStamp as u64;
+    let pid = info
+        .get_u32("ProcessId")
+        .or_else(|| info.get_u32("ProcessID"))
+        .filter(|&p| p != 0)?;
+    let parent_pid = info
+        .get_u32("ParentId")
+        .or_else(|| info.get_u32("ParentProcessId"))
+        .unwrap_or(0);
+    let image_short_name = info.get_string("ImageFileName").unwrap_or_default();
+    let command_line = info.get_string("CommandLine").unwrap_or_default();
+    if command_line.trim().is_empty() {
+        return None;
+    }
+
+    let resolved = {
+        let mut correlator = ctx
+            .cmdline_correlator
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        correlator.on_system_process_start(SystemProcessCommandLine {
+            pid,
+            parent_pid,
+            event_ts_100ns,
+            image_short_name,
+            command_line,
+        })
+    }?;
+
+    log_correlated_cmdline(
+        "path_b_delayed",
+        resolved.pending.pid,
+        resolved.delta_100ns,
+    );
+    Some(SensorEvent::ProcessStart {
+        identity: ProcessIdentity::new(
+            resolved.pending.pid,
+            resolved.pending.create_time_100ns,
+        ),
+        parent_pid: resolved.pending.parent_pid,
+        exe_path: resolved.pending.exe_path,
+        command_line: resolved.command_line,
+        user_sid: resolved.pending.user_sid,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +822,7 @@ mod tests {
     use crate::dns_cache::DnsResolutionCache;
     use crate::path_norm::DosVolumeMap;
 
+    use super::super::cmdline_correlator::ProcessCommandLineCorrelator;
     use super::super::context::HoneypotHandleTracker;
     use super::super::file_canary::CanaryMatcher;
     use super::super::session::EventSinkFn;
@@ -587,6 +838,8 @@ mod tests {
             honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
             has_honeypot_handles: AtomicBool::new(false),
             registry_kcb_names: Mutex::new(HashMap::new()),
+            cmdline_correlator: Arc::new(Mutex::new(ProcessCommandLineCorrelator::new())),
+            aux_active: Arc::new(AtomicBool::new(false)),
             stop_requested: Arc::new(AtomicBool::new(false)),
             session_name_nul: vec![0],
         }
@@ -924,5 +1177,399 @@ mod tests {
             }
             other => panic!("expected ProcessStart, got {other:?}"),
         }
+    }
+
+    struct StubSysProcSource {
+        pid: Option<u32>,
+        parent_pid: Option<u32>,
+        image_file_name: Option<String>,
+        command_line: Option<String>,
+    }
+
+    impl SystemProcessPropertySource for StubSysProcSource {
+        fn get_u32(&self, name: &str) -> Option<u32> {
+            match name {
+                "ProcessId" | "ProcessID" => self.pid,
+                "ParentId" | "ParentProcessId" => self.parent_pid,
+                _ => None,
+            }
+        }
+
+        fn get_string(&self, name: &str) -> Option<String> {
+            match name {
+                "ImageFileName" => self.image_file_name.clone(),
+                "CommandLine" => self.command_line.clone(),
+                _ => None,
+            }
+        }
+    }
+
+    fn make_capturing_contexts(
+        aux_active_init: bool,
+    ) -> (
+        EtwCallbackContext,
+        AuxSystemProcessContext,
+        Arc<Mutex<Vec<SensorEvent>>>,
+    ) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_sink = Arc::clone(&captured);
+        let sink: EventSinkFn = Arc::new(move |ev| {
+            captured_sink
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ev);
+            true
+        });
+        let correlator = Arc::new(Mutex::new(ProcessCommandLineCorrelator::new()));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let aux_active = Arc::new(AtomicBool::new(aux_active_init));
+        let main_ctx = EtwCallbackContext {
+            sink: Arc::clone(&sink),
+            dns_cache: Mutex::new(DnsResolutionCache::default()),
+            volume_map: DosVolumeMap::with_mappings(Vec::new()),
+            canary_matcher: Arc::new(RwLock::new(CanaryMatcher::default())),
+            honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
+            has_honeypot_handles: AtomicBool::new(false),
+            registry_kcb_names: Mutex::new(HashMap::new()),
+            cmdline_correlator: Arc::clone(&correlator),
+            aux_active: Arc::clone(&aux_active),
+            stop_requested: Arc::clone(&stop_requested),
+            session_name_nul: vec![0],
+        };
+        let aux_ctx = AuxSystemProcessContext {
+            sink,
+            cmdline_correlator: correlator,
+            stop_requested,
+            aux_active,
+            session_name_nul: vec![0],
+        };
+        (main_ctx, aux_ctx, captured)
+    }
+
+    /// `ETW-P4-CMD-01`: Path A (`SystemTrace` arrives before `Kernel-Process` Event 1) ->
+    /// `inspect_fn` is called 0 times and a single `ProcessStart` with kernel `command_line` is emitted.
+    #[test]
+    fn etw_p4_cmd_01_path_a_system_trace_first_skips_peb_and_emits_single_start() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (main_ctx, aux_ctx, captured) = make_capturing_contexts(true);
+        let create_ts: u64 = 133_800_000_000_000_000;
+
+        let mut sys_record = EVENT_RECORD::default();
+        sys_record.EventHeader.TimeStamp = (create_ts + 25_000) as i64;
+        sys_record.EventHeader.ProviderId = SYSTEM_PROCESS_MOF_GUID;
+        sys_record.EventHeader.EventDescriptor.Opcode = 1;
+
+        assert!(handle_system_process_start(
+            &sys_record,
+            &aux_ctx,
+            Ok(StubSysProcSource {
+                pid: Some(4242),
+                parent_pid: Some(1200),
+                image_file_name: Some("cmd.exe".to_string()),
+                command_line: Some("cmd.exe /c powershell.exe -enc SQBFAFgA".to_string()),
+            })
+        )
+        .is_none());
+
+        let mut kp_record = EVENT_RECORD::default();
+        kp_record.EventHeader.TimeStamp = create_ts as i64;
+        kp_record.EventHeader.EventDescriptor.Id = 1;
+        let inspect_calls = AtomicUsize::new(0);
+        let ev = build_process_start_event(
+            &kp_record,
+            &main_ctx,
+            Ok(StubPropertySource {
+                pid: Some(4242),
+                parent_pid: Some(1200),
+                create_time_100ns: Some(create_ts),
+                image_name: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                command_line: None,
+            }),
+            |_| {
+                inspect_calls.fetch_add(1, Ordering::Relaxed);
+                None
+            },
+        )
+        .expect("ProcessStart emitted");
+
+        assert_eq!(inspect_calls.load(Ordering::Relaxed), 0);
+        dispatch_process_start_with_correlator(&main_ctx, ev);
+
+        let events = captured.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SensorEvent::ProcessStart {
+                identity,
+                command_line,
+                exe_path,
+                ..
+            } => {
+                assert_eq!(identity, &ProcessIdentity::new(4242, create_ts));
+                assert_eq!(exe_path, r"C:\Windows\System32\cmd.exe");
+                assert_eq!(command_line, "cmd.exe /c powershell.exe -enc SQBFAFgA");
+            }
+            other => panic!("expected ProcessStart, got {other:?}"),
+        }
+    }
+
+    /// `ETW-P4-CMD-02`: Path B (`Kernel-Process` Event 1 arrives first, PEB returns `None`,
+    /// then `SystemTrace` arrives) -> initial `ProcessStart` emitted first, then enriched
+    /// `ProcessStart` preserving exact `create_time_100ns` and full `exe_path`.
+    #[test]
+    fn etw_p4_cmd_02_path_b_kernel_first_then_system_trace_emits_enriched_start() {
+        let (main_ctx, aux_ctx, captured) = make_capturing_contexts(true);
+        let create_ts: u64 = 133_800_000_000_000_000;
+
+        let mut kp_record = EVENT_RECORD::default();
+        kp_record.EventHeader.TimeStamp = create_ts as i64;
+        kp_record.EventHeader.EventDescriptor.Id = 1;
+        let ev = build_process_start_event(
+            &kp_record,
+            &main_ctx,
+            Ok(StubPropertySource {
+                pid: Some(5252),
+                parent_pid: Some(1200),
+                create_time_100ns: Some(create_ts),
+                image_name: Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string()),
+                command_line: None,
+            }),
+            |_| None,
+        )
+        .expect("initial ProcessStart emitted");
+        dispatch_process_start_with_correlator(&main_ctx, ev);
+
+        let mut sys_record = EVENT_RECORD::default();
+        sys_record.EventHeader.TimeStamp = (create_ts + 40_000) as i64;
+        sys_record.EventHeader.ProviderId = SYSTEM_PROCESS_MOF_GUID;
+        sys_record.EventHeader.EventDescriptor.Opcode = 1;
+        let enriched = handle_system_process_start(
+            &sys_record,
+            &aux_ctx,
+            Ok(StubSysProcSource {
+                pid: Some(5252),
+                parent_pid: Some(1200),
+                image_file_name: Some("powershell.exe".to_string()),
+                command_line: Some("powershell.exe -EncodedCommand ZQBjAGgAbwA=".to_string()),
+            }),
+        )
+        .expect("Path B produces enriched ProcessStart");
+        assert!(aux_ctx.dispatch_event(enriched));
+
+        let events = captured.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(events.len(), 2);
+        match (&events[0], &events[1]) {
+            (
+                SensorEvent::ProcessStart {
+                    identity: id0,
+                    command_line: cmd0,
+                    exe_path: exe0,
+                    ..
+                },
+                SensorEvent::ProcessStart {
+                    identity: id1,
+                    command_line: cmd1,
+                    exe_path: exe1,
+                    ..
+                },
+            ) => {
+                assert_eq!(id0, &ProcessIdentity::new(5252, create_ts));
+                assert!(cmd0.is_empty());
+                assert_eq!(id1, &ProcessIdentity::new(5252, create_ts));
+                assert_eq!(exe1, exe0);
+                assert_eq!(cmd1, "powershell.exe -EncodedCommand ZQBjAGgAbwA=");
+            }
+            other => panic!("expected two ProcessStart events, got {other:?}"),
+        }
+    }
+
+    /// `ETW-P4-CMD-03`: TOCTOU race coverage:
+    /// (a) `SystemTrace` arrives while `inspect_fn` is running -> second-chance lookup catches it
+    ///     and emits ONE complete `ProcessStart`.
+    /// (b) `SystemTrace` arrives while initial `dispatch_event` is running -> `take_or_register_pending_start`
+    ///     resolves immediately and main thread emits initial THEN enriched `ProcessStart` (no ordering inversion).
+    #[test]
+    fn etw_p4_cmd_03_toctou_during_inspect_and_during_initial_dispatch() {
+        let create_ts: u64 = 133_800_000_000_000_000;
+
+        // Subcase (a): arrival during inspect_fn
+        {
+            let (main_ctx, aux_ctx, captured) = make_capturing_contexts(true);
+            let mut kp_record = EVENT_RECORD::default();
+            kp_record.EventHeader.TimeStamp = create_ts as i64;
+            kp_record.EventHeader.EventDescriptor.Id = 1;
+
+            let ev = build_process_start_event(
+                &kp_record,
+                &main_ctx,
+                Ok(StubPropertySource {
+                    pid: Some(6100),
+                    parent_pid: Some(1200),
+                    create_time_100ns: Some(create_ts),
+                    image_name: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                    command_line: None,
+                }),
+                |_| {
+                    let mut sys_record = EVENT_RECORD::default();
+                    sys_record.EventHeader.TimeStamp = (create_ts + 10_000) as i64;
+                    assert!(handle_system_process_start(
+                        &sys_record,
+                        &aux_ctx,
+                        Ok(StubSysProcSource {
+                            pid: Some(6100),
+                            parent_pid: Some(1200),
+                            image_file_name: Some("cmd.exe".to_string()),
+                            command_line: Some("cmd.exe /c during-inspect".to_string()),
+                        })
+                    )
+                    .is_none());
+                    None
+                },
+            )
+            .expect("ProcessStart emitted");
+            dispatch_process_start_with_correlator(&main_ctx, ev);
+
+            let events = captured.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                SensorEvent::ProcessStart { command_line, .. } => {
+                    assert_eq!(command_line, "cmd.exe /c during-inspect");
+                }
+                other => panic!("expected ProcessStart, got {other:?}"),
+            }
+            let corr = main_ctx
+                .cmdline_correlator
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(corr.cached_sys_len(), 0);
+            assert_eq!(corr.pending_starts_len(), 0);
+        }
+
+        // Subcase (b): arrival during initial dispatch_event
+        {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let correlator = Arc::new(Mutex::new(ProcessCommandLineCorrelator::new()));
+            let stop_requested = Arc::new(AtomicBool::new(false));
+            let aux_active = Arc::new(AtomicBool::new(true));
+
+            let aux_sink: EventSinkFn = Arc::new(|_| true);
+            let aux_ctx = AuxSystemProcessContext {
+                sink: aux_sink,
+                cmdline_correlator: Arc::clone(&correlator),
+                stop_requested: Arc::clone(&stop_requested),
+                aux_active: Arc::clone(&aux_active),
+                session_name_nul: vec![0],
+            };
+
+            let captured_sink = Arc::clone(&captured);
+            let main_sink: EventSinkFn = Arc::new(move |ev| {
+                let is_first = captured_sink
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
+                captured_sink
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(ev);
+                if is_first {
+                    let mut sys_record = EVENT_RECORD::default();
+                    sys_record.EventHeader.TimeStamp = (create_ts + 10_000) as i64;
+                    assert!(handle_system_process_start(
+                        &sys_record,
+                        &aux_ctx,
+                        Ok(StubSysProcSource {
+                            pid: Some(6200),
+                            parent_pid: Some(1200),
+                            image_file_name: Some("cmd.exe".to_string()),
+                            command_line: Some("cmd.exe /c during-dispatch".to_string()),
+                        })
+                    )
+                    .is_none());
+                }
+                true
+            });
+
+            let main_ctx = EtwCallbackContext {
+                sink: main_sink,
+                dns_cache: Mutex::new(DnsResolutionCache::default()),
+                volume_map: DosVolumeMap::with_mappings(Vec::new()),
+                canary_matcher: Arc::new(RwLock::new(CanaryMatcher::default())),
+                honeypot_handles: Mutex::new(HoneypotHandleTracker::default()),
+                has_honeypot_handles: AtomicBool::new(false),
+                registry_kcb_names: Mutex::new(HashMap::new()),
+                cmdline_correlator: Arc::clone(&correlator),
+                aux_active,
+                stop_requested,
+                session_name_nul: vec![0],
+            };
+
+            let initial = SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(6200, create_ts),
+                parent_pid: 1200,
+                exe_path: r"C:\Windows\System32\cmd.exe".to_string(),
+                command_line: String::new(),
+                user_sid: None,
+            };
+            dispatch_process_start_with_correlator(&main_ctx, initial);
+
+            let events = captured.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(events.len(), 2);
+            match (&events[0], &events[1]) {
+                (
+                    SensorEvent::ProcessStart { command_line: c0, .. },
+                    SensorEvent::ProcessStart { command_line: c1, .. },
+                ) => {
+                    assert!(c0.is_empty(), "initial event must arrive before enriched");
+                    assert_eq!(c1, "cmd.exe /c during-dispatch");
+                }
+                other => panic!("expected initial then enriched ProcessStart, got {other:?}"),
+            }
+            let corr = correlator.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(corr.cached_sys_len(), 0);
+            assert_eq!(corr.pending_starts_len(), 0);
+        }
+    }
+
+    /// `ETW-P4-CMD-07` (correlator gate): When `aux_active == false` (auxiliary session startup
+    /// failed or exited), `dispatch_process_start_with_correlator` does not accumulate
+    /// `PendingKernelStart` entries while PEB fallback remains intact.
+    #[test]
+    fn etw_p4_cmd_07_aux_inactive_skips_pending_registration() {
+        let (main_ctx, _aux_ctx, captured) = make_capturing_contexts(false);
+        let create_ts: u64 = 133_800_000_000_000_000;
+
+        let mut kp_record = EVENT_RECORD::default();
+        kp_record.EventHeader.TimeStamp = create_ts as i64;
+        kp_record.EventHeader.EventDescriptor.Id = 1;
+        let ev = build_process_start_event(
+            &kp_record,
+            &main_ctx,
+            Ok(StubPropertySource {
+                pid: Some(7100),
+                parent_pid: Some(1200),
+                create_time_100ns: Some(create_ts),
+                image_name: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                command_line: None,
+            }),
+            |_| None,
+        )
+        .expect("ProcessStart emitted even when aux_active is false");
+        dispatch_process_start_with_correlator(&main_ctx, ev);
+
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1
+        );
+        assert_eq!(
+            main_ctx
+                .cmdline_correlator
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending_starts_len(),
+            0
+        );
     }
 }

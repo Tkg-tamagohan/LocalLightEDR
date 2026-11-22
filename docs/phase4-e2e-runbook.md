@@ -64,7 +64,8 @@ $hkcuBackups = @(
     @{ Key = "HKCU\Software\Classes\AppUserModelId\LocalEDR.AlertUI"; File = "hkcu_aumid.reg" }
 )
 foreach ($item in $hkcuBackups) {
-    if (Test-Path ("Registry::" + $item.Key)) {
+    & $reg64 query $item.Key *> $null
+    if ($LASTEXITCODE -eq 0) {
         $outFile = Join-Path "$runDir\backup" $item.File
         & $reg64 export $item.Key $outFile /y | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outFile) -or (Get-Item $outFile).Length -eq 0) {
@@ -100,12 +101,17 @@ $reg64 = "$env:SystemRoot\System32\reg.exe"
 $reg32 = "$env:SystemRoot\SysWOW64\reg.exe"
 $adminBackupDir = Join-Path $env:ProgramData ("LocalEDR-e2e-admin-backup-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $adminBackupDir -ErrorAction Stop | Out-Null
-icacls $adminBackupDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
+$backupItem = Get-Item -LiteralPath $adminBackupDir -Force
+if (-not $backupItem.PSIsContainer -or ($backupItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw "管理者専用退避フォルダがリパースポイントのため中止します: $adminBackupDir"
+}
+$ownerSid = (Get-Acl -LiteralPath $adminBackupDir).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+if ($ownerSid -notin @("S-1-5-32-544", "S-1-5-18")) {
+    throw "管理者専用退避フォルダの所有者が Administrators または SYSTEM ではないため中止します: $adminBackupDir (Owner=$ownerSid)"
+}
+icacls $adminBackupDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-18:(OI)(CI)F" | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "管理者専用退避フォルダの ACL 設定に失敗したため中止します: $adminBackupDir"
-}
-if ((Get-Item $adminBackupDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
-    throw "管理者専用退避フォルダがリパースポイントのため中止します: $adminBackupDir"
 }
 $hklmBackups = @(
     @{ Key = "HKLM\Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_chrome_nmh_64.reg"; RegExe = $reg64 },
@@ -177,7 +183,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', 8765), Handler).serve_forever()
 "@
 $servePath = Join-Path $runDir "local_server.py"
 [System.IO.File]::WriteAllText($servePath, $serveScript, [System.Text.UTF8Encoding]::new($false))
-$serverProc = Start-Process -FilePath python -ArgumentList @($servePath, "$runDir\site") -PassThru -WindowStyle Minimized
+$serverProc = Start-Process -FilePath python -ArgumentList @("`"$servePath`"", "`"$runDir\site`"") -PassThru -WindowStyle Minimized
 
 $chromeCandidates = @(
     "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
@@ -211,21 +217,34 @@ if (-not $chromeExe) {
 | `E2E-P4-03` | `http://nrd-sim.localedr.invalid:8765/phase4-browser-test.html` の `Password` 欄へフォーカスして 1 文字入力し、`ledr-ui` で `Refresh` を押下 | ブラウザ内に NRD 警告が表示され、View 1 に `NrdPasswordWarning` が記録される |
 | `E2E-P4-04` | `http://login-paypa1.localedr.invalid:8765/phase4-browser-test.html` の `Password` 欄へフォーカスして 1 文字入力し、`ledr-ui` で `Refresh` を押下 | ブラウザ内にホモグラフ警告（対象ブランド `paypal`）が表示され、View 1 に `HomographWarning` が記録される |
 | `E2E-P4-05` | `Fetch safe-sim.localedr.invalid` と `Fetch c2-sim.localedr.invalid` を順に押下し、`ledr-ui` で `Refresh` を押下 | `safe-sim` は `HTTP 200` で成功し、`c2-sim` と `blocked-test` は DNR 静的ルールで即座に遮断され、`DnrBlockedRequest` が記録される |
-| `E2E-P4-06` | `Download localedr-e2e-sample.exe` でダウンロード完了後、まず `ledr-ui` で `Refresh` を押下し、View 2（`Canary & Downloads` タブ・`Scope: All Processes`）に元パスと SHA-256 が記録されたことを確認してから、下記コマンドで `$runDir\moved\localedr-e2e-sample.exe` へ移動して `--scenario cookies-open` を実行し、再度 `ledr-ui` で `Refresh` を押下 | 移動前に View 2 の `Canary & Downloads` タブへ元パスと短縮 `sha256` が記録され、View 3 の `Tracked Downloads` 件数が増加している。移動後の起動により View 1 に `localedr-e2e-sample.exe` の `LEDR-CANARY-COOKIE_DB` アラートと MOTW カード（`Origin URL`、`Source`、一致ダウンロード行）が表示され、`Allow Once` で再開できる。View 2 のプロセスツリーに `MOTW` バッジと `Origin URL (MOTW)`、選択時の `download_origins` 行（`referrer_url` と短縮 `sha256`）が表示される |
+| `E2E-P4-06` | `Download localedr-e2e-sample.exe` でダウンロード完了後、まず `ledr-ui` で `Refresh` を押下し、View 2（`Canary & Downloads` タブ・`Scope: All Processes`）に元パスと SHA-256 が記録されたことを確認してから、下記コマンドで高リスクパス外の排他ディレクトリ（`%LOCALAPPDATA%\LocalEDR-e2e-moved-<GUID>`）へ移動して `dns-tcp --hold-ms 30000` と `cookies-open` を実行し、再度 `ledr-ui` で `Refresh` を押下 | 移動前に View 2 の `Canary & Downloads` タブへ元パスと短縮 `sha256` が記録され、View 3 の `Tracked Downloads` 件数が増加している。移動後の起動により View 1 に `localedr-e2e-sample.exe` の `LEDR-NET-HIGH-RISK-PATH`（事前 WFP 遮断、`L-18`）と `LEDR-CANARY-COOKIE_DB` アラートおよび MOTW カード（`Origin URL`、`Source`、一致ダウンロード行）が表示され、`Allow Once` で再開できる。View 2 のプロセスツリーに `MOTW` バッジと `Origin URL (MOTW)`、選択時の `download_origins` 行（`referrer_url` と短縮 `sha256`）が表示される |
 | `E2E-P4-07` | View 1 の未解決 `LAYER_4_BROWSER` アラートを `Acknowledge` で解決後、`ledr-ui` ウィンドウを閉じる | View 1 で解決状態へ遷移し、ウィンドウ閉鎖後に `ledr-ui` と WebView2 の残留プロセスが 0 件になる |
 
 `E2E-P4-06` では、拡張機能のダウンロード完了通知とデーモン側の SHA-256 算出が非同期で走るため、**移動コマンドを実行する前に** `ledr-ui` 上部の `Refresh` を押し、View 2 の `Canary & Downloads` タブ（`Scope: All Processes`）に `Downloads\localedr-e2e-sample.exe` と短縮 `sha256` が記録されたことを確かめてください（View 3 の `Tracked Downloads` は件数表示のみのため、パスと `sha256` の確認は必ず View 2 で行います）。
-記録を確認してから、ウィンドウ B で移動と起動時事前 WFP ブロック（`L-18`）およびダミーカナリア起動を実行します。
-`localedr-e2e-sample.exe` は検知直後に凍結されるため、`Start-Process -PassThru` で別プロセスとして起動し、再度 `Refresh` を押して View 1 と View 2 を確認したあとに `Allow Once` で再開します。
+記録を確認してから、ウィンドウ B で高リスクパス（`Downloads` や `Temp`）外となる `%LOCALAPPDATA%` 配下の排他ディレクトリへ移動し、起動時事前 WFP ブロック（`L-18`）およびダミーカナリア起動を実行します。
+`localedr-e2e-sample.exe` は検知直後に凍結されるため、`Start-Process -PassThru` で別プロセスとして起動し、再度 `Refresh` を押して View 1 と View 2 を確認したあとに `Allow Once` で再開し、確認後に `$simNet`、`$simMotw`、および `$movedDir` を片付けてください。
 
 ```powershell
 # ウィンドウ B（通常ユーザー PowerShell）: View 2 の Canary & Downloads タブで元パスと SHA-256 の記録を確認した後に実行
-New-Item -ItemType Directory -Force -Path "$runDir\moved" | Out-Null
-Move-Item "$env:USERPROFILE\Downloads\localedr-e2e-sample.exe" "$runDir\moved\localedr-e2e-sample.exe" -Force
-# L-18 確認: 移動後でも MOTW による事前 WFP ブロックで外部 TCP が遮断され、View 1 に LEDR-NET-HIGH-RISK-PATH と MOTW カードが記録される
-$simNet = Start-Process -FilePath "$runDir\moved\localedr-e2e-sample.exe" -ArgumentList "--scenario", "dns-tcp", "--domain", "93.184.216.34", "--port", "80", "--json" -PassThru
+$movedDir = Join-Path $env:LOCALAPPDATA ("LocalEDR-e2e-moved-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $movedDir -ErrorAction Stop | Out-Null
+$movedExe = Join-Path $movedDir "localedr-e2e-sample.exe"
+Move-Item -LiteralPath "$env:USERPROFILE\Downloads\localedr-e2e-sample.exe" -Destination $movedExe -Force
+# L-18 確認: 高リスクパス外へ移動後でも MOTW による事前 WFP ブロックで外部 TCP が遮断され、View 1 に LEDR-NET-HIGH-RISK-PATH と MOTW カードが記録される
+$simNet = Start-Process -FilePath $movedExe -ArgumentList "--scenario", "dns-tcp", "--domain", "93.184.216.34", "--port", "80", "--hold-ms", "30000", "--json" -PassThru
 Start-Sleep -Seconds 3
-$simMotw = Start-Process -FilePath "$runDir\moved\localedr-e2e-sample.exe" -ArgumentList "--scenario", "cookies-open", "--base-dir", "$runDir\canary_dir", "--hold-ms", "120000", "--json" -PassThru
+# View 1 で LEDR-NET-HIGH-RISK-PATH と MOTW カードを確認したら $simNet を停止する
+Stop-Process -Id $simNet.Id -Force -ErrorAction SilentlyContinue
+
+$simMotw = Start-Process -FilePath $movedExe -ArgumentList "--scenario", "cookies-open", "--base-dir", "`"$runDir\canary_dir`"", "--hold-ms", "120000", "--json" -PassThru
+```
+
+`View 1` と `View 2` で `LEDR-CANARY-COOKIE_DB` と MOTW 紐付けを確認し、`Allow Once` で再開したら、残待機中の `$simMotw` と一時移動ディレクトリ `$movedDir` を削除してください。
+
+```powershell
+# ウィンドウ B（通常ユーザー PowerShell）: E2E-P4-06 確認後の片付け
+if ($simMotw -and -not $simMotw.HasExited) { Stop-Process -Id $simMotw.Id -Force -ErrorAction SilentlyContinue }
+if ($movedDir -and (Test-Path -LiteralPath $movedDir)) { Remove-Item -Recurse -Force -LiteralPath $movedDir -ErrorAction SilentlyContinue }
 ```
 
 ## 手順 4 終了確認と性能計測
@@ -301,7 +320,9 @@ if (-not [Environment]::Is64BitProcess) {
 }
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 if ($serverProc -and -not $serverProc.HasExited) { Stop-Process -Id $serverProc.Id -Force }
+if ($simNet -and -not $simNet.HasExited) { Stop-Process -Id $simNet.Id -Force -ErrorAction SilentlyContinue }
 if ($simMotw -and -not $simMotw.HasExited) { Stop-Process -Id $simMotw.Id -Force -ErrorAction SilentlyContinue }
+if ($movedDir -and (Test-Path -LiteralPath $movedDir)) { Remove-Item -Recurse -Force -LiteralPath $movedDir -ErrorAction SilentlyContinue }
 .\target\debug\ledr-bridge-nm.exe unregister --scope user --browsers chrome,edge
 
 # 手順 1 で既存 HKCU 設定を退避した場合のみ復元し、失敗時は退避ファイルを消さずに停止する

@@ -74,7 +74,7 @@ Phase 0（基盤構築と共通型凍結）、Phase 1（プロセス系譜と通
 
 ### 作業前に確認する 7 つの安全前提
 
-1. **Windows Service SCM エントリポイントは未実装である**：現行の [main.rs](../crates/ledr-daemon/src/main.rs) は `#[tokio::main]` のコンソールプロセスであり、`StartServiceCtrlDispatcherW` を持たないため `sc.exe start` ではエラー 1053 で失敗する。
+1. **Windows Service SCM エントリポイントは未実装である**：現行の [main.rs](../crates/ledr-daemon/src/main.rs) は `build_daemon_runtime()`（有界マルチスレッド Tokio ランタイム）上のコンソールプロセスであり、`StartServiceCtrlDispatcherW` を持たないため `sc.exe start` ではエラー 1053 で失敗する。
    本編では `--foreground` 起動時のフォールバック経路でトースト通知と `ledr://` 起動を確認し、Session 0 境界の確認は第 6 章（`E2E-OPT-03`）へ切り分ける。
 2. **操作中の管理者 PowerShell ウィンドウを凍結させない**：`powershell.exe` は事前 WFP ブロック対象であり、`never-suspend` 保護対象に含まれない。
    ウィンドウ B から `Cookies` の開錠や自動起動レジストリ書込を直接実行すると操作中のシェル自体が凍結するため、試験アクセスには必ず `ledr-sim.exe` または `Start-Process` で別の子プロセスを起動する。
@@ -112,7 +112,32 @@ if (-not (Test-Path (Join-Path $repoRoot "Cargo.toml"))) {
     throw "リポジトリルートが見つかりません: $repoRoot"
 }
 New-Item -ItemType Directory -Force -Path "C:\Temp" | Out-Null
-[System.IO.File]::WriteAllText("C:\Temp\ledr-e2e-repo.txt", $repoRoot, [System.Text.UTF8Encoding]::new($false))
+
+# 共有参照ポインタ用と管理者専用ファイル用の 2 ディレクトリを C:\ProgramData 配下に準備し、
+# icacls 適用前（および再利用時）にリパースポイントでないことと所有者が Administrators または SYSTEM であることを必ず検証する
+$allowedOwnerSids = @("S-1-5-32-544", "S-1-5-18")
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+foreach ($dirSpec in @(
+    @{ Path = $stateDir; IcaclsArgs = @("/inheritance:r", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", "*S-1-5-32-545:(OI)(CI)RX") },
+    @{ Path = $adminDir; IcaclsArgs = @("/inheritance:r", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/grant:r", "*S-1-5-18:(OI)(CI)F") }
+)) {
+    $targetDir = $dirSpec.Path
+    if (-not (Test-Path -LiteralPath $targetDir)) {
+        New-Item -ItemType Directory -Path $targetDir -ErrorAction Stop | Out-Null
+    }
+    $dirItem = Get-Item -LiteralPath $targetDir -Force
+    if (-not $dirItem.PSIsContainer -or ($dirItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "リパースポイントまたは非ディレクトリを検出したため中止します: $targetDir"
+    }
+    $ownerSid = (Get-Acl -LiteralPath $targetDir).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($ownerSid -notin $allowedOwnerSids) {
+        throw "所有者が Administrators または SYSTEM ではないため中止します: $targetDir (Owner=$ownerSid)"
+    }
+    & icacls $targetDir @($dirSpec.IcaclsArgs) | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "ACL 設定に失敗しました: $targetDir" }
+}
+[System.IO.File]::WriteAllText((Join-Path $stateDir "repo.txt"), $repoRoot, [System.Text.UTF8Encoding]::new($false))
 Set-Location $repoRoot
 
 Get-Process ledr-daemon, ledr-ui, ledr-sim, ledr-bridge-nm -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -154,27 +179,30 @@ if ($LASTEXITCODE -ne 0) { throw "Release ビルドに失敗しました (exit c
 
 ### PREP-02：作業フォルダ、ダミーカナリア、ローカル配信資産の作成（ウィンドウ B）
 
-続けてウィンドウ B で、今回の実行専用のタイムスタンプ付きフォルダ `$runDir` を作成し、`C:\Temp\ledr-e2e-latest.txt` へ記録してください。
+続けてウィンドウ B で、今回の実行専用のタイムスタンプ付きフォルダ `$runDir` を作成し、管理者 ACL 保護済みの `C:\ProgramData\LocalEDR-e2e-state\latest.txt` へ記録してください。
+既存のおとりファイル一覧（`preexisting_honeypots.txt`）は、非管理者による改ざんを防ぐため管理者専用ディレクトリ `C:\ProgramData\LocalEDR-e2e-admin` へ保存します。
 あわせて、過去テストの残存ダウンロードファイルがないよう `Downloads\localedr-e2e-sample*` を事前に整理し、ダミーカナリアが既存ファイル上書きを拒否することを確かめます。
 
 ```powershell
 # ウィンドウ B（64 ビット版管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
 Set-Location $repoRoot
 $runDir = "C:\Temp\ledr-e2e-" + (Get-Date -Format "yyyyMMdd-HHmmss")
 foreach ($sub in @("canary_dir", "site\download", "chrome-profile", "backup")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $runDir $sub) | Out-Null
 }
-[System.IO.File]::WriteAllText("C:\Temp\ledr-e2e-latest.txt", $runDir, [System.Text.UTF8Encoding]::new($false))
+[System.IO.File]::WriteAllText((Join-Path $stateDir "latest.txt"), $runDir, [System.Text.UTF8Encoding]::new($false))
 
-# 検証前から存在するおとりファイルを記録し、後片付けで今回作成分だけを削除できるようにする
+# 検証前から存在するおとりファイルを管理者専用ディレクトリへ記録し、後片付けで今回作成分だけを削除できるようにする
 $honeypotPaths = @(
     "$env:USERPROFILE\Documents\!00_LocalEDR_Canary_DoNotEdit.docx",
     "$env:USERPROFILE\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx",
     "$env:USERPROFILE\Pictures\!00_LocalEDR_Canary_DoNotEdit.docx"
 )
 $preexistingHoneypots = @($honeypotPaths | Where-Object { Test-Path -LiteralPath $_ })
-[System.IO.File]::WriteAllLines((Join-Path $runDir "preexisting_honeypots.txt"), [string[]]$preexistingHoneypots, [System.Text.UTF8Encoding]::new($false))
+[System.IO.File]::WriteAllLines((Join-Path $adminDir "preexisting_honeypots.txt"), [string[]]$preexistingHoneypots, [System.Text.UTF8Encoding]::new($false))
 
 # 過去の同名ダウンロードがあると Chrome が (1) を付けてリネーム保存するため事前掃除する
 Get-Item "$env:USERPROFILE\Downloads\localedr-e2e-sample*.exe", "$env:USERPROFILE\Downloads\localedr-e2e-sample*.cmd" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
@@ -206,8 +234,9 @@ Write-Output ("PREP-02 完了: RunDir=" + $runDir)
 if (-not [Environment]::Is64BitProcess) {
     throw "64 ビット版 PowerShell で実行してください。"
 }
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 
@@ -218,7 +247,8 @@ $hkcuBackups = @(
     @{ Key = "HKCU\Software\Classes\AppUserModelId\LocalEDR.AlertUI"; File = "hkcu_aumid.reg" }
 )
 foreach ($item in $hkcuBackups) {
-    if (Test-Path ("Registry::" + $item.Key)) {
+    & $reg64 query $item.Key *> $null
+    if ($LASTEXITCODE -eq 0) {
         $outFile = Join-Path (Join-Path $runDir "backup") $item.File
         & $reg64 export $item.Key $outFile /y | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $outFile) -or (Get-Item $outFile).Length -eq 0) {
@@ -259,8 +289,9 @@ Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotificati
 if (-not [Environment]::Is64BitProcess) {
     throw "64 ビット版 PowerShell で実行してください。"
 }
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 .\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
@@ -291,7 +322,8 @@ Track A はウィンドウ A で `PREP-04` の Debug デーモンが稼働して
 
 ```powershell
 # ウィンドウ C（64 ビット版通常ユーザー PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
 Start-Process -FilePath (Join-Path $repoRoot "target\debug\ledr-ui.exe") -WorkingDirectory $repoRoot
 ```
 
@@ -303,7 +335,8 @@ Start-Process -FilePath (Join-Path $repoRoot "target\debug\ledr-ui.exe") -Workin
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "type `"$runDir\canary_dir\!00_LocalEDR_Canary_DoNotEdit.docx`" >nul" -Wait -PassThru
 Write-Output ("ReadOnlyExitCode=" + $p.ExitCode)
 ```
@@ -316,10 +349,11 @@ Write-Output ("ReadOnlyExitCode=" + $p.ExitCode)
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
-$simCookie = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory $repoRoot -ArgumentList "--scenario", "cookies-open", "--base-dir", (Join-Path $runDir "canary_dir"), "--hold-ms", "120000", "--json" -PassThru
+$simCookie = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory $repoRoot -ArgumentList "--scenario", "cookies-open", "--base-dir", "`"$(Join-Path $runDir 'canary_dir')`"", "--hold-ms", "120000", "--json" -PassThru
 Start-Sleep -Seconds 2
 (Get-Process -Id $simCookie.Id).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
 ```
@@ -340,10 +374,11 @@ Start-Sleep -Seconds 2
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
-$simHp = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory $repoRoot -ArgumentList "--scenario", "honeypot-write", "--base-dir", (Join-Path $runDir "canary_dir"), "--hold-ms", "120000", "--json" -PassThru
+$simHp = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory $repoRoot -ArgumentList "--scenario", "honeypot-write", "--base-dir", "`"$(Join-Path $runDir 'canary_dir')`"", "--hold-ms", "120000", "--json" -PassThru
 Start-Sleep -Seconds 2
 $children = Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $simHp.Id) | Select-Object ProcessId, Name, CommandLine
 $children | Format-Table -AutoSize
@@ -377,10 +412,11 @@ foreach ($c in $children) { Get-Process -Id $c.ProcessId -ErrorAction SilentlyCo
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
-$simExp = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory $repoRoot -ArgumentList "--scenario", "cookies-open", "--base-dir", (Join-Path $runDir "canary_dir"), "--hold-ms", "180000", "--json" -PassThru
+$simExp = Start-Process -FilePath ".\target\debug\ledr-sim.exe" -WorkingDirectory $repoRoot -ArgumentList "--scenario", "cookies-open", "--base-dir", "`"$(Join-Path $runDir 'canary_dir')`"", "--hold-ms", "180000", "--json" -PassThru
 Start-Sleep -Seconds 68
 (Get-Process -Id $simExp.Id).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
 ```
@@ -395,7 +431,8 @@ UIPI（特権分離）の影響を避けるため、通常ユーザー権限の 
 
 ```powershell
 # ウィンドウ C（通常ユーザー PowerShell）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 explorer.exe (Join-Path $runDir "canary_dir")
 ```
 
@@ -454,7 +491,8 @@ Remove-Item -Path $tmpKey -Force
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 $activeFiltersXml = Join-Path $runDir "filters_active.xml"
 netsh wfp show filters "file=$activeFiltersXml"
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $activeFiltersXml)) {
@@ -470,11 +508,11 @@ Select-String -Path $activeFiltersXml -Pattern "LocalEDR" -ErrorAction Stop | Se
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）: 単一インスタンスの SysWOW64 powershell.exe でループバック許可と外部遮断を確認
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $ps32)) { throw "32 ビット版 PowerShell が見つかりません: $ps32" }
 
-$probeOut = Join-Path $runDir "p3_01_probe.txt"
+$probeOut = Join-Path $adminDir "p3_01_probe.txt"
 Remove-Item -LiteralPath $probeOut -ErrorAction SilentlyContinue
 $probeScript = @'
 param([string]$OutFile)
@@ -506,12 +544,12 @@ try {
 [System.IO.File]::AppendAllText($OutFile, ($line2 + "`r`n"), $utf8NoBom)
 Start-Sleep -Seconds 60
 '@
-$probePath = Join-Path $runDir "p3_01_probe.ps1"
+$probePath = Join-Path $adminDir "p3_01_probe.ps1"
 [System.IO.File]::WriteAllText($probePath, $probeScript, [System.Text.UTF8Encoding]::new($false))
 
-$ps32Proc1 = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $probePath, "-OutFile", $probeOut -PassThru
+$ps32Proc1 = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$probePath`"", "-OutFile", "`"$probeOut`"" -PassThru
 Start-Sleep -Seconds 5
-if (Test-Path -LiteralPath $probeOut) { Get-Content -LiteralPath $probeOut }
+if (Test-Path -LiteralPath $probeOut) { Get-Content -Encoding UTF8 -LiteralPath $probeOut }
 (Get-Process -Id $ps32Proc1.Id -ErrorAction SilentlyContinue).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
 ```
 
@@ -528,9 +566,9 @@ if (Test-Path -LiteralPath $probeOut) { Get-Content -LiteralPath $probeOut }
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-$ambOut = Join-Path $runDir "p3_02_ambig.txt"
+$ambOut = Join-Path $adminDir "p3_02_ambig.txt"
 Remove-Item -LiteralPath $ambOut -ErrorAction SilentlyContinue
 $ambScript = @'
 param([string]$OutFile)
@@ -546,13 +584,13 @@ $msg = try {
 [System.IO.File]::WriteAllText($OutFile, ($msg + "`r`n"), [System.Text.UTF8Encoding]::new($false))
 Start-Sleep -Seconds 60
 '@
-$ambPath = Join-Path $runDir "p3_02_ambig.ps1"
+$ambPath = Join-Path $adminDir "p3_02_ambig.ps1"
 [System.IO.File]::WriteAllText($ambPath, $ambScript, [System.Text.UTF8Encoding]::new($false))
 
 Start-Sleep -Milliseconds 400
-$ps32Proc2 = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $ambPath, "-OutFile", $ambOut -PassThru
+$ps32Proc2 = Start-Process -FilePath $ps32 -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$ambPath`"", "-OutFile", "`"$ambOut`"" -PassThru
 Start-Sleep -Seconds 3
-if (Test-Path -LiteralPath $ambOut) { Get-Content -LiteralPath $ambOut }
+if (Test-Path -LiteralPath $ambOut) { Get-Content -Encoding UTF8 -LiteralPath $ambOut }
 (Get-Process -Id $ps32Proc2.Id -ErrorAction SilentlyContinue).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
 ```
 
@@ -571,7 +609,8 @@ if ($ps32Proc2) { Stop-Process -Id $ps32Proc2.Id -Force -ErrorAction SilentlyCon
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
 Set-Location $repoRoot
 .\target\debug\ledr-sim.exe --scenario lotl --json
 .\target\debug\ledr-sim.exe --scenario dns-tcp --domain example.com --port 80 --json
@@ -599,16 +638,17 @@ Set-Location $repoRoot
 # ウィンドウ B（管理者 PowerShell）
 if ($ps32Proc1) { Stop-Process -Id $ps32Proc1.Id -Force -ErrorAction SilentlyContinue }
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-& $ps32 -NoProfile -Command '$c = [System.Net.Sockets.TcpClient]::new(); $c.Connect(''93.184.216.34'', 80); Write-Output ''External connect succeeded''; $c.Close()'
+& $ps32 -NoProfile -Command '$ErrorActionPreference = ''Stop''; $c = [System.Net.Sockets.TcpClient]::new(); try { $c.Connect(''93.184.216.34'', 80); Write-Output ''External connect succeeded'' } finally { $c.Close() }'
+if ($LASTEXITCODE -ne 0) { throw "外部 TCP 接続に失敗しました (exit code: $LASTEXITCODE)." }
 ```
 
 4. `` `View 3: 防御ポリシー・カナリア・ブラウザシールド` `` を開き、作成した `NetworkAllow` ルールが一覧にあること、右側の `カナリア・おとり配置状態` が `3/3 deployed`（3 箇所のファイルサイズ付き）であること、および `Tier 1 Protected Templates` が表示されていることを確認する。
-5. ドメイン許可（検証 A）のため、View 3 の `+ Add Rule` を押して次の値を入力し `Save Rule` を押す。
+5. ドメイン許可（検証 A）のため、View 3 の `+ Add Rule` を押して次の値を入力し `Save Rule` を押す（`Save Rule` 成功後は View 3 のルール一覧が自動再読込されるため手動 `Refresh` は不要）。
    - **Scope**：`NetworkAllow (WFP Permit)`
    - **Executable Path \***：`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`
    - **Target IP / Domain / Path**：`example.com`
    - **SHA-256**：ウィンドウ B で `(Get-FileHash C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe).Hash.ToLowerInvariant()` を実行して得た値（または手順 2 で作成した署名ルールの `Signer Subject` と `Root Thumbprint` を指定してもよい）
-6. ルール行に `IP-resolved` バッジが表示されたら、ウィンドウ B から 32 ビット版 PowerShell で `example.com` へ接続し、HTTP 200（または TCP 成功）を確認する。
+6. ルール行にドメイン由来ルールを示す静的な `IP-resolved` バッジ（解決済み IP を WFP へ適用するルールであることを示す表示）が付いていることを確認したうえで、ウィンドウ B から 32 ビット版 PowerShell で `example.com` へ接続し、HTTP 200（または TCP 成功）を確認する。
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
@@ -627,8 +667,9 @@ $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
 
 ```powershell
 # ウィンドウ A（管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 .\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
@@ -638,7 +679,7 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 
 1. `paypa1.com`：期待結果は `Not in NRD` と `Homograph: paypal`
 2. `google.com`：期待結果は `Not in NRD` と `No Homograph`
-3. `Get-Content (Join-Path $runDir "nrd-cache.txt") -TotalCount 5` に出た実 NRD ドメイン 1 件：期待結果は `NRD (<=14d)`
+3. `(Get-Content -Encoding UTF8 (Join-Path $runDir "nrd-cache.txt") | Where-Object { $_ -and -not $_.StartsWith("#") } | Select-Object -First 5)` に出た実 NRD ドメイン 1 件：期待結果は `NRD (<=14d)`
 
 確認後はウィンドウ A で `Ctrl+C` を押して停止してください。
 
@@ -648,8 +689,9 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 
 ```powershell
 # ウィンドウ A（管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "ledr_store=debug,ledr_daemon=info"
 .\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "nrd_hang.db") --nrd-cache (Join-Path $runDir "nrd-hang-cache.txt") --nrd-feed-url file://198.51.100.1/share/nrd.txt
@@ -662,8 +704,9 @@ $env:RUST_LOG = "ledr_store=debug,ledr_daemon=info"
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 .\target\debug\ledr-sim.exe --scenario lotl --json
 Start-Sleep -Seconds 2
@@ -676,7 +719,8 @@ Get-Item (Join-Path $runDir "nrd_hang.db-wal") -ErrorAction SilentlyContinue | S
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Get-Item (Join-Path $runDir "nrd_hang.db-wal") -ErrorAction SilentlyContinue | Select-Object Name, Length
 $nrdHangDb = Join-Path $runDir "nrd_hang.db"
 python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print('processes=', c.execute('SELECT count(*) FROM processes').fetchone()[0]); print(c.execute('SELECT pid, exe_path, command_line FROM processes ORDER BY rowid DESC LIMIT 3').fetchall())" $nrdHangDb
@@ -688,8 +732,9 @@ python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print('processes=
 
 ```powershell
 # ウィンドウ A（管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 .\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
@@ -699,7 +744,8 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 $procs = @(Get-Process ledr-daemon -ErrorAction Stop)
 if ($procs.Count -ne 1) { throw "期待と異なる ledr-daemon プロセス数です: $($procs.Count)" }
 taskkill /F /PID $procs[0].Id
@@ -713,7 +759,8 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $afterKillFiltersXml)) 
 Select-String -Path $afterKillFiltersXml -Pattern "LocalEDR" -ErrorAction Stop
 
 $ps32 = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-& $ps32 -NoProfile -Command '$c = [System.Net.Sockets.TcpClient]::new(); $c.Connect(''93.184.216.34'', 80); Write-Output ''External connect succeeded''; $c.Close()'
+& $ps32 -NoProfile -Command '$ErrorActionPreference = ''Stop''; $c = [System.Net.Sockets.TcpClient]::new(); try { $c.Connect(''93.184.216.34'', 80); Write-Output ''External connect succeeded'' } finally { $c.Close() }'
+if ($LASTEXITCODE -ne 0) { throw "強制終了後の外部 TCP 接続回復に失敗しました (exit code: $LASTEXITCODE)." }
 ```
 
 `Select-String` の一致件数が **0 件** になり、そのまま `External connect succeeded` で外部通信が回復していれば、動的セッション（`FWPM_SESSION_FLAG_DYNAMIC`）による異常終了時の通信不能回避は合格です。
@@ -725,8 +772,9 @@ Track B はローカル HTTP サーバと隔離テストドメイン（`.localed
 
 ```powershell
 # ウィンドウ A（64 ビット版管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $nrdUrl = ([Uri](Join-Path $runDir "nrd-test-feed.txt")).AbsoluteUri
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
@@ -738,11 +786,12 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 ### E2E-P4-00：Native Messaging 登録、View 3 診断表示、Chrome 拡張疎通
 
 まずウィンドウ C（通常ユーザー 64 ビット）でユーザー単位の Native Messaging 登録を実行し、`status` を確認してください。
-ルート 3 で開始し `PREP-03` を実施していない場合は、先に第 2 章の `PREP-03` を実行してください。
+ルート 3 でも第 2 章の `PREP-01` から `PREP-03` を事前に完了している前提です（`PREP-03` が未実施の場合は先に実行して既存 `HKCU` 設定を退避してください）。
 
 ```powershell
 # ウィンドウ C（64 ビット版通常ユーザー PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
 Set-Location $repoRoot
 .\target\debug\ledr-bridge-nm.exe setup --scope user --browsers chrome,edge --bridge-exe "$repoRoot\target\debug\ledr-bridge-nm.exe" --ui-exe "$repoRoot\target\debug\ledr-ui.exe"
 if ($LASTEXITCODE -ne 0) { throw "ledr-bridge-nm setup --scope user に失敗しました。" }
@@ -758,18 +807,25 @@ if ($LASTEXITCODE -ne 0) { throw "ledr-bridge-nm status に失敗しました。
 if (-not [Environment]::Is64BitProcess) {
     throw "64 ビット版 PowerShell で実行してください。"
 }
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
 Set-Location $repoRoot
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 $reg32 = "$env:SystemRoot\SysWOW64\reg.exe"
 $adminBackupDir = Join-Path $env:ProgramData ("LocalEDR-e2e-admin-backup-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $adminBackupDir -ErrorAction Stop | Out-Null
-icacls $adminBackupDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "管理者専用退避フォルダの ACL 設定に失敗しました。" }
-if ((Get-Item $adminBackupDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+$backupItem = Get-Item -LiteralPath $adminBackupDir -Force
+if (-not $backupItem.PSIsContainer -or ($backupItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
     throw "管理者専用退避フォルダがリパースポイントのため中止します。"
 }
-[System.IO.File]::WriteAllText("C:\Temp\ledr-e2e-admin-backup.txt", $adminBackupDir, [System.Text.UTF8Encoding]::new($false))
+$ownerSid = (Get-Acl -LiteralPath $adminBackupDir).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+if ($ownerSid -notin @("S-1-5-32-544", "S-1-5-18")) {
+    throw "管理者専用退避フォルダの所有者が Administrators または SYSTEM ではないため中止します: Owner=$ownerSid"
+}
+icacls $adminBackupDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-18:(OI)(CI)F" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "管理者専用退避フォルダの ACL 設定に失敗しました。" }
+[System.IO.File]::WriteAllText((Join-Path $adminDir "admin-backup.txt"), $adminBackupDir, [System.Text.UTF8Encoding]::new($false))
 
 $hklmBackups = @(
     @{ Key = "HKLM\Software\Google\Chrome\NativeMessagingHosts\com.localedr.bridge"; File = "hklm_chrome_nmh_64.reg"; RegExe = $reg64 },
@@ -811,11 +867,13 @@ if ($LASTEXITCODE -ne 0) { throw "ledr-bridge-nm setup --scope machine に失敗
 
 ```powershell
 # ウィンドウ C（64 ビット版通常ユーザー PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 
-if (Test-Path "C:\Temp\ledr-e2e-server-pid.txt") {
-    $oldPid = [int](Get-Content "C:\Temp\ledr-e2e-server-pid.txt" -Raw).Trim()
+$serverPidFile = Join-Path $runDir "server-pid.txt"
+if (Test-Path -LiteralPath $serverPidFile) {
+    $oldPid = [int](Get-Content -Encoding UTF8 -LiteralPath $serverPidFile -Raw).Trim()
     Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
 }
 $pyCmd = Get-Command python -ErrorAction Stop
@@ -842,8 +900,8 @@ http.server.ThreadingHTTPServer(('127.0.0.1', 8765), Handler).serve_forever()
 "@
 $servePath = Join-Path $runDir "local_server.py"
 [System.IO.File]::WriteAllText($servePath, $serveScript, [System.Text.UTF8Encoding]::new($false))
-$serverProc = Start-Process -FilePath $pyCmd.Source -ArgumentList @($servePath, (Join-Path $runDir "site")) -PassThru -WindowStyle Minimized
-[System.IO.File]::WriteAllText("C:\Temp\ledr-e2e-server-pid.txt", [string]$serverProc.Id, [System.Text.UTF8Encoding]::new($false))
+$serverProc = Start-Process -FilePath $pyCmd.Source -ArgumentList @("`"$servePath`"", "`"$(Join-Path $runDir 'site')`"") -PassThru -WindowStyle Minimized
+[System.IO.File]::WriteAllText($serverPidFile, [string]$serverProc.Id, [System.Text.UTF8Encoding]::new($false))
 
 Start-Sleep -Seconds 1
 $beacon = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8765/beacon" -TimeoutSec 3
@@ -912,37 +970,49 @@ $downloadedExe = "$env:USERPROFILE\Downloads\localedr-e2e-sample.exe"
 Get-Content -LiteralPath $downloadedExe -Stream Zone.Identifier
 ```
 
-3. `ZoneId=3` が確認でき、`ledr-ui` の `` `View 2: プロセス系譜・通信フライトレコーダー` ``（左ペイン `All` 選択で `Scope: All Processes`）の `Canary & Downloads` タブへ元パスと短縮 `sha256` が記録され、View 3 の `Tracked Downloads` 件数が増えていることを確認してから、ウィンドウ B でファイルを別フォルダ `$runDir\moved` へ移動して起動試験を行う。
+3. `ZoneId=3` が確認でき、`ledr-ui` の `` `View 2: プロセス系譜・通信フライトレコーダー` ``（左ペイン `All` 選択で `Scope: All Processes`）の `Canary & Downloads` タブへ元パスと短縮 `sha256` が記録され、View 3 の `Tracked Downloads` 件数が増えていることを確認してから、ウィンドウ B でファイルを `Downloads` や `Temp` 以外の非高リスクパス（`%LOCALAPPDATA%\LocalEDR-e2e-moved-<GUID>`）へ移動して起動試験を行う（`C:\Temp` 配下へ移動すると `HighRiskPath` 判定だけで遮断されてしまい、MOTW 起因の `L-18` 事前遮断を単独で検証できないため）。
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）: View 2 での記録確認後に実行
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
-New-Item -ItemType Directory -Force -Path (Join-Path $runDir "moved") | Out-Null
-$movedExe = Join-Path $runDir "moved\localedr-e2e-sample.exe"
+$movedDir = Join-Path $env:LOCALAPPDATA ("LocalEDR-e2e-moved-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $movedDir -ErrorAction Stop | Out-Null
+$movedExe = Join-Path $movedDir "localedr-e2e-sample.exe"
 Move-Item -LiteralPath "$env:USERPROFILE\Downloads\localedr-e2e-sample.exe" -Destination $movedExe -Force
 
-# L-18 確認: Downloads 外へ移動後でも MOTW により起動時事前 WFP ブロックが適用され、外部 TCP が遮断される
-$simNet = Start-Process -FilePath $movedExe -ArgumentList "--scenario", "dns-tcp", "--domain", "93.184.216.34", "--port", "80", "--json" -PassThru
+# L-18 確認: 高リスクパス外へ移動後でも MOTW により起動時事前 WFP ブロックが適用され、外部 TCP が遮断される
+$simNet = Start-Process -FilePath $movedExe -ArgumentList "--scenario", "dns-tcp", "--domain", "93.184.216.34", "--port", "80", "--hold-ms", "30000", "--json" -PassThru
 Start-Sleep -Seconds 3
 Get-Process -Id $simNet.Id -ErrorAction SilentlyContinue | Select-Object Id, ProcessName
 ```
 
-4. `ledr-ui` で `Refresh` を押し、`View 1: アラートトリアージ` に `localedr-e2e-sample.exe` の `LEDR-NET-HIGH-RISK-PATH`（外部 TCP 遮断）と `Browser Origin (MOTW)` カード（`Origin URL`、`Source`、一致ダウンロード行）が表示されていることを確認する（プロセスが凍結残留していれば `Allow Once` で解放する）。
+4. `ledr-ui` で `Refresh` を押し、`View 1: アラートトリアージ` に `localedr-e2e-sample.exe` の `LEDR-NET-HIGH-RISK-PATH`（外部 TCP 遮断）と `Browser Origin (MOTW)` カード（`Origin URL`、`Source`、一致ダウンロード行）が表示されていることを確認する（プロセスが凍結残留していれば `Allow Once` で解放し、確認後に `$simNet` を停止する）。
+
+```powershell
+# ウィンドウ B（管理者 PowerShell）: 手順 4 の確認後に $simNet を停止する
+if ($simNet) { Stop-Process -Id $simNet.Id -Force -ErrorAction SilentlyContinue }
+```
+
 5. 続けて同じ移動後バイナリからカナリア開錠シナリオを起動し、3 段階 MOTW 紐付けによる View 1 と View 2 の表示を確認する。
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
-$movedExe = Join-Path $runDir "moved\localedr-e2e-sample.exe"
-$simMotw = Start-Process -FilePath $movedExe -ArgumentList "--scenario", "cookies-open", "--base-dir", (Join-Path $runDir "canary_dir"), "--hold-ms", "120000", "--json" -PassThru
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+$simMotw = Start-Process -FilePath $movedExe -ArgumentList "--scenario", "cookies-open", "--base-dir", "`"$(Join-Path $runDir 'canary_dir')`"", "--hold-ms", "120000", "--json" -PassThru
 Start-Sleep -Seconds 2
 (Get-Process -Id $simMotw.Id).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
 ```
 
-6. `ledr-ui` で `Refresh` を押し、次の 3 点をすべて確かめてから `Allow Once` で再開（残待機時は `Stop-Process -Id $simMotw.Id -Force`）する。
+6. `ledr-ui` で `Refresh` を押し、次の 3 点をすべて確かめてから `Allow Once` で再開し、残待機中のプロセスと一時移動ディレクトリ `$movedDir` を削除する。
    - `View 1` に `localedr-e2e-sample.exe` の `LEDR-CANARY-COOKIE_DB` アラートと `Browser Origin (MOTW)` カードが表示されている。
    - `View 2` のプロセスツリー上に `MOTW` バッジが表示され、該当プロセスを選択するとインスペクタへ `Origin URL (MOTW)` と `download_origins` 行（`referrer_url` と短縮 `sha256`）が表示される。
    - `Allow Once` 押下から 5 秒以内に `localedr-e2e-sample.exe` が凍結解除される。
+
+```powershell
+# ウィンドウ B（管理者 PowerShell）: E2E-P4-06 確認後の片付け
+if ($simMotw) { Stop-Process -Id $simMotw.Id -Force -ErrorAction SilentlyContinue }
+if ($movedDir -and (Test-Path -LiteralPath $movedDir)) { Remove-Item -Recurse -Force -LiteralPath $movedDir -ErrorAction SilentlyContinue }
+```
 
 ### E2E-P4-07：ブラウザアラートの解決操作制約確認
 
@@ -960,17 +1030,27 @@ Track C では性能基準（`WorkingSet <= 20.0 MB`、定常 `CPU < 0.5%`）を
 
 ```powershell
 # ウィンドウ A（64 ビット版管理者 PowerShell）: Chrome と Debug 版を終了したあとに実行
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "info"
 
-$nrdCache = if (Test-Path (Join-Path $runDir "nrd-cache.txt")) { Join-Path $runDir "nrd-cache.txt" } else { Join-Path $runDir "nrd-test-cache.txt" }
-$nrdUrl = ([Uri](Join-Path $runDir "nrd-test-feed.txt")).AbsoluteUri
-.\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "perf.db") --nrd-feed-url $nrdUrl --nrd-cache $nrdCache
+$realNrdCache = Join-Path $runDir "nrd-cache.txt"
+if (Test-Path -LiteralPath $realNrdCache) {
+    # ルート 1・ルート 2（オンライン実フィード）: --nrd-feed-url を渡すと実 2 フィードキャッシュが 1 件のテストフィードで上書きされるため、--disable-nrd-refresh で実キャッシュをそのまま読み込む
+    Write-Output "公開 2 フィードの実 NRD キャッシュを使用して正式な E2E-PERF-01 を起動します: $realNrdCache"
+    .\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "perf.db") --nrd-cache $realNrdCache
+} else {
+    # ルート 3 単独またはオフライン環境: 1 件のテストキャッシュで起動し、合否記録表では「ルート 3 軽量参考値」または「オフライン参考値」として正式実測値と区別する
+    Write-Warning "実 nrd-cache.txt が未作成のため 1 件のテスト NRD キャッシュで起動します。合否記録表にはルート 3 軽量参考値（またはオフライン参考値）として記録してください。"
+    $nrdUrl = ([Uri](Join-Path $runDir "nrd-test-feed.txt")).AbsoluteUri
+    .\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "perf.db") --nrd-feed-url $nrdUrl --nrd-cache (Join-Path $runDir "nrd-test-cache.txt")
+}
 ```
 
-オンライン実フィードを読み込んだ状態で計測したい場合は、`--nrd-feed-url` を外して公開フィードから取得済みの `nrd-cache.txt` を読み込ませてください。
+正式な `E2E-PERF-01`（`PeakWorkingSetMB <= 20.0`）は、`E2E-P3-05` で取得した公開 2 フィードの実 `nrd-cache.txt` を `--disable-nrd-refresh` で読み込んだ状態で計測します。
+ルート 3 単独やオフライン環境で `nrd-cache.txt` が未作成の場合は 1 件の `nrd-test-cache.txt` が使われるため、合否記録表には必ず「ルート 3 軽量参考値（NRD 1 件）」または「オフライン参考値」と明記して正式な実フィード実測値と区別してください。
 計測を始める前に、ウィンドウ A のログへ `loaded local NRD cache from disk` または `refreshed daily NRD domain cache`（どちらも `entries > 0`）が出力されたことを確認します。
 
 ### E2E-UI-01：`ledr-ui` 閉鎖時の 0 プロセス終了（`L-08`）
@@ -979,7 +1059,8 @@ $nrdUrl = ([Uri](Join-Path $runDir "nrd-test-feed.txt")).AbsoluteUri
 
 ```powershell
 # ウィンドウ C（通常ユーザー PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
 Set-Location $repoRoot
 .\target\release\ledr-ui.exe
 # 画面表示を確認したらウィンドウ右上の閉じるボタンで終了し、以下を実行する
@@ -1016,7 +1097,7 @@ $cpuPct = (($p1.CPU - $cpu0) / ($sampleSec * $logicalCores)) * 100.0
 } | Format-Table -AutoSize
 ```
 
-`PeakWorkingSetMB` が `20.0` 以下かつアイドル時 `AvgCpuPercent` が `0.5` 未満であれば合格です。
+`PeakWorkingSetMB` が `20.0` 以下かつアイドル時 `AvgCpuPercent` が `0.5` 未満であれば合格です（1 件の `nrd-test-cache.txt` で計測した場合は「ルート 3 軽量参考値」または「オフライン参考値」として区分記録します）。
 
 続けて、ブラウザ（Chrome や Edge）での通常複数タブ閲覧および別ウィンドウでの `cargo build` 負荷を掛けながら `$sampleSec = 60` で計測し、高負荷時も極端なメモリ増加がないこと（参考目安として `PeakWorkingSetMB` が 35 MB 未満で安定し、増加し続けないこと）を確認します。
 負荷計測の出力をファイルへ保存する場合は、後続の `E2E-OPT-01` で上書きされないよう `perf_load_trackc.txt` のようにトラック名入りのファイル名で分けて保存してください。
@@ -1024,9 +1105,10 @@ $cpuPct = (($p1.CPU - $cpu0) / ($sampleSec * $logicalCores)) * 100.0
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）: 高負荷計測中の高優先度応答確認
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
-$perfSim = Start-Process -FilePath (Join-Path $repoRoot "target\debug\ledr-sim.exe") -ArgumentList "--scenario", "cookies-open", "--base-dir", (Join-Path $runDir "canary_dir"), "--hold-ms", "30000", "--json" -PassThru
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+$perfSim = Start-Process -FilePath (Join-Path $repoRoot "target\debug\ledr-sim.exe") -ArgumentList "--scenario", "cookies-open", "--base-dir", "`"$(Join-Path $runDir 'canary_dir')`"", "--hold-ms", "30000", "--json" -PassThru
 Start-Sleep -Seconds 2
 (Get-Process -Id $perfSim.Id -ErrorAction SilentlyContinue).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
 Stop-Process -Id $perfSim.Id -Force -ErrorAction SilentlyContinue
@@ -1044,20 +1126,22 @@ Stop-Process -Id $perfSim.Id -Force -ErrorAction SilentlyContinue
 
 ```powershell
 # ウィンドウ A（64 ビット版管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "info,ledr_daemon=debug"
 .\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "enforce.db")
 ```
 
-ウィンドウ B で一般パス（`Downloads` や `Temp` ではない `C:\Tools\probe`）へ `ledr-sim.exe` をコピーして外部 TCP を実行し、初発通信時の `NtSuspendProcess` と動的 WFP Block を確認してください。
+ウィンドウ B で一般パス（`Downloads` や `Temp` ではない `%LOCALAPPDATA%\LocalEDR-e2e-probe-<GUID>`）の排他ディレクトリを新規作成して `ledr-sim.exe` をコピーし、外部 TCP を実行して初発通信時の `NtSuspendProcess` と動的 WFP Block を確認してください。
 
 ```powershell
 # ウィンドウ B（64 ビット版管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$probeDir = "C:\Tools\probe"
-New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$probeDir = Join-Path $env:LOCALAPPDATA ("LocalEDR-e2e-probe-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $probeDir -ErrorAction Stop | Out-Null
 $probeExe = Join-Path $probeDir "ledr-probe.exe"
 Copy-Item (Join-Path $repoRoot "target\debug\ledr-sim.exe") $probeExe -Force
 
@@ -1066,15 +1150,26 @@ Start-Sleep -Seconds 2
 (Get-Process -Id $enfSim.Id -ErrorAction SilentlyContinue).Threads | Select-Object Id, ThreadState, WaitReason | Format-Table -AutoSize
 ```
 
+`E2E-UI-01` で `ledr-ui.exe` を閉じているため、ウィンドウ C で Release 版 `ledr-ui.exe` を起動して `View 1` を確認してください。
+
+```powershell
+# ウィンドウ C（通常ユーザー PowerShell）
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+Start-Process -FilePath (Join-Path $repoRoot "target\release\ledr-ui.exe") -WorkingDirectory $repoRoot
+```
+
 `dns-tcp` の TCP 接続自体は 100 ms 程度で完了して終了するため、非同期 ETW イベント配送と `NtSuspendProcess` の競合を避ける目的で `--hold-ms 120000` を指定し、ソケット切断後もプロセスを待機させて凍結状態を確認します。
-`WaitReason: Suspended` になり、`ledr-ui` の `View 1` へ `LEDR-NET-UNKNOWN-OUTBOUND` が生成されて `Allow Once` または `Allow Permanent Rule` で再開できれば合格です。
-あわせて VM 上でこの `enforce` 稼働のまま `E2E-PERF-01` と同じ 60 秒計測を実施し、定常値に大きな乖離がないことを確認してから、`C:\Tools\probe` を削除してください。
+`WaitReason: Suspended` になり、`ledr-ui` の `View 1` へ `LEDR-NET-UNKNOWN-OUTBOUND` が生成されて `Allow Once` または `Allow Permanent Rule` で再開できれば合格です（確認後に `ledr-ui.exe` を閉じてください）。
+あわせて VM 上でこの `enforce` 稼働のまま `E2E-PERF-01` と同じ 60 秒計測を実施し、定常値に大きな乖離がないことを確認してから、今回作成した `$probeDir` のみを削除してください。
 このときの計測ログを保存する場合は、Track C の証跡と衝突しないよう `perf_load_enforce.txt` など別ファイル名で出力してください。
 
 ```powershell
 # ウィンドウ B（64 ビット版管理者 PowerShell）
-Stop-Process -Id $enfSim.Id -Force -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\Tools\probe" -ErrorAction SilentlyContinue
+if ($enfSim) { Stop-Process -Id $enfSim.Id -Force -ErrorAction SilentlyContinue }
+if ($probeDir -and (Test-Path -LiteralPath $probeDir)) {
+    Remove-Item -Recurse -Force -LiteralPath $probeDir -ErrorAction SilentlyContinue
+}
 ```
 
 ### E2E-OPT-02：`Program Files` 配置での本番 IPC 認可境界（`--dev-bypass-auth` なし）
@@ -1087,11 +1182,21 @@ Remove-Item -Recurse -Force "C:\Tools\probe" -ErrorAction SilentlyContinue
 if (Test-Path "C:\Program Files\LocalEDR") {
     throw "C:\Program Files\LocalEDR が既に存在するため上書き防止のため中止します。"
 }
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
 Set-Location $repoRoot
 $pfDir = "C:\Program Files\LocalEDR"
 New-Item -ItemType Directory -Path $pfDir -ErrorAction Stop | Out-Null
-icacls $pfDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
+$pfItem = Get-Item -LiteralPath $pfDir -Force
+if (-not $pfItem.PSIsContainer -or ($pfItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw "C:\Program Files\LocalEDR がリパースポイントのため中止します。"
+}
+$pfOwnerSid = (Get-Acl -LiteralPath $pfDir).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+if ($pfOwnerSid -notin @("S-1-5-32-544", "S-1-5-18")) {
+    throw "C:\Program Files\LocalEDR の所有者が不正なため中止します: Owner=$pfOwnerSid"
+}
+icacls $pfDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "ACL 設定に失敗しました。" }
 
 Copy-Item "target\release\ledr-daemon.exe" $pfDir -Force
@@ -1100,8 +1205,8 @@ Copy-Item "target\release\ledr-bridge-nm.exe" $pfDir -Force
 
 $uiHash = (Get-FileHash (Join-Path $pfDir "ledr-ui.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
 $bridgeHash = (Get-FileHash (Join-Path $pfDir "ledr-bridge-nm.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
-[System.IO.File]::WriteAllText("C:\Temp\ledr-e2e-ui-sha256.txt", $uiHash, [System.Text.UTF8Encoding]::new($false))
-[System.IO.File]::WriteAllText("C:\Temp\ledr-e2e-bridge-sha256.txt", $bridgeHash, [System.Text.UTF8Encoding]::new($false))
+[System.IO.File]::WriteAllText((Join-Path $adminDir "ui-sha256.txt"), $uiHash, [System.Text.UTF8Encoding]::new($false))
+[System.IO.File]::WriteAllText((Join-Path $adminDir "bridge-sha256.txt"), $bridgeHash, [System.Text.UTF8Encoding]::new($false))
 Write-Output "保護配置と SHA-256 保存完了"
 ```
 
@@ -1109,47 +1214,74 @@ Write-Output "保護配置と SHA-256 保存完了"
 
 ```powershell
 # ウィンドウ A（64 ビット版管理者 PowerShell）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
-$uiHash = (Get-Content "C:\Temp\ledr-e2e-ui-sha256.txt" -Raw).Trim()
-$bridgeHash = (Get-Content "C:\Temp\ledr-e2e-bridge-sha256.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+$uiHash = (Get-Content -Encoding UTF8 (Join-Path $adminDir "ui-sha256.txt") -Raw).Trim()
+$bridgeHash = (Get-Content -Encoding UTF8 (Join-Path $adminDir "bridge-sha256.txt") -Raw).Trim()
 $env:RUST_LOG = "info,ledr_daemon=debug"
 & "C:\Program Files\LocalEDR\ledr-daemon.exe" --foreground --ui-sha256 $uiHash --bridge-sha256 $bridgeHash --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "auth.db")
 ```
 
-次の 3 点を順に確かめてください。
+次の 3 点（およびルート 1・ルート 3 環境では任意の 4 点目）を順に確かめてください。
 
-1. **正規 UI 許可**：ウィンドウ C から `C:\Program Files\LocalEDR\ledr-ui.exe` を起動し、View 3 でテストルールを `+ Add Rule` と `Save Rule` で追加して `Delete` で削除できることを確認したあと、`ledr-ui.exe` を閉じる。
-2. **正規ブリッジ許可**：ウィンドウ C から `& "C:\Program Files\LocalEDR\ledr-bridge-nm.exe" status --ping --json` を実行し、`ping` が成功する。
-3. **非認可バイナリ拒否**：ウィンドウ C から `$repoRoot\target\debug\ledr-ui.exe` を起動し、View 3 で `+ Add Rule` と `Save Rule` を試みると、`GetNamedPipeClientProcessId` によるパスとハッシュ照合で拒否（IPC エラー表示）されることを確認したあと、`ledr-ui.exe` を閉じる。
+1. **正規 UI 許可（`SEC_0002` 受理）**：ウィンドウ C から `C:\Program Files\LocalEDR\ledr-ui.exe` を起動し、View 3 で `+ Add Rule` を開いて `Scope` に `NetworkBlock (WFP Deny)`、`Executable Path *` に `C:\Temp\ledr-auth-probe.exe` を入力し、`Save Rule` で追加して `Delete` で削除できることを確認したあと、`ledr-ui.exe` を閉じる。
+2. **正規ブリッジのパイプサーバ検証（`SEC_0003`）**：ウィンドウ C から `& "C:\Program Files\LocalEDR\ledr-bridge-nm.exe" status --ping --json` を実行し、`ping` が成功することを確認する。
+   この確認はブリッジ側の `GetNamedPipeServerProcessId` によるデーモンパス照合（`SEC_0003`）と IPC 疎通を検証するものであり、`Ping` は読み取り専用照会のためデーモン側の `--bridge-sha256` 検証（`SEC_0002`）は手順 4 で検証する。
+3. **非認可 UI バイナリ拒否（`SEC_0002` 拒否）**：ウィンドウ C から `$repoRoot\target\debug\ledr-ui.exe` を起動し、View 3 で手順 1 と同じ入力（`Scope`: `NetworkBlock (WFP Deny)`、`Executable Path *`: `C:\Temp\ledr-auth-probe.exe`）で `+ Add Rule` と `Save Rule` を試みる。
+   `NetworkBlock` ルールは `app.js` 側の `L-04` 入力検証を通過して IPC リクエストを発行するため、デーモン側の `GetNamedPipeClientProcessId` によるパスとハッシュ照合で拒否（IPC エラー表示）されることを確認したあと、`ledr-ui.exe` を閉じる。
+4. **任意（ルート 1・ルート 3 向け）：実ブリッジ経由 `ReportBrowserEvent` での `--bridge-sha256` 許可・拒否（`SEC_0002`）**：
+   ルート 2（Chrome を使用しない `FU-E2E-01` 単独）では本手順を省略し、`--bridge-sha256` の実中継は「未検証差異（単体テスト `daemon_p4_12` で検証済み）」として合否記録表へ記録してください。
+   ルート 1 またはルート 3 で Chrome とローカル HTTP サーバを利用できる場合は、Track C の前に Chrome を閉じているため必要に応じて `E2E-P4-00` の手順でローカル HTTP サーバ（`127.0.0.1:8765/beacon`）と隔離プロファイル Chrome を再起動したうえで、ウィンドウ C で一時的に `Program Files` 配下のブリッジを登録して許可と拒否の両方を確認します。
 
-`E2E-OPT-03` を連続して実施しない場合は、ウィンドウ A を `Ctrl+C` で停止したうえで `C:\Program Files\LocalEDR` とハッシュ一時ファイルを削除してください（`E2E-OPT-03` を続ける場合はそのまま残して次へ進みます）。
+```powershell
+# ウィンドウ C（64 ビット版通常ユーザー PowerShell・ルート 1/3 で --bridge-sha256 実中継を検証する場合のみ）
+& "C:\Program Files\LocalEDR\ledr-bridge-nm.exe" setup --scope user --browsers chrome --bridge-exe "C:\Program Files\LocalEDR\ledr-bridge-nm.exe" --skip-uri
+if ($LASTEXITCODE -ne 0) { throw "Program Files ブリッジの一時登録に失敗しました。" }
+```
+
+   - **一致ハッシュ受理**：ウィンドウ A が一致する `--bridge-sha256 $bridgeHash` で稼働中の状態で、Chrome の検証ページ（`http://clickfix-sim.localedr.invalid:8765/phase4-browser-test.html` 等、30 秒重複抑止を避ける場合は別サブドメイン）から ClickFix 操作を実行し、`C:\Program Files\LocalEDR\ledr-ui.exe` の `View 1` へ `LAYER_4_BROWSER` が新規記録されることを確認する。
+   - **不一致ハッシュ拒否**：ウィンドウ A を `Ctrl+C` で止め、`--bridge-sha256 0000000000000000000000000000000000000000000000000000000000000000` を指定して `C:\Program Files\LocalEDR\ledr-daemon.exe` を再起動したうえで再度ブラウザイベントを送出し、ウィンドウ A ログで `SEC_0002` 認可拒否が出て `View 1` へ記録されないことを確認する。
+   - **一時登録解除**：確認後に Chrome と `ledr-ui.exe` を閉じ、ウィンドウ C で次を実行して一時登録を解除する（元の `HKCU` 設定の完全復元は第 7 章 `CLEAN-02` で行う）。
+
+```powershell
+# ウィンドウ C（64 ビット版通常ユーザー PowerShell）
+& "C:\Program Files\LocalEDR\ledr-bridge-nm.exe" unregister --scope user --browsers chrome --keep-uri
+```
+
+`E2E-OPT-03` を連続して実施しない場合は、ウィンドウ A を `Ctrl+C` で停止したうえで `C:\Program Files\LocalEDR` と `C:\ProgramData\LocalEDR-e2e-admin` 配下のハッシュ一時ファイルを削除してください（`E2E-OPT-03` を続ける場合はそのまま残して次へ進みます）。
 
 ### E2E-OPT-03（`E2E-SVC-01`）：Session 0（`LocalSystem`）からのトースト起動代替確認
 
 Windows Service SCM エントリポイントが未実装の段階でも、Sysinternals `PsExec64.exe` を用いて `LocalSystem` 権限（Session 0）からデーモンを起動し、`WTSQueryUserToken` と `CreateProcessAsUserW` による対話セッションへの `--notify` 起動を確認できます。
+なお、デーモンは `SEC_0004` に基づき Session 0 で動作している間は `--foreground` が指定されていてもフォアグラウンド代替起動を拒否するため、本手順でトーストが表示されれば `WTSQueryUserToken` と `CreateProcessAsUserW` の実経路が通ったことを確認できます。
 `E2E-OPT-02` で作成した `C:\Program Files\LocalEDR\`（未作成の場合は `E2E-OPT-02` 前半で配置してください）が存在する状態で、ウィンドウ A を `Ctrl+C` で止めてからウィンドウ B で Session 0 起動を実行してください。
 
 ```powershell
 # ウィンドウ B（64 ビット版管理者 PowerShell・PsExec64.exe が PATH または作業フォルダにある前提）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 $psexec = Get-Command PsExec64.exe -ErrorAction Stop
+$svcDb = Join-Path $runDir "svc.db"
 Start-Process -FilePath $psexec.Source -ArgumentList @(
     "-accepteula", "-s", "-i", "0", "-d",
-    "C:\Program Files\LocalEDR\ledr-daemon.exe",
+    "`"C:\Program Files\LocalEDR\ledr-daemon.exe`"",
     "--foreground", "--dev-bypass-auth", "--outbound-mode", "preemptive-only",
     "--resume-suspended-on-shutdown", "--disable-nrd-refresh",
-    "--db", (Join-Path $runDir "svc.db")
+    "--db", "`"$svcDb`""
 )
 Start-Sleep -Seconds 3
 ```
 
 `PREP-03` で `HKCU\Software\Classes\ledr` 登録が済んでいる状態で、`ledr-sim.exe` の `cookies-open` を `Start-Process -PassThru` で別起動し、対話デスクトップ上へ通常ユーザー権限（非 `SYSTEM`）で `ledr-ui.exe --notify` のトースト通知が表示されることを確かめてください。
+通知からの UI 起動は 2 段階の引き継ぎで動作し、まず Session 0 デーモンが `CreateProcessAsUserW` で対話ユーザー権限の `C:\Program Files\LocalEDR\ledr-ui.exe --notify <alert_id>` を起動してトーストを出し、ユーザーがトーストをクリックすると `PREP-03` で登録した `HKCU\Software\Classes\ledr` ハンドラ経由で `ledr://alert/<alert_id>` が開きます。
 
 ```powershell
 # ウィンドウ B（64 ビット版管理者 PowerShell）
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
-$svcSim = Start-Process -FilePath (Join-Path $repoRoot "target\debug\ledr-sim.exe") -ArgumentList "--scenario", "cookies-open", "--base-dir", (Join-Path $runDir "canary_dir"), "--hold-ms", "30000", "--json" -PassThru
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+$svcSim = Start-Process -FilePath (Join-Path $repoRoot "target\debug\ledr-sim.exe") -ArgumentList "--scenario", "cookies-open", "--base-dir", "`"$(Join-Path $runDir 'canary_dir')`"", "--hold-ms", "30000", "--json" -PassThru
 Start-Sleep -Seconds 3
 ```
 
@@ -1158,10 +1290,11 @@ Start-Sleep -Seconds 3
 
 ```powershell
 # ウィンドウ B（64 ビット版管理者 PowerShell）
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 if ($svcSim) { Stop-Process -Id $svcSim.Id -Force -ErrorAction SilentlyContinue }
 Get-Process ledr-daemon, ledr-sim, ledr-ui -ErrorAction SilentlyContinue | Stop-Process -Force
 Remove-Item -Recurse -Force "C:\Program Files\LocalEDR" -ErrorAction SilentlyContinue
-Remove-Item "C:\Temp\ledr-e2e-ui-sha256.txt", "C:\Temp\ledr-e2e-bridge-sha256.txt" -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $adminDir "ui-sha256.txt"), (Join-Path $adminDir "bridge-sha256.txt") -ErrorAction SilentlyContinue
 ```
 
 結果を記録する際は、Windows Service SCM によるサービス登録と自動復旧自体は未実装差異である旨を必ず切り分けて記載してください。
@@ -1181,7 +1314,8 @@ Get-Process ledr-daemon, ledr-ui, ledr-sim, ledr-bridge-nm, localedr-e2e-sample,
 $rem = Get-Process ledr-daemon, ledr-ui -ErrorAction SilentlyContinue
 if ($rem) { throw "LocalEDR プロセスが残留しています。" }
 
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 $cleanupXml = Join-Path $runDir "filters_cleanup.xml"
 netsh wfp show filters "file=$cleanupXml"
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $cleanupXml)) {
@@ -1195,6 +1329,7 @@ Write-Output "CLEAN-01 完了: プロセス 0 件、WFP フィルタ 0 件"
 ### CLEAN-02：ローカルサーバ停止と HKCU 設定の削除および復元（ウィンドウ C）
 
 `PREP-03` または Track B を実施した場合は（ルート 2 を含む全ルート）、ウィンドウ C（通常ユーザー 64 ビット）でローカル HTTP サーバを停止し、`unregister --scope user` のあとに本検証で追加された `HKCU` キーを掃除したうえで、退避ファイルが存在するキーだけを元の登録へ復元してください。
+ルート 2（`FU-E2E-01` 単独）では `ledr-bridge-nm.exe setup` を未実行ですが、`unregister --scope user` は未登録の Native Messaging キーをそのまま無視して正常終了し、続くループで `PREP-03` の URI と AUMID キーを片付けて退避済み設定を復元します。
 復元が途中で失敗した場合は退避フォルダを消さずに停止します。
 
 ```powershell
@@ -1202,15 +1337,17 @@ Write-Output "CLEAN-01 完了: プロセス 0 件、WFP フィルタ 0 件"
 if (-not [Environment]::Is64BitProcess) {
     throw "64 ビット版 PowerShell で実行してください。"
 }
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 
-if (Test-Path "C:\Temp\ledr-e2e-server-pid.txt") {
-    $srvPid = [int](Get-Content "C:\Temp\ledr-e2e-server-pid.txt" -Raw).Trim()
+$serverPidFile = Join-Path $runDir "server-pid.txt"
+if (Test-Path -LiteralPath $serverPidFile) {
+    $srvPid = [int](Get-Content -Encoding UTF8 -LiteralPath $serverPidFile -Raw).Trim()
     Stop-Process -Id $srvPid -Force -ErrorAction SilentlyContinue
-    Remove-Item "C:\Temp\ledr-e2e-server-pid.txt" -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $serverPidFile -ErrorAction SilentlyContinue
 }
 
 .\target\debug\ledr-bridge-nm.exe unregister --scope user --browsers chrome,edge
@@ -1243,13 +1380,16 @@ if (Test-Path $userBackupManifest) {
 ### CLEAN-03：HKLM 設定の復元（`--scope machine` を実施した場合のみ、ウィンドウ B）
 
 `E2E-P4-00` で `--scope machine` を登録した場合のみ、ウィンドウ B（管理者 64 ビット）で解除、未退避キーの残留除去、および退避済み `HKLM` 両ビューとマニフェストの復元を行ってください。
+`reg.exe import` の実行前に、退避フォルダが `$env:ProgramData\LocalEDR-e2e-admin-backup-*` 配下であること、リパースポイントでないこと、所有者が `Administrators` または `SYSTEM` であること、および非管理者の書き込み ACL が存在しないことを検証します。
 
 ```powershell
 # ウィンドウ B（64 ビット版管理者 PowerShell）
 if (-not [Environment]::Is64BitProcess) {
     throw "64 ビット版 PowerShell で実行してください。"
 }
-$repoRoot = (Get-Content "C:\Temp\ledr-e2e-repo.txt" -Raw).Trim()
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
 Set-Location $repoRoot
 .\target\debug\ledr-bridge-nm.exe unregister --scope machine --browsers chrome,edge
 foreach ($hklmKey in @(
@@ -1261,45 +1401,75 @@ foreach ($hklmKey in @(
     }
 }
 
-if (Test-Path "C:\Temp\ledr-e2e-admin-backup.txt") {
-    $adminBackupDir = (Get-Content "C:\Temp\ledr-e2e-admin-backup.txt" -Raw).Trim()
+$adminBackupPtr = Join-Path $adminDir "admin-backup.txt"
+if (Test-Path -LiteralPath $adminBackupPtr) {
+    $adminBackupDir = (Get-Content -Encoding UTF8 -LiteralPath $adminBackupPtr -Raw).Trim()
     $reg64 = "$env:SystemRoot\System32\reg.exe"
     $reg32 = "$env:SystemRoot\SysWOW64\reg.exe"
-    if ($adminBackupDir -and (Test-Path $adminBackupDir)) {
-        if ((Get-Item $adminBackupDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
-            throw "管理者専用退避フォルダがリパースポイントのため復元を中止します: $adminBackupDir"
+    if ($adminBackupDir -and (Test-Path -LiteralPath $adminBackupDir)) {
+        $allowedSids = @("S-1-5-32-544", "S-1-5-18")
+        $expectedPrefix = [IO.Path]::GetFullPath((Join-Path $env:ProgramData "LocalEDR-e2e-admin-backup-"))
+        $backupFull = [IO.Path]::GetFullPath($adminBackupDir)
+        if (-not $backupFull.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "管理者専用退避フォルダのパスが期待プレフィックス外のため復元を中止します: $backupFull"
         }
-        Get-ChildItem "$adminBackupDir\hklm_*_64.reg" -ErrorAction SilentlyContinue | ForEach-Object {
+        $backupItem = Get-Item -LiteralPath $backupFull -Force
+        if (-not $backupItem.PSIsContainer -or ($backupItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "管理者専用退避フォルダがリパースポイントのため復元を中止します: $backupFull"
+        }
+        $backupAcl = Get-Acl -LiteralPath $backupFull
+        $ownerSid = $backupAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($ownerSid -notin $allowedSids) {
+            throw "管理者専用退避フォルダの所有者が不正なため復元を中止します: $backupFull (Owner=$ownerSid)"
+        }
+        $writeRights = [System.Security.AccessControl.FileSystemRights]::Write -bor
+            [System.Security.AccessControl.FileSystemRights]::Modify -bor
+            [System.Security.AccessControl.FileSystemRights]::FullControl -bor
+            [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+            [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+            [System.Security.AccessControl.FileSystemRights]::WriteData
+        foreach ($ace in $backupAcl.Access) {
+            if ($ace.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) {
+                $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                if (($aceSid -notin $allowedSids) -and (($ace.FileSystemRights -band $writeRights) -ne 0)) {
+                    throw "管理者専用退避フォルダに非管理者の書き込み ACL があるため復元を中止します: $aceSid"
+                }
+            }
+        }
+        Get-ChildItem "$backupFull\hklm_*_64.reg" -ErrorAction SilentlyContinue | ForEach-Object {
             & $reg64 import $_.FullName | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "HKLM 64 ビット復元失敗: $($_.FullName)" }
         }
-        Get-ChildItem "$adminBackupDir\hklm_*_32.reg" -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-ChildItem "$backupFull\hklm_*_32.reg" -ErrorAction SilentlyContinue | ForEach-Object {
             & $reg32 import $_.FullName | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "HKLM 32 ビット復元失敗: $($_.FullName)" }
         }
         $machineManifestDir = "C:\ProgramData\LocalEDR\native-messaging"
-        if (Test-Path "$adminBackupDir\machine-native-messaging") {
+        if (Test-Path "$backupFull\machine-native-messaging") {
             Remove-Item -Recurse -Force $machineManifestDir -ErrorAction SilentlyContinue
             New-Item -ItemType Directory -Force -Path $machineManifestDir | Out-Null
-            Copy-Item -Recurse -Force -ErrorAction Stop "$adminBackupDir\machine-native-messaging\*" $machineManifestDir
+            Copy-Item -Recurse -Force -ErrorAction Stop "$backupFull\machine-native-messaging\*" $machineManifestDir
         }
         .\target\debug\ledr-bridge-nm.exe status --scope all
-        Remove-Item -Recurse -Force $adminBackupDir
+        Remove-Item -Recurse -Force -LiteralPath $backupFull
     }
-    Remove-Item "C:\Temp\ledr-e2e-admin-backup.txt" -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $adminBackupPtr -ErrorAction SilentlyContinue
 }
 ```
 
 ### CLEAN-04：新規おとり、レジストリプローブ、一時フォルダの整理（ウィンドウ B）
 
-現行の `ledr-daemon.exe` は終了時におとりファイルを自動削除しないため、`PREP-02` で記録した `preexisting_honeypots.txt` に基づいて今回新規配置されたおとりファイルだけを削除してください。
+現行の `ledr-daemon.exe` は終了時におとりファイルを自動削除しないため、`PREP-02` で `C:\ProgramData\LocalEDR-e2e-admin\preexisting_honeypots.txt` へ記録した一覧に基づいて今回新規配置されたおとりファイルだけを削除してください。
 あわせて、`E2E-P2-06` が途中失敗した場合に残る一時レジストリとダウンロード済みサンプルも片付けます。
-テスト証跡（DB や WFP XML）を検証報告用に残す場合は、末尾の `$runDir` 削除行を実行せず保持してください。
+テスト証跡（DB や WFP XML）を検証報告用に残す場合は、末尾の `$runDir` と状態ディレクトリ削除行を実行せず保持してください。
 
 ```powershell
 # ウィンドウ B（64 ビット版管理者 PowerShell）
-$runDir = (Get-Content "C:\Temp\ledr-e2e-latest.txt" -Raw).Trim()
-$preexistingFile = Join-Path $runDir "preexisting_honeypots.txt"
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+$preexistingFile = Join-Path $adminDir "preexisting_honeypots.txt"
 if (Test-Path -LiteralPath $preexistingFile) {
     $preexisting = @([System.IO.File]::ReadAllLines($preexistingFile, [System.Text.UTF8Encoding]::new($false)))
     @(
@@ -1314,10 +1484,9 @@ Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" 
 Remove-Item -Path "HKCU:\Software\LocalEdrE2eTmp" -Recurse -Force -ErrorAction SilentlyContinue
 Get-Item "$env:USERPROFILE\Downloads\localedr-e2e-sample*.exe", "$env:USERPROFILE\Downloads\localedr-e2e-sample*.cmd" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-# 証跡（DB や XML）が不要になった場合のみ次の 3 行のコメントを外して削除する
-# Remove-Item -Recurse -Force -LiteralPath $runDir
-# Remove-Item -LiteralPath "C:\Temp\ledr-e2e-latest.txt", "C:\Temp\ledr-e2e-repo.txt" -ErrorAction SilentlyContinue
-# Remove-Item -Recurse -Force "C:\Tools\probe" -ErrorAction SilentlyContinue
+# 証跡（DB や XML）が不要になった場合のみ次の 2 行のコメントを外して削除する
+# Remove-Item -Recurse -Force -LiteralPath $runDir -ErrorAction SilentlyContinue
+# Remove-Item -Recurse -Force -LiteralPath $stateDir, $adminDir -ErrorAction SilentlyContinue
 ```
 
 ## 8. トラブルシューティング、完了判定基準、合否記録テンプレート

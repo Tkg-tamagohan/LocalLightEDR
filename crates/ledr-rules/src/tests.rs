@@ -2633,20 +2633,38 @@ fn rules_p4_01_local_cert_chain_flags_offline_and_verifies_cmd_exe() {
     let auth = inspect_authenticode(cmd_exe)
         .expect("cmd.exe should verify locally with offline cert chain flags");
     assert!(
-        !auth.signer_subject.trim().is_empty(),
-        "expected non-empty signer_subject for cmd.exe"
+        signer_subject_matches(&auth.signer_subject, "CN=Microsoft Windows"),
+        "unexpected signer_subject for cmd.exe: {}",
+        auth.signer_subject
     );
     assert_eq!(
-        auth.root_thumbprint.len(),
-        40,
-        "expected 40-char SHA-1 root_thumbprint, got {:?}",
+        auth.root_thumbprint,
+        "3B1EFD3A66EA28B16697394703A72CA340A05BD5",
+        "expected Microsoft Root Certificate Authority 2010 thumbprint for cmd.exe, got {:?}",
         auth.root_thumbprint
     );
+
+    let allowlist_json = include_str!("../../../rules/default_allowlist.json");
+    let cfg = AllowlistConfig::from_json_str(allowlist_json).expect("parse default allowlist");
+    let sys32_rules: Vec<_> = cfg
+        .allowlist_rules
+        .iter()
+        .filter(|rule| rule.rule_id == "ALLOW-OS-WIN-SYS32")
+        .cloned()
+        .collect();
+    assert_eq!(
+        sys32_rules.len(),
+        1,
+        "expected ALLOW-OS-WIN-SYS32 in default_allowlist.json"
+    );
+    let identity = BinaryIdentity::from_path(cmd_exe);
     assert!(
-        auth.root_thumbprint
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
-        "expected uppercase hex root_thumbprint, got {:?}",
-        auth.root_thumbprint
+        is_allowed_by_rules(
+            &identity,
+            None,
+            ledr_proto::RuleScope::ProcessAllow,
+            &sys32_rules
+        ),
+        "cmd.exe should match ALLOW-OS-WIN-SYS32 from default_allowlist.json"
     );
 }

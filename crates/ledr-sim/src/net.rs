@@ -1,5 +1,6 @@
 //! Harmless DNS resolution and loopback TCP ping/ack simulator.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -10,6 +11,13 @@ use tokio::net::{TcpListener, TcpStream, lookup_host};
 use super::types::DnsTcpOutcome;
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Result of an async cancellable scenario hold window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldOutcome {
+    Completed,
+    Interrupted,
+}
 
 /// Resolves `domain:port` and connects briefly over TCP, falling back to an in-process
 /// loopback TCP listener when `--loopback` is requested or the host is offline.
@@ -29,78 +37,100 @@ pub async fn run_dns_tcp_scenario_with_hold(
     force_loopback: bool,
     hold_ms: u64,
 ) -> Result<DnsTcpOutcome> {
-    if force_loopback {
-        let outcome = run_loopback_tcp_exchange("forced --loopback mode").await?;
-        wait_hold_ms(hold_ms).await;
-        return Ok(outcome);
-    }
-
-    let lookup_res = tokio::time::timeout(NETWORK_TIMEOUT, lookup_host((domain, port))).await;
-    let addrs: Vec<SocketAddr> = match lookup_res {
-        Ok(Ok(iter)) => iter.collect(),
-        Ok(Err(err)) => {
-            let outcome = run_loopback_tcp_exchange(&format!(
-                "DNS lookup for `{domain}:{port}` unavailable ({err}); fell back to loopback"
-            ))
-            .await?;
-            wait_hold_ms(hold_ms).await;
-            return Ok(outcome);
-        }
-        Err(_) => {
-            let outcome = run_loopback_tcp_exchange(&format!(
-                "DNS lookup for `{domain}:{port}` timed out; fell back to loopback"
-            ))
-            .await?;
-            wait_hold_ms(hold_ms).await;
-            return Ok(outcome);
-        }
-    };
-
-    let mut resolved_ips = Vec::new();
-    for addr in &addrs {
-        if !resolved_ips.contains(&addr.ip()) {
-            resolved_ips.push(addr.ip());
-        }
-    }
-
-    for addr in addrs {
-        if let Ok(Ok(mut stream)) =
-            tokio::time::timeout(NETWORK_TIMEOUT, TcpStream::connect(addr)).await
-        {
-            let _ = stream.shutdown().await;
-            drop(stream);
-            wait_hold_ms(hold_ms).await;
-            return Ok(DnsTcpOutcome {
-                domain: domain.to_string(),
-                resolved_ips,
-                connected_addr: Some(addr.to_string()),
-                used_loopback: false,
-                connected: true,
-                note: "DNS resolution and TCP connect completed".to_string(),
-            });
-        }
-    }
-
-    let outcome = run_loopback_tcp_exchange(&format!(
-        "TCP connect to `{domain}:{port}` unreachable offline; fell back to loopback"
-    ))
-    .await?;
-    wait_hold_ms(hold_ms).await;
-    Ok(outcome)
+    run_dns_tcp_scenario_with_cancel(domain, port, force_loopback, hold_ms, ctrl_c_signal())
+        .await
+        .map(|(outcome, _)| outcome)
 }
 
-async fn wait_hold_ms(hold_ms: u64) {
-    if hold_ms == 0 {
-        return;
-    }
-    let ctrl_c = async {
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
+pub(crate) async fn run_dns_tcp_scenario_with_cancel<F>(
+    domain: &str,
+    port: u16,
+    force_loopback: bool,
+    hold_ms: u64,
+    cancel: F,
+) -> Result<(DnsTcpOutcome, HoldOutcome)>
+where
+    F: Future<Output = ()>,
+{
+    let outcome = if force_loopback {
+        run_loopback_tcp_exchange("forced --loopback mode").await?
+    } else {
+        let lookup_res = tokio::time::timeout(NETWORK_TIMEOUT, lookup_host((domain, port))).await;
+        match lookup_res {
+            Ok(Ok(iter)) => {
+                let addrs: Vec<SocketAddr> = iter.collect();
+                let mut resolved_ips = Vec::new();
+                for addr in &addrs {
+                    if !resolved_ips.contains(&addr.ip()) {
+                        resolved_ips.push(addr.ip());
+                    }
+                }
+
+                let mut connected_outcome = None;
+                for addr in addrs {
+                    if let Ok(Ok(mut stream)) =
+                        tokio::time::timeout(NETWORK_TIMEOUT, TcpStream::connect(addr)).await
+                    {
+                        let _ = stream.shutdown().await;
+                        drop(stream);
+                        connected_outcome = Some(DnsTcpOutcome {
+                            domain: domain.to_string(),
+                            resolved_ips: resolved_ips.clone(),
+                            connected_addr: Some(addr.to_string()),
+                            used_loopback: false,
+                            connected: true,
+                            note: "DNS resolution and TCP connect completed".to_string(),
+                        });
+                        break;
+                    }
+                }
+
+                match connected_outcome {
+                    Some(outcome) => outcome,
+                    None => {
+                        run_loopback_tcp_exchange(&format!(
+                            "TCP connect to `{domain}:{port}` unreachable offline; fell back to loopback"
+                        ))
+                        .await?
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                run_loopback_tcp_exchange(&format!(
+                    "DNS lookup for `{domain}:{port}` unavailable ({err}); fell back to loopback"
+                ))
+                .await?
+            }
+            Err(_) => {
+                run_loopback_tcp_exchange(&format!(
+                    "DNS lookup for `{domain}:{port}` timed out; fell back to loopback"
+                ))
+                .await?
+            }
         }
     };
+
+    let hold_outcome = wait_hold_ms_with_cancel(hold_ms, cancel).await;
+    Ok((outcome, hold_outcome))
+}
+
+pub(crate) async fn ctrl_c_signal() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+pub(crate) async fn wait_hold_ms_with_cancel<F>(hold_ms: u64, cancel: F) -> HoldOutcome
+where
+    F: Future<Output = ()>,
+{
+    if hold_ms == 0 {
+        return HoldOutcome::Completed;
+    }
     tokio::select! {
-        _ = tokio::time::sleep(Duration::from_millis(hold_ms)) => {}
-        _ = ctrl_c => {}
+        biased;
+        _ = cancel => HoldOutcome::Interrupted,
+        _ = tokio::time::sleep(Duration::from_millis(hold_ms)) => HoldOutcome::Completed,
     }
 }
 

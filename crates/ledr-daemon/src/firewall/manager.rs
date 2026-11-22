@@ -18,7 +18,13 @@ pub struct WfpRuleManager {
     pub(super) bound_alerts: HashMap<String, WfpTargetKey>,
     once_allowed_processes: HashMap<String, String>,
     pub(super) startup_preemptive_exes: HashMap<String, String>,
-    pub(super) preemptive_remove_failures: HashMap<u64, u64>,
+    /// Tracks handles of non-startup `Preemptive` app-wide WFP blocks whose removal explicitly
+    /// failed in `remove_preemptive_block_if_unused` or `discard_obsolete_preemptive_block`,
+    /// mapping `wfp_handle -> consecutive_sweep_failures` for periodic retry and exponential
+    /// backoff warning throttling. Only handles present here are eligible for
+    /// [`Self::sweep_unused_preemptive_blocks`], so active processes evicted from `ProcessTable`
+    /// under capacity pressure never lose their live `Preemptive` block.
+    pub(super) pending_preemptive_removals: HashMap<u64, u64>,
     pub(super) has_wildcard_network_rules: bool,
     pub(super) has_domain_network_rules: bool,
 }
@@ -47,6 +53,7 @@ impl WfpRuleManager {
                 .entry(key)
                 .or_insert_with(|| trimmed.to_string());
         }
+        self.prune_stale_pending_preemptive_removals();
     }
 
     /// Returns `true` when `exe_path` is a startup-pinned pre-restricted executable.
@@ -171,13 +178,42 @@ impl WfpRuleManager {
                 exe_path = %exe_path,
                 wfp_handle = entry.handle,
                 error = %err,
-                "failed to remove pre-emptive WFP block on ProcessStop"
+                "failed to remove pre-emptive WFP block on ProcessStop; queuing handle for periodic sweep retry"
             );
+            self.pending_preemptive_removals
+                .entry(entry.handle)
+                .or_insert(0);
             return false;
         }
         self.installed.remove(&key);
-        self.preemptive_remove_failures.remove(&entry.handle);
+        self.pending_preemptive_removals.remove(&entry.handle);
         true
+    }
+
+    /// Returns `true` when the app-wide filter currently installed for `exe_path` is queued for
+    /// periodic unused-preemptive removal retry.
+    pub fn has_pending_preemptive_removal(&self, exe_path: &str) -> bool {
+        if self.pending_preemptive_removals.is_empty() {
+            return false;
+        }
+        let key = Self::target_key(exe_path, None);
+        self.installed
+            .get(&key)
+            .is_some_and(|entry| self.pending_preemptive_removals.contains_key(&entry.handle))
+    }
+
+    /// Reclaims a pending-removal `Preemptive` app-wide block when a live process reuses it,
+    /// clearing it from periodic sweep retry so subsequent `ProcessTable` capacity eviction cannot
+    /// drop an active process's block. Returns `true` if a pending removal entry was cleared.
+    pub fn clear_pending_preemptive_removal(&mut self, exe_path: &str) -> bool {
+        if self.pending_preemptive_removals.is_empty() {
+            return false;
+        }
+        let key = Self::target_key(exe_path, None);
+        let Some(handle) = self.installed.get(&key).map(|entry| entry.handle) else {
+            return false;
+        };
+        self.pending_preemptive_removals.remove(&handle).is_some()
     }
 
     fn is_sweepable_preemptive_entry(&self, key: &WfpTargetKey, entry: &InstalledWfpFilter) -> bool {
@@ -188,14 +224,14 @@ impl WfpRuleManager {
             && !self.bound_alerts.values().any(|bound| bound == key)
     }
 
-    fn prune_stale_preemptive_remove_failures(&mut self) {
-        if self.preemptive_remove_failures.is_empty() {
+    fn prune_stale_pending_preemptive_removals(&mut self) {
+        if self.pending_preemptive_removals.is_empty() {
             return;
         }
         let installed = &self.installed;
         let startup = &self.startup_preemptive_exes;
         let bound_alerts = &self.bound_alerts;
-        self.preemptive_remove_failures.retain(|handle, _| {
+        self.pending_preemptive_removals.retain(|handle, _| {
             installed.iter().any(|(key, entry)| {
                 entry.handle == *handle
                     && key.1.is_none()
@@ -207,18 +243,19 @@ impl WfpRuleManager {
         });
     }
 
-    /// Periodically retries removing non-startup, unbound `Preemptive` app-wide WFP blocks whose
-    /// executables no longer have any active process (for example, handles retained after
-    /// transient `remove_wfp_rule` failures in [`Self::remove_preemptive_block_if_unused`] or
-    /// [`Self::discard_obsolete_preemptive_block`]).
+    /// Periodically retries removing non-startup, unbound `Preemptive` app-wide WFP blocks that
+    /// were explicitly queued after transient `remove_wfp_rule` failures in
+    /// [`Self::remove_preemptive_block_if_unused`] or [`Self::discard_obsolete_preemptive_block`].
     ///
-    /// Fast-paths with zero `is_exe_active` calls and zero heap allocations when no sweepable
-    /// `Preemptive` filter is installed. On persistent `remove_wfp_rule` failure, emits
-    /// `tracing::warn!` with exponential backoff (powers of two: 1, 2, 4, 8, ...) per handle and
-    /// retains the filter for subsequent sweeps.
+    /// Fast-paths in O(1) with zero `self.installed` scans, zero `is_exe_active` calls, and zero
+    /// heap allocations when no pending removal exists. Never sweeps live `Preemptive` filters
+    /// that were not queued for removal (protecting active processes even if evicted from
+    /// `ProcessTable` under capacity pressure), and never removes startup-pinned preemptive
+    /// filters, alert-bound filters, `PersistedPolicy`, `DomainPolicy`, or `TransientContainment`
+    /// filters.
     ///
-    /// Never removes startup-pinned preemptive filters, alert-bound filters, `PersistedPolicy`,
-    /// `DomainPolicy`, or `TransientContainment` filters.
+    /// On persistent `remove_wfp_rule` failure, emits `tracing::warn!` with exponential backoff
+    /// (powers of two: 1, 2, 4, 8, ...) per handle and retains the filter for subsequent sweeps.
     pub fn sweep_unused_preemptive_blocks<F>(
         &mut self,
         mut is_exe_active: F,
@@ -227,31 +264,30 @@ impl WfpRuleManager {
     where
         F: FnMut(&str) -> bool,
     {
-        if !self
-            .installed
-            .iter()
-            .any(|(key, entry)| self.is_sweepable_preemptive_entry(key, entry))
-        {
-            self.prune_stale_preemptive_remove_failures();
+        if self.pending_preemptive_removals.is_empty() {
+            return 0;
+        }
+        self.prune_stale_pending_preemptive_removals();
+        if self.pending_preemptive_removals.is_empty() {
             return 0;
         }
 
         let mut unused_candidates: Vec<(WfpTargetKey, u64, String)> = Vec::new();
         let mut reactivated_handles: Vec<u64> = Vec::new();
         for (key, entry) in &self.installed {
-            if !self.is_sweepable_preemptive_entry(key, entry) {
+            if !self.pending_preemptive_removals.contains_key(&entry.handle)
+                || !self.is_sweepable_preemptive_entry(key, entry)
+            {
                 continue;
             }
             if is_exe_active(&key.0) {
-                if self.preemptive_remove_failures.contains_key(&entry.handle) {
-                    reactivated_handles.push(entry.handle);
-                }
+                reactivated_handles.push(entry.handle);
             } else {
                 unused_candidates.push((key.clone(), entry.handle, entry.exe_path.clone()));
             }
         }
         for handle in reactivated_handles {
-            self.preemptive_remove_failures.remove(&handle);
+            self.pending_preemptive_removals.remove(&handle);
         }
 
         let mut removed = 0usize;
@@ -259,29 +295,21 @@ impl WfpRuleManager {
             match defense.remove_wfp_rule(handle) {
                 Ok(()) => {
                     self.installed.remove(&key);
-                    let prior_failures = self
-                        .preemptive_remove_failures
+                    let prior_sweep_failures = self
+                        .pending_preemptive_removals
                         .remove(&handle)
                         .unwrap_or(0);
-                    if prior_failures > 0 {
-                        tracing::info!(
-                            exe_path = %exe_path,
-                            wfp_handle = handle,
-                            prior_failures,
-                            "removed retained unused pre-emptive WFP block on periodic sweep retry"
-                        );
-                    } else {
-                        tracing::debug!(
-                            exe_path = %exe_path,
-                            wfp_handle = handle,
-                            "removed unused pre-emptive WFP block on periodic sweep"
-                        );
-                    }
+                    tracing::info!(
+                        exe_path = %exe_path,
+                        wfp_handle = handle,
+                        prior_sweep_failures,
+                        "removed retained unused pre-emptive WFP block on periodic sweep retry"
+                    );
                     removed += 1;
                 }
                 Err(err) => {
                     let failures = self
-                        .preemptive_remove_failures
+                        .pending_preemptive_removals
                         .entry(handle)
                         .or_insert(0);
                     *failures = failures.saturating_add(1);
@@ -307,7 +335,7 @@ impl WfpRuleManager {
             }
         }
 
-        self.prune_stale_preemptive_remove_failures();
+        self.prune_stale_pending_preemptive_removals();
         removed
     }
 

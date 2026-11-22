@@ -451,6 +451,7 @@ impl WfpRuleManager {
                             }
                         }
                         self.installed.remove(&key);
+                        self.pending_preemptive_removals.remove(&entry.handle);
                         self.bound_alerts.retain(|_, k| k != &key);
                         report.removed += 1;
                     }
@@ -559,7 +560,9 @@ impl WfpRuleManager {
                     prev_origin: entry.origin.clone(),
                     bound_alert_ids,
                 });
+                let promoted_handle = entry.handle;
                 entry.origin = WfpFilterOrigin::PersistedPolicy;
+                self.pending_preemptive_removals.remove(&promoted_handle);
                 report.promoted += 1;
             }
             self.bound_alerts.retain(|_, k| k != &key);

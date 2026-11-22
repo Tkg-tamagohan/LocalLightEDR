@@ -570,8 +570,14 @@ impl DaemonEngine {
         // installing a fresh BFE handle when no qualifying active process remains (unless
         // startup-pinned). Lock order: `firewall` -> `process_table`.
         {
-            let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+            let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
             if fw.has_any_app_filter(trimmed) || fw.has_once_allowed_for_exe(&exe_key) {
+                if !fw.has_once_allowed_for_exe(&exe_key)
+                    && fw.has_pending_preemptive_removal(trimmed)
+                    && is_preemptive_still_needed(&fw)
+                {
+                    fw.clear_pending_preemptive_removal(trimmed);
+                }
                 tracing::debug!(
                     exe_path = %trimmed,
                     "deferring automatic pre-emptive WFP block while existing filter or AllowOnce is active"
@@ -618,14 +624,17 @@ impl DaemonEngine {
         }
     }
 
-    /// Periodically retries removing unused non-startup `Preemptive` WFP blocks (for example,
-    /// handles retained after transient `remove_wfp_rule` failures during `ProcessStop` or
-    /// `discard_obsolete_preemptive_block`) without waiting for process relaunch or an app-wide
+    /// Periodically retries removing non-startup `Preemptive` WFP blocks that were explicitly
+    /// queued after transient `remove_wfp_rule` failures during `ProcessStop` /
+    /// `TerminateAndBlock` (`remove_preemptive_block_if_unused`) or
+    /// `discard_obsolete_preemptive_block`, without waiting for process relaunch or an app-wide
     /// `NetworkAllow` reconciliation (`PRRT_kwDOVyjVyM66kD_M`).
     ///
     /// Lock order: `firewall` -> `process_table` (unified with
-    /// `maybe_apply_preemptive_wfp_block_with_motw`, `events.rs`, and `alerts.rs`). Fast-paths
-    /// with zero `process_table` locks when no sweepable `Preemptive` filter is installed.
+    /// `maybe_apply_preemptive_wfp_block_with_motw`, `events.rs`, and `alerts.rs`). Fast-paths in
+    /// O(1) with zero `process_table` locks when no pending-removal `Preemptive` handle is queued,
+    /// and never sweeps live `Preemptive` blocks that were not queued for removal (preventing
+    /// `ProcessTable` capacity eviction from stripping active processes' blocks).
     pub(super) fn sweep_unused_preemptive_wfp_blocks(&self) -> usize {
         if !self.config.outbound_firewall_enabled {
             return 0;

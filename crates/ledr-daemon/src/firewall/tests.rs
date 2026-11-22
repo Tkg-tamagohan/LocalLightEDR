@@ -268,23 +268,70 @@ fn firewall_sweep_unused_preemptive_blocks_fast_path_and_protections() {
     );
     assert_eq!(fw.active_filter_count(), 5);
 
-    // 3. Add one active non-startup Preemptive and one unused retained Preemptive (via failed
-    //    discard). Sweep removes ONLY the unused one.
+    // 3. Live non-startup Preemptive filters that were NEVER queued for failed removal (including
+    //    `evicted_live_exe`, simulating a still-running app evicted from `ProcessTable` under
+    //    capacity pressure, `PRRT_kwDOVyjVyM66kWHQ`) must ALSO hit the O(1) 0-candidate fast path
+    //    with zero `is_exe_active` probes and must NEVER be removed.
     let active_exe = r"C:\Users\Alice\Downloads\still_active.exe";
-    let unused_exe = r"C:\Users\Alice\Downloads\orphaned_retained.exe";
+    let evicted_live_exe = r"C:\Users\Alice\Downloads\evicted_from_process_table_still_running.exe";
     let active_key = WfpRuleManager::exe_key(active_exe);
 
     let h_active = defense
         .add_wfp_app_rule(Path::new(active_exe), None, false)
         .unwrap();
     assert!(fw.register_preemptive_block(active_exe, h_active, &defense));
+    let h_evicted_live = defense
+        .add_wfp_app_rule(Path::new(evicted_live_exe), None, false)
+        .unwrap();
+    assert!(fw.register_preemptive_block(evicted_live_exe, h_evicted_live, &defense));
+
+    assert_eq!(
+        fw.sweep_unused_preemptive_blocks(
+            |_| {
+                probe_calls += 1;
+                false
+            },
+            &defense,
+        ),
+        0
+    );
+    assert_eq!(
+        probe_calls, 0,
+        "live non-pending Preemptive blocks must hit O(1) fast path without probing process_table"
+    );
+    assert!(fw.has_active_filter(active_exe, None, false));
+    assert!(fw.has_active_filter(evicted_live_exe, None, false));
+
+    // 4. Queue two failed removals: one via `discard_obsolete_preemptive_block` and one via
+    //    `remove_preemptive_block_if_unused`. Sweep probes ONLY those two pending handles and
+    //    removes ONLY them—leaving `evicted_live_exe` (even though `is_exe_active` returns
+    //    `false`), `active_exe`, and all protected filters untouched.
+    let unused_exe = r"C:\Users\Alice\Downloads\orphaned_retained.exe";
+    let stop_failed_exe = r"C:\Users\Alice\Downloads\stop_remove_failed.exe";
+    let reclaimed_exe = r"C:\Users\Alice\Downloads\reclaimed_before_sweep.exe";
+
+    let h_stop_failed = defense
+        .add_wfp_app_rule(Path::new(stop_failed_exe), None, false)
+        .unwrap();
+    assert!(fw.register_preemptive_block(stop_failed_exe, h_stop_failed, &defense));
 
     defense.set_fail_removes(true);
     let h_unused = defense
         .add_wfp_app_rule(Path::new(unused_exe), None, false)
         .unwrap();
     assert!(!fw.discard_obsolete_preemptive_block(unused_exe, h_unused, &defense));
+    assert!(!fw.remove_preemptive_block_if_unused(stop_failed_exe, &defense));
+    let h_reclaimed = defense
+        .add_wfp_app_rule(Path::new(reclaimed_exe), None, false)
+        .unwrap();
+    assert!(!fw.discard_obsolete_preemptive_block(reclaimed_exe, h_reclaimed, &defense));
     defense.set_fail_removes(false);
+
+    // Reclaiming `reclaimed_exe` for a newly started process clears its pending removal so a
+    // subsequent `ProcessTable` eviction (`is_exe_active == false`) cannot strip it.
+    assert!(fw.has_pending_preemptive_removal(reclaimed_exe));
+    assert!(fw.clear_pending_preemptive_removal(reclaimed_exe));
+    assert!(!fw.has_pending_preemptive_removal(reclaimed_exe));
 
     let mut probed_keys = Vec::new();
     let removed = fw.sweep_unused_preemptive_blocks(
@@ -294,24 +341,52 @@ fn firewall_sweep_unused_preemptive_blocks_fast_path_and_protections() {
         },
         &defense,
     );
-    assert_eq!(removed, 1);
-    assert_eq!(probed_keys.len(), 2);
+    assert_eq!(removed, 2);
+    assert_eq!(
+        probed_keys.len(),
+        2,
+        "sweep must only probe explicitly pending-removal handles"
+    );
     assert!(!fw.has_any_app_filter(unused_exe));
+    assert!(!fw.has_any_app_filter(stop_failed_exe));
+    assert!(
+        fw.has_active_filter(evicted_live_exe, None, false),
+        "live Preemptive block evicted from ProcessTable must never be swept"
+    );
+    assert!(
+        fw.has_active_filter(reclaimed_exe, None, false),
+        "reclaimed Preemptive block must never be swept even when is_exe_active returns false"
+    );
     assert!(fw.has_active_filter(active_exe, None, false));
     assert!(fw.has_active_filter(startup_ps, None, false));
     assert!(fw.has_active_filter(policy_exe, None, false));
     assert!(fw.has_active_filter(domain_exe, Some(domain_ip), false));
     assert!(fw.has_active_filter(transient_exe, None, false));
     assert!(fw.has_active_filter(bound_preempt_exe, None, false));
-    assert_eq!(*defense.removed.lock().unwrap(), vec![h_unused]);
+    let removed_handles = defense.removed.lock().unwrap().clone();
+    assert_eq!(removed_handles.len(), 2);
+    assert!(removed_handles.contains(&h_unused));
+    assert!(removed_handles.contains(&h_stop_failed));
 
-    // 4. Once the bound alert unbinds, the previously bound Preemptive filter becomes sweepable.
-    fw.unbind_alert("ALT-PREEMPT");
-    let removed_after_unbind =
-        fw.sweep_unused_preemptive_blocks(|exe_key| exe_key == active_key, &defense);
-    assert_eq!(removed_after_unbind, 1);
-    assert!(!fw.has_any_app_filter(bound_preempt_exe));
-    assert_eq!(*defense.removed.lock().unwrap(), vec![h_unused, h_bound]);
+    // 5. Binding an alert to a pending-removal Preemptive filter clears its pending removal so
+    //    periodic sweeps protect it while the alert is unresolved (and after unbind until a
+    //    ProcessStop/TerminateAndBlock explicitly attempts removal).
+    let alert_rebound_exe = r"C:\Users\Alice\Downloads\pending_then_bound.exe";
+    defense.set_fail_removes(true);
+    let h_alert_rebound = defense
+        .add_wfp_app_rule(Path::new(alert_rebound_exe), None, false)
+        .unwrap();
+    assert!(!fw.discard_obsolete_preemptive_block(alert_rebound_exe, h_alert_rebound, &defense));
+    defense.set_fail_removes(false);
+    assert!(fw.has_pending_preemptive_removal(alert_rebound_exe));
+    assert!(fw.bind_alert_to_app_block("ALT-REBOUND", alert_rebound_exe));
+    assert!(!fw.has_pending_preemptive_removal(alert_rebound_exe));
+    assert_eq!(
+        fw.sweep_unused_preemptive_blocks(|_| false, &defense),
+        0,
+        "alert-bound Preemptive filter must not be swept"
+    );
+    assert!(fw.has_active_filter(alert_rebound_exe, None, false));
 }
 
 #[test]
@@ -371,22 +446,34 @@ fn firewall_sweep_unused_preemptive_blocks_backoff_throttles_warnings_and_recove
             assert!(fw.has_active_filter(exe, None, false));
         }
 
-        // Process reactivation resets backoff so a later exit warns immediately on failure #1.
+        // Process reactivation clears pending removal so subsequent sweeps neither warn nor strip
+        // the filter (even if later evicted from ProcessTable).
         assert_eq!(fw.sweep_unused_preemptive_blocks(|_| true, &defense), 0);
         assert_eq!(warn_count.load(Ordering::SeqCst), 4);
+        assert!(!fw.has_pending_preemptive_removal(exe));
         assert_eq!(fw.sweep_unused_preemptive_blocks(|_| false, &defense), 0);
+        assert_eq!(warn_count.load(Ordering::SeqCst), 4);
+        assert!(fw.has_active_filter(exe, None, false));
+
+        // When the relaunched process later exits and `remove_preemptive_block_if_unused` fails,
+        // the handle is re-queued (1 WARN from ProcessStop failure) and backoff starts fresh at 1
+        // on the next sweep failure (1 WARN -> cumulative 6).
+        assert!(!fw.remove_preemptive_block_if_unused(exe, &defense));
         assert_eq!(warn_count.load(Ordering::SeqCst), 5);
+        assert!(fw.has_pending_preemptive_removal(exe));
+        assert_eq!(fw.sweep_unused_preemptive_blocks(|_| false, &defense), 0);
+        assert_eq!(warn_count.load(Ordering::SeqCst), 6);
 
         // Once BFE recovers, sweep removes the filter with zero extra warnings.
         defense.set_fail_removes(false);
         assert_eq!(fw.sweep_unused_preemptive_blocks(|_| false, &defense), 1);
-        assert_eq!(warn_count.load(Ordering::SeqCst), 5);
+        assert_eq!(warn_count.load(Ordering::SeqCst), 6);
     });
 
     assert!(!fw.has_any_app_filter(exe));
     assert_eq!(*defense.removed.lock().unwrap(), vec![h]);
 
-    // Subsequent sweep hits 0-candidate fast path (0 probe calls).
+    // Subsequent sweep hits O(1) 0-candidate fast path (0 probe calls).
     let mut probe_calls = 0usize;
     assert_eq!(
         fw.sweep_unused_preemptive_blocks(

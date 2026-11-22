@@ -35,9 +35,8 @@ impl DaemonEngine {
         let mut purge_in_flight: Option<JoinHandle<()>> = None;
 
         let expiry_interval_ms = (self.config.alert_timeout_ms / 4).clamp(50, 5_000);
-        let mut expiry_ticker = tokio::time::interval(Duration::from_millis(expiry_interval_ms));
-        expiry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        expiry_ticker.tick().await;
+        let expiry_interval = Duration::from_millis(expiry_interval_ms);
+        let mut next_expiry_at = tokio::time::Instant::now() + expiry_interval;
 
         let nrd_refresh_enabled = self.config.nrd_refresh_enabled;
         let nrd_tick_ms = (self.config.nrd_refresh_interval_ms / 4).clamp(100, 3_600_000);
@@ -140,6 +139,19 @@ impl DaemonEngine {
                 continue;
             }
 
+            // Tier 2c: Run overdue periodic alert expiry and retained unused-preemptive WFP
+            // sweeps strictly AFTER high-priority / MOTW / WFP drop lanes (`L-10`) and BEFORE
+            // Tier 3 steady telemetry so sustained telemetry bursts cannot starve either
+            // `expire_overdue_alerts` or `sweep_unused_preemptive_wfp_blocks`
+            // (`PRRT_kwDOVyjVyM66kWF3`). Skip once shutdown is initiated so periodic BFE retries
+            // never consume the 3-second shutdown flush budget.
+            if !self.nrd_cancel.is_cancelled() && tokio::time::Instant::now() >= next_expiry_at {
+                sync_telemetry_streak = 0;
+                self.run_periodic_expiry_and_sweep();
+                next_expiry_at = tokio::time::Instant::now() + expiry_interval;
+                continue;
+            }
+
             // Tier 3: Steady telemetry lane, yielding periodically so single-threaded runtimes and
             // grace timers remain responsive during bursts.
             if let Some(event) = receiver.try_recv_telemetry() {
@@ -173,6 +185,9 @@ impl DaemonEngine {
                 }
             };
             tokio::pin!(next_drop_sleep);
+
+            let next_expiry_sleep = tokio::time::sleep_until(next_expiry_at);
+            tokio::pin!(next_expiry_sleep);
 
             tokio::select! {
                 biased;
@@ -228,11 +243,9 @@ impl DaemonEngine {
                         tracing::warn!(error = %err, "periodic SQLite batch flush failed");
                     }
                 }
-                _ = expiry_ticker.tick() => {
-                    if let Err(err) = self.expire_overdue_alerts(current_unix_ms()) {
-                        tracing::warn!(error = %err, "periodic alert expiry transition failed");
-                    }
-                    self.sweep_unused_preemptive_wfp_blocks();
+                _ = &mut next_expiry_sleep, if !self.nrd_cancel.is_cancelled() => {
+                    self.run_periodic_expiry_and_sweep();
+                    next_expiry_at = tokio::time::Instant::now() + expiry_interval;
                 }
                 _ = purge_ticker.tick() => {
                     let busy = purge_in_flight.as_ref().is_some_and(|h| !h.is_finished());
@@ -387,5 +400,12 @@ impl DaemonEngine {
                 Err(err)
             }
         }
+    }
+
+    fn run_periodic_expiry_and_sweep(&self) {
+        if let Err(err) = self.expire_overdue_alerts(current_unix_ms()) {
+            tracing::warn!(error = %err, "periodic alert expiry transition failed");
+        }
+        self.sweep_unused_preemptive_wfp_blocks();
     }
 }

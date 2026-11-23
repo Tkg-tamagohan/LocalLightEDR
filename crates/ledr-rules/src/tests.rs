@@ -1028,6 +1028,137 @@ brand-new.org
     );
 }
 
+fn extract_const_quoted_strings(src: &str, anchor: &str, end_delim: &str) -> Vec<String> {
+    let start = src
+        .find(anchor)
+        .unwrap_or_else(|| panic!("missing anchor {anchor}"));
+    let rest = &src[start + anchor.len()..];
+    let end = rest
+        .find(end_delim)
+        .unwrap_or_else(|| panic!("missing closing delimiter {end_delim} for {anchor}"));
+    let block = &rest[..end];
+    let mut items = Vec::new();
+    let mut cursor = block;
+    while let Some(open) = cursor.find('"') {
+        let after_open = &cursor[open + 1..];
+        let close = after_open
+            .find('"')
+            .unwrap_or_else(|| panic!("unterminated string literal in {anchor}"));
+        items.push(after_open[..close].to_string());
+        cursor = &after_open[close + 1..];
+    }
+    items
+}
+
+#[test]
+fn rules_p4_02_domain_risk_parity_compound_suffixes_and_benign_neighbors() {
+    let rust_src = include_str!("domain.rs");
+    let js_src = include_str!("../../../extensions/ledr-chrome-mv3/lib/domain_risk.js");
+
+    for (name, expected_len) in [
+        ("PROTECTED_BRANDS", 10usize),
+        ("COMPOUND_PUBLIC_SUFFIXES", 51usize),
+        ("BENIGN_BRAND_NEIGHBORS", 7usize),
+    ] {
+        let rust_anchor = format!("const {name}: &[&str] = &[");
+        let js_anchor = format!("export const {name} = Object.freeze([");
+        let rust_list = extract_const_quoted_strings(rust_src, &rust_anchor, "];");
+        let js_list = extract_const_quoted_strings(js_src, &js_anchor, "]);");
+        assert_eq!(
+            rust_list.len(),
+            expected_len,
+            "unexpected length for Rust {name}"
+        );
+        assert_eq!(
+            rust_list, js_list,
+            "{name} mismatch between domain.rs and domain_risk.js"
+        );
+    }
+
+    let shared_parity_vectors: &[(&str, bool, Option<&str>)] = &[
+        // 2-level ccTLDs (exact + typo + subdomain)
+        ("google.co.jp", false, None),
+        ("login.microsoft.co.uk", false, None),
+        ("paypa1.co.jp", true, Some("paypal")),
+        ("secure.app1e.co.uk", true, Some("apple")),
+        ("dr0pb0x.com.au", true, Some("dropbox")),
+        ("githbu.co.nz", true, Some("github")),
+        ("amaz0n.com.br", true, Some("amazon")),
+        ("rnicrosoft.co.kr", true, Some("microsoft")),
+        ("0pena1.com.cn", true, Some("openai")),
+        // Bare compound public suffixes (no SLD)
+        ("co.jp", false, None),
+        ("co.uk", false, None),
+        ("com.au", false, None),
+        // Benign brand neighbors
+        ("amaze.com", false, None),
+        ("ample.co.uk", false, None),
+        ("apply.com", false, None),
+        ("apply.example.com", false, None),
+        ("boggle.com.au", false, None),
+        ("maple.co.nz", false, None),
+        ("openal.org", false, None),
+        ("papal.com", false, None),
+        ("login-papal.localedr.invalid", false, None),
+        // Skeleton equality
+        ("g00g1e.com", true, Some("google")),
+        ("rnlcr0s0ft.com", true, Some("microsoft")),
+        ("c10udf1are.com", true, Some("cloudflare")),
+        ("glthub.com", true, Some("github")),
+        ("0pena1.com", true, Some("openai")),
+        ("arnaz0n.com", true, Some("amazon")),
+        // Single adjacent transposition
+        ("goolge.com", true, Some("google")),
+        ("amzaon.com", true, Some("amazon")),
+        ("paypla.com", true, Some("paypal")),
+        ("aplpe.com", true, Some("apple")),
+        ("opneai.com", true, Some("openai")),
+        ("dorpbox.com", true, Some("dropbox")),
+        // Length-tiered Levenshtein distance
+        ("aple.com", true, Some("apple")),
+        ("app.com", false, None),
+        ("axpxe.com", false, None),
+        ("foofle.com", false, None),
+        ("dropb.com", true, Some("dropbox")),
+        ("drop.com", false, None),
+        ("microzoff.com", true, Some("microsoft")),
+        ("cloudflre.com", true, Some("cloudflare")),
+        ("anthropk.com", true, Some("anthropic")),
+        // Hyphen-split tokens on non-suffix labels
+        ("login-paypa1.co.jp", true, Some("paypal")),
+        ("auth-g00g1e.com", true, Some("google")),
+        ("login-rnicrosoft.localedr.invalid", true, Some("microsoft")),
+        ("login-paypal.localedr.invalid", false, None),
+        ("login-paypal.com", false, None),
+        ("web1-apples.com", false, None),
+        ("co-jp.com", false, None),
+        // Punycode
+        ("xn--pple-43d.com", true, None),
+        ("xn--pple-43d.google.com", true, Some("google")),
+        ("xn--pple-43d.google.co.jp", true, Some("google")),
+    ];
+
+    for &(domain, expected_homograph, expected_brand) in shared_parity_vectors {
+        let res = assess_domain_risk(domain, None);
+        assert_eq!(
+            res.is_homograph, expected_homograph,
+            "unexpected is_homograph for {domain}: got {:?}",
+            res
+        );
+        assert_eq!(
+            res.matched_brand.as_deref(),
+            expected_brand,
+            "unexpected matched_brand for {domain}: got {:?}",
+            res
+        );
+        assert_eq!(
+            assess_domain_risk_with_cache(domain, None),
+            res,
+            "assess_domain_risk_with_cache mismatch for {domain}"
+        );
+    }
+}
+
 #[test]
 fn rules_p3_04_nrd_url_parsing_file_refresh_and_byte_cap() {
     // HTTP/HTTPS URL parser edge cases.

@@ -1426,7 +1426,46 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
     drop(root_handle);
     let root_ident = ProcessIdentity::new(root_pid, root_ct);
 
-    // 2. Exited intermediate PID whose kernel object is already gone (`ERROR_INVALID_PARAMETER`).
+    // 1b. Live surviving child created BEFORE any PID recycling of `root_pid`.
+    let mut pre_reuse_child = Command::new(&leaf_exe)
+        .args([
+            "--exact",
+            "defense::tests::sens_p2_tree_helper_entrypoint",
+            "--nocapture",
+        ])
+        .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "leaf")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pre-reuse payload_leaf.exe");
+    let pre_reuse_pid = pre_reuse_child.id();
+    cleanup.track_pid(pre_reuse_pid);
+    let pre_reuse_handle = open_process_checked(pre_reuse_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .expect("open pre-reuse leaf helper");
+    let pre_reuse_ct = query_process_creation_time(pre_reuse_handle.as_raw())
+        .expect("pre-reuse leaf CreationTime");
+    drop(pre_reuse_handle);
+    let pre_reuse_ident = ProcessIdentity::new(pre_reuse_pid, pre_reuse_ct);
+    assert!(
+        pre_reuse_ct > root_ct,
+        "pre-reuse child must have strictly newer CreationTime than root"
+    );
+
+    // 2. Two distinct exited intermediate PIDs whose kernel objects are reaped (`ERROR_INVALID_PARAMETER`).
+    // Spawn both concurrently before waiting so Windows guarantees distinct PIDs.
+    let mut exiting_pre_child = Command::new(&launcher_exe)
+        .args([
+            "--exact",
+            "defense::tests::sens_p2_tree_helper_entrypoint",
+            "--nocapture",
+        ])
+        .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "exit_immediately")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn exiting pre-reuse intermediate helper");
     let mut exiting_child = Command::new(&launcher_exe)
         .args([
             "--exact",
@@ -1439,25 +1478,30 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn exiting intermediate helper");
+    let exited_pre_pid = exiting_pre_child.id();
     let exited_pid = exiting_child.id();
-    let status = exiting_child.wait().expect("wait exiting intermediate");
-    assert!(status.success());
+    assert_ne!(exited_pre_pid, exited_pid, "concurrent exiting helpers must have distinct PIDs");
+    assert!(exiting_pre_child.wait().expect("wait exiting pre-reuse intermediate").success());
+    assert!(exiting_child.wait().expect("wait exiting intermediate").success());
+    drop(exiting_pre_child);
     drop(exiting_child);
     let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        if matches!(
-            open_process_checked_detailed(exited_pid, PROCESS_QUERY_LIMITED_INFORMATION),
-            Err(OpenProcessError::Failed(_))
-        ) {
-            break;
+    for reaped_pid in [exited_pre_pid, exited_pid] {
+        loop {
+            if matches!(
+                open_process_checked_detailed(reaped_pid, PROCESS_QUERY_LIMITED_INFORMATION),
+                Err(OpenProcessError::Failed(_))
+            ) {
+                break;
+            }
+            if std::time::Instant::now() >= reap_deadline {
+                panic!("reaped exited PID {reaped_pid} must fail OpenProcess");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        if std::time::Instant::now() >= reap_deadline {
-            panic!("reaped exited PID {exited_pid} must fail OpenProcess");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    // 3. Live newer process (newer than `root_ct`).
+    // 3. Live newer process (strictly newer than `pre_reuse_ct` and `root_ct`).
     let mut leaf_child = Command::new(&leaf_exe)
         .args([
             "--exact",
@@ -1476,7 +1520,10 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
         .expect("open leaf helper");
     let leaf_ct = query_process_creation_time(leaf_handle.as_raw()).expect("leaf CreationTime");
     drop(leaf_handle);
-    assert!(leaf_ct > root_ct, "leaf helper must have strictly newer CreationTime than root");
+    assert!(
+        leaf_ct > pre_reuse_ct,
+        "leaf helper must have strictly newer CreationTime than pre-reuse child"
+    );
 
     // Verify `snapshot_process_entries()` (`NtQuerySystemInformation`) captures exact kernel
     // `create_time_100ns`, `ppid`, and `exe_name` matching `GetProcessTimes`.
@@ -1547,17 +1594,32 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
         "exited child at/after recycled_cutoff_100ns must NOT traverse grandchild"
     );
 
-    // Case B2 (Snapshot-inferred recycled root cutoff): `initial_cutoff_100ns` is `None` because
-    // the initial `OpenProcess(root.pid)` probe saw the exited/unrecycled state, and only the
-    // subsequent `entries` snapshot sees the new process reusing `root.pid` (`snap_ct > root_ct`).
-    // Both a live direct child and a live grandchild via an exited intermediate child spawned by
-    // the recycled root must be rejected via the snapshot-inferred cutoff.
+    // Case B2 (Snapshot-inferred recycled root cutoff with pre-reuse surviving tree):
+    // `initial_cutoff_100ns` is `None` because the initial `OpenProcess(root.pid)` probe saw the
+    // exited/unrecycled state, and only the subsequent `entries` snapshot sees the new process
+    // reusing `root.pid` (`snap_ct = leaf_ct > root_ct`). Include BOTH pre-reuse descendants
+    // (created strictly before `leaf_ct`, both via an exited pre-reuse intermediate child and
+    // directly under `root_pid`) AND post-reuse candidates (`>= leaf_ct`) in the same snapshot so
+    // an implementation that aborts the whole tree on root recycling would fail.
+    let pre_reuse_intermediate_ct = root_ct + ((pre_reuse_ct - root_ct) / 2);
     let snapshot_inferred_cutoff_entries = vec![
         SnapshotEntry {
             pid: root_pid,
             ppid: 4,
             exe_name: "recycled_root.exe".to_string(),
             create_time_100ns: Some(leaf_ct),
+        },
+        SnapshotEntry {
+            pid: exited_pre_pid,
+            ppid: root_pid,
+            exe_name: "pre_reuse_intermediate.exe".to_string(),
+            create_time_100ns: Some(pre_reuse_intermediate_ct),
+        },
+        SnapshotEntry {
+            pid: pre_reuse_pid,
+            ppid: exited_pre_pid,
+            exe_name: "payload_leaf.exe".to_string(),
+            create_time_100ns: Some(pre_reuse_ct),
         },
         SnapshotEntry {
             pid: exited_pid,
@@ -1582,9 +1644,10 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
         None,
         snapshot_inferred_cutoff_entries,
     );
-    assert!(
-        snapshot_inferred_discovered.is_empty(),
-        "grandchild under exited child of snapshot-detected recycled root must be rejected"
+    assert_eq!(
+        snapshot_inferred_discovered,
+        vec![pre_reuse_ident],
+        "only pre-reuse grandchild must survive while post-reuse grandchild under recycled root is rejected"
     );
 
     let snapshot_inferred_direct_entries = vec![
@@ -1593,6 +1656,12 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
             ppid: 4,
             exe_name: "recycled_root.exe".to_string(),
             create_time_100ns: Some(leaf_ct),
+        },
+        SnapshotEntry {
+            pid: pre_reuse_pid,
+            ppid: root_pid,
+            exe_name: "payload_leaf.exe".to_string(),
+            create_time_100ns: Some(pre_reuse_ct),
         },
         SnapshotEntry {
             pid: leaf_pid,
@@ -1606,9 +1675,10 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
         None,
         snapshot_inferred_direct_entries,
     );
-    assert!(
-        snapshot_inferred_direct_discovered.is_empty(),
-        "live child of snapshot-detected recycled root must be rejected"
+    assert_eq!(
+        snapshot_inferred_direct_discovered,
+        vec![pre_reuse_ident],
+        "only pre-reuse live direct child must be returned while post-reuse child of recycled root is rejected"
     );
 
     // Case C (Unverified snapshot timestamp): If snapshot lacks `create_time_100ns` (`None`), an
@@ -1651,6 +1721,8 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
 
     let _ = leaf_child.kill();
     let _ = leaf_child.wait();
+    let _ = pre_reuse_child.kill();
+    let _ = pre_reuse_child.wait();
     let _ = root_child.kill();
     let _ = root_child.wait();
 }

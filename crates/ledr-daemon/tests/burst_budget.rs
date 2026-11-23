@@ -442,7 +442,7 @@ async fn burst_03_named_pipe_ipc_roundtrip_and_auth() {
     let ipc_handle = start_ipc_server(std::sync::Arc::clone(&engine)).expect("bind Named Pipe");
     let pipe_for_client = pipe_name.clone();
 
-    let (pong, snapshot_resp, metrics_resp, risk_resp, unauth_resp) =
+    let (pong, snapshot_resp, alerts_resp, rules_resp, metrics_resp, risk_resp, unauth_resp) =
         tokio::task::spawn_blocking(move || {
             let pong = send_pipe_request(&pipe_for_client, &IpcRequest::Ping);
             let snapshot_resp = send_pipe_request(
@@ -452,6 +452,15 @@ async fn burst_03_named_pipe_ipc_roundtrip_and_auth() {
                     process_instance_id: None,
                 },
             );
+            let alerts_resp = send_pipe_request(
+                &pipe_for_client,
+                &IpcRequest::GetAlerts {
+                    status: None,
+                    limit: 20,
+                },
+            );
+            let rules_resp =
+                send_pipe_request(&pipe_for_client, &IpcRequest::ListRules { scope: None });
             let metrics_resp = send_pipe_request(&pipe_for_client, &IpcRequest::GetPipelineMetrics);
             let risk_resp = send_pipe_request(
                 &pipe_for_client,
@@ -465,7 +474,111 @@ async fn burst_03_named_pipe_ipc_roundtrip_and_auth() {
                     rule_id: "ALLOW-OS-WIN-SYS32".to_string(),
                 },
             );
-            (pong, snapshot_resp, metrics_resp, risk_resp, unauth_resp)
+            (
+                pong,
+                snapshot_resp,
+                alerts_resp,
+                rules_resp,
+                metrics_resp,
+                risk_resp,
+                unauth_resp,
+            )
+        })
+        .await
+        .expect("join IPC client task");
+
+    match pong {
+        IpcResponse::Pong {
+            protocol_version, ..
+        } => assert_eq!(protocol_version, ledr_proto::IPC_PROTOCOL_VERSION),
+        other => panic!("expected Pong, got {other:?}"),
+    }
+    for (label, resp) in [
+        ("GetFlightRecorder", snapshot_resp),
+        ("GetAlerts", alerts_resp),
+        ("ListRules", rules_resp),
+        ("GetPipelineMetrics", metrics_resp),
+        ("CheckDomainRisk", risk_resp),
+        ("DeleteRule", unauth_resp),
+    ] {
+        match resp {
+            IpcResponse::Error { code, .. } => {
+                assert_eq!(code, "UNAUTHORIZED", "{label} must return UNAUTHORIZED");
+            }
+            other => panic!("expected UNAUTHORIZED error for {label}, got {other:?}"),
+        }
+    }
+
+    ipc_handle.shutdown().await;
+    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+}
+
+#[tokio::test]
+async fn burst_03b_named_pipe_ipc_dev_bypass_roundtrip() {
+    let pipe_name = unique_test_pipe_name();
+    let store = LedrStore::open_in_memory().expect("open in-memory store");
+    let sigma = SigmaEngine::from_rules(Vec::new()).expect("empty rules");
+    let pruner = EarlyPruner::default();
+
+    let engine = DaemonEngine::start(
+        store.clone(),
+        sigma,
+        pruner,
+        DaemonConfig {
+            pipe_name: pipe_name.clone(),
+            dev_mode_bypass_ui_auth: true,
+            ..DaemonConfig::default()
+        },
+    );
+
+    let proc_ident = ProcessIdentity::new(5556, 133_765_432_100_000_556);
+    engine
+        .seed_processes(vec![SensorEvent::ProcessStart {
+            identity: proc_ident,
+            parent_pid: 4,
+            exe_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            command_line: "powershell.exe -NoLogo".to_string(),
+            user_sid: None,
+        }])
+        .expect("seed process");
+
+    let ipc_handle = start_ipc_server(std::sync::Arc::clone(&engine)).expect("bind Named Pipe");
+    let pipe_for_client = pipe_name.clone();
+
+    let (pong, snapshot_resp, alerts_resp, rules_resp, metrics_resp, risk_resp) =
+        tokio::task::spawn_blocking(move || {
+            let pong = send_pipe_request(&pipe_for_client, &IpcRequest::Ping);
+            let snapshot_resp = send_pipe_request(
+                &pipe_for_client,
+                &IpcRequest::GetFlightRecorder {
+                    limit: 20,
+                    process_instance_id: None,
+                },
+            );
+            let alerts_resp = send_pipe_request(
+                &pipe_for_client,
+                &IpcRequest::GetAlerts {
+                    status: None,
+                    limit: 20,
+                },
+            );
+            let rules_resp =
+                send_pipe_request(&pipe_for_client, &IpcRequest::ListRules { scope: None });
+            let metrics_resp = send_pipe_request(&pipe_for_client, &IpcRequest::GetPipelineMetrics);
+            let risk_resp = send_pipe_request(
+                &pipe_for_client,
+                &IpcRequest::CheckDomainRisk {
+                    domain: "micros0ft.com".to_string(),
+                },
+            );
+            (
+                pong,
+                snapshot_resp,
+                alerts_resp,
+                rules_resp,
+                metrics_resp,
+                risk_resp,
+            )
         })
         .await
         .expect("join IPC client task");
@@ -483,6 +596,14 @@ async fn burst_03_named_pipe_ipc_roundtrip_and_auth() {
         }
         other => panic!("expected FlightRecorder, got {other:?}"),
     }
+    assert!(
+        matches!(alerts_resp, IpcResponse::Alerts(_)),
+        "expected Alerts, got {alerts_resp:?}"
+    );
+    assert!(
+        matches!(rules_resp, IpcResponse::Rules(_)),
+        "expected Rules, got {rules_resp:?}"
+    );
     match metrics_resp {
         IpcResponse::Metrics(m) => {
             assert_eq!(m.high_priority_capacity, HIGH_PRIORITY_CHANNEL_CAPACITY);
@@ -501,10 +622,6 @@ async fn burst_03_named_pipe_ipc_roundtrip_and_auth() {
             assert_eq!(matched_brand.as_deref(), Some("microsoft"));
         }
         other => panic!("expected DomainRisk, got {other:?}"),
-    }
-    match unauth_resp {
-        IpcResponse::Error { code, .. } => assert_eq!(code, "UNAUTHORIZED"),
-        other => panic!("expected UNAUTHORIZED error, got {other:?}"),
     }
 
     ipc_handle.shutdown().await;
@@ -928,8 +1045,28 @@ async fn burst_06_ipc_bridge_caller_auth_and_stalled_frame_timeout() {
         other => panic!("expected Pong after stalled clients timed out, got {other:?}"),
     }
 
+    ipc_handle.shutdown().await;
+    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+
     // Part B (SEC_0001): Non-reading clients requesting >64 KiB responses time out in
     // `write_response` and release their `Semaphore` permits while still open.
+    let bypass_pipe_name = unique_test_pipe_name();
+    let bypass_store = LedrStore::open_in_memory().expect("open in-memory store for Part B");
+    let bypass_engine = DaemonEngine::start(
+        bypass_store,
+        SigmaEngine::from_rules(Vec::new()).expect("empty rules"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            pipe_name: bypass_pipe_name.clone(),
+            dev_mode_bypass_ui_auth: true,
+            max_concurrent_ipc_clients: 2,
+            ipc_frame_timeout_ms: 100,
+            ..DaemonConfig::default()
+        },
+    );
+    let bypass_ipc_handle =
+        start_ipc_server(Arc::clone(&bypass_engine)).expect("bind Part B Named Pipe");
+
     let bulk_snapshots: Vec<SensorEvent> = (0..600u32)
         .map(|i| SensorEvent::ProcessStart {
             identity: ProcessIdentity::new(30_000 + i, 133_765_432_200_000_000 + u64::from(i)),
@@ -941,11 +1078,11 @@ async fn burst_06_ipc_bridge_caller_auth_and_stalled_frame_timeout() {
             user_sid: None,
         })
         .collect();
-    engine
+    bypass_engine
         .seed_processes(bulk_snapshots)
         .expect("seed 600 processes for oversized IPC response");
 
-    let pipe_for_non_reader = pipe_name.clone();
+    let pipe_for_non_reader = bypass_pipe_name.clone();
     let (post_timeout_pong, non_reader_disconnected) = tokio::task::spawn_blocking(move || {
         let mut non_reader_1 = open_pipe_with_retry(&pipe_for_non_reader);
         write_ipc_frame(
@@ -1009,8 +1146,11 @@ async fn burst_06_ipc_bridge_caller_auth_and_stalled_frame_timeout() {
         "non-reading client pipes must be closed promptly after write_response timeout"
     );
 
-    ipc_handle.shutdown().await;
-    engine.shutdown_and_flush().await.expect("shutdown_and_flush");
+    bypass_ipc_handle.shutdown().await;
+    bypass_engine
+        .shutdown_and_flush()
+        .await
+        .expect("shutdown_and_flush Part B");
 }
 
 #[tokio::test]

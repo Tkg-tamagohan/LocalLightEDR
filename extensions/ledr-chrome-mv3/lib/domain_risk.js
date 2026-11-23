@@ -1,5 +1,6 @@
 // Local-only domain normalization and Punycode/brand homograph assessment (Decision Record L-14).
-// Matches `PROTECTED_BRANDS` in `crates/ledr-rules/src/domain.rs`.
+// Matches `PROTECTED_BRANDS`, `COMPOUND_PUBLIC_SUFFIXES`, and `BENIGN_BRAND_NEIGHBORS`
+// in `crates/ledr-rules/src/domain.rs`.
 
 export const PROTECTED_BRANDS = Object.freeze([
   "google",
@@ -12,6 +13,34 @@ export const PROTECTED_BRANDS = Object.freeze([
   "openai",
   "anthropic",
   "dropbox",
+]);
+
+export const COMPOUND_PUBLIC_SUFFIXES = Object.freeze([
+  // .jp (9)
+  "co.jp", "ne.jp", "or.jp", "go.jp", "ac.jp", "ed.jp", "gr.jp", "ad.jp", "lg.jp",
+  // .uk (6)
+  "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk",
+  // .au (7)
+  "com.au", "net.au", "org.au", "edu.au", "gov.au", "asn.au", "id.au",
+  // .nz (5)
+  "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
+  // .br (5)
+  "com.br", "net.br", "org.br", "gov.br", "edu.br",
+  // .kr (5)
+  "co.kr", "ne.kr", "or.kr", "go.kr", "ac.kr",
+  // Other (14)
+  "com.cn", "net.cn", "org.cn", "com.tw", "org.tw", "com.hk", "com.sg", "co.in", "net.in",
+  "org.in", "co.za", "com.mx", "com.tr", "co.il",
+]);
+
+export const BENIGN_BRAND_NEIGHBORS = Object.freeze([
+  "amaze",
+  "ample",
+  "apply",
+  "boggle",
+  "maple",
+  "openal",
+  "papal",
 ]);
 
 const IPV4_RE = /^\d{1,3}(?:\.\d{1,3}){3}$/;
@@ -119,16 +148,81 @@ export function levenshteinDistance(a, b) {
   return prev[lenB];
 }
 
+function homographSkeleton(s) {
+  return s
+    .replace(/rn/g, "m")
+    .replace(/vv/g, "w")
+    .replace(/0/g, "o")
+    .replace(/[1i]/g, "l");
+}
+
+function isSingleAdjacentTransposition(a, b) {
+  const aChars = Array.from(a);
+  const bChars = Array.from(b);
+  if (aChars.length !== bChars.length || aChars.length < 2) {
+    return false;
+  }
+  let i = 0;
+  while (i < aChars.length && aChars[i] === bChars[i]) {
+    i++;
+  }
+  if (i + 1 >= aChars.length) {
+    return false;
+  }
+  if (aChars[i] !== bChars[i + 1] || aChars[i + 1] !== bChars[i]) {
+    return false;
+  }
+  for (let k = i + 2; k < aChars.length; k++) {
+    if (aChars[k] !== bChars[k]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isCompoundPublicSuffix(penult, last) {
+  return COMPOUND_PUBLIC_SUFFIXES.includes(`${penult}.${last}`);
+}
+
+function splitDomainLabels(labels) {
+  const len = labels.length;
+  if (len < 2) {
+    return { sld: "", nonSuffixLabels: [] };
+  }
+  if (isCompoundPublicSuffix(labels[len - 2], labels[len - 1])) {
+    if (len === 2) {
+      return { sld: "", nonSuffixLabels: [] };
+    }
+    return { sld: labels[len - 3], nonSuffixLabels: labels.slice(0, -2) };
+  }
+  return { sld: labels[len - 2], nonSuffixLabels: labels.slice(0, -1) };
+}
+
 function matchBrandTypo(label) {
   if (!label || label.length < 4) {
-    return { exact: PROTECTED_BRANDS.includes(label), typoBrand: null };
+    return { exact: false, typoBrand: null };
   }
+  if (PROTECTED_BRANDS.includes(label)) {
+    return { exact: true, typoBrand: null };
+  }
+  if (BENIGN_BRAND_NEIGHBORS.includes(label)) {
+    return { exact: false, typoBrand: null };
+  }
+
+  const labelSkeleton = homographSkeleton(label);
   for (const brand of PROTECTED_BRANDS) {
-    if (label === brand) {
-      return { exact: true, typoBrand: null };
+    if (labelSkeleton === homographSkeleton(brand)) {
+      return { exact: false, typoBrand: brand };
+    }
+    if (isSingleAdjacentTransposition(label, brand)) {
+      return { exact: false, typoBrand: brand };
     }
     const dist = levenshteinDistance(label, brand);
-    if (dist >= 1 && dist <= 2) {
+    const matchesLenTier =
+      brand.length >= 7
+        ? dist >= 1 && dist <= 2 && label.length >= 5
+        : dist === 1 && label.length >= 4;
+    if (matchesLenTier) {
       return { exact: false, typoBrand: brand };
     }
   }
@@ -155,7 +249,7 @@ export function assessLocalDomainRisk(domainOrUrl) {
 
   const labels = domain.split(".");
   const hasPunycode = labels.some((label) => label.startsWith("xn--"));
-  const sld = labels.length >= 2 ? labels[labels.length - 2] : "";
+  const { sld, nonSuffixLabels } = splitDomainLabels(labels);
 
   let matchedBrand = null;
   let looksLikeBrandTypo = false;
@@ -169,8 +263,7 @@ export function assessLocalDomainRisk(domainOrUrl) {
     looksLikeBrandTypo = true;
   } else {
     const isLocalTestDomain = domain.endsWith(".localedr.invalid");
-    const nonTldLabels = labels.slice(0, -1);
-    outer: for (const label of nonTldLabels) {
+    outer: for (const label of nonSuffixLabels) {
       for (const token of label.split("-")) {
         if (token.length < 4) {
           continue;

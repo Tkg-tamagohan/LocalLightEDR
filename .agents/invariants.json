@@ -34,7 +34,7 @@
     },
     "never_suspend_and_create_time": {
       "heading": "Active Defense Never-Suspend and Process Identity Guard",
-      "description": "NtSuspendProcess とプロセス終了の前に、is_never_suspend_process 判定と ProcessIdentity.create_time_100ns 一致を必ず検証する。",
+      "description": "NtSuspendProcess とプロセス終了の前に、フルパス検証（validate_open_handle_detailed のフルパス欠落時フェイルクローズを含む）、is_never_suspend_process 判定、ProcessIdentity.create_time_100ns 一致、および終了済み非保護子プロセス越しの孫プロセス走査継続を必ず維持する。",
       "source_file": ".agents/rules/active-defense-guards.md",
       "path_globs": [
         "crates/ledr-sensor-win/src/defense/**",
@@ -42,10 +42,10 @@
       ],
       "threshold": 0.65,
       "warn_threshold": 0.40,
-      "instructions": "Does the Git diff invoke or wire NtSuspendProcess or process termination while omitting, bypassing, or weakening the is_never_suspend_process check, the ProcessIdentity.create_time_100ns match verification, or ProcessLiveness Unknown handling? Answer Yes only if the diff allows suspend or termination paths to skip is_never_suspend_process or create_time_100ns verification or treats Unknown liveness as Gone. Answer No if both guards remain enforced before suspend or terminate or the diff is unrelated to defense actuators.",
+      "instructions": "Does the Git diff invoke or wire NtSuspendProcess or process termination while omitting, bypassing, or weakening full-path verification before skip, fail-closed handling on missing full path in validate_open_handle_detailed, the is_never_suspend_process check, the ProcessIdentity.create_time_100ns match verification, ProcessLiveness Unknown handling, or grandchild traversal continuation when an intermediate non-protected child has already exited? Answer Yes only if the diff allows suspend or termination paths to skip full-path verification, treat missing full path in validate_open_handle_detailed as non-protected or skippable, skip is_never_suspend_process or create_time_100ns verification, treat Unknown liveness as Gone, or abort grandchild traversal on an exited non-protected child. Answer No if full-path verification before skip, validate_open_handle_detailed fail-closed handling, both guards, and grandchild traversal continuation remain enforced or the diff is unrelated to defense actuators.",
       "criteria": {
-        "true_description": "The Git diff adds or modifies a suspend or termination path that skips, bypasses, or weakens is_never_suspend_process, create_time_100ns verification, or ProcessLiveness safety checks.",
-        "false_description": "The Git diff enforces is_never_suspend_process and create_time_100ns verification on all suspend and termination paths, or does not alter process defense actuation."
+        "true_description": "The Git diff adds or modifies a suspend or termination path that skips, bypasses, or weakens full-path verification before skip, fail-closed missing full-path handling in validate_open_handle_detailed, is_never_suspend_process, create_time_100ns verification, ProcessLiveness safety checks, or grandchild traversal continuation on an exited non-protected child.",
+        "false_description": "The Git diff enforces full-path verification before skip, fail-closed validate_open_handle_detailed handling on missing full paths, is_never_suspend_process and create_time_100ns verification, and grandchild traversal continuation across exited non-protected children, or does not alter process defense actuation."
       }
     },
     "canary_write_only_and_expired_suspended": {
@@ -85,7 +85,7 @@
     },
     "ipc_caller_auth_and_rw_timeout": {
       "heading": "Named Pipe IPC Caller Authorization and Read/Write Timeouts",
-      "description": "状態変更要求および ReportDownloadOrigin と ReportBrowserEvent 等の監査報告要求は開発バイパス無効時に GetNamedPipeClientProcessId で正規バイナリを検証し、読み書き双方へタイムアウトを設定する。",
+      "description": "Ping を除く全 IPC コマンドは CallerAuthPolicy（UiOnly、BridgeOnly、UiOrBridge）に従い、開発バイパス無効時に GetNamedPipeClientProcessId と inspect_uncached 経路で正規バイナリを検証し、読み書き双方へタイムアウトを設定する。",
       "source_file": ".agents/rules/active-defense-guards.md",
       "path_globs": [
         "crates/ledr-daemon/src/ipc/**",
@@ -93,10 +93,10 @@
       ],
       "threshold": 0.65,
       "warn_threshold": 0.40,
-      "instructions": "Does the Git diff add or modify an IPC state-changing or audit-reporting handler (such as ReportDownloadOrigin or ReportBrowserEvent) that omits GetNamedPipeClientProcessId caller binary verification (AUTHORIZED_UI_EXE_PATH or AUTHORIZED_BRIDGE_EXE_PATH) when dev_bypass_auth is disabled, or omit read, write, or flush timeouts on IPC pipe I/O? Answer Yes only if caller authentication is skipped outside dev_bypass_auth or IPC I/O lacks bounded read, write, or flush timeouts. Answer No if caller authorization and bounded read/write/flush timeouts are enforced.",
+      "instructions": "Does the Git diff add or modify any non-Ping IPC command handler (UiOnly, BridgeOnly, or UiOrBridge under CallerAuthPolicy) that omits GetNamedPipeClientProcessId caller binary verification (AUTHORIZED_UI_EXE_PATH or AUTHORIZED_BRIDGE_EXE_PATH) when dev_mode_bypass_ui_auth (dev_bypass_auth) is disabled, replaces inspect_uncached with cached inspect or an in-app or inter-process signature cache on Authenticode verification paths, or omits read, write, or flush timeouts on IPC pipe I/O? Answer Yes only if any non-Ping IPC command skips CallerAuthPolicy caller authentication outside dev_bypass_auth, weakens inspect_uncached Authenticode re-verification, or leaves IPC I/O without bounded read, write, or flush timeouts. Answer No if all non-Ping IPC commands enforce CallerAuthPolicy with inspect_uncached and bounded read/write/flush timeouts.",
       "criteria": {
-        "true_description": "The Git diff omits GetNamedPipeClientProcessId caller authorization on state-changing or audit-reporting IPC requests when dev_bypass_auth is false, or leaves IPC read, write, or flush operations without timeouts.",
-        "false_description": "The Git diff enforces GetNamedPipeClientProcessId binary verification for non-bypass builds and applies explicit read, write, and flush timeouts across IPC handlers."
+        "true_description": "The Git diff omits CallerAuthPolicy or GetNamedPipeClientProcessId caller authorization on any non-Ping IPC command when dev_bypass_auth is false, caches or bypasses inspect_uncached Authenticode verification, or leaves IPC read, write, or flush operations without timeouts.",
+        "false_description": "The Git diff enforces CallerAuthPolicy (UiOnly, BridgeOnly, UiOrBridge) with GetNamedPipeClientProcessId and inspect_uncached verification for all non-Ping IPC commands when dev_bypass_auth is false, and applies explicit read, write, and flush timeouts across IPC handlers."
       }
     },
     "wfp_dynamic_session_and_deny_priority": {

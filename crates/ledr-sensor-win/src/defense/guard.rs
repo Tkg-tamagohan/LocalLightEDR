@@ -129,18 +129,16 @@ pub(super) fn validate_open_handle(handle: HANDLE, target: &ProcessIdentity) -> 
     validate_open_handle_detailed(handle, target).map_err(TargetValidationError::into_message)
 }
 
-fn validate_open_handle_detailed(
+pub(super) fn validate_open_handle_detailed(
     handle: HANDLE,
     target: &ProcessIdentity,
 ) -> Result<ValidatedTarget, TargetValidationError> {
-    let exe_path = query_full_image_name(handle)
-        .or_else(|| find_process_exe_toolhelp32(target.pid))
-        .ok_or_else(|| {
-            TargetValidationError::Unavailable(format!(
-                "unable to resolve image name for PID {}; refusing action fail-closed",
-                target.pid
-            ))
-        })?;
+    let exe_path = query_full_image_name(handle).ok_or_else(|| {
+        TargetValidationError::Unavailable(format!(
+            "unable to resolve image name for PID {}; refusing action fail-closed",
+            target.pid
+        ))
+    })?;
 
     let actual_create_time = query_process_creation_time(handle);
     if let Err(err) = validate_process_metadata(

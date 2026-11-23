@@ -117,6 +117,35 @@ test("EXT-11: MV3 manifest, DNR rules, popup CSP, and offline privacy checks hol
     assert.doesNotMatch(src, /\bXMLHttpRequest\b/, `${rel} must not use XMLHttpRequest`);
     assert.doesNotMatch(src, /\.then\s*\(/, `${rel} must use async/await instead of .then()`);
   }
+
+  // Node 18/20 LTS ESM compatibility: package.json must declare private=true, type=module, and zero dependencies
+  const pkgPath = path.join(EXT_DIR, "package.json");
+  assert.ok(fs.existsSync(pkgPath), "package.json must exist in extensions/ledr-chrome-mv3");
+  const pkgBytes = fs.readFileSync(pkgPath);
+  assert.equal(
+    pkgBytes.length >= 3 && pkgBytes[0] === 0xef && pkgBytes[1] === 0xbb && pkgBytes[2] === 0xbf,
+    false,
+    "package.json must be UTF-8 without BOM"
+  );
+  const pkg = JSON.parse(pkgBytes.toString("utf8"));
+  assert.equal(pkg.private, true);
+  assert.equal(pkg.type, "module");
+  for (const depField of [
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+  ]) {
+    const deps = pkg[depField];
+    assert.ok(
+      deps === undefined ||
+        (typeof deps === "object" &&
+          deps !== null &&
+          !Array.isArray(deps) &&
+          Object.keys(deps).length === 0),
+      `package.json ${depField} must be absent or empty`
+    );
+  }
 });
 
 test("EXT-12: manifest.json public key matches Rust DEFAULT_CHROME_EXTENSION_ID", () => {

@@ -1398,6 +1398,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\profile_daemon
     -Mode idle -DurationSec 600 -OutDir (Join-Path $runDir "perf_idle")
 
 # 2. 60 秒高負荷計測（ブラウザ複数タブ閲覧と別ウィンドウでの cargo build --locked を併用）
+$daemonProc = Get-Process ledr-daemon -ErrorAction Stop
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\profile_daemon_memory.ps1 `
     -Pid $daemonProc.Id -DbPath $dbPath -DaemonExePath $daemonProc.Path `
     -Mode load -DurationSec 60 -OutDir (Join-Path $runDir "perf_load")
@@ -1407,11 +1408,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\profile_daemon
 
 合格判定は `memory-profile-summary.json` の `track_gates.e2e_perf_01_mode_pass` で行い、三値の意味は次のとおりです（1 件の `nrd-test-cache.txt` で計測した場合は「ルート 3 軽量参考値」または「オフライン参考値」として区分記録します）。
 
-- **`$true`（合格）**：モード基準時間（`idle`: 600 秒、`load`: 60 秒）を途中終了なく完走し、必須指標の欠測や開始前 OS 累積ピークによる遮蔽（`os_peak_preexisting_ge_64_34mb` / `os_peak_preexisting_ge_100mb`）がなく、全基準を満たした場合のみ。
+- **`$true`（合格）**：モード基準時間（`idle`: 600 秒、`load`: 60 秒）を途中終了なく完走し、必須指標の欠測や開始前 OS 累積ピークによる遮蔽（`-Mode load` では `os_peak_preexisting_ge_64_34mb`、両モード共通では `os_peak_preexisting_ge_100mb`）がなく、全基準を満たした場合のみ。
 - **`$false`（不合格）**：いずれかの必須基準に違反した場合（`>= 100 MB` スパイクまたは高負荷 `>= 64.34 MB` 超過は、途中終了やモード基準時間未達であっても超過を観測した時点で `$false`）。
-- **`$null`（判定不能）**：上記超過は未観測だが、Private Working Set 欠測、途中終了、モード基準時間未達、または計測開始前の OS 累積ピーク既超過（`os_peak_preexisting_ge_64_34mb` / `os_peak_preexisting_ge_100mb`）により合格を保証できない場合（集計値は参考値として保持）。
+- **`$null`（判定不能）**：上記超過は未観測だが、Private Working Set 欠測、途中終了、モード基準時間未達、または対象モードでの計測開始前 OS 累積ピーク既超過（`-Mode load` は `os_peak_preexisting_ge_64_34mb`、両モード共通は `os_peak_preexisting_ge_100mb`）により合格を保証できない場合（集計値は参考値として保持）。
 
-各モードの全条件は以下のとおりです（連続計測や再計測で開始前の OS 累積ピーク `initial_os_peak_working_set_mb` が既に `64.34 MB` 以上または `100.0 MB` 以上になっている場合は、`ledr-daemon.exe` を再起動してから計測し直してください）。
+各モードの全条件は以下のとおりです。連続計測や再計測で開始前の OS 累積ピークが対象モードの閾値を既に超えている場合（`-Mode idle` は `os_peak_preexisting_ge_100mb == true` すなわち `100.0 MB` 以上、`-Mode load` は `os_peak_preexisting_ge_64_34mb == true` すなわち `64.34 MB` 以上）は、`ledr-daemon.exe` を再起動し、`$daemonProc = Get-Process ledr-daemon -ErrorAction Stop` で PID と実行パスを再取得してから該当モードのコマンドを再実行してください。
 
 - **600 秒アイドル必須基準（`-Mode idle`）**：`steady_window_60s_to_end.median_private_ws_mb <= 20.0`、`latest_private_ws_mb <= 20.0`、`AvgCpuPercent < 0.5%`、`effective_interval_peak_working_set_mb < 100.0`（初回サンプル・ポーリング値・区間内更新 OS ピークの最大）、`spikes_ge_100mb_sampled_count == 0`、`os_peak_crossed_100mb_during_interval == false`、`os_peak_preexisting_ge_100mb == false`、および定常後半（`330..600s`）と前半（`60..330s`）の `WorkingSet64` / `PrivateWorkingSetSize` 中央値差 `<= +1.0 MB`。
 - **参考指標（`WorkingSet64` OS 共有ページ下限）**：Windows 11 環境では OS 共有ページ（`Shared == 1`）のみで約 `14.5 MB`（Stage 3 実測 `14.51–14.70 MB`）を占有するため、`WorkingSet64` の絶対値自体は参考値（`track_gates.legacy_reference_ws_le_20mb`）として記録し、リークおよび異常スパイクがないことを後半前半中央値差と 100 MB 未満維持で判定する（`決定記録 L-24`）。

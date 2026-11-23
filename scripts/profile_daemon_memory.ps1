@@ -1605,16 +1605,14 @@ try {
 
     $latestPrivWsMb = if ($null -ne $latestPrivWsBytes) { ConvertTo-MB $latestPrivWsBytes } else { $null }
     $peakPrivWsMb = if ($null -ne $peakPrivWsBytesMax) { ConvertTo-MB $peakPrivWsBytesMax } else { $null }
-    $intervalPeakWsMb = if ($allWsMb.Count -gt 0) { ConvertTo-MB $intervalPeakWsBytes } else { $null }
+    $intervalPeakWsMb = ConvertTo-MB $intervalPeakWsBytes
     $osPeakUpdatedDuringInterval = ($peakWsBytesMax -gt $initialOsPeakWsBytes)
-    $effectiveIntervalPeakWsBytes = if ($allWsMb.Count -eq 0) {
-        $null
-    } elseif ($osPeakUpdatedDuringInterval) {
+    $effectiveIntervalPeakWsBytes = if ($osPeakUpdatedDuringInterval) {
         [Math]::Max($intervalPeakWsBytes, $peakWsBytesMax)
     } else {
         $intervalPeakWsBytes
     }
-    $effectiveIntervalPeakWsMb = if ($null -ne $effectiveIntervalPeakWsBytes) { ConvertTo-MB $effectiveIntervalPeakWsBytes } else { $null }
+    $effectiveIntervalPeakWsMb = ConvertTo-MB $effectiveIntervalPeakWsBytes
 
     $endMinus60sPriv = if ($null -ne $startPriv60sMb -and $null -ne $endPrivMb) { [math]::Round($endPrivMb - $startPriv60sMb, 4) } else { $null }
     $peakMinusSteadyPriv = if ($null -ne $steadyMedianPrivWs -and $null -ne $peakPrivWsMb) { [math]::Round($peakPrivWsMb - $steadyMedianPrivWs, 4) } else { $null }
@@ -1683,7 +1681,7 @@ try {
         e2e_perf_01_load_peak_ws_lt_64_34mb         = $loadPeakWsLt6434
         e2e_perf_01_spikes_ge_100mb_zero            = $spikesZeroPass
         e2e_perf_01_mode_pass                       = $modePass
-        legacy_reference_ws_le_20mb                 = if ($null -ne $effectiveIntervalPeakWsBytes) { ($effectiveIntervalPeakWsBytes / $ONE_MB) -le 20.0 } else { $null }
+        legacy_reference_ws_le_20mb                 = (($effectiveIntervalPeakWsBytes / $ONE_MB) -le 20.0)
     }
 
     $summary = [ordered]@{

@@ -18,7 +18,9 @@ use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use crate::engine::{BrowserReportError, DaemonEngine};
 
 use super::auth::inspect_pipe_client_exe;
-use super::dispatch::{authorize_caller_flags, browser_report_error_response, dispatch_request};
+use super::dispatch::{
+    authorize_caller_policy, browser_report_error_response, dispatch_request, CallerAuthPolicy,
+};
 use super::security::{build_strict_pipe_security_descriptor, PipeSecurityDescriptor};
 #[cfg(doc)]
 use super::security::{DEV_BYPASS_SYSTEM_PIPE_SDDL, SERVICE_PIPE_SDDL};
@@ -378,7 +380,11 @@ async fn handle_pipe_client(
                 let auth_engine = Arc::clone(&engine);
                 let auth_caller = caller_exe.clone();
                 let auth_task = tokio::task::spawn_blocking(move || {
-                    authorize_caller_flags(&auth_engine, auth_caller.as_deref(), false, true)
+                    authorize_caller_policy(
+                        &auth_engine,
+                        auth_caller.as_deref(),
+                        CallerAuthPolicy::BridgeOnly,
+                    )
                 });
                 let denied_opt = match tokio::time::timeout(session_remaining, auth_task).await {
                     Ok(Ok(opt)) => opt,

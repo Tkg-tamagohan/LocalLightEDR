@@ -398,6 +398,29 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertTrue(str(criteria.get("true_description", "")).strip())
             self.assertTrue(str(criteria.get("false_description", "")).strip())
 
+        never_suspend = questions["never_suspend_and_create_time"]
+        self.assertIn("validate_open_handle_detailed", never_suspend["instructions"])
+        for text_field in (
+            never_suspend["instructions"],
+            never_suspend["criteria"]["true_description"],
+            never_suspend["criteria"]["false_description"],
+        ):
+            self.assertIn("full-path", text_field.lower())
+            self.assertIn("grandchild", text_field.lower())
+
+        ipc_auth = questions["ipc_caller_auth_and_rw_timeout"]
+        self.assertIn("UiOnly", ipc_auth["instructions"])
+        self.assertIn("BridgeOnly", ipc_auth["instructions"])
+        self.assertIn("UiOrBridge", ipc_auth["instructions"])
+        for text_field in (
+            ipc_auth["instructions"],
+            ipc_auth["criteria"]["true_description"],
+            ipc_auth["criteria"]["false_description"],
+        ):
+            self.assertIn("non-Ping", text_field)
+            self.assertIn("CallerAuthPolicy", text_field)
+            self.assertIn("inspect_uncached", text_field)
+
         two_lane = questions["two_lane_no_unbounded_channel"]
         for text_field in (
             two_lane["instructions"],

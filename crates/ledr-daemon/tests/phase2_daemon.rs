@@ -1147,7 +1147,15 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
     let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("bind strict SDDL Named Pipe");
 
     let pipe_client = strict_pipe.clone();
-    let (ping_resp, unauth_resolve, metrics_resp) = tokio::task::spawn_blocking(move || {
+    let (
+        ping_resp,
+        unauth_resolve,
+        metrics_resp,
+        flight_resp,
+        alerts_resp,
+        rules_resp,
+        risk_resp,
+    ) = tokio::task::spawn_blocking(move || {
         let ping = send_pipe_request(&pipe_client, &IpcRequest::Ping);
         let unauth = send_pipe_request(
             &pipe_client,
@@ -1157,17 +1165,46 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
             },
         );
         let metrics = send_pipe_request(&pipe_client, &IpcRequest::GetPipelineMetrics);
-        (ping, unauth, metrics)
+        let flight = send_pipe_request(
+            &pipe_client,
+            &IpcRequest::GetFlightRecorder {
+                limit: 10,
+                process_instance_id: None,
+            },
+        );
+        let alerts = send_pipe_request(
+            &pipe_client,
+            &IpcRequest::GetAlerts {
+                status: None,
+                limit: 10,
+            },
+        );
+        let rules = send_pipe_request(&pipe_client, &IpcRequest::ListRules { scope: None });
+        let risk = send_pipe_request(
+            &pipe_client,
+            &IpcRequest::CheckDomainRisk {
+                domain: "example.com".to_string(),
+            },
+        );
+        (ping, unauth, metrics, flight, alerts, rules, risk)
     })
     .await
     .expect("join strict IPC client");
 
     assert!(matches!(ping_resp, IpcResponse::Pong { .. }));
-    assert!(matches!(
-        unauth_resolve,
-        IpcResponse::Error { ref code, .. } if code == "UNAUTHORIZED"
-    ));
-    assert!(matches!(metrics_resp, IpcResponse::Metrics(_)));
+    for (label, resp) in [
+        ("ResolveAlert", unauth_resolve),
+        ("GetPipelineMetrics", metrics_resp),
+        ("GetFlightRecorder", flight_resp),
+        ("GetAlerts", alerts_resp),
+        ("ListRules", rules_resp),
+        ("CheckDomainRisk", risk_resp),
+    ] {
+        assert!(
+            matches!(resp, IpcResponse::Error { ref code, .. } if code == "UNAUTHORIZED"),
+            "{label} must return UNAUTHORIZED when auth bypass is off, got {resp:?}"
+        );
+    }
 
     ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await.expect("shutdown");

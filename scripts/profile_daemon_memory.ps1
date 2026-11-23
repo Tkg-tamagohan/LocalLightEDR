@@ -1358,10 +1358,11 @@ try {
     $initialOsPeakWsBytes = [uint64]$firstSample.PeakWorkingSetSize
     $peakWsBytesMax = [uint64]$firstSample.PeakWorkingSetSize
     $osPeakCrossed100MbDuringInterval = $false
-    $intervalPeakWsBytes = [uint64]$firstSample.WorkingSetSize
+    $intervalPeakWsBytes = [uint64]0
     $peakPrivWsBytesMax = $null
     $peakCommitBytesMax = [uint64]$firstSample.PrivateUsage
     $latestSample = $firstSample
+    $lastSampleElapsedSec = $null
     $latestPrivWsBytes = $null
     $privWsUnsupportedCount = 0
 
@@ -1393,6 +1394,7 @@ try {
             break
         }
         $latestSample = $sample
+        $lastSampleElapsedSec = $elapsedSec
 
         $privSource = 'EX2'
         $privWsBytes = [uint64]$sample.PrivateWorkingSetSize
@@ -1603,22 +1605,40 @@ try {
 
     $latestPrivWsMb = if ($null -ne $latestPrivWsBytes) { ConvertTo-MB $latestPrivWsBytes } else { $null }
     $peakPrivWsMb = if ($null -ne $peakPrivWsBytesMax) { ConvertTo-MB $peakPrivWsBytesMax } else { $null }
-    $intervalPeakWsMb = ConvertTo-MB $intervalPeakWsBytes
+    $intervalPeakWsMb = if ($allWsMb.Count -gt 0) { ConvertTo-MB $intervalPeakWsBytes } else { $null }
+    $osPeakUpdatedDuringInterval = ($peakWsBytesMax -gt $initialOsPeakWsBytes)
+    $effectiveIntervalPeakWsBytes = if ($allWsMb.Count -eq 0) {
+        $null
+    } elseif ($osPeakUpdatedDuringInterval) {
+        [Math]::Max($intervalPeakWsBytes, $peakWsBytesMax)
+    } else {
+        $intervalPeakWsBytes
+    }
+    $effectiveIntervalPeakWsMb = if ($null -ne $effectiveIntervalPeakWsBytes) { ConvertTo-MB $effectiveIntervalPeakWsBytes } else { $null }
 
     $endMinus60sPriv = if ($null -ne $startPriv60sMb -and $null -ne $endPrivMb) { [math]::Round($endPrivMb - $startPriv60sMb, 4) } else { $null }
     $peakMinusSteadyPriv = if ($null -ne $steadyMedianPrivWs -and $null -ne $peakPrivWsMb) { [math]::Round($peakPrivWsMb - $steadyMedianPrivWs, 4) } else { $null }
     $authMappedSpikeOverSteady = if ($null -ne $steadyAuthMappedMed) { [math]::Round($peakAuthMappedMb - $steadyAuthMappedMed, 4) } else { $null }
 
-    $spikesZeroPass = ($spikes100Mb -eq 0) -and (-not $osPeakCrossed100MbDuringInterval)
+    $modeMinDurationSec = if ($Mode -eq 'idle') { 600.0 } elseif ($Mode -eq 'load') { 60.0 } else { $null }
+    $measurementComplete = if ($null -ne $modeMinDurationSec) {
+        (-not $processExitedEarly) -and ($allWsMb.Count -gt 0) -and ($null -ne $lastSampleElapsedSec) -and ($lastSampleElapsedSec -ge [double]$DurationSec) -and ([double]$DurationSec -ge $modeMinDurationSec)
+    } else {
+        (-not $processExitedEarly) -and ($allWsMb.Count -gt 0) -and ($null -ne $lastSampleElapsedSec) -and ($lastSampleElapsedSec -ge [double]$DurationSec)
+    }
 
-    $idlePrivLatestLe20 = if ($Mode -eq 'idle' -and $null -ne $latestPrivWsMb) { $latestPrivWsMb -le 20.0 } else { $null }
-    $idlePrivMedLe20 = if ($Mode -eq 'idle' -and $null -ne $steadyMedianPrivWs) { $steadyMedianPrivWs -le 20.0 } else { $null }
-    $idleAvgCpuLt05 = if ($Mode -eq 'idle') { $lastCumCpuPct -lt 0.5 } else { $null }
-    $idleHalfDiffWsLe1 = if ($Mode -eq 'idle' -and $null -ne $halfDiffWs) { $halfDiffWs -le 1.0 } else { $null }
-    $idleHalfDiffPrivLe1 = if ($Mode -eq 'idle' -and $null -ne $halfDiffPriv) { $halfDiffPriv -le 1.0 } else { $null }
+    $spikesViolated = ($spikes100Mb -gt 0) -or $osPeakCrossed100MbDuringInterval
+    $spikesZeroPass = if ($spikesViolated) { $false } elseif ($measurementComplete) { $true } else { $null }
 
-    $loadAvgCpuLt1 = if ($Mode -eq 'load') { $lastCumCpuPct -lt 1.0 } else { $null }
-    $loadPeakWsLt6434 = if ($Mode -eq 'load') { $intervalPeakWsMb -lt 64.34 } else { $null }
+    $idlePrivLatestLe20 = if ($Mode -eq 'idle' -and $measurementComplete -and $null -ne $latestPrivWsBytes) { ($latestPrivWsBytes / $ONE_MB) -le 20.0 } else { $null }
+    $idlePrivMedLe20 = if ($Mode -eq 'idle' -and $measurementComplete -and $null -ne $steadyMedianPrivWs) { $steadyMedianPrivWs -le 20.0 } else { $null }
+    $idleAvgCpuLt05 = if ($Mode -eq 'idle' -and $measurementComplete) { $lastCumCpuPct -lt 0.5 } else { $null }
+    $idleHalfDiffWsLe1 = if ($Mode -eq 'idle' -and $measurementComplete -and $null -ne $halfDiffWs) { $halfDiffWs -le 1.0 } else { $null }
+    $idleHalfDiffPrivLe1 = if ($Mode -eq 'idle' -and $measurementComplete -and $null -ne $halfDiffPriv) { $halfDiffPriv -le 1.0 } else { $null }
+
+    $loadAvgCpuLt1 = if ($Mode -eq 'load' -and $measurementComplete) { $lastCumCpuPct -lt 1.0 } else { $null }
+    $loadPeakViolated = ($null -ne $effectiveIntervalPeakWsBytes) -and (($effectiveIntervalPeakWsBytes / $ONE_MB) -ge 64.34)
+    $loadPeakWsLt6434 = if ($Mode -ne 'load') { $null } elseif ($loadPeakViolated) { $false } elseif ($measurementComplete) { $true } else { $null }
 
     $modePass = $null
     if ($Mode -eq 'idle') {
@@ -1643,6 +1663,8 @@ try {
 
     $gates = [ordered]@{
         e2e_perf_01_mode                            = $Mode
+        e2e_perf_01_min_duration_sec                = $modeMinDurationSec
+        e2e_perf_01_measurement_complete            = $measurementComplete
         track_1a_steady_priv_ws_gt_10mb             = if ($null -ne $steadyMedianPrivWs) { $steadyMedianPrivWs -gt 10.0 } else { $null }
         track_1c_idle_growth_ge_3mb                 = if ($null -ne $endMinus60sPriv) { $endMinus60sPriv -ge 3.0 } else { $null }
         track_1c_peak_delta_ge_5mb                  = if ($null -ne $peakMinusSteadyPriv) { $peakMinusSteadyPriv -ge 5.0 } else { $null }
@@ -1658,7 +1680,7 @@ try {
         e2e_perf_01_load_peak_ws_lt_64_34mb         = $loadPeakWsLt6434
         e2e_perf_01_spikes_ge_100mb_zero            = $spikesZeroPass
         e2e_perf_01_mode_pass                       = $modePass
-        legacy_reference_ws_le_20mb                 = ($intervalPeakWsMb -le 20.0)
+        legacy_reference_ws_le_20mb                 = if ($null -ne $effectiveIntervalPeakWsBytes) { ($effectiveIntervalPeakWsBytes / $ONE_MB) -le 20.0 } else { $null }
     }
 
     $summary = [ordered]@{
@@ -1669,6 +1691,7 @@ try {
         db_path                                 = $DbPath
         duration_requested_sec                  = $DurationSec
         duration_actual_sec                     = [math]::Round($sw.Elapsed.TotalSeconds, 3)
+        last_sample_elapsed_sec                 = if ($null -ne $lastSampleElapsedSec) { [math]::Round($lastSampleElapsedSec, 3) } else { $null }
         process_exited_early                    = $processExitedEarly
         poll_interval_ms                        = $PollMs
         logical_cores                           = $logicalCores
@@ -1679,6 +1702,8 @@ try {
         interval_peak_working_set_mb            = $intervalPeakWsMb
         initial_os_peak_working_set_mb          = ConvertTo-MB $initialOsPeakWsBytes
         os_peak_working_set_mb                  = ConvertTo-MB $peakWsBytesMax
+        os_peak_updated_during_interval         = $osPeakUpdatedDuringInterval
+        effective_interval_peak_working_set_mb  = $effectiveIntervalPeakWsMb
         latest_private_ws_mb                    = $latestPrivWsMb
         peak_private_ws_mb                      = $peakPrivWsMb
         peak_private_commit_mb                  = ConvertTo-MB $peakCommitBytesMax

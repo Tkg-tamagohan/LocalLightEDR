@@ -1405,11 +1405,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\profile_daemon
 
 `profile_daemon_memory.ps1` は 200 ms 間隔の `GetProcessMemoryInfo` と `GetProcessTimes` ポーリングに加え、10 秒後、60 秒後、終了直前、ピーク `+2.0 MB` 更新時、および `+5.0 MB` 急増時に `QueryWorkingSetEx` で `Shared == 0/1` の 4 KiB ページ内訳スナップショットを保存し、`timeseries.csv`、`memory-profile-summary.json`、および `snapshots/*.json` を出力します（`-AnalyzePeOnly` を指定すると PE 静的および遅延インポートの推移的依存解析のみを単体実行できます）。
 
-合格判定は `memory-profile-summary.json`（`track_gates.e2e_perf_01_mode_pass -eq $true`、欠測時は `$null` で判定不能扱い）の以下の全条件で行います（1 件の `nrd-test-cache.txt` で計測した場合は「ルート 3 軽量参考値」または「オフライン参考値」として区分記録します）。
+合格判定は `memory-profile-summary.json`（`track_gates.e2e_perf_01_mode_pass -eq $true`、欠測・途中終了・モード基準時間未達時は `$null` で判定不能扱い）の以下の全条件で行います（1 件の `nrd-test-cache.txt` で計測した場合は「ルート 3 軽量参考値」または「オフライン参考値」として区分記録します）。
 
 - **600 秒アイドル必須基準（`-Mode idle`）**：`steady_window_60s_to_end.median_private_ws_mb <= 20.0`、`latest_private_ws_mb <= 20.0`、`AvgCpuPercent < 0.5%`、`spikes_ge_100mb_sampled_count == 0` かつ `os_peak_crossed_100mb_during_interval == false`、および定常後半（`330..600s`）と前半（`60..330s`）の `WorkingSet64` / `PrivateWorkingSetSize` 中央値差 `<= +1.0 MB`。
 - **参考指標（`WorkingSet64` OS 共有ページ下限）**：Windows 11 環境では OS 共有ページ（`Shared == 1`）のみで約 `14.5 MB`（Stage 3 実測 `14.51–14.70 MB`）を占有するため、`WorkingSet64` の絶対値自体は参考値（`track_gates.legacy_reference_ws_le_20mb`）として記録し、リークおよび異常スパイクがないことを後半前半中央値差と 100 MB 未満維持で判定する（`決定記録 L-24`）。
-- **60 秒高負荷基準（`-Mode load`）**：ブラウザ複数タブ閲覧と `cargo build --locked` の併用負荷下で `interval_peak_working_set_mb < 64.34`、`spikes_ge_100mb_sampled_count == 0` かつ `os_peak_crossed_100mb_during_interval == false`、かつ `AvgCpuPercent < 1.0%` であること（Stage 1 未改変ベースラインの 60 秒高負荷実測は `0.5475%`、Stage 3 実測は `0.5952%`）。
+- **60 秒高負荷基準（`-Mode load`）**：ブラウザ複数タブ閲覧と `cargo build --locked` の併用負荷下で `effective_interval_peak_working_set_mb < 64.34`（サンプリング最大値 `interval_peak_working_set_mb` と計測区間中に更新された OS 累積ピーク `os_peak_working_set_mb` の大きい方）、`spikes_ge_100mb_sampled_count == 0` かつ `os_peak_crossed_100mb_during_interval == false`、かつ `AvgCpuPercent < 1.0%` であること（Stage 1 未改変ベースラインの 60 秒高負荷実測は `0.5475%`、Stage 3 実測は `0.5952%`）。
 
 高負荷計測の直後（または併用中）に次のコマンドでダミー `Cookies` アクセスを走らせ、高優先度レーンのトースト応答が 1 秒以内に返ることを確認したあと、凍結したプロセスを終了してください。
 負荷計測の出力をファイルへ保存する場合は、後続の `E2E-OPT-01` で上書きされないよう `perf_load_trackc.txt` のようにトラック名入りのファイル名で分けて保存してください。

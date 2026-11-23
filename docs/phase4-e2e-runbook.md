@@ -93,6 +93,7 @@ $runDir = "<上記で表示された RunDir の絶対パス>"
 ```
 
 必要に応じてウィンドウ A（管理者権限）でも `--scope machine` を検証できます。
+管理者側ウィンドウでも通常ユーザー側で作成した `$runDir`（`RunDir=...` のパス）を明示設定したうえで実行してください。
 既存のマシン全体登録がある環境では、通常ユーザーが書き込めない管理者専用の退避フォルダ（`Administrators` と `SYSTEM` のみ許可）を作成したうえで、64 ビット版 `reg.exe` と 32 ビット版 `SysWOW64\reg.exe` で `HKLM` の該当キー（`Chrome`、`Edge` の 64/32 ビット双方、`ledr` URI、および `AppUserModelId\LocalEDR.AlertUI`）と `C:\ProgramData\LocalEDR\native-messaging` を退避し、全退避の成功を確認してから `setup` を実行してください。
 マシン単位で URI と AUMID を検証しない場合は、`setup` に `--skip-uri`、後片付けの `unregister` に `--keep-uri` を指定すると両キーを変更せずに検証できます。
 
@@ -102,6 +103,7 @@ if (-not [Environment]::Is64BitProcess) {
     throw "32 ビット版 PowerShell では System32 がリダイレクトされ 64 ビットビューを退避できないため、64 ビット版 PowerShell で実行してください。"
 }
 cd e:\Documents\code\LocalEDR
+$runDir = "<ウィンドウ B で表示された RunDir の絶対パス>"
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 $reg32 = "$env:SystemRoot\SysWOW64\reg.exe"
 $adminBackupDir = Join-Path $env:ProgramData ("LocalEDR-e2e-admin-backup-" + [guid]::NewGuid().ToString("N"))

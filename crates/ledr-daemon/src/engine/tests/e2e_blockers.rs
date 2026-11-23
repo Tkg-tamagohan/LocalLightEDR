@@ -9266,28 +9266,58 @@ async fn mem_maint_burst_01_runs_under_telemetry_backlog_and_stops_on_shutdown()
         table.on_process_stop(old_id.pid, now_ms - 90_000);
     }
 
+    struct FloodGuard {
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+    impl FloodGuard {
+        fn stop_and_join(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+    impl Drop for FloodGuard {
+        fn drop(&mut self) {
+            self.stop_and_join();
+        }
+    }
+
     let sender = engine.sender();
     let stop_flood = Arc::new(AtomicBool::new(false));
     let stop_flood_bg = Arc::clone(&stop_flood);
     let flood_thread = std::thread::spawn(move || {
         let mut seq = 0u64;
-        while !stop_flood_bg.load(Ordering::Acquire) {
+        'flood: while !stop_flood_bg.load(Ordering::Acquire) {
             if sender.telemetry_depth() < 2048 {
                 for _ in 0..64 {
+                    if stop_flood_bg.load(Ordering::Acquire) {
+                        break 'flood;
+                    }
                     seq = seq.wrapping_add(1);
-                    let _ = sender.send_telemetry(SensorEvent::DnsQuery {
-                        pid: 4242,
-                        query_name: format!("burst-{seq}.example.com"),
-                        query_type: 1,
-                        resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
-                        timestamp_ms: 1_700_000_000_000 + (seq as i64),
-                    });
+                    if sender
+                        .send_telemetry(SensorEvent::DnsQuery {
+                            pid: 4242,
+                            query_name: format!("burst-{seq}.example.com"),
+                            query_type: 1,
+                            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                            timestamp_ms: 1_700_000_000_000 + (seq as i64),
+                        })
+                        .is_err()
+                    {
+                        break 'flood;
+                    }
                 }
             } else {
                 std::thread::yield_now();
             }
         }
     });
+    let mut flood_guard = FloodGuard {
+        stop: stop_flood,
+        handle: Some(flood_thread),
+    };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while engine.tier2c_mem_maintenance_runs.load(Ordering::Acquire) == 0
@@ -9359,8 +9389,7 @@ async fn mem_maint_burst_01_runs_under_telemetry_backlog_and_stops_on_shutdown()
         );
     }
 
-    stop_flood.store(true, Ordering::Release);
-    flood_thread.join().expect("join flood thread");
+    flood_guard.stop_and_join();
     store.clear_shutdown_flag();
     engine.shutdown_and_flush().await.expect("shutdown engine");
 }

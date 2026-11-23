@@ -213,8 +213,8 @@ where
                     anyhow::anyhow!("--auth-helper-sha256 requires a SHA-256 hex argument")
                 })?;
                 let trimmed = val.to_string_lossy().trim().to_string();
-                if trimmed.is_empty() {
-                    anyhow::bail!("--auth-helper-sha256 cannot be empty");
+                if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    anyhow::bail!("--auth-helper-sha256 requires exactly 64 hexadecimal digits");
                 }
                 parsed.auth_helper_sha256 = Some(trimmed);
             }
@@ -818,6 +818,34 @@ mod tests {
             ("--bridge-root-thumbprint missing value", &["ledr-daemon", "--bridge-root-thumbprint"], false),
             ("--auth-helper-sha256 missing value", &["ledr-daemon", "--auth-helper-sha256"], false),
             ("--auth-helper-sha256 empty", &["ledr-daemon", "--auth-helper-sha256", "   "], false),
+            ("--auth-helper-sha256 short", &["ledr-daemon", "--auth-helper-sha256", "abcd"], false),
+            (
+                "--auth-helper-sha256 too long (65 hex)",
+                &[
+                    "ledr-daemon",
+                    "--auth-helper-sha256",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ],
+                false,
+            ),
+            (
+                "--auth-helper-sha256 non-hex chars",
+                &[
+                    "ledr-daemon",
+                    "--auth-helper-sha256",
+                    "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+                ],
+                false,
+            ),
+            (
+                "--auth-helper-sha256 valid uppercase 64 hex",
+                &[
+                    "ledr-daemon",
+                    "--auth-helper-sha256",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                ],
+                true,
+            ),
             ("--nrd-feed-url missing value", &["ledr-daemon", "--nrd-feed-url"], false),
             ("--nrd-feed-url whitespace", &["ledr-daemon", "--nrd-feed-url", "   "], false),
             ("--nrd-cache missing value", &["ledr-daemon", "--nrd-cache"], false),

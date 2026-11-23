@@ -13,7 +13,7 @@ use super::events::DnsCorrelationUpdate;
 use super::motw::{refresh_download_origins_after_purge, LateMotwAttribution};
 use super::nrd::{execute_nrd_refresh, NrdThreadHandle};
 use super::wfp_drops::{PendingWfpDrop, QueuedWfpDrop};
-use super::{current_unix_ms, DaemonEngine};
+use super::{current_unix_ms, DaemonEngine, StoreWriteGate};
 
 const HIGH_PRIORITY_MOTW_INTERLEAVE_STREAK: usize = 16;
 
@@ -287,11 +287,10 @@ impl DaemonEngine {
                         let retention_days = self.config.ttl_retention_days;
                         let write_gate = Arc::clone(&self.store_write_gate);
                         purge_in_flight = Some(tokio::task::spawn_blocking(move || {
-                            if *write_gate.read().unwrap_or_else(|e| e.into_inner()) {
-                                return;
-                            }
                             let now_ms = current_unix_ms();
-                            match store.purge_expired(now_ms, retention_days) {
+                            match store.purge_expired_with_guard(now_ms, retention_days, || {
+                                StoreWriteGate::enter_op(&write_gate)
+                            }) {
                                 Ok(stats) => {
                                     refresh_download_origins_after_purge(
                                         &dl_state,
@@ -461,11 +460,16 @@ impl DaemonEngine {
             if self.is_shutdown_drain_cutoff() {
                 return Ok(WorkerExit::DrainTruncated);
             }
-            if pending.reason.includes_attribution_grace() {
+            if pending.reason.includes_attribution_grace() && !pending.confirmed_ambiguous {
                 // Never freeze a process on attribution-grace expiry during daemon shutdown.
                 continue;
             }
-            self.handle_wfp_drop_event_now(&pending.item);
+            self.handle_wfp_drop_event_with_context(
+                &pending.item,
+                None,
+                pending.confirmed_ambiguous,
+                None,
+            );
             tokio::task::yield_now().await;
         }
 

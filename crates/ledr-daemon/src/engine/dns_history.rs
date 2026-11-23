@@ -39,6 +39,13 @@ impl LatestDomainIps {
 
 const MAX_RESOLVERS_PER_EXE_IP: usize = 8;
 
+#[derive(Debug, Clone)]
+pub(super) struct ExeIpResolverRecord {
+    pub(super) instance_id: String,
+    pub(super) dns_timestamp_ms: i64,
+    pub(super) process_created_at_ms: Option<i64>,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ProcessDnsHistory {
     capacity: usize,
@@ -46,7 +53,7 @@ pub(super) struct ProcessDnsHistory {
     insertion_order: VecDeque<(String, IpAddr)>,
     pub(super) latest_domain_by_exe: HashMap<(String, String), LatestDomainIps>,
     latest_domain_order: VecDeque<(String, String)>,
-    recent_exe_ip_resolvers: HashMap<(String, IpAddr), Vec<(String, i64)>>,
+    recent_exe_ip_resolvers: HashMap<(String, IpAddr), Vec<ExeIpResolverRecord>>,
     recent_exe_ip_order: VecDeque<(String, IpAddr)>,
 }
 
@@ -74,6 +81,7 @@ impl ProcessDnsHistory {
         self.record_for_exe(process_instance_id, "", query_name, resolved_ips, timestamp_ms);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn record_for_exe(
         &mut self,
         process_instance_id: &str,
@@ -81,6 +89,25 @@ impl ProcessDnsHistory {
         query_name: &str,
         resolved_ips: &[IpAddr],
         timestamp_ms: i64,
+    ) -> Vec<IpAddr> {
+        self.record_for_exe_with_created_at(
+            process_instance_id,
+            exe_key,
+            query_name,
+            resolved_ips,
+            timestamp_ms,
+            None,
+        )
+    }
+
+    pub(super) fn record_for_exe_with_created_at(
+        &mut self,
+        process_instance_id: &str,
+        exe_key: &str,
+        query_name: &str,
+        resolved_ips: &[IpAddr],
+        timestamp_ms: i64,
+        process_created_at_ms: Option<i64>,
     ) -> Vec<IpAddr> {
         let norm_domain = query_name.trim().trim_end_matches('.').to_ascii_lowercase();
         if norm_domain.is_empty() || resolved_ips.is_empty() {
@@ -272,24 +299,31 @@ impl ProcessDnsHistory {
             if !exe_norm.is_empty() {
                 let resolver_key = (exe_norm.clone(), canon);
                 if let Some(resolvers) = self.recent_exe_ip_resolvers.get_mut(&resolver_key) {
-                    if let Some((_, prev_ts)) = resolvers
+                    if let Some(existing) = resolvers
                         .iter_mut()
-                        .find(|(inst_id, _)| inst_id == process_instance_id)
+                        .find(|r| r.instance_id == process_instance_id)
                     {
-                        *prev_ts = (*prev_ts).max(timestamp_ms);
+                        existing.dns_timestamp_ms = existing.dns_timestamp_ms.max(timestamp_ms);
+                        if existing.process_created_at_ms.is_none() {
+                            existing.process_created_at_ms = process_created_at_ms;
+                        }
                     } else {
                         while resolvers.len() >= MAX_RESOLVERS_PER_EXE_IP {
                             if let Some((oldest_idx, _)) = resolvers
                                 .iter()
                                 .enumerate()
-                                .min_by_key(|(idx, (_, ts))| (*ts, *idx))
+                                .min_by_key(|(idx, r)| (r.dns_timestamp_ms, *idx))
                             {
                                 resolvers.remove(oldest_idx);
                             } else {
                                 break;
                             }
                         }
-                        resolvers.push((process_instance_id.to_string(), timestamp_ms));
+                        resolvers.push(ExeIpResolverRecord {
+                            instance_id: process_instance_id.to_string(),
+                            dns_timestamp_ms: timestamp_ms,
+                            process_created_at_ms,
+                        });
                     }
                 } else {
                     while self.recent_exe_ip_resolvers.len() >= self.capacity {
@@ -299,8 +333,14 @@ impl ProcessDnsHistory {
                         self.recent_exe_ip_resolvers.remove(&oldest);
                     }
                     self.recent_exe_ip_order.push_back(resolver_key.clone());
-                    self.recent_exe_ip_resolvers
-                        .insert(resolver_key, vec![(process_instance_id.to_string(), timestamp_ms)]);
+                    self.recent_exe_ip_resolvers.insert(
+                        resolver_key,
+                        vec![ExeIpResolverRecord {
+                            instance_id: process_instance_id.to_string(),
+                            dns_timestamp_ms: timestamp_ms,
+                            process_created_at_ms,
+                        }],
+                    );
                 }
             }
         }
@@ -583,6 +623,7 @@ impl ProcessDnsHistory {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn has_fresh_ip_record_for_other_instance(
         &self,
         exe_key: &str,
@@ -590,6 +631,8 @@ impl ProcessDnsHistory {
         ip: IpAddr,
         event_ts_ms: i64,
         max_age_ms: i64,
+        max_process_created_at_ms: i64,
+        max_post_event_skew_ms: i64,
     ) -> bool {
         let exe_norm = exe_key.trim().to_ascii_lowercase();
         if exe_norm.is_empty() || max_age_ms < 0 {
@@ -599,10 +642,14 @@ impl ProcessDnsHistory {
         let Some(resolvers) = self.recent_exe_ip_resolvers.get(&(exe_norm, canon)) else {
             return false;
         };
-        resolvers.iter().any(|(inst_id, ts_ms)| {
-            inst_id != exclude_instance_id
-                && event_ts_ms.saturating_sub(*ts_ms) <= max_age_ms
-                && *ts_ms <= event_ts_ms.saturating_add(1_000)
+        let max_dns_ts = event_ts_ms.saturating_add(max_post_event_skew_ms.max(0));
+        resolvers.iter().any(|rec| {
+            rec.instance_id != exclude_instance_id
+                && event_ts_ms.saturating_sub(rec.dns_timestamp_ms) <= max_age_ms
+                && rec.dns_timestamp_ms <= max_dns_ts
+                && rec
+                    .process_created_at_ms
+                    .is_some_and(|created_ms| created_ms <= max_process_created_at_ms)
         })
     }
 

@@ -70,6 +70,83 @@ const WFP_DROP_DEDUP_WINDOW_MS: i64 = 250;
 const APP_WFP_ALERT_DEDUP_CAPACITY: usize = 512;
 const AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS: i64 = 60_000;
 
+#[derive(Debug, Default)]
+struct WriteGateState {
+    closed: bool,
+    in_flight: usize,
+}
+
+/// Coordinates engine-initiated SQLite mutations with graceful shutdown (`FU-E2E-05`).
+///
+/// Multi-step transactions + compensation rollbacks (e.g., `resolve_alert_with_outcome`,
+/// `upsert_policy_rule`, `delete_policy_rule`) and per-batch TTL purges hold a [`WriteOpGuard`]
+/// across the whole logical operation, ensuring an already-admitted rollback completes before
+/// final `wal_checkpoint(TRUNCATE)` while new operations fail closed once shutdown starts.
+#[derive(Debug, Default)]
+pub(super) struct StoreWriteGate {
+    state: Mutex<WriteGateState>,
+    notify_idle: tokio::sync::Notify,
+}
+
+pub(super) struct WriteOpGuard {
+    gate: Arc<StoreWriteGate>,
+}
+
+impl Drop for WriteOpGuard {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.in_flight == 0 {
+            self.gate.notify_idle.notify_waiters();
+        }
+    }
+}
+
+impl WriteOpGuard {
+    pub(super) fn write<T>(
+        &self,
+        store: &LedrStore,
+        op: impl FnOnce(&LedrStore) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        op(store)
+    }
+}
+
+impl StoreWriteGate {
+    pub(super) fn enter_op(gate: &Arc<Self>) -> Option<WriteOpGuard> {
+        let mut state = gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return None;
+        }
+        state.in_flight = state.in_flight.saturating_add(1);
+        Some(WriteOpGuard {
+            gate: Arc::clone(gate),
+        })
+    }
+
+    pub(super) async fn close_and_wait_idle(&self, deadline: tokio::time::Instant) -> bool {
+        let mut notified = std::pin::pin!(self.notify_idle.notified());
+        loop {
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.closed = true;
+                if state.in_flight == 0 {
+                    return true;
+                }
+            }
+            if tokio::time::timeout_at(deadline, notified.as_mut())
+                .await
+                .is_err()
+            {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                return state.in_flight == 0;
+            }
+            notified.set(self.notify_idle.notified());
+        }
+    }
+}
+
 /// Resident Layer 2 detection and persistence pipeline engine.
 pub struct DaemonEngine {
     config: DaemonConfig,
@@ -130,7 +207,7 @@ pub struct DaemonEngine {
     shutdown_initiated: Arc<AtomicBool>,
     shutdown_drain_cutoff: Arc<AtomicBool>,
     shutdown_cutoff_notify: Arc<tokio::sync::Notify>,
-    store_write_gate: Arc<RwLock<bool>>,
+    store_write_gate: Arc<StoreWriteGate>,
     worker_handle: tokio::sync::Mutex<Option<JoinHandle<Result<WorkerExit, StoreError>>>>,
 }
 
@@ -254,14 +331,8 @@ impl DaemonEngine {
         &self,
         op: impl FnOnce(&LedrStore) -> Result<T, StoreError>,
     ) -> Option<Result<T, StoreError>> {
-        let closed = self
-            .store_write_gate
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        if *closed {
-            return None;
-        }
-        Some(op(&self.store))
+        let guard = StoreWriteGate::enter_op(&self.store_write_gate)?;
+        Some(guard.write(&self.store, op))
     }
 
     pub(super) fn inspect_binary_for_pipeline(&self, exe_path: &str) -> InspectOutcome {

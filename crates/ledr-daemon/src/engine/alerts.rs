@@ -16,7 +16,9 @@ use super::domain_policy::{
     extend_authorizing_hints_from_existing_permit, partition_permit_hints,
     select_outbound_decision_for_domains,
 };
-use super::{current_unix_ms, DaemonEngine, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS};
+use super::{
+    current_unix_ms, DaemonEngine, StoreWriteGate, WriteOpGuard, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS,
+};
 
 /// Outcome of a successful [`DaemonEngine::resolve_alert_with_outcome`] call.
 #[derive(Debug)]
@@ -49,6 +51,8 @@ impl DaemonEngine {
         decision: AlertDecision,
     ) -> Result<ResolvedAlertOutcome, String> {
         let _resolve_guard = self.resolve_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let write_guard = StoreWriteGate::enter_op(&self.store_write_gate)
+            .ok_or_else(|| "daemon store writes closed for shutdown".to_string())?;
         let mut saved_rule_id: Option<String> = None;
         let mut alert = self
             .store
@@ -71,9 +75,10 @@ impl DaemonEngine {
                     add_block_rule: false,
                 } => {
                     let new_status = decision.resulting_status();
-                    let updated = self
-                        .try_store_write(|s| s.update_alert_status(alert_id, new_status, Some(now_ms)))
-                        .unwrap_or_else(|| Err(Self::store_write_closed_err()))
+                    let updated = write_guard
+                        .write(&self.store, |s| {
+                            s.update_alert_status(alert_id, new_status, Some(now_ms))
+                        })
                         .map_err(|err| format!("failed to update alert status: {err}"))?;
                     if !updated {
                         return Err(format!("alert {alert_id} not found"));
@@ -316,6 +321,7 @@ impl DaemonEngine {
                 }
 
                 if let Err(err) = self.resume_alert_targets_if_unblocked(
+                    &write_guard,
                     &alert,
                     identity,
                     &own_suspended_children,
@@ -381,8 +387,8 @@ impl DaemonEngine {
                 let prev_network_rules = (scope == RuleScope::NetworkAllow
                     && self.config.outbound_firewall_enabled)
                     .then(|| self.store.list_network_rules().unwrap_or_default());
-                self.try_store_write(|s| s.upsert_rule(&rule))
-                    .unwrap_or_else(|| Err(Self::store_write_closed_err()))
+                write_guard
+                    .write(&self.store, |s| s.upsert_rule(&rule))
                     .map_err(|err| format!("failed to store permanent allowlist rule: {err}"))?;
                 saved_rule_id = Some(rule.rule_id.clone());
 
@@ -403,7 +409,7 @@ impl DaemonEngine {
                             }
                         }
                         Err(err) => {
-                            self.rollback_saved_rule(&rule.rule_id);
+                            self.rollback_saved_rule(&write_guard, &rule.rule_id);
                             return Err(err);
                         }
                     }
@@ -607,7 +613,7 @@ impl DaemonEngine {
                         Ok(report) => applied_wfp_report = Some(report),
                         Err(boxed) => {
                             let (err, failed_report) = *boxed;
-                            self.rollback_saved_rule(&rule.rule_id);
+                            self.rollback_saved_rule(&write_guard, &rule.rule_id);
                             self.compensate_failed_wfp_report(&failed_report);
                             self.maybe_apply_preemptive_wfp_block(&exe);
                             self.rollback_allow_once_wfp(
@@ -625,6 +631,7 @@ impl DaemonEngine {
                 drop(_policy_guard);
 
                 if let Err(err) = self.resume_alert_targets_if_unblocked(
+                    &write_guard,
                     &alert,
                     identity,
                     &own_suspended_children,
@@ -633,7 +640,7 @@ impl DaemonEngine {
                     {
                         let _policy_guard =
                             self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
-                        self.rollback_saved_rule(&rule.rule_id);
+                        self.rollback_saved_rule(&write_guard, &rule.rule_id);
                         if scope == RuleScope::NetworkAllow && self.config.outbound_firewall_enabled
                         {
                             // Reconcile first so any newly added PersistedPolicy/DomainPolicy
@@ -736,8 +743,8 @@ impl DaemonEngine {
                             .config
                             .outbound_firewall_enabled
                             .then(|| self.store.list_network_rules().unwrap_or_default());
-                        self.try_store_write(|s| s.upsert_rule(&block_rule))
-                            .unwrap_or_else(|| Err(Self::store_write_closed_err()))
+                        write_guard
+                            .write(&self.store, |s| s.upsert_rule(&block_rule))
                             .map_err(|err| format!("failed to store block rule: {err}"))?;
                         saved_rule_id = Some(block_rule.rule_id.clone());
                         if self.config.outbound_firewall_enabled {
@@ -745,7 +752,7 @@ impl DaemonEngine {
                                 prev_network_rules.as_deref(),
                             );
                             if let Some(summary) = report.failure_summary_for_rules(&[&block_rule]) {
-                                self.rollback_saved_rule(&block_rule.rule_id);
+                                self.rollback_saved_rule(&write_guard, &block_rule.rule_id);
                                 self.compensate_failed_wfp_report(&report);
                                 return Err(format!(
                                     "failed synchronizing WFP firewall rule for NetworkBlock {}: {summary}",
@@ -792,9 +799,10 @@ impl DaemonEngine {
             }
         }
 
-        let status_result = self
-            .try_store_write(|s| s.update_alert_status(alert_id, new_status, Some(now_ms)))
-            .unwrap_or_else(|| Err(Self::store_write_closed_err()))
+        let status_result = write_guard
+            .write(&self.store, |s| {
+                s.update_alert_status(alert_id, new_status, Some(now_ms))
+            })
             .map_err(|err| format!("failed to update alert status: {err}"))
             .and_then(|updated| {
                 if updated {
@@ -806,7 +814,7 @@ impl DaemonEngine {
         if let Err(err) = status_result {
             if let Some(rule_id) = saved_rule_id.take() {
                 let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
-                self.rollback_saved_rule(&rule_id);
+                self.rollback_saved_rule(&write_guard, &rule_id);
                 if self.config.outbound_firewall_enabled {
                     if let Some(rep) = applied_wfp_report.take() {
                         self.compensate_failed_wfp_report(&rep);
@@ -847,7 +855,12 @@ impl DaemonEngine {
         if let Some(ref proc_inst_id) = alert.process_instance_id {
             self.clear_alert_dedup_from_context_val(proc_inst_id, &alert.source_layer, &ctx_val);
             if is_terminate {
-                self.resolve_sibling_alerts_as_terminated(alert_id, proc_inst_id, now_ms);
+                self.resolve_sibling_alerts_as_terminated(
+                    &write_guard,
+                    alert_id,
+                    proc_inst_id,
+                    now_ms,
+                );
             }
         }
 
@@ -935,6 +948,7 @@ impl DaemonEngine {
     /// sibling can orphan frozen children.
     fn transfer_deferred_suspended_children(
         &self,
+        write_guard: &WriteOpGuard,
         source_alert_id: &str,
         parent_holding_siblings: &[AlertRecord],
         deferred_children: &[ProcessIdentity],
@@ -1002,30 +1016,27 @@ impl DaemonEngine {
                 "suspended_children".to_string(),
                 serde_json::Value::Array(merged_entries),
             );
-            match self.try_store_write(|s| {
+            match write_guard.write(&self.store, |s| {
                 s.update_alert_suspension_state(
                     &sibling.alert_id,
                     sibling.process_suspended,
                     &ctx_val.to_string(),
                 )
             }) {
-                Some(Ok(true)) => {
+                Ok(true) => {
                     adopted_count += 1;
                 }
-                Some(Ok(false)) => {
+                Ok(false) => {
                     last_err = Some(format!(
                         "sibling alert {} disappeared while transferring suspended_children",
                         sibling.alert_id
                     ));
                 }
-                Some(Err(err)) => {
+                Err(err) => {
                     last_err = Some(format!(
                         "failed updating sibling alert {} suspended_children: {err}",
                         sibling.alert_id
                     ));
-                }
-                None => {
-                    last_err = Some("daemon store writes closed for shutdown".to_string());
                 }
             }
         }
@@ -1049,6 +1060,7 @@ impl DaemonEngine {
     /// `suspended_children` onto surviving parent-holding sibling alerts).
     fn resume_alert_targets_if_unblocked(
         &self,
+        write_guard: &WriteOpGuard,
         alert: &AlertRecord,
         identity: Option<ProcessIdentity>,
         own_suspended_children: &[ProcessIdentity],
@@ -1084,6 +1096,7 @@ impl DaemonEngine {
                 .filter(|child| !other_held_identities.contains(child))
                 .collect();
             self.transfer_deferred_suspended_children(
+                write_guard,
                 alert_id,
                 &parent_holding_siblings,
                 &deferred_children,
@@ -1123,8 +1136,8 @@ impl DaemonEngine {
     /// Best-effort rollback of a rule stored by a failed
     /// [`DaemonEngine::resolve_alert_with_outcome`] call so a rejected resume or status update
     /// cannot leave a permanent allow/block rule active (BUG_0001).
-    fn rollback_saved_rule(&self, rule_id: &str) {
-        if let Some(Err(err)) = self.try_store_write(|s| s.delete_rule(rule_id)) {
+    fn rollback_saved_rule(&self, write_guard: &WriteOpGuard, rule_id: &str) {
+        if let Err(err) = write_guard.write(&self.store, |s| s.delete_rule(rule_id)) {
             tracing::warn!(
                 rule_id = %rule_id,
                 error = %err,
@@ -1213,6 +1226,7 @@ impl DaemonEngine {
 
     fn resolve_sibling_alerts_as_terminated(
         &self,
+        write_guard: &WriteOpGuard,
         resolved_alert_id: &str,
         proc_inst_id: &str,
         now_ms: i64,
@@ -1222,15 +1236,13 @@ impl DaemonEngine {
         };
         for other in unresolved {
             if other.alert_id != resolved_alert_id {
-                let Some(update_res) = self.try_store_write(|s| {
+                let update_res = write_guard.write(&self.store, |s| {
                     s.update_alert_status(
                         &other.alert_id,
                         AlertStatus::TerminatedBlocked,
                         Some(now_ms),
                     )
-                }) else {
-                    break;
-                };
+                });
                 match update_res {
                     Ok(true) => {
                         let ctx: serde_json::Value = serde_json::from_str(&other.context_json)

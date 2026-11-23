@@ -288,7 +288,7 @@ impl DaemonEngine {
             shutdown_initiated: Arc::new(AtomicBool::new(false)),
             shutdown_drain_cutoff: Arc::new(AtomicBool::new(false)),
             shutdown_cutoff_notify: Arc::new(tokio::sync::Notify::new()),
-            store_write_gate: Arc::new(RwLock::new(false)),
+            store_write_gate: Arc::new(super::StoreWriteGate::default()),
             worker_handle: tokio::sync::Mutex::new(None),
         });
 
@@ -466,17 +466,10 @@ impl DaemonEngine {
             guard.take()
         };
 
-        let mut worker_checkpointed = false;
-        let mut drain_truncated = false;
         let mut drain_err: Option<anyhow::Error> = None;
         if let Some(mut h) = handle {
             match tokio::time::timeout_at(deadline, &mut h).await {
-                Ok(Ok(Ok(WorkerExit::Completed))) => {
-                    worker_checkpointed = true;
-                }
-                Ok(Ok(Ok(WorkerExit::DrainTruncated))) => {
-                    drain_truncated = true;
-                }
+                Ok(Ok(Ok(WorkerExit::Completed | WorkerExit::DrainTruncated))) => {}
                 Ok(Ok(Err(store_err))) => {
                     drain_err = Some(anyhow::Error::new(store_err));
                 }
@@ -508,31 +501,33 @@ impl DaemonEngine {
         self.shutdown_drain_cutoff.store(true, Ordering::Release);
         self.shutdown_cutoff_notify.notify_waiters();
 
-        let mut needs_checkpoint = !worker_checkpointed || drain_truncated;
-        if self.config.resume_suspended_on_shutdown
-            && self.resume_unresolved_suspended_processes_on_shutdown(deadline)
-        {
-            needs_checkpoint = true;
+        if self.config.resume_suspended_on_shutdown {
+            let _ = self.resume_unresolved_suspended_processes_on_shutdown(deadline);
         }
 
-        // Atomically close engine-initiated SQLite writes and run WAL truncation BEFORE waiting on
-        // any remaining NRD refresh thread so neither slow/wedged NRD I/O nor residual pipeline/IPC
-        // tasks can delay checkpointing or regenerate `-wal` (`AUTO-10`, `R-11`, `FU-E2E-05`).
-        {
-            let mut closed = self
-                .store_write_gate
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            *closed = true;
-            if needs_checkpoint || self.store.buffered_len() > 0 {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let cp_budget = remaining
-                    .max(Duration::from_millis(100))
-                    .min(Duration::from_millis(500));
-                self.store
-                    .checkpoint_truncate_with_deadline(std::time::Instant::now() + cp_budget)?;
-            }
+        // Atomically close engine-initiated SQLite writes, drain any already-admitted multi-step
+        // operations (alerts/policy rollbacks, per-batch TTL purges), and run final WAL truncation
+        // strictly BEFORE waiting on any remaining NRD refresh thread (`AUTO-10`, `R-11`, `FU-E2E-05`).
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let gate_budget = remaining
+            .max(Duration::from_millis(100))
+            .min(Duration::from_millis(500));
+        let gate_idle = self
+            .store_write_gate
+            .close_and_wait_idle(tokio::time::Instant::now() + gate_budget)
+            .await;
+        if !gate_idle {
+            tracing::warn!(
+                "timed out waiting for in-flight store write operations before WAL checkpoint"
+            );
         }
+        let cp_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let cp_budget = cp_remaining
+            .max(Duration::from_millis(100))
+            .min(Duration::from_millis(500));
+        let _ = self
+            .store
+            .checkpoint_truncate_with_deadline(std::time::Instant::now() + cp_budget)?;
 
         let nrd_handle = {
             let mut guard = self

@@ -8,7 +8,7 @@ use ledr_store::StoreError;
 
 use crate::firewall::{WfpFailedOp, WfpReconcileDnsContext, WfpReconcileReport};
 
-use super::DaemonEngine;
+use super::{DaemonEngine, StoreWriteGate};
 
 /// Errors returned when validating or persisting a policy rule via [`DaemonEngine::upsert_policy_rule`].
 #[derive(Debug)]
@@ -273,6 +273,8 @@ impl DaemonEngine {
     ) -> Result<WfpReconcileReport, PolicyRuleError> {
         validate_policy_rule(rule).map_err(PolicyRuleError::Invalid)?;
         let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let write_guard = StoreWriteGate::enter_op(&self.store_write_gate)
+            .ok_or_else(Self::store_write_closed_err)?;
         let previous = self.store.get_rule(&rule.rule_id)?;
         let previous_was_network = previous
             .as_ref()
@@ -283,8 +285,7 @@ impl DaemonEngine {
                 .then(|| self.store.list_network_rules())
                 .transpose()?;
 
-        self.try_store_write(|s| s.upsert_rule(rule))
-            .unwrap_or_else(|| Err(Self::store_write_closed_err()))?;
+        write_guard.write(&self.store, |s| s.upsert_rule(rule))?;
         if let Some(ref prev_rules) = prev_network_rules {
             let report = self.deploy_persisted_network_rules_with_baseline(Some(prev_rules));
             let mut affected: Vec<&AllowlistRuleRecord> = Vec::with_capacity(2);
@@ -297,12 +298,10 @@ impl DaemonEngine {
                 }
             }
             if let Some(err_summary) = report.failure_summary_for_rules(&affected) {
-                let comp_res = self
-                    .try_store_write(|s| match previous {
-                        Some(ref prev) => s.upsert_rule(prev),
-                        None => s.delete_rule(&rule.rule_id).map(|_| ()),
-                    })
-                    .unwrap_or_else(|| Err(Self::store_write_closed_err()));
+                let comp_res = write_guard.write(&self.store, |s| match previous {
+                    Some(ref prev) => s.upsert_rule(prev),
+                    None => s.delete_rule(&rule.rule_id).map(|_| ()),
+                });
                 if let Err(comp_err) = comp_res {
                     tracing::warn!(
                         rule_id = %rule.rule_id,
@@ -354,6 +353,8 @@ impl DaemonEngine {
         rule_id: &str,
     ) -> Result<(bool, WfpReconcileReport), PolicyRuleError> {
         let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let write_guard = StoreWriteGate::enter_op(&self.store_write_gate)
+            .ok_or_else(Self::store_write_closed_err)?;
         let existing = self.store.get_rule(rule_id)?;
         let existing_is_network = existing.as_ref().is_some_and(|r| {
             matches!(r.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow)
@@ -361,9 +362,7 @@ impl DaemonEngine {
         let prev_network_rules = (self.config.outbound_firewall_enabled && existing_is_network)
             .then(|| self.store.list_network_rules())
             .transpose()?;
-        let deleted = self
-            .try_store_write(|s| s.delete_rule(rule_id))
-            .unwrap_or_else(|| Err(Self::store_write_closed_err()))?;
+        let deleted = write_guard.write(&self.store, |s| s.delete_rule(rule_id))?;
         if deleted {
             if let Some(ref prev_rules) = prev_network_rules {
                 let report = self.deploy_persisted_network_rules_with_baseline(Some(prev_rules));
@@ -372,8 +371,7 @@ impl DaemonEngine {
                     .and_then(|prev| report.failure_summary_for_rules(&[prev]));
                 if let Some(err_summary) = err_summary {
                     if let Some(ref prev) = existing {
-                        if let Some(Err(comp_err)) =
-                            self.try_store_write(|s| s.upsert_rule(prev))
+                        if let Err(comp_err) = write_guard.write(&self.store, |s| s.upsert_rule(prev))
                         {
                             tracing::warn!(
                                 rule_id = %rule_id,

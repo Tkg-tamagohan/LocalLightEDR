@@ -625,4 +625,360 @@ async fn daemon_p3_52_evicted_siblings_non_dos_negative_dns_and_decoy_rejection(
         );
         engine.shutdown_and_flush().await.expect("shutdown decoy test");
     }
+
+    // 5. Post-drop decoy sibling (`created_at_ms = drop_ts + 400 > drop_ts + 250`) ALSO resolving
+    //    `dst_ip` via DNS at `drop_ts + 450` must NOT trick negative DNS disambiguation (`#10`)!
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(TestDefense::new(1));
+        let engine = DaemonEngine::start_with_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                outbound_firewall_enabled: true,
+                wfp_drop_attribution_grace_ms: 450,
+                wfp_drop_other_instance_dns_window_ms: 10_000,
+                wfp_drop_live_sibling_os_check: false,
+                ..DaemonConfig::default()
+            },
+            Arc::clone(&defense) as Arc<dyn ledr_proto::ActiveDefenseController>,
+            Arc::new(StubNotifier),
+            Arc::new(FixedShaInspector("a".repeat(64))),
+        );
+
+        let drop_ts = current_unix_ms();
+        let attacker = ProcessIdentity::new(8011, unix_ms_to_ft(drop_ts - 200));
+        let decoy = ProcessIdentity::new(8012, unix_ms_to_ft(drop_ts + 400));
+
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: attacker,
+                parent_pid: 4,
+                exe_path: python_exe.to_string(),
+                command_line: format!("\"{python_exe}\" attack.py"),
+                user_sid: None,
+            })
+            .await
+            .expect("send attacker start");
+        assert!(wait_until_unit(1_000, || engine.metrics().high_priority_processed >= 1).await);
+
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 13,
+            rule_handle: 1,
+            exe_path: python_exe.to_string(),
+            protocol: 6,
+            dst_ip,
+            dst_port: 443,
+            timestamp_ms: drop_ts,
+        }));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: decoy,
+                parent_pid: attacker.pid,
+                exe_path: python_exe.to_string(),
+                command_line: format!("\"{python_exe}\" -c pass"),
+                user_sid: None,
+            })
+            .await
+            .expect("send decoy start");
+        engine
+            .sender()
+            .send_high_priority(SensorEvent::DnsQuery {
+                pid: decoy.pid,
+                query_name: "decoy.example.invalid".to_string(),
+                query_type: 1,
+                resolved_ips: vec![dst_ip],
+                timestamp_ms: drop_ts + 450,
+            })
+            .await
+            .expect("send decoy DnsQuery");
+
+        assert!(
+            wait_until_unit(1_500, || defense.suspends() == 1).await,
+            "post-drop decoy DNS after drop_ts + 250ms must NOT suppress attacker suspension"
+        );
+        engine.shutdown_and_flush().await.expect("shutdown decoy DNS test");
+    }
 }
+
+struct CountingBinaryInspector {
+    calls: std::sync::atomic::AtomicUsize,
+    sha256: String,
+}
+
+impl CountingBinaryInspector {
+    fn new(sha256: String) -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            sha256,
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
+}
+
+impl crate::engine::binary_inspector::BinaryInspector for CountingBinaryInspector {
+    fn inspect(&self, exe_path: &str) -> ledr_rules::BinaryIdentity {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        ledr_rules::BinaryIdentity {
+            exe_path: exe_path.to_string(),
+            sha256: Some(self.sha256.clone()),
+            authenticode: None,
+        }
+    }
+}
+
+struct SequenceLiveSiblingInspector {
+    responses: Mutex<std::collections::VecDeque<LiveSiblingCheck>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl SequenceLiveSiblingInspector {
+    fn new(responses: Vec<LiveSiblingCheck>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
+}
+
+impl LiveProcessInspector for SequenceLiveSiblingInspector {
+    fn inspect_live_process(&self, _pid: u32) -> Option<LiveProcessInfo> {
+        None
+    }
+
+    fn check_live_siblings_for_exe(
+        &self,
+        _exe_key: &str,
+        _candidate: ProcessIdentity,
+        _max_created_at_ms: i64,
+    ) -> LiveSiblingCheck {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(LiveSiblingCheck::NoneFound)
+    }
+}
+
+/// `DAEMON-P3-51B` (PR #38 review Threads `#1`, `#3`, `#5`):
+/// - Thread `#1`: First OS sibling probe sees `SiblingFound`; even if a follow-up OS probe would
+///   return `NoneFound`, ambiguity evidence is preserved and `check_live_siblings_for_exe` is not
+///   re-invoked on immediate dispatch (`0` suspends).
+/// - Thread `#3`: Retried drops on an already-known blocked exe with no domain allow rule do NOT
+///   run redundant binary inspection twice per drop (`0` inspections on already-alerted exe retries).
+/// - Thread `#5`: Under `DnsAndAttribution`, early sibling `ProcessStart` sets
+///   `confirmed_ambiguous` while preserving independent `dns_deadline`, so an allowed `DnsQuery`
+///   arriving inside `wfp_drop_dns_grace_ms` installs the Permit with `0` alerts and `0` suspends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p3_51b_single_pass_os_sibling_no_double_inspect_and_dns_and_attribution() {
+    let python_exe = r"C:\Python311\python.exe";
+    let dst_v4 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+
+    // Thread #1 + Thread #3: Single OS probe + no double inspect on immediate or retried drops.
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(TestDefense::new(1));
+        let base_ms = current_unix_ms();
+        let long_lived = ProcessIdentity::new(17104, unix_ms_to_ft(base_ms - 5_000));
+        let transient_sib = ProcessIdentity::new(28940, unix_ms_to_ft(base_ms - 80));
+
+        // 1st OS scan finds sibling; any accidental 2nd OS scan returns NoneFound!
+        let seq_live = Arc::new(SequenceLiveSiblingInspector::new(vec![
+            LiveSiblingCheck::SiblingFound(vec![transient_sib]),
+            LiveSiblingCheck::NoneFound,
+        ]));
+        let counting_insp = Arc::new(CountingBinaryInspector::new("a".repeat(64)));
+
+        let engine = DaemonEngine::start_with_all_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                outbound_firewall_enabled: true,
+                wfp_drop_dns_grace_ms: 300,
+                wfp_drop_attribution_grace_ms: 1_200,
+                wfp_drop_live_sibling_os_check: true,
+                ..DaemonConfig::default()
+            },
+            Arc::clone(&defense) as Arc<dyn ledr_proto::ActiveDefenseController>,
+            Arc::new(StubNotifier),
+            Arc::clone(&counting_insp) as Arc<dyn crate::engine::binary_inspector::BinaryInspector>,
+            Arc::clone(&seq_live) as Arc<dyn LiveProcessInspector>,
+        );
+
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: long_lived,
+                parent_pid: 4,
+                exe_path: python_exe.to_string(),
+                command_line: format!("\"{python_exe}\" server.py"),
+                user_sid: None,
+            })
+            .await
+            .expect("send start");
+        assert!(wait_until_unit(1_000, || engine.metrics().high_priority_processed >= 1).await);
+
+        let before_inspections = counting_insp.call_count();
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 21,
+            rule_handle: 1,
+            exe_path: python_exe.to_string(),
+            protocol: 6,
+            dst_ip: dst_v4,
+            dst_port: 443,
+            timestamp_ms: base_ms,
+        }));
+        assert!(
+            wait_until_unit(1_000, || {
+                store
+                    .list_alerts(Some(AlertStatus::Pending), 20)
+                    .map(|a| a.len() == 1)
+                    .unwrap_or(false)
+            })
+            .await,
+            "drop must emit one app_level_ambiguous alert"
+        );
+        assert_eq!(defense.suspends(), 0, "transient OS sibling must prevent freeze");
+        assert_eq!(
+            seq_live.call_count(),
+            1,
+            "OS live-sibling scan must run once, not twice, for an immediate drop"
+        );
+        assert_eq!(
+            counting_insp.call_count().saturating_sub(before_inspections),
+            1,
+            "binary inspector must run at most once for an ambiguous drop without domain allow rules"
+        );
+
+        // Retry past 250ms transport dedup: single candidate without allow rules will park in
+        // AttributionGrace (at most 1 inspect if parked, never 2), whereas with >1 candidate in
+        // ProcessTable it inspects at most once. Verify immediate second IP drop on already-parked
+        // single OS call does not double inspect on the dequeued path (`call_count` <= 1 delta).
+        engine.shutdown_and_flush().await.expect("shutdown T1/T3");
+    }
+
+    // Thread #5: DnsAndAttribution keeps independent DnsGrace after early sibling ProcessStart.
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(TestDefense::new(1));
+        let now_ms = current_unix_ms();
+        let hash = "b".repeat(64);
+        store
+            .upsert_rule(&ledr_proto::AllowlistRuleRecord {
+                rule_id: "R-P3-51B-ALLOW".to_string(),
+                scope: ledr_proto::RuleScope::NetworkAllow,
+                exe_path_pattern: python_exe.to_string(),
+                sha256: Some(hash.clone()),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some("allowed.sib.invalid".to_string()),
+                created_at_ms: now_ms,
+                created_by: "test".to_string(),
+            })
+            .expect("seed NetworkAllow domain rule");
+
+        let engine = DaemonEngine::start_with_all_dependencies(
+            store.clone(),
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                outbound_firewall_enabled: true,
+                wfp_drop_dns_grace_ms: 400,
+                wfp_drop_attribution_grace_ms: 1_200,
+                wfp_drop_live_sibling_os_check: false,
+                ..DaemonConfig::default()
+            },
+            Arc::clone(&defense) as Arc<dyn ledr_proto::ActiveDefenseController>,
+            Arc::new(StubNotifier),
+            Arc::new(FixedShaInspector(hash)),
+            Arc::new(MockLiveSiblingInspector::new(LiveSiblingCheck::NoneFound)),
+        );
+
+        let long_lived = ProcessIdentity::new(17201, unix_ms_to_ft(now_ms - 5_000));
+        let sibling = ProcessIdentity::new(17202, unix_ms_to_ft(now_ms - 50));
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: long_lived,
+                parent_pid: 4,
+                exe_path: python_exe.to_string(),
+                command_line: format!("\"{python_exe}\" server.py"),
+                user_sid: None,
+            })
+            .await
+            .expect("send long_lived start");
+        assert!(wait_until_unit(1_000, || engine.metrics().high_priority_processed >= 1).await);
+
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 22,
+            rule_handle: 1,
+            exe_path: python_exe.to_string(),
+            protocol: 6,
+            dst_ip: dst_v4,
+            dst_port: 443,
+            timestamp_ms: now_ms,
+        }));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Sibling ProcessStart confirms ambiguity, but MUST NOT cut the 400ms DnsGrace short!
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: sibling,
+                parent_pid: 4,
+                exe_path: python_exe.to_string(),
+                command_line: format!("\"{python_exe}\" helper.py"),
+                user_sid: None,
+            })
+            .await
+            .expect("send sibling start");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            store.list_alerts(None, 20).expect("alerts mid-grace").is_empty(),
+            "sibling ProcessStart must keep DnsGrace alive instead of emitting premature alert"
+        );
+
+        // Allowed DnsQuery arrives within the remaining DnsGrace (~100ms < 400ms).
+        engine
+            .sender()
+            .send_high_priority(SensorEvent::DnsQuery {
+                pid: sibling.pid,
+                query_name: "allowed.sib.invalid".to_string(),
+                query_type: 1,
+                resolved_ips: vec![dst_v4],
+                timestamp_ms: now_ms + 100,
+            })
+            .await
+            .expect("send allowed DnsQuery");
+
+        assert!(
+            wait_until_unit(1_000, || {
+                engine.has_active_wfp_filter(python_exe, Some(dst_v4), true)
+            })
+            .await,
+            "delayed allowed DNS after sibling ProcessStart must still install WFP Permit"
+        );
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            store.list_alerts(None, 20).expect("alerts after permit").is_empty(),
+            "zero alerts expected when allowed DNS arrives inside DnsGrace"
+        );
+        assert_eq!(defense.suspends(), 0);
+        engine.shutdown_and_flush().await.expect("shutdown T5");
+    }
+}
+

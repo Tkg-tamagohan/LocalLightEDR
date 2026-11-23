@@ -349,8 +349,10 @@ use super::{current_unix_ms, DaemonConfig, DaemonEngine, PendingWfpDrop, WfpRule
         pending.push_back(PendingWfpDrop {
             item: make_queued_drop(exe, v4_stale, now_ms + 250, 1),
             deadline: future_deadline,
+            dns_deadline: Some(future_deadline),
             reason: PendingWfpDropReason::DnsGrace,
             parked_single_instance_id: Some(inst_id.clone()),
+            confirmed_ambiguous: false,
         });
         engine.flush_ready_pending_wfp_drops(
             &inst_id,
@@ -370,8 +372,10 @@ use super::{current_unix_ms, DaemonConfig, DaemonEngine, PendingWfpDrop, WfpRule
         pending.push_back(PendingWfpDrop {
             item: make_queued_drop(exe, v6_new, now_ms + 250, 2),
             deadline: future_deadline,
+            dns_deadline: Some(future_deadline),
             reason: PendingWfpDropReason::DnsGrace,
             parked_single_instance_id: Some(inst_id.clone()),
+            confirmed_ambiguous: false,
         });
         engine.flush_ready_pending_wfp_drops(
             &inst_id,

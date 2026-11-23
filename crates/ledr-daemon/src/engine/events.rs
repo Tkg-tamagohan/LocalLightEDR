@@ -495,12 +495,13 @@ impl DaemonEngine {
                                 .process_dns_history
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .record_for_exe(
+                                .record_for_exe_with_created_at(
                                     inst_id,
                                     exe_k_opt.as_deref().unwrap_or(""),
                                     query_name,
                                     resolved_ips,
                                     event_ts_ms,
+                                    proc_ctx.proc_created_at_ms,
                                 );
                             if let Some(exe_k) = exe_k_opt {
                                 if !accepted.is_empty() {
@@ -1325,6 +1326,7 @@ impl DaemonEngine {
                     motw_referrer,
                     motw_frame_url,
                     motw_zone_id,
+                    proc_created_at_ms,
                 ) = if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
                     let differs = entry.identity != *identity
                         || entry.ppid != *parent_pid
@@ -1347,6 +1349,7 @@ impl DaemonEngine {
                         entry.motw_referrer.clone(),
                         entry.motw_frame_url.clone(),
                         entry.motw_zone_id,
+                        Some(entry.created_at_ms),
                     )
                 } else {
                     (
@@ -1358,6 +1361,12 @@ impl DaemonEngine {
                         None,
                         None,
                         None,
+                        (res.resolved_identity.create_time_100ns != 0).then(|| {
+                            super::filetime_100ns_to_unix_ms(
+                                res.resolved_identity.create_time_100ns,
+                                event_ts_ms,
+                            )
+                        }),
                     )
                 };
                 ResolvedProcessContext {
@@ -1380,6 +1389,7 @@ impl DaemonEngine {
                     motw_frame_url,
                     motw_zone_id,
                     proc_sha256: None,
+                    proc_created_at_ms,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
@@ -1407,6 +1417,7 @@ impl DaemonEngine {
                     motw_frame_url: None,
                     motw_zone_id: None,
                     proc_sha256: None,
+                    proc_created_at_ms: None,
                 }
             }
             SensorEvent::DnsQuery { pid, .. }
@@ -1426,6 +1437,7 @@ impl DaemonEngine {
                     motw_referrer,
                     motw_frame_url,
                     motw_zone_id,
+                    created_at_ms,
                 )) = table.lookup_by_pid_at(*pid, event_ts_ms).map(|e| {
                     (
                         e.identity,
@@ -1438,6 +1450,7 @@ impl DaemonEngine {
                         e.motw_referrer.clone(),
                         e.motw_frame_url.clone(),
                         e.motw_zone_id,
+                        e.created_at_ms,
                     )
                 })
                 else {
@@ -1470,6 +1483,7 @@ impl DaemonEngine {
                     motw_frame_url,
                     motw_zone_id,
                     proc_sha256: None,
+                    proc_created_at_ms: Some(created_at_ms),
                 }
             }
         }
@@ -1527,6 +1541,7 @@ pub(super) struct ResolvedProcessContext {
     pub(super) motw_frame_url: Option<String>,
     pub(super) motw_zone_id: Option<u32>,
     pub(super) proc_sha256: Option<String>,
+    pub(super) proc_created_at_ms: Option<i64>,
 }
 
 impl Default for ResolvedProcessContext {
@@ -1551,6 +1566,7 @@ impl Default for ResolvedProcessContext {
             motw_frame_url: None,
             motw_zone_id: None,
             proc_sha256: None,
+            proc_created_at_ms: None,
         }
     }
 }

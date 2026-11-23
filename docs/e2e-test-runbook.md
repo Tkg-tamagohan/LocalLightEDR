@@ -15,7 +15,7 @@ Phase 0（基盤構築と共通型凍結）、Phase 1（プロセス系譜と通
 
 ### 本書で使う主な用語と仕組み
 
-初見の検証者が他文書を開かずに手順の意味を判断できるよう、本書で使う固有の語と設計決定（[decision-records.md](decision-records.md) の `L-01` から `L-21`）を整理する。
+初見の検証者が他文書を開かずに手順の意味を判断できるよう、本書で使う固有の語と設計決定（[decision-records.md](decision-records.md) の `L-01` から `L-24`）を整理する。
 
 - **コンポーネント 4 バイナリと補助資産**：`ledr-daemon.exe` は監視と制御の中核常駐デーモン、`ledr-ui.exe` はトリアージと履歴表示を行うオンデマンド UI、`ledr-bridge-nm.exe` は Chrome 拡張とデーモンを仲介する Native Messaging ホスト、`ledr-sim.exe` は実マルウェアを使わずに各攻撃シナリオを擬似実行する無害なシミュレータである。
 - **UI の 3 ビュー構成**：`View 1: アラートトリアージ` は検知確認と解決操作（`Terminate & Block`、`Allow Once`、`Allow Permanent Rule`、`Acknowledge`）、`View 2: プロセス系譜・通信フライトレコーダー` は親子関係や DNS、TCP、ダウンロードの履歴表示、`View 3: 防御ポリシー・カナリア・ブラウザシールド` は WFP ルール、おとり状態、拡張診断とドメイン検査を行う。
@@ -1297,9 +1297,13 @@ if ($movedDir -and (Test-Path -LiteralPath $movedDir)) { Remove-Item -Recurse -F
 
 ## 5. Track C：UI 完全終了（L-08）と Release 常駐性能計測（E2E-PERF-01）
 
-Track C では性能基準（`WorkingSet <= 20.0 MB`、定常 `CPU < 0.5%`）を正確に測るため、必ず Release ビルド（`target\release\`）を使います。
+Track C では性能基準（`PrivateWorkingSetSize <= 20.0 MB` 必須、`WorkingSet64` 後半前半差 `<= +1.0 MB`、100.0 MB 以上スパイク 0 回、高負荷ピーク `< 64.34 MB`、アイドル `AvgCpuPercent < 0.5%`、高負荷とバースト `< 1%`、`決定記録 L-24`）を正確に測るため、必ず Release ビルド（`target\release\`）を使います。
 第 2 章の安全前提 4（`SEC_0003` パイプサーバ照合）で説明したとおり、先に検証用 Chrome ウィンドウと開いている `ledr-ui.exe` を閉じ、ウィンドウ A の Debug 版 `ledr-daemon.exe` を `Ctrl+C` で終了してから Release 版へ切り替えてください。
 なお、Track C では `ledr-ui.exe` を直接起動するため `PREP-03` で登録した `ledr://`（Debug 版）は使用しませんが、Release 版 UI を URI 起動させたい場合は `.\target\release\ledr-ui.exe --register-uri` を実行してから進めます。
+
+また、Track 2 の `ledr-auth-helper.exe` 分離（`決定記録 L-23`）ではハードリンク悪用を防ぐため `nNumberOfLinks == 1` を厳格に検証します。
+一方、Cargo のビルド成果物 `target\release\ledr-auth-helper.exe` はビルドキャッシュ（`target\release\build\ledr-auth-helper\...\out\ledr_auth_helper.exe`）とハードリンクされており `nNumberOfLinks == 2` となるため、`target\release\` から `ledr-daemon.exe` を直実行するとワーカー起動が拒否され 30 秒サーキットブレーカが動作します。
+Release 版を直接起動して検証する際は、以下のように新しいステージングディレクトリへ `Copy-Item` で複製し、ハードリンク数が `1`（`Links = 1`）であることを確認した上でステージング先から起動してください（`nNumberOfLinks == 1` の厳格検査自体は維持します）。
 
 ```powershell
 # ウィンドウ A（64 ビット版管理者 PowerShell）: Chrome と Debug 版を終了したあとに実行
@@ -1309,36 +1313,48 @@ $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).T
 Set-Location $repoRoot
 $env:RUST_LOG = "info"
 
+$stageBinDir = Join-Path $runDir "release-bin"
+New-Item -ItemType Directory -Path $stageBinDir -Force | Out-Null
+foreach ($exeName in @("ledr-daemon.exe", "ledr-auth-helper.exe", "ledr-ui.exe", "ledr-bridge-nm.exe", "ledr-sim.exe")) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot "target\release\$exeName") -Destination (Join-Path $stageBinDir $exeName) -Force
+}
+# fsutil hardlink list (Join-Path $stageBinDir "ledr-auth-helper.exe") が 1 行のみであることを確認する
+$daemonExe = Join-Path $stageBinDir "ledr-daemon.exe"
+
 $realNrdCache = Join-Path $runDir "nrd-cache.txt"
 if (Test-Path -LiteralPath $realNrdCache) {
     # ルート 1・ルート 2（オンライン実フィード）: --nrd-feed-url を渡すと実キャッシュが 1 件のテストフィードで上書きされるため、--disable-nrd-refresh で実キャッシュをそのまま読み込む
     $nrdEntryCount = @(Get-Content -Encoding UTF8 -LiteralPath $realNrdCache | Where-Object { $_ -and -not $_.StartsWith("#") }).Count
     Write-Output "実 NRD キャッシュを読み込んで E2E-PERF-01 を起動します: $realNrdCache (entries=$nrdEntryCount)"
     Write-Output "※ 正式な公開 2 フィード実測値とするには E2E-P3-05 ログで feeds_succeeded=2, feeds_failed=0 を確認済みであること（feeds_succeeded=1 の場合は単一フィード参考値として記録）。"
-    .\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "perf.db") --nrd-cache $realNrdCache
+    & $daemonExe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "perf.db") --nrd-cache $realNrdCache
 } else {
     # ルート 3 単独またはオフライン環境: 1 件のテストキャッシュで起動し、合否記録表では「ルート 3 軽量参考値」または「オフライン参考値」として正式実測値と区別する
     Write-Warning "実 nrd-cache.txt が未作成のため 1 件のテスト NRD キャッシュで起動します。合否記録表にはルート 3 軽量参考値（またはオフライン参考値）として記録してください。"
     $nrdUrl = ([Uri](Join-Path $runDir "nrd-test-feed.txt")).AbsoluteUri
-    .\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "perf.db") --nrd-feed-url $nrdUrl --nrd-cache (Join-Path $runDir "nrd-test-cache.txt")
+    & $daemonExe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "perf.db") --nrd-feed-url $nrdUrl --nrd-cache (Join-Path $runDir "nrd-test-cache.txt")
 }
 ```
 
-正式な `E2E-PERF-01`（`PeakWorkingSetMB <= 20.0`）は、`E2E-P3-05` の `refreshed daily NRD domain cache` ログで `feeds_succeeded=2` かつ `feeds_failed=0` を確認済みの実 `nrd-cache.txt` を `--disable-nrd-refresh` で読み込んだ状態で計測します。
+正式な `E2E-PERF-01`（`PrivateWorkingSetSize <= 20.0 MB` 必須および `WorkingSet64` スパイクと単調増加監視基準）は、`E2E-P3-05` の `refreshed daily NRD domain cache` ログで `feeds_succeeded=2` かつ `feeds_failed=0` を確認済みの実 `nrd-cache.txt` を `--disable-nrd-refresh` で読み込んだ状態で計測します。
 公開フィードの片方が失敗した場合でも `nrd-cache.txt` 自体は `entries > 0` で保存されるため、`E2E-P3-05` が `feeds_succeeded=1` で終わったときは合否記録表へ「単一フィード参考値（`feeds_succeeded=1`、`entries=...`）」と明記してください。
 ルート 3 単独やオフライン環境で `nrd-cache.txt` が未作成の場合は 1 件の `nrd-test-cache.txt` が使われるため、合否記録表には必ず「ルート 3 軽量参考値（NRD 1 件）」または「オフライン参考値」と明記して正式な公開 2 フィード実測値と区別してください。
 計測を始める前に、ウィンドウ A のログへ `loaded local NRD cache from disk` または `refreshed daily NRD domain cache`（どちらも `entries > 0`）が出力されたことを確認します。
 
 ### E2E-UI-01：`ledr-ui` 閉鎖時の 0 プロセス終了（`L-08`）
 
-ウィンドウ C で `.\target\release\ledr-ui.exe` を起動して `Daemon: Connected` と画面描画を確認したあと、ウィンドウ右上の閉じるボタンで終了し、直後にプロセス残存ゼロを確認してください。
+ウィンドウ C で `Join-Path $runDir "release-bin\ledr-ui.exe"`（または `.\target\release\ledr-ui.exe`）を起動して `Daemon: Connected` と画面描画を確認したあと、ウィンドウ右上の閉じるボタンで終了し、直後にプロセス残存ゼロを確認してください。
 
 ```powershell
 # ウィンドウ C（通常ユーザー PowerShell）
 $stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
-$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
-Set-Location $repoRoot
-.\target\release\ledr-ui.exe
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+$stageUiExe = Join-Path $runDir "release-bin\ledr-ui.exe"
+if (Test-Path -LiteralPath $stageUiExe) { & $stageUiExe } else {
+    $repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+    Set-Location $repoRoot
+    .\target\release\ledr-ui.exe
+}
 # 画面表示を確認したらウィンドウ右上の閉じるボタンで終了し、以下を実行する
 Get-Process ledr-ui -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object { $_.CommandLine -match 'ledr-ui|LocalEDR' } | Select-Object ProcessId, CommandLine
@@ -1346,38 +1362,41 @@ Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object
 
 両方のコマンドで出力が 0 件であれば `L-08` は合格です。
 
-### E2E-PERF-01：`ledr-daemon` 常駐メモリ 20 MB 以下と定常 CPU 0.5% 未満
+### E2E-PERF-01：`ledr-daemon` 常駐メモリ（`PrivateWorkingSetSize` 20 MB 以下）と CPU 基準
 
-ウィンドウ B で次の計測スクリプトを実行し、Release 版 `ledr-daemon.exe` の測定区間におけるピーク `WorkingSet64` と平均 CPU 使用率を取得してください。
-[implementation-plan.md](implementation-plan.md) の計画基準に沿う 10 分間アイドル計測では `$sampleSec = 600`（簡易確認では `60`）を使用します。
+ウィンドウ B でリポジトリ同梱のプロファイラ `scripts/profile_daemon_memory.ps1` を実行し、Release 版 `ledr-daemon.exe` の `PrivateWorkingSetSize`、`WorkingSet64`（`Shared == 0/1` ページ内訳とスナップショット）、および `AvgCpuPercent` を取得してください（単位は `1 MB = 1 MiB = 1,048,576` バイト）。
+[implementation-plan.md](implementation-plan.md) の計画基準に沿う 10 分間アイドル計測では `-DurationSec 600`（高負荷確認では `-DurationSec 60`）を指定します。
 
 ```powershell
-# ウィンドウ B（管理者 PowerShell）
-$sampleSec = 600
-$logicalCores = [int]$env:NUMBER_OF_PROCESSORS
-$p0 = Get-Process ledr-daemon
-$cpu0 = $p0.CPU
-$wsMax = $p0.WorkingSet64
-1..$sampleSec | ForEach-Object {
-    Start-Sleep -Seconds 1
-    $cur = Get-Process ledr-daemon -ErrorAction SilentlyContinue
-    if ($cur -and $cur.WorkingSet64 -gt $wsMax) { $wsMax = $cur.WorkingSet64 }
-}
-$p1 = Get-Process ledr-daemon
-$cpuPct = (($p1.CPU - $cpu0) / ($sampleSec * $logicalCores)) * 100.0
-[PSCustomObject]@{
-    SampleSeconds = $sampleSec
-    LatestWorkingSetMB = [math]::Round($p1.WorkingSet64 / 1MB, 2)
-    PeakWorkingSetMB = [math]::Round($wsMax / 1MB, 2)
-    AvgCpuPercent = [math]::Round($cpuPct, 4)
-} | Format-Table -AutoSize
+# ウィンドウ B（管理者 PowerShell）: 600 秒アイドル計測と 60 秒高負荷計測
+$stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
+$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+Set-Location $repoRoot
+$daemonProc = Get-Process ledr-daemon -ErrorAction Stop
+$dbPath = Join-Path $runDir "perf.db"
+
+# 1. 600 秒アイドル計測
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\profile_daemon_memory.ps1 `
+    -Pid $daemonProc.Id -DbPath $dbPath -DaemonExePath $daemonProc.Path `
+    -DurationSec 600 -OutDir (Join-Path $runDir "perf_idle")
+
+# 2. 60 秒高負荷計測（ブラウザ複数タブ閲覧と別ウィンドウでの cargo build --locked を併用）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\profile_daemon_memory.ps1 `
+    -Pid $daemonProc.Id -DbPath $dbPath -DaemonExePath $daemonProc.Path `
+    -DurationSec 60 -OutDir (Join-Path $runDir "perf_load")
 ```
 
-`PeakWorkingSetMB` が `20.0` 以下かつアイドル時 `AvgCpuPercent` が `0.5` 未満であれば合格です（1 件の `nrd-test-cache.txt` で計測した場合は「ルート 3 軽量参考値」または「オフライン参考値」として区分記録します）。
+`profile_daemon_memory.ps1` は 200 ms 間隔の `GetProcessMemoryInfo` と `GetProcessTimes` ポーリングに加え、10 秒後、60 秒後、終了直前、ピーク `+2.0 MB` 更新時、および `+5.0 MB` 急増時に `QueryWorkingSetEx` で `Shared == 0/1` の 4 KiB ページ内訳スナップショットを保存し、`timeseries.csv`、`memory-profile-summary.json`、および `snapshots/*.json` を出力します（`-AnalyzePeOnly` を指定すると PE 静的および遅延インポートの推移的依存解析のみを単体実行できます）。
 
-続けて、ブラウザ（Chrome や Edge）での通常複数タブ閲覧および別ウィンドウでの `cargo build` 負荷を掛けながら `$sampleSec = 60` で計測し、高負荷時も極端なメモリ増加がないこと（参考目安として `PeakWorkingSetMB` が 35 MB 未満で安定し、増加し続けないこと）を確認します。
+合格判定は `memory-profile-summary.json` の以下の全条件で行います（1 件の `nrd-test-cache.txt` で計測した場合は「ルート 3 軽量参考値」または「オフライン参考値」として区分記録します）。
+
+- **600 秒アイドル必須基準**：`steady_window_60s_to_end.median_private_ws_mb <= 20.0`、`latest_private_ws_mb <= 20.0`、`AvgCpuPercent < 0.5%`、`spikes_ge_100mb_count == 0`、および定常後半（`330..600s`）と前半（`60..330s`）の `WorkingSet64` 中央値差 `<= +1.0 MB`。
+- **参考指標（`WorkingSet64` OS 共有ページ下限）**：Windows 11 環境では OS 共有ページ（`Shared == 1`）のみで約 `14.5 MB`（Stage 3 実測 `14.51–14.70 MB`）を占有するため、`WorkingSet64` の絶対値自体は参考値として記録し、リークおよび異常スパイクがないことを後半前半中央値差と 100 MB 未満維持で判定する（`決定記録 L-24`）。
+- **60 秒高負荷基準**：ブラウザ複数タブ閲覧と `cargo build --locked` の併用負荷下で `interval_peak_working_set_mb < 64.34`、`spikes_ge_100mb_count == 0`、かつ `AvgCpuPercent < 1.0%` であること（Stage 1 未改変ベースラインの 60 秒高負荷実測は `0.5475%`、Stage 3 実測は `0.5952%`）。
+
+高負荷計測の直後（または併用中）に次のコマンドでダミー `Cookies` アクセスを走らせ、高優先度レーンのトースト応答が 1 秒以内に返ることを確認したあと、凍結したプロセスを終了してください。
 負荷計測の出力をファイルへ保存する場合は、後続の `E2E-OPT-01` で上書きされないよう `perf_load_trackc.txt` のようにトラック名入りのファイル名で分けて保存してください。
-あわせて負荷計測中に次のコマンドでダミー `Cookies` アクセスを走らせ、高優先度レーンのトースト応答が 1 秒以内に返ることを確認したあと、凍結したプロセスを終了してください。
 
 ```powershell
 # ウィンドウ B（管理者 PowerShell）: 高負荷計測中の高優先度応答確認
@@ -1831,7 +1850,7 @@ Get-Item "$env:USERPROFILE\Downloads\localedr-e2e-sample*.exe", "$env:USERPROFIL
 | `E2E-P4-06` | Track B | `:Zone.Identifier` 確認、移動後 `dns-tcp` 事前 WFP 遮断（`L-18`）、MOTW 3 段階紐付け | | |
 | `E2E-P4-07` | Track B | `LAYER_4_BROWSER` の `Allow Permanent Rule` 無効と `Acknowledge` 解決 | | |
 | `E2E-UI-01` | Track C | Release 版 `ledr-ui` 閉鎖後の `ledr-ui` と WebView2 0 プロセス終了（`L-08`） | | |
-| `E2E-PERF-01` | Track C | Release 版 `ledr-daemon` Working Set 20 MB 以下、定常 CPU 0.5% 未満、負荷時応答 | | |
+| `E2E-PERF-01` | Track C | Release 版 `ledr-daemon` `PrivateWorkingSetSize <= 20.0 MB`（`WorkingSet64` 後半前半差 `<= +1.0 MB`、`>= 100.0 MB` スパイク 0 回、高負荷ピーク `< 64.34 MB`）、アイドル CPU `< 0.5%`（負荷 `< 1%`）、負荷時応答 | | |
 | `E2E-OPT-01` | 専用（任意） | `--outbound-mode enforce` での一般パス未知プロセス初発通信凍結と負荷計測 | | |
 | `E2E-OPT-02` | 専用（任意） | `Program Files` 配置＋ハッシュピン（`--dev-bypass-auth` なし）での IPC 認可境界 | | |
 | `E2E-OPT-03` | 専用（任意） | Session 0（`LocalSystem`）からの `CreateProcessAsUserW` 起動と SCM 差異切り分け | | |

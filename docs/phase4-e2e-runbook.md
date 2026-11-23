@@ -22,7 +22,7 @@ cd e:\Documents\code\LocalEDR
 cargo build --workspace --locked
 ```
 
-- **検証用バイナリ**：`target\debug\ledr-daemon.exe`、`target\debug\ledr-bridge-nm.exe`、`target\debug\ledr-ui.exe`、`target\debug\ledr-sim.exe`
+- **検証用バイナリ**：`target\debug\ledr-daemon.exe`、`target\debug\ledr-auth-helper.exe`、`target\debug\ledr-bridge-nm.exe`、`target\debug\ledr-ui.exe`、`target\debug\ledr-sim.exe`（`ledr-auth-helper.exe` の `nNumberOfLinks == 1` 要件と `SEC_0003` 兄弟パス一致のため、`$runDir\debug-bin` へ複製して使用）
 - **Chrome 拡張ディレクトリ**：`extensions\ledr-chrome-mv3`（固定拡張 ID `ecelachfiiiiiibpjeomfncgpegbpanh`）
 - **ローカル検証ページ**：`docs\fixtures\phase4-browser-test.html`
 - **ウィンドウ A（64 ビット版管理者 PowerShell）**：`ledr-daemon.exe` の起動と停止、`--scope machine` 検証用
@@ -38,11 +38,15 @@ New-Item -ItemType Directory -Force -Path "$runDir\site\download" | Out-Null
 New-Item -ItemType Directory -Force -Path "$runDir\chrome-profile" | Out-Null
 New-Item -ItemType Directory -Force -Path "$runDir\canary_dir" | Out-Null
 New-Item -ItemType Directory -Force -Path "$runDir\backup" | Out-Null
+New-Item -ItemType Directory -Force -Path "$runDir\debug-bin" | Out-Null
+foreach ($exeName in @("ledr-daemon.exe", "ledr-auth-helper.exe", "ledr-bridge-nm.exe", "ledr-ui.exe", "ledr-sim.exe")) {
+    Copy-Item -LiteralPath "target\debug\$exeName" -Destination "$runDir\debug-bin\$exeName" -Force
+}
 Copy-Item "docs\fixtures\phase4-browser-test.html" "$runDir\site\phase4-browser-test.html"
 Copy-Item "target\debug\ledr-sim.exe" "$runDir\site\download\localedr-e2e-sample.exe"
 [System.IO.File]::WriteAllText("$runDir\site\download\localedr-e2e-sample.cmd", "@echo off`r`necho LocalEDR MOTW E2E`r`n", [System.Text.UTF8Encoding]::new($false))
 [System.IO.File]::WriteAllText("$runDir\nrd-test-feed.txt", "nrd-sim.localedr.invalid`r`n", [System.Text.UTF8Encoding]::new($false))
-.\target\debug\ledr-sim.exe --prepare-dir "$runDir\canary_dir" --json
+& "$runDir\debug-bin\ledr-sim.exe" --prepare-dir "$runDir\canary_dir" --json
 Write-Output ("RunDir=" + $runDir)
 ```
 
@@ -83,11 +87,13 @@ if (Test-Path $userManifestDir) {
 
 ```powershell
 cd e:\Documents\code\LocalEDR
-.\target\debug\ledr-bridge-nm.exe setup --scope user --browsers chrome,edge --bridge-exe "$PWD\target\debug\ledr-bridge-nm.exe" --ui-exe "$PWD\target\debug\ledr-ui.exe"
-.\target\debug\ledr-bridge-nm.exe status --scope all
+$runDir = "<上記で表示された RunDir の絶対パス>"
+& "$runDir\debug-bin\ledr-bridge-nm.exe" setup --scope user --browsers chrome,edge --bridge-exe "$runDir\debug-bin\ledr-bridge-nm.exe" --ui-exe "$runDir\debug-bin\ledr-ui.exe"
+& "$runDir\debug-bin\ledr-bridge-nm.exe" status --scope all
 ```
 
 必要に応じてウィンドウ A（管理者権限）でも `--scope machine` を検証できます。
+管理者側ウィンドウでも通常ユーザー側で作成した `$runDir`（`RunDir=...` のパス）を明示設定したうえで実行してください。
 既存のマシン全体登録がある環境では、通常ユーザーが書き込めない管理者専用の退避フォルダ（`Administrators` と `SYSTEM` のみ許可）を作成したうえで、64 ビット版 `reg.exe` と 32 ビット版 `SysWOW64\reg.exe` で `HKLM` の該当キー（`Chrome`、`Edge` の 64/32 ビット双方、`ledr` URI、および `AppUserModelId\LocalEDR.AlertUI`）と `C:\ProgramData\LocalEDR\native-messaging` を退避し、全退避の成功を確認してから `setup` を実行してください。
 マシン単位で URI と AUMID を検証しない場合は、`setup` に `--skip-uri`、後片付けの `unregister` に `--keep-uri` を指定すると両キーを変更せずに検証できます。
 
@@ -97,6 +103,7 @@ if (-not [Environment]::Is64BitProcess) {
     throw "32 ビット版 PowerShell では System32 がリダイレクトされ 64 ビットビューを退避できないため、64 ビット版 PowerShell で実行してください。"
 }
 cd e:\Documents\code\LocalEDR
+$runDir = "<ウィンドウ B で表示された RunDir の絶対パス>"
 $reg64 = "$env:SystemRoot\System32\reg.exe"
 $reg32 = "$env:SystemRoot\SysWOW64\reg.exe"
 $adminBackupDir = Join-Path $env:ProgramData ("LocalEDR-e2e-admin-backup-" + [guid]::NewGuid().ToString("N"))
@@ -135,18 +142,18 @@ if (Test-Path "C:\ProgramData\LocalEDR\native-messaging") {
     Copy-Item -Recurse -Force -ErrorAction Stop "C:\ProgramData\LocalEDR\native-messaging" "$adminBackupDir\machine-native-messaging"
 }
 Write-Output ("AdminBackupDir=" + $adminBackupDir)
-.\target\debug\ledr-bridge-nm.exe setup --scope machine --browsers chrome,edge --bridge-exe "$PWD\target\debug\ledr-bridge-nm.exe" --ui-exe "$PWD\target\debug\ledr-ui.exe"
-.\target\debug\ledr-bridge-nm.exe status --scope all
+& "$runDir\debug-bin\ledr-bridge-nm.exe" setup --scope machine --browsers chrome,edge --bridge-exe "$runDir\debug-bin\ledr-bridge-nm.exe" --ui-exe "$runDir\debug-bin\ledr-ui.exe"
+& "$runDir\debug-bin\ledr-bridge-nm.exe" status --scope all
 ```
 
 ウィンドウ A で `ledr-daemon.exe` を検証用設定で起動し、続けてウィンドウ B で `ledr-ui.exe` を開いて `View 3: 防御ポリシー・カナリア・ブラウザシールド` を確認してください。
-起動前に、ウィンドウ B で出力された `RunDir=...` のパスをウィンドウ A の `$runDir` へ明示的に設定します。
+起動前に、ウィンドウ B で出力された `RunDir=...` のパスをウィンドウ A の `$runDir` へ明示的に設定します（`ledr-auth-helper.exe` の `nNumberOfLinks == 1` 要件と `SEC_0003` 兄弟パス一致を同時に満たすため、`$runDir\debug-bin` へ複製したバイナリを使用します）。
 
 ```powershell
 # ウィンドウ A（管理者 PowerShell）
 $runDir = "<ウィンドウ B で表示された RunDir の絶対パス>"
 $nrdUrl = ([Uri]"$runDir\nrd-test-feed.txt").AbsoluteUri
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db "$runDir\ledr.db" --nrd-feed-url $nrdUrl --nrd-cache "$runDir\nrd-cache.txt"
+& "$runDir\debug-bin\ledr-daemon.exe" --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db "$runDir\ledr.db" --nrd-feed-url $nrdUrl --nrd-cache "$runDir\nrd-cache.txt"
 ```
 
 `View 3` のブラウザシールド欄に次の項目が表示されていれば登録確認は完了です。
@@ -263,11 +270,15 @@ Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object
 `SEC_0003` の兄弟パス検証により Debug 版 `ledr-bridge-nm.exe` が登録されている状態では Release 版 `ledr-daemon.exe` への IPC が拒否されるため、手順 3 の Chrome 拡張操作をすべて終えて検証用 Chrome ウィンドウを閉じてから、ウィンドウ A でデバッグ版 `ledr-daemon.exe` を `Ctrl+C` で終了し、リリース版を起動します。
 
 ```powershell
-# ウィンドウ A（管理者 PowerShell）: 検証用 Chrome 終了・デバッグ版停止後にリリース版で起動
+# ウィンドウ A（管理者 PowerShell）: 検証用 Chrome 終了・デバッグ版停止後にリリース版をステージング（Links=1）して起動
 cd e:\Documents\code\LocalEDR
 cargo build --workspace --release --locked
+New-Item -ItemType Directory -Force -Path "$runDir\release-bin" | Out-Null
+foreach ($exeName in @("ledr-daemon.exe", "ledr-auth-helper.exe", "ledr-ui.exe", "ledr-bridge-nm.exe", "ledr-sim.exe")) {
+    Copy-Item -LiteralPath "target\release\$exeName" -Destination "$runDir\release-bin\$exeName" -Force
+}
 $nrdUrl = ([Uri]"$runDir\nrd-test-feed.txt").AbsoluteUri
-.\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db "$runDir\ledr.db" --nrd-feed-url $nrdUrl --nrd-cache "$runDir\nrd-cache.txt"
+& "$runDir\release-bin\ledr-daemon.exe" --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db "$runDir\ledr.db" --nrd-feed-url $nrdUrl --nrd-cache "$runDir\nrd-cache.txt"
 ```
 
 ウィンドウ A のログに初期化完了と NRD キャッシュ読み込みが出力されたら、ウィンドウ B で次の計測スクリプトを実行してください。

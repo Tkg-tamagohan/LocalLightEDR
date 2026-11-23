@@ -14,3 +14,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 strsim = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+ledr-auth-helper = { workspace = true }

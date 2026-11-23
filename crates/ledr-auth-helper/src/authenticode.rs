@@ -403,7 +403,7 @@ const CHAIN_FALLBACK_ERROR_MASK: u32 =
 /// Offline-only flags for `CertGetCertificateChain`: cache end certificates, restrict URL
 /// retrieval to local cache, and disable automatic AuthRoot CTL network updates so chain
 /// building never triggers outbound HTTP/AIA/CRL/AuthRoot traffic from the daemon process.
-pub(crate) const LOCAL_CERT_CHAIN_FLAGS: u32 = CERT_CHAIN_CACHE_END_CERT
+pub const LOCAL_CERT_CHAIN_FLAGS: u32 = CERT_CHAIN_CACHE_END_CERT
     | CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL
     | CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE;
 

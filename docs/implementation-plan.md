@@ -8,8 +8,8 @@
 
 [ledr_artifact.html](../ledr_artifact.html) は、全ファイル走査型の従来型アンチウイルスや常駐型 Electron GUI を排し、OS カーネルのイベント駆動通知、Rust 製常駐コアデーモン、組み込み SQLite WAL ストア、オンデマンド起動の Tauri v2 UI、および Chrome Manifest V3 拡張機能の連携によって CPU 負荷 1% 未満と常駐メモリ 10〜20 MB 以下の両立を目指している。
 
-設計レビューで抽出した要協議事項 A〜P は 2026-11-18 に、Phase 4 詳細設計の追加論点 5 件は 2026-11-21 にユーザーが全推奨案を承認して確定した。
-確定した 21 件の仕様判断は [decision-records.md](decision-records.md) に保存しており、本計画書では決定内容や根拠を重複管理せず `決定記録 L-01` 〜 `決定記録 L-21` の ID で参照する。
+設計レビューで抽出した要協議事項 A〜P は 2026-11-18 に、Phase 4 詳細設計の追加論点 5 件は 2026-11-21 に、性能改善 `FU-E2E-03` の追加論点 3 件は 2026-11-23 にユーザーが全推奨案を承認して確定した。
+確定した 24 件の仕様判断は [decision-records.md](decision-records.md) に保存しており、本計画書では決定内容や根拠を重複管理せず `決定記録 L-01` 〜 `決定記録 L-24` の ID で参照する。
 
 | 決定 ID | 論点 | 計画書内の主な反映先 |
 | :--- | :--- | :--- |
@@ -34,6 +34,9 @@
 | `決定記録 L-19` | `ReportBrowserEvent` 受信時の OS トースト通知要否 | Layer 2 詳細設計、Layer 4 詳細設計 |
 | `決定記録 L-20` | 拡張機能の固定公開鍵と `ledr-bridge-nm setup` スコープ | Layer 4 詳細設計（Native Messaging） |
 | `決定記録 L-21` | ClickFix 観測用 `MAIN` world フックと DNR 初期ルール範囲 | Layer 4 詳細設計（Chrome MV3 拡張） |
+| `決定記録 L-22` | `AUTO-09` 読取専用 SQLite 接続の `cache_size` 縮小とアイドル時解放 | Layer 2 詳細設計、Layer 3 詳細設計 |
+| `決定記録 L-23` | Authenticode 署名検証の専用ワーカー分離とフェイルクローズ | Layer 1〜3 詳細設計（署名検証経路） |
+| `決定記録 L-24` | `E2E-PERF-01` 定常メモリ基準への `PrivateWorkingSetSize` 併記 | 前提と実行環境、実機検証（Track C） |
 
 技術的な品質と安全性を確保するための改善 15 項目（`AUTO-01` 〜 `AUTO-15`）は、仕様の意図を変えない範囲で各層の設計へ織り込んでいる。
 
@@ -47,7 +50,7 @@
 | `AUTO-06` | Layer 1 | AMSI 検査を DLL 注入ではなく ETW（AMSI イベント ID 1101 と PowerShell イベント ID 4104）の非同期購読へ統一する |
 | `AUTO-07` | 文書整合 | [L406](../ledr_artifact.html#L406) の Linux `XDP` 表記を [L552](../ledr_artifact.html#L552) と揃えて `eBPF Cgroup SockAddr / Socket Filter` 相当として整理する |
 | `AUTO-08` | Layer 1〜2 | `QueryDosDeviceW` ボリューム変換表と UTF-16 スライス比較により、対象外の `FileIo` イベントをメモリ確保前に破棄する |
-| `AUTO-09` | Layer 3 | SQLite 接続へ `cache_size = -2048`、`mmap_size = 0`、`wal_autocheckpoint = 1000` を強制し、書込専用 1 接続と読取専用接続を分離する |
+| `AUTO-09` | Layer 3 | SQLite 接続へ `mmap_size = 0`、`wal_autocheckpoint = 1000`、および接続別 `cache_size`（書込専用 1 接続は `-2048`、読取専用接続は `-512`）を強制し、停止未要求かつ 30 秒以上無アクセス時は 60 秒定期保守ティックから `shrink_reader_memory_if_idle(30s)`（`PRAGMA shrink_memory`）を実行する |
 | `AUTO-10` | Layer 2〜3 | サービス停止シグナル受信時に 3 秒以内でチャネルの残件フラッシュと `wal_checkpoint(TRUNCATE)` を行う終了処理を実装する |
 | `AUTO-11` | Layer 4 | Native Messaging と Named Pipe（`\\.\pipe\localedr-ipc`）を中継するブリッジ CLI（`ledr-bridge-nm`）を設け、4 バイト長と UTF-8 JSON に統一する |
 | `AUTO-12` | Layer 4 | 拡張の `downloads.onCreated` と `onChanged` 完了フックを組み合わせ、デーモン側で SHA-256 算出と `:Zone.Identifier` 確認を行う |
@@ -67,10 +70,10 @@
 結合テストおよび実機検証のうち ETW、WFP、Named Pipe DACL、`NtSuspendProcess`、`CreateProcessAsUser` を伴う確認は、Windows 10 または Windows 11（x86_64）の管理者昇格セッションが必須となる。
 一方、`ledr-proto`、`ledr-rules`、`ledr-store` のロジック単体テストは非特権環境でも実行できる。
 
-目標性能は以下の数値を基準として維持する。
+目標性能は以下の数値を基準として維持する（`決定記録 L-24`）。
 
-- デーモンの常駐メモリ使用量は 10〜20 MB 以下に抑える。
-- 定常時の CPU 平均使用率は 0.5% 未満（バースト時を含めて 1% 未満）に抑える。
+- デーモンの常駐メモリは `PrivateWorkingSetSize <= 20.0 MB` を必須基準とし、`WorkingSet64` は Windows 11 OS 共有ページ（`Shared == 1`、下限約 14.5 MB）を含む参考値およびスパイクと単調増加の監視基準（600 秒定常後半前半中央値差 `<= +1.0 MB`、`>= 100.0 MB` スパイク 0 回、高負荷ピーク `< 64.34 MB`）として併記する。
+- アイドル定常時の CPU 平均使用率は 0.5% 未満、バーストおよび高負荷時は 1% 未満に抑える。
 - オンデマンド UI はウィンドウ閉鎖時に完全終了させ、待機中のプロセス数とメモリ使用量を 0 に保つ。
 
 ## 設計レビュー課題の解決方針
@@ -357,13 +360,15 @@ Named Pipe（`\\.\pipe\localedr-ipc`）は作成時の DACL を `SYSTEM`、管�
 
 ### Layer 3 組み込み時系列ストア
 
-Worker 3 が担当する `crates/ledr-store` は、書き込み専用の単一コネクション（500 件、1 秒周期、または重大アラート即時発火のバッチトランザクション）と、IPC クエリ用の読み取り専用コネクションを分離して管理する（`AUTO-09`）。
-メモリ消費を 20 MB 上限内に収めるため、全接続へ以下の PRAGMA を強制適用する（`AUTO-09`）。
+Worker 3 が担当する `crates/ledr-store` は、書き込み専用の単一コネクション（500 件、1 秒周期、または重大アラート即時発火のバッチトランザクション）と、IPC クエリ用の読み取り専用コネクションを分離して管理する（`AUTO-09`、`決定記録 L-22`）。
+メモリ消費を基準内に抑えるため、全接続へ共通の PRAGMA を強制適用した上で、書込専用接続は `PRAGMA cache_size = -2048;`（2 MiB 上限）、読取専用接続は `PRAGMA cache_size = -512;`（512 KiB 上限）を設定する（`AUTO-09`、`決定記録 L-22`）。
+さらに `DaemonEngine` の 60 秒定期保守ティックから停止未要求時（`!is_shutdown_requested()`）に限って `shrink_reader_memory_if_idle(30s)` を呼び出し、30 秒以上読取アクセスがない場合のみ読取専用接続へ `PRAGMA shrink_memory;` を実行する（クエリごとの都度実行は行わない）。
 
 ```sql
+-- 共通 PRAGMA（書込専用: cache_size = -2048 / 読取専用: cache_size = -512）
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
-PRAGMA cache_size = -2048;
+PRAGMA cache_size = -2048; -- 読取専用接続では -512
 PRAGMA temp_store = MEMORY;
 PRAGMA mmap_size = 0;
 PRAGMA wal_autocheckpoint = 1000;
@@ -597,7 +602,8 @@ if ($LASTEXITCODE -ne 0) { throw "Tauri UI mock DOM tests failed (exit code: $LA
 実機 E2E 検証の統合手順は [e2e-test-runbook.md](e2e-test-runbook.md) にまとめる。
 
 1. 疑似攻撃シナリオ検証（Windows 10/11 の管理者昇格 PowerShell で実行）では、[e2e-test-runbook.md](e2e-test-runbook.md) の Track A（または [phase2-3-e2e-runbook.md](phase2-3-e2e-runbook.md)）に従い、`ledr-daemon.exe` を稼働させた状態で `ledr-sim.exe` 等を実行し、Phase 1〜3 の受け入れ条件（親子系譜記録、ダミー機密ファイルアクセス時のサスペンドと再開、おとり書込によるツリー封じ込め、WFP 動的遮断と強制終了時の通信不能回避）を確認する。なお、トースト通知（`ledr://alert/<id>`）クリック起動の検証にはユーザー単位の `HKCU\Software\Classes\ledr` 登録（`--notify` 実行時の自動登録または `ledr-ui --register-uri` の事前実行）を用い、システム全体のレジストリ登録は Phase 4 インストーラ（`AUTO-14`）で実施する。
-2. リソース上限の計測（10 分間アイドルおよび `cargo build` 負荷計測）では、[e2e-test-runbook.md](e2e-test-runbook.md) の Track C に従い、ウィンドウ閉鎖状態で `Get-Process ledr-ui -ErrorAction SilentlyContinue` が 0 件（UI メモリ 0 MB）であること、`Get-Process ledr-daemon` の Working Set が 20 MB 以下かつ定常時 CPU 平均使用率が 0.5% 未満であることを確認する。
+2. リソース上限の計測（10 分間アイドルおよび `cargo build` 負荷計測）では、[e2e-test-runbook.md](e2e-test-runbook.md) の Track C に従い、ウィンドウ閉鎖状態で `Get-Process ledr-ui -ErrorAction SilentlyContinue` が 0 件（UI メモリ 0 MB）であることを確認する。
+   また `scripts/profile_daemon_memory.ps1` を用いて、`ledr-daemon` の `PrivateWorkingSetSize <= 20.0 MB`（必須）、`WorkingSet64` の 600 秒定常後半前半中央値差 `<= +1.0 MB`、100.0 MB 以上スパイク 0 回、60 秒高負荷ピーク `< 64.34 MB`（OS 共有ページ `Shared == 1` 下限約 14.5 MB を含む参考値として記録）、600 秒アイドル時 `AvgCpuPercent < 0.5%`、および高負荷とバースト時 `< 1%` を満たすことを確認する（`決定記録 L-24`）。
 3. Chrome 拡張 E2E 検証（Phase 4）では、[e2e-test-runbook.md](e2e-test-runbook.md) の Track B（または [phase4-e2e-runbook.md](phase4-e2e-runbook.md)）に従い `extensions/ledr-chrome-mv3` を Chrome のデベロッパーモードで読み込み、[phase4-browser-test.html](fixtures/phase4-browser-test.html) 上で ClickFix 疑似ボタンと疑似 NRD パスワードフォームを操作してブラウザ警告と `ledr-ui` の記録を確認し、さらにローカルサーバーからダウンロードしたテスト実行ファイルの起動時にオリジン URL が View 1 と View 2 に表示されることを確認する。
 
 ## 引き継ぎと次セッションへの移行手順
@@ -607,7 +613,7 @@ Phase 0 から Phase 4 までの全実装項目（Phase 4 は PR #25、PR #26、
 
 ### 現在地の確認方法
 
-実装を再開する際は、はじめに `main` ブランチの最新状態、本計画書の Phase 0〜4 チェックリストの `[x]` 完了状況、および [decision-records.md](decision-records.md) の `L-01` 〜 `L-21` を確認する。
+実装を再開する際は、はじめに `main` ブランチの最新状態、本計画書の Phase 0〜4 チェックリストの `[x]` 完了状況、および [decision-records.md](decision-records.md) の `L-01` 〜 `L-24` を確認する。
 
 ### ブランチ運用とマージ後の基準点更新ルール
 
@@ -626,7 +632,7 @@ ETW、WFP、Named Pipe DACL、`NtSuspendProcess`、`CreateProcessAsUser`、お�
 #### Phase 4 実機 Chrome E2E 検証（`FU-E2E-02`）用
 
 ```text
-docs/e2e-test-runbook.md（Track B および Track C）、docs/phase4-e2e-runbook.md、docs/follow-up-notes.md の FU-E2E-02、docs/decision-records.md（L-01〜L-21）、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU 環境で Phase 4 の実機 Chrome E2E 検証を実施し、検証結果と合否記録を独立した PR としてまとめてください。
+docs/e2e-test-runbook.md（Track B および Track C）、docs/phase4-e2e-runbook.md、docs/follow-up-notes.md の FU-E2E-02、docs/decision-records.md（L-01〜L-24）、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU 環境で Phase 4 の実機 Chrome E2E 検証を実施し、検証結果と合否記録を独立した PR としてまとめてください。
 ```
 
 #### Phase 2〜3 実機 E2E 検証（`FU-E2E-01`）用

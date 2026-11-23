@@ -46,6 +46,7 @@ struct CliArgs {
     bridge_sha256: Option<String>,
     bridge_signer: Option<String>,
     bridge_root_thumbprint: Option<String>,
+    auth_helper_sha256: Option<String>,
     show_help: bool,
 }
 
@@ -69,6 +70,7 @@ impl Default for CliArgs {
             bridge_sha256: None,
             bridge_signer: None,
             bridge_root_thumbprint: None,
+            auth_helper_sha256: None,
             show_help: false,
         }
     }
@@ -205,6 +207,16 @@ where
                     anyhow::bail!("--bridge-root-thumbprint cannot be empty");
                 }
                 parsed.bridge_root_thumbprint = Some(trimmed);
+            }
+            "--auth-helper-sha256" => {
+                let val = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--auth-helper-sha256 requires a SHA-256 hex argument")
+                })?;
+                let trimmed = val.to_string_lossy().trim().to_string();
+                if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    anyhow::bail!("--auth-helper-sha256 requires exactly 64 hexadecimal digits");
+                }
+                parsed.auth_helper_sha256 = Some(trimmed);
             }
             "--help" | "-h" => parsed.show_help = true,
             other => anyhow::bail!("unrecognized argument: {other}"),
@@ -373,7 +385,7 @@ fn main() -> anyhow::Result<()> {
     let cli = parse_cli_args(std::env::args_os())?;
     if cli.show_help {
         println!(
-            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>] [--bridge-sha256 <hex>] [--bridge-signer <dn>] [--bridge-root-thumbprint <sha1>]"
+            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>] [--bridge-sha256 <hex>] [--bridge-signer <dn>] [--bridge-root-thumbprint <sha1>] [--auth-helper-sha256 <hex>]"
         );
         return Ok(());
     }
@@ -411,6 +423,7 @@ fn build_daemon_config(
         authorized_bridge_sha256,
         authorized_bridge_signer: cli.bridge_signer.clone(),
         authorized_bridge_root_thumbprint: cli.bridge_root_thumbprint.clone(),
+        auth_helper_sha256: cli.auth_helper_sha256.clone(),
         outbound_firewall_enabled,
         outbound_enforcement_mode: cli.outbound_mode,
         resume_suspended_on_shutdown,
@@ -669,6 +682,8 @@ mod tests {
             "CN=LocalEDR Bridge",
             "--bridge-root-thumbprint",
             "4C2EFD3A66EA28B16697394703A72CA340A05BD6",
+            "--auth-helper-sha256",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         ])
         .expect("custom args");
         assert!(custom.foreground);
@@ -705,6 +720,15 @@ mod tests {
         assert_eq!(
             custom.bridge_root_thumbprint.as_deref(),
             Some("4C2EFD3A66EA28B16697394703A72CA340A05BD6")
+        );
+        assert_eq!(
+            custom.auth_helper_sha256.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
+        let custom_cfg = build_daemon_config(&custom, None, None, None, Vec::new(), Vec::new());
+        assert_eq!(
+            custom_cfg.auth_helper_sha256.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
         );
 
         let service_strict = parse_cli_args(["ledr-daemon", "--service-strict"]).expect("service strict");
@@ -792,6 +816,36 @@ mod tests {
                 true,
             ),
             ("--bridge-root-thumbprint missing value", &["ledr-daemon", "--bridge-root-thumbprint"], false),
+            ("--auth-helper-sha256 missing value", &["ledr-daemon", "--auth-helper-sha256"], false),
+            ("--auth-helper-sha256 empty", &["ledr-daemon", "--auth-helper-sha256", "   "], false),
+            ("--auth-helper-sha256 short", &["ledr-daemon", "--auth-helper-sha256", "abcd"], false),
+            (
+                "--auth-helper-sha256 too long (65 hex)",
+                &[
+                    "ledr-daemon",
+                    "--auth-helper-sha256",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ],
+                false,
+            ),
+            (
+                "--auth-helper-sha256 non-hex chars",
+                &[
+                    "ledr-daemon",
+                    "--auth-helper-sha256",
+                    "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+                ],
+                false,
+            ),
+            (
+                "--auth-helper-sha256 valid uppercase 64 hex",
+                &[
+                    "ledr-daemon",
+                    "--auth-helper-sha256",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                ],
+                true,
+            ),
             ("--nrd-feed-url missing value", &["ledr-daemon", "--nrd-feed-url"], false),
             ("--nrd-feed-url whitespace", &["ledr-daemon", "--nrd-feed-url", "   "], false),
             ("--nrd-cache missing value", &["ledr-daemon", "--nrd-cache"], false),

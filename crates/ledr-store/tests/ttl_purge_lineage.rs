@@ -90,7 +90,7 @@ fn store_01_wal_pragmas_and_separated_readonly_connection() {
         .verify_reader_pragmas()
         .expect("verify reader pragmas");
     assert_eq!(r_mode.to_ascii_lowercase(), "wal");
-    assert_eq!(r_cache, -2048);
+    assert_eq!(r_cache, -512);
     assert_eq!(r_mmap, 0);
 
     // Confirm separated read-only query connection actively rejects SQL writes.
@@ -1632,3 +1632,77 @@ fn store_11_checkpoint_truncate_with_deadline_respects_budget_under_reader_lock(
     }
 }
 
+/// `STORE-MEM-01` integration boundary check: verifies public `shrink_reader_memory_if_idle`
+/// behavior against idle threshold, repeat suppression, shutdown suppression, restart recovery,
+/// and read/write consistency across the separated read-only connection.
+#[test]
+fn store_12_shrink_reader_memory_if_idle_public_boundary() {
+    let dir = TempDir::new().expect("create temp dir");
+    let db_path = dir.path().join("shrink_boundary.db");
+    let store = LedrStore::open(&db_path).expect("open LedrStore");
+
+    let (_, w_cache, _) = store.verify_pragmas().expect("verify writer pragmas");
+    let (_, r_cache, _) = store
+        .verify_reader_pragmas()
+        .expect("verify reader pragmas");
+    assert_eq!(w_cache, -2048);
+    assert_eq!(r_cache, -512);
+
+    let (ident, proc_start) = make_process_start(
+        6101,
+        1_750_000_000_000,
+        4,
+        r"C:\Tools\shrink_boundary.exe",
+        "shrink_boundary.exe --check",
+    );
+    store
+        .ingest_event(&proc_start, Some("4:1"), false, "OBSERVED")
+        .expect("ingest process start");
+    store.flush_batch().expect("flush process start");
+
+    let snap = store
+        .query_flight_recorder(10, Some(&ident.instance_id()))
+        .expect("query process");
+    assert_eq!(snap.processes.len(), 1);
+
+    assert!(
+        !store
+            .shrink_reader_memory_if_idle(Duration::from_secs(30))
+            .expect("idle < 30s must not shrink"),
+        "30s threshold must not shrink immediately after reader access"
+    );
+
+    assert!(
+        store
+            .shrink_reader_memory_if_idle(Duration::ZERO)
+            .expect("zero-threshold shrink"),
+        "idle >= 0 threshold must shrink once"
+    );
+    assert!(
+        !store
+            .shrink_reader_memory_if_idle(Duration::ZERO)
+            .expect("repeat zero-threshold shrink"),
+        "already shrunk since last access must return Ok(false)"
+    );
+
+    // Reader query resets shrunk state; shutdown still blocks execution.
+    let snap2 = store
+        .query_flight_recorder(10, Some(&ident.instance_id()))
+        .expect("query process after shrink");
+    assert_eq!(snap2.processes.len(), 1);
+
+    store.request_shutdown();
+    assert!(
+        !store
+            .shrink_reader_memory_if_idle(Duration::ZERO)
+            .expect("shrink during shutdown"),
+        "shutdown requested must suppress shrink_memory"
+    );
+    store.clear_shutdown_flag();
+    assert!(
+        store
+            .shrink_reader_memory_if_idle(Duration::ZERO)
+            .expect("shrink after clear_shutdown_flag"),
+        "clear_shutdown_flag must allow shrink_memory again"
+    );
+}

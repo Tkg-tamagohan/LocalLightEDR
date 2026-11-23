@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use ledr_rules::{canonical_ip, matches_network_target};
 
 use crate::firewall::parse_literal_target_ip;
+use crate::process_table::{PathInterner, PATH_INTERNER_MAX_ENTRIES};
 
 pub(super) const MAX_DOMAINS_PER_PROCESS_IP: usize = 16;
 
@@ -11,13 +13,13 @@ const CROSS_PROCESS_DNS_CONFLICT_WINDOW_MS: i64 = 3_600_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DomainTimestamp {
-    pub(super) domain: String,
+    pub(super) domain: Arc<str>,
     pub(super) timestamp_ms: i64,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct DnsHistoryEntry {
-    pub(super) exe_key: String,
+    pub(super) exe_key: Arc<str>,
     pub(super) domains: Vec<DomainTimestamp>,
 }
 
@@ -49,18 +51,20 @@ pub(super) struct ExeIpResolverRecord {
 #[derive(Debug, Default)]
 pub(super) struct ProcessDnsHistory {
     capacity: usize,
+    interner: PathInterner,
     pub(super) entries: HashMap<(String, IpAddr), DnsHistoryEntry>,
     insertion_order: VecDeque<(String, IpAddr)>,
-    pub(super) latest_domain_by_exe: HashMap<(String, String), LatestDomainIps>,
-    latest_domain_order: VecDeque<(String, String)>,
-    recent_exe_ip_resolvers: HashMap<(String, IpAddr), Vec<ExeIpResolverRecord>>,
-    recent_exe_ip_order: VecDeque<(String, IpAddr)>,
+    pub(super) latest_domain_by_exe: HashMap<(Arc<str>, Arc<str>), LatestDomainIps>,
+    latest_domain_order: VecDeque<(Arc<str>, Arc<str>)>,
+    recent_exe_ip_resolvers: HashMap<(Arc<str>, IpAddr), Vec<ExeIpResolverRecord>>,
+    recent_exe_ip_order: VecDeque<(Arc<str>, IpAddr)>,
 }
 
 impl ProcessDnsHistory {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
+            interner: PathInterner::new(PATH_INTERNER_MAX_ENTRIES),
             entries: HashMap::new(),
             insertion_order: VecDeque::new(),
             latest_domain_by_exe: HashMap::new(),
@@ -68,6 +72,34 @@ impl ProcessDnsHistory {
             recent_exe_ip_resolvers: HashMap::new(),
             recent_exe_ip_order: VecDeque::new(),
         }
+    }
+
+    fn shrink_map<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
+        let target = map.len().saturating_mul(2).max(64);
+        if map.capacity() > target {
+            map.shrink_to(target);
+        }
+    }
+
+    fn shrink_deque<T>(deque: &mut VecDeque<T>) {
+        let target = deque.len().saturating_mul(2).max(64);
+        if deque.capacity() > target {
+            deque.shrink_to(target);
+        }
+    }
+
+    pub(super) fn maybe_shrink_capacities(&mut self) {
+        Self::shrink_map(&mut self.entries);
+        Self::shrink_deque(&mut self.insertion_order);
+        Self::shrink_map(&mut self.latest_domain_by_exe);
+        Self::shrink_deque(&mut self.latest_domain_order);
+        Self::shrink_map(&mut self.recent_exe_ip_resolvers);
+        Self::shrink_deque(&mut self.recent_exe_ip_order);
+    }
+
+    pub(super) fn sweep_interner_and_shrink(&mut self) -> usize {
+        self.maybe_shrink_capacities();
+        self.interner.sweep_dead()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -109,11 +141,14 @@ impl ProcessDnsHistory {
         timestamp_ms: i64,
         process_created_at_ms: Option<i64>,
     ) -> Vec<IpAddr> {
-        let norm_domain = query_name.trim().trim_end_matches('.').to_ascii_lowercase();
-        if norm_domain.is_empty() || resolved_ips.is_empty() {
+        let norm_domain_str = query_name.trim().trim_end_matches('.').to_ascii_lowercase();
+        if norm_domain_str.is_empty() || resolved_ips.is_empty() {
             return Vec::new();
         }
-        let exe_norm = exe_key.trim().to_ascii_lowercase();
+        let exe_norm_str = exe_key.trim().to_ascii_lowercase();
+        let norm_domain = self.interner.intern(&norm_domain_str);
+        let exe_norm = self.interner.intern(&exe_norm_str);
+        let mut pruned_or_evicted = false;
         let mut canon_ips: Vec<IpAddr> = Vec::with_capacity(resolved_ips.len());
         let mut v4_ips: Vec<IpAddr> = Vec::new();
         let mut v6_ips: Vec<IpAddr> = Vec::new();
@@ -135,7 +170,7 @@ impl ProcessDnsHistory {
         let accepted_v6: Vec<IpAddr>;
 
         if !exe_norm.is_empty() {
-            let domain_key = (exe_norm.clone(), norm_domain.clone());
+            let domain_key = (Arc::clone(&exe_norm), Arc::clone(&norm_domain));
             if let Some(latest) = self.latest_domain_by_exe.get_mut(&domain_key) {
                 accepted_v4 = if v4_ips.is_empty() {
                     Vec::new()
@@ -173,7 +208,9 @@ impl ProcessDnsHistory {
                     let Some(oldest) = self.latest_domain_order.pop_front() else {
                         break;
                     };
-                    self.latest_domain_by_exe.remove(&oldest);
+                    if self.latest_domain_by_exe.remove(&oldest).is_some() {
+                        pruned_or_evicted = true;
+                    }
                 }
                 let mut latest = LatestDomainIps::default();
                 if !v4_ips.is_empty() {
@@ -230,6 +267,7 @@ impl ProcessDnsHistory {
             });
             if !removed_keys.is_empty() {
                 self.insertion_order.retain(|k| !removed_keys.contains(k));
+                pruned_or_evicted = true;
             }
         }
 
@@ -237,7 +275,7 @@ impl ProcessDnsHistory {
             let key = (process_instance_id.to_string(), canon);
             if let Some(existing) = self.entries.get_mut(&key) {
                 if existing.exe_key.is_empty() && !exe_norm.is_empty() {
-                    existing.exe_key = exe_norm.clone();
+                    existing.exe_key = Arc::clone(&exe_norm);
                 }
                 if let Some(cur) = existing
                     .domains
@@ -247,7 +285,7 @@ impl ProcessDnsHistory {
                     cur.timestamp_ms = cur.timestamp_ms.max(timestamp_ms);
                 } else {
                     let latest_map = &self.latest_domain_by_exe;
-                    let entry_exe = existing.exe_key.as_str();
+                    let entry_exe = &existing.exe_key;
                     if existing.domains.len() >= MAX_DOMAINS_PER_PROCESS_IP {
                         existing.domains.retain(|d| {
                             !Self::is_domain_superseded_in_map(
@@ -272,7 +310,7 @@ impl ProcessDnsHistory {
                         }
                     }
                     existing.domains.push(DomainTimestamp {
-                        domain: norm_domain.clone(),
+                        domain: Arc::clone(&norm_domain),
                         timestamp_ms,
                     });
                 }
@@ -281,15 +319,17 @@ impl ProcessDnsHistory {
                     let Some(oldest) = self.insertion_order.pop_front() else {
                         break;
                     };
-                    self.entries.remove(&oldest);
+                    if self.entries.remove(&oldest).is_some() {
+                        pruned_or_evicted = true;
+                    }
                 }
                 self.insertion_order.push_back(key.clone());
                 self.entries.insert(
                     key,
                     DnsHistoryEntry {
-                        exe_key: exe_norm.clone(),
+                        exe_key: Arc::clone(&exe_norm),
                         domains: vec![DomainTimestamp {
-                            domain: norm_domain.clone(),
+                            domain: Arc::clone(&norm_domain),
                             timestamp_ms,
                         }],
                     },
@@ -297,7 +337,7 @@ impl ProcessDnsHistory {
             }
 
             if !exe_norm.is_empty() {
-                let resolver_key = (exe_norm.clone(), canon);
+                let resolver_key = (Arc::clone(&exe_norm), canon);
                 if let Some(resolvers) = self.recent_exe_ip_resolvers.get_mut(&resolver_key) {
                     if let Some(existing) = resolvers
                         .iter_mut()
@@ -330,7 +370,9 @@ impl ProcessDnsHistory {
                         let Some(oldest) = self.recent_exe_ip_order.pop_front() else {
                             break;
                         };
-                        self.recent_exe_ip_resolvers.remove(&oldest);
+                        if self.recent_exe_ip_resolvers.remove(&oldest).is_some() {
+                            pruned_or_evicted = true;
+                        }
                     }
                     self.recent_exe_ip_order.push_back(resolver_key.clone());
                     self.recent_exe_ip_resolvers.insert(
@@ -343,6 +385,9 @@ impl ProcessDnsHistory {
                     );
                 }
             }
+        }
+        if pruned_or_evicted {
+            self.maybe_shrink_capacities();
         }
         accepted_ips
     }
@@ -359,7 +404,7 @@ impl ProcessDnsHistory {
         let canon_cands: Vec<IpAddr> = candidate_ips.iter().map(|ip| canonical_ip(*ip)).collect();
         let mut out: Vec<(IpAddr, String)> = Vec::new();
         for ((k_exe, dom), latest) in &self.latest_domain_by_exe {
-            if k_exe != &exe_norm {
+            if k_exe.as_ref() != exe_norm {
                 continue;
             }
             for &cand in &canon_cands {
@@ -367,7 +412,7 @@ impl ProcessDnsHistory {
                     .family(cand)
                     .is_some_and(|(latest_ips, _)| latest_ips.contains(&cand))
                 {
-                    out.push((cand, dom.clone()));
+                    out.push((cand, dom.to_string()));
                 }
             }
         }
@@ -381,7 +426,10 @@ impl ProcessDnsHistory {
             return false;
         }
         let canon = canonical_ip(ip);
-        let Some(latest) = self.latest_domain_by_exe.get(&(exe_norm, dom_norm)) else {
+        let Some(latest) = self
+            .latest_domain_by_exe
+            .get(&(Arc::from(exe_norm), Arc::from(dom_norm)))
+        else {
             return false;
         };
         let Some((latest_ips, _)) = latest.family(canon) else {
@@ -413,7 +461,7 @@ impl ProcessDnsHistory {
         };
         if let Some(latest) = self
             .latest_domain_by_exe
-            .get(&(exe_norm.clone(), dom_norm.clone()))
+            .get(&(Arc::from(exe_norm.as_str()), Arc::from(dom_norm.as_str())))
         {
             if is_fresh(latest) {
                 return true;
@@ -428,7 +476,7 @@ impl ProcessDnsHistory {
                 .latest_domain_by_exe
                 .iter()
                 .any(|((k_exe, k_dom), latest)| {
-                    k_exe == &exe_norm
+                    k_exe.as_ref() == exe_norm
                         && matches_network_target(&dom_norm, canon, Some(k_dom))
                         && is_fresh(latest)
                         && wildcard_domain_allowed(k_dom)
@@ -450,7 +498,10 @@ impl ProcessDnsHistory {
             return false;
         }
         let canon = canonical_ip(ip);
-        let Some(latest) = self.latest_domain_by_exe.get(&(exe_norm, dom_norm)) else {
+        let Some(latest) = self
+            .latest_domain_by_exe
+            .get(&(Arc::from(exe_norm), Arc::from(dom_norm)))
+        else {
             return false;
         };
         let Some((latest_ips, latest_ts)) = latest.family(canon) else {
@@ -460,9 +511,9 @@ impl ProcessDnsHistory {
     }
 
     fn is_domain_superseded_in_map(
-        latest_domain_by_exe: &HashMap<(String, String), LatestDomainIps>,
-        exe_key: &str,
-        domain: &str,
+        latest_domain_by_exe: &HashMap<(Arc<str>, Arc<str>), LatestDomainIps>,
+        exe_key: &Arc<str>,
+        domain: &Arc<str>,
         timestamp_ms: i64,
         ip: IpAddr,
     ) -> bool {
@@ -470,7 +521,8 @@ impl ProcessDnsHistory {
             return false;
         }
         let canon = canonical_ip(ip);
-        let Some(latest) = latest_domain_by_exe.get(&(exe_key.to_string(), domain.to_string()))
+        let Some(latest) =
+            latest_domain_by_exe.get(&(Arc::clone(exe_key), Arc::clone(domain)))
         else {
             return false;
         };
@@ -495,10 +547,14 @@ impl ProcessDnsHistory {
     }
 
     pub(super) fn remove_process(&mut self, process_instance_id: &str) {
+        let before = self.entries.len();
         self.entries
             .retain(|(inst_id, _), _| inst_id != process_instance_id);
         self.insertion_order
             .retain(|(inst_id, _)| inst_id != process_instance_id);
+        if self.entries.len() < before {
+            self.maybe_shrink_capacities();
+        }
     }
 
     pub(super) fn lookup_domains_for_process(
@@ -525,7 +581,7 @@ impl ProcessDnsHistory {
                     canon,
                 )
             })
-            .map(|d| (d.domain.clone(), d.timestamp_ms))
+            .map(|d| (d.domain.to_string(), d.timestamp_ms))
             .collect();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
@@ -575,7 +631,7 @@ impl ProcessDnsHistory {
         }
         let mut out: Vec<String> = Vec::new();
         for ((_, entry_ip), entry) in &self.entries {
-            if *entry_ip != canon || entry.exe_key != exe_norm {
+            if *entry_ip != canon || entry.exe_key.as_ref() != exe_norm {
                 continue;
             }
             for d in &entry.domains {
@@ -586,7 +642,7 @@ impl ProcessDnsHistory {
                     d.timestamp_ms,
                     canon,
                 ) {
-                    out.push(d.domain.clone());
+                    out.push(d.domain.to_string());
                 }
             }
         }
@@ -605,7 +661,7 @@ impl ProcessDnsHistory {
         }
         let mut out: Vec<(IpAddr, String)> = Vec::new();
         for ((_, entry_ip), entry) in &self.entries {
-            if entry.exe_key != exe_norm {
+            if entry.exe_key.as_ref() != exe_norm {
                 continue;
             }
             for d in &entry.domains {
@@ -616,7 +672,7 @@ impl ProcessDnsHistory {
                     d.timestamp_ms,
                     *entry_ip,
                 ) {
-                    out.push((*entry_ip, d.domain.clone()));
+                    out.push((*entry_ip, d.domain.to_string()));
                 }
             }
         }
@@ -639,7 +695,10 @@ impl ProcessDnsHistory {
             return false;
         }
         let canon = canonical_ip(ip);
-        let Some(resolvers) = self.recent_exe_ip_resolvers.get(&(exe_norm, canon)) else {
+        let Some(resolvers) = self
+            .recent_exe_ip_resolvers
+            .get(&(Arc::from(exe_norm), canon))
+        else {
             return false;
         };
         let max_dns_ts = event_ts_ms.saturating_add(max_post_event_skew_ms.max(0));
@@ -669,7 +728,7 @@ impl ProcessDnsHistory {
             Some(inst_id.as_str()) != current_inst_id
                 && *entry_ip == canon
                 && entry.domains.iter().any(|d| {
-                    d.domain == norm_domain
+                    d.domain.as_ref() == norm_domain
                         && !Self::is_domain_superseded_in_map(
                             &self.latest_domain_by_exe,
                             &entry.exe_key,
@@ -682,5 +741,57 @@ impl ProcessDnsHistory {
                         && d.timestamp_ms <= event_ts_ms.saturating_add(60_000)
                 })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn dns_mem_01_interns_strings_and_shrinks_capacities_on_prune() {
+        let mut hist = ProcessDnsHistory::new(1_024);
+        let ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        for i in 0..500u32 {
+            hist.record_for_exe(
+                &format!("{i}:100"),
+                r"C:\Program Files\Browser\browser.exe",
+                "shared.example",
+                &[ip],
+                1_000 + i64::from(i),
+            );
+        }
+        assert_eq!(hist.entries.len(), 500);
+        let first = hist
+            .entries
+            .get(&("0:100".to_string(), ip))
+            .expect("first entry");
+        let second = hist
+            .entries
+            .get(&("1:100".to_string(), ip))
+            .expect("second entry");
+        assert!(Arc::ptr_eq(&first.exe_key, &second.exe_key));
+        assert!(Arc::ptr_eq(&first.domains[0].domain, &second.domains[0].domain));
+
+        let peak_cap = hist.entries.capacity();
+        assert!(peak_cap >= 500);
+
+        for i in 0..490u32 {
+            hist.remove_process(&format!("{i}:100"));
+        }
+        assert_eq!(hist.entries.len(), 10);
+        assert!(
+            hist.entries.capacity() < peak_cap,
+            "entries capacity {} should shrink below peak {}",
+            hist.entries.capacity(),
+            peak_cap
+        );
+        assert!(
+            hist.insertion_order.capacity() <= 128,
+            "insertion_order capacity {} should shrink",
+            hist.insertion_order.capacity()
+        );
+        let _ = hist.sweep_interner_and_shrink();
     }
 }

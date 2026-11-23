@@ -11,7 +11,7 @@ mod schema;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use ledr_proto::{
@@ -20,7 +20,9 @@ use ledr_proto::{
 use rusqlite::{params, Connection};
 use thiserror::Error;
 
-use schema::{apply_pragmas, reader_open_flags, writer_open_flags, SCHEMA_DDL};
+use schema::{
+    apply_reader_pragmas, apply_writer_pragmas, reader_open_flags, writer_open_flags, SCHEMA_DDL,
+};
 
 /// Returns the store crate version string.
 pub fn store_version() -> &'static str {
@@ -160,6 +162,11 @@ struct StoreInner {
     shutdown_requested: AtomicBool,
     purge_batches_completed: AtomicUsize,
     purge_batch_delay_ms: AtomicU64,
+    opened_at: Instant,
+    last_reader_access_ns: AtomicU64,
+    reader_shrunk_since_access: AtomicBool,
+    #[cfg(test)]
+    test_elapsed_offset_ns: AtomicU64,
 }
 
 /// Thread-safe embedded SQLite WAL store with separated write/read connections (`AUTO-09`).
@@ -179,11 +186,11 @@ impl LedrStore {
         }
 
         let writer = Connection::open_with_flags(path, writer_open_flags())?;
-        apply_pragmas(&writer)?;
+        apply_writer_pragmas(&writer)?;
         writer.execute_batch(SCHEMA_DDL)?;
 
         let reader = Connection::open_with_flags(path, reader_open_flags())?;
-        apply_pragmas(&reader)?;
+        apply_reader_pragmas(&reader)?;
 
         Ok(Self {
             inner: Arc::new(StoreInner {
@@ -194,6 +201,11 @@ impl LedrStore {
                 shutdown_requested: AtomicBool::new(false),
                 purge_batches_completed: AtomicUsize::new(0),
                 purge_batch_delay_ms: AtomicU64::new(0),
+                opened_at: Instant::now(),
+                last_reader_access_ns: AtomicU64::new(0),
+                reader_shrunk_since_access: AtomicBool::new(false),
+                #[cfg(test)]
+                test_elapsed_offset_ns: AtomicU64::new(0),
             }),
         })
     }
@@ -201,7 +213,7 @@ impl LedrStore {
     /// Opens an in-memory SQLite store sharing a single connection between writer and reader.
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
-        apply_pragmas(&conn)?;
+        apply_writer_pragmas(&conn)?;
         conn.execute_batch(SCHEMA_DDL)?;
 
         let shared = Arc::new(Mutex::new(conn));
@@ -214,6 +226,11 @@ impl LedrStore {
                 shutdown_requested: AtomicBool::new(false),
                 purge_batches_completed: AtomicUsize::new(0),
                 purge_batch_delay_ms: AtomicU64::new(0),
+                opened_at: Instant::now(),
+                last_reader_access_ns: AtomicU64::new(0),
+                reader_shrunk_since_access: AtomicBool::new(false),
+                #[cfg(test)]
+                test_elapsed_offset_ns: AtomicU64::new(0),
             }),
         })
     }
@@ -246,6 +263,42 @@ impl LedrStore {
         self.inner.purge_batches_completed.load(Ordering::Acquire)
     }
 
+    fn elapsed_since_open_ns(&self) -> u64 {
+        let base = u64::try_from(self.inner.opened_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        #[cfg(test)]
+        {
+            base.saturating_add(self.inner.test_elapsed_offset_ns.load(Ordering::Acquire))
+        }
+        #[cfg(not(test))]
+        {
+            base
+        }
+    }
+
+    fn record_reader_access(&self) {
+        let now_ns = self.elapsed_since_open_ns();
+        self.inner
+            .last_reader_access_ns
+            .store(now_ns, Ordering::Release);
+        self.inner
+            .reader_shrunk_since_access
+            .store(false, Ordering::Release);
+    }
+
+    fn reader_idle_ns(&self) -> u64 {
+        let now_ns = self.elapsed_since_open_ns();
+        let last_ns = self.inner.last_reader_access_ns.load(Ordering::Acquire);
+        now_ns.saturating_sub(last_ns)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_reader_idle_for_test(&self, delta: Duration) {
+        let delta_ns = u64::try_from(delta.as_nanos()).unwrap_or(u64::MAX);
+        self.inner
+            .test_elapsed_offset_ns
+            .fetch_add(delta_ns, Ordering::AcqRel);
+    }
+
     fn lock_writer(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.inner
             .writer
@@ -254,10 +307,57 @@ impl LedrStore {
     }
 
     fn lock_reader(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
-        self.inner
+        let guard = self
+            .inner
             .reader
             .lock()
-            .map_err(|_| StoreError::LockPoisoned("reader"))
+            .map_err(|_| StoreError::LockPoisoned("reader"))?;
+        self.record_reader_access();
+        Ok(guard)
+    }
+
+    /// Executes `PRAGMA shrink_memory;` on the read-only connection when idle for at least
+    /// `idle_threshold` and shutdown has not been requested. Non-blocking on lock contention.
+    pub fn shrink_reader_memory_if_idle(
+        &self,
+        idle_threshold: Duration,
+    ) -> Result<bool, StoreError> {
+        if self.is_shutdown_requested() {
+            return Ok(false);
+        }
+        if self
+            .inner
+            .reader_shrunk_since_access
+            .load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let threshold_ns = u64::try_from(idle_threshold.as_nanos()).unwrap_or(u64::MAX);
+        if self.reader_idle_ns() < threshold_ns {
+            return Ok(false);
+        }
+
+        let reader = match self.inner.reader.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => return Err(StoreError::LockPoisoned("reader")),
+        };
+
+        if self.is_shutdown_requested()
+            || self
+                .inner
+                .reader_shrunk_since_access
+                .load(Ordering::Acquire)
+            || self.reader_idle_ns() < threshold_ns
+        {
+            return Ok(false);
+        }
+
+        reader.execute_batch("PRAGMA shrink_memory;")?;
+        self.inner
+            .reader_shrunk_since_access
+            .store(true, Ordering::Release);
+        Ok(true)
     }
 
     fn lock_batch(&self) -> Result<MutexGuard<'_, BatchBuffer>, StoreError> {

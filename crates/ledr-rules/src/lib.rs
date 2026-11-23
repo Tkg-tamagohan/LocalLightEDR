@@ -17,8 +17,8 @@ use thiserror::Error;
 
 pub use allowlist::{
     compute_file_sha256_hex, compute_file_sha256_hex_cancellable,
-    compute_reader_sha256_hex_cancellable, inspect_authenticode, is_allowed_by_rules,
-    matches_path_pattern, signer_subject_matches, BinaryIdentity,
+    compute_reader_sha256_hex_cancellable, is_allowed_by_rules, matches_path_pattern,
+    signer_subject_matches, BinaryIdentity,
 };
 pub use domain::{assess_domain_risk, assess_domain_risk_with_cache, DomainRiskAssessment};
 pub use nrd::{

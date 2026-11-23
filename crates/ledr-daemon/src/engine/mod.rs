@@ -2,6 +2,7 @@
 //! [`EarlyPruner`], [`SigmaEngine`], and [`LedrStore`].
 
 mod alerts;
+mod auth_worker;
 mod binary_inspector;
 mod config;
 mod dns_history;
@@ -287,6 +288,12 @@ pub struct DaemonEngine {
     pub(super) select_idle_periodic_sweeps: AtomicU64,
     #[cfg(test)]
     pub(super) select_idle_periodic_sweep_removals: AtomicU64,
+    #[cfg(test)]
+    pub(super) mem_maintenance_interval_ms: AtomicU64,
+    #[cfg(test)]
+    pub(super) tier2c_mem_maintenance_runs: AtomicU64,
+    #[cfg(test)]
+    pub(super) select_idle_mem_maintenance_runs: AtomicU64,
     shutdown_initiated: Arc<AtomicBool>,
     shutdown_drain_cutoff: Arc<AtomicBool>,
     shutdown_cutoff_notify: Arc<tokio::sync::Notify>,
@@ -332,10 +339,39 @@ impl DaemonEngine {
         &self.config
     }
 
+    /// Returns the active [`BinaryInspector`] implementation.
+    pub fn inspector(&self) -> &Arc<dyn BinaryInspector> {
+        &self.inspector
+    }
+
     #[doc(hidden)]
     pub fn set_fail_record_alert_for_test(&self, fail: bool) {
         self.fail_record_alert_for_test
             .store(fail, Ordering::Release);
+    }
+
+    pub(super) fn mem_maintenance_interval(&self) -> std::time::Duration {
+        #[cfg(test)]
+        {
+            std::time::Duration::from_millis(
+                self.mem_maintenance_interval_ms
+                    .load(Ordering::Acquire)
+                    .max(1),
+            )
+        }
+        #[cfg(not(test))]
+        {
+            std::time::Duration::from_secs(60)
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_mem_maintenance_interval_for_test(&self, interval: std::time::Duration) {
+        let ms = u64::try_from(interval.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.mem_maintenance_interval_ms
+            .store(ms, Ordering::Release);
     }
 
     /// Returns current [`PipelineMetrics`] (`決定記録 L-10`).
@@ -433,9 +469,19 @@ impl DaemonEngine {
             .inspect_cancellable(exe_path, cancel_flag, fast_skip)
     }
 
+    /// Returns `true` if `pid` belongs to the active out-of-process Authenticode helper
+    /// (`FU-E2E-03` Track 2 self-PID recursion guard).
+    pub fn is_helper_pid(&self, pid: u32) -> bool {
+        self.inspector.is_helper_pid(pid)
+    }
+
     /// Returns `true` iff `(pid, exe_path)` matches the running daemon's own PID and normalized
-    /// executable path (fail-closed when `self_exe_normalized` is `None` or `exe_path` is empty).
+    /// executable path (or its active Authenticode helper PID, fail-closed when
+    /// `self_exe_normalized` is `None` or `exe_path` is empty).
     pub(super) fn is_self_process(&self, pid: u32, exe_path: &str) -> bool {
+        if self.inspector.is_helper_pid(pid) {
+            return true;
+        }
         if pid != self.self_pid || exe_path.trim().is_empty() {
             return false;
         }

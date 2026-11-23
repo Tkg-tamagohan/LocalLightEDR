@@ -1,7 +1,7 @@
 # LocalEDR 申し送り事項と実機検証計画
 
 本書は LocalEDR の各 Phase を `main` ブランチへマージした後に残した副次的な改善余地と、合成自動テストでは検証済みと扱わない実機 E2E 検証の対象を管理する。
-仕様の正は [implementation-plan.md](implementation-plan.md)、[decision-records.md](decision-records.md)（L-01 から L-21）、および凍結済みの [crates/ledr-proto/src/lib.rs](../crates/ledr-proto/src/lib.rs) に置き、本書では後続作業へ引き継ぐ個別項目を ID ごとに記録する。
+仕様の正は [implementation-plan.md](implementation-plan.md)、[decision-records.md](decision-records.md)（L-01 から L-24）、および凍結済みの [crates/ledr-proto/src/lib.rs](../crates/ledr-proto/src/lib.rs) に置き、本書では後続作業へ引き継ぐ個別項目を ID ごとに記録する。
 
 ## 項目一覧
 
@@ -11,7 +11,7 @@
 | `FU-P4-01` | 副次改善 | Phase 4 | `ledr-bridge-nm` の `HKLM` 登録および確認における 32 ビットレジストリビュー（`KEY_WOW64_32KEY`）対応 | 次回 `crates/ledr-bridge-nm/` 改修または後続整備 PR |
 | `FU-E2E-01` | 実機 E2E 検証 | Phase 2、Phase 3 | Windows 10 または Windows 11 クライアント SKU 管理者環境での実機検証 | 独立した実機 E2E 検証 PR |
 | `FU-E2E-02` | 実機 E2E 検証 | Phase 4 | Windows 10 または Windows 11 クライアント SKU 上での Chrome 拡張、Native Messaging、MOTW、および UI 終了の実機検証 | 独立した実機 E2E 検証 PR |
-| `FU-E2E-03` | 性能最適化 | Phase 3、Phase 4 | `E2E-PERF-01` の `WorkingSet64` 基準（20 MB 以下）超過（アイドル最新 `28.59 MB`、ピーク `108.71 MB`、高負荷最新 `51.80 MB`、ピーク `64.34 MB`）の原因分析とメモリ削減 | 次回性能改善 PR |
+| `FU-E2E-03` | 性能最適化 | Phase 3、Phase 4 | `E2E-PERF-01` 超過に対する Stage 1〜3 最適化（`ledr-auth-helper` 分離、LRU 上限、非系譜解放、SQLite reader 縮小、`PrivateWorkingSetSize <= 20.0 MB` 基準併記） | 本作業ブランチ（`perf/fu-e2e-03-memory-reduction`）で実装と実機再計測を完了（マージ後の最終 E2E で再確認） |
 | `FU-E2E-04` | 検知改善 | Phase 1、Phase 3 | 短命プロセス（約 40 ms）での PEB 補完欠落による `command_line` 欠落と `LEDR-LOTL-001`（正規管理ツール悪用検知ルール）未発火の解消 | 次回センサーおよび ETW 改善 PR |
 | `FU-E2E-05` | 境界改善 | Phase 3 | WFP ドロップの終了済み兄弟プロセス由来の誤帰属抑止および `E2E-P3-06` 停止予算超過時の残余書き込みによる `-wal` 再生成の整理 | 次回デーモン境界改善 PR |
 
@@ -208,52 +208,78 @@ x64 Windows 上の `ledr-bridge-nm` は `RegKey::predef(HKEY_LOCAL_MACHINE)` に
 
 ### 対象ファイル
 
-- Authenticode 署名検証経路：[authenticode.rs](../crates/ledr-rules/src/allowlist/authenticode.rs#L235-L246)（`WinVerifyTrust` 呼び出し）
-- 永続化とバッチバッファ：[crates/ledr-store/src/lib.rs](../crates/ledr-store/src/lib.rs)
-- NRD キャッシュとデーモン起動構成：[crates/ledr-daemon/src/engine/lifecycle.rs](../crates/ledr-daemon/src/engine/lifecycle.rs)
+- Authenticode ワーカー分離（`Option 2-A` + `案 X`）：[crates/ledr-auth-helper/src/lib.rs](../crates/ledr-auth-helper/src/lib.rs)、[authenticode.rs](../crates/ledr-auth-helper/src/authenticode.rs)、[ffi.rs](../crates/ledr-auth-helper/src/ffi.rs)、[auth_worker.rs](../crates/ledr-daemon/src/engine/auth_worker.rs)、および [binary_inspector.rs](../crates/ledr-daemon/src/engine/binary_inspector.rs)（旧 `crates/ledr-rules/src/allowlist/{authenticode.rs,ffi.rs}` は移行後に削除）
+- 永続化接続縮小と保守フック：[crates/ledr-store/src/schema.rs](../crates/ledr-store/src/schema.rs)、[crates/ledr-store/src/lib.rs](../crates/ledr-store/src/lib.rs)、および [pipeline.rs](../crates/ledr-daemon/src/engine/pipeline.rs)
+- チャネル、プロセス表、DNS 履歴の縮約：[channel.rs](../crates/ledr-daemon/src/channel.rs)、[process_table.rs](../crates/ledr-daemon/src/process_table.rs)、[dns_history.rs](../crates/ledr-daemon/src/engine/dns_history.rs)、および [outbound.rs](../crates/ledr-daemon/src/engine/outbound.rs)
+- 実機メモリプロファイラ：[profile_daemon_memory.ps1](../scripts/profile_daemon_memory.ps1)
 
 ### 背景と出典
 
-2026 年 11 月 22 日に実施したルート 1 実機 E2E（[e2e-test-runbook.md](e2e-test-runbook.md)、`E2E-PERF-01`、公開 2 フィード 50,000 件の実 NRD キャッシュ読み込み時、未マージの PR #34 ブランチ `fix/e2e-pipe-dacl-dev-bypass` 上での実測）で、Release 版 `ledr-daemon.exe` の `WorkingSet64` が目標上限の 20.0 MB 以下を超過した。
+2026 年 11 月 22 日に実施したルート 1 実機 E2E（[e2e-test-runbook.md](e2e-test-runbook.md)、`E2E-PERF-01`、公開 2 フィード 50,000 件の実 NRD キャッシュ読み込み時、PR #34 暫定構成上の実測）で、Release 版 `ledr-daemon.exe` の `WorkingSet64` が目標上限の 20.0 MB 以下を超過した（`LatestWorkingSetMB = 28.59 MB`、`PeakWorkingSetMB = 108.71 MB`、直後 `PrivateMemorySize64 = 17.15 MB`）。
+2026 年 11 月 23 日に PR #38 マージ済み `main`（`b8d9c66`）上で Stage 1 実機プロファイリングを実施し、人間決裁チェックポイント（`B-1` と `B-2`）の承認を得て Track 1a〜1d と Track 2 を実装した（統合コミット `87be6d5`、単位はすべて `1 MB = 1 MiB = 1,048,576` バイト）。
+さらに Stage 3 実機再計測で OS 共有ページ（`Shared == 1`）下限による `WorkingSet64 <= 20.0 MB` の物理的達成不能を数値証明した上で、`Track 3` 仕様協議（`PrivateWorkingSetSize <= 20.0 MB` 必須と `WorkingSet64` 監視基準の併記、`決定記録 L-24`）のユーザー承認を受けた。
 
-### 現行挙動と実測値
+### 実装内容（Track 1a〜1d および Track 2）
 
-- 600 秒アイドル計測（10 分間の開発ホスト背景負荷：`processes = 1,037`、`dns_queries = 563`、`network_events = 44,496`、`alerts = 15`）：`AvgCpuPercent = 0.2876%`（基準 `< 0.5%` 合格）、`LatestWorkingSetMB = 28.59 MB`、`PeakWorkingSetMB = 108.71 MB`、直後確認時の `PrivateMemorySize64 = 17.15 MB`。
-- 60 秒高負荷計測（ブラウザ閲覧とビルド負荷併用）：`AvgCpuPercent = 0.3076%`、`LatestWorkingSetMB = 51.80 MB`、`PeakWorkingSetMB = 64.34 MB`。
-- `PrivateMemorySize64` は 20 MB 以内に収まっていた一方、共有ページを含む `WorkingSet64` に一時的な 108.71 MB スパイクと定常 28 MB 以上の滞在が見られた。
-  大容量バイナリやシステムカタログに対する `WinVerifyTrust` のファイルマッピング、SQLite ページキャッシュ、またはイベント受信時のバッファ保持が寄与している可能性があると推測するが、ヒープおよびページプロファイラによる内訳の切り分けは未実施である。
+- **Track 1a（`決定記録 L-22` / `B-1`）**：`crates/ledr-store` の書込専用接続は `PRAGMA cache_size = -2048;`（2 MiB 上限）を維持し、読取専用接続（`reader`）のみ `PRAGMA cache_size = -512;`（512 KiB 上限）へ縮小した。
+  また `DaemonEngine` の 60 秒定期保守ティックから `!is_shutdown_requested()` かつ 30 秒以上無アクセス時に限り `shrink_reader_memory_if_idle(30s)`（`PRAGMA shrink_memory`）を実行し、回帰テスト `STORE-MEM-01` を追加した。
+- **Track 1b**：`TelemetryRing`（[channel.rs](../crates/ledr-daemon/src/channel.rs)）について、容量 1,024 超過の最終時刻から 30 秒以上経過し、かつキューが空で容量が 1,024 超のときのみ `shrink_to(1024)` を実行し、`L-10` の高優先度 1,024 件ドロップ禁止と 8,192 件再バースト耐性を維持した（`CHAN-MEM-01`）。
+- **Track 1c**：`ActiveProcessTable::compact_exited_older_than` で終了 60 秒後の非系譜 5 フィールド（`user_sid`、`motw_referrer`、`motw_frame_url`、`motw_source`、`motw_zone_id`）のみを解放し、親系譜、`evicted_live`、および `EvictedCommandLine::Oversized` を保持した。
+  あわせて弱参照 8,192 件上限の `PathInterner`（末端ロック順序 `firewall -> process_table -> path_interner`）と、DNS 履歴および `VerifiedAppWideAllowCache` の文字列インターンと容量縮小を実装した（`PROC-MEM-01`、`DNS-MEM-01`）。
+- **Track 1d**：`authenticode_cache` を 512 件上限の `BoundedLruCache` 化し、呼び出しごとのファイル SHA-256 再計算（`SEC_0005`）を維持したまま一時エラー、タイムアウト、およびキャンセルの非キャッシュ化を徹底した（`BIN-MEM-01`）。
+- **Track 2（`決定記録 L-23` / `B-2` / `Option 2-A` + `案 X`）**：`WinVerifyTrust` 等の Authenticode 検証を専用軽量バイナリ `crates/ledr-auth-helper`（`Option 2-A`）へ分離した。
+  親デーモン側は `FILE_FLAG_OPEN_REPARSE_POINT` と `GetFinalPathNameByHandleW` による同一ディレクトリ閉じ込め、リパースポイントおよびハードリンク（`nNumberOfLinks == 1`）拒否、64 KiB ストリーミング SHA-256 検証、匿名パイプと `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` と `JobObject`（`KILL_ON_JOB_CLOSE`）、15 秒アイドル自己終了、6,000 ms 予算内 1 回自動リトライ、5,000 ms タイムアウト、停止要求時 50 ms 以内中断、30 秒内 3 連続失敗時の 30 秒サーキットブレーカ、および自ワーカー PID 再帰防止を実装した（`AUTH-WORKER-01`、`helper_protocol`）。
+  1 回リトライ後も失敗した場合は親プロセス内フォールバックを行わず、フェイルクローズ（`authenticode: None` と警告ログ、`案 X`）で処理する。
+- **PE 静的および遅延インポート検証**：`target\release\ledr-daemon.exe`（`7,414,784` バイト）の静的インポート（21 DLL）および遅延ロードインポート（0 件）のいずれにも `wintrust.dll` と `crypt32.dll` が含まれず、`target\release\ledr-auth-helper.exe`（`312,832` バイト）へ完全に分離されたことを実機 PE パーサで確認した。
 
-### 利用者と運用上の影響
+### Stage 1 と Stage 3 の実機計測比較
 
-常駐エージェントの物理メモリ占有が増えると、メモリ容量が限られた一般クライアント PC で他アプリとメモリを奪い合い、Phase 1 から掲げる軽量常駐の設計目標と [implementation-plan.md](implementation-plan.md) の `E2E-PERF-01` 合格基準を満たせなくなる。
-また、100 MB 超の一時スパイクは常駐監視の異常肥大と誤認されやすく、長期稼働時のリーク有無を判別しづらくする。
+同一ホスト（Windows 11 x64、16 論理コア、管理者 PowerShell）、同一の公開 2 フィード 50,000 件 `nrd-cache.txt`（`--disable-nrd-refresh`）、同一起動フラグ（`--foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown`）、および同一手順（600 秒アイドルと 60 秒ブラウザ 5 タブ＋`cargo build --locked` 負荷と 60 秒クールダウン）で比較計測した結果を以下に示す。
+なお、Track 1e（`PrivateMemorySize64` が PR #34 実測 `17.15 MB` 比で `-0.6266 MB` かつプロセス増分 0 件のため未発動）と Track 1f（`ledr-daemon.exe` の `MEM_IMAGE` が `3.8750 MB < 4.0 MB` のため未発動）は Stage 1 採否基準の判定に基づき見送った。
 
-### 想定リスクと維持する不変条件
+| 計測項目（`1 MB = 1 MiB = 1,048,576 B`） | Stage 1 改変前（`b8d9c66`） | Stage 3 改変後（`87be6d5`） | 変化と判定 |
+| :--- | ---: | ---: | :--- |
+| 600s アイドル定常 `WorkingSet64` 中央値（`t=60..600s`） | `28.7617 MB` | `27.6250 MB` | `-1.1367 MB` |
+| 600s アイドル定常 `PrivateWorkingSetSize` 中央値（`t=60..600s`） | `12.1484 MB` | `13.0234 MB` | `+0.8750 MB`（`<= 20.0 MB` 合格、背景通信 `+4,813` vs `+2,747`） |
+| 600s アイドル終了時 `LatestWorkingSetMB`（`t=600s`） | `29.6172 MB` | `27.2227 MB` | `-2.3945 MB`（`Shared == 1` 下限により参考値） |
+| 600s アイドル終了時 `latest_private_ws_mb`（`t=600s`） | `13.0039 MB` | `12.5508 MB` | `-0.4531 MB`（`<= 20.0 MB` 合格） |
+| 600s アイドル `t=60s -> 600s` `PrivateWorkingSet` 増分 | `+1.5586 MB` | `-1.1680 MB` | `-2.7266 MB`（増加から縮小へ反転） |
+| 600s アイドル後半前半中央値差（`WS` / `PrivateWS`） | `+0.9062 / +0.8008 MB` | `+0.4375 / +0.3281 MB` | 両方 `<= +1.0 MB` 合格 |
+| 600s アイドル区間ピーク `WorkingSet64` | `50.3398 MB` | `43.4648 MB` | `-6.8750 MB` |
+| 600s アイドル `AvgCpuPercent` | `0.0723%` | `0.2054%` | `< 0.5%` 合格 |
+| 60s 高負荷ピーク `WorkingSet64`（2 秒以降） | `45.1758 MB`（`42.5430 MB`） | `36.9727 MB`（`36.9727 MB`） | `-8.2031 MB`（`< 64.34 MB` 合格） |
+| 60s 高負荷ピーク `PrivateWorkingSetSize` | `28.5625 MB` | `22.2734 MB` | `-6.2891 MB` |
+| 60s 高負荷 `AvgCpuPercent` | `0.5475%` | `0.5952%` | `+0.0477%`（`< 1%` 負荷基準内かつ環境変動範囲） |
+| `>= 100.0 MB` スパイク回数（全区間） | `0` 回 | `0` 回 | 合格 |
+| クールダウン終了時 `PrivateWS` 対定常残留 | `+2.4102 MB`（`14.5586 MB`） | `+1.2852 MB`（`14.3086 MB`） | `< +2.0 MB` 合格 |
+| `Shared == 1`（OS 共有ページ下限） | `16.49–16.65 MB` | `14.5117–14.6992 MB` | 約 `1.95 MB` 低減も 20 MB 下限を物理制約 |
+| アイドル時 `authenticode_dlls` 占有量 | `1.3906–1.3984 MB` | `0.2969–0.3125 MB` | `-77.7%`（`wintrust.dll` と `cryptnet.dll` 消滅） |
+| Authenticode 起因 `MEM_MAPPED` ピーク | `10.0000 MB` | `0.0000 MB` | `-10.0000 MB`（`100%` 解消） |
 
-- **定常 CPU 基準の維持**：キャッシュ削減やワーキングセット圧縮によって署名検証や SQLite 読み書きが再計算へ傾き、`E2E-PERF-01` の定常 CPU 使用率 `0.5%` 未満を破らないこと。
-- **検知漏れ（False Negative）と有界チャネルの維持**：署名検証のスキップや `TwoLaneSender`（高優先度 1,024 件、テレメトリ 8,192 件）および 50,000 件規模の NRD キャッシュの検知範囲を削って見かけのメモリを下げないこと。
-- **ロック解放と停止予算の維持**：SQLite `cache_size` やバッチ調整によって `purge_expired` のバッチ間ロック解放や 3 秒停止予算内チェックポイントを遅延させないこと。
+### Track 2 実機レイテンシと Windows 11 Authenticode 一致確認
 
-### 改善方針と段階的進め方
+- **キャッシュヒット（SHA-256 ファイル I/O 除く `Mutex<BoundedLruCache>` 512 件、n=10,000）**：平均 `0.000139 ms`、p50 `0.000100 ms`、p95 `0.000200 ms`、最大 `0.011400 ms`（基準 `< 5 ms` 合格）。
+- **ワーカーミス（温態常駐 `ledr-auth-helper.exe`、Windows 11 バイナリ 31 件）**：最小 `5.262 ms`、中央値 `6.973 ms`、平均 `8.061 ms`、p95 `11.050 ms`、最大 `33.075 ms`（基準 `< 150 ms` p95 合格）。
+- **ワーカーミス（冷態プロセス起動込み 12 回）**：最小 `35.814 ms`、中央値 `38.747 ms`、平均 `40.666 ms`、p95 `59.785 ms`、最大 `59.785 ms`（基準 `< 300 ms` p95 合格）。
+- **Windows 11 Authenticode 判定一致（31 件）**：29 件は `Get-AuthenticodeSignature`＋`X509Chain` と `signer_subject` および `root_thumbprint` が完全一致し、デュアル署名の 2 件（`svchost.exe`、`wininit.exe`）も `[X509Certificate2]` で埋め込み署名（`CN=Microsoft Windows Publisher`、ルートサムプリント `3b1efd3a66ea28b16697394703a72ca340a05bd5`）が `WinVerifyTrust(WTD_CHOICE_FILE)` 優先の旧実装と一致し、不一致は `0` 件だった。
 
-1. **Step 1（調査フェーズ）**：Windows 実機上でメモリプロファイラ（VMMap や WPA 等）を用いて `WorkingSet64` の内訳（プライベート作業領域、メモリマップドファイル、共有 DLL）と `108.71 MB` ピークの発生契機を特定し、寄与率の高い上位要因を数値で確定する。
-2. **Step 2（実装フェーズ）**：Step 1 の実測内訳に基づき、対象領域（署名検証マッピング、キャッシュ保持上限、SQLite `cache_size` 等）を改善し、単体および負荷テスト（`burst_budget`、`ttl_purge_lineage`）と実機 `E2E-PERF-01` で再計測する。
-3. **受け入れ条件**：公開 2 フィード 50,000 件の NRD キャッシュ読み込み状態で、アイドル 600 秒の `AvgCpuPercent < 0.5%` を維持したまま `WorkingSet64`（または合意済み計測指標）が基準内に収まり、100 MB 超の異常スパイクが解消されていること。
+### Track 3 数値証明と仕様改定（`決定記録 L-24`）
 
-### 後続 PR 着手時の未決判断事項
+Stage 3 の全 34 スナップショット（`QueryWorkingSetEx` 失敗チャンク 0 件）において、`Shared == 1` ページ合計は **`14.5117–14.6992 MB`** で推移した（内訳は `other_os_dlls` `s1 = 9.55–9.65 MB`、`ledr-daemon.exe` `s1 = 3.97–4.05 MB`、`other_mapped` `0.46–0.47 MB`、`wtsapi32.dll` が静的参照する `crypt32.dll` `s1 = 0.25–0.27 MB`、`MpOAV.dll` `s1 = 0.23 MB`、SQLite 共有マップ `0.03 MB`）。
+実測最小の `PrivateWorkingSetSize`（`10.6602 MB`）と最小の `Shared == 1` 下限（`14.5117 MB`）を合算しても `25.1719 MB > 20.0 MB` となり、総 `WorkingSet64 <= 20.0 MB` を達成するには 50,000 件の `NrdCache`、2 レーンチャネル、`ActiveProcessTable`、SQLite WAL、および Sigma Aho-Corasick を抱えたまま `PrivateWorkingSetSize <= 5.33–5.49 MB` を恒常維持する必要があり、物理的に達成不能であると数値証明された。
+これを受け、2026 年 11 月 23 日の人間決裁で [implementation-plan.md](implementation-plan.md)、[decision-records.md](decision-records.md)（`L-24`）、および [e2e-test-runbook.md](e2e-test-runbook.md) へ **`PrivateWorkingSetSize <= 20.0 MB`（必須）＋ `WorkingSet64` スパイクおよび単調増加監視基準** を併記する改定を承認した。
 
-以下は PR #34 では確定せず、Step 1 のプロファイル結果を得た後続 PR 着手時に選択する。
+### 実機運用注記、制約、および検証範囲の区分
 
-- **候補 A（検証対象とキャッシュの分離）**：`WinVerifyTrust` の大容量バイナリ検証やシステムカタログ参照が共有マップを押し上げている場合、検証結果キャッシュの上限調整や大容量バイナリ検証の分離（必要時のみ別スレッドや短命ワーカーへ逃がす等）を検討する。
-  副次トレードオフは検証レイテンシ増とワーカー生成に伴う CPU 負荷増である。
-- **候補 B（SQLite ページキャッシュと常駐テーブルの上限見直し）**：`PRAGMA cache_size`（現行 `-2048`）やプロセス履歴および DNS 履歴のメモリ保持上限を調整する。
-  副次トレードオフはディスク I/O 増加と高負荷時のバッチ書き込み遅延である。
-- **候補 C（計測指標の定義整理）**：共有 DLL や OS カタログの共有ページが `WorkingSet64` の大半を占め、プロセス固有の `PrivateMemorySize64`（実測 `17.15 MB`）と乖離する構造が確認された場合、[implementation-plan.md](implementation-plan.md) の基準を `WorkingSet64` のまま維持するか、`PrivateWorkingSet` 等の併記基準へ改定するかを仕様判断として協議する。
-  副次トレードオフは基準緩和と受け取られないための根拠開示と既存文書との整合作業である。
+- **Cargo ハードリンク運用注記**：`target\release\ledr-auth-helper.exe` は Cargo ビルドキャッシュとハードリンクされており `nNumberOfLinks == 2` を持つため、`nNumberOfLinks == 1` 検査を維持したまま Release 版を直接起動する場合は別ディレクトリへ `Copy-Item` ステージング（`Links = 1`）して起動する（[e2e-test-runbook.md](e2e-test-runbook.md) 第 5 章へ追記済み）。
+- **実機機能回帰とホスト ETW 競合制約**：`87be6d5` 上のステージングバイナリで `E2E-P4-07`（PASS、Live IPC と UI モック DOM テスト `10/10`）と 3 秒停止予算（`377.05 ms` および `393.19 ms`、`WAL = 0`、`CLEAN-01` PASS）を確認した。
+  一方、`E2E-P3-01` と `E2E-P3-03` は WFP フィルタ、通信遮断、事前凍結済み `python.exe` への `WfpDrop` と `NtSuspendProcess`、および `DnsQuery` と `NetworkConnect` を確認したものの、検証ホスト上で `AcePldTraceSession_28364` と 2 本の `NT Kernel Logger` が稼働していた影響により LocalEDR 停止下の独立 `logman` 測定でも `Microsoft-Windows-Kernel-Process` `0x10` が `0` イベントとなり、起動後 `ProcessStart` 帰属のみ未確認の「部分 PASS（ホスト ETW 0 イベント制約付き）」となった（`main` マージ後の最終 E2E 検証対象）。
+- **`.github/workflows/ci.yml` 自動実行範囲（PR 作成後の CI で検証）**：`changes` ジョブは `Cargo.toml`、`Cargo.lock`、`crates/`、`docs/implementation-plan.md`、`docs/decision-records.md` の変更により `rust=true` かつ `web=true` と判定し、`static-checks`（`ubuntu-latest`、Node 22：`node --check`、Chrome MV3 拡張テスト 19 件、Tauri UI モック DOM テスト 10 件、固定拡張 ID 検証、および JSON、UTF-8、U+FFFD、競合マーカー検査）と `rust-windows`（`windows-latest`：`cargo check`、`clippy -- -D warnings`、`cargo test --workspace --locked`、`burst_budget`、`ttl_purge_lineage`、`cargo doc -D rustdoc::broken_intra_doc_links`）を実行する。
+- **ローカル別途実行範囲（CI 対象外、Windows 11 x64 環境で `87be6d5` に対し実行済み）**：`cargo clippy`、`cargo test --workspace --locked`（415 件合格）、`burst_budget`（11 件合格）、`ttl_purge_lineage`（12 件合格）、Chrome 拡張 Node テスト（19 件合格）、UI モック DOM テスト（10 件合格）、`python scripts/test_check_invariants.py`（8 件合格）、`cargo build --release --locked` と PE インポート検査（`wintrust.dll` と `crypt32.dll` が 0 件）、`scripts/profile_daemon_memory.ps1` による Stage 1 および Stage 3 実機計測、Track 2 実機レイテンシと `31/31` Authenticode 一致確認、および実機 E2E 回帰（`E2E-P3-01`、`E2E-P3-03`、`E2E-P4-07`、3 秒停止予算）。
 
 ### 対応予定タイミング
 
-推奨着手順に従い、`FU-E2E-04` と `FU-E2E-05` の修正を先に取り込んだ後の次回性能改善 PR で対応する。
+本作業ブランチ（`perf/fu-e2e-03-memory-reduction`）の PR マージ後に、PR #34、`FU-E2E-04`、`FU-E2E-05` とあわせた `main` 上の最終実機 E2E（`FU-E2E-01`、`FU-E2E-02`、およびホスト ETW 競合を解消した `E2E-P3-01` / `E2E-P3-03` を含む）で再確認した上で [implementation-plan.md](implementation-plan.md) の `[ ]` チェックリストを更新する。
 
 ## FU-E2E-04 短命プロセスでの PEB 補完欠落による command_line 欠落と LEDR-LOTL-001 未発火
 

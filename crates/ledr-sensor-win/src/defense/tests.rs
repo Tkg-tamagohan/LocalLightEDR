@@ -1220,11 +1220,38 @@ fn sens_p2_tree_01_spoofed_svchost_three_level_containment() {
     let _ = root_child.wait();
 }
 
+fn wait_until_pid_reaped(pid: u32) {
+    use super::process_probe::{OpenProcessError, open_process_checked_detailed};
+    use super::tree::is_error_invalid_parameter;
+
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let probe = open_process_checked_detailed(pid, PROCESS_QUERY_LIMITED_INFORMATION);
+        if matches!(
+            &probe,
+            Err(OpenProcessError::Failed(err)) if is_error_invalid_parameter(err)
+        ) {
+            break;
+        }
+        let timed_out = std::time::Instant::now() >= reap_deadline;
+        if timed_out {
+            let probe_state = probe.map(|_| ());
+            panic!(
+                "reaped exited PID {pid} must fail OpenProcess with ERROR_INVALID_PARAMETER (last_probe={probe_state:?})"
+            );
+        }
+        // Close any opened query handle immediately before sleeping so the test itself does
+        // not keep the kernel process object alive across the poll interval.
+        drop(probe);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn sens_p2_tree_02_exited_intermediate_child_and_unavailable_full_path_fail_closed() {
     use super::guard::validate_open_handle_detailed;
-    use super::process_probe::{OpenProcessError, SnapshotEntry, open_process_checked_detailed};
-    use super::tree::{collect_validated_descendants_from_entries, is_error_invalid_parameter};
+    use super::process_probe::SnapshotEntry;
+    use super::tree::collect_validated_descendants_from_entries;
     use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
 
     let temp = TempTestDir::new("exited-intermediate");
@@ -1274,20 +1301,7 @@ fn sens_p2_tree_02_exited_intermediate_child_and_unavailable_full_path_fail_clos
     let status = exiting_child.wait().expect("wait exiting intermediate");
     assert!(status.success());
     drop(exiting_child);
-    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let probe = open_process_checked_detailed(exited_pid, PROCESS_QUERY_LIMITED_INFORMATION);
-        if matches!(&probe, Err(OpenProcessError::Failed(err)) if is_error_invalid_parameter(err)) {
-            break;
-        }
-        if std::time::Instant::now() >= reap_deadline {
-            let probe_state = probe.map(|_| ());
-            panic!(
-                "reaped exited PID {exited_pid} must fail OpenProcess with ERROR_INVALID_PARAMETER (last_probe={probe_state:?})"
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    wait_until_pid_reaped(exited_pid);
 
     // 3. Live grandchild process created after root.
     let mut leaf_child = Command::new(&leaf_exe)
@@ -1391,10 +1405,10 @@ fn sens_p2_tree_02_exited_intermediate_child_and_unavailable_full_path_fail_clos
 
 #[test]
 fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
-    use super::process_probe::{OpenProcessError, SnapshotEntry, open_process_checked_detailed};
+    use super::process_probe::SnapshotEntry;
     use super::tree::{
         collect_validated_descendants_from_entries, collect_validated_descendants_from_snapshot,
-        is_error_invalid_parameter, resolve_recycled_cutoff_from_entries,
+        resolve_recycled_cutoff_from_entries,
     };
 
     let temp = TempTestDir::new("exited-pid-reuse");
@@ -1486,25 +1500,8 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
     assert!(exiting_child.wait().expect("wait exiting intermediate").success());
     drop(exiting_pre_child);
     drop(exiting_child);
-    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     for reaped_pid in [exited_pre_pid, exited_pid] {
-        loop {
-            let probe =
-                open_process_checked_detailed(reaped_pid, PROCESS_QUERY_LIMITED_INFORMATION);
-            if matches!(
-                &probe,
-                Err(OpenProcessError::Failed(err)) if is_error_invalid_parameter(err)
-            ) {
-                break;
-            }
-            if std::time::Instant::now() >= reap_deadline {
-                let probe_state = probe.map(|_| ());
-                panic!(
-                    "reaped exited PID {reaped_pid} must fail OpenProcess with ERROR_INVALID_PARAMETER (last_probe={probe_state:?})"
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_until_pid_reaped(reaped_pid);
     }
 
     // 3. Live newer process (strictly newer than `pre_reuse_ct` and `root_ct`).

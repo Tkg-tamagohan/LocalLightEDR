@@ -1358,7 +1358,7 @@ try {
     $initialOsPeakWsBytes = [uint64]$firstSample.PeakWorkingSetSize
     $peakWsBytesMax = [uint64]$firstSample.PeakWorkingSetSize
     $osPeakCrossed100MbDuringInterval = $false
-    $intervalPeakWsBytes = [uint64]0
+    $intervalPeakWsBytes = [uint64]$firstSample.WorkingSetSize
     $peakPrivWsBytesMax = $null
     $peakCommitBytesMax = [uint64]$firstSample.PrivateUsage
     $latestSample = $firstSample
@@ -1627,8 +1627,11 @@ try {
         (-not $processExitedEarly) -and ($allWsMb.Count -gt 0) -and ($null -ne $lastSampleElapsedSec) -and ($lastSampleElapsedSec -ge [double]$DurationSec)
     }
 
-    $spikesViolated = ($spikes100Mb -gt 0) -or $osPeakCrossed100MbDuringInterval
-    $spikesZeroPass = if ($spikesViolated) { $false } elseif ($measurementComplete) { $true } else { $null }
+    $osPeakPreexistingGe6434 = (($initialOsPeakWsBytes / $ONE_MB) -ge 64.34)
+    $osPeakPreexistingGe100 = ($initialOsPeakWsBytes -ge ([uint64]100 * [uint64]1048576))
+
+    $spikesViolated = ($spikes100Mb -gt 0) -or $osPeakCrossed100MbDuringInterval -or (($null -ne $effectiveIntervalPeakWsBytes) -and ($effectiveIntervalPeakWsBytes -ge ([uint64]100 * [uint64]1048576)))
+    $spikesZeroPass = if ($spikesViolated) { $false } elseif ($osPeakPreexistingGe100) { $null } elseif ($measurementComplete) { $true } else { $null }
 
     $idlePrivLatestLe20 = if ($Mode -eq 'idle' -and $measurementComplete -and $null -ne $latestPrivWsBytes) { ($latestPrivWsBytes / $ONE_MB) -le 20.0 } else { $null }
     $idlePrivMedLe20 = if ($Mode -eq 'idle' -and $measurementComplete -and $null -ne $steadyMedianPrivWs) { $steadyMedianPrivWs -le 20.0 } else { $null }
@@ -1638,7 +1641,7 @@ try {
 
     $loadAvgCpuLt1 = if ($Mode -eq 'load' -and $measurementComplete) { $lastCumCpuPct -lt 1.0 } else { $null }
     $loadPeakViolated = ($null -ne $effectiveIntervalPeakWsBytes) -and (($effectiveIntervalPeakWsBytes / $ONE_MB) -ge 64.34)
-    $loadPeakWsLt6434 = if ($Mode -ne 'load') { $null } elseif ($loadPeakViolated) { $false } elseif ($measurementComplete) { $true } else { $null }
+    $loadPeakWsLt6434 = if ($Mode -ne 'load') { $null } elseif ($loadPeakViolated) { $false } elseif ($osPeakPreexistingGe6434) { $null } elseif ($measurementComplete) { $true } else { $null }
 
     $modePass = $null
     if ($Mode -eq 'idle') {
@@ -1703,6 +1706,8 @@ try {
         initial_os_peak_working_set_mb          = ConvertTo-MB $initialOsPeakWsBytes
         os_peak_working_set_mb                  = ConvertTo-MB $peakWsBytesMax
         os_peak_updated_during_interval         = $osPeakUpdatedDuringInterval
+        os_peak_preexisting_ge_64_34mb          = $osPeakPreexistingGe6434
+        os_peak_preexisting_ge_100mb            = $osPeakPreexistingGe100
         effective_interval_peak_working_set_mb  = $effectiveIntervalPeakWsMb
         latest_private_ws_mb                    = $latestPrivWsMb
         peak_private_ws_mb                      = $peakPrivWsMb

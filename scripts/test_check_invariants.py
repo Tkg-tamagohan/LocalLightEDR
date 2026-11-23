@@ -63,7 +63,11 @@ EXPECTED_QUESTIONS: dict[str, tuple[list[str], float, float]] = {
         0.40,
     ),
     "session0_non_system_and_ui_zero_exit": (
-        ["crates/ledr-daemon/src/notify.rs", "apps/ledr-ui/src/**"],
+        [
+            "crates/ledr-daemon/src/notify.rs",
+            "crates/ledr-daemon/src/main.rs",
+            "apps/ledr-ui/src/**",
+        ],
         0.65,
         0.40,
     ),
@@ -400,6 +404,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
 
         never_suspend = questions["never_suspend_and_create_time"]
         self.assertIn("validate_open_handle_detailed", never_suspend["instructions"])
+        self.assertIn("NtQuerySystemInformation", never_suspend["instructions"])
         for text_field in (
             never_suspend["instructions"],
             never_suspend["criteria"]["true_description"],
@@ -407,6 +412,20 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
         ):
             self.assertIn("full-path", text_field.lower())
             self.assertIn("grandchild", text_field.lower())
+            self.assertIn("recycled_cutoff_100ns", text_field)
+            self.assertIn("is_valid_descendant_timestamp", text_field)
+            self.assertIn("None", text_field)
+
+        session0 = questions["session0_non_system_and_ui_zero_exit"]
+        for text_field in (
+            session0["instructions"],
+            session0["criteria"]["true_description"],
+            session0["criteria"]["false_description"],
+        ):
+            self.assertIn("AUTHORIZED_UI_EXE_PATH", text_field)
+            self.assertIn("--dev-bypass-auth", text_field)
+            self.assertIn("--foreground", text_field)
+            self.assertIn("L-25", text_field)
 
         ipc_auth = questions["ipc_caller_auth_and_rw_timeout"]
         self.assertIn("UiOnly", ipc_auth["instructions"])
@@ -743,6 +762,23 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                     "-  );"
                 ),
                 {"phase4_ui_manifest_allowlist_and_wow64"},
+            ),
+            (
+                "crates/ledr-sensor-win/src/defense/tree.rs",
+                "@@ -155,2 +155,2 @@",
+                "                     if is_error_invalid_parameter(&open_err) {",
+                (
+                    "-                        let Some(child_ct) = child_entry.create_time_100ns else {\n"
+                    "+                        let child_ct = child_entry.create_time_100ns.unwrap_or(parent.create_time_100ns);"
+                ),
+                {"never_suspend_and_create_time"},
+            ),
+            (
+                "crates/ledr-daemon/src/main.rs",
+                "@@ -363,2 +363,2 @@",
+                " ) -> PathBuf {",
+                "-    if !foreground || !dev_bypass_auth {\n+    if !foreground {",
+                {"session0_non_system_and_ui_zero_exit"},
             ),
         ]
 

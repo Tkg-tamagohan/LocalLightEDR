@@ -74,6 +74,16 @@ pub(super) fn collect_validated_descendants(root: &ProcessIdentity) -> Vec<Proce
         return Vec::new();
     };
 
+    if recycled_cutoff_100ns.is_none() {
+        if let Some(root_entry) = entries.iter().find(|e| e.pid == root.pid) {
+            if let Some(snap_ct) = root_entry.create_time_100ns {
+                if snap_ct > root.create_time_100ns {
+                    recycled_cutoff_100ns = Some(snap_ct);
+                }
+            }
+        }
+    }
+
     collect_validated_descendants_from_entries(root, recycled_cutoff_100ns, entries)
 }
 
@@ -129,16 +139,47 @@ pub(super) fn collect_validated_descendants_from_entries(
                         continue;
                     }
                     if is_error_invalid_parameter(&open_err) {
+                        let Some(child_ct) = child_entry.create_time_100ns else {
+                            tracing::warn!(
+                                parent_pid = parent.pid,
+                                child_pid = child_entry.pid,
+                                exe = %child_entry.exe_name,
+                                "intermediate child exited before handle open without verified snapshot creation time; refusing traversal fail-closed"
+                            );
+                            continue;
+                        };
+                        if parent.pid == root.pid {
+                            if let Some(cutoff) = recycled_cutoff_100ns {
+                                if child_ct >= cutoff {
+                                    tracing::debug!(
+                                        parent_pid = parent.pid,
+                                        child_pid = child_entry.pid,
+                                        child_create_time_100ns = child_ct,
+                                        recycled_cutoff_100ns = cutoff,
+                                        "skipping exited intermediate child created at or after recycled root cutoff"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        if !is_valid_descendant_timestamp(parent.create_time_100ns, child_ct) {
+                            tracing::debug!(
+                                parent_pid = parent.pid,
+                                parent_create_time_100ns = parent.create_time_100ns,
+                                child_pid = child_entry.pid,
+                                child_create_time_100ns = child_ct,
+                                "skipping exited intermediate child created before parent (PID reuse guard)"
+                            );
+                            continue;
+                        }
                         tracing::debug!(
                             parent_pid = parent.pid,
                             child_pid = child_entry.pid,
+                            child_create_time_100ns = child_ct,
                             exe = %child_entry.exe_name,
-                            "intermediate child exited before handle open; continuing grandchild traversal"
+                            "intermediate child exited before handle open; continuing grandchild traversal with verified snapshot creation time"
                         );
-                        queue.push_back(ProcessIdentity::new(
-                            child_entry.pid,
-                            parent.create_time_100ns,
-                        ));
+                        queue.push_back(ProcessIdentity::new(child_entry.pid, child_ct));
                     } else {
                         tracing::warn!(
                             parent_pid = parent.pid,
@@ -155,6 +196,18 @@ pub(super) fn collect_validated_descendants_from_entries(
             let Some(child_create_time) = query_process_creation_time(child_handle.as_raw()) else {
                 continue;
             };
+            if let Some(snap_ct) = child_entry.create_time_100ns {
+                if snap_ct != child_create_time {
+                    tracing::debug!(
+                        parent_pid = parent.pid,
+                        child_pid = child_entry.pid,
+                        snapshot_create_time_100ns = snap_ct,
+                        handle_create_time_100ns = child_create_time,
+                        "skipping descendant whose PID was recycled between snapshot and OpenProcess"
+                    );
+                    continue;
+                }
+            }
 
             if parent.pid == root.pid {
                 if let Some(cutoff) = recycled_cutoff_100ns {

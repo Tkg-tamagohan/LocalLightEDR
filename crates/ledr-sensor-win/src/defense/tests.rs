@@ -1310,17 +1310,21 @@ fn sens_p2_tree_02_exited_intermediate_child_and_unavailable_full_path_fail_clos
     let leaf_ident = ProcessIdentity::new(leaf_pid, leaf_ct);
 
     // Exited non-protected intermediate child is NOT added to `descendants`, but IS queued
-    // so live grandchild `leaf_pid` is still discovered and validated.
+    // when its snapshot `create_time_100ns` is verified and valid so live grandchild `leaf_pid`
+    // is still discovered and validated.
+    let intermediate_ct = root_ct + ((leaf_ct.saturating_sub(root_ct)) / 2);
     let entries = vec![
         SnapshotEntry {
             pid: exited_pid,
             ppid: root_pid,
             exe_name: "intermediate_launcher.exe".to_string(),
+            create_time_100ns: Some(intermediate_ct),
         },
         SnapshotEntry {
             pid: leaf_pid,
             ppid: exited_pid,
             exe_name: "payload_leaf.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
         },
     ];
     let discovered = collect_validated_descendants_from_entries(&root_ident, None, entries);
@@ -1340,11 +1344,13 @@ fn sens_p2_tree_02_exited_intermediate_child_and_unavailable_full_path_fail_clos
             pid: exited_pid,
             ppid: root_pid,
             exe_name: "csrss.exe".to_string(),
+            create_time_100ns: Some(intermediate_ct),
         },
         SnapshotEntry {
             pid: leaf_pid,
             ppid: exited_pid,
             exe_name: "payload_leaf.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
         },
     ];
     let skipped =
@@ -1375,6 +1381,206 @@ fn sens_p2_tree_02_exited_intermediate_child_and_unavailable_full_path_fail_clos
         ),
     }
     drop(sync_only_handle);
+
+    let _ = leaf_child.kill();
+    let _ = leaf_child.wait();
+    let _ = root_child.kill();
+    let _ = root_child.wait();
+}
+
+#[test]
+fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
+    use super::process_probe::{OpenProcessError, SnapshotEntry, open_process_checked_detailed};
+    use super::tree::collect_validated_descendants_from_entries;
+
+    let temp = TempTestDir::new("exited-pid-reuse");
+    let current_exe = std::env::current_exe().expect("resolve current test exe");
+    let launcher_exe = temp.path().join("root_launcher.exe");
+    let leaf_exe = temp.path().join("payload_leaf.exe");
+    std::fs::copy(&current_exe, &launcher_exe).expect("copy root_launcher.exe");
+    std::fs::copy(&current_exe, &leaf_exe).expect("copy payload_leaf.exe");
+
+    let mut cleanup = ChildProcessCleanupGuard::new();
+
+    // 1. Live root process.
+    let mut root_child = Command::new(&launcher_exe)
+        .args([
+            "--exact",
+            "defense::tests::sens_p2_tree_helper_entrypoint",
+            "--nocapture",
+        ])
+        .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "leaf")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn root helper");
+    let root_pid = root_child.id();
+    cleanup.track_pid(root_pid);
+    let root_handle = open_process_checked(root_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .expect("open root helper");
+    let root_ct = query_process_creation_time(root_handle.as_raw()).expect("root CreationTime");
+    drop(root_handle);
+    let root_ident = ProcessIdentity::new(root_pid, root_ct);
+
+    // 2. Exited intermediate PID whose kernel object is already gone (`ERROR_INVALID_PARAMETER`).
+    let mut exiting_child = Command::new(&launcher_exe)
+        .args([
+            "--exact",
+            "defense::tests::sens_p2_tree_helper_entrypoint",
+            "--nocapture",
+        ])
+        .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "exit_immediately")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn exiting intermediate helper");
+    let exited_pid = exiting_child.id();
+    let status = exiting_child.wait().expect("wait exiting intermediate");
+    assert!(status.success());
+    drop(exiting_child);
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if matches!(
+            open_process_checked_detailed(exited_pid, PROCESS_QUERY_LIMITED_INFORMATION),
+            Err(OpenProcessError::Failed(_))
+        ) {
+            break;
+        }
+        if std::time::Instant::now() >= reap_deadline {
+            panic!("reaped exited PID {exited_pid} must fail OpenProcess");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // 3. Live newer process (newer than `root_ct`).
+    let mut leaf_child = Command::new(&leaf_exe)
+        .args([
+            "--exact",
+            "defense::tests::sens_p2_tree_helper_entrypoint",
+            "--nocapture",
+        ])
+        .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "leaf")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn live payload_leaf.exe");
+    let leaf_pid = leaf_child.id();
+    cleanup.track_pid(leaf_pid);
+    let leaf_handle = open_process_checked(leaf_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .expect("open leaf helper");
+    let leaf_ct = query_process_creation_time(leaf_handle.as_raw()).expect("leaf CreationTime");
+    drop(leaf_handle);
+    assert!(leaf_ct > root_ct, "leaf helper must have strictly newer CreationTime than root");
+
+    // Verify `snapshot_process_entries()` (`NtQuerySystemInformation`) captures exact kernel
+    // `create_time_100ns`, `ppid`, and `exe_name` matching `GetProcessTimes`.
+    let live_entries = snapshot_process_entries().expect("NtQuerySystemInformation snapshot");
+    let self_pid = std::process::id();
+    let snap_root = live_entries
+        .iter()
+        .find(|e| e.pid == root_pid)
+        .expect("root_pid must appear in live snapshot");
+    assert_eq!(snap_root.ppid, self_pid);
+    assert!(snap_root.exe_name.eq_ignore_ascii_case("root_launcher.exe"));
+    assert_eq!(snap_root.create_time_100ns, Some(root_ct));
+
+    let snap_leaf = live_entries
+        .iter()
+        .find(|e| e.pid == leaf_pid)
+        .expect("leaf_pid must appear in live snapshot");
+    assert_eq!(snap_leaf.ppid, self_pid);
+    assert!(snap_leaf.exe_name.eq_ignore_ascii_case("payload_leaf.exe"));
+    assert_eq!(snap_leaf.create_time_100ns, Some(leaf_ct));
+
+    // Case A (Devin Review counterexample): An old-generation child `B` created BEFORE `root_ident`
+    // (when `root_ident.pid` belonged to prior process `A`) exited after enumeration while its
+    // grandchild `C` (`leaf_pid`) was created AFTER `root_ident`. Substituting `root_ct` for `B`
+    // would wrongly traverse `C`; checking `B`'s snapshot `create_time_100ns` must reject `B`.
+    let old_gen_entries = vec![
+        SnapshotEntry {
+            pid: exited_pid,
+            ppid: root_pid,
+            exe_name: "old_gen_child.exe".to_string(),
+            create_time_100ns: Some(root_ct.saturating_sub(1)),
+        },
+        SnapshotEntry {
+            pid: leaf_pid,
+            ppid: exited_pid,
+            exe_name: "payload_leaf.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
+        },
+    ];
+    let old_gen_discovered =
+        collect_validated_descendants_from_entries(&root_ident, None, old_gen_entries);
+    assert!(
+        old_gen_discovered.is_empty(),
+        "old-generation exited child (ct < root_ct) must NOT traverse newer grandchild"
+    );
+
+    // Case B (Recycled root cutoff): `root` exited and was recycled at `cutoff`, and the recycled
+    // process spawned `B` (`ct >= cutoff`), which exited after enumeration while `C` remained live.
+    // `recycled_cutoff_100ns` must reject `B` before queueing `C`.
+    let cutoff_entries = vec![
+        SnapshotEntry {
+            pid: exited_pid,
+            ppid: root_pid,
+            exe_name: "recycled_root_child.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
+        },
+        SnapshotEntry {
+            pid: leaf_pid,
+            ppid: exited_pid,
+            exe_name: "payload_leaf.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
+        },
+    ];
+    let cutoff_discovered =
+        collect_validated_descendants_from_entries(&root_ident, Some(leaf_ct), cutoff_entries);
+    assert!(
+        cutoff_discovered.is_empty(),
+        "exited child at/after recycled_cutoff_100ns must NOT traverse grandchild"
+    );
+
+    // Case C (Unverified snapshot timestamp): If snapshot lacks `create_time_100ns` (`None`), an
+    // exited intermediate child cannot be verified against PID reuse and must fail closed.
+    let unverified_entries = vec![
+        SnapshotEntry {
+            pid: exited_pid,
+            ppid: root_pid,
+            exe_name: "unverified_intermediate.exe".to_string(),
+            create_time_100ns: None,
+        },
+        SnapshotEntry {
+            pid: leaf_pid,
+            ppid: exited_pid,
+            exe_name: "payload_leaf.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
+        },
+    ];
+    let unverified_discovered =
+        collect_validated_descendants_from_entries(&root_ident, None, unverified_entries);
+    assert!(
+        unverified_discovered.is_empty(),
+        "exited intermediate child with create_time_100ns == None must fail closed"
+    );
+
+    // Case D (Snapshot-to-OpenProcess PID reuse): A live handle whose creation time mismatches its
+    // snapshot `create_time_100ns` must be rejected.
+    let reused_live_entries = vec![SnapshotEntry {
+        pid: leaf_pid,
+        ppid: root_pid,
+        exe_name: "payload_leaf.exe".to_string(),
+        create_time_100ns: Some(leaf_ct.saturating_sub(1)),
+    }];
+    let reused_live_discovered =
+        collect_validated_descendants_from_entries(&root_ident, None, reused_live_entries);
+    assert!(
+        reused_live_discovered.is_empty(),
+        "live child whose OpenProcess CreationTime mismatches snapshot CreationTime must be rejected"
+    );
 
     let _ = leaf_child.kill();
     let _ = leaf_child.wait();

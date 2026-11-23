@@ -351,16 +351,23 @@ fn apply_startup_rules(store: &LedrStore, loaded: &LoadedRulesDir) {
     }
 }
 
-fn resolve_ui_exe_path(foreground: bool) -> PathBuf {
-    if !foreground {
+fn resolve_ui_exe_path(foreground: bool, dev_bypass_auth: bool) -> PathBuf {
+    let current_exe = std::env::current_exe().ok();
+    resolve_ui_exe_path_from(current_exe.as_deref(), foreground, dev_bypass_auth)
+}
+
+fn resolve_ui_exe_path_from(
+    current_exe: Option<&Path>,
+    foreground: bool,
+    dev_bypass_auth: bool,
+) -> PathBuf {
+    if !foreground || !dev_bypass_auth {
         return PathBuf::from(AUTHORIZED_UI_EXE_PATH);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join("ledr-ui.exe");
-            if sibling.is_file() {
-                return sibling;
-            }
+    if let Some(dir) = current_exe.and_then(Path::parent) {
+        let sibling = dir.join("ledr-ui.exe");
+        if sibling.is_file() {
+            return sibling;
         }
     }
     PathBuf::from(AUTHORIZED_UI_EXE_PATH)
@@ -461,12 +468,14 @@ async fn run_daemon(cli: CliArgs) -> anyhow::Result<()> {
     } = loaded_rules;
     let rule_count = sigma.rule_count();
 
-    let ui_exe = resolve_ui_exe_path(cli.foreground);
+    let ui_exe = resolve_ui_exe_path(cli.foreground, cli.dev_bypass_auth);
     let authorized_ui_sha256 = cli.ui_sha256.clone().or_else(|| {
         if cli.ui_signer.is_some() {
             None
-        } else {
+        } else if cli.foreground && cli.dev_bypass_auth {
             resolve_existing_sha256(&[Path::new(AUTHORIZED_UI_EXE_PATH), ui_exe.as_path()])
+        } else {
+            resolve_existing_sha256(&[Path::new(AUTHORIZED_UI_EXE_PATH)])
         }
     });
     let authorized_bridge_sha256 = cli.bridge_sha256.clone().or_else(|| {
@@ -1038,5 +1047,35 @@ mod tests {
                 "{label}: resume_suspended_on_shutdown mismatch"
             );
         }
+    }
+
+    #[test]
+    fn cli_ui_path_01_foreground_sibling_ui_only_used_with_dev_bypass() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-main-ui-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+        let daemon_exe = tmp_dir.join("ledr-daemon.exe");
+        let sibling_ui = tmp_dir.join("ledr-ui.exe");
+        std::fs::write(&sibling_ui, b"stub").expect("create sibling ledr-ui.exe");
+
+        assert_eq!(
+            resolve_ui_exe_path_from(Some(&daemon_exe), true, false),
+            PathBuf::from(AUTHORIZED_UI_EXE_PATH),
+            "foreground without --dev-bypass-auth must target AUTHORIZED_UI_EXE_PATH to match L-25 IPC auth"
+        );
+        assert_eq!(
+            resolve_ui_exe_path_from(Some(&daemon_exe), true, true),
+            sibling_ui,
+            "foreground with --dev-bypass-auth prefers sibling ledr-ui.exe"
+        );
+        assert_eq!(
+            resolve_ui_exe_path_from(Some(&daemon_exe), false, true),
+            PathBuf::from(AUTHORIZED_UI_EXE_PATH),
+            "service/non-foreground mode must target AUTHORIZED_UI_EXE_PATH"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

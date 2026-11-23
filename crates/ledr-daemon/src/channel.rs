@@ -9,6 +9,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use ledr_proto::{
     EventLane, SensorEvent, ACTIVE_PROCESS_TABLE_CAPACITY, HIGH_PRIORITY_CHANNEL_CAPACITY,
@@ -52,10 +53,13 @@ impl fmt::Display for ChannelClosedError {
 
 impl std::error::Error for ChannelClosedError {}
 
+const TELEMETRY_IDLE_BASELINE_CAPACITY: usize = 1024;
+
 #[derive(Debug)]
 struct TelemetryState {
     queue: VecDeque<SensorEvent>,
     closed: bool,
+    last_above_1024_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -71,8 +75,9 @@ impl TelemetryRing {
         Self {
             capacity: capacity.max(1),
             state: Mutex::new(TelemetryState {
-                queue: VecDeque::with_capacity(capacity.min(1024)),
+                queue: VecDeque::with_capacity(capacity.min(TELEMETRY_IDLE_BASELINE_CAPACITY)),
                 closed: false,
+                last_above_1024_at: None,
             }),
             dropped: AtomicU64::new(0),
             notify: Notify::new(),
@@ -90,6 +95,9 @@ impl TelemetryRing {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
             guard.queue.push_back(event);
+            if guard.queue.len() > TELEMETRY_IDLE_BASELINE_CAPACITY {
+                guard.last_above_1024_at = Some(Instant::now());
+            }
         }
         self.notify.notify_one();
         Ok(())
@@ -97,7 +105,46 @@ impl TelemetryRing {
 
     fn try_pop(&self) -> Option<SensorEvent> {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.queue.pop_front()
+        let event = guard.queue.pop_front();
+        if guard.queue.len() > TELEMETRY_IDLE_BASELINE_CAPACITY {
+            guard.last_above_1024_at = Some(Instant::now());
+        }
+        event
+    }
+
+    fn shrink_to_if_idle(&self, idle_threshold: Duration) -> bool {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.queue.is_empty() || guard.queue.capacity() <= TELEMETRY_IDLE_BASELINE_CAPACITY {
+            return false;
+        }
+        let Some(last_above) = guard.last_above_1024_at else {
+            return false;
+        };
+        if last_above.elapsed() < idle_threshold {
+            return false;
+        }
+        guard.queue.shrink_to(TELEMETRY_IDLE_BASELINE_CAPACITY);
+        guard.last_above_1024_at = None;
+        true
+    }
+
+    #[cfg(test)]
+    fn queue_capacity(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queue
+            .capacity()
+    }
+
+    #[cfg(test)]
+    fn backdate_last_above_1024(&self, age: Duration) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.last_above_1024_at = Some(
+            Instant::now()
+                .checked_sub(age)
+                .unwrap_or_else(Instant::now),
+        );
     }
 
     fn len(&self) -> usize {
@@ -270,6 +317,22 @@ impl TwoLaneSender {
     /// Total oldest telemetry events evicted because the telemetry ring buffer was full.
     pub fn telemetry_dropped(&self) -> u64 {
         self.telemetry.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Shrinks the telemetry ring buffer back to 1,024 slots when empty and idle for at least
+    /// `idle_threshold` since the queue last exceeded 1,024 entries (`FU-E2E-03` Track 1b).
+    pub fn shrink_telemetry_if_idle(&self, idle_threshold: Duration) -> bool {
+        self.telemetry.shrink_to_if_idle(idle_threshold)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn telemetry_queue_capacity(&self) -> usize {
+        self.telemetry.queue_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_telemetry_last_above_1024_for_test(&self, age: Duration) {
+        self.telemetry.backdate_last_above_1024(age);
     }
 }
 
@@ -860,5 +923,79 @@ mod tests {
         let drained = rx.drain_ready_with_lane();
         assert_eq!(drained[0], (ext_dns, EventLane::HighPriority));
         assert_eq!(drained[1], (connect, EventLane::HighPriority));
+    }
+
+    /// `CHAN-MEM-01`: `TelemetryRing` expands to absorb 8,192 events, refuses to shrink while
+    /// non-empty or before the 30s idle threshold, shrinks back to `<= with_capacity(1024)` once
+    /// drained and idle `>= 30s`, and cleanly accepts another 8,192-event burst (`L-10` non-regression).
+    #[test]
+    fn chan_mem_01_telemetry_ring_shrinks_after_idle_and_rebursts() {
+        let (tx, mut rx) = TwoLaneChannel::new().split();
+        assert_eq!(tx.high_priority_capacity(), HIGH_PRIORITY_CHANNEL_CAPACITY);
+        assert_eq!(tx.telemetry_capacity(), TELEMETRY_CHANNEL_CAPACITY);
+
+        let baseline_cap = VecDeque::<SensorEvent>::with_capacity(TELEMETRY_IDLE_BASELINE_CAPACITY).capacity();
+        assert!(tx.telemetry_queue_capacity() <= baseline_cap);
+
+        // Push full 8,192-event telemetry burst (plus 16 overflow to verify L-10 drop-oldest).
+        for i in 0..(TELEMETRY_CHANNEL_CAPACITY + 16) {
+            tx.send_telemetry(dns_query(
+                100,
+                format!("burst1-{i}.example"),
+                Ipv4Addr::new(93, 184, 216, 34),
+                i as i64,
+            ))
+            .expect("telemetry burst1");
+        }
+        assert_eq!(tx.telemetry_depth(), TELEMETRY_CHANNEL_CAPACITY);
+        assert_eq!(tx.telemetry_dropped(), 16);
+        assert!(tx.telemetry_queue_capacity() >= TELEMETRY_CHANNEL_CAPACITY);
+
+        // Must NOT shrink while queue is non-empty, even if idle threshold were 0.
+        assert!(!tx.shrink_telemetry_if_idle(Duration::ZERO));
+
+        // Drain all 8,192 events.
+        let drained = rx.drain_ready_with_lane();
+        assert_eq!(drained.len(), TELEMETRY_CHANNEL_CAPACITY);
+        assert_eq!(tx.telemetry_depth(), 0);
+
+        // Must NOT shrink before 30s idle threshold elapses.
+        let threshold = Duration::from_secs(30);
+        assert!(!tx.shrink_telemetry_if_idle(threshold));
+        assert!(tx.telemetry_queue_capacity() > TELEMETRY_IDLE_BASELINE_CAPACITY);
+
+        // Simulate >= 30s idle since last >1024 activity -> shrinks cleanly.
+        tx.backdate_telemetry_last_above_1024_for_test(Duration::from_secs(31));
+        assert!(tx.shrink_telemetry_if_idle(threshold));
+        let shrunk_cap = tx.telemetry_queue_capacity();
+        assert!(
+            shrunk_cap <= baseline_cap,
+            "shrunk capacity {shrunk_cap} must be <= baseline {baseline_cap}"
+        );
+
+        // Repeated idle tick must be a no-op.
+        assert!(!tx.shrink_telemetry_if_idle(threshold));
+
+        // Re-burst another 8,192 events cleanly without drops up to capacity, and drop-oldest beyond.
+        for i in 0..TELEMETRY_CHANNEL_CAPACITY {
+            tx.send_telemetry(dns_query(
+                200,
+                format!("burst2-{i}.example"),
+                Ipv4Addr::new(198, 51, 100, 1),
+                i as i64,
+            ))
+            .expect("telemetry burst2");
+        }
+        assert_eq!(tx.telemetry_depth(), TELEMETRY_CHANNEL_CAPACITY);
+        assert_eq!(tx.telemetry_dropped(), 16);
+        tx.send_telemetry(dns_query(
+            200,
+            "burst2-overflow.example",
+            Ipv4Addr::new(198, 51, 100, 1),
+            99_999,
+        ))
+        .expect("telemetry burst2 overflow");
+        assert_eq!(tx.telemetry_depth(), TELEMETRY_CHANNEL_CAPACITY);
+        assert_eq!(tx.telemetry_dropped(), 17);
     }
 }

@@ -79,6 +79,11 @@ impl DaemonEngine {
         let mut nrd_ticker = tokio::time::interval(Duration::from_millis(nrd_tick_ms));
         nrd_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut mem_maintenance_ticker = tokio::time::interval(Duration::from_secs(60));
+        mem_maintenance_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate t=0 tick so memory maintenance runs on 60s periodic ticks.
+        mem_maintenance_ticker.tick().await;
+
         let mut pending_wfp_drops: VecDeque<PendingWfpDrop> = VecDeque::new();
         let mut wfp_drop_rx_closed = false;
         let mut motw_result_rx_closed = false;
@@ -174,7 +179,10 @@ impl DaemonEngine {
             // `expire_overdue_alerts` or `sweep_unused_preemptive_wfp_blocks`
             // (`PRRT_kwDOVyjVyM66kWF3`). Skip once shutdown is initiated so periodic BFE retries
             // never consume the 3-second shutdown flush budget.
-            if !self.nrd_cancel.is_cancelled() && tokio::time::Instant::now() >= next_expiry_at {
+            if !self.nrd_cancel.is_cancelled()
+                && !self.store.is_shutdown_requested()
+                && tokio::time::Instant::now() >= next_expiry_at
+            {
                 sync_telemetry_streak = 0;
                 let removed = self.run_periodic_expiry_and_sweep();
                 #[cfg(test)]
@@ -263,7 +271,7 @@ impl DaemonEngine {
                         tracing::warn!(error = %err, "periodic SQLite batch flush failed");
                     }
                 }
-                _ = &mut next_expiry_sleep, if !self.nrd_cancel.is_cancelled() => {
+                _ = &mut next_expiry_sleep, if !self.nrd_cancel.is_cancelled() && !self.store.is_shutdown_requested() => {
                     let removed = self.run_periodic_expiry_and_sweep();
                     #[cfg(test)]
                     {
@@ -395,6 +403,9 @@ impl DaemonEngine {
                         }
                     }
                 }
+                _ = mem_maintenance_ticker.tick(), if !self.nrd_cancel.is_cancelled() && !self.store.is_shutdown_requested() && !self.is_shutdown_drain_cutoff() => {
+                    self.run_periodic_memory_maintenance();
+                }
             }
         }
 
@@ -488,5 +499,41 @@ impl DaemonEngine {
             tracing::warn!(error = %err, "periodic alert expiry transition failed");
         }
         self.sweep_unused_preemptive_wfp_blocks()
+    }
+
+    pub(super) fn run_periodic_memory_maintenance(&self) {
+        if self.nrd_cancel.is_cancelled()
+            || self.store.is_shutdown_requested()
+            || self.is_shutdown_drain_cutoff()
+        {
+            return;
+        }
+        let _ = self
+            .sender
+            .shrink_telemetry_if_idle(Duration::from_secs(30));
+        let now_ms = current_unix_ms();
+        let interner = {
+            let mut table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _ = table.compact_exited_older_than(now_ms.saturating_sub(60_000));
+            table.path_interner()
+        };
+        let _ = interner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sweep_dead();
+        let _ = self
+            .process_dns_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sweep_interner_and_shrink();
+        let _ = self
+            .verified_app_wide_allows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sweep_interner();
+        // PHASE3_STORE_HOOK: let _ = self.store.shrink_reader_memory_if_idle(Duration::from_secs(30));
     }
 }

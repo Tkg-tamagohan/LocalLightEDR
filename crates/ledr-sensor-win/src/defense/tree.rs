@@ -276,7 +276,7 @@ pub(super) fn collect_validated_descendants_from_entries(
     descendants
 }
 
-fn is_error_invalid_parameter(open_err: &str) -> bool {
+pub(super) fn is_error_invalid_parameter(open_err: &str) -> bool {
     let invalid_param_hex = format!("0x{:08x}", ERROR_INVALID_PARAMETER.to_hresult().0 as u32);
     open_err.to_ascii_lowercase().contains(&invalid_param_hex)
 }

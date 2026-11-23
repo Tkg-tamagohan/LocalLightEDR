@@ -1037,3 +1037,73 @@ async fn daemon_p3_51b_single_pass_os_sibling_no_double_inspect_and_dns_and_attr
     }
 }
 
+/// `DAEMON-P3-56B` (PR #38 Round 3 Thread `PRRT_kwDOVyjVyM66r7aT`):
+/// Direct SQLite writes via `StoreWriteGate::enter_sql_write` (MOTW download origin persistence
+/// and TTL purge batches) keep `active_sql_writes > 0` so `seal_and_wait_sql_idle` blocks until
+/// they finish even when `close_and_wait_idle` timed out on a slow multi-step `WriteOpGuard`, and
+/// times out cleanly if the direct SQLite write remains wedged past the seal budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p3_56b_enter_sql_write_blocks_seal_after_op_gate_timeout() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let gate = Arc::new(crate::engine::StoreWriteGate::default());
+
+    let op_guard = crate::engine::StoreWriteGate::enter_op(&gate).expect("enter_op succeeds");
+    let sql_guard =
+        crate::engine::StoreWriteGate::enter_sql_write(&gate).expect("enter_sql_write succeeds");
+
+    let op_idle = gate
+        .close_and_wait_idle(tokio::time::Instant::now() + Duration::from_millis(30))
+        .await;
+    assert!(
+        !op_idle,
+        "close_and_wait_idle must time out while op_guard + sql_guard are active"
+    );
+
+    let seal_gate = Arc::clone(&gate);
+    let seal_task = tokio::spawn(async move {
+        seal_gate
+            .seal_and_wait_sql_idle(tokio::time::Instant::now() + Duration::from_millis(1_000))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        !seal_task.is_finished(),
+        "seal_and_wait_sql_idle must wait for active OwnedSqlWriteGuard before WAL checkpoint"
+    );
+
+    assert!(
+        crate::engine::StoreWriteGate::enter_op(&gate).is_none(),
+        "enter_op must fail closed after gate is closed/sealed"
+    );
+    assert!(
+        crate::engine::StoreWriteGate::enter_sql_write(&gate).is_none(),
+        "enter_sql_write must fail closed after gate is closed/sealed"
+    );
+    assert!(
+        op_guard
+            .write(&store, |s| s.delete_rule("nonexistent-rule"))
+            .is_err(),
+        "op_guard.write must be rejected once gate is sealed"
+    );
+
+    drop(sql_guard);
+    assert!(
+        seal_task.await.expect("join seal_task"),
+        "seal_and_wait_sql_idle must complete promptly once OwnedSqlWriteGuard drops even if op_guard remains held"
+    );
+    drop(op_guard);
+
+    // Timeout verification: wedged OwnedSqlWriteGuard exceeding seal budget returns false cleanly.
+    let gate2 = Arc::new(crate::engine::StoreWriteGate::default());
+    let sql_guard2 =
+        crate::engine::StoreWriteGate::enter_sql_write(&gate2).expect("enter_sql_write 2");
+    let sql_idle2 = gate2
+        .seal_and_wait_sql_idle(tokio::time::Instant::now() + Duration::from_millis(30))
+        .await;
+    assert!(
+        !sql_idle2,
+        "seal_and_wait_sql_idle must return false when direct SQLite write exceeds budget"
+    );
+    drop(sql_guard2);
+}
+

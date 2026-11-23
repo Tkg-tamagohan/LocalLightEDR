@@ -81,13 +81,14 @@ struct WriteGateState {
 /// Coordinates engine-initiated SQLite mutations with graceful shutdown (`FU-E2E-05`).
 ///
 /// Multi-step transactions + compensation rollbacks (e.g., `resolve_alert_with_outcome`,
-/// `upsert_policy_rule`, `delete_policy_rule`) and per-batch TTL purges hold a [`WriteOpGuard`]
-/// across the whole logical operation, ensuring an already-admitted rollback completes before
-/// final `wal_checkpoint(TRUNCATE)` while new operations fail closed once shutdown starts.
+/// `upsert_policy_rule`, `delete_policy_rule`) hold a [`WriteOpGuard`] across the whole logical
+/// operation, while direct single-step SQLite write paths (download origin persistence and
+/// per-batch TTL purges) hold an [`OwnedSqlWriteGuard`] from [`StoreWriteGate::enter_sql_write`].
 ///
-/// If an admitted operation outlives the shutdown drain budget, [`StoreWriteGate::seal_and_wait_sql_idle`]
-/// permanently seals `WriteOpGuard::write` and waits for active SQLite calls to unwind before
-/// final WAL truncation so late post-checkpoint writes cannot regenerate `-wal`.
+/// If an admitted multi-step operation outlives the shutdown drain budget,
+/// [`StoreWriteGate::seal_and_wait_sql_idle`] permanently seals `WriteOpGuard::write` and waits
+/// for both active [`WriteOpGuard::write`] calls and [`OwnedSqlWriteGuard`]s to unwind before
+/// final `wal_checkpoint(TRUNCATE)` so late post-checkpoint writes cannot regenerate `-wal`.
 #[derive(Debug, Default)]
 pub(super) struct StoreWriteGate {
     state: Mutex<WriteGateState>,
@@ -121,6 +122,24 @@ impl Drop for SqlWriteGuard<'_> {
     }
 }
 
+pub(super) struct OwnedSqlWriteGuard {
+    gate: Arc<StoreWriteGate>,
+}
+
+impl Drop for OwnedSqlWriteGuard {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.in_flight = state.in_flight.saturating_sub(1);
+        state.active_sql_writes = state.active_sql_writes.saturating_sub(1);
+        if state.in_flight == 0 {
+            self.gate.notify_idle.notify_waiters();
+        }
+        if state.active_sql_writes == 0 {
+            self.gate.notify_sql_idle.notify_waiters();
+        }
+    }
+}
+
 impl WriteOpGuard {
     pub(super) fn write<T>(
         &self,
@@ -149,6 +168,18 @@ impl StoreWriteGate {
         }
         state.in_flight = state.in_flight.saturating_add(1);
         Some(WriteOpGuard {
+            gate: Arc::clone(gate),
+        })
+    }
+
+    pub(super) fn enter_sql_write(gate: &Arc<Self>) -> Option<OwnedSqlWriteGuard> {
+        let mut state = gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || state.sealed {
+            return None;
+        }
+        state.in_flight = state.in_flight.saturating_add(1);
+        state.active_sql_writes = state.active_sql_writes.saturating_add(1);
+        Some(OwnedSqlWriteGuard {
             gate: Arc::clone(gate),
         })
     }

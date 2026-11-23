@@ -1622,7 +1622,7 @@ impl DaemonEngine {
             sha256,
             zone_info,
         );
-        let Some(_write_guard) = StoreWriteGate::enter_op(&self.store_write_gate) else {
+        let Some(_write_guard) = StoreWriteGate::enter_sql_write(&self.store_write_gate) else {
             return Err(BrowserReportError::Cancelled);
         };
         persist_download_origin_idempotent(&self.store, &self.download_origin_state, record, None)
@@ -1702,7 +1702,7 @@ impl DaemonEngine {
         let write_cancel = Arc::clone(&cancel);
         let write_gate = Arc::clone(&self.store_write_gate);
         let persisted = tokio::task::spawn_blocking(move || {
-            let Some(_write_guard) = StoreWriteGate::enter_op(&write_gate) else {
+            let Some(_write_guard) = StoreWriteGate::enter_sql_write(&write_gate) else {
                 return Err(BrowserReportError::Cancelled);
             };
             if write_cancel.load(Ordering::Acquire) {

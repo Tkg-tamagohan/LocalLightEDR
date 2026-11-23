@@ -289,7 +289,7 @@ impl DaemonEngine {
                         purge_in_flight = Some(tokio::task::spawn_blocking(move || {
                             let now_ms = current_unix_ms();
                             match store.purge_expired_with_guard(now_ms, retention_days, || {
-                                StoreWriteGate::enter_op(&write_gate)
+                                StoreWriteGate::enter_sql_write(&write_gate)
                             }) {
                                 Ok(stats) => {
                                     refresh_download_origins_after_purge(

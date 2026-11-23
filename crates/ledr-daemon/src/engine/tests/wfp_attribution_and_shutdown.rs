@@ -1059,17 +1059,18 @@ async fn daemon_p3_56b_enter_sql_write_blocks_seal_after_op_gate_timeout() {
         "close_and_wait_idle must time out while op_guard + sql_guard are active"
     );
 
-    let seal_gate = Arc::clone(&gate);
-    let seal_task = tokio::spawn(async move {
-        seal_gate
-            .seal_and_wait_sql_idle(tokio::time::Instant::now() + Duration::from_millis(1_000))
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    assert!(
-        !seal_task.is_finished(),
-        "seal_and_wait_sql_idle must wait for active OwnedSqlWriteGuard before WAL checkpoint"
+    let mut seal_fut = std::pin::pin!(
+        gate.seal_and_wait_sql_idle(tokio::time::Instant::now() + Duration::from_millis(1_000))
     );
+    tokio::select! {
+        biased;
+        res = &mut seal_fut => {
+            panic!(
+                "seal_and_wait_sql_idle must wait for active OwnedSqlWriteGuard before WAL checkpoint (returned {res})"
+            );
+        }
+        _ = std::future::ready(()) => {}
+    }
 
     assert!(
         crate::engine::StoreWriteGate::enter_op(&gate).is_none(),
@@ -1088,7 +1089,7 @@ async fn daemon_p3_56b_enter_sql_write_blocks_seal_after_op_gate_timeout() {
 
     drop(sql_guard);
     assert!(
-        seal_task.await.expect("join seal_task"),
+        seal_fut.await,
         "seal_and_wait_sql_idle must complete promptly once OwnedSqlWriteGuard drops even if op_guard remains held"
     );
     drop(op_guard);

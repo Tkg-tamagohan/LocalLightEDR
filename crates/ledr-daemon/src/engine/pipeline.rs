@@ -79,10 +79,7 @@ impl DaemonEngine {
         let mut nrd_ticker = tokio::time::interval(Duration::from_millis(nrd_tick_ms));
         nrd_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut mem_maintenance_ticker = tokio::time::interval(Duration::from_secs(60));
-        mem_maintenance_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Consume the immediate t=0 tick so memory maintenance runs on 60s periodic ticks.
-        mem_maintenance_ticker.tick().await;
+        let mut last_mem_maintenance_at = tokio::time::Instant::now();
 
         let mut pending_wfp_drops: VecDeque<PendingWfpDrop> = VecDeque::new();
         let mut wfp_drop_rx_closed = false;
@@ -199,6 +196,24 @@ impl DaemonEngine {
                 continue;
             }
 
+            // Tier 2c-mem: Run overdue periodic memory maintenance BEFORE Tier 3 steady telemetry
+            // so sustained telemetry bursts cannot starve exited-process compaction, path interner
+            // sweeps, or idle SQLite reader shrinking (`PRRT_kwDOVyjVyM66vYBQ`).
+            let mem_maintenance_deadline = last_mem_maintenance_at + self.mem_maintenance_interval();
+            if !self.nrd_cancel.is_cancelled()
+                && !self.store.is_shutdown_requested()
+                && !self.is_shutdown_drain_cutoff()
+                && tokio::time::Instant::now() >= mem_maintenance_deadline
+            {
+                sync_telemetry_streak = 0;
+                self.run_periodic_memory_maintenance();
+                #[cfg(test)]
+                self.tier2c_mem_maintenance_runs
+                    .fetch_add(1, Ordering::Release);
+                last_mem_maintenance_at = tokio::time::Instant::now();
+                continue;
+            }
+
             // Tier 3: Steady telemetry lane, yielding periodically so single-threaded runtimes and
             // grace timers remain responsive during bursts.
             if let Some(event) = receiver.try_recv_telemetry() {
@@ -225,6 +240,9 @@ impl DaemonEngine {
 
             let next_expiry_sleep = tokio::time::sleep_until(next_expiry_at);
             tokio::pin!(next_expiry_sleep);
+
+            let next_mem_maintenance_sleep = tokio::time::sleep_until(mem_maintenance_deadline);
+            tokio::pin!(next_mem_maintenance_sleep);
 
             tokio::select! {
                 biased;
@@ -403,8 +421,12 @@ impl DaemonEngine {
                         }
                     }
                 }
-                _ = mem_maintenance_ticker.tick(), if !self.nrd_cancel.is_cancelled() && !self.store.is_shutdown_requested() && !self.is_shutdown_drain_cutoff() => {
+                _ = &mut next_mem_maintenance_sleep, if !self.nrd_cancel.is_cancelled() && !self.store.is_shutdown_requested() && !self.is_shutdown_drain_cutoff() => {
                     self.run_periodic_memory_maintenance();
+                    #[cfg(test)]
+                    self.select_idle_mem_maintenance_runs
+                        .fetch_add(1, Ordering::Release);
+                    last_mem_maintenance_at = tokio::time::Instant::now();
                 }
             }
         }

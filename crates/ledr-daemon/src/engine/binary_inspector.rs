@@ -24,6 +24,13 @@ pub enum InspectOutcome {
 pub trait BinaryInspector: Send + Sync {
     fn inspect(&self, exe_path: &str) -> BinaryIdentity;
 
+    /// Inspects `exe_path` without reading from or populating any in-memory Authenticode
+    /// verdict cache. Security-critical boundaries where certificate trust revocation must take
+    /// effect immediately (e.g. mutating IPC caller authorization) must use this method.
+    fn inspect_uncached(&self, exe_path: &str) -> BinaryIdentity {
+        self.inspect(exe_path)
+    }
+
     /// Inspects `exe_path` with cooperative cancellation (`cancel`) and optional fast shutdown
     /// skip of cold disk/Authenticode work (`fast_skip_on_shutdown`).
     fn inspect_cancellable(
@@ -257,26 +264,13 @@ impl WindowsBinaryInspector {
             auth_worker,
         }
     }
-}
 
-impl BinaryInspector for WindowsBinaryInspector {
-    fn inspect(&self, exe_path: &str) -> BinaryIdentity {
-        let never_cancel = AtomicBool::new(false);
-        match self.inspect_cancellable(exe_path, &never_cancel, false) {
-            InspectOutcome::Completed(id) => id,
-            InspectOutcome::Cancelled => BinaryIdentity {
-                exe_path: exe_path.to_string(),
-                sha256: None,
-                authenticode: None,
-            },
-        }
-    }
-
-    fn inspect_cancellable(
+    fn inspect_cancellable_inner(
         &self,
         exe_path: &str,
         cancel: &AtomicBool,
         fast_skip_on_shutdown: bool,
+        use_cache: bool,
     ) -> InspectOutcome {
         if cancel.load(Ordering::Acquire) || fast_skip_on_shutdown {
             return InspectOutcome::Cancelled;
@@ -326,13 +320,15 @@ impl BinaryInspector for WindowsBinaryInspector {
         };
 
         let cache_key = (exe_path.to_ascii_lowercase(), fresh_sha256.clone());
-        if let Ok(mut guard) = self.authenticode_cache.lock() {
-            if let Some(cached_auth) = guard.get(&cache_key) {
-                return InspectOutcome::Completed(BinaryIdentity {
-                    exe_path: exe_path.to_string(),
-                    sha256: Some(fresh_sha256),
-                    authenticode: cached_auth.clone(),
-                });
+        if use_cache {
+            if let Ok(mut guard) = self.authenticode_cache.lock() {
+                if let Some(cached_auth) = guard.get(&cache_key) {
+                    return InspectOutcome::Completed(BinaryIdentity {
+                        exe_path: exe_path.to_string(),
+                        sha256: Some(fresh_sha256),
+                        authenticode: cached_auth.clone(),
+                    });
+                }
             }
         }
         if cancel.load(Ordering::Acquire) {
@@ -347,8 +343,10 @@ impl BinaryInspector for WindowsBinaryInspector {
                 if cancel.load(Ordering::Acquire) {
                     return InspectOutcome::Cancelled;
                 }
-                if let Ok(mut guard) = self.authenticode_cache.lock() {
-                    guard.insert(cache_key, authenticode.clone());
+                if use_cache {
+                    if let Ok(mut guard) = self.authenticode_cache.lock() {
+                        guard.insert(cache_key, authenticode.clone());
+                    }
                 }
                 InspectOutcome::Completed(BinaryIdentity {
                     exe_path: exe_path.to_string(),
@@ -374,6 +372,41 @@ impl BinaryInspector for WindowsBinaryInspector {
                 })
             }
         }
+    }
+}
+
+impl BinaryInspector for WindowsBinaryInspector {
+    fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+        let never_cancel = AtomicBool::new(false);
+        match self.inspect_cancellable(exe_path, &never_cancel, false) {
+            InspectOutcome::Completed(id) => id,
+            InspectOutcome::Cancelled => BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: None,
+                authenticode: None,
+            },
+        }
+    }
+
+    fn inspect_uncached(&self, exe_path: &str) -> BinaryIdentity {
+        let never_cancel = AtomicBool::new(false);
+        match self.inspect_cancellable_inner(exe_path, &never_cancel, false, false) {
+            InspectOutcome::Completed(id) => id,
+            InspectOutcome::Cancelled => BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: None,
+                authenticode: None,
+            },
+        }
+    }
+
+    fn inspect_cancellable(
+        &self,
+        exe_path: &str,
+        cancel: &AtomicBool,
+        fast_skip_on_shutdown: bool,
+    ) -> InspectOutcome {
+        self.inspect_cancellable_inner(exe_path, cancel, fast_skip_on_shutdown, true)
     }
 
     fn compute_sha256(&self, exe_path: &str) -> Option<String> {
@@ -728,5 +761,92 @@ mod tests {
         ));
         let id = inspector.inspect(&p.to_string_lossy());
         assert!(id.authenticode.is_some());
+    }
+
+    #[test]
+    fn bin_mem_02_inspect_uncached_bypasses_and_does_not_overwrite_cache() {
+        let tmp = TestTempDir::new("bin-mem-02");
+        let exe_path = tmp.path.join("ipc_caller.exe");
+        std::fs::write(&exe_path, b"MZ-immutable-caller").expect("write caller");
+        let exe_str = exe_path.to_string_lossy().into_owned();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        struct FlippingSpawner {
+            calls: Arc<AtomicUsize>,
+        }
+        struct FlippingProc {
+            calls: Arc<AtomicUsize>,
+            last_req_id: u64,
+            last_call_idx: usize,
+        }
+        impl WorkerProcessHandle for FlippingProc {
+            fn pid(&self) -> u32 {
+                88_002
+            }
+            fn try_has_exited(&mut self) -> bool {
+                false
+            }
+            fn kill_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
+                None
+            }
+            fn send_request(&mut self, req: &AuthVerifyRequest) -> io::Result<()> {
+                self.last_req_id = req.id;
+                self.last_call_idx = self.calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+            fn recv_response_timeout(
+                &mut self,
+                _timeout: Duration,
+            ) -> Result<AuthVerifyResponse, RecvError> {
+                let authenticode = if self.last_call_idx == 0 {
+                    Some(AuthenticodeInfo {
+                        signer_subject: "CN=LocalEDR".to_string(),
+                        root_thumbprint: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+                    })
+                } else {
+                    None
+                };
+                Ok(AuthVerifyResponse {
+                    id: self.last_req_id,
+                    authenticode,
+                })
+            }
+            fn force_kill(self: Box<Self>) {}
+        }
+        impl WorkerSpawner for FlippingSpawner {
+            fn spawn(
+                &self,
+                _cancel: &AtomicBool,
+            ) -> Result<Box<dyn WorkerProcessHandle>, AuthWorkerError> {
+                Ok(Box::new(FlippingProc {
+                    calls: Arc::clone(&self.calls),
+                    last_req_id: 0,
+                    last_call_idx: 0,
+                }))
+            }
+        }
+
+        let cfg = AuthWorkerConfig::default();
+        let spawner = Arc::new(FlippingSpawner {
+            calls: Arc::clone(&calls),
+        });
+        let inspector =
+            WindowsBinaryInspector::with_auth_worker(AuthWorkerClient::with_spawner(cfg, spawner));
+
+        // 1. Cached `inspect` populates cache with signed verdict.
+        let cached = inspector.inspect(&exe_str);
+        assert!(cached.authenticode.is_some());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        // 2. Subsequent `inspect` hits cache (no worker call).
+        let cached_again = inspector.inspect(&exe_str);
+        assert!(cached_again.authenticode.is_some());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        // 3. `inspect_uncached` bypasses cache, calls worker, observes revoked (`None`), and
+        //    leaves cached state intact only for non-security `inspect` callers.
+        let uncached = inspector.inspect_uncached(&exe_str);
+        assert_eq!(uncached.authenticode, None);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 }

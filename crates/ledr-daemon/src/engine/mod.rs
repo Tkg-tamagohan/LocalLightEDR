@@ -288,6 +288,12 @@ pub struct DaemonEngine {
     pub(super) select_idle_periodic_sweeps: AtomicU64,
     #[cfg(test)]
     pub(super) select_idle_periodic_sweep_removals: AtomicU64,
+    #[cfg(test)]
+    pub(super) mem_maintenance_interval_ms: AtomicU64,
+    #[cfg(test)]
+    pub(super) tier2c_mem_maintenance_runs: AtomicU64,
+    #[cfg(test)]
+    pub(super) select_idle_mem_maintenance_runs: AtomicU64,
     shutdown_initiated: Arc<AtomicBool>,
     shutdown_drain_cutoff: Arc<AtomicBool>,
     shutdown_cutoff_notify: Arc<tokio::sync::Notify>,
@@ -342,6 +348,30 @@ impl DaemonEngine {
     pub fn set_fail_record_alert_for_test(&self, fail: bool) {
         self.fail_record_alert_for_test
             .store(fail, Ordering::Release);
+    }
+
+    pub(super) fn mem_maintenance_interval(&self) -> std::time::Duration {
+        #[cfg(test)]
+        {
+            std::time::Duration::from_millis(
+                self.mem_maintenance_interval_ms
+                    .load(Ordering::Acquire)
+                    .max(1),
+            )
+        }
+        #[cfg(not(test))]
+        {
+            std::time::Duration::from_secs(60)
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_mem_maintenance_interval_for_test(&self, interval: std::time::Duration) {
+        let ms = u64::try_from(interval.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.mem_maintenance_interval_ms
+            .store(ms, Ordering::Release);
     }
 
     /// Returns current [`PipelineMetrics`] (`決定記録 L-10`).

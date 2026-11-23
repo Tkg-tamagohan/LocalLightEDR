@@ -113,7 +113,7 @@ pub fn verify_authorized_caller_binary_with_inspector(
     {
         BinaryIdentity::from_path_sha256_only(Path::new(caller_path))
     } else {
-        inspector.inspect(caller_path)
+        inspector.inspect_uncached(caller_path)
     };
     verify_caller_identity(
         Some(&identity),
@@ -292,12 +292,22 @@ mod tests {
 
     struct SpyInspector {
         calls: AtomicUsize,
+        uncached_calls: AtomicUsize,
         authenticode: Option<AuthenticodeInfo>,
     }
 
     impl BinaryInspector for SpyInspector {
         fn inspect(&self, exe_path: &str) -> BinaryIdentity {
             self.calls.fetch_add(1, Ordering::AcqRel);
+            BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: compute_file_sha256_hex(Path::new(exe_path)).ok(),
+                authenticode: self.authenticode.clone(),
+            }
+        }
+
+        fn inspect_uncached(&self, exe_path: &str) -> BinaryIdentity {
+            self.uncached_calls.fetch_add(1, Ordering::AcqRel);
             BinaryIdentity {
                 exe_path: exe_path.to_string(),
                 sha256: compute_file_sha256_hex(Path::new(exe_path)).ok(),
@@ -317,6 +327,7 @@ mod tests {
 
         let spy = SpyInspector {
             calls: AtomicUsize::new(0),
+            uncached_calls: AtomicUsize::new(0),
             authenticode: Some(AuthenticodeInfo {
                 signer_subject: "CN=LocalEDR".to_string(),
                 root_thumbprint: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
@@ -334,8 +345,9 @@ mod tests {
             false
         ));
         assert_eq!(spy.calls.load(Ordering::Acquire), 0);
+        assert_eq!(spy.uncached_calls.load(Ordering::Acquire), 0);
 
-        // 2. Without SHA-256 pin, Authenticode routes through BinaryInspector.
+        // 2. Without SHA-256 pin, Authenticode routes through `inspect_uncached` (never cached `inspect`).
         assert!(verify_authorized_caller_binary_with_inspector(
             &spy,
             Some(&exe_str),
@@ -345,11 +357,13 @@ mod tests {
             None,
             false
         ));
-        assert_eq!(spy.calls.load(Ordering::Acquire), 1);
+        assert_eq!(spy.calls.load(Ordering::Acquire), 0);
+        assert_eq!(spy.uncached_calls.load(Ordering::Acquire), 1);
 
         // 3. Option X fail-closed when BinaryInspector returns `authenticode: None`.
         let fail_closed_spy = SpyInspector {
             calls: AtomicUsize::new(0),
+            uncached_calls: AtomicUsize::new(0),
             authenticode: None,
         };
         assert!(!verify_authorized_caller_binary_with_inspector(
@@ -361,7 +375,83 @@ mod tests {
             None,
             false
         ));
-        assert_eq!(fail_closed_spy.calls.load(Ordering::Acquire), 1);
+        assert_eq!(fail_closed_spy.calls.load(Ordering::Acquire), 0);
+        assert_eq!(fail_closed_spy.uncached_calls.load(Ordering::Acquire), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn ipc_auth_revoked_01_trust_revocation_without_file_change_denies_mutating_ipc() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-ipc-auth-revoked-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp");
+        let exe = tmp_dir.join("ledr-ui.exe");
+        std::fs::write(&exe, b"MZ-immutable-ui-binary").expect("write exe");
+        let exe_str = exe.to_string_lossy().into_owned();
+
+        struct RevokingInspector {
+            cached_calls: AtomicUsize,
+            uncached_calls: AtomicUsize,
+        }
+        impl BinaryInspector for RevokingInspector {
+            fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+                self.cached_calls.fetch_add(1, Ordering::AcqRel);
+                BinaryIdentity {
+                    exe_path: exe_path.to_string(),
+                    sha256: compute_file_sha256_hex(Path::new(exe_path)).ok(),
+                    authenticode: Some(AuthenticodeInfo {
+                        signer_subject: "CN=LocalEDR".to_string(),
+                        root_thumbprint: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+                    }),
+                }
+            }
+            fn inspect_uncached(&self, exe_path: &str) -> BinaryIdentity {
+                let n = self.uncached_calls.fetch_add(1, Ordering::AcqRel);
+                let authenticode = if n == 0 {
+                    Some(AuthenticodeInfo {
+                        signer_subject: "CN=LocalEDR".to_string(),
+                        root_thumbprint: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+                    })
+                } else {
+                    None
+                };
+                BinaryIdentity {
+                    exe_path: exe_path.to_string(),
+                    sha256: compute_file_sha256_hex(Path::new(exe_path)).ok(),
+                    authenticode,
+                }
+            }
+        }
+
+        let inspector = RevokingInspector {
+            cached_calls: AtomicUsize::new(0),
+            uncached_calls: AtomicUsize::new(0),
+        };
+        assert!(verify_authorized_caller_binary_with_inspector(
+            &inspector,
+            Some(&exe_str),
+            &exe_str,
+            None,
+            Some("CN=LocalEDR"),
+            Some("0123456789ABCDEF0123456789ABCDEF01234567"),
+            false
+        ));
+        // Second call with identical file on disk after trust revocation MUST fail closed.
+        assert!(!verify_authorized_caller_binary_with_inspector(
+            &inspector,
+            Some(&exe_str),
+            &exe_str,
+            None,
+            Some("CN=LocalEDR"),
+            Some("0123456789ABCDEF0123456789ABCDEF01234567"),
+            false
+        ));
+        assert_eq!(inspector.cached_calls.load(Ordering::Acquire), 0);
+        assert_eq!(inspector.uncached_calls.load(Ordering::Acquire), 2);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

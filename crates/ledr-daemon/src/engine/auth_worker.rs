@@ -506,7 +506,7 @@ struct OsWorkerProcess {
     job_handle: Option<OwnedWinHandle>,
     process_handle: OwnedWinHandle,
     stdin_write: Option<File>,
-    resp_rx: mpsc::Receiver<io::Result<AuthVerifyResponse>>,
+    resp_rx: Option<mpsc::Receiver<io::Result<AuthVerifyResponse>>>,
     reader_thread: Option<JoinHandle<()>>,
 }
 
@@ -568,7 +568,10 @@ impl WorkerProcessHandle for OsWorkerProcess {
     }
 
     fn recv_response_timeout(&mut self, timeout: Duration) -> Result<AuthVerifyResponse, RecvError> {
-        match self.resp_rx.recv_timeout(timeout) {
+        let Some(ref resp_rx) = self.resp_rx else {
+            return Err(RecvError::Disconnected);
+        };
+        match resp_rx.recv_timeout(timeout) {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(err)) => {
                 if err.kind() == io::ErrorKind::UnexpectedEof
@@ -588,6 +591,10 @@ impl WorkerProcessHandle for OsWorkerProcess {
         drop(self.stdin_write.take());
         Self::kill_process_now(self.process_handle.0);
         drop(self.job_handle.take());
+        // Drop the bounded channel receiver BEFORE joining `reader_thread` so a reader thread
+        // blocked trying to send an EOF error into a full capacity-1 channel unblocks immediately
+        // instead of deadlocking `join()` while holding `AuthWorkerClient::inner`.
+        drop(self.resp_rx.take());
         // SAFETY: Bounded short wait for kernel teardown after `TerminateProcess`.
         unsafe {
             let _ = WaitForSingleObject(self.process_handle.0, 50);
@@ -603,6 +610,7 @@ impl Drop for OsWorkerProcess {
         drop(self.stdin_write.take());
         Self::kill_process_now(self.process_handle.0);
         drop(self.job_handle.take());
+        drop(self.resp_rx.take());
         // Do not join indefinitely in arbitrary Drop; pipes are closed and process terminated.
         let _ = self.reader_thread.take();
     }
@@ -816,7 +824,7 @@ impl WorkerSpawner for OsWorkerSpawner {
             job_handle: Some(job),
             process_handle,
             stdin_write: Some(stdin_file),
-            resp_rx,
+            resp_rx: Some(resp_rx),
             reader_thread: Some(reader_thread),
         }))
     }
@@ -1624,5 +1632,70 @@ mod tests {
                 assert_eq!(got_after_idle, expected);
                 real_client.shutdown();
         }
+    }
+
+    #[test]
+    fn auth_worker_02_force_kill_does_not_hang_when_sync_channel_is_full() {
+        use std::os::windows::io::IntoRawHandle;
+        use std::os::windows::process::CommandExt;
+
+        let sys_cmd = Path::new(r"C:\Windows\System32\cmd.exe");
+        if !sys_cmd.is_file() {
+            return;
+        }
+        let child = std::process::Command::new(sys_cmd)
+            .args(["/c", "ping", "-n", "10", "127.0.0.1", ">nul"])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .expect("spawn dummy child");
+        let pid = child.id();
+        let raw_handle = child.into_raw_handle();
+
+        // Capacity-1 channel already holding an unread response, plus a reader thread blocked
+        // trying to send a trailing EOF error (`PRRT_kwDOVyjVyM66vX7D`).
+        let (resp_tx, resp_rx) = mpsc::sync_channel::<io::Result<AuthVerifyResponse>>(1);
+        resp_tx
+            .try_send(Ok(AuthVerifyResponse {
+                id: 1,
+                authenticode: None,
+            }))
+            .expect("prefill capacity-1 sync_channel");
+
+        let reader_entered_send = Arc::new(AtomicBool::new(false));
+        let reader_entered_bg = Arc::clone(&reader_entered_send);
+        let reader_thread = std::thread::spawn(move || {
+            reader_entered_bg.store(true, Ordering::Release);
+            let _ = resp_tx.send(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "simulated EOF while unread response occupies channel",
+            )));
+        });
+
+        let wait_start = Instant::now();
+        while !reader_entered_send.load(Ordering::Acquire) {
+            assert!(wait_start.elapsed() < Duration::from_secs(2));
+            std::thread::yield_now();
+        }
+        // Give the reader thread a brief slice to block inside `sync_channel::send`.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let proc_handle: Box<dyn WorkerProcessHandle> = Box::new(OsWorkerProcess {
+            pid,
+            job_handle: None,
+            process_handle: OwnedWinHandle(HANDLE(raw_handle)),
+            stdin_write: None,
+            resp_rx: Some(resp_rx),
+            reader_thread: Some(reader_thread),
+        });
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            proc_handle.force_kill();
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("force_kill must drop resp_rx before joining reader_thread and not deadlock");
     }
 }

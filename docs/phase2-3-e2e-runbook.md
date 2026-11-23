@@ -43,8 +43,8 @@
 
 作業ディレクトリ `e:\Documents\code\LocalEDR` 配下に次のバイナリが揃っており、PowerShell ウィンドウ 3 つを開ける状態にしてください。
 
-- **ビルド済みバイナリ（機能確認用）**：`target\debug\ledr-daemon.exe`、`target\debug\ledr-ui.exe`、`target\debug\ledr-sim.exe`
-- **ビルド済みバイナリ（`E2E-PERF-01` 性能計測用）**：`cargo build --release --locked` で生成した `target\release\ledr-daemon.exe` と `target\release\ledr-ui.exe`
+- **ビルド済みバイナリ（機能確認用）**：`target\debug\ledr-daemon.exe`、`target\debug\ledr-auth-helper.exe`、`target\debug\ledr-ui.exe`、`target\debug\ledr-sim.exe`（`ledr-auth-helper.exe` は `nNumberOfLinks == 1` を要求するため、Cargo 出力を `$runDir\debug-bin` へ複製して実行する）
+- **ビルド済みバイナリ（`E2E-PERF-01` 性能計測用）**：`cargo build --release --locked` で生成した `target\release\ledr-daemon.exe`、`target\release\ledr-auth-helper.exe`、`target\release\ledr-ui.exe`（`$runDir\release-bin` へ複製して実行する）
 - **検証用一時フォルダ**：実行ごとに新規割り当てする `C:\Temp\ledr-e2e-<yyyyMMdd-HHmmss>`（変数 `$runDir` で参照し、SQLite DB、NRD キャッシュ、ダミーカナリア、および `netsh wfp` 出力 XML を保存し、過去の検証フォルダは自動削除しない）
 - **ウィンドウ A（管理者 PowerShell）**：`ledr-daemon.exe` のフォアグラウンド起動とログ監視用
 - **ウィンドウ B（管理者 PowerShell）**：`ledr-sim.exe` 実行、`netsh wfp` 確認、TCP 接続試験、および `taskkill` 用
@@ -54,28 +54,17 @@
 
 ### 1. 一時フォルダ準備と URI スキーム・AUMID 登録（ウィンドウ B とウィンドウ C）
 
-はじめに、ウィンドウ C（通常ユーザー権限）で `ledr://` プロトコルハンドラと専用 AUMID（`LocalEDR.AlertUI`）を現在のユーザーへ登録し、登録状態および Windows 通知設定（`ToastEnabled`）を確認してください。
+はじめに、ウィンドウ B（管理者権限）で今回の実行専用の作業フォルダ（前回の DB やログ証跡を上書き削除しないタイムスタンプ付きフォルダ）と `debug-bin` ステージング（`Links = 1` 保証）および Phase 2 用のダミーカナリア群を作成してください。
 
 ```powershell
 cd e:\Documents\code\LocalEDR
-.\target\debug\ledr-ui.exe --register-uri
-Get-ItemProperty "HKCU:\Software\Classes\ledr\shell\open\command"
-Get-ItemProperty "HKCU:\Software\Classes\AppUserModelId\LocalEDR.AlertUI"
-Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications" -Name ToastEnabled -ErrorAction SilentlyContinue
-.\target\debug\ledr-ui.exe --notify test-alert-001
-```
-
-標準出力に `"status":"registered"`（または既存一致時は `"already_registered"`）が表示され、`ledr` コマンド値に `e:\Documents\code\LocalEDR\target\debug\ledr-ui.exe`、`LocalEDR.AlertUI` の `DisplayName` に `LocalEDR` が登録されていれば準備は完了である。
-`ToastEnabled` が `0` の場合、`--notify test-alert-001` は `"status":"suppressed_by_os_settings"` を返すため、実機トーストを目視確認する前に Windows の「設定 > システム > 通知」をオン（`ToastEnabled = 1` または値なし）にしてから再実行し、`"status":"dispatched"` と通知バナー表示を確認する。
-なお、`--register-uri` が `LocalEDR.AlertUI` へ登録するレジストリ値は `DisplayName` のみであるため、Windows 10 と 11 のクリーン環境（新規ユーザーアカウントや既存 `LocalEDR.AlertUI` キーを削除した状態）で初回の通知バナー表示とクリック起動（`ledr://alert/test-alert-001`）が機能することもあわせて確認してください。
-
-次に、ウィンドウ B（管理者権限）で今回の実行専用の作業フォルダ（前回の DB やログ証跡を上書き削除しないタイムスタンプ付きフォルダ）と Phase 2 用のダミーカナリア群を作成してください。
-
-```powershell
-cd e:\Documents\code\LocalEDR
-Get-Process ledr-daemon, ledr-ui, ledr-sim -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process ledr-daemon, ledr-auth-helper, ledr-ui, ledr-sim -ErrorAction SilentlyContinue | Stop-Process -Force
 $runDir = "C:\Temp\ledr-e2e-" + (Get-Date -Format "yyyyMMdd-HHmmss")
 New-Item -ItemType Directory -Force -Path (Join-Path $runDir "canary_dir") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $runDir "debug-bin") | Out-Null
+foreach ($exeName in @("ledr-daemon.exe", "ledr-auth-helper.exe", "ledr-ui.exe", "ledr-sim.exe")) {
+    Copy-Item -LiteralPath (Join-Path "target\debug" $exeName) -Destination (Join-Path $runDir "debug-bin\$exeName") -Force
+}
 [System.IO.File]::WriteAllText("C:\Temp\ledr-e2e-latest.txt", $runDir, [System.Text.UTF8Encoding]::new($false))
 Write-Output ("RunDir=" + $runDir)
 # 検証前から存在するおとりファイルを記録し、後片付けで今回作成分だけを削除できるようにする
@@ -86,8 +75,24 @@ $honeypotPaths = @(
 )
 $preexistingHoneypots = @($honeypotPaths | Where-Object { Test-Path -LiteralPath $_ })
 [System.IO.File]::WriteAllLines((Join-Path $runDir "preexisting_honeypots.txt"), [string[]]$preexistingHoneypots, [System.Text.UTF8Encoding]::new($false))
-.\target\debug\ledr-sim.exe --prepare-dir (Join-Path $runDir "canary_dir") --json
+& (Join-Path $runDir "debug-bin\ledr-sim.exe") --prepare-dir (Join-Path $runDir "canary_dir") --json
 ```
+
+次に、ウィンドウ C（通常ユーザー権限）で `ledr://` プロトコルハンドラと専用 AUMID（`LocalEDR.AlertUI`）を現在のユーザーへ登録し、登録状態および Windows 通知設定（`ToastEnabled`）を確認してください。
+
+```powershell
+$runDir = (Get-Content -Encoding UTF8 C:\Temp\ledr-e2e-latest.txt -Raw).Trim()
+$debugUiExe = Join-Path $runDir "debug-bin\ledr-ui.exe"
+& $debugUiExe --register-uri
+Get-ItemProperty "HKCU:\Software\Classes\ledr\shell\open\command"
+Get-ItemProperty "HKCU:\Software\Classes\AppUserModelId\LocalEDR.AlertUI"
+Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications" -Name ToastEnabled -ErrorAction SilentlyContinue
+& $debugUiExe --notify test-alert-001
+```
+
+標準出力に `"status":"registered"`（または既存一致時は `"already_registered"`）が表示され、`ledr` コマンド値に `$runDir\debug-bin\ledr-ui.exe`、`LocalEDR.AlertUI` の `DisplayName` に `LocalEDR` が登録されていれば準備は完了である。
+`ToastEnabled` が `0` の場合、`--notify test-alert-001` は `"status":"suppressed_by_os_settings"` を返すため、実機トーストを目視確認する前に Windows の「設定 > システム > 通知」をオン（`ToastEnabled = 1` または値なし）にしてから再実行し、`"status":"dispatched"` と通知バナー表示を確認する。
+なお、`--register-uri` が `LocalEDR.AlertUI` へ登録するレジストリ値は `DisplayName` のみであるため、Windows 10 と 11 のクリーン環境（新規ユーザーアカウントや既存 `LocalEDR.AlertUI` キーを削除した状態）で初回の通知バナー表示とクリック起動（`ledr://alert/test-alert-001`）が機能することもあわせて確認してください。
 
 この時点で `$runDir\canary_dir` 配下にダミーの `Google\Chrome\User Data\Default\Cookies` と `!00_LocalEDR_Canary_DoNotEdit.docx` が排他作成される。
 同じ `--prepare-dir` コマンドをもう一度実行し、既存ファイルの上書きに失敗して終了コードが非ゼロになることを確認すれば、`create_new(true)` による既存保護もあわせて検証できる（再試行時は後続テスト前に元のダミーファイルが残っていることを確かめる）。
@@ -101,7 +106,7 @@ Phase 2 と Phase 3 前半の検証では外部通信や NRD 取得のノイズ�
 cd e:\Documents\code\LocalEDR
 $runDir = (Get-Content -Encoding UTF8 C:\Temp\ledr-e2e-latest.txt -Raw).Trim()
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
+& (Join-Path $runDir "debug-bin\ledr-daemon.exe") --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
 ```
 
 標準出力に次のログが順番に出力されれば、特権有効化、WFP 動的セッション、おとりファイル 3 箇所配置、リアルタイム ETW、および IPC サーバの初期化に成功している。
@@ -334,7 +339,7 @@ try {
 
 ### 4. `ledr-ui` の View 1 と View 3 による許可登録と Deny 優先と削除の WFP 連動
 
-ウィンドウ C（通常ユーザー権限）で `.\target\debug\ledr-ui.exe` を開き（起動済みなら **`Refresh`**）、画面上のタブを切り替えて次の順に操作してください。
+ウィンドウ C（通常ユーザー権限）で `(Join-Path $runDir "debug-bin\ledr-ui.exe")` を開き（起動済みなら **`Refresh`**）、画面上のタブを切り替えて次の順に操作してください。
 
 1. **`View 1: アラートトリアージ`** で、手順 2 で発生した単一インスタンス側の `powershell.exe` アラート（`LEDR-NET-SCRIPT-INTERPRETER`）を選択する。
 2. 右下の **`Allow Permanent Rule`** カードで `Target scope (optional)` に `93.184.216.34` を入力し、`Match Authenticode signer` がオンの状態で **`Allow Permanent Rule`** ボタンを押す。
@@ -357,7 +362,7 @@ try {
 
 ```powershell
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
+& (Join-Path $runDir "debug-bin\ledr-daemon.exe") --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
 ```
 
 ウィンドウ A に `refreshed daily NRD domain cache`（`entries` や `feeds_succeeded=2`）が出たら、`ledr-ui` の `View 3` 右下にある `NRD / Homograph Check` 入力欄へ `paypa1.com`（期待結果 `Not in NRD` と `Homograph: paypal`）、`google.com`（期待結果 `Not in NRD` と `No Homograph`）、および `(Get-Content -Encoding UTF8 (Join-Path $runDir "nrd-cache.txt") | Where-Object { $_ -and -not $_.StartsWith("#") } | Select-Object -First 5)` に出た実ドメイン 1 件（期待結果 `NRD (<=14d)`）を入力して **`Check`** を押し、期待どおりに判定されることを確認してください。
@@ -370,7 +375,7 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 
 ```powershell
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "nrd_hang.db") --nrd-cache (Join-Path $runDir "nrd-hang-cache.txt") --nrd-feed-url file://198.51.100.1/share/nrd.txt
+& (Join-Path $runDir "debug-bin\ledr-daemon.exe") --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "nrd_hang.db") --nrd-cache (Join-Path $runDir "nrd-hang-cache.txt") --nrd-feed-url file://198.51.100.1/share/nrd.txt
 ```
 
 次の手順で 3 秒停止予算と WAL トランケート先行完了を確認してください。
@@ -398,7 +403,7 @@ Get-Item (Join-Path $runDir "nrd_hang.db-wal") -ErrorAction SilentlyContinue | S
 
 ```powershell
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
+& (Join-Path $runDir "debug-bin\ledr-daemon.exe") --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
 ```
 
 ウィンドウ B で `ledr-daemon.exe` を `taskkill /F` で強制終了させ、BFE のフィルタ一覧と外部通信の復旧を確認してください。
@@ -417,17 +422,22 @@ Select-String -Path $afterKillFiltersXml -Pattern "LocalEDR"
 ## リソース消費と UI 完全終了の確認
 
 [implementation-plan.md](implementation-plan.md) のリソース基準（`E2E-PERF-01`）は、デバッグシンボルや未最適化コードによるメモリと CPU の膨張を除くため、必ず `--release` ビルドで計測してください。
-最初にワークスペースのリリースバイナリをビルドし、ウィンドウ A で `RUST_LOG=info` の `target\release\ledr-daemon.exe`（NRD キャッシュ読み込み付き）を起動します。
+最初にワークスペースのリリースバイナリをビルドして `$runDir\release-bin` へ複製（`Links = 1` 化）し、ウィンドウ A で `RUST_LOG=info` の `release-bin\ledr-daemon.exe`（NRD キャッシュ読み込み付き）を起動します。
 
 ```powershell
 # ビルド（任意ウィンドウ）
 cd e:\Documents\code\LocalEDR
 cargo build --release --locked
 
-# ウィンドウ A（管理者 PowerShell）で既存の debug デーモンを停止したうえで起動する
+# ウィンドウ A（管理者 PowerShell）で既存の debug デーモンを停止したうえでステージング（Links=1）して起動する
 $runDir = (Get-Content -Encoding UTF8 C:\Temp\ledr-e2e-latest.txt -Raw).Trim()
+$stageBinDir = Join-Path $runDir "release-bin"
+New-Item -ItemType Directory -Path $stageBinDir -Force | Out-Null
+foreach ($exeName in @("ledr-daemon.exe", "ledr-auth-helper.exe", "ledr-ui.exe", "ledr-sim.exe")) {
+    Copy-Item -LiteralPath (Join-Path "target\release" $exeName) -Destination (Join-Path $stageBinDir $exeName) -Force
+}
 $env:RUST_LOG = "info"
-.\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
+& (Join-Path $stageBinDir "ledr-daemon.exe") --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
 ```
 
 指定した `nrd-cache.txt` が未作成の場合、`ledr-daemon.exe` は空の NRD キャッシュで起動し、バックグラウンドで初回フィード取得を実行する。
@@ -435,7 +445,7 @@ $env:RUST_LOG = "info"
 
 ### 1. `ledr-ui` 閉鎖時のプロセス 0 件確認（`L-08`）
 
-ウィンドウ C で `.\target\release\ledr-ui.exe` を開いた状態で右上の閉じるボタンから終了し、直後にウィンドウ C で UI 本体と WebView2 子プロセスの残存がないことを確認してください。
+ウィンドウ C で `(Join-Path $runDir "release-bin\ledr-ui.exe")` を開いた状態で右上の閉じるボタンから終了し、直後にウィンドウ C で UI 本体と WebView2 子プロセスの残存がないことを確認してください。
 
 ```powershell
 Get-Process ledr-ui -ErrorAction SilentlyContinue
@@ -446,7 +456,7 @@ Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object
 
 ### 2. `ledr-daemon` 常駐メモリ（20 MB 以下）と定常 CPU 使用率（0.5% 未満）の計測
 
-ウィンドウ B で次の計測スクリプトを実行し、`target\release\ledr-daemon.exe` の定常アイドル時（および必要に応じて別ウィンドウでの `cargo build` 負荷中）の Working Set と平均 CPU 使用率を計測してください。
+ウィンドウ B で次の計測スクリプトを実行し、ステージングした `release-bin\ledr-daemon.exe`（`--release` ビルド）の定常アイドル時（および必要に応じて別ウィンドウでの `cargo build` 負荷中）の Working Set と平均 CPU 使用率を計測してください。
 標準の目標確認では `$sampleSec = 60`（厳密な計画基準に沿うアイドル計測では `600` 秒）として計測できます。
 
 ```powershell

@@ -288,6 +288,12 @@ impl DaemonEngine {
             select_idle_periodic_sweeps: AtomicU64::new(0),
             #[cfg(test)]
             select_idle_periodic_sweep_removals: AtomicU64::new(0),
+            #[cfg(test)]
+            mem_maintenance_interval_ms: AtomicU64::new(60_000),
+            #[cfg(test)]
+            tier2c_mem_maintenance_runs: AtomicU64::new(0),
+            #[cfg(test)]
+            select_idle_mem_maintenance_runs: AtomicU64::new(0),
             shutdown_initiated: Arc::new(AtomicBool::new(false)),
             shutdown_drain_cutoff: Arc::new(AtomicBool::new(false)),
             shutdown_cutoff_notify: Arc::new(tokio::sync::Notify::new()),

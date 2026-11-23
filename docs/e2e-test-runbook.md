@@ -83,7 +83,7 @@ Phase 0（基盤構築と共通型凍結）、Phase 1（プロセス系譜と通
    なお、`--dev-bypass-auth` 時の Named Pipe DACL は起動元アカウントの現在ユーザー SID のみに接続を限定し（`IU` を含めず、`LocalSystem` `S-1-5-18` では `SY` と `BA` のみへフェイルクローズする）、同一ユーザーでの UAC トークン分割昇格を前提とする。
    あわせて開発ホスト PC 上の未知常駐アプリの誤凍結を防ぐため、第 3 章から第 5 章までは `--outbound-mode preemptive-only --resume-suspended-on-shutdown` を常に付与する。
 4. **Debug と Release の混在時は `SEC_0003` パイプサーバ照合に注意する**：`ledr-bridge-nm.exe` は接続先の Named Pipe サーバが `C:\Program Files\LocalEDR\ledr-daemon.exe` または（Debug ビルド時か同パス未存在時に限り）ブリッジと同一ディレクトリの兄弟 `ledr-daemon.exe` であることを検証する。
-   そのため `target\debug\ledr-bridge-nm.exe` を登録している間は `target\debug\ledr-daemon.exe` と組み合わせ、第 5 章で `target\release\ledr-daemon.exe` へ切り替える前に Chrome 拡張の操作をすべて終えて検証用 Chrome を閉じる。
+   そのため `$runDir\debug-bin\ledr-bridge-nm.exe` を登録している間は同一ディレクトリの `$runDir\debug-bin\ledr-daemon.exe`（ハードリンクなし・`Links = 1` でステージングしたもの）と組み合わせ、第 5 章で `$runDir\release-bin\ledr-daemon.exe` へ切り替える前に Chrome 拡張の操作をすべて終えて検証用 Chrome を閉じる。
    なお、`C:\Program Files\LocalEDR\ledr-daemon.exe` が既に存在する PC では兄弟パスへのフォールバックが無効になるため、本番導入済みのバイナリを退避するか検証専用 VM で実施してください。
 5. **Windows 通知設定（`ToastEnabled`）をオンにする**：OS 側で通知がオフ（`ToastEnabled = 0`）の場合、`ledr-ui.exe --notify` は JSON に `"status":"suppressed_by_os_settings"` を返してバナーを表示しない。
    目視確認前に Windows の「設定」から「システム」の「通知」をオンにしてください。
@@ -211,7 +211,7 @@ if ($LASTEXITCODE -ne 0) { throw "Release ビルドに失敗しました (exit c
 ```
 
 `BfeStatus` が `Running` であり、両方の `cargo build` が終了コード `0` で完了することを確認してください。
-`target\debug\` と `target\release\` の双方に `ledr-daemon.exe`、`ledr-ui.exe`、`ledr-sim.exe`、`ledr-bridge-nm.exe` が生成されます。
+`target\debug\` と `target\release\` の双方に `ledr-daemon.exe`、`ledr-auth-helper.exe`、`ledr-ui.exe`、`ledr-sim.exe`、`ledr-bridge-nm.exe` が生成されます。
 
 ### PREP-02：作業フォルダ、ダミーカナリア、ローカル配信資産の作成（ウィンドウ B）
 
@@ -226,8 +226,11 @@ $adminDir = Join-Path $env:ProgramData "LocalEDR-e2e-admin"
 $repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
 Set-Location $repoRoot
 $runDir = "C:\Temp\ledr-e2e-" + (Get-Date -Format "yyyyMMdd-HHmmss")
-foreach ($sub in @("canary_dir", "site\download", "chrome-profile", "backup")) {
+foreach ($sub in @("canary_dir", "site\download", "chrome-profile", "backup", "debug-bin")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $runDir $sub) | Out-Null
+}
+foreach ($exeName in @("ledr-daemon.exe", "ledr-auth-helper.exe", "ledr-ui.exe", "ledr-bridge-nm.exe", "ledr-sim.exe")) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot "target\debug\$exeName") -Destination (Join-Path $runDir "debug-bin\$exeName") -Force
 }
 [System.IO.File]::WriteAllText((Join-Path $stateDir "latest.txt"), $runDir, [System.Text.UTF8Encoding]::new($false))
 
@@ -297,19 +300,20 @@ if (Test-Path $userManifestDir) {
     Copy-Item -Recurse -Force -ErrorAction Stop $userManifestDir (Join-Path $runDir "backup\user-native-messaging")
 }
 
-.\target\debug\ledr-ui.exe --register-uri
+$debugUiExe = Join-Path $runDir "debug-bin\ledr-ui.exe"
+& $debugUiExe --register-uri
 if ($LASTEXITCODE -ne 0) { throw "--register-uri に失敗しました。" }
 
 Get-ItemProperty "HKCU:\Software\Classes\ledr\shell\open\command"
 Get-ItemProperty "HKCU:\Software\Classes\AppUserModelId\LocalEDR.AlertUI"
 Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications" -Name ToastEnabled -ErrorAction SilentlyContinue
-.\target\debug\ledr-ui.exe --notify test-alert-001
+& $debugUiExe --notify test-alert-001
 ```
 
 次の 3 点を満たせば `PREP-03` は合格です。
 
 1. `--register-uri` の標準出力に `"status":"registered"` または `"already_registered"` が表示される。
-2. `ledr` コマンド値に `$repoRoot\target\debug\ledr-ui.exe` が登録され、`LocalEDR.AlertUI` の `DisplayName` が `LocalEDR` である。
+2. `ledr` コマンド値に `$runDir\debug-bin\ledr-ui.exe` が登録され、`LocalEDR.AlertUI` の `DisplayName` が `LocalEDR` である。
 3. `--notify test-alert-001` が `"status":"dispatched"` を返し、画面右下にトースト通知が表示される（`suppressed_by_os_settings` が出た場合は Windows の通知設定をオンにして再実行してください）。
 
 参考として、`--notify test-alert-001` の通知バナーをクリックすると `ledr://alert/test-alert-001` 経由で `ledr-ui.exe` が開きます（デーモン未起動中は `Daemon Offline` バナー付きで View 1 が開きます）。
@@ -317,7 +321,7 @@ Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotificati
 
 ### PREP-04：Debug 版 `ledr-daemon.exe` の起動と初期化ログ確認（ウィンドウ A）
 
-ルート 1 またはルート 2 を実施する場合は、ウィンドウ A（管理者 64 ビット）で外部通信や NRD 取得のノイズを切り離した状態の Debug デーモンを起動してください。
+ルート 1 またはルート 2 を実施する場合は、ウィンドウ A（管理者 64 ビット）で外部通信や NRD 取得のノイズを切り離した状態の Debug デーモンを `PREP-02` でステージングした `$runDir\debug-bin`（`ledr-auth-helper.exe` のハードリンク数 `nNumberOfLinks == 1` および兄弟バイナリ整合を満たす独立配置）から起動してください。
 ルート 3（`FU-E2E-02` 単独）を実施する場合は本章の `PREP-04` を飛ばして第 4 章へ進んで構いません。
 
 ```powershell
@@ -330,7 +334,8 @@ $repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).T
 $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
+$debugDaemonExe = Join-Path $runDir "debug-bin\ledr-daemon.exe"
+& $debugDaemonExe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
 ```
 
 標準出力に次の 7 つのログが順番に出力されれば初期化は完了です。
@@ -360,7 +365,8 @@ Track A はウィンドウ A で `PREP-04` の Debug デーモンが稼働して
 # ウィンドウ C（64 ビット版通常ユーザー PowerShell）
 $stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
 $repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
-Start-Process -FilePath (Join-Path $repoRoot "target\debug\ledr-ui.exe") -WorkingDirectory $repoRoot
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+Start-Process -FilePath (Join-Path $runDir "debug-bin\ledr-ui.exe") -WorkingDirectory $repoRoot
 ```
 
 `ledr-ui` は画面遷移やタブ切替だけでは最新データを再取得しないため、各テストケースを実行したあと毎回 `ledr-ui` 上部バーの `Refresh` ボタンを押して確認してください。
@@ -920,7 +926,8 @@ $repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).T
 $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
+$debugDaemonExe = Join-Path $runDir "debug-bin\ledr-daemon.exe"
+& $debugDaemonExe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "e2e.db") --nrd-cache (Join-Path $runDir "nrd-cache.txt")
 ```
 
 ウィンドウ A に `refreshed daily NRD domain cache`（`feeds_succeeded >= 1` かつ `entries > 0`）が出力されたら、保存されたキャッシュを用いて `ledr-ui` の `View 3` 右下にある `NRD / Homograph Check` 欄へ次の 3 つを順に入力し、`Check` を押してドメイン診断を確認してください。
@@ -946,7 +953,8 @@ $repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).T
 $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "ledr_store=debug,ledr_daemon=info"
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "nrd_hang.db") --nrd-cache (Join-Path $runDir "nrd-hang-cache.txt") --nrd-feed-url file://198.51.100.1/share/nrd.txt
+$debugDaemonExe = Join-Path $runDir "debug-bin\ledr-daemon.exe"
+& $debugDaemonExe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "nrd_hang.db") --nrd-cache (Join-Path $runDir "nrd-hang-cache.txt") --nrd-feed-url file://198.51.100.1/share/nrd.txt
 ```
 
 次の 5 ステップで 3 秒停止予算と WAL トランケート先行完了を確認してください。
@@ -989,7 +997,8 @@ $repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).T
 $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
+$debugDaemonExe = Join-Path $runDir "debug-bin\ledr-daemon.exe"
+& $debugDaemonExe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "e2e.db")
 ```
 
 ログに初期化完了が出たら、ウィンドウ B で `ledr-daemon.exe` を `taskkill /F` で強制終了させ、BFE フィルタの自動消去と外部通信の復旧を確認してください。
@@ -1051,7 +1060,8 @@ $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).T
 Set-Location $repoRoot
 $nrdUrl = ([Uri](Join-Path $runDir "nrd-test-feed.txt")).AbsoluteUri
 $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
-.\target\debug\ledr-daemon.exe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "ledr-p4.db") --nrd-feed-url $nrdUrl --nrd-cache (Join-Path $runDir "nrd-test-cache.txt")
+$debugDaemonExe = Join-Path $runDir "debug-bin\ledr-daemon.exe"
+& $debugDaemonExe --foreground --dev-bypass-auth --outbound-mode preemptive-only --resume-suspended-on-shutdown --db (Join-Path $runDir "ledr-p4.db") --nrd-feed-url $nrdUrl --nrd-cache (Join-Path $runDir "nrd-test-cache.txt")
 ```
 
 起動ログに初期化完了と `nrd-test-feed.txt` の読み込み（`entries=1`）が出たら次に進みます。
@@ -1065,10 +1075,13 @@ $env:RUST_LOG = "info,ledr_sensor_win=debug,ledr_store=debug"
 # ウィンドウ C（64 ビット版通常ユーザー PowerShell）
 $stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
 $repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+$debugBridgeExe = Join-Path $runDir "debug-bin\ledr-bridge-nm.exe"
+$debugUiExe = Join-Path $runDir "debug-bin\ledr-ui.exe"
 Set-Location $repoRoot
-.\target\debug\ledr-bridge-nm.exe setup --scope user --browsers chrome,edge --bridge-exe "$repoRoot\target\debug\ledr-bridge-nm.exe" --ui-exe "$repoRoot\target\debug\ledr-ui.exe"
+& $debugBridgeExe setup --scope user --browsers chrome,edge --bridge-exe $debugBridgeExe --ui-exe $debugUiExe
 if ($LASTEXITCODE -ne 0) { throw "ledr-bridge-nm setup --scope user に失敗しました。" }
-.\target\debug\ledr-bridge-nm.exe status --scope all
+& $debugBridgeExe status --scope all
 if ($LASTEXITCODE -ne 0) { throw "ledr-bridge-nm status に失敗しました。" }
 ```
 
@@ -1121,12 +1134,15 @@ foreach ($item in $hklmBackups) {
 if (Test-Path "C:\ProgramData\LocalEDR\native-messaging") {
     Copy-Item -Recurse -Force -ErrorAction Stop "C:\ProgramData\LocalEDR\native-messaging" (Join-Path $adminBackupDir "machine-native-messaging")
 }
-.\target\debug\ledr-bridge-nm.exe setup --scope machine --browsers chrome,edge --bridge-exe "$repoRoot\target\debug\ledr-bridge-nm.exe" --ui-exe "$repoRoot\target\debug\ledr-ui.exe"
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+$debugBridgeExe = Join-Path $runDir "debug-bin\ledr-bridge-nm.exe"
+$debugUiExe = Join-Path $runDir "debug-bin\ledr-ui.exe"
+& $debugBridgeExe setup --scope machine --browsers chrome,edge --bridge-exe $debugBridgeExe --ui-exe $debugUiExe
 if ($LASTEXITCODE -ne 0) { throw "ledr-bridge-nm setup --scope machine に失敗しました。" }
-.\target\debug\ledr-bridge-nm.exe status --scope all
+& $debugBridgeExe status --scope all
 ```
 
-次に、ウィンドウ C で `ledr-ui.exe` を開き（未起動なら `Start-Process .\target\debug\ledr-ui.exe`、起動済みなら `Refresh`）、`` `View 3: 防御ポリシー・カナリア・ブラウザシールド` `` 右下のブラウザシールド欄を確認してください。
+次に、ウィンドウ C で `ledr-ui.exe` を開き（未起動なら `Start-Process (Join-Path $runDir "debug-bin\ledr-ui.exe")`、起動済みなら `Refresh`）、`` `View 3: 防御ポリシー・カナリア・ブラウザシールド` `` 右下のブラウザシールド欄を確認してください。
 
 - `Daemon IPC` が `Connected` を表示している。
 - `Native Messaging` が登録スコープ（`HKCU`、`HKLM`、または `HKCU+HKLM`）と登録ブラウザ（`Chrome`、`Edge`）を表示している。
@@ -1379,21 +1395,21 @@ $dbPath = Join-Path $runDir "perf.db"
 # 1. 600 秒アイドル計測
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\profile_daemon_memory.ps1 `
     -Pid $daemonProc.Id -DbPath $dbPath -DaemonExePath $daemonProc.Path `
-    -DurationSec 600 -OutDir (Join-Path $runDir "perf_idle")
+    -Mode idle -DurationSec 600 -OutDir (Join-Path $runDir "perf_idle")
 
 # 2. 60 秒高負荷計測（ブラウザ複数タブ閲覧と別ウィンドウでの cargo build --locked を併用）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\profile_daemon_memory.ps1 `
     -Pid $daemonProc.Id -DbPath $dbPath -DaemonExePath $daemonProc.Path `
-    -DurationSec 60 -OutDir (Join-Path $runDir "perf_load")
+    -Mode load -DurationSec 60 -OutDir (Join-Path $runDir "perf_load")
 ```
 
 `profile_daemon_memory.ps1` は 200 ms 間隔の `GetProcessMemoryInfo` と `GetProcessTimes` ポーリングに加え、10 秒後、60 秒後、終了直前、ピーク `+2.0 MB` 更新時、および `+5.0 MB` 急増時に `QueryWorkingSetEx` で `Shared == 0/1` の 4 KiB ページ内訳スナップショットを保存し、`timeseries.csv`、`memory-profile-summary.json`、および `snapshots/*.json` を出力します（`-AnalyzePeOnly` を指定すると PE 静的および遅延インポートの推移的依存解析のみを単体実行できます）。
 
-合格判定は `memory-profile-summary.json` の以下の全条件で行います（1 件の `nrd-test-cache.txt` で計測した場合は「ルート 3 軽量参考値」または「オフライン参考値」として区分記録します）。
+合格判定は `memory-profile-summary.json`（`track_gates.e2e_perf_01_mode_pass -eq $true`、欠測時は `$null` で判定不能扱い）の以下の全条件で行います（1 件の `nrd-test-cache.txt` で計測した場合は「ルート 3 軽量参考値」または「オフライン参考値」として区分記録します）。
 
-- **600 秒アイドル必須基準**：`steady_window_60s_to_end.median_private_ws_mb <= 20.0`、`latest_private_ws_mb <= 20.0`、`AvgCpuPercent < 0.5%`、`spikes_ge_100mb_count == 0`、および定常後半（`330..600s`）と前半（`60..330s`）の `WorkingSet64` 中央値差 `<= +1.0 MB`。
-- **参考指標（`WorkingSet64` OS 共有ページ下限）**：Windows 11 環境では OS 共有ページ（`Shared == 1`）のみで約 `14.5 MB`（Stage 3 実測 `14.51–14.70 MB`）を占有するため、`WorkingSet64` の絶対値自体は参考値として記録し、リークおよび異常スパイクがないことを後半前半中央値差と 100 MB 未満維持で判定する（`決定記録 L-24`）。
-- **60 秒高負荷基準**：ブラウザ複数タブ閲覧と `cargo build --locked` の併用負荷下で `interval_peak_working_set_mb < 64.34`、`spikes_ge_100mb_count == 0`、かつ `AvgCpuPercent < 1.0%` であること（Stage 1 未改変ベースラインの 60 秒高負荷実測は `0.5475%`、Stage 3 実測は `0.5952%`）。
+- **600 秒アイドル必須基準（`-Mode idle`）**：`steady_window_60s_to_end.median_private_ws_mb <= 20.0`、`latest_private_ws_mb <= 20.0`、`AvgCpuPercent < 0.5%`、`spikes_ge_100mb_sampled_count == 0` かつ `os_peak_crossed_100mb_during_interval == false`、および定常後半（`330..600s`）と前半（`60..330s`）の `WorkingSet64` / `PrivateWorkingSetSize` 中央値差 `<= +1.0 MB`。
+- **参考指標（`WorkingSet64` OS 共有ページ下限）**：Windows 11 環境では OS 共有ページ（`Shared == 1`）のみで約 `14.5 MB`（Stage 3 実測 `14.51–14.70 MB`）を占有するため、`WorkingSet64` の絶対値自体は参考値（`track_gates.legacy_reference_ws_le_20mb`）として記録し、リークおよび異常スパイクがないことを後半前半中央値差と 100 MB 未満維持で判定する（`決定記録 L-24`）。
+- **60 秒高負荷基準（`-Mode load`）**：ブラウザ複数タブ閲覧と `cargo build --locked` の併用負荷下で `interval_peak_working_set_mb < 64.34`、`spikes_ge_100mb_sampled_count == 0` かつ `os_peak_crossed_100mb_during_interval == false`、かつ `AvgCpuPercent < 1.0%` であること（Stage 1 未改変ベースラインの 60 秒高負荷実測は `0.5475%`、Stage 3 実測は `0.5952%`）。
 
 高負荷計測の直後（または併用中）に次のコマンドでダミー `Cookies` アクセスを走らせ、高優先度レーンのトースト応答が 1 秒以内に返ることを確認したあと、凍結したプロセスを終了してください。
 負荷計測の出力をファイルへ保存する場合は、後続の `E2E-OPT-01` で上書きされないよう `perf_load_trackc.txt` のようにトラック名入りのファイル名で分けて保存してください。
@@ -1426,7 +1442,12 @@ $repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).T
 $runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
 Set-Location $repoRoot
 $env:RUST_LOG = "info,ledr_daemon=debug"
-.\target\release\ledr-daemon.exe --foreground --dev-bypass-auth --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "enforce.db")
+$stageBinDir = Join-Path $runDir "release-bin"
+New-Item -ItemType Directory -Path $stageBinDir -Force | Out-Null
+foreach ($exeName in @("ledr-daemon.exe", "ledr-auth-helper.exe", "ledr-ui.exe", "ledr-bridge-nm.exe", "ledr-sim.exe")) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot "target\release\$exeName") -Destination (Join-Path $stageBinDir $exeName) -Force
+}
+& (Join-Path $stageBinDir "ledr-daemon.exe") --foreground --dev-bypass-auth --resume-suspended-on-shutdown --disable-nrd-refresh --db (Join-Path $runDir "enforce.db")
 ```
 
 ウィンドウ B で一般パス（`Downloads` や `Temp` ではない `%LOCALAPPDATA%\LocalEDR-e2e-probe-<GUID>`）の排他ディレクトリを新規作成して `ledr-sim.exe` をコピーし、外部 TCP を実行して初発通信時の `NtSuspendProcess` と動的 WFP Block を確認してください。
@@ -1450,8 +1471,8 @@ Start-Sleep -Seconds 2
 ```powershell
 # ウィンドウ C（通常ユーザー PowerShell）
 $stateDir = Join-Path $env:ProgramData "LocalEDR-e2e-state"
-$repoRoot = (Get-Content -Encoding UTF8 (Join-Path $stateDir "repo.txt") -Raw).Trim()
-Start-Process -FilePath (Join-Path $repoRoot "target\release\ledr-ui.exe") -WorkingDirectory $repoRoot
+$runDir = (Get-Content -Encoding UTF8 (Join-Path $stateDir "latest.txt") -Raw).Trim()
+Start-Process -FilePath (Join-Path $runDir "release-bin\ledr-ui.exe") -WorkingDirectory (Join-Path $runDir "release-bin")
 ```
 
 `dns-tcp` の TCP 接続自体は 100 ms 程度で完了して終了するため、非同期 ETW イベント配送と `NtSuspendProcess` の競合を避ける目的で `--hold-ms 120000` を指定し、ソケット切断後もプロセスを待機させて凍結状態を確認します。
@@ -1495,6 +1516,7 @@ icacls $pfDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" /grant:r "*S-1-5
 if ($LASTEXITCODE -ne 0) { throw "ACL 設定に失敗しました。" }
 
 Copy-Item "target\release\ledr-daemon.exe" $pfDir -Force
+Copy-Item "target\release\ledr-auth-helper.exe" $pfDir -Force
 Copy-Item "target\release\ledr-ui.exe" $pfDir -Force
 Copy-Item "target\release\ledr-bridge-nm.exe" $pfDir -Force
 

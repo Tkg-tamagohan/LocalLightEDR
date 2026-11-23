@@ -2,6 +2,7 @@
 //! [`EarlyPruner`], [`SigmaEngine`], and [`LedrStore`].
 
 mod alerts;
+mod auth_worker;
 mod binary_inspector;
 mod config;
 mod dns_history;
@@ -332,6 +333,11 @@ impl DaemonEngine {
         &self.config
     }
 
+    /// Returns the active [`BinaryInspector`] implementation.
+    pub fn inspector(&self) -> &Arc<dyn BinaryInspector> {
+        &self.inspector
+    }
+
     #[doc(hidden)]
     pub fn set_fail_record_alert_for_test(&self, fail: bool) {
         self.fail_record_alert_for_test
@@ -433,9 +439,19 @@ impl DaemonEngine {
             .inspect_cancellable(exe_path, cancel_flag, fast_skip)
     }
 
+    /// Returns `true` if `pid` belongs to the active out-of-process Authenticode helper
+    /// (`FU-E2E-03` Track 2 self-PID recursion guard).
+    pub fn is_helper_pid(&self, pid: u32) -> bool {
+        self.inspector.is_helper_pid(pid)
+    }
+
     /// Returns `true` iff `(pid, exe_path)` matches the running daemon's own PID and normalized
-    /// executable path (fail-closed when `self_exe_normalized` is `None` or `exe_path` is empty).
+    /// executable path (or its active Authenticode helper PID, fail-closed when
+    /// `self_exe_normalized` is `None` or `exe_path` is empty).
     pub(super) fn is_self_process(&self, pid: u32, exe_path: &str) -> bool {
+        if self.inspector.is_helper_pid(pid) {
+            return true;
+        }
         if pid != self.self_pid || exe_path.trim().is_empty() {
             return false;
         }

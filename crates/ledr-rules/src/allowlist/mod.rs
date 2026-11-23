@@ -1,8 +1,9 @@
-//! Two-tier binary allowlist evaluation (`決定記録 L-04`), streaming SHA-256 hashing,
-//! and Windows Authenticode signature verification (`WinVerifyTrust` + `CryptQueryObject`).
+//! Two-tier binary allowlist evaluation (`決定記録 L-04`) and streaming SHA-256 hashing.
+//!
+//! Windows Authenticode FFI (`wintrust.dll` / `crypt32.dll`) is intentionally isolated in the
+//! out-of-process `ledr-auth-helper` crate (`FU-E2E-03` Track 2, Option 2-A) so `ledr-rules`
+//! and `ledr-daemon` production builds never link `wintrust.dll` or `crypt32.dll`.
 
-mod authenticode;
-mod ffi;
 mod matcher;
 
 use std::fs::File;
@@ -14,9 +15,6 @@ use ledr_proto::AuthenticodeInfo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[cfg(test)]
-pub(crate) use authenticode::LOCAL_CERT_CHAIN_FLAGS;
-pub use authenticode::inspect_authenticode;
 pub use matcher::{is_allowed_by_rules, matches_path_pattern, signer_subject_matches};
 
 const SHA256_BUF_LEN: usize = 65_536;
@@ -30,13 +28,26 @@ pub struct BinaryIdentity {
 }
 
 impl BinaryIdentity {
-    /// Inspects `path` on disk, collecting streaming SHA-256 and Authenticode metadata gracefully.
+    /// Inspects `path` on disk for streaming SHA-256 only (`authenticode: None`), without
+    /// loading `wintrust.dll` or `crypt32.dll` (`FU-E2E-03` Track 2).
+    pub fn from_path_sha256_only(path: impl AsRef<Path>) -> Self {
+        let p = path.as_ref();
+        Self {
+            exe_path: p.to_string_lossy().into_owned(),
+            sha256: compute_file_sha256_hex(p).ok(),
+            authenticode: None,
+        }
+    }
+
+    /// Inspects `path` on disk in tests using `ledr-auth-helper`'s in-process Authenticode
+    /// verifier (`dev-dependencies` only; never compiled into production `ledr-rules`).
+    #[cfg(test)]
     pub fn from_path(path: impl AsRef<Path>) -> Self {
         let p = path.as_ref();
         Self {
             exe_path: p.to_string_lossy().into_owned(),
             sha256: compute_file_sha256_hex(p).ok(),
-            authenticode: inspect_authenticode(p),
+            authenticode: ledr_auth_helper::inspect_authenticode(p),
         }
     }
 }

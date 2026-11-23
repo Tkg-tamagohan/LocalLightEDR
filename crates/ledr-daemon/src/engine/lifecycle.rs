@@ -56,6 +56,9 @@ impl DaemonEngine {
         defense: Arc<dyn ActiveDefenseController>,
         notifier: Arc<dyn NotificationDispatcher>,
     ) -> Arc<Self> {
+        let inspector = Arc::new(WindowsBinaryInspector::with_auth_helper_sha256(
+            config.auth_helper_sha256.clone(),
+        ));
         Self::start_with_dependencies(
             store,
             sigma,
@@ -63,7 +66,7 @@ impl DaemonEngine {
             config,
             defense,
             notifier,
-            Arc::new(WindowsBinaryInspector::new()),
+            inspector,
         )
     }
 
@@ -482,6 +485,7 @@ impl DaemonEngine {
                 Err(_) => {
                     self.shutdown_drain_cutoff.store(true, Ordering::Release);
                     self.shutdown_cutoff_notify.notify_waiters();
+                    self.inspector.shutdown();
                     h.abort();
                     let _ = tokio::time::timeout(Duration::from_millis(50), &mut h).await;
                     tracing::warn!(
@@ -605,6 +609,8 @@ impl DaemonEngine {
         // Shutdown the dedicated MOTW I/O worker pool AFTER pipeline drain + WAL checkpoint,
         // cancelling active file hashes and detaching wedged raw OS worker threads on timeout.
         self.motw_pool.shutdown_and_join(deadline).await;
+        // Ensure any remaining out-of-process Authenticode helper is terminated cleanly on shutdown.
+        self.inspector.shutdown();
 
         if let Some(err) = drain_err.or(gate_err) {
             return Err(err);

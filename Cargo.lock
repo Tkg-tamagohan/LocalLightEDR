@@ -1705,6 +1705,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "ledr-auth-helper"
+version = "0.1.0"
+dependencies = [
+ "ledr-proto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ledr-bridge-nm"
 version = "0.1.0"
 dependencies = [
@@ -1720,6 +1729,7 @@ name = "ledr-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ledr-auth-helper",
  "ledr-proto",
  "ledr-rules",
  "ledr-sensor-win",
@@ -1748,6 +1758,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "hex",
+ "ledr-auth-helper",
  "ledr-proto",
  "regex",
  "serde",

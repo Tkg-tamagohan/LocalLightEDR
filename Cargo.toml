@@ -5,6 +5,7 @@ members = [
     "crates/ledr-sensor-win",
     "crates/ledr-sim",
     "crates/ledr-rules",
+    "crates/ledr-auth-helper",
     "crates/ledr-daemon",
     "crates/ledr-store",
     "crates/ledr-bridge-nm",
@@ -23,6 +24,7 @@ license = "MIT OR Apache-2.0"
 ledr-proto = { path = "crates/ledr-proto" }
 ledr-sensor-win = { path = "crates/ledr-sensor-win" }
 ledr-rules = { path = "crates/ledr-rules" }
+ledr-auth-helper = { path = "crates/ledr-auth-helper" }
 ledr-store = { path = "crates/ledr-store" }
 
 serde = { version = "1.0", features = ["derive"] }
@@ -45,6 +47,7 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Pipes",

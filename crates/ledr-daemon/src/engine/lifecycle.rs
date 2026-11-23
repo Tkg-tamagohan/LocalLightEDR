@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ use super::motw::{
     BROWSER_EVENT_DEDUP_CAPACITY, BROWSER_EVENT_DEDUP_WINDOW_MS, MOTW_IO_QUEUE_CAPACITY,
     MOTW_STAGE2_CACHE_CAPACITY, MOTW_STAGE2_CACHE_TTL_SECS,
 };
+use super::pipeline::WorkerExit;
 use super::wfp_drops::{AppWfpAlertDedup, WfpDropDedupCache, WfpDropOverflowQueue};
 use super::{
     current_unix_ms, BinaryInspector, DaemonConfig, DaemonEngine, LiveProcessInspector,
@@ -130,6 +131,7 @@ impl DaemonEngine {
         live_process_inspector: Arc<dyn LiveProcessInspector>,
         motw_inspector: Arc<dyn MotwInspector>,
     ) -> Arc<Self> {
+        store.clear_shutdown_flag();
         let initial_has_downloads = store.has_any_download_origins().unwrap_or(false);
         let prior_running_candidates = store.list_running_process_instance_ids().unwrap_or_default();
         let (sender, receiver) = TwoLaneChannel::with_capacities(
@@ -283,6 +285,10 @@ impl DaemonEngine {
             select_idle_periodic_sweeps: AtomicU64::new(0),
             #[cfg(test)]
             select_idle_periodic_sweep_removals: AtomicU64::new(0),
+            shutdown_initiated: Arc::new(AtomicBool::new(false)),
+            shutdown_drain_cutoff: Arc::new(AtomicBool::new(false)),
+            shutdown_cutoff_notify: Arc::new(tokio::sync::Notify::new()),
+            store_write_gate: Arc::new(super::StoreWriteGate::default()),
             worker_handle: tokio::sync::Mutex::new(None),
         });
 
@@ -350,7 +356,7 @@ impl DaemonEngine {
             );
             return Ok(0);
         }
-        self.store.flush_batch()?;
+        let _ = self.try_store_write(|s| s.flush_batch()).transpose()?;
         {
             let table = self
                 .process_table
@@ -412,7 +418,10 @@ impl DaemonEngine {
     pub fn expire_overdue_alerts(&self, now_ms: i64) -> Result<usize, StoreError> {
         let timeout_ms = i64::try_from(self.config.alert_timeout_ms).unwrap_or(i64::MAX);
         let cutoff_ms = now_ms.saturating_sub(timeout_ms);
-        self.store.expire_pending_alerts(cutoff_ms)
+        match self.try_store_write(|s| s.expire_pending_alerts(cutoff_ms)) {
+            Some(res) => res,
+            None => Ok(0),
+        }
     }
 
     /// Collects unexited descendant [`ProcessIdentity`] values for `root_ident` by combining
@@ -447,6 +456,7 @@ impl DaemonEngine {
     pub async fn shutdown_and_flush(&self) -> Result<(), anyhow::Error> {
         let total_budget = Duration::from_millis(self.config.shutdown_flush_timeout_ms.max(1));
         let deadline = tokio::time::Instant::now() + total_budget;
+        self.shutdown_initiated.store(true, Ordering::Release);
         self.nrd_cancel.cancel();
         self.store.request_shutdown();
         self.sender.close();
@@ -456,13 +466,10 @@ impl DaemonEngine {
             guard.take()
         };
 
-        let mut worker_checkpointed = false;
         let mut drain_err: Option<anyhow::Error> = None;
-        if let Some(h) = handle {
-            match tokio::time::timeout_at(deadline, h).await {
-                Ok(Ok(Ok(()))) => {
-                    worker_checkpointed = true;
-                }
+        if let Some(mut h) = handle {
+            match tokio::time::timeout_at(deadline, &mut h).await {
+                Ok(Ok(Ok(WorkerExit::Completed | WorkerExit::DrainTruncated))) => {}
                 Ok(Ok(Err(store_err))) => {
                     drain_err = Some(anyhow::Error::new(store_err));
                 }
@@ -473,9 +480,13 @@ impl DaemonEngine {
                     ));
                 }
                 Err(_) => {
+                    self.shutdown_drain_cutoff.store(true, Ordering::Release);
+                    self.shutdown_cutoff_notify.notify_waiters();
+                    h.abort();
+                    let _ = tokio::time::timeout(Duration::from_millis(50), &mut h).await;
                     tracing::warn!(
                         timeout_ms = self.config.shutdown_flush_timeout_ms,
-                        "daemon pipeline drain exceeded shutdown flush timeout; forcing best-effort checkpoint"
+                        "daemon pipeline drain exceeded shutdown flush timeout; aborted worker and forcing best-effort checkpoint"
                     );
                     drain_err = Some(anyhow::anyhow!(
                         "daemon pipeline drain exceeded {} ms shutdown flush timeout",
@@ -485,17 +496,70 @@ impl DaemonEngine {
             }
         }
 
-        let mut needs_checkpoint = !worker_checkpointed;
-        if self.config.resume_suspended_on_shutdown
-            && self.resume_unresolved_suspended_processes_on_shutdown(deadline)
-        {
-            needs_checkpoint = true;
+        // Prevent any detached/late path from issuing new process suspensions before or after
+        // best-effort shutdown resume runs (`FU-E2E-05`).
+        self.shutdown_drain_cutoff.store(true, Ordering::Release);
+        self.shutdown_cutoff_notify.notify_waiters();
+
+        if self.config.resume_suspended_on_shutdown {
+            let _ = self.resume_unresolved_suspended_processes_on_shutdown(deadline);
         }
 
-        // Prioritize WAL truncation BEFORE waiting on any remaining NRD refresh thread so a slow
-        // or wedged NRD thread can never delay or starve SQLite checkpointing (`AUTO-10`, `R-11`, `ANALYSIS_0003`).
-        if needs_checkpoint {
-            self.store.checkpoint_truncate()?;
+        // Atomically close engine-initiated SQLite writes, drain any already-admitted multi-step
+        // operations (alerts/policy rollbacks, per-batch TTL purges), and run final WAL truncation
+        // strictly BEFORE waiting on any remaining NRD refresh thread (`AUTO-10`, `R-11`, `FU-E2E-05`).
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let cp_reserve = Duration::from_millis(200).min(remaining / 3);
+        let gate_budget = remaining
+            .saturating_sub(cp_reserve)
+            .max(Duration::from_millis(50));
+        let mut gate_err: Option<anyhow::Error> = None;
+        let gate_idle = self
+            .store_write_gate
+            .close_and_wait_idle(tokio::time::Instant::now() + gate_budget)
+            .await;
+        if !gate_idle {
+            tracing::warn!(
+                "timed out waiting for in-flight store write operations before WAL checkpoint"
+            );
+            gate_err = Some(anyhow::anyhow!(
+                "timed out waiting for in-flight store write operations before WAL checkpoint"
+            ));
+        }
+        let sql_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sql_budget = sql_remaining
+            .max(Duration::from_millis(50))
+            .min(Duration::from_millis(250));
+        let sql_idle = self
+            .store_write_gate
+            .seal_and_wait_sql_idle(tokio::time::Instant::now() + sql_budget)
+            .await;
+        if !sql_idle {
+            tracing::warn!(
+                "timed out waiting for active SQLite mutation to finish before WAL checkpoint"
+            );
+            if gate_err.is_none() {
+                gate_err = Some(anyhow::anyhow!(
+                    "timed out waiting for active SQLite mutation to finish before WAL checkpoint"
+                ));
+            }
+        }
+        let cp_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let cp_budget = cp_remaining
+            .max(Duration::from_millis(100))
+            .min(Duration::from_millis(500));
+        let checkpoint_completed = self
+            .store
+            .checkpoint_truncate_with_deadline(std::time::Instant::now() + cp_budget)?;
+        if !checkpoint_completed {
+            tracing::warn!(
+                "WAL checkpoint truncation did not complete within shutdown budget"
+            );
+            if gate_err.is_none() {
+                gate_err = Some(anyhow::anyhow!(
+                    "WAL checkpoint truncation did not complete within shutdown budget"
+                ));
+            }
         }
 
         let nrd_handle = {
@@ -542,7 +606,7 @@ impl DaemonEngine {
         // cancelling active file hashes and detaching wedged raw OS worker threads on timeout.
         self.motw_pool.shutdown_and_join(deadline).await;
 
-        if let Some(err) = drain_err {
+        if let Some(err) = drain_err.or(gate_err) {
             return Err(err);
         }
         Ok(())

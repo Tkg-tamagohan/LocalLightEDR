@@ -9026,3 +9026,1239 @@ async fn daemon_p3_50_self_process_skips_dns_wfp_prematerialization() {
 
     engine.shutdown_and_flush().await.expect("shutdown engine");
 }
+
+/// `DAEMON-P3-53` (`FU-E2E-05`, `E2E-P3-01` preservation):
+/// - Part A: Single malicious process connecting to an IPv4 literal under
+///   `wfp_drop_attribution_grace_ms` with repeated `WfpDropEvent` retries (`> 250 ms` apart)
+///   deduplicates pending entries without extending the deadline and suspends the process once the
+///   grace expires (`Pending` alert bound to `process_instance_id`).
+/// - Part B: Single process with a domain `NetworkAllow` rule whose own `DnsQuery` arrives during
+///   `AttributionGrace` re-evaluates via `select_outbound_decision_for_domains`, installs a
+///   temporary WFP Permit, and emits 0 suspends / 0 alerts.
+/// - Part C: Multi-candidate 60 s DNS freshness symmetry keeps stale (> 60 s) allowed DNS from
+///   emitting an early Permit and produces an `app_level_ambiguous` alert (`0` suspends).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p3_53_single_process_freeze_retry_dedup_and_grace_own_dns_allow() {
+    let tool_exe = r"C:\Users\alice\Downloads\p353_tool.exe";
+
+    // Part A: Single malicious process + retries > 250 ms apart do not extend grace deadline.
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+
+        let engine = start_test_engine(
+            store.clone(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                outbound_firewall_enabled: true,
+                wfp_drop_dns_grace_ms: 0,
+                wfp_drop_attribution_grace_ms: 500,
+                wfp_drop_live_sibling_os_check: false,
+                ..DaemonConfig::default()
+            },
+            defense.clone(),
+            notifier,
+            inspector,
+        );
+
+        let now_ms = current_unix_ms();
+        let proc_id = ProcessIdentity::new(9911, unix_ms_to_filetime(now_ms - 500));
+        let inst_id = proc_id.instance_id();
+        send_process_start(&engine.sender(), proc_id, tool_exe).await;
+        assert!(wait_until(1_000, || engine.metrics().high_priority_processed >= 1).await);
+
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 91));
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 1,
+            rule_handle: 1,
+            exe_path: tool_exe.to_string(),
+            protocol: 6,
+            dst_ip,
+            dst_port: 443,
+            timestamp_ms: now_ms,
+        }));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            defense.suspends().is_empty(),
+            "single candidate should wait out initial attribution grace"
+        );
+
+        // Retry past 250ms transport dedup window while the parked drop is still pending.
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 1,
+            rule_handle: 1,
+            exe_path: tool_exe.to_string(),
+            protocol: 6,
+            dst_ip,
+            dst_port: 443,
+            timestamp_ms: now_ms + 280,
+        }));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            defense.suspends().is_empty(),
+            "retry at +280ms must not bypass remaining grace prematurely"
+        );
+
+        // If retry had extended the 500ms deadline to 280+500=780ms, waiting 350ms from now (~670ms)
+        // would time out. Without extension, original 500ms deadline fires around ~220ms from now.
+        assert!(
+            wait_until(380, || defense.suspends() == vec![proc_id]).await,
+            "pending dedup must preserve original deadline and suspend single malicious process promptly"
+        );
+        assert!(
+            wait_until(1_000, || {
+                store
+                    .list_alerts(Some(AlertStatus::Pending), 10)
+                    .map(|a| a.len() == 1)
+                    .unwrap_or(false)
+            })
+            .await,
+            "alert row must be persisted before querying"
+        );
+        let alerts = store.list_alerts(Some(AlertStatus::Pending), 10).expect("alerts");
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].process_suspended);
+        assert_eq!(alerts[0].process_instance_id.as_deref(), Some(inst_id.as_str()));
+
+        engine.shutdown_and_flush().await.expect("shutdown Part A");
+    }
+
+    // Part B: Own allowed DnsQuery arriving during AttributionGrace re-evaluates to AllowedByRule.
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+        let hash = "d".repeat(64);
+        inspector.register(tool_exe, Some(&hash), None);
+
+        let now_ms = current_unix_ms();
+        store
+            .upsert_rule(&AllowlistRuleRecord {
+                rule_id: "R-P3-53-ALLOW-DOMAIN".to_string(),
+                scope: RuleScope::NetworkAllow,
+                exe_path_pattern: tool_exe.to_string(),
+                sha256: Some(hash),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some("allowed.example.invalid".to_string()),
+                created_at_ms: now_ms,
+                created_by: "test".to_string(),
+            })
+            .expect("seed NetworkAllow domain rule");
+
+        let engine = start_test_engine(
+            store.clone(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                outbound_firewall_enabled: true,
+                wfp_drop_dns_grace_ms: 0,
+                wfp_drop_attribution_grace_ms: 350,
+                wfp_drop_live_sibling_os_check: false,
+                ..DaemonConfig::default()
+            },
+            defense.clone(),
+            notifier,
+            inspector,
+        );
+
+        let proc_id = ProcessIdentity::new(9912, unix_ms_to_filetime(now_ms - 500));
+        send_process_start(&engine.sender(), proc_id, tool_exe).await;
+        assert!(wait_until(1_000, || engine.metrics().high_priority_processed >= 1).await);
+
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 92));
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 2,
+            rule_handle: 2,
+            exe_path: tool_exe.to_string(),
+            protocol: 6,
+            dst_ip,
+            dst_port: 443,
+            timestamp_ms: now_ms + 10,
+        }));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        engine
+            .sender()
+            .send_high_priority(SensorEvent::DnsQuery {
+                pid: proc_id.pid,
+                query_name: "allowed.example.invalid".to_string(),
+                query_type: 1,
+                resolved_ips: vec![dst_ip],
+                timestamp_ms: now_ms + 30,
+            })
+            .await
+            .expect("send own allowed DnsQuery");
+
+        assert!(
+            wait_until(1_000, || {
+                engine.has_active_wfp_filter(tool_exe, Some(dst_ip), true)
+            })
+            .await,
+            "own allowed DnsQuery during AttributionGrace must authorize Permit via select_outbound_decision_for_domains"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            defense.suspends().is_empty(),
+            "allowed domain during AttributionGrace must produce 0 suspends"
+        );
+        assert!(
+            store.list_alerts(None, 10).expect("alerts").is_empty(),
+            "allowed domain during AttributionGrace must produce 0 alerts"
+        );
+
+        engine.shutdown_and_flush().await.expect("shutdown Part B");
+    }
+
+    // Part C: Multi-candidate 60 s DNS freshness symmetry rejects stale (> 60 s) allowed DNS.
+    {
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(MockWfpDefense::new());
+        let notifier = Arc::new(MockNotifier::default());
+        let inspector = Arc::new(MapBinaryInspector::default());
+        let hash = "e".repeat(64);
+        inspector.register(tool_exe, Some(&hash), None);
+
+        let now_ms = current_unix_ms();
+        store
+            .upsert_rule(&AllowlistRuleRecord {
+                rule_id: "R-P3-53-ALLOW-STALE".to_string(),
+                scope: RuleScope::NetworkAllow,
+                exe_path_pattern: tool_exe.to_string(),
+                sha256: Some(hash),
+                signer_subject: None,
+                root_thumbprint: None,
+                allowed_target: Some("stale.example.invalid".to_string()),
+                created_at_ms: now_ms,
+                created_by: "test".to_string(),
+            })
+            .expect("seed allow rule");
+
+        let engine = start_test_engine(
+            store.clone(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                outbound_firewall_enabled: true,
+                wfp_drop_dns_grace_ms: 150,
+                wfp_drop_attribution_grace_ms: 0,
+                wfp_drop_live_sibling_os_check: false,
+                ..DaemonConfig::default()
+            },
+            defense.clone(),
+            notifier,
+            inspector,
+        );
+
+        let p1 = ProcessIdentity::new(9913, unix_ms_to_filetime(now_ms - 120_000));
+        let p2 = ProcessIdentity::new(9914, unix_ms_to_filetime(now_ms - 5_000));
+        send_process_start(&engine.sender(), p1, tool_exe).await;
+        send_process_start(&engine.sender(), p2, tool_exe).await;
+        assert!(wait_until(1_000, || engine.metrics().high_priority_processed >= 2).await);
+
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 93));
+        // Stale DNS resolution (> 60_000 ms before drop timestamp) on p1.
+        engine
+            .sender()
+            .send_high_priority(SensorEvent::DnsQuery {
+                pid: p1.pid,
+                query_name: "stale.example.invalid".to_string(),
+                query_type: 1,
+                resolved_ips: vec![dst_ip],
+                timestamp_ms: now_ms - 90_000,
+            })
+            .await
+            .expect("send stale DnsQuery");
+        assert!(wait_until(1_000, || engine.metrics().high_priority_processed >= 3).await);
+        let permits_before_drop = defense
+            .added_wfp()
+            .iter()
+            .filter(|f| f.allow && f.remote_ip == Some(dst_ip))
+            .count();
+
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 3,
+            rule_handle: 3,
+            exe_path: tool_exe.to_string(),
+            protocol: 6,
+            dst_ip,
+            dst_port: 443,
+            timestamp_ms: now_ms,
+        }));
+
+        assert!(
+            wait_until(1_500, || {
+                store
+                    .list_alerts(Some(AlertStatus::Pending), 10)
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+            })
+            .await,
+            "stale >60s DNS under multi-candidate ambiguity must fall back to app_level_ambiguous alert"
+        );
+        let permits_after_drop = defense
+            .added_wfp()
+            .iter()
+            .filter(|f| f.allow && f.remote_ip == Some(dst_ip))
+            .count();
+        assert_eq!(
+            permits_after_drop, permits_before_drop,
+            "stale >60s DNS must not authorize any new WFP Permit on WfpDropEvent"
+        );
+        assert!(defense.suspends().is_empty());
+
+        engine.shutdown_and_flush().await.expect("shutdown Part C");
+    }
+}
+
+struct ShutdownTestBinaryInspector {
+    target_substr: String,
+    entered: Arc<AtomicBool>,
+    delay_ms: u64,
+    cancelled_observed: Arc<AtomicBool>,
+}
+
+impl BinaryInspector for ShutdownTestBinaryInspector {
+    fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+        BinaryIdentity {
+            exe_path: exe_path.to_string(),
+            sha256: Some("f".repeat(64)),
+            authenticode: None,
+        }
+    }
+
+    fn inspect_cancellable(
+        &self,
+        exe_path: &str,
+        cancel: &AtomicBool,
+        fast_skip_on_shutdown: bool,
+    ) -> ledr_daemon::InspectOutcome {
+        if exe_path
+            .to_ascii_lowercase()
+            .contains(&self.target_substr.to_ascii_lowercase())
+        {
+            self.entered.store(true, Ordering::Release);
+            if fast_skip_on_shutdown || cancel.load(Ordering::Acquire) {
+                self.cancelled_observed.store(true, Ordering::Release);
+                return ledr_daemon::InspectOutcome::Cancelled;
+            }
+            let wait_fn = || {
+                let deadline = Instant::now() + Duration::from_millis(self.delay_ms);
+                while Instant::now() < deadline {
+                    if cancel.load(Ordering::Acquire) {
+                        self.cancelled_observed.store(true, Ordering::Release);
+                        return ledr_daemon::InspectOutcome::Cancelled;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                ledr_daemon::InspectOutcome::Completed(self.inspect(exe_path))
+            };
+            if tokio::runtime::Handle::try_current().is_ok_and(|h| {
+                h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            }) {
+                return tokio::task::block_in_place(wait_fn);
+            }
+            return wait_fn();
+        }
+        ledr_daemon::InspectOutcome::Completed(self.inspect(exe_path))
+    }
+}
+
+/// `DAEMON-P3-54` (`FU-E2E-05`, `E2E-P3-06`):
+/// - Part A: Fast CLI shutdown (`shutdown_skip_cold_binary_inspect: true` +
+///   `signal_early_shutdown()`) skips cold binary inspection cleanly (`Ok(())`), truncates WAL to
+///   0 bytes, detaches a wedged NRD thread, and drops the independent Tokio runtime in `< 300 ms`.
+/// - Part B: Genuine drain timeout (`shutdown_flush_timeout_ms: 350`) returns `Err` containing
+///   `"timeout"` (`DAEMON-P3-37` compatibility), emits 0 false alerts/suspends from cancelled
+///   inspection, truncates WAL to 0 bytes, keeps post-shutdown writes closed (`-wal` remains
+///   absent or 0 bytes), and drops the independent Tokio runtime in `< 300 ms`.
+#[test]
+fn daemon_p3_54_shutdown_wal_zero_bytes_and_nrd_detach() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct PipeServerGuard {
+        release_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl PipeServerGuard {
+        fn stop_and_join(&mut self) {
+            if let Some(tx) = self.release_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(jh) = self.thread.take() {
+                let _ = jh.join();
+            }
+        }
+    }
+    impl Drop for PipeServerGuard {
+        fn drop(&mut self) {
+            self.stop_and_join();
+        }
+    }
+
+    fn spawn_wedged_nrd_pipe() -> (String, PipeServerGuard) {
+        let pipe_leaf = format!(
+            "localedr-p3-54-nrd-{}-{}",
+            std::process::id(),
+            PIPE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let pipe_path = format!(r"\\.\pipe\{pipe_leaf}");
+        let feed_url = format!("file://./pipe/{pipe_leaf}");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, mut release_rx) = tokio::sync::oneshot::channel::<()>();
+        let pipe_path_bg = pipe_path.clone();
+
+        let thread = std::thread::Builder::new()
+            .name("test-p3-54-nrd-pipe".to_string())
+            .spawn(move || {
+                let pipe_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build helper pipe runtime");
+                pipe_rt.block_on(async move {
+                    let mut server = ServerOptions::new()
+                        .first_pipe_instance(true)
+                        .out_buffer_size(1024)
+                        .create(&pipe_path_bg)
+                        .expect("create pipe");
+                    let _ = ready_tx.send(());
+                    let connected = tokio::select! {
+                        res = server.connect() => res.is_ok(),
+                        _ = &mut release_rx => false,
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => false,
+                    };
+                    if connected {
+                        let wrote = tokio::select! {
+                            res = async {
+                                server.write_all(b"\n").await?;
+                                server.flush().await
+                            } => res.is_ok(),
+                            _ = &mut release_rx => false,
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => false,
+                        };
+                        if wrote {
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(10), &mut release_rx)
+                                    .await;
+                        }
+                        let _ = server.disconnect();
+                    }
+                });
+            })
+            .expect("spawn pipe server");
+        ready_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("pipe ready");
+        (
+            feed_url,
+            PipeServerGuard {
+                release_tx: Some(release_tx),
+                thread: Some(thread),
+            },
+        )
+    }
+
+    fn assert_wal_zero(db_path: &Path) {
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+        if wal_path.exists() {
+            let len = std::fs::metadata(&wal_path).expect("stat wal").len();
+            assert_eq!(len, 0, "expected 0-byte WAL at {}", wal_path.display());
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ledr-p3-54-wal-{}-{}",
+        std::process::id(),
+        PIPE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir for DAEMON-P3-54");
+    let _tmp_guard = TempDirGuard(tmp_dir.clone());
+
+    // Part A: Fast CLI shutdown path -> Ok(()), -wal == 0, NRD detached, Runtime::drop < 300ms.
+    {
+        let db_path = tmp_dir.join("shutdown_fast_wal.db");
+        let (feed_url, mut pipe_guard) = spawn_wedged_nrd_pipe();
+        let subject_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime A");
+
+        let now_ms = current_unix_ms();
+        let marker_proc = ProcessIdentity::new(9921, unix_ms_to_filetime(now_ms - 1_000));
+        let marker_id = marker_proc.instance_id();
+        let cold_proc = ProcessIdentity::new(9922, unix_ms_to_filetime(now_ms - 500));
+        let cold_dns_proc = ProcessIdentity::new(9923, unix_ms_to_filetime(now_ms - 450));
+        let cold_start_proc = ProcessIdentity::new(9924, unix_ms_to_filetime(now_ms - 10));
+        let cancelled_observed = Arc::new(AtomicBool::new(false));
+        let cancelled_clone = Arc::clone(&cancelled_observed);
+
+        let db_rt = db_path.clone();
+        let marker_id_rt = marker_id.clone();
+        subject_rt.block_on(async move {
+            let store = LedrStore::open(&db_rt).expect("open store");
+            store
+                .upsert_rule(&AllowlistRuleRecord {
+                    rule_id: "R-P3-54-COLD-DNS-ALLOW".to_string(),
+                    scope: RuleScope::NetworkAllow,
+                    exe_path_pattern: r"C:\Apps\cold_dns.exe".to_string(),
+                    sha256: Some("f".repeat(64)),
+                    signer_subject: None,
+                    root_thumbprint: None,
+                    allowed_target: Some("allowed.cold.invalid".to_string()),
+                    created_at_ms: now_ms,
+                    created_by: "test".to_string(),
+                })
+                .expect("seed cold_dns allow rule");
+            store
+                .upsert_rule(&AllowlistRuleRecord {
+                    rule_id: "R-P3-54-COLD-START-BLOCK".to_string(),
+                    scope: RuleScope::NetworkBlock,
+                    exe_path_pattern: r"C:\Users\alice\Downloads\cold_start.exe".to_string(),
+                    sha256: Some("f".repeat(64)),
+                    signer_subject: None,
+                    root_thumbprint: None,
+                    allowed_target: None,
+                    created_at_ms: now_ms,
+                    created_by: "test".to_string(),
+                })
+                .expect("seed cold_start block rule");
+
+            let defense = Arc::new(MockWfpDefense::new());
+            let notifier = Arc::new(MockNotifier::default());
+            let entered = Arc::new(AtomicBool::new(false));
+            let inspector = Arc::new(ShutdownTestBinaryInspector {
+                target_substr: "cold_".to_string(),
+                entered: Arc::clone(&entered),
+                delay_ms: 2_500,
+                cancelled_observed: cancelled_clone,
+            });
+
+            let engine = start_test_engine(
+                store.clone(),
+                DaemonConfig {
+                    pipe_name: unique_test_pipe_name(),
+                    nrd_refresh_enabled: true,
+                    nrd_refresh_interval_ms: 200,
+                    nrd_feed_urls: vec![feed_url],
+                    shutdown_flush_timeout_ms: 800,
+                    batch_flush_interval_ms: 500,
+                    shutdown_skip_cold_binary_inspect: true,
+                    ..DaemonConfig::default()
+                },
+                defense.clone(),
+                notifier,
+                inspector,
+            );
+
+            let nrd_token = engine.nrd_cancel_token();
+            assert!(
+                wait_until(3_000, || {
+                    nrd_token.blocking_read_entries() >= 2
+                        && nrd_token.is_blocking_read_active()
+                        && engine.is_nrd_refresh_in_flight()
+                })
+                .await
+            );
+
+            send_process_start(&engine.sender(), marker_proc, r"C:\Tools\fast_marker.exe").await;
+            send_process_start(&engine.sender(), cold_proc, r"C:\Apps\cold_electron.exe").await;
+            send_process_start(&engine.sender(), cold_dns_proc, r"C:\Apps\cold_dns.exe").await;
+            assert!(wait_until(1_000, || engine.metrics().high_priority_processed >= 3).await);
+
+            // Trigger early shutdown (like Ctrl+C in main.rs), then enqueue cold NetworkConnect,
+            // DnsQuery (`wfp_premat.rs` prematerialization), and ProcessStart (`wfp_premat.rs` guard).
+            engine.signal_early_shutdown();
+            engine
+                .sender()
+                .send(SensorEvent::NetworkConnect {
+                    pid: cold_proc.pid,
+                    protocol: 6,
+                    dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 120)),
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: now_ms,
+                })
+                .await
+                .expect("send cold NetworkConnect");
+            engine
+                .sender()
+                .send_high_priority(SensorEvent::DnsQuery {
+                    pid: cold_dns_proc.pid,
+                    query_name: "allowed.cold.invalid".to_string(),
+                    query_type: 1,
+                    resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 122))],
+                    timestamp_ms: now_ms + 1,
+                })
+                .await
+                .expect("send cold DnsQuery");
+            send_process_start(
+                &engine.sender(),
+                cold_start_proc,
+                r"C:\Users\alice\Downloads\cold_start.exe",
+            )
+            .await;
+
+            engine
+                .shutdown_and_flush()
+                .await
+                .expect("fast CLI shutdown with skip_cold_binary_inspect must return Ok(())");
+
+            assert!(
+                defense.suspends().is_empty(),
+                "skipped cold binary inspection must not trigger suspension"
+            );
+            let persisted = store
+                .list_running_process_instance_ids()
+                .expect("running ids");
+            assert!(persisted.contains(&marker_id_rt));
+            assert_wal_zero(&db_rt);
+        });
+
+        assert!(
+            cancelled_observed.load(Ordering::Acquire),
+            "shutdown_skip_cold_binary_inspect must fast-skip cold binary inspection"
+        );
+        let drop_started = Instant::now();
+        drop(subject_rt);
+        assert!(
+            drop_started.elapsed() < Duration::from_millis(300),
+            "Runtime::drop A must not hang on wedged NRD thread (took {:?})",
+            drop_started.elapsed()
+        );
+        pipe_guard.stop_and_join();
+    }
+
+    // Part B: Genuine drain timeout -> Err("timeout"), 0 false alerts/suspends, closed write gate.
+    {
+        let db_path = tmp_dir.join("shutdown_timeout_wal.db");
+        let (feed_url, mut pipe_guard) = spawn_wedged_nrd_pipe();
+        let subject_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime B");
+
+        let now_ms = current_unix_ms();
+        let slow_proc = ProcessIdentity::new(9931, unix_ms_to_filetime(now_ms - 500));
+        let entered = Arc::new(AtomicBool::new(false));
+        let cancelled_observed = Arc::new(AtomicBool::new(false));
+        let entered_clone = Arc::clone(&entered);
+        let cancelled_clone = Arc::clone(&cancelled_observed);
+
+        let db_rt = db_path.clone();
+        subject_rt.block_on(async move {
+            let store = LedrStore::open(&db_rt).expect("open store");
+            let defense = Arc::new(MockWfpDefense::new());
+            let notifier = Arc::new(MockNotifier::default());
+            let inspector = Arc::new(ShutdownTestBinaryInspector {
+                target_substr: "slow_timeout.exe".to_string(),
+                entered: entered_clone,
+                delay_ms: 5_000,
+                cancelled_observed: cancelled_clone,
+            });
+
+            let engine = start_test_engine(
+                store.clone(),
+                DaemonConfig {
+                    pipe_name: unique_test_pipe_name(),
+                    nrd_refresh_enabled: true,
+                    nrd_refresh_interval_ms: 200,
+                    nrd_feed_urls: vec![feed_url],
+                    shutdown_flush_timeout_ms: 350,
+                    batch_flush_interval_ms: 500,
+                    shutdown_skip_cold_binary_inspect: false,
+                    ..DaemonConfig::default()
+                },
+                defense.clone(),
+                notifier,
+                inspector,
+            );
+
+            let nrd_token = engine.nrd_cancel_token();
+            assert!(
+                wait_until(3_000, || {
+                    nrd_token.blocking_read_entries() >= 2
+                        && nrd_token.is_blocking_read_active()
+                        && engine.is_nrd_refresh_in_flight()
+                })
+                .await
+            );
+
+            send_process_start(&engine.sender(), slow_proc, r"C:\Tools\slow_timeout.exe").await;
+            assert!(wait_until(1_000, || engine.metrics().high_priority_processed >= 1).await);
+
+            engine
+                .sender()
+                .send(SensorEvent::NetworkConnect {
+                    pid: slow_proc.pid,
+                    protocol: 6,
+                    dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 121)),
+                    dst_port: 443,
+                    domain_hint: None,
+                    timestamp_ms: now_ms,
+                })
+                .await
+                .expect("send slow NetworkConnect");
+            assert!(
+                wait_until(1_000, || entered.load(Ordering::Acquire)).await,
+                "worker must enter slow_timeout inspect"
+            );
+
+            let err = engine
+                .shutdown_and_flush()
+                .await
+                .expect_err("genuine drain overrun must return timeout Err (DAEMON-P3-37)");
+            assert!(
+                err.to_string().to_ascii_lowercase().contains("timeout"),
+                "error must contain 'timeout': {err}"
+            );
+
+            assert!(
+                defense.suspends().is_empty(),
+                "cancelled inspection must never produce a suspension"
+            );
+            assert!(
+                store.list_alerts(None, 20).expect("alerts").is_empty(),
+                "cancelled inspection must produce 0 false alerts"
+            );
+            assert_wal_zero(&db_rt);
+
+            // Post-shutdown write attempts via IPC/engine helpers fail closed and leave WAL 0.
+            let ev_res = engine.record_browser_event(
+                ledr_proto::BrowserSecurityEventType::ClickFixPastejacking,
+                "https://post-shutdown.example.invalid",
+                Some("blocked"),
+                now_ms + 100,
+            );
+            assert!(matches!(ev_res, Err(ledr_daemon::BrowserReportError::Cancelled)));
+
+            let dl_res = engine.record_browser_download_origin(
+                r"C:\Users\alice\Downloads\post_shutdown.bin",
+                "https://post-shutdown.example.invalid",
+                None,
+                None,
+                now_ms + 100,
+            );
+            assert!(matches!(dl_res, Err(ledr_daemon::BrowserReportError::Cancelled)));
+            assert_wal_zero(&db_rt);
+        });
+
+        let drop_started = Instant::now();
+        drop(subject_rt);
+        assert!(
+            drop_started.elapsed() < Duration::from_millis(300),
+            "Runtime::drop B must not hang on wedged NRD thread (took {:?})",
+            drop_started.elapsed()
+        );
+        pipe_guard.stop_and_join();
+    }
+}
+
+/// `DAEMON-P3-55` (`FU-E2E-05`):
+/// Confirms `store_write_gate` is strictly scoped to a shut-down `DaemonEngine` instance, does
+/// not permanently poison the shared [`LedrStore`], and `start_with_motw_inspector` clears the
+/// store's cooperative shutdown flag so a second `DaemonEngine` cleanly reuses the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p3_55_store_write_gate_engine_scoped_and_store_reusable() {
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ledr-p3-55-reuse-{}-{}",
+        std::process::id(),
+        PIPE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir for DAEMON-P3-55");
+    let _tmp_guard = TempDirGuard(tmp_dir.clone());
+    let db_path = tmp_dir.join("store_reuse_wal.db");
+    let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+
+    let store = LedrStore::open(&db_path).expect("open file-backed store");
+    let now_ms = current_unix_ms();
+
+    let engine1 = start_test_engine(
+        store.clone(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            shutdown_flush_timeout_ms: 800,
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockWfpDefense::new()),
+        Arc::new(MockNotifier::default()),
+        Arc::new(MapBinaryInspector::default()),
+    );
+    let p1 = ProcessIdentity::new(9941, unix_ms_to_filetime(now_ms - 500));
+    send_process_start(&engine1.sender(), p1, r"C:\Tools\reuse1.exe").await;
+    assert!(wait_until(1_000, || engine1.metrics().high_priority_processed >= 1).await);
+
+    engine1
+        .shutdown_and_flush()
+        .await
+        .expect("engine1 shutdown must succeed");
+    if wal_path.exists() {
+        assert_eq!(std::fs::metadata(&wal_path).expect("stat wal 1").len(), 0);
+    }
+
+    // Closed engine1 rejects new engine-mediated writes and does not regenerate `-wal`.
+    let closed_err = engine1.record_browser_event(
+        ledr_proto::BrowserSecurityEventType::ClickFixPastejacking,
+        "https://closed-engine1.example.invalid",
+        None,
+        now_ms + 10,
+    );
+    assert!(matches!(closed_err, Err(ledr_daemon::BrowserReportError::Cancelled)));
+    if wal_path.exists() {
+        assert_eq!(std::fs::metadata(&wal_path).expect("stat wal post close").len(), 0);
+    }
+
+    // Direct store writes remain operational for callers reusing the same LedrStore (`e2e_blockers`).
+    store
+        .record_alert(&AlertRecord {
+            alert_id: "alert-p3-55-direct-reuse".to_string(),
+            timestamp_ms: now_ms + 20,
+            severity: AlertSeverity::Low,
+            source_layer: "LAYER_4_BROWSER".to_string(),
+            rule_id: "LEDR-TEST-REUSE".to_string(),
+            title: "Direct store reuse check".to_string(),
+            process_instance_id: None,
+            process_suspended: false,
+            status: AlertStatus::Pending,
+            context_json: "{}".to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("direct store.record_alert on reused LedrStore must succeed");
+
+    let engine2 = start_test_engine(
+        store.clone(),
+        DaemonConfig {
+            pipe_name: unique_test_pipe_name(),
+            shutdown_flush_timeout_ms: 800,
+            ..DaemonConfig::default()
+        },
+        Arc::new(MockWfpDefense::new()),
+        Arc::new(MockNotifier::default()),
+        Arc::new(MapBinaryInspector::default()),
+    );
+    assert!(
+        !store.is_shutdown_requested(),
+        "starting engine2 on reused store must reset shutdown_requested flag"
+    );
+
+    let p2 = ProcessIdentity::new(9942, unix_ms_to_filetime(now_ms + 50));
+    send_process_start(&engine2.sender(), p2, r"C:\Tools\reuse2.exe").await;
+    assert!(wait_until(1_000, || engine2.metrics().high_priority_processed >= 1).await);
+
+    engine2
+        .shutdown_and_flush()
+        .await
+        .expect("engine2 shutdown must succeed");
+    if wal_path.exists() {
+        assert_eq!(std::fs::metadata(&wal_path).expect("stat wal 2").len(), 0);
+    }
+    let reopened_alerts = store.list_alerts(Some(AlertStatus::Pending), 10).expect("alerts");
+    assert!(reopened_alerts.iter().any(|a| a.alert_id == "alert-p3-55-direct-reuse"));
+}
+
+/// `DAEMON-P3-56` (PR #38 review Threads `#2`, `#6`, `#8`):
+/// - Part A (`#2`): An in-flight `resolve_alert_with_outcome(AllowPermanent)` whose `resume_process`
+///   fails while `shutdown_and_flush` is in progress completes its `rollback_saved_rule` via the
+///   operation-scoped `WriteOpGuard` before final WAL checkpointing (`0` orphaned rules, `-wal == 0`).
+/// - Part B (`#6`): Direct `upsert_policy_rule` committed immediately before shutdown (with
+///   `store.buffered_len() == 0`) still triggers final `checkpoint_truncate_with_deadline` (`-wal == 0`).
+/// - Part C (`#8`): Concurrent periodic TTL purge acquires per-batch `WriteOpGuard`, stops cleanly
+///   at shutdown boundary, and leaves `-wal == 0` with zero post-checkpoint purge writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_p3_56_store_write_gate_rollback_direct_ipc_and_ttl_purge_wal() {
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct BlockingResumeDefense {
+        next_handle: AtomicU64,
+        entered_resume: Arc<AtomicBool>,
+        release_resume: Arc<AtomicBool>,
+        succeed_on_release: bool,
+    }
+
+    impl BlockingResumeDefense {
+        fn new(entered_resume: Arc<AtomicBool>, release_resume: Arc<AtomicBool>) -> Self {
+            Self::new_with_result(entered_resume, release_resume, false)
+        }
+
+        fn new_with_result(
+            entered_resume: Arc<AtomicBool>,
+            release_resume: Arc<AtomicBool>,
+            succeed_on_release: bool,
+        ) -> Self {
+            Self {
+                next_handle: AtomicU64::new(100),
+                entered_resume,
+                release_resume,
+                succeed_on_release,
+            }
+        }
+    }
+
+    impl ActiveDefenseController for BlockingResumeDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, target: &ProcessIdentity) -> Result<(), String> {
+            self.entered_resume.store(true, Ordering::Release);
+            let wait_fn = || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !self.release_resume.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            if tokio::runtime::Handle::try_current().is_ok_and(|h| {
+                h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            }) {
+                tokio::task::block_in_place(wait_fn);
+            } else {
+                wait_fn();
+            }
+            if self.succeed_on_release {
+                Ok(())
+            } else {
+                Err(format!(
+                    "OpenProcess(PID {}) failed: Access is denied.",
+                    target.pid
+                ))
+            }
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(&self, _: &Path, _: Option<IpAddr>, _: bool) -> Result<u64, String> {
+            Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
+        }
+        fn remove_wfp_rule(&self, _: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ledr-p3-56-gate-{}-{}",
+        std::process::id(),
+        PIPE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir for DAEMON-P3-56");
+    let _tmp_guard = TempDirGuard(tmp_dir.clone());
+
+    let assert_wal_zero = |db_path: &Path| {
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+        if wal_path.exists() {
+            assert_eq!(
+                std::fs::metadata(&wal_path).expect("stat wal").len(),
+                0,
+                "expected 0-byte WAL at {}",
+                wal_path.display()
+            );
+        }
+    };
+
+    // Part A: Failed resume during concurrent shutdown must still roll back saved rule via WriteOpGuard.
+    {
+        let db_path = tmp_dir.join("resolve_rollback_shutdown.db");
+        let store = LedrStore::open(&db_path).expect("open store A");
+        let entered_resume = Arc::new(AtomicBool::new(false));
+        let release_resume = Arc::new(AtomicBool::new(false));
+        let defense = Arc::new(BlockingResumeDefense::new(
+            Arc::clone(&entered_resume),
+            Arc::clone(&release_resume),
+        ));
+        let engine = start_test_engine(
+            store.clone(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                shutdown_flush_timeout_ms: 1_500,
+                ..DaemonConfig::default()
+            },
+            defense,
+            Arc::new(MockNotifier::default()),
+            Arc::new(MapBinaryInspector::default()),
+        );
+
+        let now_ms = current_unix_ms();
+        let proc_id = ProcessIdentity::new(std::process::id(), unix_ms_to_filetime(now_ms - 500));
+        let inst_id = proc_id.instance_id();
+        let alert_id = "alert-p3-56-rollback";
+        let exe_path = r"C:\Tools\p356_app.exe";
+        let hash = "a".repeat(64);
+        send_process_start(&engine.sender(), proc_id, exe_path).await;
+        assert!(wait_until(1_000, || engine.metrics().high_priority_processed >= 1).await);
+
+        let ctx_json = serde_json::json!({
+            "exe_path": exe_path,
+            "sha256": hash,
+            "dst_ip": "198.51.100.201",
+            "dst_port": 443,
+        })
+        .to_string();
+        store
+            .record_alert(&AlertRecord {
+                alert_id: alert_id.to_string(),
+                timestamp_ms: now_ms,
+                severity: AlertSeverity::Medium,
+                source_layer: "LAYER_3_NETWORK".to_string(),
+                rule_id: "LEDR-NET-UNKNOWN-OUTBOUND".to_string(),
+                title: "Unknown outbound".to_string(),
+                process_instance_id: Some(inst_id),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: ctx_json,
+                resolved_at_ms: None,
+            })
+            .expect("seed suspended alert");
+
+        let eng_resolve = Arc::clone(&engine);
+        let resolve_task = tokio::task::spawn_blocking(move || {
+            eng_resolve.resolve_alert_with_outcome(
+                alert_id,
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: false,
+                    allow_dest: None,
+                },
+            )
+        });
+        assert!(
+            wait_until(1_000, || entered_resume.load(Ordering::Acquire)).await,
+            "resolve_alert must enter resume_process"
+        );
+
+        let eng_shutdown = Arc::clone(&engine);
+        let shutdown_task = tokio::spawn(async move { eng_shutdown.shutdown_and_flush().await });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !shutdown_task.is_finished(),
+            "shutdown_and_flush must wait for in-flight admitted resolve_alert operation"
+        );
+
+        release_resume.store(true, Ordering::Release);
+        let resolve_res = resolve_task.await.expect("join resolve");
+        assert!(
+            resolve_res.is_err(),
+            "access-denied live resume failure must return Err"
+        );
+        shutdown_task
+            .await
+            .expect("join shutdown")
+            .expect("shutdown completes cleanly after rollback");
+
+        assert!(
+            store.list_rules(None).expect("list rules").is_empty(),
+            "rollback_saved_rule must delete persisted rule even when shutdown arrived mid-resolve"
+        );
+        assert_wal_zero(&db_path);
+    }
+
+    // Part B: Direct `upsert_policy_rule` SQLite commit right before shutdown (`buffered_len() == 0`)
+    // must still trigger final WAL truncation (`-wal == 0`).
+    {
+        let db_path = tmp_dir.join("direct_ipc_wal_truncate.db");
+        let store = LedrStore::open(&db_path).expect("open store B");
+        let engine = start_test_engine(
+            store.clone(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                shutdown_flush_timeout_ms: 800,
+                ..DaemonConfig::default()
+            },
+            Arc::new(MockWfpDefense::new()),
+            Arc::new(MockNotifier::default()),
+            Arc::new(MapBinaryInspector::default()),
+        );
+
+        let rule = AllowlistRuleRecord {
+            rule_id: "R-P3-56-DIRECT-IPC".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: r"C:\Tools\p356_direct.exe".to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("198.51.100.202".to_string()),
+            created_at_ms: current_unix_ms(),
+            created_by: "ipc_test".to_string(),
+        };
+        engine
+            .upsert_policy_rule(&rule)
+            .expect("direct upsert_policy_rule succeeds");
+        assert_eq!(store.buffered_len(), 0);
+
+        engine
+            .shutdown_and_flush()
+            .await
+            .expect("shutdown truncates direct IPC commit WAL");
+        assert_wal_zero(&db_path);
+
+        drop(engine);
+        drop(store);
+        let reopened = LedrStore::open(&db_path).expect("reopen store B");
+        assert_eq!(reopened.list_rules(None).expect("rules").len(), 1);
+    }
+
+    // Part C: Concurrent periodic TTL purge uses per-batch `WriteOpGuard` and never writes `-wal`
+    // after shutdown WAL truncation.
+    {
+        let db_path = tmp_dir.join("ttl_purge_shutdown_wal.db");
+        let store = LedrStore::open(&db_path).expect("open store C");
+        let old_ms = current_unix_ms().saturating_sub(10 * 86_400_000);
+        for idx in 0..650u32 {
+            let pid = 20_000 + idx;
+            let ident = ProcessIdentity::new(pid, unix_ms_to_filetime(old_ms));
+            store
+                .ingest_event_with_lifecycle(
+                    &SensorEvent::ProcessStart {
+                        identity: ident,
+                        parent_pid: 4,
+                        exe_path: r"C:\Tools\old_purge.exe".to_string(),
+                        command_line: "old_purge.exe".to_string(),
+                        user_sid: None,
+                    },
+                    None,
+                    Some(old_ms + 100),
+                    None,
+                    false,
+                    "OBSERVED",
+                )
+                .expect("seed old exited row");
+        }
+        store.flush_batch().expect("flush old rows");
+        store.set_purge_batch_delay_ms(40);
+
+        let engine = start_test_engine(
+            store.clone(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                ttl_purge_interval_ms: 50,
+                ttl_retention_days: 1,
+                shutdown_flush_timeout_ms: 1_000,
+                ..DaemonConfig::default()
+            },
+            Arc::new(MockWfpDefense::new()),
+            Arc::new(MockNotifier::default()),
+            Arc::new(MapBinaryInspector::default()),
+        );
+
+        assert!(
+            wait_until(2_000, || store.purge_batches_completed() >= 1).await,
+            "periodic TTL purge must complete at least 1 batch before shutdown"
+        );
+        engine
+            .shutdown_and_flush()
+            .await
+            .expect("shutdown stops purge cleanly and truncates WAL");
+        assert_wal_zero(&db_path);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_wal_zero(&db_path);
+    }
+
+    // Part D: Over-budget in-flight `resolve_alert` surfaces Err from `shutdown_and_flush` and
+    // is permanently sealed before final WAL truncation so late `update_alert_status` /
+    // `rollback_saved_rule` writes cannot regenerate `-wal` (`PRRT_kwDOVyjVyM66ryyT`).
+    {
+        let db_path = tmp_dir.join("resolve_over_budget_sealed_wal.db");
+        let store = LedrStore::open(&db_path).expect("open store D");
+        let entered_resume = Arc::new(AtomicBool::new(false));
+        let release_resume = Arc::new(AtomicBool::new(false));
+        let defense = Arc::new(BlockingResumeDefense::new_with_result(
+            Arc::clone(&entered_resume),
+            Arc::clone(&release_resume),
+            true,
+        ));
+        let engine = start_test_engine(
+            store.clone(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                shutdown_flush_timeout_ms: 250,
+                ..DaemonConfig::default()
+            },
+            defense,
+            Arc::new(MockNotifier::default()),
+            Arc::new(MapBinaryInspector::default()),
+        );
+
+        let now_ms = current_unix_ms();
+        let proc_id = ProcessIdentity::new(std::process::id(), unix_ms_to_filetime(now_ms - 500));
+        let inst_id = proc_id.instance_id();
+        let alert_id = "alert-p3-56-over-budget";
+        let exe_path = r"C:\Tools\p356_over_budget.exe";
+        let hash = "b".repeat(64);
+        send_process_start(&engine.sender(), proc_id, exe_path).await;
+        assert!(wait_until(1_000, || engine.metrics().high_priority_processed >= 1).await);
+
+        let ctx_json = serde_json::json!({
+            "exe_path": exe_path,
+            "sha256": hash,
+            "dst_ip": "198.51.100.203",
+            "dst_port": 443,
+        })
+        .to_string();
+        store
+            .record_alert(&AlertRecord {
+                alert_id: alert_id.to_string(),
+                timestamp_ms: now_ms,
+                severity: AlertSeverity::Medium,
+                source_layer: "LAYER_3_NETWORK".to_string(),
+                rule_id: "LEDR-NET-UNKNOWN-OUTBOUND".to_string(),
+                title: "Unknown outbound".to_string(),
+                process_instance_id: Some(inst_id),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: ctx_json,
+                resolved_at_ms: None,
+            })
+            .expect("seed suspended alert D");
+
+        let eng_resolve = Arc::clone(&engine);
+        let resolve_task = tokio::task::spawn_blocking(move || {
+            eng_resolve.resolve_alert_with_outcome(
+                alert_id,
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: false,
+                    allow_dest: None,
+                },
+            )
+        });
+        assert!(
+            wait_until(1_000, || entered_resume.load(Ordering::Acquire)).await,
+            "resolve_alert D must enter resume_process"
+        );
+
+        let shutdown_res = engine.shutdown_and_flush().await;
+        assert!(
+            shutdown_res.is_err(),
+            "over-budget in-flight StoreWriteGate must return Err from shutdown_and_flush"
+        );
+        assert_wal_zero(&db_path);
+
+        release_resume.store(true, Ordering::Release);
+        let resolve_res = resolve_task.await.expect("join resolve D");
+        assert!(
+            resolve_res.is_err(),
+            "late update_alert_status / rollback_saved_rule must be rejected after gate seal"
+        );
+        assert_wal_zero(&db_path);
+    }
+}
+
+

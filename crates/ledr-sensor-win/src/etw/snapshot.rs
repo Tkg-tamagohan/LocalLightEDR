@@ -9,7 +9,139 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use crate::path_norm::DosVolumeMap;
 use crate::{OwnedHandle, SensorError};
 
-use super::tdh::inspect_process_by_pid;
+use super::tdh::{
+    PidBasicInspect, filetime_100ns_to_unix_ms, inspect_process_basic_by_pid, inspect_process_by_pid,
+};
+
+/// Result of querying live OS processes for another active instance of the same executable (`FU-E2E-05`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveSiblingCheck {
+    NoneFound,
+    SiblingFound(Vec<ProcessIdentity>),
+    CandidateGone,
+    Indeterminate,
+}
+
+fn normalize_exe_key(raw: &str) -> String {
+    let trimmed = raw.trim().replace('/', "\\");
+    let stripped = if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\"))
+    {
+        format!(r"\\{}", &trimmed[8..])
+    } else if trimmed
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\"))
+    {
+        trimmed[4..].to_string()
+    } else {
+        trimmed
+    };
+    stripped.to_ascii_lowercase()
+}
+
+/// Scans running OS processes via Toolhelp32, pre-filtering by `szExeFile` basename before
+/// opening process handles, to detect concurrent live sibling instances of `exe_key` (`FU-E2E-05`).
+pub fn find_other_live_processes_for_exe_key(
+    exe_key: &str,
+    candidate: ProcessIdentity,
+    max_created_at_ms: i64,
+) -> LiveSiblingCheck {
+    let target_key = normalize_exe_key(exe_key);
+    let target_leaf = target_key
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if target_key.is_empty() || target_leaf.is_empty() {
+        return LiveSiblingCheck::Indeterminate;
+    }
+
+    // SAFETY: `TH32CS_SNAPPROCESS` with PID 0 snapshots all processes on the host.
+    let Ok(raw_snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return LiveSiblingCheck::Indeterminate;
+    };
+    let Some(snapshot) = OwnedHandle::new(raw_snap) else {
+        return LiveSiblingCheck::Indeterminate;
+    };
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `snapshot` is a valid process snapshot handle and `entry.dwSize` is initialized.
+    if unsafe { Process32FirstW(snapshot.as_raw(), &mut entry) }.is_err() {
+        return LiveSiblingCheck::Indeterminate;
+    }
+
+    let no_more_files = ERROR_NO_MORE_FILES.to_hresult();
+    let mut volume_map: Option<DosVolumeMap> = None;
+    let mut saw_candidate_live = false;
+    let mut siblings: Vec<ProcessIdentity> = Vec::new();
+    let mut unverified_same_name_other_pid = false;
+
+    loop {
+        let pid = entry.th32ProcessID;
+        if pid != 0 {
+            let exe_name = utf16_z_to_string(&entry.szExeFile);
+            if exe_name.eq_ignore_ascii_case(target_leaf) {
+                let vmap = volume_map.get_or_insert_with(DosVolumeMap::from_system);
+                match inspect_process_basic_by_pid(pid, Some(vmap)) {
+                    PidBasicInspect::Accessible {
+                        create_time_100ns,
+                        exe_path,
+                    } => {
+                        if pid == candidate.pid
+                            && (candidate.create_time_100ns == 0
+                                || create_time_100ns == candidate.create_time_100ns)
+                        {
+                            saw_candidate_live = true;
+                        } else if let Some(path) = exe_path {
+                            if normalize_exe_key(&path) == target_key {
+                                if create_time_100ns != 0 {
+                                    let created_ms = filetime_100ns_to_unix_ms(create_time_100ns);
+                                    if created_ms <= max_created_at_ms {
+                                        siblings.push(ProcessIdentity::new(pid, create_time_100ns));
+                                    }
+                                } else {
+                                    unverified_same_name_other_pid = true;
+                                }
+                            }
+                        } else if pid != candidate.pid {
+                            unverified_same_name_other_pid = true;
+                        }
+                    }
+                    PidBasicInspect::AccessDenied => {
+                        if pid == candidate.pid {
+                            saw_candidate_live = true;
+                        } else {
+                            unverified_same_name_other_pid = true;
+                        }
+                    }
+                    PidBasicInspect::GoneOrInvalid => {}
+                }
+            }
+        }
+
+        // SAFETY: `snapshot` and `entry` remain valid across iteration.
+        if let Err(err) = unsafe { Process32NextW(snapshot.as_raw(), &mut entry) } {
+            if err.code() == no_more_files {
+                break;
+            }
+            return LiveSiblingCheck::Indeterminate;
+        }
+    }
+
+    if !siblings.is_empty() {
+        LiveSiblingCheck::SiblingFound(siblings)
+    } else if unverified_same_name_other_pid {
+        LiveSiblingCheck::SiblingFound(Vec::new())
+    } else if candidate.create_time_100ns != 0 && !saw_candidate_live {
+        LiveSiblingCheck::CandidateGone
+    } else {
+        LiveSiblingCheck::NoneFound
+    }
+}
 
 /// Captures a baseline snapshot of currently running processes using Toolhelp32 (`AUTO-03`,
 /// `BUG_0002`).

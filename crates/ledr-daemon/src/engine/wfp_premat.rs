@@ -18,7 +18,7 @@ use super::domain_policy::{
     select_outbound_decision_for_domains,
 };
 use super::events::ResolvedProcessContext;
-use super::DaemonEngine;
+use super::{DaemonEngine, InspectOutcome};
 
 impl DaemonEngine {
     pub(super) fn prematerialize_domain_wfp_filters(
@@ -87,7 +87,10 @@ impl DaemonEngine {
         let mut cached_identity: Option<BinaryIdentity> = None;
         if !candidate_blocks.is_empty() || !candidate_permits.is_empty() {
             let rules = self.store.list_network_rules().unwrap_or_default();
-            let bin_identity = self.inspector.inspect(exe_path);
+            let bin_identity = match self.inspect_binary_for_pipeline(exe_path) {
+                InspectOutcome::Completed(id) => id,
+                InspectOutcome::Cancelled => return,
+            };
             let (active_dns_entries, superseded_block_pairs, current_domain_entries, superseded_permit_pairs) = {
                 let history = self
                     .process_dns_history
@@ -217,7 +220,13 @@ impl DaemonEngine {
             return;
         }
 
-        let bin_identity = cached_identity.unwrap_or_else(|| self.inspector.inspect(exe_path));
+        let bin_identity = match cached_identity {
+            Some(id) => id,
+            None => match self.inspect_binary_for_pipeline(exe_path) {
+                InspectOutcome::Completed(id) => id,
+                InspectOutcome::Cancelled => return,
+            },
+        };
         for ip in external_ips {
             let decision = evaluate_outbound_policy(&bin_identity, ip, Some(norm_query), &rules);
             match decision {
@@ -417,7 +426,10 @@ impl DaemonEngine {
         };
         if has_permit {
             let rules = self.store.list_network_rules().unwrap_or_default();
-            let identity = self.inspector.inspect(trimmed);
+            let identity = match self.inspect_binary_for_pipeline(trimmed) {
+                InspectOutcome::Completed(id) => id,
+                InspectOutcome::Cancelled => return,
+            };
             let still_authorized = if has_app_wide_permit {
                 rules
                     .iter()
@@ -484,7 +496,10 @@ impl DaemonEngine {
                         .is_some_and(|s| !s.trim().is_empty())
             });
             let identity = if needs_inspect {
-                self.inspector.inspect(trimmed)
+                match self.inspect_binary_for_pipeline(trimmed) {
+                    InspectOutcome::Completed(id) => id,
+                    InspectOutcome::Cancelled => return,
+                }
             } else {
                 BinaryIdentity {
                     exe_path: trimmed.to_string(),

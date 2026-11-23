@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::firewall::{WfpFilterOrigin, WfpRuleManager};
 use crate::process_table::ProcessStartResolution;
 
-use super::{current_unix_ms, event_timestamp_ms, DaemonEngine};
+use super::{current_unix_ms, event_timestamp_ms, DaemonEngine, InspectOutcome};
 
 pub(super) struct DnsCorrelationUpdate {
     pub(super) instance_id: String,
@@ -62,11 +62,13 @@ impl DaemonEngine {
         }
         if proc_ctx.skip_store_ingest {
             if let Some(inst_id) = instance_id {
-                if let Err(err) = self.store.update_process_motw_metadata(
-                    inst_id,
-                    Some(&motw.origin_url),
-                    motw.sha256.as_deref(),
-                ) {
+                if let Some(Err(err)) = self.try_store_write(|s| {
+                    s.update_process_motw_metadata(
+                        inst_id,
+                        Some(&motw.origin_url),
+                        motw.sha256.as_deref(),
+                    )
+                }) {
                     tracing::warn!(
                         process_instance_id = %inst_id,
                         error = %err,
@@ -84,6 +86,9 @@ impl DaemonEngine {
     }
 
     pub(super) fn apply_late_motw_attribution(&self, late: super::motw::LateMotwAttribution) {
+        if self.is_shutdown_drain_cutoff() {
+            return;
+        }
         let mut persist_instance_ids: Vec<String> = Vec::new();
         let mut active_instances: Vec<(String, u32)> = Vec::new();
         {
@@ -118,19 +123,21 @@ impl DaemonEngine {
         }
 
         for inst_id in &persist_instance_ids {
-            match self.store.update_process_motw_metadata(
-                inst_id,
-                Some(&late.attribution.origin_url),
-                late.attribution.sha256.as_deref(),
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
+            match self.try_store_write(|s| {
+                s.update_process_motw_metadata(
+                    inst_id,
+                    Some(&late.attribution.origin_url),
+                    late.attribution.sha256.as_deref(),
+                )
+            }) {
+                Some(Ok(true)) | None => {}
+                Some(Ok(false)) => {
                     tracing::debug!(
                         process_instance_id = %inst_id,
                         "delayed MOTW backfill found no matching process row in SQLite store"
                     );
                 }
-                Err(err) => {
+                Some(Err(err)) => {
                     tracing::warn!(
                         process_instance_id = %inst_id,
                         error = %err,
@@ -419,7 +426,8 @@ impl DaemonEngine {
                 value: "injected record_alert failure".to_string(),
             })
         } else {
-            self.store.record_alert(&alert)
+            self.try_store_write(|s| s.record_alert(&alert))
+                .unwrap_or_else(|| Err(Self::store_write_closed_err()))
         };
 
         if let Err(err) = record_result {
@@ -487,12 +495,13 @@ impl DaemonEngine {
                                 .process_dns_history
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .record_for_exe(
+                                .record_for_exe_with_created_at(
                                     inst_id,
                                     exe_k_opt.as_deref().unwrap_or(""),
                                     query_name,
                                     resolved_ips,
                                     event_ts_ms,
+                                    proc_ctx.proc_created_at_ms,
                                 );
                             if let Some(exe_k) = exe_k_opt {
                                 if !accepted.is_empty() {
@@ -535,23 +544,27 @@ impl DaemonEngine {
         };
 
         if !proc_ctx.skip_store_ingest {
-            if let Err(err) = self.store.ingest_event_with_process_metadata(
-                effective_event,
-                proc_ctx.store_hint.as_deref(),
-                proc_ctx.exited_at_ms,
-                proc_ctx
-                    .superseded_exit
-                    .as_ref()
-                    .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
-                proc_ctx.origin_url.as_deref(),
-                proc_ctx.proc_sha256.as_deref(),
-                is_nrd,
-                action,
-            ) {
-                tracing::warn!(error = %err, "failed to ingest event into SQLite store");
-            } else if flush_now {
-                if let Err(err) = self.store.flush_batch() {
-                    tracing::warn!(error = %err, "failed to flush network alert telemetry batch");
+            if let Some(res) = self.try_store_write(|s| {
+                s.ingest_event_with_process_metadata(
+                    effective_event,
+                    proc_ctx.store_hint.as_deref(),
+                    proc_ctx.exited_at_ms,
+                    proc_ctx
+                        .superseded_exit
+                        .as_ref()
+                        .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
+                    proc_ctx.origin_url.as_deref(),
+                    proc_ctx.proc_sha256.as_deref(),
+                    is_nrd,
+                    action,
+                )
+            }) {
+                if let Err(err) = res {
+                    tracing::warn!(error = %err, "failed to ingest event into SQLite store");
+                } else if flush_now {
+                    if let Some(Err(err)) = self.try_store_write(|s| s.flush_batch()) {
+                        tracing::warn!(error = %err, "failed to flush network alert telemetry batch");
+                    }
                 }
             }
         }
@@ -575,7 +588,8 @@ impl DaemonEngine {
                 value: "injected record_alert failure".to_string(),
             })
         } else {
-            self.store.record_alert(alert)
+            self.try_store_write(|s| s.record_alert(alert))
+                .unwrap_or_else(|| Err(Self::store_write_closed_err()))
         }
     }
 
@@ -854,18 +868,20 @@ impl DaemonEngine {
             command_line: command_line.clone(),
             user_sid: None,
         };
-        if let Err(err) = self.store.ingest_event_with_process_metadata(
-            &synthetic_start,
-            res.parent_instance_id.as_deref(),
-            res.exited_at_ms,
-            res.superseded_exit
-                .as_ref()
-                .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
-            proc_ctx.origin_url.as_deref(),
-            proc_ctx.proc_sha256.as_deref(),
-            false,
-            "OBSERVED",
-        ) {
+        if let Some(Err(err)) = self.try_store_write(|s| {
+            s.ingest_event_with_process_metadata(
+                &synthetic_start,
+                res.parent_instance_id.as_deref(),
+                res.exited_at_ms,
+                res.superseded_exit
+                    .as_ref()
+                    .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
+                proc_ctx.origin_url.as_deref(),
+                proc_ctx.proc_sha256.as_deref(),
+                false,
+                "OBSERVED",
+            )
+        }) {
             tracing::warn!(
                 pid,
                 error = %err,
@@ -925,13 +941,15 @@ impl DaemonEngine {
             .as_deref()
             .is_some_and(|inst_id| self.has_rule_alert_emitted(inst_id, &dedup_key));
         if already_emitted {
-            if let Err(err) = self.store.ingest_event_with_exit(
-                event,
-                proc_ctx.store_hint.as_deref(),
-                None,
-                false,
-                "DEDUP_SUPPRESSED",
-            ) {
+            if let Some(Err(err)) = self.try_store_write(|s| {
+                s.ingest_event_with_exit(
+                    event,
+                    proc_ctx.store_hint.as_deref(),
+                    None,
+                    false,
+                    "DEDUP_SUPPRESSED",
+                )
+            }) {
                 tracing::warn!(error = %err, "failed to ingest deduplicated canary event");
             }
             return;
@@ -945,7 +963,10 @@ impl DaemonEngine {
                 authenticode: None,
             }
         } else {
-            self.inspector.inspect(&exe_path)
+            match self.inspect_binary_for_pipeline(&exe_path) {
+                InspectOutcome::Completed(id) => id,
+                InspectOutcome::Cancelled => return,
+            }
         };
 
         let rules = self.store.list_rules(Some(RuleScope::FileCanaryAllow)).unwrap_or_default();
@@ -958,15 +979,21 @@ impl DaemonEngine {
             );
 
         if allowed {
-            if let Err(err) = self.store.ingest_event_with_exit(
-                event,
-                proc_ctx.store_hint.as_deref(),
-                None,
-                false,
-                "ALLOWED",
-            ) {
+            if let Some(Err(err)) = self.try_store_write(|s| {
+                s.ingest_event_with_exit(
+                    event,
+                    proc_ctx.store_hint.as_deref(),
+                    None,
+                    false,
+                    "ALLOWED",
+                )
+            }) {
                 tracing::warn!(error = %err, "failed to ingest allowed canary event");
             }
+            return;
+        }
+
+        if self.is_shutdown_drain_cutoff() {
             return;
         }
 
@@ -1093,7 +1120,8 @@ impl DaemonEngine {
                 value: "injected record_alert failure".to_string(),
             })
         } else {
-            self.store.record_alert(&alert)
+            self.try_store_write(|s| s.record_alert(&alert))
+                .unwrap_or_else(|| Err(Self::store_write_closed_err()))
         };
 
         if let Err(err) = record_result {
@@ -1131,13 +1159,15 @@ impl DaemonEngine {
             } else {
                 "ALERTED"
             };
-            if let Err(ingest_err) = self.store.ingest_event_with_exit(
-                event,
-                proc_ctx.store_hint.as_deref(),
-                None,
-                false,
-                action,
-            ) {
+            if let Some(Err(ingest_err)) = self.try_store_write(|s| {
+                s.ingest_event_with_exit(
+                    event,
+                    proc_ctx.store_hint.as_deref(),
+                    None,
+                    false,
+                    action,
+                )
+            }) {
                 tracing::warn!(error = %ingest_err, "failed to ingest canary event after alert error");
             }
             return;
@@ -1150,13 +1180,15 @@ impl DaemonEngine {
         } else {
             "ALERTED"
         };
-        if let Err(err) = self.store.ingest_event_with_exit(
-            event,
-            proc_ctx.store_hint.as_deref(),
-            None,
-            false,
-            action,
-        ) {
+        if let Some(Err(err)) = self.try_store_write(|s| {
+            s.ingest_event_with_exit(
+                event,
+                proc_ctx.store_hint.as_deref(),
+                None,
+                false,
+                action,
+            )
+        }) {
             tracing::warn!(error = %err, "failed to ingest canary event");
         }
 
@@ -1294,6 +1326,7 @@ impl DaemonEngine {
                     motw_referrer,
                     motw_frame_url,
                     motw_zone_id,
+                    proc_created_at_ms,
                 ) = if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
                     let differs = entry.identity != *identity
                         || entry.ppid != *parent_pid
@@ -1316,6 +1349,7 @@ impl DaemonEngine {
                         entry.motw_referrer.clone(),
                         entry.motw_frame_url.clone(),
                         entry.motw_zone_id,
+                        Some(entry.created_at_ms),
                     )
                 } else {
                     (
@@ -1327,6 +1361,12 @@ impl DaemonEngine {
                         None,
                         None,
                         None,
+                        (res.resolved_identity.create_time_100ns != 0).then(|| {
+                            super::filetime_100ns_to_unix_ms(
+                                res.resolved_identity.create_time_100ns,
+                                event_ts_ms,
+                            )
+                        }),
                     )
                 };
                 ResolvedProcessContext {
@@ -1349,6 +1389,7 @@ impl DaemonEngine {
                     motw_frame_url,
                     motw_zone_id,
                     proc_sha256: None,
+                    proc_created_at_ms,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
@@ -1376,6 +1417,7 @@ impl DaemonEngine {
                     motw_frame_url: None,
                     motw_zone_id: None,
                     proc_sha256: None,
+                    proc_created_at_ms: None,
                 }
             }
             SensorEvent::DnsQuery { pid, .. }
@@ -1395,6 +1437,7 @@ impl DaemonEngine {
                     motw_referrer,
                     motw_frame_url,
                     motw_zone_id,
+                    created_at_ms,
                 )) = table.lookup_by_pid_at(*pid, event_ts_ms).map(|e| {
                     (
                         e.identity,
@@ -1407,6 +1450,7 @@ impl DaemonEngine {
                         e.motw_referrer.clone(),
                         e.motw_frame_url.clone(),
                         e.motw_zone_id,
+                        e.created_at_ms,
                     )
                 })
                 else {
@@ -1439,6 +1483,7 @@ impl DaemonEngine {
                     motw_frame_url,
                     motw_zone_id,
                     proc_sha256: None,
+                    proc_created_at_ms: Some(created_at_ms),
                 }
             }
         }
@@ -1496,6 +1541,7 @@ pub(super) struct ResolvedProcessContext {
     pub(super) motw_frame_url: Option<String>,
     pub(super) motw_zone_id: Option<u32>,
     pub(super) proc_sha256: Option<String>,
+    pub(super) proc_created_at_ms: Option<i64>,
 }
 
 impl Default for ResolvedProcessContext {
@@ -1520,6 +1566,7 @@ impl Default for ResolvedProcessContext {
             motw_frame_url: None,
             motw_zone_id: None,
             proc_sha256: None,
+            proc_created_at_ms: None,
         }
     }
 }
@@ -1656,7 +1703,10 @@ mod tests {
             Arc::new(NoopNotifier),
             Arc::new(EmptyInspector),
         );
-        engine.shutdown_and_flush().await.expect("stop pipeline");
+        if let Some(h) = engine.worker_handle.lock().await.take() {
+            h.abort();
+            let _ = h.await;
+        }
 
         let base_ft = 134_000_000_000_000_000u64;
         let base_ms = 1_760_025_000_000i64;

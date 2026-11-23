@@ -273,7 +273,8 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
         make_net_rule, make_queued_drop, send_dns, send_dns_typed, send_process_start,
         send_process_stop, start_stopped_engine, FixedShaInspector, TestDefense,
     };
-    use super::{current_unix_ms, DaemonConfig, DaemonEngine, PendingWfpDrop, WfpRuleManager};
+    use super::super::wfp_drops::PendingWfpDropReason;
+use super::{current_unix_ms, DaemonConfig, DaemonEngine, PendingWfpDrop, WfpRuleManager};
     use ledr_proto::{ProcessIdentity, RuleScope};
     use ledr_rules::{EarlyPruner, SigmaEngine};
     use ledr_store::LedrStore;
@@ -348,6 +349,10 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
         pending.push_back(PendingWfpDrop {
             item: make_queued_drop(exe, v4_stale, now_ms + 250, 1),
             deadline: future_deadline,
+            dns_deadline: Some(future_deadline),
+            reason: PendingWfpDropReason::DnsGrace,
+            parked_single_instance_id: Some(inst_id.clone()),
+            confirmed_ambiguous: false,
         });
         engine.flush_ready_pending_wfp_drops(
             &inst_id,
@@ -367,6 +372,10 @@ fn daemon_p3_43b_r03_accepted_ips_and_flush_ready_history_guard() {
         pending.push_back(PendingWfpDrop {
             item: make_queued_drop(exe, v6_new, now_ms + 250, 2),
             deadline: future_deadline,
+            dns_deadline: Some(future_deadline),
+            reason: PendingWfpDropReason::DnsGrace,
+            parked_single_instance_id: Some(inst_id.clone()),
+            confirmed_ambiguous: false,
         });
         engine.flush_ready_pending_wfp_drops(
             &inst_id,

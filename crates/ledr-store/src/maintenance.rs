@@ -22,6 +22,21 @@ impl LedrStore {
         now_ms: i64,
         retention_days: u32,
     ) -> Result<PurgeStats, StoreError> {
+        self.purge_expired_with_guard(now_ms, retention_days, || Some(()))
+    }
+
+    /// Variant of [`Self::purge_expired`] that acquires a caller-supplied RAII batch guard
+    /// per batch transaction (released before any inter-batch sleep), aborting cleanly if
+    /// `acquire_batch_guard` returns `None` (`FU-E2E-05`).
+    pub fn purge_expired_with_guard<G, B>(
+        &self,
+        now_ms: i64,
+        retention_days: u32,
+        mut acquire_batch_guard: G,
+    ) -> Result<PurgeStats, StoreError>
+    where
+        G: FnMut() -> Option<B>,
+    {
         let retention_ms = i64::from(retention_days).saturating_mul(MS_PER_DAY);
         let cutoff_ms = now_ms.saturating_sub(retention_ms);
         let batch_limit = i64::try_from(TTL_PURGE_BATCH_LIMIT).unwrap_or(500);
@@ -31,49 +46,64 @@ impl LedrStore {
             return Ok(stats);
         }
 
-        stats.alerts_deleted = self.purge_in_batches(|tx| {
-            tx.execute(
-                "DELETE FROM alerts
-                 WHERE alert_id IN (
-                     SELECT alert_id FROM alerts
-                     WHERE timestamp_ms < ?1
-                       AND status NOT IN ('PENDING', 'EXPIRED_SUSPENDED')
-                     LIMIT ?2
-                 )",
-                params![cutoff_ms, batch_limit],
-            )
-        })?;
-        if self.is_shutdown_requested() {
-            return Ok(stats);
-        }
-
-        stats.dns_deleted =
-            self.purge_by_timestamp_id("dns_queries", "timestamp_ms", cutoff_ms, batch_limit)?;
-        if self.is_shutdown_requested() {
-            return Ok(stats);
-        }
-
-        stats.network_deleted =
-            self.purge_by_timestamp_id("network_events", "timestamp_ms", cutoff_ms, batch_limit)?;
-        if self.is_shutdown_requested() {
-            return Ok(stats);
-        }
-
-        stats.canary_deleted = self.purge_by_timestamp_id(
-            "file_canary_events",
-            "timestamp_ms",
-            cutoff_ms,
-            batch_limit,
+        stats.alerts_deleted = self.purge_in_batches_with_guard(
+            &mut acquire_batch_guard,
+            |tx| {
+                tx.execute(
+                    "DELETE FROM alerts
+                     WHERE alert_id IN (
+                         SELECT alert_id FROM alerts
+                         WHERE timestamp_ms < ?1
+                           AND status NOT IN ('PENDING', 'EXPIRED_SUSPENDED')
+                         LIMIT ?2
+                     )",
+                    params![cutoff_ms, batch_limit],
+                )
+            },
         )?;
         if self.is_shutdown_requested() {
             return Ok(stats);
         }
 
-        stats.downloads_deleted = self.purge_by_timestamp_id(
+        stats.dns_deleted = self.purge_by_timestamp_id_with_guard(
+            "dns_queries",
+            "timestamp_ms",
+            cutoff_ms,
+            batch_limit,
+            &mut acquire_batch_guard,
+        )?;
+        if self.is_shutdown_requested() {
+            return Ok(stats);
+        }
+
+        stats.network_deleted = self.purge_by_timestamp_id_with_guard(
+            "network_events",
+            "timestamp_ms",
+            cutoff_ms,
+            batch_limit,
+            &mut acquire_batch_guard,
+        )?;
+        if self.is_shutdown_requested() {
+            return Ok(stats);
+        }
+
+        stats.canary_deleted = self.purge_by_timestamp_id_with_guard(
+            "file_canary_events",
+            "timestamp_ms",
+            cutoff_ms,
+            batch_limit,
+            &mut acquire_batch_guard,
+        )?;
+        if self.is_shutdown_requested() {
+            return Ok(stats);
+        }
+
+        stats.downloads_deleted = self.purge_by_timestamp_id_with_guard(
             "download_origins",
             "downloaded_at_ms",
             cutoff_ms,
             batch_limit,
+            &mut acquire_batch_guard,
         )?;
         if self.is_shutdown_requested() {
             return Ok(stats);
@@ -81,28 +111,31 @@ impl LedrStore {
 
         // Bottom-up batched purge: each pass removes expired exited leaf processes that have
         // neither unpurged children nor unresolved (PENDING / EXPIRED_SUSPENDED) alerts.
-        stats.processes_deleted = self.purge_in_batches(|tx| {
-            tx.execute(
-                "DELETE FROM processes
-                 WHERE process_instance_id IN (
-                     SELECT p.process_instance_id
-                     FROM processes p
-                     WHERE p.exited_at_ms IS NOT NULL
-                       AND p.exited_at_ms < ?1
-                       AND NOT EXISTS (
-                           SELECT 1 FROM processes c
-                           WHERE c.parent_instance_id = p.process_instance_id
-                       )
-                       AND NOT EXISTS (
-                           SELECT 1 FROM alerts a
-                           WHERE a.process_instance_id = p.process_instance_id
-                             AND a.status IN ('PENDING', 'EXPIRED_SUSPENDED')
-                       )
-                     LIMIT ?2
-                 )",
-                params![cutoff_ms, batch_limit],
-            )
-        })?;
+        stats.processes_deleted = self.purge_in_batches_with_guard(
+            &mut acquire_batch_guard,
+            |tx| {
+                tx.execute(
+                    "DELETE FROM processes
+                     WHERE process_instance_id IN (
+                         SELECT p.process_instance_id
+                         FROM processes p
+                         WHERE p.exited_at_ms IS NOT NULL
+                           AND p.exited_at_ms < ?1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM processes c
+                               WHERE c.parent_instance_id = p.process_instance_id
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM alerts a
+                               WHERE a.process_instance_id = p.process_instance_id
+                                 AND a.status IN ('PENDING', 'EXPIRED_SUSPENDED')
+                           )
+                         LIMIT ?2
+                     )",
+                    params![cutoff_ms, batch_limit],
+                )
+            },
+        )?;
 
         Ok(stats)
     }
@@ -217,8 +250,21 @@ impl LedrStore {
         Ok(updated)
     }
 
-    pub(crate) fn purge_in_batches<F>(&self, mut delete_batch: F) -> Result<usize, StoreError>
+    #[cfg(test)]
+    pub(crate) fn purge_in_batches<F>(&self, delete_batch: F) -> Result<usize, StoreError>
     where
+        F: FnMut(&Transaction<'_>) -> rusqlite::Result<usize>,
+    {
+        self.purge_in_batches_with_guard(&mut || Some(()), delete_batch)
+    }
+
+    pub(crate) fn purge_in_batches_with_guard<G, B, F>(
+        &self,
+        acquire_batch_guard: &mut G,
+        mut delete_batch: F,
+    ) -> Result<usize, StoreError>
+    where
+        G: FnMut() -> Option<B>,
         F: FnMut(&Transaction<'_>) -> rusqlite::Result<usize>,
     {
         let mut total_deleted = 0usize;
@@ -227,7 +273,16 @@ impl LedrStore {
                 break;
             }
             let deleted = {
+                let Some(_batch_guard) = acquire_batch_guard() else {
+                    break;
+                };
+                if self.is_shutdown_requested() {
+                    break;
+                }
                 let mut writer = self.lock_writer()?;
+                if self.is_shutdown_requested() {
+                    break;
+                }
                 let tx = writer.transaction()?;
                 let deleted = delete_batch(&tx)?;
                 tx.commit()?;
@@ -248,13 +303,17 @@ impl LedrStore {
         Ok(total_deleted)
     }
 
-    fn purge_by_timestamp_id(
+    fn purge_by_timestamp_id_with_guard<G, B>(
         &self,
         table: &str,
         ts_col: &str,
         cutoff_ms: i64,
         batch_limit: i64,
-    ) -> Result<usize, StoreError> {
+        acquire_batch_guard: &mut G,
+    ) -> Result<usize, StoreError>
+    where
+        G: FnMut() -> Option<B>,
+    {
         let sql = format!(
             "DELETE FROM {table}
              WHERE id IN (
@@ -263,6 +322,8 @@ impl LedrStore {
                  LIMIT ?2
              )"
         );
-        self.purge_in_batches(|tx| tx.execute(&sql, params![cutoff_ms, batch_limit]))
+        self.purge_in_batches_with_guard(acquire_batch_guard, |tx| {
+            tx.execute(&sql, params![cutoff_ms, batch_limit])
+        })
     }
 }

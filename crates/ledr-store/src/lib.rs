@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ledr_proto::{
     AlertStatus, DownloadOriginRecord, SensorEvent, DEFAULT_TTL_RETENTION_DAYS,
@@ -223,6 +223,12 @@ impl LedrStore {
         self.inner.shutdown_requested.store(true, Ordering::Release);
     }
 
+    /// Clears the shutdown flag when a new engine instance starts on an existing [`LedrStore`]
+    /// (`FU-E2E-05`).
+    pub fn clear_shutdown_flag(&self) {
+        self.inner.shutdown_requested.store(false, Ordering::Release);
+    }
+
     /// Returns `true` after [`LedrStore::request_shutdown`] has been invoked (`BUG_0004`).
     pub fn is_shutdown_requested(&self) -> bool {
         self.inner.shutdown_requested.load(Ordering::Acquire)
@@ -343,19 +349,71 @@ impl LedrStore {
 
     /// Flushes all buffered events and executes `PRAGMA wal_checkpoint(TRUNCATE);` (`AUTO-10`).
     pub fn checkpoint_truncate(&self) -> Result<(), StoreError> {
-        self.flush_batch()?;
-        let writer = self.lock_writer()?;
-        let (busy, log_frames, checkpointed): (i64, i64, i64) =
-            writer.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
-        tracing::debug!(
-            busy,
-            log_frames,
-            checkpointed,
-            "completed wal_checkpoint(TRUNCATE)"
-        );
+        let _ = self.checkpoint_truncate_with_deadline(
+            std::time::Instant::now() + std::time::Duration::from_millis(5_000),
+        )?;
         Ok(())
+    }
+
+    /// Flushes all buffered events and executes `PRAGMA wal_checkpoint(TRUNCATE);`, capping
+    /// SQLite's per-attempt `busy_timeout` and retrying briefly until `deadline` if SQLite
+    /// reports `busy != 0` (`FU-E2E-05`).
+    ///
+    /// Returns `Ok(true)` if WAL truncation completed (`busy == 0`), or `Ok(false)` if
+    /// `deadline` elapsed while another reader still held a WAL lock (`busy != 0`).
+    pub fn checkpoint_truncate_with_deadline(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<bool, StoreError> {
+        struct BusyTimeoutReset<'a>(&'a Connection);
+        impl Drop for BusyTimeoutReset<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.busy_timeout(Duration::from_millis(5_000));
+            }
+        }
+
+        self.flush_batch()?;
+        loop {
+            let now = std::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            let slice = if remaining.is_zero() {
+                Duration::ZERO
+            } else {
+                remaining.min(Duration::from_millis(50))
+            };
+            let (busy, log_frames, checkpointed): (i64, i64, i64) = {
+                let writer = self.lock_writer()?;
+                let _reset = BusyTimeoutReset(&writer);
+                writer.busy_timeout(slice)?;
+                writer.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+            };
+            if busy == 0 {
+                tracing::debug!(
+                    busy,
+                    log_frames,
+                    checkpointed,
+                    "completed wal_checkpoint(TRUNCATE)"
+                );
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    busy,
+                    log_frames,
+                    checkpointed,
+                    "wal_checkpoint(TRUNCATE) finished with busy flag at deadline"
+                );
+                return Ok(false);
+            }
+            let sleep_for = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(10));
+            if !sleep_for.is_zero() {
+                std::thread::sleep(sleep_for);
+            }
+        }
     }
 }
 

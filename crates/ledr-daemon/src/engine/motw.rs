@@ -19,7 +19,7 @@ use ledr_store::{LedrStore, StoreError};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use super::{current_unix_ms, BinaryInspector, DaemonEngine};
+use super::{current_unix_ms, BinaryInspector, DaemonEngine, StoreWriteGate};
 
 /// Maximum file size (128 MiB) hashed with SHA-256 on `ReportDownloadOrigin` and Stage 2 lookup.
 pub const MAX_DOWNLOAD_HASH_BYTES: u64 = 128 * 1024 * 1024;
@@ -1622,6 +1622,9 @@ impl DaemonEngine {
             sha256,
             zone_info,
         );
+        let Some(_write_guard) = StoreWriteGate::enter_sql_write(&self.store_write_gate) else {
+            return Err(BrowserReportError::Cancelled);
+        };
         persist_download_origin_idempotent(&self.store, &self.download_origin_state, record, None)
     }
 
@@ -1697,7 +1700,14 @@ impl DaemonEngine {
         let store = self.store.clone();
         let dl_state = Arc::clone(&self.download_origin_state);
         let write_cancel = Arc::clone(&cancel);
+        let write_gate = Arc::clone(&self.store_write_gate);
         let persisted = tokio::task::spawn_blocking(move || {
+            let Some(_write_guard) = StoreWriteGate::enter_sql_write(&write_gate) else {
+                return Err(BrowserReportError::Cancelled);
+            };
+            if write_cancel.load(Ordering::Acquire) {
+                return Err(BrowserReportError::Cancelled);
+            }
             persist_download_origin_idempotent(&store, &dl_state, record, Some(&write_cancel))
         })
         .await
@@ -1795,6 +1805,9 @@ impl DaemonEngine {
         details: Option<&str>,
         timestamp_ms: i64,
     ) -> Result<BrowserEventOutcome, BrowserReportError> {
+        if self.is_shutdown_drain_cutoff() {
+            return Err(BrowserReportError::Cancelled);
+        }
         let clean_url = url.trim();
         if clean_url.is_empty() {
             return Err(BrowserReportError::Invalid(

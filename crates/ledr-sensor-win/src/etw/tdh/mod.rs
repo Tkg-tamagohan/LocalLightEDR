@@ -5,7 +5,8 @@ mod process;
 
 pub(crate) use decode::{decode_tdh_string, inspect_raw_utf16_bytes, parse_dns_query_results};
 pub(crate) use process::{
-    ProcessInspectInfo, filetime_100ns_to_unix_ms, filetime_to_u64, inspect_process_by_pid,
+    PidBasicInspect, ProcessInspectInfo, filetime_100ns_to_unix_ms, filetime_to_u64,
+    inspect_process_basic_by_pid, inspect_process_by_pid,
 };
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

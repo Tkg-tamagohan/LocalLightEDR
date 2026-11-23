@@ -10,7 +10,7 @@ use ledr_proto::{
 use ledr_store::{
     default_alert_status, default_retention_days, sqlite_version, store_version, LedrStore,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
 
 const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
@@ -1551,3 +1551,84 @@ fn store_10_pr23_u2_out_of_order_superseded_exit_closes_late_placeholder() {
     );
     assert_eq!(rl_b.exited_at_ms, None, "real B row must remain running");
 }
+
+/// `STORE-11` (`PRRT_kwDOVyjVyM66riuS`, `FU-E2E-05`): `checkpoint_truncate_with_deadline` caps
+/// SQLite's `busy_timeout` so an active reader holding the WAL lock causes an immediate bounded
+/// `Ok(false)` instead of stalling 5,000 ms, and completes (`Ok(true)`, 0-byte WAL) once the
+/// reader releases its snapshot.
+#[test]
+fn store_11_checkpoint_truncate_with_deadline_respects_budget_under_reader_lock() {
+    let dir = TempDir::new().expect("create temp dir");
+    let db_path = dir.path().join("bounded_checkpoint_reader.db");
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    let store = LedrStore::open(&db_path).expect("open LedrStore");
+
+    let (_, ev1) = make_process_start(
+        101,
+        1_750_000_000_000,
+        4,
+        r"C:\Tools\wal_reader_block_1.exe",
+        "wal_reader_block_1.exe",
+    );
+    store
+        .ingest_event(&ev1, Some("4:1"), false, "OBSERVED")
+        .expect("ingest ev1");
+    store.flush_batch().expect("flush ev1");
+
+    // Hold a WAL read snapshot on a separate read-only connection, then append a second WAL write
+    // AFTER the snapshot begins so `TRUNCATE` cannot truncate past the reader's WAL mark.
+    let reader = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open secondary readonly connection");
+    reader
+        .execute_batch("BEGIN DEFERRED; SELECT COUNT(*) FROM processes;")
+        .expect("acquire active WAL reader snapshot");
+
+    let (_, ev2) = make_process_start(
+        102,
+        1_750_000_001_000,
+        4,
+        r"C:\Tools\wal_reader_block_2.exe",
+        "wal_reader_block_2.exe",
+    );
+    store
+        .ingest_event(&ev2, Some("4:1"), false, "OBSERVED")
+        .expect("ingest ev2 while reader holds older snapshot");
+    store.flush_batch().expect("flush ev2");
+    assert!(
+        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0) > 0,
+        "WAL must be non-empty before checkpoint attempt"
+    );
+
+    let started = Instant::now();
+    let completed = store
+        .checkpoint_truncate_with_deadline(Instant::now() + Duration::from_millis(120))
+        .expect("bounded checkpoint must not error when WAL reader is busy");
+    let elapsed = started.elapsed();
+    assert!(
+        !completed,
+        "checkpoint_truncate_with_deadline must return Ok(false) while WAL reader holds older snapshot"
+    );
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "checkpoint_truncate_with_deadline must respect ~120ms deadline instead of stalling 5000ms (took {elapsed:?})"
+    );
+
+    reader.execute_batch("COMMIT;").expect("release WAL reader snapshot");
+    drop(reader);
+
+    let completed_after = store
+        .checkpoint_truncate_with_deadline(Instant::now() + Duration::from_millis(500))
+        .expect("checkpoint after reader release");
+    assert!(
+        completed_after,
+        "checkpoint_truncate_with_deadline must return Ok(true) once WAL reader releases lock"
+    );
+    if wal_path.exists() {
+        assert_eq!(
+            std::fs::metadata(&wal_path).expect("stat wal").len(),
+            0,
+            "WAL must be truncated to 0 bytes after reader releases"
+        );
+    }
+}
+

@@ -509,9 +509,11 @@ impl DaemonEngine {
         // operations (alerts/policy rollbacks, per-batch TTL purges), and run final WAL truncation
         // strictly BEFORE waiting on any remaining NRD refresh thread (`AUTO-10`, `R-11`, `FU-E2E-05`).
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let cp_reserve = Duration::from_millis(200).min(remaining / 3);
         let gate_budget = remaining
-            .max(Duration::from_millis(100))
-            .min(Duration::from_millis(500));
+            .saturating_sub(cp_reserve)
+            .max(Duration::from_millis(50));
+        let mut gate_err: Option<anyhow::Error> = None;
         let gate_idle = self
             .store_write_gate
             .close_and_wait_idle(tokio::time::Instant::now() + gate_budget)
@@ -520,14 +522,45 @@ impl DaemonEngine {
             tracing::warn!(
                 "timed out waiting for in-flight store write operations before WAL checkpoint"
             );
+            gate_err = Some(anyhow::anyhow!(
+                "timed out waiting for in-flight store write operations before WAL checkpoint"
+            ));
+        }
+        let sql_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sql_budget = sql_remaining
+            .max(Duration::from_millis(50))
+            .min(Duration::from_millis(250));
+        let sql_idle = self
+            .store_write_gate
+            .seal_and_wait_sql_idle(tokio::time::Instant::now() + sql_budget)
+            .await;
+        if !sql_idle {
+            tracing::warn!(
+                "timed out waiting for active SQLite mutation to finish before WAL checkpoint"
+            );
+            if gate_err.is_none() {
+                gate_err = Some(anyhow::anyhow!(
+                    "timed out waiting for active SQLite mutation to finish before WAL checkpoint"
+                ));
+            }
         }
         let cp_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let cp_budget = cp_remaining
             .max(Duration::from_millis(100))
             .min(Duration::from_millis(500));
-        let _ = self
+        let checkpoint_completed = self
             .store
             .checkpoint_truncate_with_deadline(std::time::Instant::now() + cp_budget)?;
+        if !checkpoint_completed {
+            tracing::warn!(
+                "WAL checkpoint truncation did not complete within shutdown budget"
+            );
+            if gate_err.is_none() {
+                gate_err = Some(anyhow::anyhow!(
+                    "WAL checkpoint truncation did not complete within shutdown budget"
+                ));
+            }
+        }
 
         let nrd_handle = {
             let mut guard = self
@@ -573,7 +606,7 @@ impl DaemonEngine {
         // cancelling active file hashes and detaching wedged raw OS worker threads on timeout.
         self.motw_pool.shutdown_and_join(deadline).await;
 
-        if let Some(err) = drain_err {
+        if let Some(err) = drain_err.or(gate_err) {
             return Err(err);
         }
         Ok(())

@@ -777,8 +777,8 @@ impl LiveProcessInspector for SequenceLiveSiblingInspector {
 /// - Thread `#1`: First OS sibling probe sees `SiblingFound`; even if a follow-up OS probe would
 ///   return `NoneFound`, ambiguity evidence is preserved and `check_live_siblings_for_exe` is not
 ///   re-invoked on immediate dispatch (`0` suspends).
-/// - Thread `#3`: Retried drops on an already-known blocked exe with no domain allow rule do NOT
-///   run redundant binary inspection twice per drop (`0` inspections on already-alerted exe retries).
+/// - Thread `#3`: Retried drops on an ambiguous/blocked exe with no domain allow rule run
+///   at most 1 binary inspection per drop (never 2) while alert dedup suppresses duplicate alerts.
 /// - Thread `#5`: Under `DnsAndAttribution`, early sibling `ProcessStart` sets
 ///   `confirmed_ambiguous` while preserving independent `dns_deadline`, so an allowed `DnsQuery`
 ///   arriving inside `wfp_drop_dns_grace_ms` installs the Permit with `0` alerts and `0` suspends.
@@ -864,11 +864,66 @@ async fn daemon_p3_51b_single_pass_os_sibling_no_double_inspect_and_dns_and_attr
             "binary inspector must run at most once for an ambiguous drop without domain allow rules"
         );
 
-        // Retry past 250ms transport dedup: single candidate without allow rules will park in
-        // AttributionGrace (at most 1 inspect if parked, never 2), whereas with >1 candidate in
-        // ProcessTable it inspects at most once. Verify immediate second IP drop on already-parked
-        // single OS call does not double inspect on the dequeued path (`call_count` <= 1 delta).
+        // Retry past 250ms transport dedup with transient sibling present in ProcessTable:
+        // verify binary inspection increments by at most 1 (never 2), OS sibling scan does
+        // not repeat unnecessarily, and duplicate alert emission remains suppressed.
+        engine
+            .sender()
+            .send(SensorEvent::ProcessStart {
+                identity: transient_sib,
+                parent_pid: 4,
+                exe_path: python_exe.to_string(),
+                command_line: format!("\"{python_exe}\" worker.py"),
+                user_sid: None,
+            })
+            .await
+            .expect("send transient sibling start");
+        assert!(wait_until_unit(1_000, || engine.metrics().high_priority_processed >= 2).await);
+
+        let before_retry_inspections = counting_insp.call_count();
+        let before_retry_live_scans = seq_live.call_count();
+        assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 21,
+            rule_handle: 1,
+            exe_path: python_exe.to_string(),
+            protocol: 6,
+            dst_ip: dst_v4,
+            dst_port: 443,
+            timestamp_ms: base_ms + 300,
+        }));
+        assert!(
+            wait_until_unit(1_000, || {
+                counting_insp.call_count() > before_retry_inspections
+            })
+            .await,
+            "retry drop past 250ms dedup must reach dequeued handling"
+        );
         engine.shutdown_and_flush().await.expect("shutdown T1/T3");
+        assert_eq!(
+            counting_insp
+                .call_count()
+                .saturating_sub(before_retry_inspections),
+            1,
+            "retry drop must invoke binary inspector once, not twice"
+        );
+        assert_eq!(
+            seq_live.call_count(),
+            before_retry_live_scans,
+            "retry drop with siblings in ProcessTable must not re-run OS sibling scan"
+        );
+        assert_eq!(
+            store
+                .list_alerts(Some(AlertStatus::Pending), 20)
+                .expect("list alerts after retry")
+                .len(),
+            1,
+            "alert dedup must suppress duplicate alerts on retried drop"
+        );
+        assert_eq!(
+            defense.suspends(),
+            0,
+            "retry drop with live siblings must still prevent freeze"
+        );
     }
 
     // Thread #5: DnsAndAttribution keeps independent DnsGrace after early sibling ProcessStart.

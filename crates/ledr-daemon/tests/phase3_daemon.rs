@@ -9895,14 +9895,24 @@ async fn daemon_p3_56_store_write_gate_rollback_direct_ipc_and_ttl_purge_wal() {
         next_handle: AtomicU64,
         entered_resume: Arc<AtomicBool>,
         release_resume: Arc<AtomicBool>,
+        succeed_on_release: bool,
     }
 
     impl BlockingResumeDefense {
         fn new(entered_resume: Arc<AtomicBool>, release_resume: Arc<AtomicBool>) -> Self {
+            Self::new_with_result(entered_resume, release_resume, false)
+        }
+
+        fn new_with_result(
+            entered_resume: Arc<AtomicBool>,
+            release_resume: Arc<AtomicBool>,
+            succeed_on_release: bool,
+        ) -> Self {
             Self {
                 next_handle: AtomicU64::new(100),
                 entered_resume,
                 release_resume,
+                succeed_on_release,
             }
         }
     }
@@ -9926,7 +9936,14 @@ async fn daemon_p3_56_store_write_gate_rollback_direct_ipc_and_ttl_purge_wal() {
             } else {
                 wait_fn();
             }
-            Err(format!("OpenProcess(PID {}) failed: Access is denied.", target.pid))
+            if self.succeed_on_release {
+                Ok(())
+            } else {
+                Err(format!(
+                    "OpenProcess(PID {}) failed: Access is denied.",
+                    target.pid
+                ))
+            }
         }
         fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
             Ok(())
@@ -10152,6 +10169,94 @@ async fn daemon_p3_56_store_write_gate_rollback_direct_ipc_and_ttl_purge_wal() {
             .expect("shutdown stops purge cleanly and truncates WAL");
         assert_wal_zero(&db_path);
         tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_wal_zero(&db_path);
+    }
+
+    // Part D: Over-budget in-flight `resolve_alert` surfaces Err from `shutdown_and_flush` and
+    // is permanently sealed before final WAL truncation so late `update_alert_status` /
+    // `rollback_saved_rule` writes cannot regenerate `-wal` (`PRRT_kwDOVyjVyM66ryyT`).
+    {
+        let db_path = tmp_dir.join("resolve_over_budget_sealed_wal.db");
+        let store = LedrStore::open(&db_path).expect("open store D");
+        let entered_resume = Arc::new(AtomicBool::new(false));
+        let release_resume = Arc::new(AtomicBool::new(false));
+        let defense = Arc::new(BlockingResumeDefense::new_with_result(
+            Arc::clone(&entered_resume),
+            Arc::clone(&release_resume),
+            true,
+        ));
+        let engine = start_test_engine(
+            store.clone(),
+            DaemonConfig {
+                pipe_name: unique_test_pipe_name(),
+                shutdown_flush_timeout_ms: 250,
+                ..DaemonConfig::default()
+            },
+            defense,
+            Arc::new(MockNotifier::default()),
+            Arc::new(MapBinaryInspector::default()),
+        );
+
+        let now_ms = current_unix_ms();
+        let proc_id = ProcessIdentity::new(std::process::id(), unix_ms_to_filetime(now_ms - 500));
+        let inst_id = proc_id.instance_id();
+        let alert_id = "alert-p3-56-over-budget";
+        let exe_path = r"C:\Tools\p356_over_budget.exe";
+        let hash = "b".repeat(64);
+        send_process_start(&engine.sender(), proc_id, exe_path).await;
+        assert!(wait_until(1_000, || engine.metrics().high_priority_processed >= 1).await);
+
+        let ctx_json = serde_json::json!({
+            "exe_path": exe_path,
+            "sha256": hash,
+            "dst_ip": "198.51.100.203",
+            "dst_port": 443,
+        })
+        .to_string();
+        store
+            .record_alert(&AlertRecord {
+                alert_id: alert_id.to_string(),
+                timestamp_ms: now_ms,
+                severity: AlertSeverity::Medium,
+                source_layer: "LAYER_3_NETWORK".to_string(),
+                rule_id: "LEDR-NET-UNKNOWN-OUTBOUND".to_string(),
+                title: "Unknown outbound".to_string(),
+                process_instance_id: Some(inst_id),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: ctx_json,
+                resolved_at_ms: None,
+            })
+            .expect("seed suspended alert D");
+
+        let eng_resolve = Arc::clone(&engine);
+        let resolve_task = tokio::task::spawn_blocking(move || {
+            eng_resolve.resolve_alert_with_outcome(
+                alert_id,
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: false,
+                    allow_dest: None,
+                },
+            )
+        });
+        assert!(
+            wait_until(1_000, || entered_resume.load(Ordering::Acquire)).await,
+            "resolve_alert D must enter resume_process"
+        );
+
+        let shutdown_res = engine.shutdown_and_flush().await;
+        assert!(
+            shutdown_res.is_err(),
+            "over-budget in-flight StoreWriteGate must return Err from shutdown_and_flush"
+        );
+        assert_wal_zero(&db_path);
+
+        release_resume.store(true, Ordering::Release);
+        let resolve_res = resolve_task.await.expect("join resolve D");
+        assert!(
+            resolve_res.is_err(),
+            "late update_alert_status / rollback_saved_rule must be rejected after gate seal"
+        );
         assert_wal_zero(&db_path);
     }
 }

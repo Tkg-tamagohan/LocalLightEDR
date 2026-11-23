@@ -73,7 +73,9 @@ const AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS: i64 = 60_000;
 #[derive(Debug, Default)]
 struct WriteGateState {
     closed: bool,
+    sealed: bool,
     in_flight: usize,
+    active_sql_writes: usize,
 }
 
 /// Coordinates engine-initiated SQLite mutations with graceful shutdown (`FU-E2E-05`).
@@ -82,10 +84,15 @@ struct WriteGateState {
 /// `upsert_policy_rule`, `delete_policy_rule`) and per-batch TTL purges hold a [`WriteOpGuard`]
 /// across the whole logical operation, ensuring an already-admitted rollback completes before
 /// final `wal_checkpoint(TRUNCATE)` while new operations fail closed once shutdown starts.
+///
+/// If an admitted operation outlives the shutdown drain budget, [`StoreWriteGate::seal_and_wait_sql_idle`]
+/// permanently seals `WriteOpGuard::write` and waits for active SQLite calls to unwind before
+/// final WAL truncation so late post-checkpoint writes cannot regenerate `-wal`.
 #[derive(Debug, Default)]
 pub(super) struct StoreWriteGate {
     state: Mutex<WriteGateState>,
     notify_idle: tokio::sync::Notify,
+    notify_sql_idle: tokio::sync::Notify,
 }
 
 pub(super) struct WriteOpGuard {
@@ -102,12 +109,34 @@ impl Drop for WriteOpGuard {
     }
 }
 
+struct SqlWriteGuard<'a>(&'a StoreWriteGate);
+
+impl Drop for SqlWriteGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active_sql_writes = state.active_sql_writes.saturating_sub(1);
+        if state.active_sql_writes == 0 {
+            self.0.notify_sql_idle.notify_waiters();
+        }
+    }
+}
+
 impl WriteOpGuard {
     pub(super) fn write<T>(
         &self,
         store: &LedrStore,
         op: impl FnOnce(&LedrStore) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        {
+            let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.sealed {
+                return Err(StoreError::Io(std::io::Error::other(
+                    "store write gate sealed for shutdown checkpoint",
+                )));
+            }
+            state.active_sql_writes = state.active_sql_writes.saturating_add(1);
+        }
+        let _sql_guard = SqlWriteGuard(&self.gate);
         op(store)
     }
 }
@@ -115,7 +144,7 @@ impl WriteOpGuard {
 impl StoreWriteGate {
     pub(super) fn enter_op(gate: &Arc<Self>) -> Option<WriteOpGuard> {
         let mut state = gate.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.closed {
+        if state.closed || state.sealed {
             return None;
         }
         state.in_flight = state.in_flight.saturating_add(1);
@@ -143,6 +172,29 @@ impl StoreWriteGate {
                 return state.in_flight == 0;
             }
             notified.set(self.notify_idle.notified());
+        }
+    }
+
+    pub(super) async fn seal_and_wait_sql_idle(&self, deadline: tokio::time::Instant) -> bool {
+        let mut notified = std::pin::pin!(self.notify_sql_idle.notified());
+        loop {
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.closed = true;
+                state.sealed = true;
+                if state.active_sql_writes == 0 {
+                    return true;
+                }
+            }
+            if tokio::time::timeout_at(deadline, notified.as_mut())
+                .await
+                .is_err()
+            {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                return state.active_sql_writes == 0;
+            }
+            notified.set(self.notify_sql_idle.notified());
         }
     }
 }

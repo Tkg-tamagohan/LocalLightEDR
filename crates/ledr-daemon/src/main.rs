@@ -418,6 +418,9 @@ fn build_daemon_config(
         nrd_refresh_enabled: !cli.disable_nrd_refresh,
         nrd_cache_path,
         nrd_feed_urls,
+        wfp_drop_attribution_grace_ms: 1_200,
+        wfp_drop_live_sibling_os_check: true,
+        shutdown_skip_cold_binary_inspect: true,
         ..DaemonConfig::default()
     }
 }
@@ -592,6 +595,7 @@ async fn run_daemon(cli: CliArgs) -> anyhow::Result<()> {
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("Ctrl+C received; initiating graceful shutdown and WAL checkpoint");
+    engine.signal_early_shutdown();
 
     let stop_res = tokio::task::spawn_blocking(move || {
         let mut backend = active_backend;

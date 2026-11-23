@@ -24,7 +24,7 @@ use super::domain_policy::{
     select_outbound_decision_for_domains,
 };
 use super::events::ResolvedProcessContext;
-use super::DaemonEngine;
+use super::{DaemonEngine, InspectOutcome};
 
 /// Maximum number of verified process instances cached for app-wide `NetworkAllow` fast path.
 pub(super) const VERIFIED_APP_WIDE_ALLOW_CAPACITY: usize = 4_096;
@@ -380,6 +380,9 @@ impl DaemonEngine {
         domain_candidates: &[(String, i64)],
         event_ts_ms: i64,
     ) -> (&'static str, bool) {
+        if self.is_shutdown_drain_cutoff() {
+            return ("OBSERVED", false);
+        }
         if self.is_self_process(pid, exe_path) {
             self.outbound_classifier.mark_protected_os(pid);
             return ("OBSERVED", false);
@@ -528,7 +531,10 @@ impl DaemonEngine {
             }
         }
 
-        let bin_identity = self.inspector.inspect(exe_path);
+        let InspectOutcome::Completed(bin_identity) = self.inspect_binary_for_pipeline(exe_path)
+        else {
+            return ("OBSERVED", false);
+        };
         let (decision, effective_domain_hint) = select_outbound_decision_for_domains(
             &bin_identity,
             dst_ip,
@@ -1037,6 +1043,10 @@ impl DaemonEngine {
                 let mut newly_added_transient: Option<u64> = None;
                 let mut bound_existing_alert = false;
                 let mut wfp_shared_allow_once_deferred = false;
+
+                if should_enforce && self.is_shutdown_drain_cutoff() {
+                    return ("OBSERVED", false);
+                }
 
                 if !should_enforce {
                     tracing::info!(

@@ -16,7 +16,7 @@ pub use channel::{
 };
 pub use engine::{
     BinaryInspector, BrowserEventOutcome, BrowserReportError, DaemonConfig, DaemonEngine,
-    LiveProcessInspector, MotwAttribution, MotwInspector, MotwMatchStage,
+    InspectOutcome, LiveProcessInspector, MotwAttribution, MotwInspector, MotwMatchStage,
     OutboundEnforcementMode, PolicyRuleError, WindowsBinaryInspector, WindowsLiveProcessInspector,
     WindowsMotwInspector, DEFAULT_MAX_CONCURRENT_IPC_CLIENTS, MAX_BROWSER_EVENT_DETAILS_BYTES,
     MAX_DOWNLOAD_HASH_BYTES,

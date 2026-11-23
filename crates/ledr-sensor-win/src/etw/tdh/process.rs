@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::FILETIME;
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, FILETIME};
 use windows::Win32::System::Threading::{
     GetProcessId, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -53,6 +53,16 @@ pub(crate) struct ProcessInspectInfo {
     pub(crate) create_time_100ns: u64,
     pub(crate) exe_path: Option<String>,
     pub(crate) command_line: Option<String>,
+}
+
+/// Lightweight live process check result distinguishing `ERROR_ACCESS_DENIED` from exited/missing PIDs.
+pub(crate) enum PidBasicInspect {
+    Accessible {
+        create_time_100ns: u64,
+        exe_path: Option<String>,
+    },
+    AccessDenied,
+    GoneOrInvalid,
 }
 
 /// Returns current Unix epoch time in milliseconds.
@@ -154,6 +164,86 @@ pub(crate) fn inspect_process_by_pid(
         exe_path,
         command_line,
     })
+}
+
+/// Lightweight live process probe querying only creation time and image path (skipping PEB reads)
+/// while distinguishing `ERROR_ACCESS_DENIED` from exited or invalid PIDs.
+pub(crate) fn inspect_process_basic_by_pid(
+    pid: u32,
+    volume_map: Option<&DosVolumeMap>,
+) -> PidBasicInspect {
+    if pid == 0 {
+        return PidBasicInspect::GoneOrInvalid;
+    }
+
+    // SAFETY: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` is read-only metadata access.
+    let raw_handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => h,
+        Err(err) => {
+            if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
+                return PidBasicInspect::AccessDenied;
+            }
+            return PidBasicInspect::GoneOrInvalid;
+        }
+    };
+    let Some(handle) = OwnedHandle::new(raw_handle) else {
+        return PidBasicInspect::GoneOrInvalid;
+    };
+
+    // SAFETY: `handle` is an open process handle with `PROCESS_QUERY_LIMITED_INFORMATION`.
+    let actual_pid = unsafe { GetProcessId(handle.as_raw()) };
+    if actual_pid != pid {
+        return PidBasicInspect::GoneOrInvalid;
+    }
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: `handle` is open and all four `FILETIME` pointers are stack-allocated.
+    let create_time_100ns = if unsafe {
+        GetProcessTimes(
+            handle.as_raw(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    }
+    .is_ok()
+    {
+        filetime_to_u64(creation)
+    } else {
+        0
+    };
+
+    let mut path_buf = vec![0u16; 1024];
+    let mut path_len = path_buf.len() as u32;
+    // SAFETY: `handle` is valid and `path_buf` has `path_len` `u16` elements.
+    let exe_path = if unsafe {
+        QueryFullProcessImageNameW(
+            handle.as_raw(),
+            PROCESS_NAME_WIN32,
+            PWSTR(path_buf.as_mut_ptr()),
+            &mut path_len,
+        )
+    }
+    .is_ok()
+        && path_len > 0
+    {
+        let raw_slice = &path_buf[..(path_len as usize).min(path_buf.len())];
+        Some(match volume_map {
+            Some(map) => map.normalize_u16(raw_slice),
+            None => String::from_utf16_lossy(raw_slice),
+        })
+    } else {
+        None
+    };
+
+    PidBasicInspect::Accessible {
+        create_time_100ns,
+        exe_path,
+    }
 }
 
 fn query_handle_parent_pid(

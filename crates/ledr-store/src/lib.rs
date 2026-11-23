@@ -223,6 +223,12 @@ impl LedrStore {
         self.inner.shutdown_requested.store(true, Ordering::Release);
     }
 
+    /// Clears the shutdown flag when a new engine instance starts on an existing [`LedrStore`]
+    /// (`FU-E2E-05`).
+    pub fn clear_shutdown_flag(&self) {
+        self.inner.shutdown_requested.store(false, Ordering::Release);
+    }
+
     /// Returns `true` after [`LedrStore::request_shutdown`] has been invoked (`BUG_0004`).
     pub fn is_shutdown_requested(&self) -> bool {
         self.inner.shutdown_requested.load(Ordering::Acquire)
@@ -343,19 +349,44 @@ impl LedrStore {
 
     /// Flushes all buffered events and executes `PRAGMA wal_checkpoint(TRUNCATE);` (`AUTO-10`).
     pub fn checkpoint_truncate(&self) -> Result<(), StoreError> {
+        self.checkpoint_truncate_with_deadline(std::time::Instant::now())
+    }
+
+    /// Flushes all buffered events and executes `PRAGMA wal_checkpoint(TRUNCATE);`, retrying
+    /// briefly until `deadline` if SQLite reports `busy != 0` (`FU-E2E-05`).
+    pub fn checkpoint_truncate_with_deadline(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), StoreError> {
         self.flush_batch()?;
-        let writer = self.lock_writer()?;
-        let (busy, log_frames, checkpointed): (i64, i64, i64) =
-            writer.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
-        tracing::debug!(
-            busy,
-            log_frames,
-            checkpointed,
-            "completed wal_checkpoint(TRUNCATE)"
-        );
-        Ok(())
+        loop {
+            let (busy, log_frames, checkpointed): (i64, i64, i64) = {
+                let writer = self.lock_writer()?;
+                writer.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+            };
+            if busy == 0 || std::time::Instant::now() >= deadline {
+                if busy != 0 {
+                    tracing::warn!(
+                        busy,
+                        log_frames,
+                        checkpointed,
+                        "wal_checkpoint(TRUNCATE) finished with busy flag at deadline"
+                    );
+                } else {
+                    tracing::debug!(
+                        busy,
+                        log_frames,
+                        checkpointed,
+                        "completed wal_checkpoint(TRUNCATE)"
+                    );
+                }
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+        }
     }
 }
 

@@ -1622,6 +1622,13 @@ impl DaemonEngine {
             sha256,
             zone_info,
         );
+        let closed = self
+            .store_write_gate
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if *closed {
+            return Err(BrowserReportError::Cancelled);
+        }
         persist_download_origin_idempotent(&self.store, &self.download_origin_state, record, None)
     }
 
@@ -1697,7 +1704,12 @@ impl DaemonEngine {
         let store = self.store.clone();
         let dl_state = Arc::clone(&self.download_origin_state);
         let write_cancel = Arc::clone(&cancel);
+        let write_gate = Arc::clone(&self.store_write_gate);
         let persisted = tokio::task::spawn_blocking(move || {
+            let closed = write_gate.read().unwrap_or_else(|e| e.into_inner());
+            if *closed || write_cancel.load(Ordering::Acquire) {
+                return Err(BrowserReportError::Cancelled);
+            }
             persist_download_origin_idempotent(&store, &dl_state, record, Some(&write_cancel))
         })
         .await
@@ -1795,6 +1807,9 @@ impl DaemonEngine {
         details: Option<&str>,
         timestamp_ms: i64,
     ) -> Result<BrowserEventOutcome, BrowserReportError> {
+        if self.is_shutdown_drain_cutoff() {
+            return Err(BrowserReportError::Cancelled);
+        }
         let clean_url = url.trim();
         if clean_url.is_empty() {
             return Err(BrowserReportError::Invalid(

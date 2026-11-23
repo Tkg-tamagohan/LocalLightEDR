@@ -121,6 +121,16 @@ struct EvictedLiveRecord {
     generation: u64,
 }
 
+/// Compact WFP drop attribution snapshot avoiding cloning `emitted_rule_ids` and omitting
+/// global overflow flags (`FU-E2E-05`).
+#[derive(Debug)]
+pub struct WfpProcessCandidates<'a> {
+    pub entries: Vec<&'a ActiveProcessEntry>,
+    pub evicted_live_identities: Vec<ProcessIdentity>,
+    pub evicted_exited_identities: Vec<ProcessIdentity>,
+    pub exe_evicted_live_overflowed: bool,
+}
+
 /// Bounded in-memory process table (`ACTIVE_PROCESS_TABLE_CAPACITY` = 4,096) supporting
 /// O(1) lookup by `pid` or `instance_id` and evicting oldest exited entries when over capacity.
 #[derive(Debug)]
@@ -185,6 +195,11 @@ impl ActiveProcessTable {
     pub fn with_evicted_live_capacity(mut self, capacity: usize) -> Self {
         self.evicted_live_capacity = capacity;
         self
+    }
+
+    #[cfg(test)]
+    pub fn force_evicted_live_overflow_any_for_test(&mut self) {
+        self.evicted_live_overflow_any = true;
     }
 
     /// Records a newly started (or initially snapshotted) process and resolves its parent lineage in O(1).
@@ -875,6 +890,72 @@ impl ActiveProcessTable {
                 .then_with(|| b.identity.create_time_100ns.cmp(&a.identity.create_time_100ns))
         });
         matches
+    }
+
+    /// Time-windowed WFP drop candidate lookup including live/recently-exited `entries`,
+    /// `evicted_live`, `evicted_exited`, and per-executable `overflowed_evicted_live_exes`
+    /// (excluding global `evicted_live_overflow_any` to prevent cross-executable freeze bypasses).
+    pub fn candidates_by_exe_key_for_wfp(
+        &self,
+        target_exe_key: &str,
+        event_ts_ms: i64,
+        recent_exit_window_ms: i64,
+        max_post_event_create_skew_ms: i64,
+    ) -> WfpProcessCandidates<'_> {
+        let exit_window = recent_exit_window_ms.max(0);
+        let max_created = event_ts_ms.saturating_add(max_post_event_create_skew_ms.max(0));
+        let mut matches: Vec<&ActiveProcessEntry> = self
+            .entries
+            .values()
+            .filter(|entry| {
+                !entry.exe_path.trim().is_empty()
+                    && normalized_exe_key_eq(&entry.exe_path, target_exe_key)
+                    && entry.created_at_ms <= max_created
+                    && entry
+                        .exited_at_ms
+                        .is_none_or(|ex| event_ts_ms <= ex.saturating_add(exit_window))
+            })
+            .collect();
+        matches.sort_by(|a, b| {
+            let a_exited = a.exited_at_ms.is_some();
+            let b_exited = b.exited_at_ms.is_some();
+            a_exited
+                .cmp(&b_exited)
+                .then_with(|| b.exited_at_ms.cmp(&a.exited_at_ms))
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| b.identity.create_time_100ns.cmp(&a.identity.create_time_100ns))
+        });
+
+        let norm_target = normalize_exe_key(target_exe_key);
+        let evicted_live_identities: Vec<ProcessIdentity> = self
+            .evicted_live
+            .values()
+            .filter(|ev| {
+                ev.exe_key == norm_target && ev.created_at_ms <= max_created
+            })
+            .map(|ev| ev.identity)
+            .collect();
+
+        let evicted_exited_identities: Vec<ProcessIdentity> = self
+            .evicted_exited
+            .values()
+            .filter(|ev| {
+                !ev.exe_path.trim().is_empty()
+                    && normalized_exe_key_eq(&ev.exe_path, &norm_target)
+                    && ev.created_at_ms <= max_created
+                    && event_ts_ms <= ev.exited_at_ms.saturating_add(exit_window)
+            })
+            .map(|ev| ev.identity)
+            .collect();
+
+        let exe_evicted_live_overflowed = self.overflowed_evicted_live_exes.contains(&norm_target);
+
+        WfpProcessCandidates {
+            entries: matches,
+            evicted_live_identities,
+            evicted_exited_identities,
+            exe_evicted_live_overflowed,
+        }
     }
 
     /// O(1) lookup by composite `instance_id` (`"{pid}:{create_time_100ns}"`).

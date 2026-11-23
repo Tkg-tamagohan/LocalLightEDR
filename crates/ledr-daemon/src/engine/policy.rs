@@ -283,7 +283,8 @@ impl DaemonEngine {
                 .then(|| self.store.list_network_rules())
                 .transpose()?;
 
-        self.store.upsert_rule(rule)?;
+        self.try_store_write(|s| s.upsert_rule(rule))
+            .unwrap_or_else(|| Err(Self::store_write_closed_err()))?;
         if let Some(ref prev_rules) = prev_network_rules {
             let report = self.deploy_persisted_network_rules_with_baseline(Some(prev_rules));
             let mut affected: Vec<&AllowlistRuleRecord> = Vec::with_capacity(2);
@@ -296,10 +297,12 @@ impl DaemonEngine {
                 }
             }
             if let Some(err_summary) = report.failure_summary_for_rules(&affected) {
-                let comp_res = match previous {
-                    Some(ref prev) => self.store.upsert_rule(prev),
-                    None => self.store.delete_rule(&rule.rule_id).map(|_| ()),
-                };
+                let comp_res = self
+                    .try_store_write(|s| match previous {
+                        Some(ref prev) => s.upsert_rule(prev),
+                        None => s.delete_rule(&rule.rule_id).map(|_| ()),
+                    })
+                    .unwrap_or_else(|| Err(Self::store_write_closed_err()));
                 if let Err(comp_err) = comp_res {
                     tracing::warn!(
                         rule_id = %rule.rule_id,
@@ -358,7 +361,9 @@ impl DaemonEngine {
         let prev_network_rules = (self.config.outbound_firewall_enabled && existing_is_network)
             .then(|| self.store.list_network_rules())
             .transpose()?;
-        let deleted = self.store.delete_rule(rule_id)?;
+        let deleted = self
+            .try_store_write(|s| s.delete_rule(rule_id))
+            .unwrap_or_else(|| Err(Self::store_write_closed_err()))?;
         if deleted {
             if let Some(ref prev_rules) = prev_network_rules {
                 let report = self.deploy_persisted_network_rules_with_baseline(Some(prev_rules));
@@ -367,7 +372,9 @@ impl DaemonEngine {
                     .and_then(|prev| report.failure_summary_for_rules(&[prev]));
                 if let Some(err_summary) = err_summary {
                     if let Some(ref prev) = existing {
-                        if let Err(comp_err) = self.store.upsert_rule(prev) {
+                        if let Some(Err(comp_err)) =
+                            self.try_store_write(|s| s.upsert_rule(prev))
+                        {
                             tracing::warn!(
                                 rule_id = %rule_id,
                                 error = %comp_err,

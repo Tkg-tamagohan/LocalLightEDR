@@ -7,12 +7,14 @@ use std::time::Duration;
 #[cfg(doc)]
 use ledr_proto::SensorEvent;
 use ledr_proto::{
-    AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord, ProcessIdentity,
+    is_never_suspend_process, AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord,
+    ProcessIdentity,
 };
 use ledr_rules::{
     canonical_ip, classify_outbound_risk, evaluate_outbound_policy, is_external_ip,
     matches_network_target, parse_cidr_target, OutboundDecision, OutboundRiskClass,
 };
+use ledr_sensor_win::etw::LiveSiblingCheck;
 #[cfg(doc)]
 use ledr_sensor_win::WfpDynamicEngine;
 use ledr_sensor_win::{WfpDropEvent, WfpDropSinkFn};
@@ -28,9 +30,13 @@ use super::domain_policy::{
     select_outbound_decision_for_domains,
 };
 use super::events::ResolvedProcessContext;
-use super::{current_unix_ms, DaemonEngine, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS};
+use super::{
+    current_unix_ms, DaemonEngine, InspectOutcome, OutboundEnforcementMode,
+    AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS,
+};
 
 const MAX_PENDING_WFP_DROPS: usize = 512;
+const WFP_DROP_LATE_SIBLING_CREATE_SKEW_MS: i64 = 250;
 
 /// Queued WFP net-event drop metadata passed from BFE callbacks into [`DaemonEngine::run_pipeline`]
 /// over a bounded channel so correlation happens off the BFE callback thread in order behind
@@ -46,10 +52,35 @@ pub(super) struct QueuedWfpDrop {
     pub(super) os_filter_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingWfpDropReason {
+    DnsGrace,
+    AttributionGrace,
+    DnsAndAttribution,
+}
+
+impl PendingWfpDropReason {
+    pub(super) fn includes_attribution_grace(self) -> bool {
+        matches!(self, Self::AttributionGrace | Self::DnsAndAttribution)
+    }
+
+    fn includes_dns_grace(self) -> bool {
+        matches!(self, Self::DnsGrace | Self::DnsAndAttribution)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct PendingWfpDrop {
     pub(super) item: QueuedWfpDrop,
     pub(super) deadline: tokio::time::Instant,
+    pub(super) reason: PendingWfpDropReason,
+    pub(super) parked_single_instance_id: Option<String>,
+}
+
+struct WfpCandidateResolution {
+    candidates: Vec<WfpCandidate>,
+    ambiguous: bool,
+    candidate_gone: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -351,41 +382,166 @@ impl DaemonEngine {
         self.wfp_drop_overflow_coalesced.load(Ordering::Acquire)
     }
 
-    fn collect_wfp_candidates(&self, exe_key: &str, event_ts_ms: i64) -> Vec<WfpCandidate> {
-        let table = self
-            .process_table
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        table
-            .candidates_by_exe_key_at(exe_key, event_ts_ms)
-            .into_iter()
-            .map(|e| {
-                let (parent_exe_path, parent_command_line) = e
-                    .parent_instance_id
-                    .as_deref()
-                    .and_then(|pid_id| table.get_by_instance_id(pid_id))
-                    .map(|p| {
-                        (
-                            Some(p.exe_path.clone()),
-                            (!p.command_line.is_empty()).then(|| p.command_line.clone()),
-                        )
-                    })
-                    .unwrap_or((None, None));
-                WfpCandidate {
-                    identity: e.identity,
-                    instance_id: e.instance_id.clone(),
-                    exe_path: e.exe_path.clone(),
-                    command_line: (!e.command_line.is_empty()).then(|| e.command_line.clone()),
-                    parent_exe_path,
-                    parent_command_line,
-                    origin_url: e.origin_url.clone(),
-                    motw_source: e.motw_source.clone(),
-                    motw_referrer: e.motw_referrer.clone(),
-                    motw_frame_url: e.motw_frame_url.clone(),
-                    motw_zone_id: e.motw_zone_id,
+    fn resolve_wfp_candidates(
+        &self,
+        item: &QueuedWfpDrop,
+        check_live_os_siblings: bool,
+    ) -> WfpCandidateResolution {
+        let (mut candidates, mut extra_identities, exe_overflowed) = {
+            let table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let raw = table.candidates_by_exe_key_for_wfp(
+                &item.exe_key,
+                item.timestamp_ms,
+                self.config.wfp_drop_recent_exit_window_ms as i64,
+                WFP_DROP_LATE_SIBLING_CREATE_SKEW_MS,
+            );
+            let candidates: Vec<WfpCandidate> = raw
+                .entries
+                .into_iter()
+                .map(|e| {
+                    let (parent_exe_path, parent_command_line) = e
+                        .parent_instance_id
+                        .as_deref()
+                        .and_then(|pid_id| table.get_by_instance_id(pid_id))
+                        .map(|p| {
+                            (
+                                Some(p.exe_path.clone()),
+                                (!p.command_line.is_empty()).then(|| p.command_line.clone()),
+                            )
+                        })
+                        .unwrap_or((None, None));
+                    WfpCandidate {
+                        identity: e.identity,
+                        instance_id: e.instance_id.clone(),
+                        exe_path: e.exe_path.clone(),
+                        command_line: (!e.command_line.is_empty()).then(|| e.command_line.clone()),
+                        parent_exe_path,
+                        parent_command_line,
+                        origin_url: e.origin_url.clone(),
+                        motw_source: e.motw_source.clone(),
+                        motw_referrer: e.motw_referrer.clone(),
+                        motw_frame_url: e.motw_frame_url.clone(),
+                        motw_zone_id: e.motw_zone_id,
+                    }
+                })
+                .collect();
+            let mut extra_identities: Vec<ProcessIdentity> = Vec::new();
+            for id in raw
+                .evicted_live_identities
+                .into_iter()
+                .chain(raw.evicted_exited_identities)
+            {
+                if !candidates.iter().any(|c| c.identity == id) && !extra_identities.contains(&id) {
+                    extra_identities.push(id);
                 }
-            })
-            .collect()
+            }
+            (candidates, extra_identities, raw.exe_evicted_live_overflowed)
+        };
+
+        let mut candidate_gone = false;
+
+        let canonical_exe = candidates
+            .first()
+            .map(|c| c.exe_path.clone())
+            .unwrap_or_else(|| item.exe_path.clone());
+        for id in extra_identities.drain(..) {
+            candidates.push(WfpCandidate {
+                identity: id,
+                instance_id: id.instance_id(),
+                exe_path: canonical_exe.clone(),
+                command_line: None,
+                parent_exe_path: None,
+                parent_command_line: None,
+                origin_url: None,
+                motw_source: None,
+                motw_referrer: None,
+                motw_frame_url: None,
+                motw_zone_id: None,
+            });
+        }
+        let mut ambiguous = candidates.len() > 1;
+
+        if candidates.len() == 1 && !ambiguous {
+            let single_inst_id = candidates[0].instance_id.clone();
+            let single_identity = candidates[0].identity;
+            let other_dns_window_ms = self.config.wfp_drop_other_instance_dns_window_ms as i64;
+            let negative_dns_ambiguous = {
+                let history = self
+                    .process_dns_history
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let own_has_dns = !history
+                    .lookup_domains_for_process(&single_inst_id, item.dst_ip)
+                    .is_empty();
+                !own_has_dns
+                    && other_dns_window_ms > 0
+                    && history.has_fresh_ip_record_for_other_instance(
+                        &item.exe_key,
+                        &single_inst_id,
+                        item.dst_ip,
+                        item.timestamp_ms,
+                        other_dns_window_ms,
+                    )
+            };
+            if negative_dns_ambiguous {
+                ambiguous = true;
+            }
+
+            if !ambiguous && check_live_os_siblings && self.config.wfp_drop_live_sibling_os_check {
+                let max_created_ms = item
+                    .timestamp_ms
+                    .saturating_add(WFP_DROP_LATE_SIBLING_CREATE_SKEW_MS);
+                match self.live_process_inspector.check_live_siblings_for_exe(
+                    &item.exe_key,
+                    single_identity,
+                    max_created_ms,
+                ) {
+                    LiveSiblingCheck::SiblingFound(extra_ids) => {
+                        ambiguous = true;
+                        for id in extra_ids {
+                            if !candidates.iter().any(|c| c.identity == id) {
+                                candidates.push(WfpCandidate {
+                                    identity: id,
+                                    instance_id: id.instance_id(),
+                                    exe_path: canonical_exe.clone(),
+                                    command_line: None,
+                                    parent_exe_path: None,
+                                    parent_command_line: None,
+                                    origin_url: None,
+                                    motw_source: None,
+                                    motw_referrer: None,
+                                    motw_frame_url: None,
+                                    motw_zone_id: None,
+                                });
+                            }
+                        }
+                    }
+                    LiveSiblingCheck::CandidateGone => {
+                        candidate_gone = true;
+                        if exe_overflowed {
+                            ambiguous = true;
+                        }
+                    }
+                    LiveSiblingCheck::NoneFound => {}
+                    LiveSiblingCheck::Indeterminate => {
+                        if exe_overflowed {
+                            ambiguous = true;
+                        }
+                    }
+                }
+            } else if !ambiguous && exe_overflowed && !self.config.wfp_drop_live_sibling_os_check {
+                ambiguous = true;
+            }
+        }
+
+        WfpCandidateResolution {
+            candidates,
+            ambiguous,
+            candidate_gone,
+        }
     }
 
     pub(super) fn on_wfp_drop_dequeued(
@@ -393,62 +549,112 @@ impl DaemonEngine {
         item: QueuedWfpDrop,
         pending: &mut VecDeque<PendingWfpDrop>,
     ) {
-        if self.config.wfp_drop_dns_grace_ms > 0 {
+        if self.is_shutdown_drain_cutoff() {
+            return;
+        }
+        if self.config.wfp_drop_dns_grace_ms == 0 && self.config.wfp_drop_attribution_grace_ms == 0 {
+            self.handle_wfp_drop_event_now(&item);
+            return;
+        }
+
+        let res = self.resolve_wfp_candidates(&item, true);
+        if !res.candidates.is_empty() {
             let rules = self.store.list_network_rules().unwrap_or_default();
-            if has_domain_allow_rule_for_exe(&item.exe_path, &rules) {
-                let candidates = self.collect_wfp_candidates(&item.exe_key, item.timestamp_ms);
-                if !candidates.is_empty() {
-                    let domain_candidates: Vec<(String, i64)> = {
-                        let history = self
-                            .process_dns_history
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        if candidates.len() == 1 {
-                            history.lookup_domains_for_process(&candidates[0].instance_id, item.dst_ip)
-                        } else {
-                            let mut combined = Vec::new();
-                            for c in &candidates {
-                                combined.extend(history.lookup_fresh_domains_for_process(
-                                    &c.instance_id,
-                                    item.dst_ip,
-                                    item.timestamp_ms,
-                                    AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS,
-                                ));
-                            }
-                            combined
-                        }
-                    };
-                    let bin_identity = self.inspector.inspect(&item.exe_path);
-                    let (decision, _) = select_outbound_decision_for_domains(
-                        &bin_identity,
-                        item.dst_ip,
-                        &domain_candidates,
-                        &rules,
-                    );
-                    let ambiguous_freshness = (candidates.len() > 1)
-                        .then_some((item.timestamp_ms, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS));
-                    if matches!(
-                        decision,
-                        OutboundDecision::PreemptiveRestrict(_)
-                            | OutboundDecision::UnknownFirstConnect
-                    ) && !self.has_valid_live_domain_policy_permit(
-                        &item.exe_path,
-                        &bin_identity,
-                        item.dst_ip,
-                        &domain_candidates,
-                        &rules,
-                        ambiguous_freshness,
-                    ) {
-                        while pending.len() >= MAX_PENDING_WFP_DROPS {
-                            if let Some(oldest) = pending.pop_front() {
-                                self.handle_wfp_drop_event_now(&oldest.item);
-                            }
-                        }
-                        let deadline = tokio::time::Instant::now()
-                            + Duration::from_millis(self.config.wfp_drop_dns_grace_ms);
-                        pending.push_back(PendingWfpDrop { item, deadline });
+            let has_domain_allow = has_domain_allow_rule_for_exe(&item.exe_path, &rules);
+            let is_ambig = res.ambiguous || res.candidates.len() > 1;
+            let domain_candidates: Vec<(String, i64)> = {
+                let history = self
+                    .process_dns_history
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if !is_ambig && res.candidates.len() == 1 {
+                    history.lookup_domains_for_process(&res.candidates[0].instance_id, item.dst_ip)
+                } else {
+                    let mut combined = Vec::new();
+                    for c in &res.candidates {
+                        combined.extend(history.lookup_fresh_domains_for_process(
+                            &c.instance_id,
+                            item.dst_ip,
+                            item.timestamp_ms,
+                            AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS,
+                        ));
+                    }
+                    combined
+                }
+            };
+            let InspectOutcome::Completed(bin_identity) =
+                self.inspect_binary_for_pipeline(&item.exe_path)
+            else {
+                return;
+            };
+            let (decision, _) = select_outbound_decision_for_domains(
+                &bin_identity,
+                item.dst_ip,
+                &domain_candidates,
+                &rules,
+            );
+            let decision_restrict_or_unknown = matches!(
+                decision,
+                OutboundDecision::PreemptiveRestrict(_) | OutboundDecision::UnknownFirstConnect
+            );
+            let may_need_dns = self.config.wfp_drop_dns_grace_ms > 0 && has_domain_allow;
+            let may_need_attr = self.config.wfp_drop_attribution_grace_ms > 0
+                && self.config.outbound_enforcement_mode != OutboundEnforcementMode::Audit
+                && res.candidates.len() == 1
+                && !is_ambig
+                && !res.candidate_gone
+                && domain_candidates.is_empty()
+                && !is_never_suspend_process(&res.candidates[0].exe_path);
+            if decision_restrict_or_unknown && (may_need_dns || may_need_attr) {
+                let ambiguous_freshness =
+                    is_ambig.then_some((item.timestamp_ms, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS));
+                if !self.has_valid_live_domain_policy_permit(
+                    &item.exe_path,
+                    &bin_identity,
+                    item.dst_ip,
+                    &domain_candidates,
+                    &rules,
+                    ambiguous_freshness,
+                ) {
+                    let canon_dst = canonical_ip(item.dst_ip);
+                    if pending.iter().any(|p| {
+                        p.item.exe_key == item.exe_key
+                            && canonical_ip(p.item.dst_ip) == canon_dst
+                            && p.item.dst_port == item.dst_port
+                    }) {
                         return;
                     }
+                    while pending.len() >= MAX_PENDING_WFP_DROPS {
+                        if let Some(oldest) = pending.pop_front() {
+                            self.handle_wfp_drop_event_now(&oldest.item);
+                        }
+                    }
+                    let reason = match (may_need_dns, may_need_attr) {
+                        (true, true) => PendingWfpDropReason::DnsAndAttribution,
+                        (true, false) => PendingWfpDropReason::DnsGrace,
+                        (false, true) => PendingWfpDropReason::AttributionGrace,
+                        (false, false) => unreachable!(),
+                    };
+                    let grace_ms = match reason {
+                        PendingWfpDropReason::DnsGrace => self.config.wfp_drop_dns_grace_ms,
+                        PendingWfpDropReason::AttributionGrace => {
+                            self.config.wfp_drop_attribution_grace_ms
+                        }
+                        PendingWfpDropReason::DnsAndAttribution => self
+                            .config
+                            .wfp_drop_dns_grace_ms
+                            .max(self.config.wfp_drop_attribution_grace_ms),
+                    };
+                    let deadline =
+                        tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+                    pending.push_back(PendingWfpDrop {
+                        item,
+                        deadline,
+                        reason,
+                        parked_single_instance_id: (res.candidates.len() == 1 && !is_ambig)
+                            .then(|| res.candidates[0].instance_id.clone()),
+                    });
+                    return;
                 }
             }
         }
@@ -463,27 +669,81 @@ impl DaemonEngine {
         accepted_ips: &[IpAddr],
         pending: &mut VecDeque<PendingWfpDrop>,
     ) {
-        if pending.is_empty() || accepted_ips.is_empty() {
+        if self.is_shutdown_drain_cutoff() || pending.is_empty() || accepted_ips.is_empty() {
             return;
         }
         let canon_accepted: Vec<IpAddr> = accepted_ips.iter().map(|ip| canonical_ip(*ip)).collect();
         let mut cached_rules: Option<Vec<AllowlistRuleRecord>> = None;
         let mut remaining = VecDeque::with_capacity(pending.len());
         let mut ready = Vec::new();
-        while let Some(entry) = pending.pop_front() {
+        while let Some(mut entry) = pending.pop_front() {
             let canon_dst = canonical_ip(entry.item.dst_ip);
             if dns_exe_key != entry.item.exe_key || !canon_accepted.contains(&canon_dst) {
                 remaining.push_back(entry);
                 continue;
             }
-            let candidates =
-                self.collect_wfp_candidates(&entry.item.exe_key, entry.item.timestamp_ms);
-            let dns_matches_candidate = candidates.iter().any(|c| c.instance_id == dns_inst_id);
+            let res = self.resolve_wfp_candidates(&entry.item, false);
+            let is_ambig = res.ambiguous || res.candidates.len() > 1;
+            let dns_matches_candidate = res.candidates.iter().any(|c| c.instance_id == dns_inst_id);
+
+            if entry.reason.includes_attribution_grace() {
+                if is_ambig {
+                    ready.push(entry.item);
+                    continue;
+                }
+                if entry.parked_single_instance_id.as_deref() == Some(dns_inst_id) {
+                    if !entry.reason.includes_dns_grace() {
+                        ready.push(entry.item);
+                        continue;
+                    }
+                    // Candidate's own DNS arrived while both AttributionGrace and DnsGrace were active.
+                    // Check if the resolved domain now authorizes or explicitly blocks; otherwise
+                    // clear AttributionGrace so only DnsGrace remains if any DNS grace is still left.
+                    let domains = {
+                        let history = self
+                            .process_dns_history
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        history.lookup_domains_for_process(dns_inst_id, canon_dst)
+                    };
+                    let rules = cached_rules
+                        .get_or_insert_with(|| self.store.list_network_rules().unwrap_or_default());
+                    let InspectOutcome::Completed(bin_identity) =
+                        self.inspect_binary_for_pipeline(&entry.item.exe_path)
+                    else {
+                        return;
+                    };
+                    let (decision, _) = select_outbound_decision_for_domains(
+                        &bin_identity,
+                        entry.item.dst_ip,
+                        &domains,
+                        rules,
+                    );
+                    if matches!(
+                        decision,
+                        OutboundDecision::AllowedByRule { .. }
+                            | OutboundDecision::BlockedByRule { .. }
+                            | OutboundDecision::ProtectedOs
+                    ) {
+                        ready.push(entry.item);
+                        continue;
+                    }
+                    entry.reason = PendingWfpDropReason::DnsGrace;
+                    let dns_cap = tokio::time::Instant::now()
+                        + Duration::from_millis(self.config.wfp_drop_dns_grace_ms);
+                    if dns_cap < entry.deadline {
+                        entry.deadline = dns_cap;
+                    }
+                    remaining.push_back(entry);
+                    continue;
+                }
+            }
+
             if !dns_matches_candidate {
                 remaining.push_back(entry);
                 continue;
             }
-            if candidates.len() == 1 {
+            if !is_ambig && res.candidates.len() == 1 {
                 let domains = {
                     let history = self
                         .process_dns_history
@@ -501,7 +761,11 @@ impl DaemonEngine {
                     ready.push(entry.item);
                     continue;
                 }
-                let bin_identity = self.inspector.inspect(&entry.item.exe_path);
+                let InspectOutcome::Completed(bin_identity) =
+                    self.inspect_binary_for_pipeline(&entry.item.exe_path)
+                else {
+                    return;
+                };
                 let (decision, _) = select_outbound_decision_for_domains(
                     &bin_identity,
                     entry.item.dst_ip,
@@ -538,7 +802,7 @@ impl DaemonEngine {
                         (false, Vec::new())
                     } else {
                         let mut combined = Vec::new();
-                        for c in &candidates {
+                        for c in &res.candidates {
                             combined.extend(history.lookup_fresh_domains_for_process(
                                 &c.instance_id,
                                 canon_dst,
@@ -559,7 +823,11 @@ impl DaemonEngine {
                     ready.push(entry.item);
                     continue;
                 }
-                let bin_identity = self.inspector.inspect(&entry.item.exe_path);
+                let InspectOutcome::Completed(bin_identity) =
+                    self.inspect_binary_for_pipeline(&entry.item.exe_path)
+                else {
+                    return;
+                };
                 let (decision, _) = select_outbound_decision_for_domains(
                     &bin_identity,
                     entry.item.dst_ip,
@@ -576,6 +844,64 @@ impl DaemonEngine {
                 } else {
                     remaining.push_back(entry);
                 }
+            }
+        }
+        *pending = remaining;
+        for item in ready {
+            self.handle_wfp_drop_event_now(&item);
+        }
+    }
+
+    pub(super) fn flush_ambiguous_pending_wfp_drops_for_process_start(
+        &self,
+        identity: ProcessIdentity,
+        exe_path: &str,
+        pending: &mut VecDeque<PendingWfpDrop>,
+    ) {
+        if pending.is_empty() || exe_path.trim().is_empty() {
+            return;
+        }
+        let started_info = {
+            let table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = table
+                .get_by_instance_id(&identity.instance_id())
+                .or_else(|| table.lookup_by_pid(identity.pid));
+            entry.and_then(|e| {
+                let clean_exe = e.exe_path.trim();
+                (!clean_exe.is_empty()).then(|| {
+                    (
+                        e.instance_id.clone(),
+                        WfpRuleManager::exe_key(clean_exe),
+                        e.created_at_ms,
+                    )
+                })
+            })
+        };
+        let Some((new_inst_id, new_exe_key, new_created_at_ms)) = started_info else {
+            return;
+        };
+
+        let mut remaining = VecDeque::with_capacity(pending.len());
+        let mut ready = Vec::new();
+        while let Some(entry) = pending.pop_front() {
+            let sibling_in_window = entry.reason.includes_attribution_grace()
+                && entry.item.exe_key == new_exe_key
+                && entry
+                    .parked_single_instance_id
+                    .as_deref()
+                    .is_some_and(|id| id != new_inst_id)
+                && new_created_at_ms
+                    <= entry
+                        .item
+                        .timestamp_ms
+                        .saturating_add(WFP_DROP_LATE_SIBLING_CREATE_SKEW_MS);
+            if sibling_in_window {
+                ready.push(entry.item);
+            } else {
+                remaining.push_back(entry);
             }
         }
         *pending = remaining;
@@ -605,8 +931,11 @@ impl DaemonEngine {
     }
 
     pub(super) fn handle_wfp_drop_event_now(&self, item: &QueuedWfpDrop) {
-        let candidates = self.collect_wfp_candidates(&item.exe_key, item.timestamp_ms);
-        if candidates.is_empty() {
+        if self.is_shutdown_drain_cutoff() {
+            return;
+        }
+        let res = self.resolve_wfp_candidates(item, true);
+        if res.candidates.is_empty() {
             tracing::debug!(
                 exe_path = %item.exe_path,
                 dst_ip = %item.dst_ip,
@@ -616,13 +945,13 @@ impl DaemonEngine {
             return;
         }
 
-        if candidates.len() > 1 {
+        if res.ambiguous || res.candidates.len() > 1 {
             // WfpDropEvent carries no PID or local socket tuple (`BUG_0004`); never guess an
             // individual instance across concurrent siblings — keep multi-candidate drops app-level.
-            self.handle_ambiguous_wfp_drop(item, &candidates);
+            self.handle_ambiguous_wfp_drop(item, &res.candidates);
             return;
         }
-        let cand = &candidates[0];
+        let cand = &res.candidates[0];
 
         let domain_candidates = {
             let history = self
@@ -664,13 +993,16 @@ impl DaemonEngine {
             item.timestamp_ms,
         );
         if emitted_alert {
-            if let Err(err) = self.store.flush_batch() {
+            if let Some(Err(err)) = self.try_store_write(|s| s.flush_batch()) {
                 tracing::warn!(error = %err, "failed flushing store after attributed WFP drop alert");
             }
         }
     }
 
     fn handle_ambiguous_wfp_drop(&self, item: &QueuedWfpDrop, candidates: &[WfpCandidate]) {
+        if self.is_shutdown_drain_cutoff() {
+            return;
+        }
         let canonical_exe = candidates
             .first()
             .map(|c| c.exe_path.as_str())
@@ -680,7 +1012,11 @@ impl DaemonEngine {
             return;
         }
         let rules = self.store.list_network_rules().unwrap_or_default();
-        let bin_identity = self.inspector.inspect(canonical_exe);
+        let InspectOutcome::Completed(bin_identity) =
+            self.inspect_binary_for_pipeline(canonical_exe)
+        else {
+            return;
+        };
         let cand_domains: Vec<(String, i64)> = {
             let history = self
                 .process_dns_history
@@ -1063,7 +1399,7 @@ impl DaemonEngine {
                 "failed to dispatch toast notification for app-level WFP drop alert"
             );
         }
-        if let Err(err) = self.store.flush_batch() {
+        if let Some(Err(err)) = self.try_store_write(|s| s.flush_batch()) {
             tracing::warn!(error = %err, "failed flushing store after app-level WFP drop alert");
         }
     }

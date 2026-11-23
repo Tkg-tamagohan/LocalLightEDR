@@ -12,6 +12,8 @@ pub const DEFAULT_MAX_CONCURRENT_IPC_CLIENTS: usize = 16;
 const DEFAULT_IPC_FRAME_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_IPC_SESSION_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_WFP_DROP_DNS_GRACE_MS: u64 = 300;
+const DEFAULT_WFP_DROP_RECENT_EXIT_WINDOW_MS: u64 = 1_000;
+const DEFAULT_WFP_DROP_OTHER_INSTANCE_DNS_WINDOW_MS: u64 = 10_000;
 const DEFAULT_MOTW_SYNC_WAIT_BUDGET_MS: u64 = 50;
 
 /// Controls how aggressively Phase 3 outbound firewall rules enforce containment (`L-03`).
@@ -118,6 +120,24 @@ pub struct DaemonConfig {
     /// blocked executable triggers a `WfpDropEvent` while a domain-scoped `NetworkAllow` rule is
     /// configured (`#5` / Thread 13). Defaults to `300 ms`.
     pub wfp_drop_dns_grace_ms: u64,
+    /// Unconditional post-exit inclusion window (ms) for exited siblings during WFP drop
+    /// attribution (`FU-E2E-05`, Plan 1B). Defaults to `1_000 ms`.
+    pub wfp_drop_recent_exit_window_ms: u64,
+    /// Freshness window (ms) for negative same-executable other-instance DNS disambiguation during
+    /// WFP drop attribution (`FU-E2E-05`, Plan 1B). Defaults to `10_000 ms`.
+    pub wfp_drop_other_instance_dns_window_ms: u64,
+    /// Bounded ETW attribution settling grace window (ms) when a `WfpDropEvent` initially resolves
+    /// to a single candidate with no DNS record (`FU-E2E-05`, Plan 1C). Defaults to `0 ms` in
+    /// `DaemonConfig::default()` for fast deterministic tests; CLI sets `1_200 ms`.
+    pub wfp_drop_attribution_grace_ms: u64,
+    /// Enables lightweight OS Toolhelp32 live-sibling probing for WFP drop attribution
+    /// (`FU-E2E-05`, Plan 1C). Defaults to `false` in `DaemonConfig::default()` to isolate tests
+    /// from host processes; CLI sets `true`.
+    pub wfp_drop_live_sibling_os_check: bool,
+    /// When `true`, `WindowsBinaryInspector::inspect_cancellable` skips cold SHA-256 hashing and
+    /// `WinVerifyTrust` during post-shutdown drain (`FU-E2E-05`, Plan 2B-Lightweight). Defaults to
+    /// `false` in `DaemonConfig::default()` for test determinism; CLI sets `true`.
+    pub shutdown_skip_cold_binary_inspect: bool,
     /// Maximum number of `(process_instance_id, IpAddr)` entries and `(exe_key, domain)` latest
     /// records retained in `ProcessDnsHistory` (`L-10`). Defaults to
     /// [`DNS_RESOLUTION_CACHE_CAPACITY`] (`4,096`). Values of `0` are clamped to `1`.
@@ -168,6 +188,11 @@ impl Default for DaemonConfig {
                 .map(|s| (*s).to_string())
                 .collect(),
             wfp_drop_dns_grace_ms: DEFAULT_WFP_DROP_DNS_GRACE_MS,
+            wfp_drop_recent_exit_window_ms: DEFAULT_WFP_DROP_RECENT_EXIT_WINDOW_MS,
+            wfp_drop_other_instance_dns_window_ms: DEFAULT_WFP_DROP_OTHER_INSTANCE_DNS_WINDOW_MS,
+            wfp_drop_attribution_grace_ms: 0,
+            wfp_drop_live_sibling_os_check: false,
+            shutdown_skip_cold_binary_inspect: false,
             dns_history_capacity: DNS_RESOLUTION_CACHE_CAPACITY,
             notify_browser_events: false,
             download_hash_max_bytes: super::motw::MAX_DOWNLOAD_HASH_BYTES,

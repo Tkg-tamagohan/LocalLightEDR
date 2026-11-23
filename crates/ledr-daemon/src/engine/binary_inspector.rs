@@ -12,9 +12,35 @@ use ledr_rules::{
 
 const BINARY_INSPECTOR_CACHE_CAPACITY: usize = 512;
 
+/// Explicit inspection outcome distinguishing cooperative shutdown cancellation from an
+/// unsigned or unreadable binary (`FU-E2E-05`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InspectOutcome {
+    Completed(BinaryIdentity),
+    Cancelled,
+}
+
 /// Abstraction for inspecting binary SHA-256 and Authenticode metadata (`L-04`).
 pub trait BinaryInspector: Send + Sync {
     fn inspect(&self, exe_path: &str) -> BinaryIdentity;
+
+    /// Inspects `exe_path` with cooperative cancellation (`cancel`) and optional fast shutdown
+    /// skip of cold disk/Authenticode work (`fast_skip_on_shutdown`).
+    fn inspect_cancellable(
+        &self,
+        exe_path: &str,
+        cancel: &AtomicBool,
+        _fast_skip_on_shutdown: bool,
+    ) -> InspectOutcome {
+        if cancel.load(Ordering::Acquire) {
+            return InspectOutcome::Cancelled;
+        }
+        let id = self.inspect(exe_path);
+        if cancel.load(Ordering::Acquire) {
+            return InspectOutcome::Cancelled;
+        }
+        InspectOutcome::Completed(id)
+    }
 
     /// Computes or returns only the SHA-256 hex digest of `exe_path` without Authenticode
     /// verification overhead (`Phase 4A` MOTW hot-path optimization).
@@ -145,6 +171,87 @@ impl BinaryInspector for WindowsBinaryInspector {
         }
     }
 
+    fn inspect_cancellable(
+        &self,
+        exe_path: &str,
+        cancel: &AtomicBool,
+        fast_skip_on_shutdown: bool,
+    ) -> InspectOutcome {
+        if cancel.load(Ordering::Acquire) || fast_skip_on_shutdown {
+            return InspectOutcome::Cancelled;
+        }
+        if exe_path.trim().is_empty() {
+            return InspectOutcome::Completed(BinaryIdentity {
+                exe_path: String::new(),
+                sha256: None,
+                authenticode: None,
+            });
+        }
+        let path = Path::new(exe_path);
+        let Ok(meta) = std::fs::metadata(path) else {
+            return InspectOutcome::Completed(BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: None,
+                authenticode: None,
+            });
+        };
+        if !meta.is_file() {
+            return InspectOutcome::Completed(BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: None,
+                authenticode: None,
+            });
+        }
+        let fresh_sha256 = match compute_file_sha256_hex_cancellable(path, u64::MAX, cancel) {
+            Ok(Some(hash)) => hash,
+            Ok(None) => {
+                return InspectOutcome::Completed(BinaryIdentity {
+                    exe_path: exe_path.to_string(),
+                    sha256: None,
+                    authenticode: None,
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                return InspectOutcome::Cancelled;
+            }
+            Err(_) => {
+                return InspectOutcome::Completed(BinaryIdentity {
+                    exe_path: exe_path.to_string(),
+                    sha256: None,
+                    authenticode: None,
+                });
+            }
+        };
+        let cache_key = (exe_path.to_ascii_lowercase(), fresh_sha256.clone());
+        if let Ok(guard) = self.authenticode_cache.lock() {
+            if let Some(cached_auth) = guard.get(&cache_key) {
+                return InspectOutcome::Completed(BinaryIdentity {
+                    exe_path: exe_path.to_string(),
+                    sha256: Some(fresh_sha256),
+                    authenticode: cached_auth.clone(),
+                });
+            }
+        }
+        if cancel.load(Ordering::Acquire) {
+            return InspectOutcome::Cancelled;
+        }
+        let authenticode = inspect_authenticode(path);
+        if cancel.load(Ordering::Acquire) {
+            return InspectOutcome::Cancelled;
+        }
+        if let Ok(mut guard) = self.authenticode_cache.lock() {
+            if guard.len() >= BINARY_INSPECTOR_CACHE_CAPACITY {
+                guard.clear();
+            }
+            guard.insert(cache_key, authenticode.clone());
+        }
+        InspectOutcome::Completed(BinaryIdentity {
+            exe_path: exe_path.to_string(),
+            sha256: Some(fresh_sha256),
+            authenticode,
+        })
+    }
+
     fn compute_sha256(&self, exe_path: &str) -> Option<String> {
         if exe_path.trim().is_empty() {
             return None;
@@ -182,6 +289,17 @@ impl BinaryInspector for WindowsBinaryInspector {
 /// `CanaryFileAccess` event before `Kernel-Process` delivers `ProcessStart`.
 pub trait LiveProcessInspector: Send + Sync {
     fn inspect_live_process(&self, pid: u32) -> Option<ledr_sensor_win::etw::LiveProcessInfo>;
+
+    /// Checks live OS processes for another active instance matching `exe_key` started at or
+    /// before `max_created_at_ms` (`FU-E2E-05`).
+    fn check_live_siblings_for_exe(
+        &self,
+        _exe_key: &str,
+        _candidate: ledr_proto::ProcessIdentity,
+        _max_created_at_ms: i64,
+    ) -> ledr_sensor_win::etw::LiveSiblingCheck {
+        ledr_sensor_win::etw::LiveSiblingCheck::NoneFound
+    }
 }
 
 /// Default Windows live-process inspector backed by [`ledr_sensor_win::etw::inspect_live_process`].
@@ -197,5 +315,18 @@ impl WindowsLiveProcessInspector {
 impl LiveProcessInspector for WindowsLiveProcessInspector {
     fn inspect_live_process(&self, pid: u32) -> Option<ledr_sensor_win::etw::LiveProcessInfo> {
         ledr_sensor_win::etw::inspect_live_process(pid)
+    }
+
+    fn check_live_siblings_for_exe(
+        &self,
+        exe_key: &str,
+        candidate: ledr_proto::ProcessIdentity,
+        max_created_at_ms: i64,
+    ) -> ledr_sensor_win::etw::LiveSiblingCheck {
+        ledr_sensor_win::etw::find_other_live_processes_for_exe_key(
+            exe_key,
+            candidate,
+            max_created_at_ms,
+        )
     }
 }

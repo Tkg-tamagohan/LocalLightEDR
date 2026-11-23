@@ -72,8 +72,8 @@ impl DaemonEngine {
                 } => {
                     let new_status = decision.resulting_status();
                     let updated = self
-                        .store
-                        .update_alert_status(alert_id, new_status, Some(now_ms))
+                        .try_store_write(|s| s.update_alert_status(alert_id, new_status, Some(now_ms)))
+                        .unwrap_or_else(|| Err(Self::store_write_closed_err()))
                         .map_err(|err| format!("failed to update alert status: {err}"))?;
                     if !updated {
                         return Err(format!("alert {alert_id} not found"));
@@ -381,8 +381,8 @@ impl DaemonEngine {
                 let prev_network_rules = (scope == RuleScope::NetworkAllow
                     && self.config.outbound_firewall_enabled)
                     .then(|| self.store.list_network_rules().unwrap_or_default());
-                self.store
-                    .upsert_rule(&rule)
+                self.try_store_write(|s| s.upsert_rule(&rule))
+                    .unwrap_or_else(|| Err(Self::store_write_closed_err()))
                     .map_err(|err| format!("failed to store permanent allowlist rule: {err}"))?;
                 saved_rule_id = Some(rule.rule_id.clone());
 
@@ -736,8 +736,8 @@ impl DaemonEngine {
                             .config
                             .outbound_firewall_enabled
                             .then(|| self.store.list_network_rules().unwrap_or_default());
-                        self.store
-                            .upsert_rule(&block_rule)
+                        self.try_store_write(|s| s.upsert_rule(&block_rule))
+                            .unwrap_or_else(|| Err(Self::store_write_closed_err()))
                             .map_err(|err| format!("failed to store block rule: {err}"))?;
                         saved_rule_id = Some(block_rule.rule_id.clone());
                         if self.config.outbound_firewall_enabled {
@@ -793,8 +793,8 @@ impl DaemonEngine {
         }
 
         let status_result = self
-            .store
-            .update_alert_status(alert_id, new_status, Some(now_ms))
+            .try_store_write(|s| s.update_alert_status(alert_id, new_status, Some(now_ms)))
+            .unwrap_or_else(|| Err(Self::store_write_closed_err()))
             .map_err(|err| format!("failed to update alert status: {err}"))
             .and_then(|updated| {
                 if updated {
@@ -1002,25 +1002,30 @@ impl DaemonEngine {
                 "suspended_children".to_string(),
                 serde_json::Value::Array(merged_entries),
             );
-            match self.store.update_alert_suspension_state(
-                &sibling.alert_id,
-                sibling.process_suspended,
-                &ctx_val.to_string(),
-            ) {
-                Ok(true) => {
+            match self.try_store_write(|s| {
+                s.update_alert_suspension_state(
+                    &sibling.alert_id,
+                    sibling.process_suspended,
+                    &ctx_val.to_string(),
+                )
+            }) {
+                Some(Ok(true)) => {
                     adopted_count += 1;
                 }
-                Ok(false) => {
+                Some(Ok(false)) => {
                     last_err = Some(format!(
                         "sibling alert {} disappeared while transferring suspended_children",
                         sibling.alert_id
                     ));
                 }
-                Err(err) => {
+                Some(Err(err)) => {
                     last_err = Some(format!(
                         "failed updating sibling alert {} suspended_children: {err}",
                         sibling.alert_id
                     ));
+                }
+                None => {
+                    last_err = Some("daemon store writes closed for shutdown".to_string());
                 }
             }
         }
@@ -1119,7 +1124,7 @@ impl DaemonEngine {
     /// [`DaemonEngine::resolve_alert_with_outcome`] call so a rejected resume or status update
     /// cannot leave a permanent allow/block rule active (BUG_0001).
     fn rollback_saved_rule(&self, rule_id: &str) {
-        if let Err(err) = self.store.delete_rule(rule_id) {
+        if let Some(Err(err)) = self.try_store_write(|s| s.delete_rule(rule_id)) {
             tracing::warn!(
                 rule_id = %rule_id,
                 error = %err,
@@ -1217,11 +1222,16 @@ impl DaemonEngine {
         };
         for other in unresolved {
             if other.alert_id != resolved_alert_id {
-                match self.store.update_alert_status(
-                    &other.alert_id,
-                    AlertStatus::TerminatedBlocked,
-                    Some(now_ms),
-                ) {
+                let Some(update_res) = self.try_store_write(|s| {
+                    s.update_alert_status(
+                        &other.alert_id,
+                        AlertStatus::TerminatedBlocked,
+                        Some(now_ms),
+                    )
+                }) else {
+                    break;
+                };
+                match update_res {
                     Ok(true) => {
                         let ctx: serde_json::Value = serde_json::from_str(&other.context_json)
                             .unwrap_or(serde_json::Value::Null);

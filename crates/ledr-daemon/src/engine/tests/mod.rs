@@ -12,3 +12,4 @@ mod e2e_blockers;
 mod helpers;
 mod overflow_and_lifecycle;
 mod shared_ip_policy;
+mod wfp_attribution_and_shutdown;

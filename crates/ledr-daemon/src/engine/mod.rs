@@ -20,7 +20,8 @@ mod wfp_premat;
 
 pub use alerts::ResolvedAlertOutcome;
 pub use binary_inspector::{
-    BinaryInspector, LiveProcessInspector, WindowsBinaryInspector, WindowsLiveProcessInspector,
+    BinaryInspector, InspectOutcome, LiveProcessInspector, WindowsBinaryInspector,
+    WindowsLiveProcessInspector,
 };
 pub use config::{DaemonConfig, OutboundEnforcementMode, DEFAULT_MAX_CONCURRENT_IPC_CLIENTS};
 pub use motw::{
@@ -57,6 +58,7 @@ use domain_policy::select_outbound_decision_for_domains;
 use motw::{BrowserEventDedupCache, MotwIoWorkerPool, MotwStage2Cache};
 use nrd::NrdThreadHandle;
 use outbound::{VerifiedAppWideAllowCache, VERIFIED_APP_WIDE_ALLOW_CAPACITY};
+use pipeline::WorkerExit;
 #[cfg(test)]
 use wfp_drops::{OverflowPushOutcome, PendingWfpDrop};
 use wfp_drops::{AppWfpAlertDedup, QueuedWfpDrop, WfpDropDedupCache, WfpDropOverflowQueue};
@@ -125,7 +127,11 @@ pub struct DaemonEngine {
     pub(super) select_idle_periodic_sweeps: AtomicU64,
     #[cfg(test)]
     pub(super) select_idle_periodic_sweep_removals: AtomicU64,
-    worker_handle: tokio::sync::Mutex<Option<JoinHandle<Result<(), StoreError>>>>,
+    shutdown_initiated: Arc<AtomicBool>,
+    shutdown_drain_cutoff: Arc<AtomicBool>,
+    shutdown_cutoff_notify: Arc<tokio::sync::Notify>,
+    store_write_gate: Arc<RwLock<bool>>,
+    worker_handle: tokio::sync::Mutex<Option<JoinHandle<Result<WorkerExit, StoreError>>>>,
 }
 
 impl DaemonEngine {
@@ -220,6 +226,57 @@ impl DaemonEngine {
             .lock()
             .map(|t| t.total_len())
             .unwrap_or(0)
+    }
+
+    /// Signals early cooperative shutdown before stopping the ETW backend (`FU-E2E-05`).
+    ///
+    /// Cancels background NRD fetches, halts multi-batch TTL purges, and allows
+    /// `shutdown_skip_cold_binary_inspect` to abort/skip cold disk hashing without closing the
+    /// event channel prematurely so `ControlTraceW` buffer collection still drains cleanly.
+    pub fn signal_early_shutdown(&self) {
+        self.shutdown_initiated.store(true, Ordering::Release);
+        self.nrd_cancel.cancel();
+        self.store.request_shutdown();
+    }
+
+    pub(super) fn is_shutdown_drain_cutoff(&self) -> bool {
+        self.shutdown_drain_cutoff.load(Ordering::Acquire)
+    }
+
+    pub(super) fn store_write_closed_err() -> StoreError {
+        StoreError::InvalidValue {
+            field: "store.shutdown",
+            value: "daemon store writes closed for shutdown".to_string(),
+        }
+    }
+
+    pub(super) fn try_store_write<T>(
+        &self,
+        op: impl FnOnce(&LedrStore) -> Result<T, StoreError>,
+    ) -> Option<Result<T, StoreError>> {
+        let closed = self
+            .store_write_gate
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if *closed {
+            return None;
+        }
+        Some(op(&self.store))
+    }
+
+    pub(super) fn inspect_binary_for_pipeline(&self, exe_path: &str) -> InspectOutcome {
+        if self.is_shutdown_drain_cutoff() {
+            return InspectOutcome::Cancelled;
+        }
+        let fast_skip = self.config.shutdown_skip_cold_binary_inspect
+            && self.shutdown_initiated.load(Ordering::Acquire);
+        let cancel_flag = if self.config.shutdown_skip_cold_binary_inspect {
+            &self.shutdown_initiated
+        } else {
+            &self.shutdown_drain_cutoff
+        };
+        self.inspector
+            .inspect_cancellable(exe_path, cancel_flag, fast_skip)
     }
 
     /// Returns `true` iff `(pid, exe_path)` matches the running daemon's own PID and normalized

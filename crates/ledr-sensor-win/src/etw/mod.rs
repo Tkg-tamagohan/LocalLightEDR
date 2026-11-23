@@ -20,7 +20,10 @@ pub use self::file_canary::{
 pub use self::session::{
     DEFAULT_ETW_SESSION_NAME, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
 };
-pub use self::snapshot::{capture_running_processes, try_capture_running_processes};
+pub use self::snapshot::{
+    LiveSiblingCheck, capture_running_processes, find_other_live_processes_for_exe_key,
+    try_capture_running_processes,
+};
 
 /// Live process attributes retrieved on demand via Win32 `OpenProcess` / `GetProcessTimes` /
 /// `QueryFullProcessImageNameW` / `NtQueryInformationProcess`.

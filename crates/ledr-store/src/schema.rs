@@ -6,10 +6,21 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 
 use crate::StoreError;
 
-pub(crate) const PRAGMAS_SQL: &str = "
+pub(crate) const WRITER_PRAGMAS_SQL: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA cache_size = -2048;
+PRAGMA temp_store = MEMORY;
+PRAGMA mmap_size = 0;
+PRAGMA wal_autocheckpoint = 1000;
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+";
+
+pub(crate) const READER_PRAGMAS_SQL: &str = "
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA cache_size = -512;
 PRAGMA temp_store = MEMORY;
 PRAGMA mmap_size = 0;
 PRAGMA wal_autocheckpoint = 1000;
@@ -133,8 +144,13 @@ pub(crate) fn reader_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
-pub(crate) fn apply_pragmas(conn: &Connection) -> Result<(), StoreError> {
-    conn.execute_batch(PRAGMAS_SQL)?;
+pub(crate) fn apply_writer_pragmas(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(WRITER_PRAGMAS_SQL)?;
+    Ok(())
+}
+
+pub(crate) fn apply_reader_pragmas(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(READER_PRAGMAS_SQL)?;
     Ok(())
 }
 

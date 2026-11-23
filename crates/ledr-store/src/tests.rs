@@ -77,8 +77,11 @@ fn unit_schema_tables_indexes_and_all_seven_pragmas() {
         assert_eq!(indexes, expected_indexes);
     }
 
-    // Verify all 7 AUTO-09 PRAGMAs on both writer and reader connections.
-    for conn_guard in [writer, store.lock_reader().expect("lock reader")] {
+    // Verify all 7 AUTO-09 PRAGMAs on both writer (-2048) and reader (-512) connections.
+    for (label, expected_cache_size, conn_guard) in [
+        ("writer", -2048i64, writer),
+        ("reader", -512i64, store.lock_reader().expect("lock reader")),
+    ] {
         let jm: String = conn_guard
             .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
             .expect("journal_mode");
@@ -101,13 +104,13 @@ fn unit_schema_tables_indexes_and_all_seven_pragmas() {
             .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
             .expect("foreign_keys");
 
-        assert_eq!(jm.to_ascii_lowercase(), "wal");
-        assert_eq!(sync, 1); // NORMAL
-        assert_eq!(cache, -2048);
-        assert_eq!(temp, 2); // MEMORY
-        assert_eq!(mmap, 0);
-        assert_eq!(auto_ckpt, 1000);
-        assert_eq!(fk, 1);
+        assert_eq!(jm.to_ascii_lowercase(), "wal", "{label} journal_mode");
+        assert_eq!(sync, 1, "{label} synchronous"); // NORMAL
+        assert_eq!(cache, expected_cache_size, "{label} cache_size");
+        assert_eq!(temp, 2, "{label} temp_store"); // MEMORY
+        assert_eq!(mmap, 0, "{label} mmap_size");
+        assert_eq!(auto_ckpt, 1000, "{label} wal_autocheckpoint");
+        assert_eq!(fk, 1, "{label} foreign_keys");
     }
 }
 
@@ -901,4 +904,156 @@ fn store_p2_ingest_process_start_closes_superseded_placeholder_atomically_withou
         "superseded placeholder must be closed with exited_at_ms clamped to >= created_at_ms"
     );
     assert_eq!(real_row.exited_at_ms, None, "real process row remains active");
+}
+
+/// `STORE-MEM-01`: File-backed `writer` uses `cache_size = -2048` and `reader` uses
+/// `cache_size = -512`; `shrink_reader_memory_if_idle(Duration::from_secs(30))` skips when
+/// idle < 30s, shrinks once when idle > 30s, skips on repeat / lock contention / shutdown,
+/// resumes after `clear_shutdown_flag()`, and preserves read/write consistency (including on
+/// `open_in_memory()`).
+#[test]
+fn store_mem_01_reader_cache_size_and_idle_shrink() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("store_mem_01.db");
+    let store = LedrStore::open(&db_path).expect("open file-backed store");
+
+    let (_, w_cache, _) = store.verify_pragmas().expect("verify writer pragmas");
+    let (_, r_cache, _) = store
+        .verify_reader_pragmas()
+        .expect("verify reader pragmas");
+    assert_eq!(w_cache, -2048);
+    assert_eq!(r_cache, -512);
+
+    let id1 = ProcessIdentity::new(5101, 133_765_432_101_000_000);
+    let ev1 = SensorEvent::ProcessStart {
+        identity: id1,
+        parent_pid: 4,
+        exe_path: r"C:\Tools\mem_probe_1.exe".to_string(),
+        command_line: "mem_probe_1.exe --alpha".to_string(),
+        user_sid: None,
+    };
+    store
+        .ingest_event(&ev1, Some("4:1"), false, "OBSERVED")
+        .expect("ingest ev1");
+    store.flush_batch().expect("flush ev1");
+
+    let snap1 = store
+        .query_flight_recorder(10, Some(&id1.instance_id()))
+        .expect("query ev1");
+    assert_eq!(snap1.processes.len(), 1);
+
+    // Idle < 30s must not execute shrink_memory.
+    assert!(
+        !store
+            .shrink_reader_memory_if_idle(Duration::from_secs(30))
+            .expect("shrink check < 30s"),
+        "must not shrink before 30s idle"
+    );
+
+    // Contention on reader lock must return Ok(false) without blocking even when idle > 30s.
+    {
+        let _reader_guard = store.lock_reader().expect("hold reader lock");
+        store.advance_reader_idle_for_test(Duration::from_secs(31));
+        assert!(
+            !store
+                .shrink_reader_memory_if_idle(Duration::from_secs(30))
+                .expect("contended shrink must not block or error"),
+            "must return Ok(false) on WouldBlock"
+        );
+    }
+
+    // Idle > 30s and uncontended must shrink once, then skip immediate repeat.
+    assert!(
+        store
+            .shrink_reader_memory_if_idle(Duration::from_secs(30))
+            .expect("shrink after 31s idle"),
+        "must shrink once after > 30s idle"
+    );
+    assert!(
+        !store
+            .shrink_reader_memory_if_idle(Duration::from_secs(30))
+            .expect("repeat shrink immediately after"),
+        "must not re-shrink until reader is accessed again"
+    );
+
+    // Accessing reader resets idle timer and clears shrunk flag.
+    let snap1_after = store
+        .query_flight_recorder(10, Some(&id1.instance_id()))
+        .expect("query ev1 after shrink");
+    assert_eq!(snap1_after.processes.len(), 1);
+    assert!(
+        !store
+            .shrink_reader_memory_if_idle(Duration::from_secs(30))
+            .expect("shrink check right after query"),
+        "reader access must reset 30s idle timer"
+    );
+
+    // Shutdown requested suppresses shrink without falsely marking shrunk.
+    store.advance_reader_idle_for_test(Duration::from_secs(31));
+    store.request_shutdown();
+    assert!(
+        !store
+            .shrink_reader_memory_if_idle(Duration::from_secs(30))
+            .expect("shrink check during shutdown"),
+        "must not acquire reader lock or shrink when shutdown is requested"
+    );
+
+    // Clearing shutdown flag (restart path) allows pending idle shrink to proceed.
+    store.clear_shutdown_flag();
+    assert!(
+        store
+            .shrink_reader_memory_if_idle(Duration::from_secs(30))
+            .expect("shrink after clear_shutdown_flag"),
+        "must shrink once shutdown flag is cleared"
+    );
+
+    // Read/write consistency and reader cache_size pragma remain intact after shrink.
+    let id2 = ProcessIdentity::new(5102, 133_765_432_102_000_000);
+    let ev2 = SensorEvent::ProcessStart {
+        identity: id2,
+        parent_pid: 4,
+        exe_path: r"C:\Tools\mem_probe_2.exe".to_string(),
+        command_line: "mem_probe_2.exe --beta".to_string(),
+        user_sid: None,
+    };
+    store
+        .ingest_event(&ev2, Some("4:1"), false, "OBSERVED")
+        .expect("ingest ev2");
+    store.flush_batch().expect("flush ev2");
+
+    let snap_all = store.query_flight_recorder(10, None).expect("query all");
+    assert_eq!(snap_all.processes.len(), 2);
+    let (_, r_cache_after, _) = store
+        .verify_reader_pragmas()
+        .expect("verify reader pragmas after shrink");
+    assert_eq!(r_cache_after, -512);
+
+    // Verify open_in_memory() keeps cache_size = -2048 and safely preserves rows on shrink.
+    let mem_store = LedrStore::open_in_memory().expect("open in-memory store");
+    let (_, mem_w_cache, _) = mem_store.verify_pragmas().expect("in-memory writer pragma");
+    let (_, mem_r_cache, _) = mem_store
+        .verify_reader_pragmas()
+        .expect("in-memory reader pragma");
+    assert_eq!(mem_w_cache, -2048);
+    assert_eq!(mem_r_cache, -2048);
+
+    mem_store
+        .ingest_event(&ev1, Some("4:1"), false, "OBSERVED")
+        .expect("in-memory ingest");
+    mem_store.flush_batch().expect("in-memory flush");
+    mem_store.advance_reader_idle_for_test(Duration::from_secs(31));
+    assert!(
+        mem_store
+            .shrink_reader_memory_if_idle(Duration::from_secs(30))
+            .expect("in-memory shrink succeeds safely"),
+        "in-memory shrink_memory should succeed safely"
+    );
+    let mem_snap = mem_store
+        .query_flight_recorder(10, Some(&id1.instance_id()))
+        .expect("in-memory query after shrink");
+    assert_eq!(mem_snap.processes.len(), 1);
+    let (_, mem_cache_after, _) = mem_store
+        .verify_reader_pragmas()
+        .expect("in-memory pragma after shrink");
+    assert_eq!(mem_cache_after, -2048);
 }

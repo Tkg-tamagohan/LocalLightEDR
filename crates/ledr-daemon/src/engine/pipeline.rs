@@ -534,6 +534,11 @@ impl DaemonEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .sweep_interner();
-        // PHASE3_STORE_HOOK: let _ = self.store.shrink_reader_memory_if_idle(Duration::from_secs(30));
+        if let Err(err) = self
+            .store
+            .shrink_reader_memory_if_idle(Duration::from_secs(30))
+        {
+            tracing::warn!(error = %err, "idle reader memory shrink failed");
+        }
     }
 }

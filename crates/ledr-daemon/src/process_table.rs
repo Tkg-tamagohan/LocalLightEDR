@@ -1,6 +1,9 @@
 //! Bounded O(1) in-memory active process table for parent-child correlation (`決定記録 L-12`).
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
+use std::sync::{Arc, Mutex, Weak};
 
 use ledr_proto::{is_never_suspend_process, ProcessIdentity, ACTIVE_PROCESS_TABLE_CAPACITY};
 
@@ -8,6 +11,103 @@ const MAX_EVICTED_EXITED_HISTORY: usize = 1024;
 const MAX_EVICTED_CMDLINE_BYTES: usize = 4096;
 const MAX_EVICTED_LIVE_HISTORY: usize = ACTIVE_PROCESS_TABLE_CAPACITY;
 const MAX_OVERFLOWED_EVICTED_LIVE_EXES: usize = ACTIVE_PROCESS_TABLE_CAPACITY;
+pub(crate) const PATH_INTERNER_MAX_ENTRIES: usize = 8_192;
+
+/// Bounded weak-reference string interner for deduplicating repeated `exe_path`, `exe_key`, and
+/// `domain` allocations (`FU-E2E-03` Track 1c).
+///
+/// Lock-order invariant: `PathInterner` MUST remain a strict **leaf lock** (`firewall ->
+/// process_table -> path_interner`). It must NEVER acquire `process_table` or `firewall`.
+#[derive(Debug)]
+pub(crate) struct PathInterner {
+    max_entries: usize,
+    hasher: RandomState,
+    empty: Arc<str>,
+    entries: HashMap<u64, Weak<str>>,
+}
+
+impl Default for PathInterner {
+    fn default() -> Self {
+        Self::new(PATH_INTERNER_MAX_ENTRIES)
+    }
+}
+
+impl PathInterner {
+    pub(crate) fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            hasher: RandomState::new(),
+            empty: Arc::from(""),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn hash_str(&self, value: &str) -> u64 {
+        self.hasher.hash_one(value)
+    }
+
+    pub(crate) fn intern(&mut self, value: &str) -> Arc<str> {
+        if value.is_empty() {
+            return Arc::clone(&self.empty);
+        }
+        let hash = self.hash_str(value);
+        if let Some(slot) = self.entries.get_mut(&hash) {
+            if let Some(existing) = slot.upgrade() {
+                if existing.as_ref() == value {
+                    return existing;
+                }
+                return Arc::from(value);
+            }
+            let arc: Arc<str> = Arc::from(value);
+            *slot = Arc::downgrade(&arc);
+            return arc;
+        }
+        if self.entries.len() >= self.max_entries {
+            self.sweep_dead();
+            if self.entries.len() >= self.max_entries {
+                return Arc::from(value);
+            }
+        }
+        let arc: Arc<str> = Arc::from(value);
+        self.entries.insert(hash, Arc::downgrade(&arc));
+        arc
+    }
+
+    pub(crate) fn intern_shared(interner: &Arc<Mutex<Self>>, value: &str) -> Arc<str> {
+        if value.is_empty() {
+            return Arc::from("");
+        }
+        interner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .intern(value)
+    }
+
+    pub(crate) fn sweep_dead(&mut self) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|_, weak| weak.strong_count() > 0);
+        let shrink_target = self.entries.len().saturating_mul(2).max(64);
+        if self.entries.capacity() > shrink_target {
+            self.entries.shrink_to(shrink_target);
+        }
+        before.saturating_sub(self.entries.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_len(&self) -> usize {
+        self.entries.values().filter(|w| w.strong_count() > 0).count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+}
 
 /// Process metadata cached in memory for O(1) parent context lookup during rule evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,7 +117,7 @@ pub struct ActiveProcessEntry {
     pub pid: u32,
     pub ppid: u32,
     pub parent_instance_id: Option<String>,
-    pub exe_path: String,
+    pub exe_path: Arc<str>,
     pub command_line: String,
     pub user_sid: Option<String>,
     pub created_at_ms: i64,
@@ -103,7 +203,7 @@ struct EvictedExitedRecord {
     created_at_ms: i64,
     exited_at_ms: i64,
     parent_instance_id: Option<String>,
-    exe_path: String,
+    exe_path: Arc<str>,
     command_line: EvictedCommandLine,
     emitted_rule_ids: HashSet<String>,
 }
@@ -115,8 +215,8 @@ struct EvictedExitedRecord {
 struct EvictedLiveRecord {
     identity: ProcessIdentity,
     created_at_ms: i64,
-    exe_path: String,
-    exe_key: String,
+    exe_path: Arc<str>,
+    exe_key: Arc<str>,
     has_motw: bool,
     generation: u64,
 }
@@ -136,6 +236,7 @@ pub struct WfpProcessCandidates<'a> {
 #[derive(Debug)]
 pub struct ActiveProcessTable {
     capacity: usize,
+    path_interner: Arc<Mutex<PathInterner>>,
     pid_to_identity: HashMap<u32, ProcessIdentity>,
     entries: HashMap<String, ActiveProcessEntry>,
     exited_fifo: VecDeque<String>,
@@ -147,10 +248,10 @@ pub struct ActiveProcessTable {
     evicted_live_fifo: VecDeque<(String, u64)>,
     evicted_live_seq: u64,
     evicted_live_capacity: usize,
-    evicted_live_exe_counts: HashMap<String, usize>,
-    evicted_live_motw_exe_counts: HashMap<String, usize>,
-    overflowed_evicted_live_exes: HashSet<String>,
-    overflowed_evicted_live_motw_exes: HashSet<String>,
+    evicted_live_exe_counts: HashMap<Arc<str>, usize>,
+    evicted_live_motw_exe_counts: HashMap<Arc<str>, usize>,
+    overflowed_evicted_live_exes: HashSet<Arc<str>>,
+    overflowed_evicted_live_motw_exes: HashSet<Arc<str>>,
     evicted_live_overflow_any: bool,
     evicted_live_motw_overflow_any: bool,
     active_count: usize,
@@ -168,6 +269,7 @@ impl ActiveProcessTable {
         let cap = capacity.max(1);
         Self {
             capacity: cap,
+            path_interner: Arc::new(Mutex::new(PathInterner::new(PATH_INTERNER_MAX_ENTRIES))),
             pid_to_identity: HashMap::with_capacity(cap.min(1024)),
             entries: HashMap::with_capacity(cap.min(1024)),
             exited_fifo: VecDeque::new(),
@@ -187,6 +289,41 @@ impl ActiveProcessTable {
             evicted_live_motw_overflow_any: false,
             active_count: 0,
         }
+    }
+
+    pub(crate) fn path_interner(&self) -> Arc<Mutex<PathInterner>> {
+        Arc::clone(&self.path_interner)
+    }
+
+    /// Frees non-lineage metadata (`motw_referrer`, `motw_frame_url`, `motw_source`,
+    /// `motw_zone_id`, `user_sid`) on exited entries whose `exited_at_ms <= cutoff_ms`
+    /// (`FU-E2E-03` Track 1c).
+    ///
+    /// Keeps entries in `entries` (no blanket 60s eviction into `evicted_exited`) and preserves
+    /// `parent_instance_id`, `exe_path`, `command_line`, `emitted_rule_ids`, and `origin_url`.
+    pub fn compact_exited_older_than(&mut self, cutoff_ms: i64) -> usize {
+        let mut compacted = 0usize;
+        for entry in self.entries.values_mut() {
+            if entry
+                .exited_at_ms
+                .is_some_and(|exited_ms| exited_ms <= cutoff_ms)
+            {
+                let had_non_lineage = entry.user_sid.is_some()
+                    || entry.motw_referrer.is_some()
+                    || entry.motw_frame_url.is_some()
+                    || entry.motw_source.is_some()
+                    || entry.motw_zone_id.is_some();
+                if had_non_lineage {
+                    entry.user_sid = None;
+                    entry.motw_referrer = None;
+                    entry.motw_frame_url = None;
+                    entry.motw_source = None;
+                    entry.motw_zone_id = None;
+                    compacted += 1;
+                }
+            }
+        }
+        compacted
     }
 
     /// Overrides the bounded capacity of the secondary evicted-live tracker in unit/integration
@@ -301,7 +438,8 @@ impl ActiveProcessTable {
                         prev_entry.ppid = parent_pid;
                     }
                     if upgraded_exe {
-                        prev_entry.exe_path = exe_path;
+                        prev_entry.exe_path =
+                            PathInterner::intern_shared(&self.path_interner, &exe_path);
                     }
                     if upgraded_cmd {
                         prev_entry.command_line = command_line;
@@ -405,7 +543,7 @@ impl ActiveProcessTable {
                 existing.ppid = parent_pid;
             }
             if !exe_path.is_empty() {
-                existing.exe_path = exe_path;
+                existing.exe_path = PathInterner::intern_shared(&self.path_interner, &exe_path);
             }
             if !command_line.is_empty() {
                 existing.command_line = command_line;
@@ -449,12 +587,16 @@ impl ActiveProcessTable {
                     } else {
                         self.lookup_parent_for(parent_pid, identity, created_at_ms, true)
                     };
+                let interned_exe = (!exe_path.is_empty())
+                    .then(|| PathInterner::intern_shared(&self.path_interner, &exe_path));
                 if let Some(evicted) = self.evicted_exited.get_mut(&instance_id) {
                     if evicted.parent_instance_id.is_none() {
                         evicted.parent_instance_id = parent_instance_id.clone();
                     }
-                    if evicted.exe_path.is_empty() && !exe_path.is_empty() {
-                        evicted.exe_path = exe_path;
+                    if evicted.exe_path.is_empty() {
+                        if let Some(interned) = interned_exe {
+                            evicted.exe_path = interned;
+                        }
                     }
                     if matches!(evicted.command_line, EvictedCommandLine::Empty)
                         && !command_line.is_empty()
@@ -497,6 +639,7 @@ impl ActiveProcessTable {
                     // Arriving ProcessStart is older than the already-registered process for this PID:
                     // preserve the newer active mapping and record this older incarnation as exited.
                     let inferred_exit_ms = prev_entry.created_at_ms;
+                    let interned_exe = PathInterner::intern_shared(&self.path_interner, &exe_path);
                     self.entries.insert(
                         instance_id.clone(),
                         ActiveProcessEntry {
@@ -505,7 +648,7 @@ impl ActiveProcessTable {
                             pid: identity.pid,
                             ppid: parent_pid,
                             parent_instance_id: parent_instance_id.clone(),
-                            exe_path,
+                            exe_path: interned_exe,
                             command_line,
                             user_sid,
                             created_at_ms,
@@ -555,6 +698,7 @@ impl ActiveProcessTable {
                 .max()
         }) {
             self.remove_evicted_live_by_id(&instance_id);
+            let interned_exe = PathInterner::intern_shared(&self.path_interner, &exe_path);
             self.entries.insert(
                 instance_id.clone(),
                 ActiveProcessEntry {
@@ -563,7 +707,7 @@ impl ActiveProcessTable {
                     pid: identity.pid,
                     ppid: parent_pid,
                     parent_instance_id: parent_instance_id.clone(),
-                    exe_path,
+                    exe_path: interned_exe,
                     command_line,
                     user_sid,
                     created_at_ms,
@@ -609,7 +753,7 @@ impl ActiveProcessTable {
             {
                 let exit_ms = created_at_ms.max(prev_entry.created_at_ms);
                 prev_entry.exited_at_ms = Some(exit_ms);
-                let prev_exe_path = prev_entry.exe_path.clone();
+                let prev_exe_path = prev_entry.exe_path.to_string();
                 self.active_count = self.active_count.saturating_sub(1);
                 self.exited_fifo.push_back(prev_id.clone());
                 superseded_exit = Some((prev_id.clone(), exit_ms));
@@ -637,7 +781,7 @@ impl ActiveProcessTable {
                         latest_evicted =
                             Some((ev_id.clone(), ev.created_at_ms, ev.identity.create_time_100ns));
                     }
-                    superseded_exited_processes.push((ev_id, ev.exe_path));
+                    superseded_exited_processes.push((ev_id, ev.exe_path.to_string()));
                 }
             }
             if let Some((latest_id, latest_created, _)) = latest_evicted {
@@ -647,6 +791,7 @@ impl ActiveProcessTable {
             }
         }
 
+        let interned_exe = PathInterner::intern_shared(&self.path_interner, &exe_path);
         self.pid_to_identity.insert(identity.pid, identity);
         self.entries.insert(
             instance_id.clone(),
@@ -656,7 +801,7 @@ impl ActiveProcessTable {
                 pid: identity.pid,
                 ppid: parent_pid,
                 parent_instance_id: parent_instance_id.clone(),
-                exe_path,
+                exe_path: interned_exe,
                 command_line,
                 user_sid,
                 created_at_ms,
@@ -736,7 +881,7 @@ impl ActiveProcessTable {
                 self.active_count = self.active_count.saturating_sub(1);
                 self.exited_fifo.push_back(target_id.clone());
             }
-            let exe_path = entry.exe_path.clone();
+            let exe_path = entry.exe_path.to_string();
             return Some((target_id, exe_path));
         }
 
@@ -748,7 +893,7 @@ impl ActiveProcessTable {
                 .map(|(id, _)| id.clone())
         }) {
             if let Some(ev) = self.remove_evicted_live_by_id(&ev_id) {
-                return Some((ev_id, ev.exe_path));
+                return Some((ev_id, ev.exe_path.to_string()));
             }
         }
 
@@ -805,7 +950,7 @@ impl ActiveProcessTable {
             if entry.exited_at_ms.is_none() && !entry.exe_path.trim().is_empty() {
                 let key = entry.exe_path.to_ascii_lowercase();
                 if seen.insert(key) {
-                    out.push(entry.exe_path.clone());
+                    out.push(entry.exe_path.to_string());
                 }
             }
         }
@@ -813,7 +958,7 @@ impl ActiveProcessTable {
             if !ev.exe_path.trim().is_empty() {
                 let key = ev.exe_path.to_ascii_lowercase();
                 if seen.insert(key) {
-                    out.push(ev.exe_path.clone());
+                    out.push(ev.exe_path.to_string());
                 }
             }
         }
@@ -931,7 +1076,7 @@ impl ActiveProcessTable {
             .evicted_live
             .values()
             .filter(|ev| {
-                ev.exe_key == norm_target && ev.created_at_ms <= max_created
+                ev.exe_key.as_ref() == norm_target && ev.created_at_ms <= max_created
             })
             .map(|ev| ev.identity)
             .collect();
@@ -948,7 +1093,9 @@ impl ActiveProcessTable {
             .map(|ev| ev.identity)
             .collect();
 
-        let exe_evicted_live_overflowed = self.overflowed_evicted_live_exes.contains(&norm_target);
+        let exe_evicted_live_overflowed = self
+            .overflowed_evicted_live_exes
+            .contains(norm_target.as_str());
 
         WfpProcessCandidates {
             entries: matches,
@@ -1013,7 +1160,7 @@ impl ActiveProcessTable {
             entry.motw_referrer = motw_referrer;
             entry.motw_frame_url = motw_frame_url;
             entry.motw_zone_id = motw_zone_id;
-            return Some((entry.exe_path.clone(), entry.pid));
+            return Some((entry.exe_path.to_string(), entry.pid));
         }
         if let Some(ev) = self.evicted_live.get_mut(instance_id) {
             if ev.has_motw {
@@ -1021,7 +1168,7 @@ impl ActiveProcessTable {
             }
             ev.has_motw = true;
             let exe_key = ev.exe_key.clone();
-            let exe_path = ev.exe_path.clone();
+            let exe_path = ev.exe_path.to_string();
             let pid = ev.identity.pid;
             if !exe_key.is_empty() {
                 *self.evicted_live_motw_exe_counts.entry(exe_key).or_insert(0) += 1;
@@ -1143,7 +1290,7 @@ impl ActiveProcessTable {
     ) -> (Option<String>, Option<String>, Option<String>) {
         (
             Some(entry.instance_id.clone()),
-            Some(entry.exe_path.clone()),
+            Some(entry.exe_path.to_string()),
             (!entry.command_line.is_empty()).then(|| entry.command_line.clone()),
         )
     }
@@ -1153,7 +1300,7 @@ impl ActiveProcessTable {
     ) -> (Option<String>, Option<String>, Option<String>) {
         (
             Some(evicted.identity.instance_id()),
-            (!evicted.exe_path.is_empty()).then(|| evicted.exe_path.clone()),
+            (!evicted.exe_path.is_empty()).then(|| evicted.exe_path.to_string()),
             evicted.command_line.as_complete().map(str::to_string),
         )
     }
@@ -1329,10 +1476,11 @@ impl ActiveProcessTable {
         instance_id: String,
         identity: ProcessIdentity,
         created_at_ms: i64,
-        exe_path: String,
+        exe_path: Arc<str>,
         has_motw: bool,
     ) {
-        let exe_key = normalize_exe_key(&exe_path);
+        let exe_key_str = normalize_exe_key(&exe_path);
+        let exe_key = PathInterner::intern_shared(&self.path_interner, &exe_key_str);
         if self.evicted_live_capacity == 0 {
             self.record_overflowed_evicted_live_exe(&exe_key, has_motw);
             return;
@@ -1343,11 +1491,14 @@ impl ActiveProcessTable {
         self.evicted_live_seq = self.evicted_live_seq.wrapping_add(1);
         let generation = self.evicted_live_seq;
         if !exe_key.is_empty() {
-            *self.evicted_live_exe_counts.entry(exe_key.clone()).or_insert(0) += 1;
+            *self
+                .evicted_live_exe_counts
+                .entry(Arc::clone(&exe_key))
+                .or_insert(0) += 1;
             if has_motw {
                 *self
                     .evicted_live_motw_exe_counts
-                    .entry(exe_key.clone())
+                    .entry(Arc::clone(&exe_key))
                     .or_insert(0) += 1;
             }
         }
@@ -1384,22 +1535,26 @@ impl ActiveProcessTable {
         }
     }
 
-    fn record_overflowed_evicted_live_exe(&mut self, exe_key: &str, has_motw: bool) {
+    fn record_overflowed_evicted_live_exe(&mut self, exe_key: &Arc<str>, has_motw: bool) {
         if exe_key.is_empty() {
             return;
         }
         if !self.evicted_live_overflow_any {
             if self.overflowed_evicted_live_exes.len() < MAX_OVERFLOWED_EVICTED_LIVE_EXES {
-                self.overflowed_evicted_live_exes.insert(exe_key.to_string());
-            } else if !self.overflowed_evicted_live_exes.contains(exe_key) {
+                self.overflowed_evicted_live_exes
+                    .insert(Arc::clone(exe_key));
+            } else if !self.overflowed_evicted_live_exes.contains(exe_key.as_ref()) {
                 self.evicted_live_overflow_any = true;
             }
         }
         if has_motw && !self.evicted_live_motw_overflow_any {
             if self.overflowed_evicted_live_motw_exes.len() < MAX_OVERFLOWED_EVICTED_LIVE_EXES {
                 self.overflowed_evicted_live_motw_exes
-                    .insert(exe_key.to_string());
-            } else if !self.overflowed_evicted_live_motw_exes.contains(exe_key) {
+                    .insert(Arc::clone(exe_key));
+            } else if !self
+                .overflowed_evicted_live_motw_exes
+                .contains(exe_key.as_ref())
+            {
                 self.evicted_live_motw_overflow_any = true;
             }
         }
@@ -1414,17 +1569,25 @@ impl ActiveProcessTable {
             }
         }
         if !removed.exe_key.is_empty() {
-            if let Some(cnt) = self.evicted_live_exe_counts.get_mut(&removed.exe_key) {
+            if let Some(cnt) = self
+                .evicted_live_exe_counts
+                .get_mut(removed.exe_key.as_ref())
+            {
                 if *cnt <= 1 {
-                    self.evicted_live_exe_counts.remove(&removed.exe_key);
+                    self.evicted_live_exe_counts
+                        .remove(removed.exe_key.as_ref());
                 } else {
                     *cnt -= 1;
                 }
             }
             if removed.has_motw {
-                if let Some(cnt) = self.evicted_live_motw_exe_counts.get_mut(&removed.exe_key) {
+                if let Some(cnt) = self
+                    .evicted_live_motw_exe_counts
+                    .get_mut(removed.exe_key.as_ref())
+                {
                     if *cnt <= 1 {
-                        self.evicted_live_motw_exe_counts.remove(&removed.exe_key);
+                        self.evicted_live_motw_exe_counts
+                            .remove(removed.exe_key.as_ref());
                     } else {
                         *cnt -= 1;
                     }
@@ -1574,7 +1737,7 @@ mod tests {
         table.on_process_start(a, 4, "a_full.exe".to_string(), "a.exe --arg".to_string(), None, 100);
         let a_entry = table.get_by_instance_id(&a.instance_id()).expect("A retained");
         assert_eq!(a_entry.exited_at_ms, Some(200));
-        assert_eq!(a_entry.exe_path, "a_full.exe");
+        assert_eq!(a_entry.exe_path.as_ref(), "a_full.exe");
         assert_eq!(table.lookup_by_pid(500).map(|e| e.identity), Some(b));
 
         // Out-of-order stop for an older incarnation must not mark newer B as exited.
@@ -1884,7 +2047,7 @@ mod tests {
             .expect("child_b remains");
         assert_eq!(b_after.ppid, 800);
         assert_eq!(b_after.parent_instance_id, None);
-        assert_eq!(b_after.exe_path, r"C:\Tools\child_b.exe");
+        assert_eq!(b_after.exe_path.as_ref(), r"C:\Tools\child_b.exe");
         assert_eq!(b_after.command_line, "child_b.exe");
         assert_eq!(b_after.user_sid, None);
 
@@ -2432,7 +2595,7 @@ mod tests {
         table.on_process_start(id_c2, 4, exe_c.to_string(), "c2.exe".to_string(), None, 130);
         assert!(table.evicted_live.contains_key(&id_a.instance_id()));
         assert!(table.evicted_live.contains_key(&id_b.instance_id()));
-        assert!(!table.overflowed_evicted_live_exes.contains(&key_a));
+        assert!(!table.overflowed_evicted_live_exes.contains(key_a.as_str()));
 
         // 4. Start D -> evicts C2 into evicted_live (size 3 > capacity 2).
         //    Stale (A, 1) sits at the head of FIFO ahead of (B, 2) and MUST be ignored so B (gen 2)
@@ -2450,7 +2613,7 @@ mod tests {
             "newer generation of re-evicted A must NOT be evicted by stale FIFO entry"
         );
         assert!(
-            !table.overflowed_evicted_live_exes.contains(&key_a),
+            !table.overflowed_evicted_live_exes.contains(key_a.as_str()),
             "A must remain individually tracked rather than fail-closed overflowed"
         );
         assert!(
@@ -2458,7 +2621,7 @@ mod tests {
             "oldest live generation B must be evicted to overflow"
         );
         assert!(
-            table.overflowed_evicted_live_exes.contains(&key_b),
+            table.overflowed_evicted_live_exes.contains(key_b.as_str()),
             "B must move to overflowed_evicted_live_exes (fail-closed)"
         );
         assert!(table.has_active_exe_key(&key_b));
@@ -2582,5 +2745,219 @@ mod tests {
         let indexed_total: usize = table.evicted_live_by_pid.values().map(Vec::len).sum();
         assert_eq!(indexed_total, table.evicted_live.len());
         assert!(table.evicted_live_by_pid.values().all(|v| !v.is_empty()));
+    }
+
+    /// `PROC-MEM-01`: Verifies that post-60s compaction frees ONLY the 5 non-lineage fields
+    /// (`motw_referrer`, `motw_frame_url`, `motw_source`, `motw_zone_id`, `user_sid`) without
+    /// blanket 60s eviction into `evicted_exited`, `PathInterner` deduplicates `Arc<str>` paths and
+    /// stays bounded `<= 8,192` with `sweep_dead()`, and parent lineage, `evicted_live`,
+    /// `EvictedCommandLine::Oversized`, and lock-order invariants (`try_lock`) hold.
+    #[test]
+    fn proc_mem_01_post_60s_compaction_interning_and_invariants() {
+        let mut table = ActiveProcessTable::new(8).with_evicted_live_capacity(8);
+
+        let parent_id = ProcessIdentity::new(100, 10_000);
+        let shared_exe = r"C:\Program Files\SharedApp\app.exe".to_string();
+        table.on_process_start(
+            parent_id,
+            4,
+            shared_exe.clone(),
+            "app.exe --parent".to_string(),
+            Some("S-1-5-21-100".to_string()),
+            1_000,
+        );
+        table.set_motw_metadata(
+            &parent_id.instance_id(),
+            "https://parent.example/app.zip".to_string(),
+            "Zone.Identifier".to_string(),
+            Some("https://ref.example/".to_string()),
+            Some("https://frame.example/".to_string()),
+            Some(3),
+        );
+
+        let old_child_id = ProcessIdentity::new(101, 20_000);
+        let oversized_cmd = format!("child.exe {}", "x".repeat(MAX_EVICTED_CMDLINE_BYTES + 128));
+        table.on_process_start(
+            old_child_id,
+            100,
+            shared_exe.clone(),
+            oversized_cmd.clone(),
+            Some("S-1-5-21-101".to_string()),
+            2_000,
+        );
+        table.set_motw_metadata(
+            &old_child_id.instance_id(),
+            "https://child.example/dl.exe".to_string(),
+            "Zone.Identifier".to_string(),
+            Some("https://ref.example/child".to_string()),
+            Some("https://frame.example/child".to_string()),
+            Some(3),
+        );
+        assert!(table.mark_rule_alert_emitted(&old_child_id.instance_id(), "SIGMA-001"));
+        assert_eq!(
+            table.on_process_stop(old_child_id.pid, 100_000),
+            Some(old_child_id.instance_id())
+        );
+
+        let recent_child_id = ProcessIdentity::new(102, 30_000);
+        table.on_process_start(
+            recent_child_id,
+            100,
+            r"C:\Tools\recent.exe".to_string(),
+            "recent.exe --keep".to_string(),
+            Some("S-1-5-21-102".to_string()),
+            130_000,
+        );
+        table.set_motw_metadata(
+            &recent_child_id.instance_id(),
+            "https://recent.example/bin.exe".to_string(),
+            "Zone.Identifier".to_string(),
+            Some("https://ref.example/recent".to_string()),
+            Some("https://frame.example/recent".to_string()),
+            Some(3),
+        );
+        assert_eq!(
+            table.on_process_stop(recent_child_id.pid, 140_000),
+            Some(recent_child_id.instance_id())
+        );
+
+        // 1. Arc<str> pointer sharing across entries with the same exe_path.
+        let parent_arc = Arc::clone(
+            &table
+                .get_by_instance_id(&parent_id.instance_id())
+                .expect("parent active")
+                .exe_path,
+        );
+        let child_arc = Arc::clone(
+            &table
+                .get_by_instance_id(&old_child_id.instance_id())
+                .expect("old child retained")
+                .exe_path,
+        );
+        assert!(
+            Arc::ptr_eq(&parent_arc, &child_arc),
+            "repeated exe_path must share the exact same Arc<str> allocation"
+        );
+        drop(parent_arc);
+        drop(child_arc);
+
+        // 2. Post-60s compaction at now_ms = 160_000 (cutoff = 100_000):
+        //    only old_child_id (exited_at_ms = 100_000 <= 100_000) is compacted;
+        //    NO blanket eviction into evicted_exited occurs.
+        let compacted = table.compact_exited_older_than(100_000);
+        assert_eq!(compacted, 1);
+        assert_eq!(
+            table.compact_exited_older_than(100_000),
+            0,
+            "second compaction pass must be idempotent"
+        );
+        assert!(table.evicted_exited.is_empty());
+
+        let old_entry = table
+            .get_by_instance_id(&old_child_id.instance_id())
+            .expect("old exited entry stays in entries (no blanket 60s eviction)");
+        assert_eq!(old_entry.user_sid, None);
+        assert_eq!(old_entry.motw_referrer, None);
+        assert_eq!(old_entry.motw_frame_url, None);
+        assert_eq!(old_entry.motw_source, None);
+        assert_eq!(old_entry.motw_zone_id, None);
+        // Preserved lineage / dedup / L-18 MOTW / oversized command_line fields:
+        assert_eq!(
+            old_entry.parent_instance_id.as_deref(),
+            Some(parent_id.instance_id().as_str())
+        );
+        assert_eq!(old_entry.exe_path.as_ref(), shared_exe);
+        assert_eq!(old_entry.command_line, oversized_cmd);
+        assert!(table.has_rule_alert_emitted(&old_child_id.instance_id(), "SIGMA-001"));
+        assert_eq!(
+            old_entry.origin_url.as_deref(),
+            Some("https://child.example/dl.exe")
+        );
+
+        // Recently exited and still-live entries keep all 5 non-lineage fields intact.
+        let recent_entry = table
+            .get_by_instance_id(&recent_child_id.instance_id())
+            .expect("recent exited entry");
+        assert_eq!(recent_entry.user_sid.as_deref(), Some("S-1-5-21-102"));
+        assert_eq!(recent_entry.motw_zone_id, Some(3));
+        assert!(recent_entry.motw_referrer.is_some());
+        assert!(recent_entry.motw_frame_url.is_some());
+        assert!(recent_entry.motw_source.is_some());
+
+        let live_parent = table
+            .get_by_instance_id(&parent_id.instance_id())
+            .expect("live parent");
+        assert_eq!(live_parent.user_sid.as_deref(), Some("S-1-5-21-100"));
+        assert_eq!(live_parent.motw_zone_id, Some(3));
+
+        // 3. Evicting old_child_id via capacity pressure preserves parent lineage, MOTW,
+        //    emitted_rule_ids, and EvictedCommandLine::Oversized (`> 4096` bytes), while
+        //    evicting live parent into `evicted_live` preserves live + MOTW tracking.
+        for i in 0..8u32 {
+            let filler_id = ProcessIdentity::new(500 + i, 50_000 + u64::from(i));
+            table.on_process_start(
+                filler_id,
+                4,
+                format!(r"C:\Temp\filler_{i}.exe"),
+                format!("filler_{i}.exe"),
+                None,
+                150_000 + i64::from(i),
+            );
+        }
+        assert!(table.get_by_instance_id(&old_child_id.instance_id()).is_none());
+        let evicted_old = table
+            .evicted_exited
+            .get(&old_child_id.instance_id())
+            .expect("old child moved to evicted_exited on capacity eviction");
+        assert!(matches!(evicted_old.command_line, EvictedCommandLine::Oversized));
+        assert_eq!(
+            evicted_old.parent_instance_id.as_deref(),
+            Some(parent_id.instance_id().as_str())
+        );
+        assert!(table.has_rule_alert_emitted(&old_child_id.instance_id(), "SIGMA-001"));
+        assert_eq!(
+            table.parent_metadata_by_id(&old_child_id.instance_id()),
+            (
+                Some(old_child_id.instance_id()),
+                Some(shared_exe.clone()),
+                None
+            )
+        );
+        // Live parent evicted into evicted_live keeps liveness + MOTW queries true.
+        let parent_exe_key = normalize_exe_key(&shared_exe);
+        assert!(table.has_active_exe_key(&parent_exe_key));
+        assert!(table.has_active_motw_for_exe_key(&parent_exe_key));
+
+        // 4. Lock-order invariant: `path_interner` is a leaf lock accessible via `try_lock()`
+        //    while `process_table` is held, and `sweep_dead()` cleans dropped entries.
+        let interner_arc = table.path_interner();
+        {
+            let mut guard = interner_arc
+                .try_lock()
+                .expect("leaf lock path_interner must be acquirable without deadlock");
+            let swept = guard.sweep_dead();
+            let _ = swept;
+            assert!(guard.len() <= PATH_INTERNER_MAX_ENTRIES);
+        }
+
+        // 5. PathInterner bounded capacity <= 8,192 and sweep_dead() reclamation.
+        let mut bounded = PathInterner::new(PATH_INTERNER_MAX_ENTRIES);
+        let mut kept: Vec<Arc<str>> = Vec::with_capacity(9_000);
+        for i in 0..9_000usize {
+            kept.push(bounded.intern(&format!(r"C:\Apps\bin_{i}.exe")));
+        }
+        assert_eq!(bounded.max_entries(), PATH_INTERNER_MAX_ENTRIES);
+        assert!(
+            bounded.len() <= PATH_INTERNER_MAX_ENTRIES,
+            "interner len {} exceeded max {}",
+            bounded.len(),
+            PATH_INTERNER_MAX_ENTRIES
+        );
+        assert_eq!(bounded.live_len(), PATH_INTERNER_MAX_ENTRIES);
+        kept.clear();
+        assert_eq!(bounded.live_len(), 0);
+        let removed = bounded.sweep_dead();
+        assert_eq!(removed, PATH_INTERNER_MAX_ENTRIES);
+        assert_eq!(bounded.len(), 0);
     }
 }

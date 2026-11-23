@@ -224,23 +224,23 @@ fn daemon_p3_43a_dual_stack_dns_family_independent_timestamps_and_non_regression
     );
     // `is_entry_superseded` must consult only the entry IP's own address family.
     let v4_entry_old = super::DnsHistoryEntry {
-        exe_key: exe.to_string(),
+        exe_key: std::sync::Arc::from(exe),
         domains: vec![super::DomainTimestamp {
-            domain: "api.example".to_string(),
+            domain: std::sync::Arc::from("api.example"),
             timestamp_ms: 1_000,
         }],
     };
     let v4_entry_cur = super::DnsHistoryEntry {
-        exe_key: exe.to_string(),
+        exe_key: std::sync::Arc::from(exe),
         domains: vec![super::DomainTimestamp {
-            domain: "api.example".to_string(),
+            domain: std::sync::Arc::from("api.example"),
             timestamp_ms: 2_000,
         }],
     };
     let v6_entry_cur = super::DnsHistoryEntry {
-        exe_key: exe.to_string(),
+        exe_key: std::sync::Arc::from(exe),
         domains: vec![super::DomainTimestamp {
-            domain: "api.example".to_string(),
+            domain: std::sync::Arc::from("api.example"),
             timestamp_ms: 3_000,
         }],
     };

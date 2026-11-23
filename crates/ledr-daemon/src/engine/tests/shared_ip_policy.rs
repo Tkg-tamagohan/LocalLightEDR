@@ -114,7 +114,7 @@ fn daemon_p3_46a_shared_ip_multi_domain_history_and_common_decision_precedence()
     // simulating an earlier timestamp entry in `50:1` directly, then inserting a 17th live domain.
     bounded
         .latest_domain_by_exe
-        .get_mut(&(exe.to_string(), "sup.example".to_string()))
+        .get_mut(&(std::sync::Arc::from(exe), std::sync::Arc::from("sup.example")))
         .expect("sup latest")
         .ipv4 = Some((vec![away_ip], 6_000));
     bounded.record_for_exe("50:1", exe, "live-15.example", &[cap_ip], 1_050);

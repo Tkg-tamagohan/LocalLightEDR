@@ -1330,18 +1330,18 @@ impl DaemonEngine {
                 ) = if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
                     let differs = entry.identity != *identity
                         || entry.ppid != *parent_pid
-                        || entry.exe_path != *exe_path
+                        || entry.exe_path.as_ref() != exe_path.as_str()
                         || entry.command_line != *command_line
                         || entry.user_sid != *user_sid;
                     let merged_ev = differs.then(|| SensorEvent::ProcessStart {
                         identity: entry.identity,
                         parent_pid: entry.ppid,
-                        exe_path: entry.exe_path.clone(),
+                        exe_path: entry.exe_path.to_string(),
                         command_line: entry.command_line.clone(),
                         user_sid: entry.user_sid.clone(),
                     });
                     (
-                        entry.exe_path.clone(),
+                        entry.exe_path.to_string(),
                         entry.command_line.clone(),
                         merged_ev,
                         entry.origin_url.clone(),
@@ -1442,7 +1442,7 @@ impl DaemonEngine {
                     (
                         e.identity,
                         e.instance_id.clone(),
-                        e.exe_path.clone(),
+                        e.exe_path.to_string(),
                         e.command_line.clone(),
                         e.parent_instance_id.clone(),
                         e.origin_url.clone(),

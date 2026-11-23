@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use ledr_proto::{
     AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord, RuleScope, SensorEvent,
@@ -16,6 +17,7 @@ use uuid::Uuid;
 #[cfg(doc)]
 use crate::firewall::WfpFilterOrigin;
 use crate::firewall::{parse_literal_target_ip, WfpRuleManager};
+use crate::process_table::{PathInterner, PATH_INTERNER_MAX_ENTRIES};
 
 use super::config::OutboundEnforcementMode;
 use super::domain_policy::{
@@ -34,7 +36,7 @@ pub(super) const VERIFIED_APP_WIDE_ALLOW_CAPACITY: usize = 4_096;
 /// app-wide `NetworkAllow` rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct VerifiedAppWideAllowEntry {
-    pub(super) exe_key: String,
+    pub(super) exe_key: Arc<str>,
     pub(super) authorizing_rule: AllowlistRuleRecord,
 }
 
@@ -45,6 +47,7 @@ pub(super) struct VerifiedAppWideAllowEntry {
 pub(super) struct VerifiedAppWideAllowCache {
     capacity: usize,
     next_gen: u64,
+    interner: PathInterner,
     entries: HashMap<String, (VerifiedAppWideAllowEntry, u64)>,
     order: VecDeque<(String, u64)>,
 }
@@ -55,16 +58,26 @@ impl VerifiedAppWideAllowCache {
         Self {
             capacity: cap,
             next_gen: 1,
+            interner: PathInterner::new(PATH_INTERNER_MAX_ENTRIES),
             entries: HashMap::with_capacity(cap.min(256)),
             order: VecDeque::with_capacity(cap.min(256)),
         }
+    }
+
+    pub(super) fn intern_exe_key(&mut self, exe_key: &str) -> Arc<str> {
+        self.interner.intern(exe_key)
+    }
+
+    pub(super) fn sweep_interner(&mut self) -> usize {
+        self.interner.sweep_dead()
     }
 
     pub(super) fn get(&self, instance_id: &str) -> Option<&VerifiedAppWideAllowEntry> {
         self.entries.get(instance_id).map(|(entry, _)| entry)
     }
 
-    pub(super) fn insert(&mut self, instance_id: String, entry: VerifiedAppWideAllowEntry) {
+    pub(super) fn insert(&mut self, instance_id: String, mut entry: VerifiedAppWideAllowEntry) {
+        entry.exe_key = self.interner.intern(&entry.exe_key);
         if let Some((existing, _)) = self.entries.get_mut(&instance_id) {
             *existing = entry;
             return;
@@ -93,12 +106,26 @@ impl VerifiedAppWideAllowCache {
     }
 
     pub(super) fn remove(&mut self, instance_id: &str) -> bool {
-        self.entries.remove(instance_id).is_some()
+        let removed = self.entries.remove(instance_id).is_some();
+        if removed {
+            let target = self.entries.len().saturating_mul(2).max(256);
+            if self.entries.capacity() > target {
+                self.entries.shrink_to(target);
+            }
+        }
+        removed
     }
 
     pub(super) fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        if self.entries.capacity() > 256 {
+            self.entries.shrink_to(256);
+        }
+        if self.order.capacity() > 256 {
+            self.order.shrink_to(256);
+        }
+        let _ = self.interner.sweep_dead();
     }
 
     #[cfg(test)]
@@ -491,7 +518,7 @@ impl DaemonEngine {
                         .unwrap_or_else(|e| e.into_inner());
                     match cache.get(inst_id) {
                         Some(entry)
-                            if entry.exe_key == exe_k
+                            if entry.exe_key.as_ref() == exe_k
                                 && !has_block_rule_for_exe
                                 && !has_target_scoped_rule_for_exe
                                 && rules.iter().any(|r| {
@@ -754,16 +781,18 @@ impl DaemonEngine {
                     if let (Some(inst_id), Some(auth_rule)) =
                         (verified_inst_id, fresh_app_wide_rule)
                     {
-                        self.verified_app_wide_allows
+                        let mut cache = self
+                            .verified_app_wide_allows
                             .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(
-                                inst_id.to_string(),
-                                VerifiedAppWideAllowEntry {
-                                    exe_key: WfpRuleManager::exe_key(exe_path),
-                                    authorizing_rule: auth_rule,
-                                },
-                            );
+                            .unwrap_or_else(|e| e.into_inner());
+                        let exe_key = cache.intern_exe_key(&WfpRuleManager::exe_key(exe_path));
+                        cache.insert(
+                            inst_id.to_string(),
+                            VerifiedAppWideAllowEntry {
+                                exe_key,
+                                authorizing_rule: auth_rule,
+                            },
+                        );
                     }
                 }
                 drop(_policy_guard);

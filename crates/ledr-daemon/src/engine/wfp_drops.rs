@@ -410,7 +410,7 @@ impl DaemonEngine {
                         .and_then(|pid_id| table.get_by_instance_id(pid_id))
                         .map(|p| {
                             (
-                                Some(p.exe_path.clone()),
+                                Some(p.exe_path.to_string()),
                                 (!p.command_line.is_empty()).then(|| p.command_line.clone()),
                             )
                         })
@@ -418,7 +418,7 @@ impl DaemonEngine {
                     WfpCandidate {
                         identity: e.identity,
                         instance_id: e.instance_id.clone(),
-                        exe_path: e.exe_path.clone(),
+                        exe_path: e.exe_path.to_string(),
                         command_line: (!e.command_line.is_empty()).then(|| e.command_line.clone()),
                         parent_exe_path,
                         parent_command_line,

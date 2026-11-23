@@ -154,7 +154,7 @@ impl DaemonEngine {
                         self.process_table
                             .lock()
                             .ok()
-                            .and_then(|t| t.get_by_instance_id(inst_id).map(|e| e.exe_path.clone()))
+                            .and_then(|t| t.get_by_instance_id(inst_id).map(|e| e.exe_path.to_string()))
                     })
                     .filter(|s| !s.trim().is_empty())
             });

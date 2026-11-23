@@ -1013,3 +1013,371 @@ fn sens_p2_rundown_01_zombie_process_liveness_and_terminate_accept_exited_rundow
 
     let _ = tree_root.wait();
 }
+
+struct ChildProcessCleanupGuard {
+    handles: Vec<OwnedHandle>,
+}
+
+impl ChildProcessCleanupGuard {
+    fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    fn track_pid(&mut self, pid: u32) {
+        if let Ok(handle) = open_process_checked(pid, PROCESS_TERMINATE) {
+            self.handles.push(handle);
+        }
+    }
+}
+
+impl Drop for ChildProcessCleanupGuard {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            // SAFETY: best-effort cleanup of test helper processes opened with `PROCESS_TERMINATE`.
+            let _ = unsafe { TerminateProcess(handle.as_raw(), 1) };
+        }
+    }
+}
+
+#[test]
+fn sens_p2_tree_helper_entrypoint() {
+    let Ok(role) = std::env::var("LEDR_DEFENSE_TREE_HELPER_ROLE") else {
+        return;
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    match role.as_str() {
+        "launcher" => {
+            let child_exe = std::env::var_os("LEDR_DEFENSE_TREE_CHILD_EXE")
+                .expect("LEDR_DEFENSE_TREE_CHILD_EXE must be set for launcher role");
+            let child_role = std::env::var("LEDR_DEFENSE_TREE_CHILD_ROLE")
+                .expect("LEDR_DEFENSE_TREE_CHILD_ROLE must be set for launcher role");
+            let mut cmd = Command::new(child_exe);
+            cmd.args([
+                "--exact",
+                "defense::tests::sens_p2_tree_helper_entrypoint",
+                "--nocapture",
+            ])
+            .env("LEDR_DEFENSE_TREE_HELPER_ROLE", child_role)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+            if let Some(leaf_exe) = std::env::var_os("LEDR_DEFENSE_TREE_LEAF_EXE") {
+                cmd.env("LEDR_DEFENSE_TREE_LEAF_EXE", leaf_exe);
+            }
+            let mut child = cmd.spawn().expect("spawn launcher child helper");
+            while std::time::Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        "spoofed_svchost" => {
+            let leaf_exe = std::env::var_os("LEDR_DEFENSE_TREE_LEAF_EXE")
+                .expect("LEDR_DEFENSE_TREE_LEAF_EXE must be set for spoofed_svchost role");
+            let mut leaf = Command::new(leaf_exe)
+                .args([
+                    "--exact",
+                    "defense::tests::sens_p2_tree_helper_entrypoint",
+                    "--nocapture",
+                ])
+                .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "leaf")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn payload_leaf.exe helper");
+            while std::time::Instant::now() < deadline {
+                if leaf.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = leaf.kill();
+            let _ = leaf.wait();
+        }
+        "leaf" => {
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        "exit_immediately" => {}
+        other => panic!("unexpected LEDR_DEFENSE_TREE_HELPER_ROLE: {other}"),
+    }
+}
+
+#[test]
+fn sens_p2_tree_01_spoofed_svchost_three_level_containment() {
+    let temp = TempTestDir::new("spoofed-svchost");
+    let current_exe = std::env::current_exe().expect("resolve current test exe");
+    let launcher_exe = temp.path().join("root_launcher.exe");
+    let svchost_exe = temp.path().join("svchost.exe");
+    let leaf_exe = temp.path().join("payload_leaf.exe");
+
+    std::fs::copy(&current_exe, &launcher_exe).expect("copy root_launcher.exe");
+    std::fs::copy(&current_exe, &svchost_exe).expect("copy spoofed svchost.exe");
+    std::fs::copy(&current_exe, &leaf_exe).expect("copy payload_leaf.exe");
+
+    let mut cleanup = ChildProcessCleanupGuard::new();
+    let mut root_child = Command::new(&launcher_exe)
+        .args([
+            "--exact",
+            "defense::tests::sens_p2_tree_helper_entrypoint",
+            "--nocapture",
+        ])
+        .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "launcher")
+        .env("LEDR_DEFENSE_TREE_CHILD_EXE", &svchost_exe)
+        .env("LEDR_DEFENSE_TREE_CHILD_ROLE", "spoofed_svchost")
+        .env("LEDR_DEFENSE_TREE_LEAF_EXE", &leaf_exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn 3-level spoofed svchost tree root");
+
+    let root_pid = root_child.id();
+    cleanup.track_pid(root_pid);
+
+    let root_handle = open_process_checked(root_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .expect("open 3-level tree root");
+    let root_ct =
+        query_process_creation_time(root_handle.as_raw()).expect("query tree root CreationTime");
+    drop(root_handle);
+    let root_ident = ProcessIdentity::new(root_pid, root_ct);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (svchost_pid, leaf_pid) = loop {
+        let entries = snapshot_process_entries().unwrap_or_default();
+        if let Some(svchost_entry) = entries
+            .iter()
+            .find(|e| e.ppid == root_pid && e.exe_name.eq_ignore_ascii_case("svchost.exe"))
+        {
+            if let Some(leaf_entry) = entries.iter().find(|e| {
+                e.ppid == svchost_entry.pid && e.exe_name.eq_ignore_ascii_case("payload_leaf.exe")
+            }) {
+                break (svchost_entry.pid, leaf_entry.pid);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for 3-level spoofed svchost.exe -> payload_leaf.exe tree");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+
+    cleanup.track_pid(svchost_pid);
+    cleanup.track_pid(leaf_pid);
+
+    let descendants = collect_live_descendants(&root_ident);
+    let svchost_ident = descendants
+        .iter()
+        .copied()
+        .find(|d| d.pid == svchost_pid)
+        .expect("spoofed TempTestDir\\svchost.exe must NOT be skipped during tree traversal");
+    assert!(
+        descendants.iter().any(|d| d.pid == leaf_pid),
+        "grandchild payload_leaf.exe under spoofed svchost.exe must be discovered"
+    );
+    assert_eq!(
+        validate_target_process(&svchost_ident),
+        Ok(()),
+        "spoofed TempTestDir\\svchost.exe must pass full-path validation"
+    );
+
+    let controller = WindowsDefenseController::new();
+    controller
+        .suspend_process(&root_ident, true)
+        .expect("suspend 3-level spoofed svchost tree");
+    let suspended_children = controller.tracked_suspended_children(&root_ident);
+    assert!(
+        suspended_children.iter().any(|d| d.pid == svchost_pid),
+        "spoofed svchost.exe must be tracked in suspended_children"
+    );
+    assert!(
+        suspended_children.iter().any(|d| d.pid == leaf_pid),
+        "grandchild payload_leaf.exe must be tracked in suspended_children"
+    );
+
+    controller
+        .resume_process(&root_ident)
+        .expect("resume 3-level spoofed svchost tree");
+    assert!(
+        controller.tracked_suspended_children(&root_ident).is_empty(),
+        "tracked_suspended_children must clear after resume"
+    );
+
+    controller
+        .terminate_process(&root_ident, true)
+        .expect("terminate 3-level spoofed svchost tree");
+    assert_eq!(process_liveness(root_pid), ProcessLiveness::Gone);
+    assert_eq!(process_liveness(svchost_pid), ProcessLiveness::Gone);
+    assert_eq!(process_liveness(leaf_pid), ProcessLiveness::Gone);
+
+    let _ = root_child.wait();
+}
+
+#[test]
+fn sens_p2_tree_02_exited_intermediate_child_and_unavailable_full_path_fail_closed() {
+    use super::guard::validate_open_handle_detailed;
+    use super::process_probe::{OpenProcessError, SnapshotEntry, open_process_checked_detailed};
+    use super::tree::collect_validated_descendants_from_entries;
+    use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+
+    let temp = TempTestDir::new("exited-intermediate");
+    let current_exe = std::env::current_exe().expect("resolve current test exe");
+    let launcher_exe = temp.path().join("root_launcher.exe");
+    let leaf_exe = temp.path().join("payload_leaf.exe");
+    std::fs::copy(&current_exe, &launcher_exe).expect("copy root_launcher.exe");
+    std::fs::copy(&current_exe, &leaf_exe).expect("copy payload_leaf.exe");
+
+    let mut cleanup = ChildProcessCleanupGuard::new();
+
+    // 1. Live root process.
+    let mut root_child = Command::new(&launcher_exe)
+        .args([
+            "--exact",
+            "defense::tests::sens_p2_tree_helper_entrypoint",
+            "--nocapture",
+        ])
+        .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "leaf")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn root helper");
+    let root_pid = root_child.id();
+    cleanup.track_pid(root_pid);
+    let root_handle = open_process_checked(root_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .expect("open root helper");
+    let root_ct = query_process_creation_time(root_handle.as_raw()).expect("root CreationTime");
+    drop(root_handle);
+    let root_ident = ProcessIdentity::new(root_pid, root_ct);
+
+    // 2. Exited intermediate process whose kernel object has been reaped (`ERROR_INVALID_PARAMETER`).
+    let mut exiting_child = Command::new(&launcher_exe)
+        .args([
+            "--exact",
+            "defense::tests::sens_p2_tree_helper_entrypoint",
+            "--nocapture",
+        ])
+        .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "exit_immediately")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn exiting intermediate helper");
+    let exited_pid = exiting_child.id();
+    let status = exiting_child.wait().expect("wait exiting intermediate");
+    assert!(status.success());
+    drop(exiting_child);
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if matches!(
+            open_process_checked_detailed(exited_pid, PROCESS_QUERY_LIMITED_INFORMATION),
+            Err(OpenProcessError::Failed(_))
+        ) {
+            break;
+        }
+        if std::time::Instant::now() >= reap_deadline {
+            panic!("reaped exited PID {exited_pid} must fail OpenProcess");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // 3. Live grandchild process created after root.
+    let mut leaf_child = Command::new(&leaf_exe)
+        .args([
+            "--exact",
+            "defense::tests::sens_p2_tree_helper_entrypoint",
+            "--nocapture",
+        ])
+        .env("LEDR_DEFENSE_TREE_HELPER_ROLE", "leaf")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn live payload_leaf.exe");
+    let leaf_pid = leaf_child.id();
+    cleanup.track_pid(leaf_pid);
+    let leaf_handle = open_process_checked(leaf_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        .expect("open leaf helper");
+    let leaf_ct = query_process_creation_time(leaf_handle.as_raw()).expect("leaf CreationTime");
+    drop(leaf_handle);
+    let leaf_ident = ProcessIdentity::new(leaf_pid, leaf_ct);
+
+    // Exited non-protected intermediate child is NOT added to `descendants`, but IS queued
+    // so live grandchild `leaf_pid` is still discovered and validated.
+    let entries = vec![
+        SnapshotEntry {
+            pid: exited_pid,
+            ppid: root_pid,
+            exe_name: "intermediate_launcher.exe".to_string(),
+        },
+        SnapshotEntry {
+            pid: leaf_pid,
+            ppid: exited_pid,
+            exe_name: "payload_leaf.exe".to_string(),
+        },
+    ];
+    let discovered = collect_validated_descendants_from_entries(&root_ident, None, entries);
+    assert!(
+        !discovered.iter().any(|d| d.pid == exited_pid),
+        "exited intermediate child must not be added to descendants"
+    );
+    assert!(
+        discovered.iter().any(|d| d.pid == leaf_pid),
+        "live grandchild under exited intermediate child must be discovered"
+    );
+
+    // Exited intermediate entry with protected bare name (e.g. csrss.exe) must be skipped
+    // without traversing grandchildren.
+    let protected_entries = vec![
+        SnapshotEntry {
+            pid: exited_pid,
+            ppid: root_pid,
+            exe_name: "csrss.exe".to_string(),
+        },
+        SnapshotEntry {
+            pid: leaf_pid,
+            ppid: exited_pid,
+            exe_name: "payload_leaf.exe".to_string(),
+        },
+    ];
+    let skipped =
+        collect_validated_descendants_from_entries(&root_ident, None, protected_entries);
+    assert!(
+        skipped.is_empty(),
+        "protected-name failed OpenProcess entry must not traverse grandchildren"
+    );
+
+    // `validate_open_handle_detailed` must fail closed as `Unavailable` without re-snapshotting
+    // when `QueryFullProcessImageNameW` returns `None` (e.g. handle without query rights).
+    // SAFETY: `leaf_pid` is our live child process; `PROCESS_SYNCHRONIZE` opens a valid handle
+    // without query rights so `QueryFullProcessImageNameW` fails and returns `None`.
+    let raw_sync_handle = unsafe {
+        windows::Win32::System::Threading::OpenProcess(PROCESS_SYNCHRONIZE, false, leaf_pid)
+    }
+    .expect("open live leaf with PROCESS_SYNCHRONIZE");
+    let sync_only_handle = OwnedHandle::new(raw_sync_handle).expect("valid sync handle");
+    match validate_open_handle_detailed(sync_only_handle.as_raw(), &leaf_ident) {
+        Err(TargetValidationError::Unavailable(msg)) => {
+            assert!(
+                msg.contains("unable to resolve image name"),
+                "unexpected Unavailable message: {msg}"
+            );
+        }
+        other => panic!(
+            "expected Unavailable when QueryFullProcessImageNameW fails without query rights, got: {other:?}"
+        ),
+    }
+    drop(sync_only_handle);
+
+    let _ = leaf_child.kill();
+    let _ = leaf_child.wait();
+    let _ = root_child.kill();
+    let _ = root_child.wait();
+}

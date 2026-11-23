@@ -3,11 +3,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use ledr_proto::{ProcessIdentity, is_never_suspend_process};
+use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
 use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
 
-use super::guard::validate_open_handle;
+use super::guard::{TargetValidationError, validate_open_handle_detailed};
 use super::process_probe::{
-    OpenProcessError, SnapshotEntry, find_process_exe_toolhelp32, open_process_checked,
+    OpenProcessError, SnapshotEntry, find_process_exe_toolhelp32,
     open_process_checked_detailed, query_full_image_name, query_process_creation_time,
     snapshot_process_entries,
 };
@@ -73,6 +74,14 @@ pub(super) fn collect_validated_descendants(root: &ProcessIdentity) -> Vec<Proce
         return Vec::new();
     };
 
+    collect_validated_descendants_from_entries(root, recycled_cutoff_100ns, entries)
+}
+
+pub(super) fn collect_validated_descendants_from_entries(
+    root: &ProcessIdentity,
+    recycled_cutoff_100ns: Option<u64>,
+    entries: Vec<SnapshotEntry>,
+) -> Vec<ProcessIdentity> {
     let mut by_ppid: HashMap<u32, Vec<SnapshotEntry>> = HashMap::new();
     for entry in entries {
         if entry.pid == 0 || entry.pid == 4 {
@@ -99,21 +108,50 @@ pub(super) fn collect_validated_descendants(root: &ProcessIdentity) -> Vec<Proce
             if !visited.insert(child_entry.pid) {
                 continue;
             }
-            if is_never_suspend_process(&child_entry.exe_name) {
-                tracing::warn!(
-                    parent_pid = parent.pid,
-                    child_pid = child_entry.pid,
-                    exe = %child_entry.exe_name,
-                    "skipping protected descendant process during tree traversal"
-                );
-                continue;
-            }
 
-            let Ok(child_handle) =
-                open_process_checked(child_entry.pid, PROCESS_QUERY_LIMITED_INFORMATION)
-            else {
-                continue;
+            let child_handle = match open_process_checked_detailed(
+                child_entry.pid,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            ) {
+                Ok(handle) => handle,
+                Err(OpenProcessError::PidZero | OpenProcessError::PidMismatch { .. }) => {
+                    continue;
+                }
+                Err(OpenProcessError::Failed(open_err)) => {
+                    if is_never_suspend_process(&child_entry.exe_name) {
+                        tracing::warn!(
+                            parent_pid = parent.pid,
+                            child_pid = child_entry.pid,
+                            exe = %child_entry.exe_name,
+                            error = %open_err,
+                            "skipping protected descendant process after OpenProcess failure"
+                        );
+                        continue;
+                    }
+                    if is_error_invalid_parameter(&open_err) {
+                        tracing::debug!(
+                            parent_pid = parent.pid,
+                            child_pid = child_entry.pid,
+                            exe = %child_entry.exe_name,
+                            "intermediate child exited before handle open; continuing grandchild traversal"
+                        );
+                        queue.push_back(ProcessIdentity::new(
+                            child_entry.pid,
+                            parent.create_time_100ns,
+                        ));
+                    } else {
+                        tracing::warn!(
+                            parent_pid = parent.pid,
+                            child_pid = child_entry.pid,
+                            exe = %child_entry.exe_name,
+                            error = %open_err,
+                            "skipping descendant process after OpenProcess failure"
+                        );
+                    }
+                    continue;
+                }
             };
+
             let Some(child_create_time) = query_process_creation_time(child_handle.as_raw()) else {
                 continue;
             };
@@ -133,16 +171,35 @@ pub(super) fn collect_validated_descendants(root: &ProcessIdentity) -> Vec<Proce
             }
 
             let candidate = ProcessIdentity::new(child_entry.pid, child_create_time);
-            match validate_open_handle(child_handle.as_raw(), &candidate) {
+            match validate_open_handle_detailed(child_handle.as_raw(), &candidate) {
                 Ok(validated) => {
                     descendants.push(validated.identity);
                     queue.push_back(validated.identity);
                 }
-                Err(err) => {
+                Err(TargetValidationError::PolicyRejected(err)) => {
+                    tracing::warn!(
+                        parent_pid = parent.pid,
+                        child_pid = child_entry.pid,
+                        exe = %child_entry.exe_name,
+                        error = %err,
+                        "skipping policy-rejected descendant process"
+                    );
+                }
+                Err(TargetValidationError::Unavailable(err)) => {
+                    tracing::warn!(
+                        parent_pid = parent.pid,
+                        child_pid = child_entry.pid,
+                        exe = %child_entry.exe_name,
+                        error = %err,
+                        "skipping descendant process fail-closed: full image path unavailable"
+                    );
+                }
+                Err(TargetValidationError::IdentityMismatch(err)) => {
                     tracing::debug!(
+                        parent_pid = parent.pid,
                         child_pid = child_entry.pid,
                         error = %err,
-                        "descendant rejected by safety guard"
+                        "descendant rejected due to identity mismatch"
                     );
                 }
             }
@@ -150,6 +207,11 @@ pub(super) fn collect_validated_descendants(root: &ProcessIdentity) -> Vec<Proce
     }
 
     descendants
+}
+
+fn is_error_invalid_parameter(open_err: &str) -> bool {
+    let invalid_param_hex = format!("0x{:08x}", ERROR_INVALID_PARAMETER.to_hresult().0 as u32);
+    open_err.to_ascii_lowercase().contains(&invalid_param_hex)
 }
 
 pub(super) fn is_valid_descendant_timestamp(parent_create_time_100ns: u64, child_create_time_100ns: u64) -> bool {

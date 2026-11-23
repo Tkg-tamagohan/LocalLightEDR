@@ -415,8 +415,14 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertIn("recycled_cutoff_100ns", text_field)
             self.assertIn("is_valid_descendant_timestamp", text_field)
             self.assertIn("None", text_field)
+            self.assertIn("parent.pid == root.pid", text_field)
 
         session0 = questions["session0_non_system_and_ui_zero_exit"]
+        self.assertIn("other than AUTHORIZED_UI_EXE_PATH", session0["instructions"])
+        self.assertIn(
+            "other than AUTHORIZED_UI_EXE_PATH",
+            session0["criteria"]["true_description"],
+        )
         for text_field in (
             session0["instructions"],
             session0["criteria"]["true_description"],

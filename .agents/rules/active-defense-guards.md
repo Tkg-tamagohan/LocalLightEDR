@@ -10,7 +10,7 @@ LocalEDR の Layer 1 から Layer 4 にわたる能動防御処理は、誤動�
 ## 手順
 
 1. サスペンドと終了：`NtSuspendProcess` とプロセス終了の前に、`crates/ledr-proto` の `is_never_suspend_process` 判定と `ProcessIdentity.create_time_100ns` 一致を必ず検証する。
-   スナップショット経由で終了済み非保護中間子プロセス越しの孫探索を継続するときは、`NtQuerySystemInformation(SystemProcessInformation)` で得た中間子自身の `create_time_100ns` に対して `recycled_cutoff_100ns`（初回照会後にスナップショットで補完したカットオフを含む）と `is_valid_descendant_timestamp` を検証してから子自身の `create_time_100ns` でキューに積み、親の作成時刻の代用と作成時刻未確認（`None`）時の走査継続（フェイルオープン）を禁止する。
+   スナップショット経由で終了済み非保護中間子プロセス越しの孫探索を継続するときは、`NtQuerySystemInformation(SystemProcessInformation)` で得た中間子自身の `create_time_100ns` に対し、ルート直下（`parent.pid == root.pid`）に限って `recycled_cutoff_100ns`（初回照会後にスナップショットで補完したカットオフを含む）を適用し、各階層で直接の親との `is_valid_descendant_timestamp` を検証してから子自身の `create_time_100ns` でキューに積み、親の作成時刻の代用と作成時刻未確認（`None`）時の走査継続（フェイルオープン）を禁止する。
 2. おとりとタイムアウト：おとりファイルは書き込み、削除、リネームのみで発火させ読み取りでは発火させない。
    未応答 60 秒到達時は `EXPIRED_SUSPENDED`（`AlertStatus::ExpiredSuspended`）へ遷移させ、自動再開しない。
 3. Session 0 と UI 終了：`--notify` 起動は `WTSQueryUserToken` と `CreateProcessAsUser` で非 SYSTEM のユーザー権限を用い、ウィンドウ閉鎖時は `ledr-ui` と関連 WebView2 プロセスを 0 件にする。

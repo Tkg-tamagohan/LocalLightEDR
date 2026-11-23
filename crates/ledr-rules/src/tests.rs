@@ -1,4 +1,5 @@
 use super::*;
+use ledr_auth_helper::{inspect_authenticode, LOCAL_CERT_CHAIN_FLAGS};
 use ledr_proto::{AlertSeverity, CanaryCategory, ProcessIdentity, ScriptSource};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
@@ -2613,7 +2614,7 @@ fn rules_p4_01_local_cert_chain_flags_offline_and_verifies_cmd_exe() {
     const EXPECTED_CACHE_ONLY_URL_RETRIEVAL: u32 = 0x0000_0004;
     const EXPECTED_DISABLE_AUTH_ROOT_AUTO_UPDATE: u32 = 0x0000_0100;
 
-    let flags = allowlist::LOCAL_CERT_CHAIN_FLAGS;
+    let flags = LOCAL_CERT_CHAIN_FLAGS;
     assert_ne!(flags & EXPECTED_CACHE_END_CERT, 0);
     assert_ne!(flags & EXPECTED_CACHE_ONLY_URL_RETRIEVAL, 0);
     assert_ne!(flags & EXPECTED_DISABLE_AUTH_ROOT_AUTO_UPDATE, 0);

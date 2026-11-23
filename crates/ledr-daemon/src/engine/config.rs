@@ -88,6 +88,9 @@ pub struct DaemonConfig {
     pub authorized_bridge_signer: Option<String>,
     /// Optional expected Authenticode root thumbprint for the authorized bridge binary (`L-09`).
     pub authorized_bridge_root_thumbprint: Option<String>,
+    /// Optional expected lowercase SHA-256 hex digest pinning the out-of-process
+    /// `ledr-auth-helper.exe` Authenticode worker binary (`FU-E2E-03` Track 2, Option 2-A).
+    pub auth_helper_sha256: Option<String>,
     /// Enables Phase 3 outbound firewall (pre-emptive WFP restriction + unknown first-connect
     /// suspend & dynamic block coupling, `L-03`). Defaults to `true`.
     pub outbound_firewall_enabled: bool,
@@ -176,6 +179,7 @@ impl Default for DaemonConfig {
             authorized_bridge_sha256: None,
             authorized_bridge_signer: None,
             authorized_bridge_root_thumbprint: None,
+            auth_helper_sha256: None,
             outbound_firewall_enabled: true,
             outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
             resume_suspended_on_shutdown: false,

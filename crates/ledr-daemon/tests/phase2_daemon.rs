@@ -1183,7 +1183,7 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
     let wrong_sha = "f".repeat(64);
     let signed_os_exe = Path::new(r"C:\Windows\System32\SearchIndexer.exe");
     let signed_os_str = signed_os_exe.to_string_lossy().into_owned();
-    let mut binary_cases = vec![
+    let binary_cases = vec![
         // SEC_0002: unpinned + unsigned binary MUST be rejected even on exact path match.
         (
             "unpinned unsigned exact path rejected",
@@ -1229,14 +1229,22 @@ async fn daemon_p2_06_named_pipe_sddl_and_caller_binary_verification() {
     ];
     // Real Authenticode-signed Windows binary succeeds even without explicit hash/signer pins.
     if signed_os_exe.is_file() {
-        binary_cases.push((
-            "authenticode signed OS binary accepted without pins",
-            Some(signed_os_str.as_str()),
-            signed_os_str.as_str(),
-            None,
-            false,
-            true,
-        ));
+        let signed_os_identity = BinaryIdentity {
+            exe_path: signed_os_str.clone(),
+            sha256: compute_file_sha256_hex(signed_os_exe).ok(),
+            authenticode: ledr_auth_helper::inspect_authenticode(signed_os_exe),
+        };
+        assert!(
+            verify_caller_identity(
+                Some(&signed_os_identity),
+                &signed_os_str,
+                None,
+                None,
+                None,
+                false,
+            ),
+            "authenticode signed OS binary accepted without pins"
+        );
     }
     for (case, caller, expected_path, sha_pin, dev_bypass, expected) in binary_cases {
         assert_eq!(

@@ -6,7 +6,7 @@ use ledr_proto::{
 
 use crate::engine::{BrowserEventOutcome, BrowserReportError, DaemonEngine, PolicyRuleError};
 
-use super::auth::verify_authorized_caller_binary;
+use super::auth::verify_authorized_caller_binary_with_inspector;
 
 pub(super) fn authorize_caller_flags(
     engine: &DaemonEngine,
@@ -15,8 +15,10 @@ pub(super) fn authorize_caller_flags(
     requires_bridge_authorization: bool,
 ) -> Option<IpcResponse> {
     let cfg = engine.config();
+    let inspector = engine.inspector().as_ref();
     if requires_ui_authorization
-        && !verify_authorized_caller_binary(
+        && !verify_authorized_caller_binary_with_inspector(
+            inspector,
             caller_exe,
             AUTHORIZED_UI_EXE_PATH,
             cfg.authorized_ui_sha256.as_deref(),
@@ -35,7 +37,8 @@ pub(super) fn authorize_caller_flags(
     }
 
     if requires_bridge_authorization
-        && !verify_authorized_caller_binary(
+        && !verify_authorized_caller_binary_with_inspector(
+            inspector,
             caller_exe,
             AUTHORIZED_BRIDGE_EXE_PATH,
             cfg.authorized_bridge_sha256.as_deref(),

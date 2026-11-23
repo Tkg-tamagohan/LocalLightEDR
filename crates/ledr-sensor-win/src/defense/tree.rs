@@ -74,17 +74,31 @@ pub(super) fn collect_validated_descendants(root: &ProcessIdentity) -> Vec<Proce
         return Vec::new();
     };
 
-    if recycled_cutoff_100ns.is_none() {
-        if let Some(root_entry) = entries.iter().find(|e| e.pid == root.pid) {
-            if let Some(snap_ct) = root_entry.create_time_100ns {
-                if snap_ct > root.create_time_100ns {
-                    recycled_cutoff_100ns = Some(snap_ct);
-                }
-            }
-        }
-    }
+    collect_validated_descendants_from_snapshot(root, recycled_cutoff_100ns, entries)
+}
 
-    collect_validated_descendants_from_entries(root, recycled_cutoff_100ns, entries)
+pub(super) fn resolve_recycled_cutoff_from_entries(
+    root: &ProcessIdentity,
+    initial_cutoff_100ns: Option<u64>,
+    entries: &[SnapshotEntry],
+) -> Option<u64> {
+    if initial_cutoff_100ns.is_some() {
+        return initial_cutoff_100ns;
+    }
+    entries
+        .iter()
+        .find(|e| e.pid == root.pid)
+        .and_then(|root_entry| root_entry.create_time_100ns)
+        .filter(|&snap_ct| snap_ct > root.create_time_100ns)
+}
+
+pub(super) fn collect_validated_descendants_from_snapshot(
+    root: &ProcessIdentity,
+    initial_cutoff_100ns: Option<u64>,
+    entries: Vec<SnapshotEntry>,
+) -> Vec<ProcessIdentity> {
+    let resolved_cutoff = resolve_recycled_cutoff_from_entries(root, initial_cutoff_100ns, &entries);
+    collect_validated_descendants_from_entries(root, resolved_cutoff, entries)
 }
 
 pub(super) fn collect_validated_descendants_from_entries(

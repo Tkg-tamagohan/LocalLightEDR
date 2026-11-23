@@ -1391,7 +1391,10 @@ fn sens_p2_tree_02_exited_intermediate_child_and_unavailable_full_path_fail_clos
 #[test]
 fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
     use super::process_probe::{OpenProcessError, SnapshotEntry, open_process_checked_detailed};
-    use super::tree::collect_validated_descendants_from_entries;
+    use super::tree::{
+        collect_validated_descendants_from_entries, collect_validated_descendants_from_snapshot,
+        resolve_recycled_cutoff_from_entries,
+    };
 
     let temp = TempTestDir::new("exited-pid-reuse");
     let current_exe = std::env::current_exe().expect("resolve current test exe");
@@ -1542,6 +1545,70 @@ fn sens_p2_tree_03_exited_intermediate_pid_reuse_and_nt_snapshot_ct() {
     assert!(
         cutoff_discovered.is_empty(),
         "exited child at/after recycled_cutoff_100ns must NOT traverse grandchild"
+    );
+
+    // Case B2 (Snapshot-inferred recycled root cutoff): `initial_cutoff_100ns` is `None` because
+    // the initial `OpenProcess(root.pid)` probe saw the exited/unrecycled state, and only the
+    // subsequent `entries` snapshot sees the new process reusing `root.pid` (`snap_ct > root_ct`).
+    // Both a live direct child and a live grandchild via an exited intermediate child spawned by
+    // the recycled root must be rejected via the snapshot-inferred cutoff.
+    let snapshot_inferred_cutoff_entries = vec![
+        SnapshotEntry {
+            pid: root_pid,
+            ppid: 4,
+            exe_name: "recycled_root.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
+        },
+        SnapshotEntry {
+            pid: exited_pid,
+            ppid: root_pid,
+            exe_name: "recycled_root_child.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
+        },
+        SnapshotEntry {
+            pid: leaf_pid,
+            ppid: exited_pid,
+            exe_name: "payload_leaf.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
+        },
+    ];
+    assert_eq!(
+        resolve_recycled_cutoff_from_entries(&root_ident, None, &snapshot_inferred_cutoff_entries),
+        Some(leaf_ct),
+        "recycled root appearing in snapshot after initial probe must infer recycled_cutoff_100ns"
+    );
+    let snapshot_inferred_discovered = collect_validated_descendants_from_snapshot(
+        &root_ident,
+        None,
+        snapshot_inferred_cutoff_entries,
+    );
+    assert!(
+        snapshot_inferred_discovered.is_empty(),
+        "grandchild under exited child of snapshot-detected recycled root must be rejected"
+    );
+
+    let snapshot_inferred_direct_entries = vec![
+        SnapshotEntry {
+            pid: root_pid,
+            ppid: 4,
+            exe_name: "recycled_root.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
+        },
+        SnapshotEntry {
+            pid: leaf_pid,
+            ppid: root_pid,
+            exe_name: "payload_leaf.exe".to_string(),
+            create_time_100ns: Some(leaf_ct),
+        },
+    ];
+    let snapshot_inferred_direct_discovered = collect_validated_descendants_from_snapshot(
+        &root_ident,
+        None,
+        snapshot_inferred_direct_entries,
+    );
+    assert!(
+        snapshot_inferred_direct_discovered.is_empty(),
+        "live child of snapshot-detected recycled root must be rejected"
     );
 
     // Case C (Unverified snapshot timestamp): If snapshot lacks `create_time_100ns` (`None`), an

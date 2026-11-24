@@ -179,14 +179,16 @@ Phase 4 は [decision-records.md](decision-records.md) の `L-17`（3 PR 分割�
 - Phase 4 機能追加後の常駐性能回帰確認（`E2E-PERF-01`）は `WorkingSet64` 基準を超過したため `FU-E2E-03` へ切り出し、PR #39（`7cdb445`）でメモリ削減と `L-24` 基準併記を `main` へマージ済みである。
   ただし最新 `main`（PR #34 から PR #45 まで統合済み）上での最終再検証が未実施であるため、[implementation-plan.md](implementation-plan.md) の `[x]` チェックリストは未更新としている。
 
-#### 実機検証 PR 着手時の未決判断事項
+#### 現行の完了基準と将来の見直し論点
 
-- `--scope machine`（`HKLM` 登録と復元）および Microsoft Edge 実ブラウザでの拡張動作確認を、[implementation-plan.md](implementation-plan.md) の Phase 4 実機 E2E チェックリスト `[x]` 更新の必須条件に含めるか、それとも未実施差異として切り分けて記録する任意項目にとどめるかは、独立した実機 E2E 検証 PR の着手時に合意する（`FU-P4-01` の 32 ビットレジストリビュー対応との前後関係もあわせて判断する）。
+- **現行基準**：[e2e-test-runbook.md](e2e-test-runbook.md#L1847-L1848) のルート別完了判定基準では、`--scope machine`（`HKLM` 登録と復元）および Microsoft Edge 実ブラウザでの拡張動作確認は未実施差異として PR 本文へ切り分け記録できる任意扱いとしている。
+- **将来の見直し論点**：独立した実機 E2E 検証 PR の着手時にこれらを [implementation-plan.md](implementation-plan.md) の `[x]` 更新必須条件へ引き上げる方針変更を行う場合は、必須化とあわせて `FU-P4-01` の 32 ビットレジストリビュー対応を先行実施するかどうかを判断する。
 
 ### 対応予定タイミング
 
 PR 4C は PR #28（`331602d`）で `main` へマージ済みであり、PR #34、`FU-E2E-03` から `FU-E2E-05`、および後続の強化 PR（PR #41 から PR #45）もすべて `main` へマージ済みである。
 独立した実機 E2E 検証作業として [e2e-test-runbook.md](e2e-test-runbook.md)（Track B および Track C：`L-08` の UI 0 プロセス終了確認および Phase 4 追加後の `E2E-PERF-01` 性能回帰確認、または [phase4-e2e-runbook.md](phase4-e2e-runbook.md)）を最新 `main` 上で再実施し、合否記録をまとめて [implementation-plan.md](implementation-plan.md) の Phase 4 実機 Chrome E2E 検証項目を `[x]` へ更新する。
+なお、代替手順書として [phase4-e2e-runbook.md](phase4-e2e-runbook.md) を用いる場合でも、性能の合否は同書記載の旧基準（`PeakWorkingSetMB <= 20.0`）に代えて [e2e-test-runbook.md](e2e-test-runbook.md#L1381) の Track C に定める `L-24` 基準（`PrivateWorkingSetSize <= 20.0 MB` 必須および `WorkingSet64` 監視基準）で判定する。
 
 ## FU-P4-01 crates/ledr-bridge-nm の HKLM 登録と確認における 32 ビットビュー対応
 
@@ -283,7 +285,8 @@ Stage 3 の全 34 スナップショット（`QueryWorkingSetEx` 失敗チャン
 - **実機機能回帰とホスト ETW 競合制約**：`87be6d5` 上のステージングバイナリで `E2E-P4-07`（PASS、Live IPC と UI モック DOM テスト `10/10`）と 3 秒停止予算（`377.05 ms` および `393.19 ms`、`WAL = 0`、`CLEAN-01` PASS）を確認した。
   一方、`E2E-P3-01` と `E2E-P3-03` は WFP フィルタ、通信遮断、事前凍結済み `python.exe` への `WfpDrop` と `NtSuspendProcess`、および `DnsQuery` と `NetworkConnect` を確認したものの、検証ホスト上で `AcePldTraceSession_28364` と 2 本の `NT Kernel Logger` が稼働していた影響により LocalEDR 停止下の独立 `logman` 測定でも `Microsoft-Windows-Kernel-Process` `0x10` が `0` イベントとなり、起動後 `ProcessStart` 帰属のみ未確認の「部分 PASS（ホスト ETW 0 イベント制約付き）」となった（`main` マージ後の最終 E2E 検証対象）。
 - **`.github/workflows/ci.yml` 自動実行範囲（PR #39 で検証済み）**：`changes` ジョブは `Cargo.toml`、`Cargo.lock`、`crates/`、`docs/implementation-plan.md`、`docs/decision-records.md` の変更により `rust=true` かつ `web=true` と判定し、`static-checks`（`ubuntu-latest`、Node 22：`node --check`、Chrome MV3 拡張テスト 19 件、Tauri UI モック DOM テスト 10 件、固定拡張 ID 検証、および JSON、UTF-8、U+FFFD、競合マーカー検査）と `rust-windows`（`windows-latest`：`cargo check`、`clippy -- -D warnings`、`cargo test --workspace --locked`、`burst_budget`、`ttl_purge_lineage`、`cargo doc -D rustdoc::broken_intra_doc_links`）を実行した。
-- **ローカル別途実行範囲（CI 対象外、Windows 11 x64 環境で PR #39 の `87be6d5` に対し実行済み）**：`cargo clippy`、`cargo test --workspace --locked`（415 件合格）、`burst_budget`（11 件合格）、`ttl_purge_lineage`（12 件合格）、Chrome 拡張 Node テスト（19 件合格）、UI モック DOM テスト（10 件合格）、`python scripts/test_check_invariants.py`（8 件合格）、`cargo build --release --locked` と PE インポート検査（`wintrust.dll` と `crypt32.dll` が 0 件）、`scripts/profile_daemon_memory.ps1` による Stage 1 および Stage 3 実機計測、Track 2 実機レイテンシと `31/31` Authenticode 一致確認、および実機 E2E 回帰（`E2E-P3-01`、`E2E-P3-03`、`E2E-P4-07`、3 秒停止予算）。
+- **ローカルでも再実行した CI 相当項目（Windows 11 x64 環境で PR #39 の `87be6d5` に対し実行済み）**：`cargo clippy`、`cargo test --workspace --locked`（415 件合格）、`burst_budget`（11 件合格）、`ttl_purge_lineage`（12 件合格）、Chrome 拡張 Node テスト（19 件合格）、および UI モック DOM テスト（10 件合格）。
+- **CI 対象外のローカル別途実行範囲（Windows 11 x64 環境で PR #39 の `87be6d5` に対し実行済み）**：`python scripts/test_check_invariants.py`（8 件合格）、`cargo build --release --locked` と PE インポート検査（`wintrust.dll` と `crypt32.dll` が 0 件）、`scripts/profile_daemon_memory.ps1` による Stage 1 および Stage 3 実機計測、Track 2 実機レイテンシと `31/31` Authenticode 一致確認、および実機 E2E 回帰（`E2E-P3-01`、`E2E-P3-03`、`E2E-P4-07`、3 秒停止予算）。
 
 ### 対応予定タイミング
 

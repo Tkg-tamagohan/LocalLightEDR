@@ -9,6 +9,7 @@ members = [
     "crates/ledr-daemon",
     "crates/ledr-store",
     "crates/ledr-bridge-nm",
+    "crates/ledr-updater",
     "apps/ledr-ui",
 ]
 
@@ -26,7 +27,9 @@ ledr-sensor-win = { path = "crates/ledr-sensor-win" }
 ledr-rules = { path = "crates/ledr-rules" }
 ledr-auth-helper = { path = "crates/ledr-auth-helper" }
 ledr-store = { path = "crates/ledr-store" }
+ledr-updater = { path = "crates/ledr-updater" }
 
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal", "process"] }

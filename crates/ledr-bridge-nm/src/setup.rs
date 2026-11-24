@@ -161,9 +161,49 @@ impl RegWow64View {
 pub enum NativeHostRegProbe {
     Present(String),
     EmptyString,
+    UnresolvableExpandSz { raw: String, error: String },
     Absent,
     InvalidType,
     AccessError(String),
+}
+
+impl NativeHostRegProbe {
+    /// Returns `true` when this probe stops Chromium's WOW64 32-bit -> 64-bit fallback.
+    pub fn stops_wow64_fallback(&self) -> bool {
+        matches!(
+            self,
+            Self::Present(_) | Self::EmptyString | Self::UnresolvableExpandSz { .. }
+        )
+    }
+}
+
+/// Returns `true` if any `%TOKEN%` pair in `raw` (non-empty, containing no `\`, `/`, `:`)
+/// still appears verbatim (case-insensitively) in `expanded`.
+pub(crate) fn has_unresolved_env_token(raw: &str, expanded: &str) -> bool {
+    let expanded_lower = expanded.to_lowercase();
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some(rel_end) = bytes[i + 1..].iter().position(|&b| b == b'%') {
+                let end = i + 1 + rel_end;
+                let token = &raw[i + 1..end];
+                if !token.is_empty() && !token.contains(['\\', '/', ':']) {
+                    let full_token = &raw[i..=end];
+                    if expanded_lower.contains(&full_token.to_lowercase()) {
+                        return true;
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                i = end;
+                continue;
+            }
+            break;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Selects the effective `HKLM` Native Messaging Host registry probe across WOW64 32-bit
@@ -171,19 +211,20 @@ pub enum NativeHostRegProbe {
 /// returning both the effective probe and the view that produced it (`None` when both are `Absent`).
 ///
 /// Chromium stops at the 32-bit view whenever `RegKey::ReadValue(nullptr, &path)` returns
-/// `ERROR_SUCCESS`, including when the `REG_SZ` value is empty (`EmptyString`). Only failed
-/// reads (`Absent`, `InvalidType`, or `AccessError`) fall back to the 64-bit view.
+/// `ERROR_SUCCESS`, including when the `REG_SZ` / `REG_EXPAND_SZ` value is empty (`EmptyString`)
+/// or unresolvable (`UnresolvableExpandSz`). Only failed reads (`Absent`, `InvalidType`, or
+/// `AccessError`) fall back to the 64-bit view.
 pub fn select_effective_hklm_probe(
     view32: NativeHostRegProbe,
     view64: NativeHostRegProbe,
 ) -> (NativeHostRegProbe, Option<RegWow64View>) {
+    if view32.stops_wow64_fallback() {
+        return (view32, Some(RegWow64View::Wow6432));
+    }
+    if view64.stops_wow64_fallback() {
+        return (view64, Some(RegWow64View::Wow6464));
+    }
     match (&view32, &view64) {
-        (NativeHostRegProbe::Present(_) | NativeHostRegProbe::EmptyString, _) => {
-            (view32, Some(RegWow64View::Wow6432))
-        }
-        (_, NativeHostRegProbe::Present(_) | NativeHostRegProbe::EmptyString) => {
-            (view64, Some(RegWow64View::Wow6464))
-        }
         (NativeHostRegProbe::Absent, NativeHostRegProbe::Absent) => {
             (NativeHostRegProbe::Absent, None)
         }
@@ -861,19 +902,21 @@ pub(crate) fn resolve_local_reparse_target(
 pub(crate) mod win_reg_ops {
     use super::{
         build_drive_path, classify_dos_device_target, dos_device_targets_match_volume,
-        format_ledr_uri_command, is_local_drive_type, parse_local_drive_path,
-        parse_reparse_data_buffer, parse_volume_guid_path, resolve_local_reparse_target,
-        BrowserKind, DosDeviceTarget, NativeHostRegProbe, ParsedReparseBuffer, RegWow64View,
-        RegistryTarget, ReparseTargetResolution, Scope, LEDR_AUMID_DISPLAY_NAME,
-        LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
+        format_ledr_uri_command, has_unresolved_env_token, is_local_drive_type,
+        parse_local_drive_path, parse_reparse_data_buffer, parse_volume_guid_path,
+        resolve_local_reparse_target, BrowserKind, DosDeviceTarget, NativeHostRegProbe,
+        ParsedReparseBuffer, RegWow64View, RegistryTarget, ReparseTargetResolution, Scope,
+        LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
     };
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use std::ffi::c_void;
     use std::io::ErrorKind;
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::ptr;
-    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_SZ};
+    use winreg::enums::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_EXPAND_SZ, REG_SZ,
+    };
     use winreg::RegKey;
 
     pub(crate) const KEY_WOW64_64KEY: u32 = 0x0100;
@@ -992,6 +1035,11 @@ pub(crate) mod win_reg_ops {
             h_file: *mut c_void,
             lp_file_information: *mut ByHandleFileInformation,
         ) -> i32;
+        fn ExpandEnvironmentStringsW(
+            lp_src: *const u16,
+            lp_dst: *mut u16,
+            n_size: u32,
+        ) -> u32;
         fn CloseHandle(object: *mut c_void) -> i32;
     }
 
@@ -1482,6 +1530,50 @@ pub(crate) mod win_reg_ops {
         Some(String::from_utf16_lossy(&units))
     }
 
+    pub(crate) fn expand_env_strings_win32(raw: &str) -> Result<String> {
+        const MAX_EXPANDED_ENV_CHARS: u32 = 32_768;
+        if raw.contains('\0') {
+            anyhow::bail!("REG_EXPAND_SZ value contains interior NUL");
+        }
+        let src: Vec<u16> = raw.encode_utf16().chain(std::iter::once(0)).collect();
+        if src.len() > MAX_EXPANDED_ENV_CHARS as usize {
+            anyhow::bail!(
+                "REG_EXPAND_SZ source length ({}) exceeds {MAX_EXPANDED_ENV_CHARS} UTF-16 units",
+                src.len()
+            );
+        }
+
+        // SAFETY: `src` is a valid NUL-terminated UTF-16 string and `lp_dst` is NULL with `n_size = 0`.
+        let mut required = unsafe { ExpandEnvironmentStringsW(src.as_ptr(), ptr::null_mut(), 0) };
+        for _ in 0..4 {
+            if required == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("ExpandEnvironmentStringsW failed");
+            }
+            if required > MAX_EXPANDED_ENV_CHARS {
+                anyhow::bail!(
+                    "expanded REG_EXPAND_SZ length ({required}) exceeds {MAX_EXPANDED_ENV_CHARS} UTF-16 units"
+                );
+            }
+            let mut buf = vec![0u16; required as usize];
+            // SAFETY: `src` is NUL-terminated UTF-16 and `buf` has capacity `required` UTF-16 units.
+            let written =
+                unsafe { ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), required) };
+            if written == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("ExpandEnvironmentStringsW failed");
+            }
+            if written <= required {
+                let slice = &buf[..written as usize];
+                let slice = slice.strip_suffix(&[0]).unwrap_or(slice);
+                return String::from_utf16(slice)
+                    .context("expanded REG_EXPAND_SZ contains invalid UTF-16");
+            }
+            required = written;
+        }
+        anyhow::bail!("ExpandEnvironmentStringsW buffer size kept growing")
+    }
+
     fn annotate_reg_err(scope: Scope, key_display: &str, err: std::io::Error) -> anyhow::Error {
         if scope == Scope::Machine && err.kind() == ErrorKind::PermissionDenied {
             anyhow::anyhow!(
@@ -1687,6 +1779,41 @@ pub(crate) mod win_reg_ops {
                 Some(val) => NativeHostRegProbe::Present(val.trim().to_string()),
                 None => NativeHostRegProbe::InvalidType,
             },
+            Ok(raw) if raw.vtype == REG_EXPAND_SZ => match decode_reg_sz_bytes(&raw.bytes) {
+                None => NativeHostRegProbe::InvalidType,
+                Some(val) => {
+                    let trimmed = val.trim();
+                    if trimmed.is_empty() {
+                        NativeHostRegProbe::EmptyString
+                    } else {
+                        match expand_env_strings_win32(trimmed) {
+                            Ok(expanded) => {
+                                if has_unresolved_env_token(trimmed, &expanded) {
+                                    NativeHostRegProbe::UnresolvableExpandSz {
+                                        raw: trimmed.to_string(),
+                                        error: format!(
+                                            "REG_EXPAND_SZ value '{trimmed}' contains unresolved environment variable(s) (expanded to '{expanded}')"
+                                        ),
+                                    }
+                                } else {
+                                    let expanded_trimmed = expanded.trim();
+                                    if expanded_trimmed.is_empty() {
+                                        NativeHostRegProbe::EmptyString
+                                    } else {
+                                        NativeHostRegProbe::Present(expanded_trimmed.to_string())
+                                    }
+                                }
+                            }
+                            Err(err) => NativeHostRegProbe::UnresolvableExpandSz {
+                                raw: trimmed.to_string(),
+                                error: format!(
+                                    "failed to expand REG_EXPAND_SZ value '{trimmed}': {err}"
+                                ),
+                            },
+                        }
+                    }
+                }
+            },
             Ok(_) => NativeHostRegProbe::InvalidType,
             Err(err) if err.kind() == ErrorKind::NotFound => NativeHostRegProbe::InvalidType,
             Err(err) => {
@@ -1856,6 +1983,7 @@ pub(crate) fn any_browser_references_manifest_with<O: RegistryViewOps + ?Sized>(
                     }
                     remaining_existing.push(existing);
                 }
+                NativeHostRegProbe::UnresolvableExpandSz { .. } => return Ok(true),
                 NativeHostRegProbe::Absent
                 | NativeHostRegProbe::EmptyString
                 | NativeHostRegProbe::InvalidType => {}
@@ -1995,20 +2123,24 @@ pub fn run_unregister_with_ops<O: RegistryViewOps + ?Sized>(
     let mut candidate_paths = BTreeSet::new();
     for &browser in &args.browsers {
         let subkey = target.browser_subkey(browser);
+        let mut browser_reg_paths = Vec::new();
         let reg_val = match target.scope {
             Scope::User => {
                 let probe = ops.probe_default_sz(target, &subkey, None);
-                if let NativeHostRegProbe::AccessError(err) = probe {
-                    bail!("{err}");
-                }
-                if let NativeHostRegProbe::Present(ref raw_path) = probe {
-                    let reg_path = PathBuf::from(raw_path);
-                    if is_localedr_manifest_filename(&reg_path) {
-                        candidate_paths.insert(reg_path);
+                match probe {
+                    NativeHostRegProbe::AccessError(err) => bail!("{err}"),
+                    NativeHostRegProbe::Present(raw_path) => {
+                        let reg_path = PathBuf::from(&raw_path);
+                        if is_localedr_manifest_filename(&reg_path) {
+                            candidate_paths.insert(reg_path);
+                        }
+                        browser_reg_paths.push(raw_path.clone());
+                        Some(raw_path)
                     }
-                    Some(raw_path.clone())
-                } else {
-                    None
+                    NativeHostRegProbe::UnresolvableExpandSz { raw, .. } => Some(raw),
+                    NativeHostRegProbe::Absent
+                    | NativeHostRegProbe::EmptyString
+                    | NativeHostRegProbe::InvalidType => None,
                 }
             }
             Scope::Machine => {
@@ -2020,29 +2152,41 @@ pub fn run_unregister_with_ops<O: RegistryViewOps + ?Sized>(
                 if let NativeHostRegProbe::AccessError(err) = &probe64 {
                     bail!("{err}");
                 }
+                let mut primary_present: Option<String> = None;
+                let mut fallback_unresolvable: Option<String> = None;
                 for probe in [&probe32, &probe64] {
-                    if let NativeHostRegProbe::Present(ref raw_path) = probe {
-                        let reg_path = PathBuf::from(raw_path);
-                        if is_localedr_manifest_filename(&reg_path) {
-                            candidate_paths.insert(reg_path);
+                    match probe {
+                        NativeHostRegProbe::Present(raw_path) => {
+                            let reg_path = PathBuf::from(raw_path);
+                            if is_localedr_manifest_filename(&reg_path) {
+                                candidate_paths.insert(reg_path);
+                            }
+                            browser_reg_paths.push(raw_path.clone());
+                            if primary_present.is_none() {
+                                primary_present = Some(raw_path.clone());
+                            }
                         }
+                        NativeHostRegProbe::UnresolvableExpandSz { raw, .. } => {
+                            if fallback_unresolvable.is_none() {
+                                fallback_unresolvable = Some(raw.clone());
+                            }
+                        }
+                        NativeHostRegProbe::Absent
+                        | NativeHostRegProbe::EmptyString
+                        | NativeHostRegProbe::InvalidType => {}
+                        NativeHostRegProbe::AccessError(_) => {}
                     }
                 }
-                match (&probe32, &probe64) {
-                    (NativeHostRegProbe::Present(p), _) | (_, NativeHostRegProbe::Present(p)) => {
-                        Some(p.clone())
-                    }
-                    _ => None,
-                }
+                primary_present.or(fallback_unresolvable)
             }
         };
         let default_browser_path = manifest_dir.join(manifest_filename_for(args.scope, browser));
         candidate_paths.insert(default_browser_path.clone());
-        per_browser_candidates.push((browser, reg_val, default_browser_path));
+        per_browser_candidates.push((browser, reg_val, browser_reg_paths, default_browser_path));
     }
 
     let mut browser_outcomes = Vec::with_capacity(args.browsers.len());
-    for (browser, reg_val, _) in &per_browser_candidates {
+    for (browser, reg_val, _, _) in &per_browser_candidates {
         let subkey = target.browser_subkey(*browser);
         let removed = match target.scope {
             Scope::User => ops.delete_subkey_tree_idempotent(target, &subkey, None)?,
@@ -2108,15 +2252,16 @@ pub fn run_unregister_with_ops<O: RegistryViewOps + ?Sized>(
         }
     }
 
-    for (entry, (_, reg_val, default_browser_path)) in
+    for (entry, (_, _, browser_reg_paths, default_browser_path)) in
         browser_outcomes.iter_mut().zip(per_browser_candidates.iter())
     {
         let default_display = normalize_display_path(default_browser_path);
         entry.manifest_removed = manifest_paths_removed.iter().any(|removed| {
             removed.eq_ignore_ascii_case(&default_display)
-                || reg_val
-                    .as_deref()
-                    .is_some_and(|reg| removed.eq_ignore_ascii_case(reg))
+                || browser_reg_paths.iter().any(|reg| {
+                    removed.eq_ignore_ascii_case(reg)
+                        || removed.eq_ignore_ascii_case(&normalize_display_path(Path::new(reg)))
+                })
         });
     }
 
@@ -2154,16 +2299,20 @@ pub fn run_status_with(
     run_status_with_ops(args, targets, manifest_dir_override, &WinRegistryViewOps)
 }
 
-fn synthetic_invalid_manifest(error: String) -> ManifestValidation {
+fn synthetic_invalid_manifest_with_path(path: String, error: String) -> ManifestValidation {
     ManifestValidation {
         exists: false,
         valid: false,
         bridge_exe_exists: false,
         extension_id_matched: false,
         allowed_origins: Vec::new(),
-        path: String::new(),
+        path,
         error: Some(error),
     }
+}
+
+fn synthetic_invalid_manifest(error: String) -> ManifestValidation {
+    synthetic_invalid_manifest_with_path(String::new(), error)
 }
 
 /// Runs `status` against explicit [`RegistryTarget`] entries and a [`RegistryViewOps`] backend.
@@ -2189,9 +2338,13 @@ pub fn run_status_with_ops<O: RegistryViewOps + ?Sized>(
                 Scope::Machine => {
                     let view32 =
                         ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6432));
-                    let view64 =
-                        ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6464));
-                    select_effective_hklm_probe(view32, view64)
+                    if view32.stops_wow64_fallback() {
+                        (view32, Some(RegWow64View::Wow6432))
+                    } else {
+                        let view64 =
+                            ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6464));
+                        select_effective_hklm_probe(view32, view64)
+                    }
                 }
             };
             let (registered, manifest_path, manifest) = match probe {
@@ -2199,6 +2352,10 @@ pub fn run_status_with_ops<O: RegistryViewOps + ?Sized>(
                 NativeHostRegProbe::Present(path) => {
                     let validation = validate_manifest_file(Path::new(&path), &expected_extension_id);
                     (true, Some(path), Some(validation))
+                }
+                NativeHostRegProbe::UnresolvableExpandSz { raw, error } => {
+                    let manifest = synthetic_invalid_manifest_with_path(raw.clone(), error);
+                    (true, Some(raw), Some(manifest))
                 }
                 NativeHostRegProbe::EmptyString => (
                     true,

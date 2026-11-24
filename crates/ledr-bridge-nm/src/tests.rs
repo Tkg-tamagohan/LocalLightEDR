@@ -27,8 +27,8 @@ use crate::pipe_client::{
 };
 use crate::relay::{read_raw_frame, run_relay_loop, write_raw_frame, FrameExchange, RawFrameError};
 use crate::setup::{
-    format_status_text, resolve_bridge_exe_with, resolve_manifest_dir, resolve_ui_exe_with,
-    run_setup_with, run_setup_with_ops, run_status_with, run_status_with_ops,
+    format_status_text, has_unresolved_env_token, resolve_bridge_exe_with, resolve_manifest_dir,
+    resolve_ui_exe_with, run_setup_with, run_setup_with_ops, run_status_with, run_status_with_ops,
     run_unregister_with, run_unregister_with_ops, select_effective_hklm_probe,
     NativeHostRegProbe, RegWow64View, RegistryTarget, RegistryViewOps,
     NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
@@ -2701,16 +2701,27 @@ fn bridge_18_cmd_mediated_pipe_inheritance_real_kernel() {
 
 #[test]
 fn bridge_19_select_effective_hklm_probe_exhaustive_matrix() {
-    use NativeHostRegProbe::{Absent, AccessError, EmptyString, InvalidType, Present};
+    use NativeHostRegProbe::{
+        Absent, AccessError, EmptyString, InvalidType, Present, UnresolvableExpandSz,
+    };
 
     let p32 = Present(r"C:\ProgramData\LocalEDR\native-messaging\m32.json".to_string());
     let p64 = Present(r"C:\ProgramData\LocalEDR\native-messaging\m64.json".to_string());
+    let unres32 = UnresolvableExpandSz {
+        raw: r"%LEDR_MISSING_32%\m32.json".to_string(),
+        error: "unresolved-32".to_string(),
+    };
+    let unres64 = UnresolvableExpandSz {
+        raw: r"%LEDR_MISSING_64%\m64.json".to_string(),
+        error: "unresolved-64".to_string(),
+    };
     let err32 = AccessError("denied-32".to_string());
     let err64 = AccessError("denied-64".to_string());
 
     let variants_32 = [
         p32.clone(),
         EmptyString,
+        unres32.clone(),
         Absent,
         InvalidType,
         err32.clone(),
@@ -2718,20 +2729,24 @@ fn bridge_19_select_effective_hklm_probe_exhaustive_matrix() {
     let variants_64 = [
         p64.clone(),
         EmptyString,
+        unres64.clone(),
         Absent,
         InvalidType,
         err64.clone(),
     ];
 
-    // Verify all 25 combinations of (view32, view64) follow Chromium's HKLM WOW64 precedence:
-    // - 32-bit Present wins unconditionally over any 64-bit state.
-    // - 32-bit EmptyString stops fallback and wins over any 64-bit state (never masked by 64-bit).
-    // - Only 32-bit Absent / InvalidType / AccessError falls back to 64-bit Present / EmptyString.
+    // Verify all 36 combinations of (view32, view64) follow Chromium's HKLM WOW64 precedence:
+    // - 32-bit Present, EmptyString, and UnresolvableExpandSz stop fallback and win over any 64-bit state.
+    // - Only 32-bit Absent / InvalidType / AccessError falls back to 64-bit Present / EmptyString / UnresolvableExpandSz.
     for v32 in &variants_32 {
         for v64 in &variants_64 {
             let expected = match (v32, v64) {
-                (Present(_), _) | (EmptyString, _) => (v32.clone(), Some(RegWow64View::Wow6432)),
-                (_, Present(_)) | (_, EmptyString) => (v64.clone(), Some(RegWow64View::Wow6464)),
+                (Present(_) | EmptyString | UnresolvableExpandSz { .. }, _) => {
+                    (v32.clone(), Some(RegWow64View::Wow6432))
+                }
+                (_, Present(_) | EmptyString | UnresolvableExpandSz { .. }) => {
+                    (v64.clone(), Some(RegWow64View::Wow6464))
+                }
                 (Absent, Absent) => (Absent, None),
                 (Absent, _) => (v64.clone(), Some(RegWow64View::Wow6464)),
                 (_, Absent) => (v32.clone(), Some(RegWow64View::Wow6432)),
@@ -2751,8 +2766,24 @@ fn bridge_19_select_effective_hklm_probe_exhaustive_matrix() {
         (EmptyString, Some(RegWow64View::Wow6432))
     );
     assert_eq!(
+        select_effective_hklm_probe(unres32.clone(), p64.clone()),
+        (unres32, Some(RegWow64View::Wow6432))
+    );
+    assert_eq!(
         select_effective_hklm_probe(p32.clone(), p64.clone()),
         (p32, Some(RegWow64View::Wow6432))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(Absent, unres64.clone()),
+        (unres64.clone(), Some(RegWow64View::Wow6464))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(InvalidType, unres64.clone()),
+        (unres64.clone(), Some(RegWow64View::Wow6464))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(err32.clone(), unres64.clone()),
+        (unres64, Some(RegWow64View::Wow6464))
     );
     assert_eq!(
         select_effective_hklm_probe(InvalidType, p64.clone()),
@@ -2768,161 +2799,167 @@ fn bridge_19_select_effective_hklm_probe_exhaustive_matrix() {
     );
 }
 
+type MockNmhMap = std::collections::HashMap<(Scope, String, Option<RegWow64View>), NativeHostRegProbe>;
+
+#[derive(Default)]
+struct MockRegistryViewOps {
+    nmh_entries: std::sync::Mutex<MockNmhMap>,
+    uri_cmds: std::sync::Mutex<std::collections::HashMap<Scope, String>>,
+    aumids: std::sync::Mutex<std::collections::HashMap<Scope, String>>,
+    probe_calls: std::sync::Mutex<Vec<(Scope, String, Option<RegWow64View>)>>,
+}
+
+impl MockRegistryViewOps {
+    fn set_entry(
+        &self,
+        scope: Scope,
+        subkey: &str,
+        view: Option<RegWow64View>,
+        probe: NativeHostRegProbe,
+    ) {
+        self.nmh_entries
+            .lock()
+            .unwrap()
+            .insert((scope, subkey.to_string(), view), probe);
+    }
+
+    fn get_entry(
+        &self,
+        scope: Scope,
+        subkey: &str,
+        view: Option<RegWow64View>,
+    ) -> NativeHostRegProbe {
+        self.nmh_entries
+            .lock()
+            .unwrap()
+            .get(&(scope, subkey.to_string(), view))
+            .cloned()
+            .unwrap_or(NativeHostRegProbe::Absent)
+    }
+
+    fn take_probe_calls(&self) -> Vec<(Scope, String, Option<RegWow64View>)> {
+        std::mem::take(&mut *self.probe_calls.lock().unwrap())
+    }
+}
+
+impl RegistryViewOps for MockRegistryViewOps {
+    fn ensure_default_sz(
+        &self,
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+        expected: &str,
+    ) -> anyhow::Result<bool> {
+        match target.scope {
+            Scope::Machine => assert!(
+                view.is_some(),
+                "Scope::Machine NMH writes must specify an explicit WOW64 view"
+            ),
+            Scope::User => assert!(
+                view.is_none(),
+                "Scope::User NMH writes must stay on default view"
+            ),
+        }
+        let mut map = self.nmh_entries.lock().unwrap();
+        let key = (target.scope, subkey.to_string(), view);
+        if matches!(map.get(&key), Some(NativeHostRegProbe::Present(cur)) if cur == expected) {
+            return Ok(false);
+        }
+        map.insert(key, NativeHostRegProbe::Present(expected.to_string()));
+        Ok(true)
+    }
+
+    fn probe_default_sz(
+        &self,
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+    ) -> NativeHostRegProbe {
+        match target.scope {
+            Scope::Machine => assert!(
+                view.is_some(),
+                "Scope::Machine NMH probes must specify an explicit WOW64 view"
+            ),
+            Scope::User => assert!(
+                view.is_none(),
+                "Scope::User NMH probes must stay on default view"
+            ),
+        }
+        self.probe_calls
+            .lock()
+            .unwrap()
+            .push((target.scope, subkey.to_string(), view));
+        self.get_entry(target.scope, subkey, view)
+    }
+
+    fn delete_subkey_tree_idempotent(
+        &self,
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+    ) -> anyhow::Result<bool> {
+        if subkey == target.uri_subkey() {
+            assert!(view.is_none(), "URI deletion must stay on default view");
+            return Ok(self.uri_cmds.lock().unwrap().remove(&target.scope).is_some());
+        }
+        if subkey == target.aumid_subkey() {
+            assert!(view.is_none(), "AUMID deletion must stay on default view");
+            return Ok(self.aumids.lock().unwrap().remove(&target.scope).is_some());
+        }
+        let mut map = self.nmh_entries.lock().unwrap();
+        Ok(map.remove(&(target.scope, subkey.to_string(), view)).is_some())
+    }
+
+    fn ensure_uri_registered(&self, target: &RegistryTarget, ui_exe: &Path) -> anyhow::Result<bool> {
+        let cmd = crate::setup::format_ledr_uri_command(ui_exe);
+        let mut map = self.uri_cmds.lock().unwrap();
+        if map.get(&target.scope).is_some_and(|cur| cur == &cmd) {
+            return Ok(false);
+        }
+        map.insert(target.scope, cmd);
+        Ok(true)
+    }
+
+    fn ensure_aumid_registered(&self, target: &RegistryTarget) -> anyhow::Result<bool> {
+        let mut map = self.aumids.lock().unwrap();
+        if map
+            .get(&target.scope)
+            .is_some_and(|cur| cur == crate::setup::LEDR_AUMID_DISPLAY_NAME)
+        {
+            return Ok(false);
+        }
+        map.insert(
+            target.scope,
+            crate::setup::LEDR_AUMID_DISPLAY_NAME.to_string(),
+        );
+        Ok(true)
+    }
+
+    fn read_uri_status(&self, target: &RegistryTarget) -> (bool, Option<String>) {
+        let val = self.uri_cmds.lock().unwrap().get(&target.scope).cloned();
+        (val.is_some(), val)
+    }
+
+    fn read_aumid_status(&self, target: &RegistryTarget) -> (bool, Option<String>) {
+        let val = self.aumids.lock().unwrap().get(&target.scope).cloned();
+        (val.is_some(), val)
+    }
+
+    fn read_native_hosts_launch_directly_policy(
+        &self,
+        _target: &RegistryTarget,
+        _browser: BrowserKind,
+    ) -> Option<bool> {
+        None
+    }
+
+    fn verify_local_manifest_for_removal(&self, _path: &Path) -> bool {
+        true
+    }
+}
+
 #[test]
 fn bridge_20_mock_registry_machine_wow64_setup_status_unregister() {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    type MockNmhMap = HashMap<(Scope, String, Option<RegWow64View>), NativeHostRegProbe>;
-
-    #[derive(Default)]
-    struct MockRegistryViewOps {
-        nmh_entries: Mutex<MockNmhMap>,
-        uri_cmds: Mutex<HashMap<Scope, String>>,
-        aumids: Mutex<HashMap<Scope, String>>,
-    }
-
-    impl MockRegistryViewOps {
-        fn set_entry(
-            &self,
-            scope: Scope,
-            subkey: &str,
-            view: Option<RegWow64View>,
-            probe: NativeHostRegProbe,
-        ) {
-            self.nmh_entries
-                .lock()
-                .unwrap()
-                .insert((scope, subkey.to_string(), view), probe);
-        }
-
-        fn get_entry(
-            &self,
-            scope: Scope,
-            subkey: &str,
-            view: Option<RegWow64View>,
-        ) -> NativeHostRegProbe {
-            self.nmh_entries
-                .lock()
-                .unwrap()
-                .get(&(scope, subkey.to_string(), view))
-                .cloned()
-                .unwrap_or(NativeHostRegProbe::Absent)
-        }
-    }
-
-    impl RegistryViewOps for MockRegistryViewOps {
-        fn ensure_default_sz(
-            &self,
-            target: &RegistryTarget,
-            subkey: &str,
-            view: Option<RegWow64View>,
-            expected: &str,
-        ) -> anyhow::Result<bool> {
-            match target.scope {
-                Scope::Machine => assert!(
-                    view.is_some(),
-                    "Scope::Machine NMH writes must specify an explicit WOW64 view"
-                ),
-                Scope::User => assert!(
-                    view.is_none(),
-                    "Scope::User NMH writes must stay on default view"
-                ),
-            }
-            let mut map = self.nmh_entries.lock().unwrap();
-            let key = (target.scope, subkey.to_string(), view);
-            if matches!(map.get(&key), Some(NativeHostRegProbe::Present(cur)) if cur == expected) {
-                return Ok(false);
-            }
-            map.insert(key, NativeHostRegProbe::Present(expected.to_string()));
-            Ok(true)
-        }
-
-        fn probe_default_sz(
-            &self,
-            target: &RegistryTarget,
-            subkey: &str,
-            view: Option<RegWow64View>,
-        ) -> NativeHostRegProbe {
-            match target.scope {
-                Scope::Machine => assert!(
-                    view.is_some(),
-                    "Scope::Machine NMH probes must specify an explicit WOW64 view"
-                ),
-                Scope::User => assert!(
-                    view.is_none(),
-                    "Scope::User NMH probes must stay on default view"
-                ),
-            }
-            self.get_entry(target.scope, subkey, view)
-        }
-
-        fn delete_subkey_tree_idempotent(
-            &self,
-            target: &RegistryTarget,
-            subkey: &str,
-            view: Option<RegWow64View>,
-        ) -> anyhow::Result<bool> {
-            if subkey == target.uri_subkey() {
-                assert!(view.is_none(), "URI deletion must stay on default view");
-                return Ok(self.uri_cmds.lock().unwrap().remove(&target.scope).is_some());
-            }
-            if subkey == target.aumid_subkey() {
-                assert!(view.is_none(), "AUMID deletion must stay on default view");
-                return Ok(self.aumids.lock().unwrap().remove(&target.scope).is_some());
-            }
-            let mut map = self.nmh_entries.lock().unwrap();
-            Ok(map.remove(&(target.scope, subkey.to_string(), view)).is_some())
-        }
-
-        fn ensure_uri_registered(&self, target: &RegistryTarget, ui_exe: &Path) -> anyhow::Result<bool> {
-            let cmd = crate::setup::format_ledr_uri_command(ui_exe);
-            let mut map = self.uri_cmds.lock().unwrap();
-            if map.get(&target.scope).is_some_and(|cur| cur == &cmd) {
-                return Ok(false);
-            }
-            map.insert(target.scope, cmd);
-            Ok(true)
-        }
-
-        fn ensure_aumid_registered(&self, target: &RegistryTarget) -> anyhow::Result<bool> {
-            let mut map = self.aumids.lock().unwrap();
-            if map
-                .get(&target.scope)
-                .is_some_and(|cur| cur == crate::setup::LEDR_AUMID_DISPLAY_NAME)
-            {
-                return Ok(false);
-            }
-            map.insert(
-                target.scope,
-                crate::setup::LEDR_AUMID_DISPLAY_NAME.to_string(),
-            );
-            Ok(true)
-        }
-
-        fn read_uri_status(&self, target: &RegistryTarget) -> (bool, Option<String>) {
-            let val = self.uri_cmds.lock().unwrap().get(&target.scope).cloned();
-            (val.is_some(), val)
-        }
-
-        fn read_aumid_status(&self, target: &RegistryTarget) -> (bool, Option<String>) {
-            let val = self.aumids.lock().unwrap().get(&target.scope).cloned();
-            (val.is_some(), val)
-        }
-
-        fn read_native_hosts_launch_directly_policy(
-            &self,
-            _target: &RegistryTarget,
-            _browser: BrowserKind,
-        ) -> Option<bool> {
-            None
-        }
-
-        fn verify_local_manifest_for_removal(&self, _path: &Path) -> bool {
-            true
-        }
-    }
-
     let temp = TempDirGuard::new("ledr-bridge-nm-b20");
     let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
     let fake_ui = temp.path().join("ledr-ui.exe");
@@ -3373,4 +3410,590 @@ fn bridge_21_real_win32_ffi_explicit_wow64_view_roundtrip() {
         win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6464)),
         NativeHostRegProbe::Absent
     );
+}
+
+#[test]
+fn bridge_22_status_machine_short_circuits_wow64_64_probe() {
+    let temp = TempDirGuard::new("ledr-bridge-nm-b22");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+    let manifest_dir = temp.path().join("nm-machine");
+    let m = build_manifest(&fake_bridge, DEFAULT_CHROME_EXTENSION_ID).unwrap();
+    let m32_path = manifest_dir.join(manifest_filename_for(Scope::Machine, BrowserKind::Chrome));
+    let m64_path = manifest_dir.join("com.localedr.bridge.m64.json");
+    write_manifest_atomic(&m32_path, &m).unwrap();
+    write_manifest_atomic(&m64_path, &m).unwrap();
+    let m32_display = crate::manifest::normalize_display_path(&m32_path);
+    let m64_display = crate::manifest::normalize_display_path(&m64_path);
+
+    let machine_target = RegistryTarget::for_scope(Scope::Machine);
+    let chrome_subkey = machine_target.browser_subkey(BrowserKind::Chrome);
+    let edge_subkey = machine_target.browser_subkey(BrowserKind::Edge);
+    let brave_subkey = machine_target.browser_subkey(BrowserKind::Brave);
+    let status_machine = StatusArgs {
+        scope: StatusScope::Machine,
+        extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
+        ping: false,
+        pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+        json: false,
+    };
+
+    // (a) When Wow6432 returns Present, EmptyString, or UnresolvableExpandSz,
+    //     run_status_with_ops MUST short-circuit and perform ZERO Wow6464 probes.
+    let ops = MockRegistryViewOps::default();
+    let unres_raw = r"%LEDR_NONEXISTENT_B22%\com.localedr.bridge.json".to_string();
+    let unres_err = "unresolved env token %LEDR_NONEXISTENT_B22%".to_string();
+
+    ops.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::Present(m32_display.clone()),
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(m64_display.clone()),
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::EmptyString,
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(m64_display.clone()),
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &brave_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::UnresolvableExpandSz {
+            raw: unres_raw.clone(),
+            error: unres_err.clone(),
+        },
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &brave_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(m64_display.clone()),
+    );
+
+    let report = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &ops,
+    )
+    .expect("status with 32-bit stopping probes");
+    let calls = ops.take_probe_calls();
+    assert_eq!(
+        calls,
+        vec![
+            (Scope::Machine, chrome_subkey.clone(), Some(RegWow64View::Wow6432)),
+            (Scope::Machine, edge_subkey.clone(), Some(RegWow64View::Wow6432)),
+            (Scope::Machine, brave_subkey.clone(), Some(RegWow64View::Wow6432)),
+        ],
+        "Wow6464 must not be probed when Wow6432 stops fallback"
+    );
+
+    let brave = &report.scopes[0].browsers[2];
+    assert!(brave.registered);
+    assert_eq!(brave.registry_view.as_deref(), Some("wow64-32"));
+    assert_eq!(brave.manifest_path.as_deref(), Some(unres_raw.as_str()));
+    let brave_manifest = brave
+        .manifest
+        .as_ref()
+        .expect("synthetic invalid manifest for UnresolvableExpandSz");
+    assert!(!brave_manifest.valid);
+    assert_eq!(brave_manifest.path, unres_raw);
+    assert_eq!(brave_manifest.error.as_deref(), Some(unres_err.as_str()));
+    let text = format_status_text(&report);
+    assert!(text.contains(&unres_raw));
+    assert!(text.contains(&unres_err));
+
+    // (b) When Wow6432 returns Absent, InvalidType, or AccessError,
+    //     run_status_with_ops MUST probe Wow6464 as fallback.
+    let ops_fallback = MockRegistryViewOps::default();
+    ops_fallback.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::Absent,
+    );
+    ops_fallback.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(m64_display.clone()),
+    );
+    ops_fallback.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::InvalidType,
+    );
+    ops_fallback.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(m64_display.clone()),
+    );
+    ops_fallback.set_entry(
+        Scope::Machine,
+        &brave_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::AccessError("denied-32".to_string()),
+    );
+    ops_fallback.set_entry(
+        Scope::Machine,
+        &brave_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(m64_display.clone()),
+    );
+
+    let fallback_report = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &ops_fallback,
+    )
+    .expect("status with 64-bit fallback");
+    let fallback_calls = ops_fallback.take_probe_calls();
+    assert_eq!(
+        fallback_calls,
+        vec![
+            (Scope::Machine, chrome_subkey, Some(RegWow64View::Wow6432)),
+            (Scope::Machine, machine_target.browser_subkey(BrowserKind::Chrome), Some(RegWow64View::Wow6464)),
+            (Scope::Machine, edge_subkey, Some(RegWow64View::Wow6432)),
+            (Scope::Machine, machine_target.browser_subkey(BrowserKind::Edge), Some(RegWow64View::Wow6464)),
+            (Scope::Machine, brave_subkey, Some(RegWow64View::Wow6432)),
+            (Scope::Machine, machine_target.browser_subkey(BrowserKind::Brave), Some(RegWow64View::Wow6464)),
+        ]
+    );
+    for b in &fallback_report.scopes[0].browsers {
+        assert!(b.registered);
+        assert_eq!(b.registry_view.as_deref(), Some("wow64-64"));
+        assert_eq!(b.manifest_path.as_deref(), Some(m64_display.as_str()));
+        assert!(b.manifest.as_ref().is_some_and(|v| v.valid));
+    }
+}
+
+#[test]
+fn bridge_23_unregister_unresolvable_expand_sz_and_dual_view_manifest_removed() {
+    let temp = TempDirGuard::new("ledr-bridge-nm-b23");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+    let m = build_manifest(&fake_bridge, DEFAULT_CHROME_EXTENSION_ID).unwrap();
+
+    let machine_target = RegistryTarget::for_scope(Scope::Machine);
+    let user_target = RegistryTarget::for_scope(Scope::User);
+    let chrome_subkey = machine_target.browser_subkey(BrowserKind::Chrome);
+    let edge_subkey = machine_target.browser_subkey(BrowserKind::Edge);
+
+    // (a) Remaining browser with UnresolvableExpandSz fails closed and blocks shared manifest deletion.
+    let ops_a = MockRegistryViewOps::default();
+    let manifest_dir_a = temp.path().join("dir-a");
+    let shared_manifest = manifest_dir_a.join(manifest_filename_for(Scope::Machine, BrowserKind::Chrome));
+    write_manifest_atomic(&shared_manifest, &m).unwrap();
+    let shared_display = crate::manifest::normalize_display_path(&shared_manifest);
+    let unres_raw = r"%LEDR_NONEXISTENT_SHARED%\com.localedr.bridge.json".to_string();
+
+    ops_a.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(shared_display),
+    );
+    ops_a.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::UnresolvableExpandSz {
+            raw: unres_raw.clone(),
+            error: "unresolved env token".to_string(),
+        },
+    );
+
+    let unreg_chrome_a = UnregisterArgs {
+        scope: Scope::Machine,
+        browsers: vec![BrowserKind::Chrome],
+        manifest_dir: Some(manifest_dir_a.clone()),
+        keep_uri: true,
+        json: false,
+    };
+    let res_a = run_unregister_with_ops(
+        &unreg_chrome_a,
+        &machine_target,
+        Some(&user_target),
+        &ops_a,
+    )
+    .expect("unregister chrome while edge has UnresolvableExpandSz");
+    assert!(res_a.browsers[0].removed);
+    assert!(
+        !res_a.manifest_removed,
+        "remaining UnresolvableExpandSz must fail-closed and preserve manifest"
+    );
+    assert!(res_a.manifest_paths_removed.is_empty());
+    assert!(shared_manifest.is_file());
+
+    // Unregistering Edge with UnresolvableExpandSz (and no Present path) preserves raw as manifest_path
+    // fallback and never adds UnresolvableExpandSz raw value to candidate_paths for deletion.
+    let unreg_edge_a = UnregisterArgs {
+        scope: Scope::Machine,
+        browsers: vec![BrowserKind::Edge],
+        manifest_dir: Some(temp.path().join("other-empty-dir")),
+        keep_uri: true,
+        json: false,
+    };
+    let res_edge_a = run_unregister_with_ops(
+        &unreg_edge_a,
+        &machine_target,
+        Some(&user_target),
+        &ops_a,
+    )
+    .expect("unregister edge with UnresolvableExpandSz");
+    assert!(res_edge_a.browsers[0].removed);
+    assert_eq!(res_edge_a.browsers[0].manifest_path.as_deref(), Some(unres_raw.as_str()));
+    assert!(!res_edge_a.manifest_removed);
+
+    // (b) Dual-view different custom paths on Chrome:
+    //     32-bit points to path A (still referenced by Edge -> kept on disk);
+    //     64-bit points to path B (unreferenced -> deleted from disk).
+    //     `manifest_paths_removed` must contain B, path A must remain on disk,
+    //     and Chrome's `BrowserUnregisterOutcome.manifest_removed` must be `true`.
+    let ops_b = MockRegistryViewOps::default();
+    let custom_dir = temp.path().join("custom-dual");
+    let path_a = custom_dir.join("com.localedr.bridge.custom-a.json");
+    let path_b = custom_dir.join("com.localedr.bridge.custom-b.json");
+    write_manifest_atomic(&path_a, &m).unwrap();
+    write_manifest_atomic(&path_b, &m).unwrap();
+    let path_a_display = crate::manifest::normalize_display_path(&path_a);
+    let path_b_display = crate::manifest::normalize_display_path(&path_b);
+    let path_b_extended = format!(r"\\?\{path_b_display}");
+
+    ops_b.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::Present(path_a_display.clone()),
+    );
+    ops_b.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(path_b_extended),
+    );
+    ops_b.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::Present(path_a_display.clone()),
+    );
+
+    let unreg_chrome_b = UnregisterArgs {
+        scope: Scope::Machine,
+        browsers: vec![BrowserKind::Chrome],
+        manifest_dir: Some(temp.path().join("unrelated-default-dir")),
+        keep_uri: true,
+        json: false,
+    };
+    let res_b = run_unregister_with_ops(
+        &unreg_chrome_b,
+        &machine_target,
+        Some(&user_target),
+        &ops_b,
+    )
+    .expect("unregister chrome with dual-view custom paths");
+    assert!(res_b.browsers[0].removed);
+    assert_eq!(
+        res_b.browsers[0].manifest_path.as_deref(),
+        Some(path_a_display.as_str()),
+        "primary manifest_path keeps 32-bit view value for backward compatibility"
+    );
+    assert_eq!(res_b.manifest_paths_removed, vec![path_b_display]);
+    assert!(res_b.manifest_removed);
+    assert!(
+        res_b.browsers[0].manifest_removed,
+        "Chrome manifest_removed must be true when its 64-bit view path B was removed"
+    );
+    assert!(path_a.is_file(), "path A referenced by Edge must remain on disk");
+    assert!(!path_b.exists(), "unreferenced path B must be deleted from disk");
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_24_real_win32_reg_expand_sz_probe_status_and_unregister() {
+    use crate::setup::win_reg_ops;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE, REG_EXPAND_SZ};
+    use winreg::{RegKey, RegValue};
+
+    // (a) Pure unit checks for has_unresolved_env_token
+    assert!(!has_unresolved_env_token(
+        r"%SystemRoot%\System32\notepad.exe",
+        r"C:\Windows\System32\notepad.exe"
+    ));
+    assert!(has_unresolved_env_token(
+        r"%LEDR_MISSING%\m.json",
+        r"%LEDR_MISSING%\m.json"
+    ));
+    assert!(has_unresolved_env_token(
+        r"%ledr_missing%\m.json",
+        r"%LEDR_MISSING%\m.json"
+    ));
+    assert!(has_unresolved_env_token(
+        r"C:\100%done\%LEDR_MISSING%\m.json",
+        r"C:\100%done\%LEDR_MISSING%\m.json"
+    ));
+    assert!(!has_unresolved_env_token(
+        r"C:\100%done\m.json",
+        r"C:\100%done\m.json"
+    ));
+    assert!(!has_unresolved_env_token(
+        r"C:\a%%b\a:b%c/d%e\m.json",
+        r"C:\a%%b\a:b%c/d%e\m.json"
+    ));
+
+    fn encode_reg_expand_sz(s: &str) -> RegValue<'static> {
+        let bytes: Vec<u8> = s
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        RegValue {
+            bytes: bytes.into(),
+            vtype: REG_EXPAND_SZ,
+        }
+    }
+
+    fn encode_path_with_env_var(path: &Path) -> Option<String> {
+        for var in ["TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA"] {
+            if let Ok(val) = std::env::var(var) {
+                if !val.is_empty() {
+                    if let Ok(rel) = path.strip_prefix(Path::new(&val)) {
+                        return Some(format!("%{var}%\\{}", rel.display()));
+                    }
+                }
+            }
+        }
+        if let Ok(drive) = std::env::var("SystemDrive") {
+            let path_str = path.to_string_lossy();
+            if path_str.len() > drive.len()
+                && path_str[..drive.len()].eq_ignore_ascii_case(&drive)
+            {
+                return Some(format!("%SystemDrive%{}", &path_str[drive.len()..]));
+            }
+        }
+        None
+    }
+
+    let temp = TempDirGuard::new("ledr-bridge-nm-b24");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+    let m = build_manifest(&fake_bridge, DEFAULT_CHROME_EXTENSION_ID).unwrap();
+
+    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let prefix = format!(r"Software\LocalEDR-Test\Bridge24-{}-{seq}", std::process::id());
+    let clsid_subkey = format!(
+        r"Software\Classes\CLSID\{{LocalEDR-Test-Bridge24-{}-{seq}}}",
+        std::process::id()
+    );
+
+    struct RegCleanup {
+        prefix: String,
+        clsid_subkey: String,
+    }
+    impl Drop for RegCleanup {
+        fn drop(&mut self) {
+            let user = RegistryTarget {
+                scope: Scope::User,
+                key_prefix: None,
+            };
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(&user, &self.prefix, None);
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(
+                &user,
+                &self.clsid_subkey,
+                Some(RegWow64View::Wow6432),
+            );
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(
+                &user,
+                &self.clsid_subkey,
+                Some(RegWow64View::Wow6464),
+            );
+        }
+    }
+    let _cleanup = RegCleanup {
+        prefix: prefix.clone(),
+        clsid_subkey: clsid_subkey.clone(),
+    };
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let user_plain = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: None,
+    };
+
+    // (b) Real Win32 REG_EXPAND_SZ probe variants under CLSID WOW64 views:
+    //     32-bit REG_EXPAND_SZ takes precedence over 64-bit REG_SZ.
+    let (k64, _) = hkcu
+        .create_subkey_with_flags(&clsid_subkey, KEY_WRITE | win_reg_ops::KEY_WOW64_64KEY)
+        .unwrap();
+    let val64 = r"C:\ProgramData\LocalEDR\native-messaging\win32-expand-64.json";
+    k64.set_value("", &val64).unwrap();
+
+    let (k32, _) = hkcu
+        .create_subkey_with_flags(&clsid_subkey, KEY_WRITE | win_reg_ops::KEY_WOW64_32KEY)
+        .unwrap();
+
+    // Resolved %SystemRoot% REG_EXPAND_SZ in 32-bit view wins over 64-bit REG_SZ
+    let sys_root = std::env::var("SystemRoot").expect("SystemRoot must be set on Windows");
+    let raw_resolved = r"%SystemRoot%\System32\notepad.exe";
+    let expected_resolved = format!(r"{sys_root}\System32\notepad.exe");
+    k32.set_raw_value("", &encode_reg_expand_sz(raw_resolved))
+        .unwrap();
+    let probe32_resolved =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert_eq!(
+        probe32_resolved,
+        NativeHostRegProbe::Present(expected_resolved.clone())
+    );
+    assert_eq!(
+        select_effective_hklm_probe(
+            probe32_resolved,
+            win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        ),
+        (
+            NativeHostRegProbe::Present(expected_resolved),
+            Some(RegWow64View::Wow6432)
+        )
+    );
+
+    // Unresolved %LEDR_NONEXISTENT_VAR_8F4B2C% REG_EXPAND_SZ in 32-bit view stops fallback over 64-bit
+    let raw_unresolved = format!(r"%LEDR_NONEXISTENT_VAR_{}_{seq}%\com.localedr.bridge.json", std::process::id());
+    k32.set_raw_value("", &encode_reg_expand_sz(&raw_unresolved))
+        .unwrap();
+    let probe32_unres =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    match &probe32_unres {
+        NativeHostRegProbe::UnresolvableExpandSz { raw, error } => {
+            assert_eq!(raw, &raw_unresolved);
+            assert!(error.contains("unresolved"), "unexpected error: {error}");
+        }
+        other => panic!("expected UnresolvableExpandSz, got {other:?}"),
+    }
+    assert_eq!(
+        select_effective_hklm_probe(
+            probe32_unres.clone(),
+            win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        ),
+        (probe32_unres, Some(RegWow64View::Wow6432))
+    );
+
+    // Whitespace-only REG_EXPAND_SZ -> EmptyString; odd-byte-length REG_EXPAND_SZ -> InvalidType
+    k32.set_raw_value("", &encode_reg_expand_sz("   ")).unwrap();
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::EmptyString
+    );
+    k32.set_raw_value(
+        "",
+        &RegValue {
+            bytes: vec![b'a', 0, b'b'].into(),
+            vtype: REG_EXPAND_SZ,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::InvalidType
+    );
+
+    // (c) Isolated HKCU end-to-end: remaining browser with real REG_EXPAND_SZ (both resolved
+    //     shared path and unresolved fail-closed) prevents deletion of shared manifest during unregister.
+    let isolated_user = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: Some(prefix),
+    };
+    let manifest_dir = temp.path().join("nm-user");
+    let shared_manifest = manifest_dir.join(manifest_filename_for(Scope::User, BrowserKind::Chrome));
+    write_manifest_atomic(&shared_manifest, &m).unwrap();
+    let shared_display = crate::manifest::normalize_display_path(&shared_manifest);
+    let edge_expand_shared = encode_path_with_env_var(&shared_manifest)
+        .expect("temp path must be expressible via standard Windows env var");
+
+    let chrome_key = isolated_user.browser_subkey(BrowserKind::Chrome);
+    let edge_key = isolated_user.browser_subkey(BrowserKind::Edge);
+    win_reg_ops::ensure_default_sz(&isolated_user, &chrome_key, None, &shared_display).unwrap();
+    let (edge_reg, _) = hkcu.create_subkey_with_flags(&edge_key, KEY_WRITE).unwrap();
+    edge_reg
+        .set_raw_value("", &encode_reg_expand_sz(&edge_expand_shared))
+        .unwrap();
+
+    let status_args = StatusArgs {
+        scope: StatusScope::User,
+        extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
+        ping: false,
+        pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+        json: false,
+    };
+    let status_resolved = run_status_with(
+        &status_args,
+        std::slice::from_ref(&isolated_user),
+        Some(&manifest_dir),
+    )
+    .expect("status with real REG_EXPAND_SZ");
+    let edge_status = &status_resolved.scopes[0].browsers[1];
+    assert!(edge_status.registered);
+    assert_eq!(
+        edge_status.manifest_path.as_deref(),
+        Some(shared_display.as_str())
+    );
+    assert!(edge_status.manifest.as_ref().is_some_and(|v| v.valid));
+
+    let unreg_chrome = UnregisterArgs {
+        scope: Scope::User,
+        browsers: vec![BrowserKind::Chrome],
+        manifest_dir: Some(manifest_dir.clone()),
+        keep_uri: true,
+        json: false,
+    };
+    let res_resolved = run_unregister_with(&unreg_chrome, &isolated_user, None)
+        .expect("unregister chrome while edge has resolved REG_EXPAND_SZ");
+    assert!(res_resolved.browsers[0].removed);
+    assert!(
+        !res_resolved.manifest_removed,
+        "resolved REG_EXPAND_SZ on Edge must prevent deleting shared manifest"
+    );
+    assert!(shared_manifest.is_file());
+
+    // Now re-register Chrome and replace Edge's REG_EXPAND_SZ with an unresolvable variable
+    win_reg_ops::ensure_default_sz(&isolated_user, &chrome_key, None, &shared_display).unwrap();
+    edge_reg
+        .set_raw_value("", &encode_reg_expand_sz(&raw_unresolved))
+        .unwrap();
+
+    let status_unres = run_status_with(
+        &status_args,
+        std::slice::from_ref(&isolated_user),
+        Some(&manifest_dir),
+    )
+    .expect("status with unresolvable REG_EXPAND_SZ");
+    let edge_unres = &status_unres.scopes[0].browsers[1];
+    assert!(edge_unres.registered);
+    assert_eq!(edge_unres.manifest_path.as_deref(), Some(raw_unresolved.as_str()));
+    assert!(!edge_unres.manifest.as_ref().unwrap().valid);
+
+    let res_unres = run_unregister_with(&unreg_chrome, &isolated_user, None)
+        .expect("unregister chrome while edge has unresolved REG_EXPAND_SZ");
+    assert!(res_unres.browsers[0].removed);
+    assert!(
+        !res_unres.manifest_removed,
+        "unresolved REG_EXPAND_SZ on Edge must fail-closed and preserve manifest"
+    );
+    assert!(shared_manifest.is_file());
 }

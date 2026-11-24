@@ -891,6 +891,18 @@ fn record_honeypots_best_effort(store: &LedrStore, records: &[OwnedHoneypotRecor
     }
 }
 
+fn sync_refreshed_owned_honeypots(
+    store: &LedrStore,
+    prev_owned: &[OwnedHoneypotRecord],
+    current_owned: &[OwnedHoneypotRecord],
+) -> bool {
+    if prev_owned == current_owned {
+        return false;
+    }
+    record_honeypots_best_effort(store, current_owned);
+    true
+}
+
 fn cleanup_honeypots_with_db_and_fallback(
     db_path: &Path,
     fallback_paths: &[PathBuf],
@@ -1446,12 +1458,11 @@ where
                         refresh_in_flight = Some(tokio::task::spawn_blocking(move || {
                             let prev_owned = mgr.owned_deployed_records().to_vec();
                             let res = mgr.refresh_service_profiles();
-                            if prev_owned != mgr.owned_deployed_records() {
-                                record_honeypots_best_effort(
-                                    &refresh_store,
-                                    mgr.owned_deployed_records(),
-                                );
-                            }
+                            sync_refreshed_owned_honeypots(
+                                &refresh_store,
+                                &prev_owned,
+                                mgr.owned_deployed_records(),
+                            );
                             (mgr, res)
                         }));
                     }
@@ -3045,5 +3056,109 @@ mod tests {
             &db_path.to_string_lossy(),
         ]);
         assert_eq!(rc, HONEYPOT_CLEANUP_PARTIAL_EXIT_CODE);
+    }
+
+    #[test]
+    fn honeypot_cleanup_03_redeployed_decoy_updates_sqlite_identity_and_deletes_on_uninstall() {
+        use std::process::Command;
+
+        struct TempCleanupDir(PathBuf);
+        impl Drop for TempCleanupDir {
+            fn drop(&mut self) {
+                fn clear(dir: &Path) {
+                    let Ok(entries) = std::fs::read_dir(dir) else {
+                        return;
+                    };
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if let Ok(meta) = std::fs::symlink_metadata(&p) {
+                            if meta.is_dir() {
+                                clear(&p);
+                            } else {
+                                let _ = Command::new("attrib")
+                                    .args(["-R", "-H", "-S", &p.to_string_lossy()])
+                                    .output();
+                            }
+                        }
+                    }
+                }
+                clear(&self.0);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!(
+            "ledr-daemon-hp-redeploy-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let _guard = TempCleanupDir(base.clone());
+
+        let db_path = base.join("localedr.db");
+        let store = LedrStore::open(&db_path).expect("open db");
+        let profile = base.join("UserRedeploy");
+        let docs = profile.join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+
+        let mut mgr = HoneypotManager::for_user_profiles(vec![profile.clone()]);
+        let deployed = mgr.deploy_honeypots().expect("initial deploy");
+        assert_eq!(deployed.len(), 1);
+        let decoy_path = deployed[0].clone();
+        let initial_owned = mgr.owned_deployed_records().to_vec();
+        assert_eq!(initial_owned.len(), 1);
+        let initial_file_id = initial_owned[0].file_id;
+        record_honeypots_best_effort(&store, &initial_owned);
+
+        // Idempotent refresh with no change returns false.
+        assert!(!sync_refreshed_owned_honeypots(
+            &store,
+            &initial_owned,
+            mgr.owned_deployed_records()
+        ));
+
+        // Delete the decoy, allocate dummy files so NTFS advances/reuses MFT entries elsewhere,
+        // and redeploy at the exact same path via refresh_user_profiles.
+        std::fs::remove_file(&decoy_path).expect("remove initial decoy");
+        let _occupier_a = std::fs::File::create(base.join("mft_occupier_a.tmp")).unwrap();
+        let _occupier_b = std::fs::File::create(base.join("mft_occupier_b.tmp")).unwrap();
+        let _ = mgr
+            .refresh_user_profiles(vec![profile])
+            .expect("refresh after decoy deletion");
+
+        let refreshed_owned = mgr.owned_deployed_records().to_vec();
+        assert_eq!(refreshed_owned.len(), 1);
+        let new_file_id = refreshed_owned[0].file_id;
+        assert_ne!(
+            new_file_id, initial_file_id,
+            "redeployed decoy must acquire a fresh file identity"
+        );
+        assert!(sync_refreshed_owned_honeypots(
+            &store,
+            &initial_owned,
+            &refreshed_owned
+        ));
+
+        let db_records = LedrStore::list_tracked_honeypot_records_read_only(&db_path)
+            .expect("read updated tracked records");
+        assert_eq!(db_records.len(), 1);
+        assert_eq!(db_records[0].volume_serial, Some(new_file_id.volume_serial));
+        assert_eq!(db_records[0].file_index, Some(new_file_id.file_index));
+        drop(store);
+
+        // Modify content so deletion depends strictly on the updated SQLite file identity.
+        std::fs::write(&decoy_path, b"MODIFIED_AFTER_REDEPLOY").unwrap();
+        let outcome = cleanup_honeypots_with_db_and_fallback(&db_path, &[]);
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.skipped_not_owned, 0);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.db_records_removed, 1);
+        assert!(!decoy_path.exists());
+        assert!(LedrStore::list_tracked_honeypot_records_read_only(&db_path)
+            .unwrap()
+            .is_empty());
     }
 }

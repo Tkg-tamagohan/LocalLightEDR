@@ -1,6 +1,6 @@
 ---
 trigger: model_decision
-description: LocalEDR の防御アクチュエータ（サスペンド、終了）、おとりファイル、Session 0 通知、IPC 認可と Authenticode 署名検証キャッシュ、WFP 動的フィルタ、ブラウザ拡張と MOTW 連携、View 3 マニフェスト検証を実装またはレビューするとき
+description: LocalEDR の防御アクチュエータ（サスペンド、終了）、おとりファイル、Session 0 通知、IPC 認可と Authenticode 署名検証キャッシュ、WFP 動的フィルタ、ブラウザ拡張と MOTW 連携、View 3 マニフェスト検証、および ledr-bridge-nm の Native Messaging レジストリプローブとマニフェスト削除保護を実装またはレビューするとき
 ---
 
 # 能動防御と特権境界の安全制約を遵守する
@@ -22,6 +22,10 @@ LocalEDR の Layer 1 から Layer 4 にわたる能動防御処理は、誤動�
 6. Chrome と MOTW：Phase 4 の NRD 判定は外部へ閲覧ドメインを送信せずローカル完結に保ち、ダウンロード起源はパス、SHA-256、`:Zone.Identifier` の 3 段階で紐付ける。
 7. View 3 マニフェスト検証：Native Messaging マニフェストの読み取りは既定 2 ディレクトリのホワイトリスト配下だけに限定し、カスタム配置パスに対してはファイル I/O を行わない。
    ホワイトリスト配下でもリパースポイントを拒否し、`FILE_FLAG_OPEN_REPARSE_POINT` と `FILE_READ_ATTRIBUTES` で先行検査して `nNumberOfLinks == 1` および `GetFinalPathNameByHandleW` によるディレクトリ閉じ込めを確認してから、`ReOpenFile` で読み取りハンドルへ昇格して読み取る。
+8. CLI Native Messaging レジストリプローブとマニフェスト削除保護：`crates/ledr-bridge-nm/src/setup.rs` の `HKLM` Native Messaging 操作は `setup --scope machine` で 32 ビットおよび 64 ビット両ビューへ冪等に登録し、レジストリ文字列プローブは Chromium 互換で `REG_SZ` と `REG_EXPAND_SZ` の双方を扱い、空白トリム前の生値（2,048 バイト時の末尾 UTF-16 NUL 終端必須を含む `exceeds_chromium_raw_limit`）および空白トリム前の展開結果に対して 1,024 UTF-16 コード単位上限（`CHROMIUM_READ_VALUE_MAX_UTF16_UNITS`）を判定する。
+   上限内かつ未解決の環境変数（展開後も `%TOKEN%` が残存する `has_unresolved_env_token` 検出）を含む `REG_EXPAND_SZ` は `UnresolvableExpandSz` として 32 ビット優先打ち切りとし、上限超過または `ExpandEnvironmentStringsW` 失敗は `ChromiumReadFallback` として `HKLM` 診断のみ 64 ビットビューへフォールバックする。
+   `HKLM` の WOW64 診断（`run_status_with_ops`）は 32 ビットビューで `stops_wow64_fallback()`（`Present`、`EmptyString`、`UnresolvableExpandSz`）が成立した時点で 64 ビットビューを読まずに短絡終了する（`HKCU`、URI スキーム、AUMID、グループポリシーはフラグなしの既定ビューのみを維持する）。
+   `unregister` では両ビューのレジストリキーを冪等に削除したうえで、共有マニフェストファイル削除前の参照検査（`any_browser_references_manifest_with`）で全ブラウザの両ビューを短絡なしで走査し、最大 32,768 UTF-16 コード単位まで保守的に展開した `ChromiumReadFallback { resolved_path: Some(..) }` を保護対象に含め、`UnresolvableExpandSz` と `ChromiumReadFallback { resolved_path: None }` はフェイルクローズ（削除しない）で保護し、ブラウザ別 `manifest_removed` は 32 ビットおよび 64 ビット両ビューの全登録パスを `normalize_display_path` と大文字小文字無視の正規化比較で照合する。
 
 ## 対象外
 

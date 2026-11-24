@@ -17,6 +17,17 @@ use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod base64;
+mod fs_safe;
+mod http;
+mod keys;
+mod manifest;
+mod semver;
+mod verify;
+
+#[cfg(test)]
+mod tests;
+
 /// Required URL prefix for initial manifest/signature retrieval and `release_notes_url`.
 pub const RELEASE_URL_PREFIX: &str =
     "https://github.com/Tkg-tamagohan/LocalLightEDR/releases/";
@@ -174,13 +185,13 @@ impl PublicKeyRing {
     }
 
     /// Parses and validates a key ring JSON document.
-    pub fn from_json_str(_json: &str) -> Result<Self, UpdaterError> {
-        todo!("implemented in M1 (updater-core)")
+    pub fn from_json_str(json: &str) -> Result<Self, UpdaterError> {
+        keys::from_json_str(json)
     }
 
     /// Looks up an active 32-byte Ed25519 verifying key by `key_id`.
-    pub fn active_verifying_key(&self, _key_id: &str) -> Result<[u8; 32], UpdaterError> {
-        todo!("implemented in M1 (updater-core)")
+    pub fn active_verifying_key(&self, key_id: &str) -> Result<[u8; 32], UpdaterError> {
+        keys::active_verifying_key(self, key_id)
     }
 
     /// Returns `true` if at least one key in the ring has [`KeyStatus::Active`].
@@ -202,8 +213,8 @@ pub struct SemVer {
 
 impl SemVer {
     /// Parses a strict SemVer string (no leading `v`, no leading zeros on numeric parts).
-    pub fn parse(_input: &str) -> Result<Self, UpdaterError> {
-        todo!("implemented in M1 (updater-core)")
+    pub fn parse(input: &str) -> Result<Self, UpdaterError> {
+        semver::parse(input)
     }
 
     /// Returns `true` if this version carries a pre-release identifier.
@@ -222,7 +233,7 @@ impl Ord for SemVer {
                 (None, None) => Ordering::Equal,
                 (None, Some(_)) => Ordering::Greater,
                 (Some(_), None) => Ordering::Less,
-                (Some(a), Some(b)) => a.cmp(b),
+                (Some(a), Some(b)) => semver::compare_prerelease(a, b),
             })
     }
 }
@@ -243,13 +254,13 @@ impl fmt::Display for SemVer {
 }
 
 /// Decodes a standard Base64 string (strict padding and alphabet validation).
-pub fn decode_base64(_input: &str) -> Result<Vec<u8>, UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn decode_base64(input: &str) -> Result<Vec<u8>, UpdaterError> {
+    base64::decode(input)
 }
 
 /// Encodes raw bytes into standard Base64 with `=` padding.
-pub fn encode_base64(_bytes: &[u8]) -> String {
-    todo!("implemented in M1 (updater-core)")
+pub fn encode_base64(bytes: &[u8]) -> String {
+    base64::encode(bytes)
 }
 
 /// Companion Chrome MV3 extension metadata inside [`UpdateManifest`].
@@ -312,51 +323,66 @@ pub enum UpdateVerificationOutcome {
 
 /// Verifies `manifest_bytes` against the JSON signature envelope `sig_bytes` using `key_ring`.
 pub fn verify_manifest_signature(
-    _manifest_bytes: &[u8],
-    _sig_bytes: &[u8],
-    _key_ring: &PublicKeyRing,
+    manifest_bytes: &[u8],
+    sig_bytes: &[u8],
+    key_ring: &PublicKeyRing,
 ) -> Result<ManifestSignatureEnvelope, UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+    verify::verify_manifest_signature(manifest_bytes, sig_bytes, key_ring)
 }
 
 /// Parses and structurally validates `update-manifest.json` bytes without network I/O.
-pub fn parse_and_validate_manifest(_manifest_bytes: &[u8]) -> Result<UpdateManifest, UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn parse_and_validate_manifest(manifest_bytes: &[u8]) -> Result<UpdateManifest, UpdaterError> {
+    manifest::parse_and_validate_manifest(manifest_bytes)
 }
 
 /// Compares a validated [`UpdateManifest`] against `current_version`.
 pub fn evaluate_manifest_for_version(
-    _manifest: &UpdateManifest,
-    _current_version: &str,
+    manifest: &UpdateManifest,
+    current_version: &str,
 ) -> Result<UpdateVerificationOutcome, UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+    manifest::evaluate_manifest_for_version(manifest, current_version)
 }
 
 /// Full verification pipeline: verifies Ed25519 signature first, then parses/validates the
 /// manifest and evaluates it against `current_version`.
 pub fn verify_and_evaluate_manifest(
-    _manifest_bytes: &[u8],
-    _sig_bytes: &[u8],
-    _key_ring: &PublicKeyRing,
-    _current_version: &str,
+    manifest_bytes: &[u8],
+    sig_bytes: &[u8],
+    key_ring: &PublicKeyRing,
+    current_version: &str,
 ) -> Result<UpdateVerificationOutcome, UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+    verify::verify_and_evaluate_manifest(manifest_bytes, sig_bytes, key_ring, current_version)
 }
 
 /// Computes lowercase hex SHA-256 of the file at `path`.
-pub fn sha256_file_hex(_path: &Path) -> Result<String, UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn sha256_file_hex(path: &Path) -> Result<String, UpdaterError> {
+    verify::sha256_file_hex(path)
 }
 
 /// Verifies that the installer file at `path` matches `manifest.size_bytes` and `manifest.sha256`.
-pub fn verify_installer_file(_path: &Path, _manifest: &UpdateManifest) -> Result<(), UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn verify_installer_file(path: &Path, manifest: &UpdateManifest) -> Result<(), UpdaterError> {
+    verify::verify_installer_file(path, manifest)
+}
+
+#[derive(Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    #[cfg(windows)]
+    active_ctx: std::sync::Mutex<Option<Arc<http::AsyncWinHttpContext>>>,
 }
 
 /// Cooperative cancellation token for bounded WinHTTP downloads.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CancelToken {
-    inner: Arc<AtomicBool>,
+    state: Arc<CancelState>,
+}
+
+impl fmt::Debug for CancelToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
 }
 
 impl CancelToken {
@@ -367,12 +393,52 @@ impl CancelToken {
 
     /// Signals cancellation to any in-flight operation observing this token.
     pub fn cancel(&self) {
-        self.inner.store(true, AtomicOrdering::Release);
+        self.state.cancelled.store(true, AtomicOrdering::SeqCst);
+        #[cfg(windows)]
+        {
+            let active = {
+                let mut guard = self
+                    .state
+                    .active_ctx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.take()
+            };
+            if let Some(ctx) = active {
+                ctx.mark_cancelled();
+            }
+        }
     }
 
     /// Returns `true` if cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        self.inner.load(AtomicOrdering::Acquire)
+        self.state.cancelled.load(AtomicOrdering::Acquire)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn register_active_ctx(&self, ctx: Arc<http::AsyncWinHttpContext>) -> bool {
+        let mut guard = self
+            .state
+            .active_ctx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.state.cancelled.load(AtomicOrdering::SeqCst) {
+            return false;
+        }
+        *guard = Some(ctx);
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn clear_active_ctx(&self, ctx: &Arc<http::AsyncWinHttpContext>) {
+        let mut guard = self
+            .state
+            .active_ctx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|c| Arc::ptr_eq(c, ctx)) {
+            *guard = None;
+        }
     }
 }
 
@@ -405,18 +471,18 @@ impl Default for HttpClientConfig {
 
 /// Validates an initial manifest/signature URL against [`RELEASE_URL_PREFIX`].
 pub fn validate_initial_release_url(
-    _url: &str,
-    _allow_loopback_http_for_tests: bool,
+    url: &str,
+    allow_loopback_http_for_tests: bool,
 ) -> Result<(), UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+    http::validate_initial_release_url(url, allow_loopback_http_for_tests)
 }
 
 /// Validates a redirect or asset download URL against HTTPS and [`ALLOWED_DOWNLOAD_HOSTS`].
 pub fn validate_download_url(
-    _url: &str,
-    _allow_loopback_http_for_tests: bool,
+    url: &str,
+    allow_loopback_http_for_tests: bool,
 ) -> Result<(), UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+    http::validate_download_url(url, allow_loopback_http_for_tests)
 }
 
 /// Independent WinHTTP release client (`winhttp.dll` `raw-dylib`).
@@ -437,83 +503,90 @@ impl UpdaterHttpClient {
     }
 
     /// Fetches `update-manifest.json` bytes bounded to [`MAX_MANIFEST_BYTES`].
-    pub fn fetch_manifest(&self, _url: &str, _cancel: &CancelToken) -> Result<Vec<u8>, UpdaterError> {
-        todo!("implemented in M1 (updater-core)")
+    pub fn fetch_manifest(&self, url: &str, cancel: &CancelToken) -> Result<Vec<u8>, UpdaterError> {
+        http::fetch_manifest(&self.config, url, cancel)
     }
 
     /// Fetches `update-manifest.json.sig` bytes bounded to [`MAX_SIG_BYTES`].
-    pub fn fetch_signature(&self, _url: &str, _cancel: &CancelToken) -> Result<Vec<u8>, UpdaterError> {
-        todo!("implemented in M1 (updater-core)")
+    pub fn fetch_signature(&self, url: &str, cancel: &CancelToken) -> Result<Vec<u8>, UpdaterError> {
+        http::fetch_signature(&self.config, url, cancel)
     }
 
     /// Fetches both [`LATEST_MANIFEST_URL`] and [`LATEST_SIG_URL`].
     pub fn fetch_latest_manifest_and_sig(
         &self,
-        _cancel: &CancelToken,
+        cancel: &CancelToken,
     ) -> Result<(Vec<u8>, Vec<u8>), UpdaterError> {
-        todo!("implemented in M1 (updater-core)")
+        http::fetch_latest_manifest_and_sig(&self.config, cancel)
     }
 
     /// Streams an asset URL into `writer`, enforcing `max_bytes` and reporting progress.
     pub fn download_to_writer(
         &self,
-        _url: &str,
-        _max_bytes: u64,
-        _writer: &mut dyn Write,
-        _cancel: &CancelToken,
-        _on_progress: &mut dyn FnMut(DownloadProgress),
+        url: &str,
+        max_bytes: u64,
+        writer: &mut dyn Write,
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(DownloadProgress),
     ) -> Result<u64, UpdaterError> {
-        todo!("implemented in M1 (updater-core)")
+        http::download_to_writer(&self.config, url, max_bytes, writer, cancel, on_progress)
     }
 
     /// Downloads an installer into a newly created exclusive `dest_path`, removing partial
     /// files on failure or cancellation.
     pub fn download_installer_to_file(
         &self,
-        _url: &str,
-        _expected_size_bytes: Option<u64>,
-        _dest_path: &Path,
-        _cancel: &CancelToken,
-        _on_progress: &mut dyn FnMut(DownloadProgress),
+        url: &str,
+        expected_size_bytes: Option<u64>,
+        dest_path: &Path,
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(DownloadProgress),
     ) -> Result<u64, UpdaterError> {
-        todo!("implemented in M1 (updater-core)")
+        http::download_installer_to_file(
+            &self.config,
+            url,
+            expected_size_bytes,
+            dest_path,
+            cancel,
+            on_progress,
+        )
     }
 }
 
 /// Validates that `filename` is a non-empty single path segment (`..`, `/`, `\`, `:`, NUL rejected).
-pub fn validate_single_segment_filename(_filename: &str) -> Result<(), UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn validate_single_segment_filename(filename: &str) -> Result<(), UpdaterError> {
+    fs_safe::validate_single_segment_filename(filename)
 }
 
 /// Verifies that no existing path component at or above `path` is a Windows reparse point.
-pub fn ensure_no_reparse_points(_path: &Path) -> Result<(), UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn ensure_no_reparse_points(path: &Path) -> Result<(), UpdaterError> {
+    fs_safe::ensure_no_reparse_points(path)
 }
 
 /// Creates a fresh UUID subdirectory under `staging_root` after checking for reparse points.
-pub fn create_staging_session_dir(_staging_root: &Path) -> Result<(Uuid, PathBuf), UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn create_staging_session_dir(staging_root: &Path) -> Result<(Uuid, PathBuf), UpdaterError> {
+    fs_safe::create_staging_session_dir(staging_root)
 }
 
 /// Creates a fresh UUID subdirectory under `verified_root` (e.g. admin-ACL `ProgramData` path).
-pub fn create_verified_session_dir(_verified_root: &Path) -> Result<(Uuid, PathBuf), UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn create_verified_session_dir(verified_root: &Path) -> Result<(Uuid, PathBuf), UpdaterError> {
+    fs_safe::create_verified_session_dir(verified_root)
 }
 
 /// Exclusively creates a new file (`create_new(true)`) after reparse-point verification.
-pub fn create_exclusive_file(_path: &Path) -> Result<File, UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn create_exclusive_file(path: &Path) -> Result<File, UpdaterError> {
+    fs_safe::create_exclusive_file(path)
 }
 
 /// Atomically writes `contents` to `dest_path` using a sibling temp file and atomic replacement.
-pub fn atomic_write_file(_dest_path: &Path, _contents: &[u8]) -> Result<(), UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+pub fn atomic_write_file(dest_path: &Path, contents: &[u8]) -> Result<(), UpdaterError> {
+    fs_safe::atomic_write_file(dest_path, contents)
 }
 
 /// Removes staging subdirectories older than `max_age`, returning the number of directories removed.
 pub fn cleanup_stale_staging_dirs(
-    _staging_root: &Path,
-    _max_age: Duration,
+    staging_root: &Path,
+    max_age: Duration,
 ) -> Result<usize, UpdaterError> {
-    todo!("implemented in M1 (updater-core)")
+    fs_safe::cleanup_stale_staging_dirs(staging_root, max_age)
 }

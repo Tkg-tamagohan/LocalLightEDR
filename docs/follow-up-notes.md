@@ -113,6 +113,7 @@ Phase 2 と Phase 3 の実装は静的検査（`cargo clippy --workspace --all-t
 - `E2E-P3-03` の `ledr-sim.exe --scenario lotl`（約 40 ms の短命プロセス）で親子系譜と `example.com` DNS 相関は通過した一方、`command_line` が `None` となり `LEDR-LOTL-001`（正規管理ツール悪用検知ルール）が発火しなかったため、`FU-E2E-04` へ切り出した。
 - `E2E-P3-06` で 3 秒停止予算を超過した後に残余パイプラインが 2 件書き込み、終了後の `-wal` に `111,272` バイトが再生成された点（シェル復帰まで計約 8 秒）と、WFP ドロップが終了済み兄弟由来の生存 `python.exe` へ単一帰属された実機エッジケースを `FU-E2E-05` へ切り出した。
 - 開発ホスト PC 上での実施のため、専用環境向けの任意項目（`E2E-OPT-01` から `E2E-OPT-03`）は未実施である。
+- PR #41 および PR #44 で追加した、生存中の発火元プロセスがおとり発火を起こした際に終了済み非保護中間親越しで生存中の孫プロセスへ `NtSuspendProcess` を適用するライブ動作（`ActiveProcessTable` 経路とスナップショット経路の統合、同一ミリ秒 PID 再利用カットオフ、および保護対象非停止を含む）は合成テストのみで確認しており、Windows 10/11 クライアント SKU の実機 E2E 対象として残している。
 - 上記の基準未達および差異が残り、かつ実測基盤の PR #34 が未マージであるため、[implementation-plan.md](implementation-plan.md) の `[x]` チェックリストは未更新としている（`[x]` 更新は PR #34 と `FU-E2E-03` から `FU-E2E-05` の `main` マージおよび `main` 上の再検証合格後に行う）。
 
 ### 検証内容
@@ -124,6 +125,7 @@ Windows Server SKU で代替検証を行う場合は、クライアント SKU �
 
 - 実 ETW `Microsoft-Windows-Kernel-File` と `Microsoft-Windows-Kernel-Registry` を購読し、ダミー `Cookies` の Open、おとりファイルへの 1 バイト書込、自動起動レジストリ更新、および `CloseKey` による `KeyObject` キャッシュ無効化が実イベントで動作することを検証する。
 - 実 `NtSuspendProcess` で対象プロセスと子孫プロセスを凍結でき、`explorer.exe` などの Never-Suspend 対象が一切停止しないこと、および `TerminateAndBlock` 実行時の子プロセスツリー終了の非同期挙動に破綻がないことを確かめる。
+- 生存中の発火元プロセスがおとり発火を起こし（`engine/events.rs` の本番凍結経路）、すでに終了済みの非保護中間親プロセス越しに生存中の孫プロセスへ `NtSuspendProcess` が適用されること、および保護対象プロセスや同一ミリ秒 PID 再利用後の後継プロセス配下が誤停止されないことを確認する。
 - 機密ファイル Open またはおとりファイル書込の検知と即時サスペンドに続いて、Session 0 の `LocalSystem` サービスから `WTSQueryUserToken` と `CreateProcessAsUser` により `ledr-ui.exe --notify <alert_id>` が対話セッションで起動し、検知から 1 秒以内にトースト通知が表示されること、および `HKCU\Software\Classes\ledr` 登録済みの `ledr://alert/<id>` クリック後 1,000 ms 以内に View 1 が開いて 5 秒以内に強制終了または再開が完了することを確認する。
 
 #### Phase 3 実機検証項目

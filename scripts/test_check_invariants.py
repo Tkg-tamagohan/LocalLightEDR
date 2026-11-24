@@ -122,6 +122,11 @@ EXPECTED_QUESTIONS: dict[str, tuple[list[str], float, float]] = {
         0.65,
         0.40,
     ),
+    "process_table_descendant_traversal": (
+        ["crates/ledr-daemon/src/process_table.rs"],
+        0.65,
+        0.40,
+    ),
 }
 
 
@@ -359,7 +364,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.skipTest(f"Global invariant gate script not installed: {exc}")
 
     def test_T1_05_invariants_json_strict_schema_and_gate_loader(self) -> None:
-        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 11 keys and load_custom_questions."""
+        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 12 keys and load_custom_questions."""
         invariants_path = REPO_ROOT / ".agents" / "invariants.json"
         self.assertTrue(invariants_path.is_file(), f"Missing {invariants_path}")
 
@@ -519,6 +524,29 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertIn("diagnostic", text_field.lower())
             self.assertIn("UI-P4-08", text_field)
             self.assertIn("non-contamination", text_field)
+
+        pt_desc = questions["process_table_descendant_traversal"]
+        pt_opening, pt_rest = pt_desc["instructions"].split("?", 1)
+        for text_field in (
+            pt_opening,
+            pt_rest,
+            pt_desc["criteria"]["true_description"],
+            pt_desc["criteria"]["false_description"],
+        ):
+            self.assertIn("by_parent_id", text_field)
+            self.assertIn("by_ppid", text_field)
+            self.assertIn("next_cutoff", text_field)
+            self.assertIn("evicted_exited", text_field)
+            self.assertIn("evicted_live", text_field)
+            self.assertIn("exe_path", text_field)
+            self.assertIn("linear rescan", text_field.lower())
+        for kw in (
+            "create_times_by_pid",
+            "partition_point",
+            "is_never_suspend_process",
+            "unrelated to collect_unexited_descendants",
+        ):
+            self.assertIn(kw, pt_desc["instructions"])
 
         # Verify offline (even when the global plugin script is not installed) that
         # every path_glob in .agents/invariants.json is reachable through
@@ -790,6 +818,13 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                 "-    if !foreground || !dev_bypass_auth {\n+    if !foreground {",
                 {"session0_non_system_and_ui_zero_exit"},
             ),
+            (
+                "crates/ledr-daemon/src/process_table.rs",
+                "@@ -1336,4 +1336,3 @@",
+                "                 e.identity.create_time_100ns != 0\n                     && e.identity.create_time_100ns >= parent.identity.create_time_100ns",
+                "-                    && next_cutoff.is_none_or(|c| e.identity.create_time_100ns < c)\n                     && !visited.contains(&e.identity)",
+                {"process_table_descendant_traversal", "never_suspend_and_create_time"},
+            ),
         ]
 
         for rel_path, hunk_header, context_line, change_lines, expected_keys in cases:
@@ -813,6 +848,8 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                         f"got {sorted(questions.keys())}"
                     ),
                 )
+                if rel_path != "crates/ledr-daemon/src/process_table.rs":
+                    self.assertNotIn("process_table_descendant_traversal", questions)
 
     def test_T1_08_require_gate_script_skips_missing_default_and_fails_bad_env(self) -> None:
         """T1-08: Missing default plugin skips, whereas invalid explicit LEDR_INVARIANT_GATE_SCRIPT fails."""

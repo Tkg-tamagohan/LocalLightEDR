@@ -1085,10 +1085,44 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                 )
 
             # C. Running install.ps1 entrypoint under polluted PSModulePath exercises top-level
-            #    PSModulePath sanitization and fails cleanly at missing source binary (not module autoload).
+            #    PSModulePath sanitization (for Microsoft.PowerShell.Management cmdlets such as
+            #    Join-Path/Test-Path/Get-Item before Assert-NoReparsePointComponent) and
+            #    Assert-AdminOrSystemOwnerIfExists (Get-Acl on existing_install), failing cleanly
+            #    at missing source binary or owner SID rather than module autoload.
+            fake_mgmt_dir = fake_sec_dir.parent / "Microsoft.PowerShell.Management"
+            fake_mgmt_dir.mkdir(parents=True)
+            (fake_mgmt_dir / "Microsoft.PowerShell.Management.psd1").write_text(
+                """@{
+    ModuleVersion = '7.0.0.0'
+    PowerShellVersion = '7.4'
+    RootModule = 'Microsoft.PowerShell.Management.dll'
+    CmdletsToExport = @('Test-Path', 'Get-Item', 'Join-Path')
+}
+""",
+                encoding="utf-8",
+            )
+            neg_mgmt = subprocess.run(
+                [
+                    ps51,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    f"$ErrorActionPreference = 'Stop'; Test-Path -LiteralPath '{acl_dir}' | Out-Null",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=polluted_env,
+                check=False,
+            )
+            self.assertNotEqual(neg_mgmt.returncode, 0)
+            self.assertIn("CouldNotAutoloadMatchingModule", neg_mgmt.stderr)
+
             empty_src = tmp_path / "empty-src"
             empty_src.mkdir()
-            unused_install = tmp_path / "unused-install"
+            existing_install = tmp_path / "existing-install"
+            existing_install.mkdir()
             unused_data = tmp_path / "unused-data"
             ep_res = subprocess.run(
                 [
@@ -1101,7 +1135,7 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                     "-SourceDir",
                     str(empty_src),
                     "-InstallDir",
-                    str(unused_install),
+                    str(existing_install),
                     "-DataDir",
                     str(unused_data),
                 ],
@@ -1112,8 +1146,12 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                 check=False,
             )
             self.assertNotEqual(ep_res.returncode, 0)
-            self.assertIn("Missing required source binary", ep_res.stderr)
             self.assertNotIn("CouldNotAutoloadMatchingModule", ep_res.stderr)
+            self.assertTrue(
+                ("Missing required source binary" in ep_res.stderr)
+                or ("Unsafe owner SID" in ep_res.stderr),
+                f"Unexpected install.ps1 stderr under polluted PSModulePath:\nSTDOUT:\n{ep_res.stdout}\nSTDERR:\n{ep_res.stderr}",
+            )
 
 
 if __name__ == "__main__":

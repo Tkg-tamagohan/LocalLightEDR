@@ -4,7 +4,7 @@
 
 ## 仕様の正と進行規則
 
-- 仕様の正は `docs/implementation-plan.md`、`docs/decision-records.md`（L-01 から L-25）、および凍結済みの `crates/ledr-proto/src/lib.rs` に置く。
+- 仕様の正は `docs/implementation-plan.md`、`docs/decision-records.md`（L-01 から L-29）、および凍結済みの `crates/ledr-proto/src/lib.rs` に置く。
 - 作業は Phase 単位（1 Phase 1 PR）で進め、`docs/implementation-plan.md` のチェックリスト `[x]` は `main` へのマージ完了後にのみ更新する。
 - `crates/ledr-proto` の既存公開型とシグネチャは後方互換なく変更しない。
 - 文書同期時の整合原則：仕様書、実装計画、フォローアップ記録等を更新する際は以下の 3 点を徹底する。

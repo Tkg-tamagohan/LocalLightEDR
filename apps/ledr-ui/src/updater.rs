@@ -33,7 +33,7 @@ pub(crate) const UPDATE_STATE_FILENAME: &str = "update-state.json";
 pub(crate) const STAGED_MANIFEST_FILENAME: &str = "update-manifest.json";
 pub(crate) const STAGED_SIG_FILENAME: &str = "update-manifest.json.sig";
 pub(crate) const UPDATE_STATE_SCHEMA_VERSION: u32 = 1;
-pub(crate) const MAX_UPDATE_STATE_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_UPDATE_STATE_BYTES: u64 = 256 * 1024;
 pub(crate) const CLOSE_CANCEL_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 const INSTALL_DIR_WINDOWS: &str = r"C:\Program Files\LocalEDR";
@@ -85,7 +85,7 @@ pub struct UpdaterStatusView {
     pub notice_message: Option<String>,
 }
 
-/// Persisted cooldown state stored in `%LOCALAPPDATA%\LocalEDR\update-state.json`.
+/// Persisted cooldown and verified-release cache state stored in `%LOCALAPPDATA%\LocalEDR\update-state.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedUpdateState {
     #[serde(default = "default_state_schema_version")]
@@ -94,6 +94,10 @@ pub struct PersistedUpdateState {
     pub last_checked_at_ms: Option<u64>,
     #[serde(default)]
     pub last_known_latest_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_manifest_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_sig_json: Option<String>,
 }
 
 fn default_state_schema_version() -> u32 {
@@ -106,6 +110,8 @@ impl Default for PersistedUpdateState {
             schema_version: UPDATE_STATE_SCHEMA_VERSION,
             last_checked_at_ms: None,
             last_known_latest_version: None,
+            cached_manifest_json: None,
+            cached_sig_json: None,
         }
     }
 }
@@ -208,7 +214,7 @@ pub fn load_persisted_state(path: &Path) -> PersistedUpdateState {
     };
 
     let mut bytes = Vec::new();
-    let limit = usize::try_from(MAX_UPDATE_STATE_BYTES).unwrap_or(64 * 1024);
+    let limit = usize::try_from(MAX_UPDATE_STATE_BYTES).unwrap_or(256 * 1024);
     if let Err(err) = file.take((limit + 1) as u64).read_to_end(&mut bytes) {
         eprintln!("updater: failed reading update-state {}: {err}", path.display());
         return PersistedUpdateState::default();
@@ -489,30 +495,221 @@ impl Drop for OperationGuard {
     }
 }
 
+struct RestoredStartupState {
+    phase: UpdaterPhase,
+    persisted: PersistedUpdateState,
+    cached_verified: Option<CachedVerifiedRelease>,
+    latest_version: Option<String>,
+    min_updater_version: Option<String>,
+    release_notes_url: Option<String>,
+}
+
+fn clear_cached_manifest_fields(persisted: &mut PersistedUpdateState, clear_latest: bool) {
+    persisted.cached_manifest_json = None;
+    persisted.cached_sig_json = None;
+    if clear_latest {
+        persisted.last_known_latest_version = None;
+    }
+}
+
+fn persist_cleaned_state_best_effort(
+    state_path: Option<&Path>,
+    persisted: &PersistedUpdateState,
+) {
+    if let Some(path) = state_path {
+        if let Err(err) = save_persisted_state(path, persisted) {
+            eprintln!("updater: failed to persist cleaned update-state: {err}");
+        }
+    }
+}
+
+fn restore_persisted_state_on_startup(config: &UpdaterConfig) -> RestoredStartupState {
+    let state_path = config
+        .data_dir
+        .as_deref()
+        .map(update_state_path_from_data_dir);
+    let mut persisted = state_path
+        .as_deref()
+        .map(load_persisted_state)
+        .unwrap_or_default();
+
+    let cached_manifest = persisted.cached_manifest_json.take();
+    let cached_sig = persisted.cached_sig_json.take();
+
+    match (cached_manifest, cached_sig) {
+        (None, None) => {
+            let latest_version = persisted.last_known_latest_version.clone();
+            RestoredStartupState {
+                phase: UpdaterPhase::Idle,
+                persisted,
+                cached_verified: None,
+                latest_version,
+                min_updater_version: None,
+                release_notes_url: None,
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!("updater: incomplete cached manifest/signature in update-state; clearing");
+            clear_cached_manifest_fields(&mut persisted, true);
+            persist_cleaned_state_best_effort(state_path.as_deref(), &persisted);
+            RestoredStartupState {
+                phase: UpdaterPhase::Idle,
+                persisted,
+                cached_verified: None,
+                latest_version: None,
+                min_updater_version: None,
+                release_notes_url: None,
+            }
+        }
+        (Some(manifest_json), Some(sig_json)) => {
+            if manifest_json.len() > MAX_MANIFEST_BYTES || sig_json.len() > MAX_SIG_BYTES {
+                eprintln!("updater: cached manifest/signature exceeded bounds; clearing");
+                clear_cached_manifest_fields(&mut persisted, true);
+                persist_cleaned_state_best_effort(state_path.as_deref(), &persisted);
+                return RestoredStartupState {
+                    phase: UpdaterPhase::Idle,
+                    persisted,
+                    cached_verified: None,
+                    latest_version: None,
+                    min_updater_version: None,
+                    release_notes_url: None,
+                };
+            }
+
+            let key_ring = match &config.key_ring_override {
+                Some(kr) => Ok(kr.clone()),
+                None => PublicKeyRing::from_embedded(),
+            };
+            let key_ring = match key_ring {
+                Ok(kr) => kr,
+                Err(err) => {
+                    eprintln!(
+                        "updater: public key ring unavailable during startup cache verification; clearing cached state: {err}"
+                    );
+                    clear_cached_manifest_fields(&mut persisted, true);
+                    persist_cleaned_state_best_effort(state_path.as_deref(), &persisted);
+                    return RestoredStartupState {
+                        phase: UpdaterPhase::Idle,
+                        persisted,
+                        cached_verified: None,
+                        latest_version: None,
+                        min_updater_version: None,
+                        release_notes_url: None,
+                    };
+                }
+            };
+
+            match verify_and_evaluate_manifest(
+                manifest_json.as_bytes(),
+                sig_json.as_bytes(),
+                &key_ring,
+                &config.app_version,
+            ) {
+                Ok(UpdateVerificationOutcome::UpdateAvailable { manifest, .. }) => {
+                    let manifest_val = *manifest;
+                    if let Err(err) = validate_staged_installer_filename(&manifest_val.filename) {
+                        eprintln!(
+                            "updater: cached manifest filename rejected; clearing cached state: {err}"
+                        );
+                        clear_cached_manifest_fields(&mut persisted, true);
+                        persist_cleaned_state_best_effort(state_path.as_deref(), &persisted);
+                        return RestoredStartupState {
+                            phase: UpdaterPhase::Idle,
+                            persisted,
+                            cached_verified: None,
+                            latest_version: None,
+                            min_updater_version: None,
+                            release_notes_url: None,
+                        };
+                    }
+                    let latest = manifest_val.version.clone();
+                    let min_ver = manifest_val.min_updater_version.clone();
+                    let notes_url = manifest_val.release_notes_url.clone();
+                    persisted.last_known_latest_version = Some(latest.clone());
+                    persisted.cached_manifest_json = Some(manifest_json.clone());
+                    persisted.cached_sig_json = Some(sig_json.clone());
+                    RestoredStartupState {
+                        phase: UpdaterPhase::UpdateAvailable,
+                        persisted,
+                        cached_verified: Some(CachedVerifiedRelease {
+                            manifest: manifest_val,
+                            manifest_bytes: manifest_json.into_bytes(),
+                            sig_bytes: sig_json.into_bytes(),
+                        }),
+                        latest_version: Some(latest),
+                        min_updater_version: Some(min_ver),
+                        release_notes_url: Some(notes_url),
+                    }
+                }
+                Ok(UpdateVerificationOutcome::ManualUpdateRequired {
+                    min_updater_version,
+                    latest_version,
+                    release_notes_url,
+                    ..
+                }) => {
+                    persisted.last_known_latest_version = Some(latest_version.clone());
+                    persisted.cached_manifest_json = Some(manifest_json);
+                    persisted.cached_sig_json = Some(sig_json);
+                    RestoredStartupState {
+                        phase: UpdaterPhase::ManualUpdateRequired,
+                        persisted,
+                        cached_verified: None,
+                        latest_version: Some(latest_version),
+                        min_updater_version: Some(min_updater_version),
+                        release_notes_url: Some(release_notes_url),
+                    }
+                }
+                Ok(UpdateVerificationOutcome::UpToDate { latest_version, .. }) => {
+                    clear_cached_manifest_fields(&mut persisted, false);
+                    persisted.last_known_latest_version = Some(latest_version.clone());
+                    persist_cleaned_state_best_effort(state_path.as_deref(), &persisted);
+                    RestoredStartupState {
+                        phase: UpdaterPhase::UpToDate,
+                        persisted,
+                        cached_verified: None,
+                        latest_version: Some(latest_version),
+                        min_updater_version: None,
+                        release_notes_url: None,
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "updater: cached manifest verification failed closed; clearing cached state: {err}"
+                    );
+                    clear_cached_manifest_fields(&mut persisted, true);
+                    persist_cleaned_state_best_effort(state_path.as_deref(), &persisted);
+                    RestoredStartupState {
+                        phase: UpdaterPhase::Idle,
+                        persisted,
+                        cached_verified: None,
+                        latest_version: None,
+                        min_updater_version: None,
+                        release_notes_url: None,
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl AppUpdateManager {
     pub(crate) fn new(config: UpdaterConfig) -> Self {
-        let persisted = config
-            .data_dir
-            .as_deref()
-            .map(update_state_path_from_data_dir)
-            .map(|p| load_persisted_state(&p))
-            .unwrap_or_default();
-        let latest_version = persisted.last_known_latest_version.clone();
+        let restored = restore_persisted_state_on_startup(&config);
 
         Self {
             config,
             inner: Arc::new(Mutex::new(ManagerInner {
-                phase: UpdaterPhase::Idle,
+                phase: restored.phase,
                 in_flight: false,
                 auto_check_started: false,
                 closing: false,
                 cancel_token: None,
                 active_staging_dir: None,
-                cached_verified: None,
-                persisted,
-                latest_version,
-                min_updater_version: None,
-                release_notes_url: None,
+                cached_verified: restored.cached_verified,
+                persisted: restored.persisted,
+                latest_version: restored.latest_version,
+                min_updater_version: restored.min_updater_version,
+                release_notes_url: restored.release_notes_url,
                 bytes_downloaded: 0,
                 total_bytes: None,
                 error_message: None,
@@ -668,6 +865,27 @@ impl AppUpdateManager {
             }
         }
 
+        let manifest_json = match String::from_utf8(manifest_bytes.clone()) {
+            Ok(s) => s,
+            Err(err) => {
+                let msg = format!("manifest is not valid UTF-8: {err}");
+                let view = self.set_error_state(msg.clone());
+                op_guard.mark_finished();
+                self.emit_status(&emit, &view);
+                return Err(msg);
+            }
+        };
+        let sig_json = match String::from_utf8(sig_bytes.clone()) {
+            Ok(s) => s,
+            Err(err) => {
+                let msg = format!("signature envelope is not valid UTF-8: {err}");
+                let view = self.set_error_state(msg.clone());
+                op_guard.mark_finished();
+                self.emit_status(&emit, &view);
+                return Err(msg);
+            }
+        };
+
         let checked_at_ms = (self.config.now_ms_fn)();
         let (next_persisted, view) = {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -685,6 +903,7 @@ impl AppUpdateManager {
                     guard.cached_verified = None;
                     guard.persisted.last_checked_at_ms = Some(checked_at_ms);
                     guard.persisted.last_known_latest_version = Some(latest_version);
+                    clear_cached_manifest_fields(&mut guard.persisted, false);
                 }
                 UpdateVerificationOutcome::UpdateAvailable { manifest, .. } => {
                     let manifest_val = *manifest;
@@ -694,6 +913,8 @@ impl AppUpdateManager {
                     guard.release_notes_url = Some(manifest_val.release_notes_url.clone());
                     guard.persisted.last_checked_at_ms = Some(checked_at_ms);
                     guard.persisted.last_known_latest_version = Some(manifest_val.version.clone());
+                    guard.persisted.cached_manifest_json = Some(manifest_json);
+                    guard.persisted.cached_sig_json = Some(sig_json);
                     guard.cached_verified = Some(CachedVerifiedRelease {
                         manifest: manifest_val,
                         manifest_bytes,
@@ -713,6 +934,8 @@ impl AppUpdateManager {
                     guard.cached_verified = None;
                     guard.persisted.last_checked_at_ms = Some(checked_at_ms);
                     guard.persisted.last_known_latest_version = Some(latest_version);
+                    guard.persisted.cached_manifest_json = Some(manifest_json);
+                    guard.persisted.cached_sig_json = Some(sig_json);
                 }
             }
             (guard.persisted.clone(), guard.to_status_view(&self.config))

@@ -12,7 +12,9 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -570,6 +572,166 @@ class TestReleaseScripts(unittest.TestCase):
                     zf.writestr(bad_entry, "{}")
                 with self.assertRaises(ValueError):
                     release_verify.verify_dist(dist_dir=d_case, public_keys_path=pub_keys)
+
+    # REL-08: Release workflow & Windows PowerShell packaging invariants
+    def test_rel_08_workflow_and_packaging_script_invariants(self) -> None:
+        release_yml = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        # Checkout ref pinning across preflight, build, publish
+        self.assertGreaterEqual(len(re.findall(r"uses:\s*actions/checkout@v4", release_yml)), 3)
+        self.assertIn("ref: ${{ github.sha }}", release_yml)
+        self.assertEqual(
+            release_yml.count("ref: ${{ needs.preflight.outputs.source_sha }}"), 2
+        )
+        # Non-dry-run tag commit verification & --verify-tag
+        self.assertIn('refs/tags/${RELEASE_TAG}^{commit}', release_yml)
+        self.assertIn('refs/tags/${TAG}^{commit}', release_yml)
+        self.assertIn("--verify-tag", release_yml)
+        # Dry-run key-id override
+        self.assertIn("--key-id dry-run-test", release_yml)
+
+        install_ps1 = (REPO_ROOT / "packaging" / "windows" / "install.ps1").read_text(
+            encoding="utf-8"
+        )
+        uninstall_ps1 = (REPO_ROOT / "packaging" / "windows" / "uninstall.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        # Rollback preservation & ACL hardening markers in install.ps1
+        self.assertIn("$rollbackRestoreFailed", install_ps1)
+        self.assertIn("PurgeAccessRules", install_ps1)
+        self.assertIn("SetAccessRuleProtection($true, $false)", install_ps1)
+        self.assertIn("Reset-DataSubdirInheritedAcl", install_ps1)
+
+        # Unresolved suspended alert check in uninstall.ps1
+        self.assertIn("--check-unresolved-suspended", uninstall_ps1)
+        self.assertIn("Assert-NoUnresolvedSuspendedAlerts", uninstall_ps1)
+
+        # Both scripts unwrap InnerException in Invoke-WithFileLockRetry
+        self.assertIn(".InnerException", install_ps1)
+        self.assertIn(".InnerException", uninstall_ps1)
+
+    @unittest.skipUnless(
+        sys.platform == "win32" and shutil.which("powershell.exe") is not None,
+        "requires Windows PowerShell",
+    )
+    def test_rel_09_powershell_ast_and_retry_behavior(self) -> None:
+        ps_exe = shutil.which("powershell.exe")
+        assert ps_exe is not None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            harness = tmp_path / "verify_ps_helpers.ps1"
+            install_path = REPO_ROOT / "packaging" / "windows" / "install.ps1"
+            uninstall_path = REPO_ROOT / "packaging" / "windows" / "uninstall.ps1"
+
+            harness.write_text(
+                f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+foreach ($p in @('{install_path}', '{uninstall_path}')) {{
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -gt 0) {{
+        throw "Parse error(s) in $p`: $($errors | Out-String)"
+    }}
+
+    $retryFn = $ast.FindAll({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-WithFileLockRetry' }}, $true) | Select-Object -First 1
+    if ($null -eq $retryFn) {{
+        throw "Invoke-WithFileLockRetry not found in $p"
+    }}
+    Invoke-Expression $retryFn.Extent.Text
+
+    # 1. MethodInvocationException wrapping IOException must retry and succeed on 2nd attempt
+    $script:attempts = 0
+    $missingPath = Join-Path '{tmp_path}' 'nonexistent-file-for-retry-test.bin'
+    Invoke-WithFileLockRetry -TimeoutSeconds 3 -Description "wrapped IOException retry ($p)" -Operation {{
+        $script:attempts++
+        if ($script:attempts -lt 2) {{
+            [System.IO.File]::Delete((Join-Path '{tmp_path}' 'missing-dir\\file.bin'))
+        }}
+    }}
+    if ($script:attempts -ne 2) {{
+        throw "Expected 2 attempts for wrapped IOException in $p, got $($script:attempts)"
+    }}
+
+    # 2. Non-IO exception must fail immediately without waiting for retry timeout
+    $script:nonIoAttempts = 0
+    $threw = $false
+    try {{
+        Invoke-WithFileLockRetry -TimeoutSeconds 5 -Description "non-IO fail fast ($p)" -Operation {{
+            $script:nonIoAttempts++
+            throw [System.ArgumentException]::new("bad arg")
+        }}
+    }}
+    catch {{
+        $threw = $true
+    }}
+    if ((-not $threw) -or ($script:nonIoAttempts -ne 1)) {{
+        throw "Non-IO exception should fail immediately in 1 attempt in $p (threw=$threw, attempts=$($script:nonIoAttempts))"
+    }}
+}}
+
+# Verify Assert-NoUnresolvedSuspendedAlerts from uninstall.ps1 handles exit codes 0, 3, and 1
+$tokens = $null
+$errors = $null
+$uAst = [System.Management.Automation.Language.Parser]::ParseFile('{uninstall_path}', [ref]$tokens, [ref]$errors)
+foreach ($fnName in @('Write-UninstallLog', 'Normalize-FullPath', 'Assert-NoReparsePointComponent', 'Assert-NoUnresolvedSuspendedAlerts')) {{
+    $fnAst = $uAst.FindAll({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $fnName }}, $true) | Select-Object -First 1
+    if ($null -eq $fnAst) {{ throw "Missing function $fnName in uninstall.ps1" }}
+    Invoke-Expression $fnAst.Extent.Text
+}}
+$script:LogWriter = $null
+$script:LogBuffer = New-Object System.Collections.Generic.List[string]
+
+$mockDb = Join-Path '{tmp_path}' 'localedr.db'
+[System.IO.File]::WriteAllText($mockDb, 'mock')
+
+$cmdZero = Join-Path '{tmp_path}' 'daemon_zero.cmd'
+[System.IO.File]::WriteAllText($cmdZero, "@echo off`r`necho ok`r`nexit /b 0`r`n")
+Assert-NoUnresolvedSuspendedAlerts -DaemonExePath $cmdZero -DbPath $mockDb
+
+$cmdThree = Join-Path '{tmp_path}' 'daemon_three.cmd'
+[System.IO.File]::WriteAllText($cmdThree, "@echo off`r`necho unresolved 1>&2`r`nexit /b 3`r`n")
+$caught3 = $false
+try {{
+    Assert-NoUnresolvedSuspendedAlerts -DaemonExePath $cmdThree -DbPath $mockDb
+}}
+catch {{
+    if ($_.Exception.Message -match 'ledr-ui\.exe') {{ $caught3 = $true }}
+}}
+if (-not $caught3) {{ throw "Expected exit code 3 to abort with ledr-ui.exe guidance" }}
+
+$cmdOne = Join-Path '{tmp_path}' 'daemon_one.cmd'
+[System.IO.File]::WriteAllText($cmdOne, "@echo off`r`necho db error 1>&2`r`nexit /b 1`r`n")
+$caught1 = $false
+try {{
+    Assert-NoUnresolvedSuspendedAlerts -DaemonExePath $cmdOne -DbPath $mockDb
+}}
+catch {{
+    if ($_.Exception.Message -match 'exit 1') {{ $caught1 = $true }}
+}}
+if (-not $caught1) {{ throw "Expected exit code 1 to fail closed" }}
+Write-Output "PS_VERIFY_OK"
+""",
+                encoding="utf-8",
+            )
+            res = subprocess.run(
+                [ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(
+                res.returncode,
+                0,
+                f"PowerShell harness failed (rc={res.returncode}):\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+            )
+            self.assertIn("PS_VERIFY_OK", res.stdout)
 
 
 if __name__ == "__main__":

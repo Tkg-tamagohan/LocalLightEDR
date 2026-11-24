@@ -2590,6 +2590,7 @@ fn ui_upd_03_auto_check_gating_cooldown_corrupt_state_and_gc() {
         schema_version: 1,
         last_checked_at_ms: Some(now_ms),
         last_known_latest_version: Some("0.2.0".to_string()),
+        ..Default::default()
     };
     save_persisted_state(&state_path, &saved).expect("atomic save update-state.json");
     let loaded = load_persisted_state(&state_path);
@@ -2605,7 +2606,7 @@ fn ui_upd_03_auto_check_gating_cooldown_corrupt_state_and_gc() {
         now_ms + cooldown_ms
     ));
 
-    // Corrupt JSON, unknown schema_version, and oversized >64KiB reset cleanly.
+    // Corrupt JSON, unknown schema_version, and oversized > MAX_UPDATE_STATE_BYTES reset cleanly.
     std::fs::write(&state_path, b"{not valid json").unwrap();
     assert_eq!(
         load_persisted_state(&state_path),
@@ -2616,7 +2617,11 @@ fn ui_upd_03_auto_check_gating_cooldown_corrupt_state_and_gc() {
         load_persisted_state(&state_path),
         PersistedUpdateState::default()
     );
-    std::fs::write(&state_path, vec![b' '; 65 * 1024]).unwrap();
+    std::fs::write(
+        &state_path,
+        vec![b' '; (updater::MAX_UPDATE_STATE_BYTES as usize) + 1024],
+    )
+    .unwrap();
     assert_eq!(
         load_persisted_state(&state_path),
         PersistedUpdateState::default()
@@ -3601,6 +3606,512 @@ fn ui_upd_10_cancel_or_close_during_verifying_skips_uac_elevation() {
             "staging dir must be cleaned up"
         );
         srv.join().unwrap();
+    }
+}
+
+#[test]
+fn ui_upd_11_restart_restores_update_available_within_cooldown() {
+    use std::net::TcpListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use updater::{
+        AppUpdateManager, ElevationLaunchResult, InstallKind, UpdaterPhase, load_persisted_state,
+        update_state_path_from_data_dir,
+    };
+
+    let tmp = TempTestDir::new("ui-upd-11");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    // Server serves 1 manifest + 1 sig for initial check, then 1 installer download after restart.
+    let srv = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            if target.ends_with(".exe") {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    TEST_UPDATER_PAYLOAD.len()
+                );
+                s.write_all(hdr.as_bytes()).unwrap();
+                s.write_all(TEST_UPDATER_PAYLOAD).unwrap();
+            } else {
+                let body = if target.ends_with(".sig") {
+                    TEST_SIG_UPDATE_AVAILABLE
+                } else {
+                    TEST_MANIFEST_UPDATE_AVAILABLE
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                s.write_all(resp.as_bytes()).unwrap();
+            }
+        }
+    });
+
+    let exits_first = Arc::new(AtomicUsize::new(0));
+    let mut cfg_first = test_updater_config(
+        tmp.0.clone(),
+        InstallKind::StandardInstalled,
+        &base_url,
+        ElevationLaunchResult::Launched,
+        exits_first,
+    );
+    cfg_first.now_ms_fn = Arc::new(|| 1_700_000_000_000);
+
+    let mgr_first = AppUpdateManager::new(cfg_first);
+    let checked = mgr_first
+        .check_for_updates_blocking_with(|_| {})
+        .expect("initial check succeeds");
+    assert_eq!(checked.phase, UpdaterPhase::UpdateAvailable);
+
+    let state_path = update_state_path_from_data_dir(&tmp.0);
+    let persisted = load_persisted_state(&state_path);
+    assert_eq!(persisted.last_checked_at_ms, Some(1_700_000_000_000));
+    assert_eq!(persisted.last_known_latest_version.as_deref(), Some("9.9.9"));
+    assert_eq!(
+        persisted.cached_manifest_json.as_deref(),
+        Some(TEST_MANIFEST_UPDATE_AVAILABLE)
+    );
+    assert_eq!(
+        persisted.cached_sig_json.as_deref(),
+        Some(TEST_SIG_UPDATE_AVAILABLE)
+    );
+
+    // Simulate restarting the UI within the 6h cooldown (60s later).
+    let exits_restarted = Arc::new(AtomicUsize::new(0));
+    let launcher_restarted = Arc::new(MockElevationLauncher {
+        result: ElevationLaunchResult::Launched,
+        calls: AtomicUsize::new(0),
+    });
+    let mut cfg_restarted = test_updater_config(
+        tmp.0.clone(),
+        InstallKind::StandardInstalled,
+        &base_url,
+        ElevationLaunchResult::Launched,
+        exits_restarted.clone(),
+    );
+    cfg_restarted.now_ms_fn = Arc::new(|| 1_700_000_060_000);
+    cfg_restarted.elevation_launcher = launcher_restarted.clone();
+
+    let mgr_restarted = AppUpdateManager::new(cfg_restarted);
+    assert!(
+        !mgr_restarted.should_trigger_startup_auto_check(&LaunchMode::Normal),
+        "auto-check must remain suppressed within 6h cooldown"
+    );
+
+    let restored = mgr_restarted.status();
+    assert_eq!(restored.phase, UpdaterPhase::UpdateAvailable);
+    assert_eq!(restored.last_checked_at_ms, Some(1_700_000_000_000));
+    assert_eq!(restored.latest_version.as_deref(), Some("9.9.9"));
+    assert_eq!(restored.min_updater_version.as_deref(), Some("0.1.0"));
+    assert_eq!(
+        restored.release_notes_url.as_deref(),
+        Some("https://github.com/Tkg-tamagohan/LocalLightEDR/releases/tag/v9.9.9")
+    );
+    assert!(restored.can_auto_apply);
+    let restored_manifest = restored
+        .manifest
+        .expect("cached_verified manifest must be restored after restart");
+    assert_eq!(restored_manifest.version, "9.9.9");
+    assert_eq!(
+        restored_manifest.filename,
+        "LocalEDR-Setup-v9.9.9-win-x64.exe"
+    );
+
+    // Applying the restored update directly (without manual re-check) must succeed.
+    mgr_restarted
+        .apply_update_blocking_with(|_| {}, None::<fn()>)
+        .expect("apply_update must work from restored UpdateAvailable state");
+    assert_eq!(launcher_restarted.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(exits_restarted.load(Ordering::SeqCst), 1);
+
+    srv.join().unwrap();
+}
+
+#[test]
+fn ui_upd_12_restart_restores_manual_update_required_within_cooldown() {
+    use std::net::TcpListener;
+    use std::sync::{Arc, atomic::AtomicUsize};
+    use updater::{
+        AppUpdateManager, ElevationLaunchResult, InstallKind, UpdaterPhase, load_persisted_state,
+        update_state_path_from_data_dir,
+    };
+
+    let tmp = TempTestDir::new("ui-upd-12");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let srv = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            let body = if target.ends_with(".sig") {
+                TEST_SIG_MANUAL_REQUIRED
+            } else {
+                TEST_MANIFEST_MANUAL_REQUIRED
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+
+    let cfg_first = test_updater_config(
+        tmp.0.clone(),
+        InstallKind::StandardInstalled,
+        &base_url,
+        ElevationLaunchResult::Launched,
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let mgr_first = AppUpdateManager::new(cfg_first);
+    let checked = mgr_first
+        .check_for_updates_blocking_with(|_| {})
+        .expect("manual check succeeds");
+    assert_eq!(checked.phase, UpdaterPhase::ManualUpdateRequired);
+
+    let persisted = load_persisted_state(&update_state_path_from_data_dir(&tmp.0));
+    assert!(persisted.cached_manifest_json.is_some());
+    assert!(persisted.cached_sig_json.is_some());
+
+    // Restart within 6h cooldown.
+    let mut cfg_restarted = test_updater_config(
+        tmp.0.clone(),
+        InstallKind::StandardInstalled,
+        &base_url,
+        ElevationLaunchResult::Launched,
+        Arc::new(AtomicUsize::new(0)),
+    );
+    cfg_restarted.now_ms_fn = Arc::new(|| 1_700_000_060_000);
+
+    let mgr_restarted = AppUpdateManager::new(cfg_restarted);
+    assert!(!mgr_restarted.should_trigger_startup_auto_check(&LaunchMode::Normal));
+
+    let restored = mgr_restarted.status();
+    assert_eq!(restored.phase, UpdaterPhase::ManualUpdateRequired);
+    assert_eq!(restored.latest_version.as_deref(), Some("9.9.9"));
+    assert_eq!(restored.min_updater_version.as_deref(), Some("5.0.0"));
+    assert_eq!(
+        restored.release_notes_url.as_deref(),
+        Some("https://github.com/Tkg-tamagohan/LocalLightEDR/releases/tag/v9.9.9")
+    );
+    assert!(
+        restored.manifest.is_none(),
+        "ManualUpdateRequired must keep cached_verified as None"
+    );
+
+    srv.join().unwrap();
+}
+
+#[test]
+fn ui_upd_13_restart_after_upgrade_clears_cached_manifest_and_returns_up_to_date() {
+    use std::net::TcpListener;
+    use std::sync::{Arc, atomic::AtomicUsize};
+    use updater::{
+        AppUpdateManager, ElevationLaunchResult, InstallKind, UpdaterPhase, load_persisted_state,
+        update_state_path_from_data_dir,
+    };
+
+    let tmp = TempTestDir::new("ui-upd-13");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let srv = std::thread::spawn(move || {
+        // Check 1: UpdateAvailable (9.9.9)
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            let body = if target.ends_with(".sig") {
+                TEST_SIG_UPDATE_AVAILABLE
+            } else {
+                TEST_MANIFEST_UPDATE_AVAILABLE
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+        // Check 2 (in separate sub-manager): UpToDate (0.1.0) clears cached manifest
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            let body = if target.ends_with(".sig") {
+                TEST_SIG_UP_TO_DATE
+            } else {
+                TEST_MANIFEST_UP_TO_DATE
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+
+    let cfg_old = test_updater_config(
+        tmp.0.clone(),
+        InstallKind::StandardInstalled,
+        &base_url,
+        ElevationLaunchResult::Launched,
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let mgr_old = AppUpdateManager::new(cfg_old);
+    mgr_old
+        .check_for_updates_blocking_with(|_| {})
+        .expect("check UpdateAvailable succeeds");
+
+    let state_path = update_state_path_from_data_dir(&tmp.0);
+    let before = load_persisted_state(&state_path);
+    assert!(before.cached_manifest_json.is_some());
+    assert!(before.cached_sig_json.is_some());
+
+    // Simulate user upgrading to 9.9.9 and restarting within the 6h cooldown.
+    let mut cfg_upgraded = test_updater_config(
+        tmp.0.clone(),
+        InstallKind::StandardInstalled,
+        &base_url,
+        ElevationLaunchResult::Launched,
+        Arc::new(AtomicUsize::new(0)),
+    );
+    cfg_upgraded.app_version = "9.9.9".to_string();
+    cfg_upgraded.now_ms_fn = Arc::new(|| 1_700_000_060_000);
+
+    let mgr_upgraded = AppUpdateManager::new(cfg_upgraded);
+    let view = mgr_upgraded.status();
+    assert_eq!(view.phase, UpdaterPhase::UpToDate);
+    assert_eq!(view.latest_version.as_deref(), Some("9.9.9"));
+    assert_eq!(view.min_updater_version, None);
+    assert_eq!(view.release_notes_url, None);
+    assert!(view.manifest.is_none());
+
+    let after_upgrade = load_persisted_state(&state_path);
+    assert_eq!(after_upgrade.last_checked_at_ms, Some(1_700_000_000_000));
+    assert_eq!(
+        after_upgrade.last_known_latest_version.as_deref(),
+        Some("9.9.9")
+    );
+    assert_eq!(after_upgrade.cached_manifest_json, None);
+    assert_eq!(after_upgrade.cached_sig_json, None);
+
+    // Also verify check_for_updates transitioning from UpdateAvailable -> UpToDate clears cached payload.
+    let tmp2 = TempTestDir::new("ui-upd-13-b");
+    let state_path2 = update_state_path_from_data_dir(&tmp2.0);
+    updater::save_persisted_state(
+        &state_path2,
+        &updater::PersistedUpdateState {
+            schema_version: 1,
+            last_checked_at_ms: Some(1_700_000_000_000),
+            last_known_latest_version: Some("9.9.9".to_string()),
+            cached_manifest_json: Some(TEST_MANIFEST_UPDATE_AVAILABLE.to_string()),
+            cached_sig_json: Some(TEST_SIG_UPDATE_AVAILABLE.to_string()),
+        },
+    )
+    .unwrap();
+    let cfg2 = test_updater_config(
+        tmp2.0.clone(),
+        InstallKind::StandardInstalled,
+        &base_url,
+        ElevationLaunchResult::Launched,
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let mgr2 = AppUpdateManager::new(cfg2);
+    assert_eq!(mgr2.status().phase, UpdaterPhase::UpdateAvailable);
+    let view2 = mgr2
+        .check_for_updates_blocking_with(|_| {})
+        .expect("UpToDate check succeeds");
+    assert_eq!(view2.phase, UpdaterPhase::UpToDate);
+    let after_check = load_persisted_state(&state_path2);
+    assert_eq!(after_check.cached_manifest_json, None);
+    assert_eq!(after_check.cached_sig_json, None);
+    assert_eq!(
+        after_check.last_known_latest_version.as_deref(),
+        Some("0.1.0")
+    );
+
+    srv.join().unwrap();
+}
+
+#[test]
+fn ui_upd_14_restart_tampered_or_partial_cached_state_fails_closed_and_clears() {
+    use std::sync::{Arc, atomic::AtomicUsize};
+    use updater::{
+        AppUpdateManager, ElevationLaunchResult, InstallKind, PersistedUpdateState, UpdaterPhase,
+        load_persisted_state, save_persisted_state, update_state_path_from_data_dir,
+    };
+
+    // (A) Tampered manifest JSON on disk -> signature verification fails closed and clears cache.
+    {
+        let tmp = TempTestDir::new("ui-upd-14-tamper-manifest");
+        let state_path = update_state_path_from_data_dir(&tmp.0);
+        let tampered_manifest =
+            TEST_MANIFEST_UPDATE_AVAILABLE.replace("LocalEDR-Setup-v9.9.9-win-x64.exe", "evil.exe");
+        save_persisted_state(
+            &state_path,
+            &PersistedUpdateState {
+                schema_version: 1,
+                last_checked_at_ms: Some(1_700_000_000_000),
+                last_known_latest_version: Some("99.0.0".to_string()),
+                cached_manifest_json: Some(tampered_manifest),
+                cached_sig_json: Some(TEST_SIG_UPDATE_AVAILABLE.to_string()),
+            },
+        )
+        .unwrap();
+
+        let cfg = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            "http://127.0.0.1:1",
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mgr = AppUpdateManager::new(cfg);
+        let view = mgr.status();
+        assert_eq!(view.phase, UpdaterPhase::Idle);
+        assert_eq!(view.latest_version, None);
+        assert_eq!(view.min_updater_version, None);
+        assert_eq!(view.release_notes_url, None);
+        assert!(view.manifest.is_none());
+
+        let cleaned = load_persisted_state(&state_path);
+        assert_eq!(cleaned.last_checked_at_ms, Some(1_700_000_000_000));
+        assert_eq!(cleaned.last_known_latest_version, None);
+        assert_eq!(cleaned.cached_manifest_json, None);
+        assert_eq!(cleaned.cached_sig_json, None);
+    }
+
+    // (B) Tampered signature JSON on disk -> fails closed and clears cache.
+    {
+        let tmp = TempTestDir::new("ui-upd-14-tamper-sig");
+        let state_path = update_state_path_from_data_dir(&tmp.0);
+        let tampered_sig = TEST_SIG_UPDATE_AVAILABLE.replace("test-key-2026", "evil-key");
+        save_persisted_state(
+            &state_path,
+            &PersistedUpdateState {
+                schema_version: 1,
+                last_checked_at_ms: Some(1_700_000_000_000),
+                last_known_latest_version: Some("9.9.9".to_string()),
+                cached_manifest_json: Some(TEST_MANIFEST_UPDATE_AVAILABLE.to_string()),
+                cached_sig_json: Some(tampered_sig),
+            },
+        )
+        .unwrap();
+
+        let cfg = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            "http://127.0.0.1:1",
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mgr = AppUpdateManager::new(cfg);
+        assert_eq!(mgr.status().phase, UpdaterPhase::Idle);
+        assert!(mgr.status().manifest.is_none());
+
+        let cleaned = load_persisted_state(&state_path);
+        assert_eq!(cleaned.cached_manifest_json, None);
+        assert_eq!(cleaned.cached_sig_json, None);
+        assert_eq!(cleaned.last_known_latest_version, None);
+    }
+
+    // (C) Half-populated cache (manifest present without signature) -> fails closed and clears.
+    {
+        let tmp = TempTestDir::new("ui-upd-14-partial");
+        let state_path = update_state_path_from_data_dir(&tmp.0);
+        save_persisted_state(
+            &state_path,
+            &PersistedUpdateState {
+                schema_version: 1,
+                last_checked_at_ms: Some(1_700_000_000_000),
+                last_known_latest_version: Some("9.9.9".to_string()),
+                cached_manifest_json: Some(TEST_MANIFEST_UPDATE_AVAILABLE.to_string()),
+                cached_sig_json: None,
+            },
+        )
+        .unwrap();
+
+        let cfg = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            "http://127.0.0.1:1",
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mgr = AppUpdateManager::new(cfg);
+        assert_eq!(mgr.status().phase, UpdaterPhase::Idle);
+
+        let cleaned = load_persisted_state(&state_path);
+        assert_eq!(cleaned.cached_manifest_json, None);
+        assert_eq!(cleaned.cached_sig_json, None);
+        assert_eq!(cleaned.last_known_latest_version, None);
+    }
+
+    // (D) Signed manifest with colliding reserved filename -> fails closed and clears.
+    {
+        let tmp = TempTestDir::new("ui-upd-14-collision");
+        let state_path = update_state_path_from_data_dir(&tmp.0);
+        save_persisted_state(
+            &state_path,
+            &PersistedUpdateState {
+                schema_version: 1,
+                last_checked_at_ms: Some(1_700_000_000_000),
+                last_known_latest_version: Some("9.9.9".to_string()),
+                cached_manifest_json: Some(TEST_MANIFEST_COLLISION.to_string()),
+                cached_sig_json: Some(TEST_SIG_COLLISION.to_string()),
+            },
+        )
+        .unwrap();
+
+        let cfg = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            "http://127.0.0.1:1",
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mgr = AppUpdateManager::new(cfg);
+        assert_eq!(mgr.status().phase, UpdaterPhase::Idle);
+
+        let cleaned = load_persisted_state(&state_path);
+        assert_eq!(cleaned.cached_manifest_json, None);
+        assert_eq!(cleaned.cached_sig_json, None);
+    }
+
+    // (E) Backward compatibility: legacy update-state.json without cached fields loads cleanly as Idle.
+    {
+        let tmp = TempTestDir::new("ui-upd-14-legacy");
+        let state_path = update_state_path_from_data_dir(&tmp.0);
+        std::fs::write(
+            &state_path,
+            br#"{"schema_version":1,"last_checked_at_ms":1700000000000,"last_known_latest_version":"0.2.0"}"#,
+        )
+        .unwrap();
+
+        let cfg = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            "http://127.0.0.1:1",
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mgr = AppUpdateManager::new(cfg);
+        let view = mgr.status();
+        assert_eq!(view.phase, UpdaterPhase::Idle);
+        assert_eq!(view.last_checked_at_ms, Some(1_700_000_000_000));
+        assert_eq!(view.latest_version.as_deref(), Some("0.2.0"));
+        assert!(view.manifest.is_none());
     }
 }
 

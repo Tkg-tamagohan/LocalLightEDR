@@ -32,14 +32,18 @@ jobs:
       dry_run: ${{ steps.resolve.outputs.dry_run }}
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Resolve release parameters
         id: resolve
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
           INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
@@ -48,6 +52,11 @@ jobs:
           import pathlib
           import sys
           import tomllib
+
+          source_sha = os.environ.get("SOURCE_SHA", "").strip()
+          if not source_sha:
+              print("SOURCE_SHA is required", file=sys.stderr)
+              sys.exit(1)
 
           event_name = os.environ.get("EVENT_NAME", "")
           if event_name == "workflow_dispatch":
@@ -72,7 +81,8 @@ jobs:
               fh.write(f"dry_run={dry_run}\n")
               fh.write(f"tag={tag}\n")
               fh.write(f"version={version}\n")
-          print(f"Resolved release parameters: tag={tag}, version={version}, dry_run={dry_run}")
+              fh.write(f"source_sha={source_sha}\n")
+          print(f"Resolved release parameters: tag={tag}, version={version}, dry_run={dry_run}, source_sha={source_sha}")
           EOF
       - name: Compile and test release scripts
         shell: bash
@@ -91,6 +101,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
           DRY_RUN: ${{ steps.resolve.outputs.dry_run }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
           LEDR_UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.LEDR_UPDATE_SIGNING_PRIVATE_KEY }}
           LEDR_UPDATE_SIGNING_KEY_ID: ${{ secrets.LEDR_UPDATE_SIGNING_KEY_ID }}
         run: |
@@ -99,6 +110,16 @@ jobs:
               echo "LEDR_UPDATE_SIGNING_PRIVATE_KEY secret is required for non-dry-run releases" >&2
               exit 1
             fi
+            if ! git fetch --no-tags --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+              echo "Release tag '${RELEASE_TAG}' does not exist on origin; refusing non-dry-run release." >&2
+              exit 1
+            fi
+            TAG_COMMIT_SHA=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+            if [ "$TAG_COMMIT_SHA" != "$SOURCE_SHA" ]; then
+              echo "Release tag '${RELEASE_TAG}' points to ${TAG_COMMIT_SHA}, expected source commit ${SOURCE_SHA}." >&2
+              exit 1
+            fi
+            echo "Verified tag ${RELEASE_TAG} points to commit ${SOURCE_SHA}"
             python3 scripts/release_verify.py preflight \
               --expect-tag "$RELEASE_TAG" \
               --require-active-key \
@@ -113,6 +134,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -165,6 +188,10 @@ jobs:
       - name: Build release binaries
         shell: pwsh
         run: |
+          # Note: ledr-ui embeds packaging/update-public-keys.json at compile time via include_str!,
+          # before dry-run ephemeral keys are generated. Therefore, in dry_run=true builds, the
+          # compiled ledr-ui binary does not trust the ephemeral test key (dry_run validates
+          # packaging, ephemeral signing, and verify-dist only).
           cargo build --release --locked -p ledr-daemon -p ledr-ui -p ledr-bridge-nm -p ledr-auth-helper
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Compile NSIS Windows installer
@@ -195,11 +222,13 @@ jobs:
           New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
           $installerExe = Join-Path (Join-Path $env:RUNNER_TEMP 'nsis-out') "LocalEDR-Setup-$tag-win-x64.exe"
           if ($env:DRY_RUN -eq 'true') {
+            # Ephemeral test keys do not match the public key ring compiled into ledr-ui above;
+            # pass --key-id dry-run-test explicitly so LEDR_UPDATE_SIGNING_KEY_ID secret does not break dry-run.
             $tmpPub = Join-Path $env:RUNNER_TEMP 'dry-run-public-keys.json'
             $tmpPriv = Join-Path $env:RUNNER_TEMP 'dry-run-signing.key'
             python scripts\release_verify.py keygen --key-id dry-run-test --write-public-keys $tmpPub --write-private-key-file $tmpPriv | Out-Null
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            python scripts\build_release_artifacts.py --bin-dir target\release --installer-exe $installerExe --out-dir dist --public-keys $tmpPub --private-key-file $tmpPriv --expect-tag $tag
+            python scripts\build_release_artifacts.py --bin-dir target\release --installer-exe $installerExe --out-dir dist --public-keys $tmpPub --key-id dry-run-test --private-key-file $tmpPriv --expect-tag $tag
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           else {
@@ -223,6 +252,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
       - uses: actions/download-artifact@v4
         with:
           name: release-dist
@@ -240,9 +271,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
         run: |
           set -euo pipefail
           TAG="$RELEASE_TAG"
+
+          if ! git fetch --no-tags --force origin "refs/tags/${TAG}:refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Release tag '${TAG}' does not exist on origin; refusing publish." >&2
+            exit 1
+          fi
+          TAG_COMMIT_SHA=$(git rev-parse --verify "refs/tags/${TAG}^{commit}")
+          if [ "$TAG_COMMIT_SHA" != "$SOURCE_SHA" ]; then
+            echo "Release tag '${TAG}' points to ${TAG_COMMIT_SHA}, expected source commit ${SOURCE_SHA}." >&2
+            exit 1
+          fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
@@ -258,7 +300,7 @@ jobs:
               done <<< "$existing_assets"
             fi
           else
-            gh release create "$TAG" --draft --title "LocalEDR $TAG" --generate-notes
+            gh release create "$TAG" --draft --verify-tag --title "LocalEDR $TAG" --generate-notes
           fi
 
           gh release upload "$TAG" \

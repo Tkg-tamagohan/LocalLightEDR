@@ -1,5 +1,6 @@
 //! Layer 2 LocalEDR resident core daemon (`--foreground`, `--service`, and `--service-strict` modes).
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -14,8 +15,8 @@ use ledr_daemon::{
     DEFAULT_MAX_CONCURRENT_IPC_CLIENTS,
 };
 use ledr_proto::{
-    AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, IPC_PIPE_NAME, PROGRAM_DATA_DIR,
-    SensorBackend,
+    AlertRecord, AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, IPC_PIPE_NAME,
+    ProcessIdentity, PROGRAM_DATA_DIR, SensorBackend,
 };
 use ledr_rules::{
     compute_file_sha256_hex, discover_default_prerestricted_interpreters, load_rules_dir,
@@ -34,6 +35,7 @@ use tracing_subscriber::EnvFilter;
 struct CliArgs {
     foreground: bool,
     service: bool,
+    check_unresolved_suspended: bool,
     dev_bypass_auth: bool,
     disable_nrd_refresh: bool,
     disable_outbound_firewall: bool,
@@ -59,6 +61,7 @@ impl Default for CliArgs {
         Self {
             foreground: true,
             service: false,
+            check_unresolved_suspended: false,
             dev_bypass_auth: false,
             disable_nrd_refresh: false,
             disable_outbound_firewall: false,
@@ -89,6 +92,7 @@ where
     let mut parsed = CliArgs::default();
     let mut saw_foreground = false;
     let mut saw_service = false;
+    let mut saw_service_strict = false;
     let mut iter = args.into_iter().map(Into::into);
     let _exe = iter.next();
 
@@ -104,7 +108,11 @@ where
                 parsed.service = true;
                 parsed.foreground = false;
             }
-            "--service-strict" => parsed.foreground = false,
+            "--service-strict" => {
+                saw_service_strict = true;
+                parsed.foreground = false;
+            }
+            "--check-unresolved-suspended" => parsed.check_unresolved_suspended = true,
             "--dev-bypass-auth" => parsed.dev_bypass_auth = true,
             "--disable-nrd-refresh" => parsed.disable_nrd_refresh = true,
             "--disable-outbound-firewall" => parsed.disable_outbound_firewall = true,
@@ -240,6 +248,11 @@ where
 
     if saw_foreground && saw_service {
         anyhow::bail!("--service cannot be combined with --foreground");
+    }
+    if parsed.check_unresolved_suspended && (saw_foreground || saw_service || saw_service_strict) {
+        anyhow::bail!(
+            "--check-unresolved-suspended cannot be combined with --foreground, --service, or --service-strict"
+        );
     }
 
     // `--ui-signer` without `--ui-root-thumbprint` can never verify: the caller check
@@ -431,6 +444,107 @@ fn run_service_mode(cli: CliArgs) -> Result<(), ServiceRunError> {
     })
 }
 
+const UNRESOLVED_SUSPENDED_EXIT_CODE: u8 = 3;
+const HONEYPOT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+fn default_daemon_db_path() -> PathBuf {
+    PathBuf::from(PROGRAM_DATA_DIR).join("localedr.db")
+}
+
+fn parse_pid_from_instance_id(instance_id: &str) -> Option<u32> {
+    ProcessIdentity::from_instance_id(instance_id)
+        .map(|id| id.pid)
+        .or_else(|| {
+            instance_id
+                .trim()
+                .split(':')
+                .next()
+                .and_then(|pid_part| pid_part.trim().parse::<u32>().ok())
+        })
+}
+
+fn collect_suspended_pids(alerts: &[AlertRecord]) -> BTreeSet<u32> {
+    let mut pids = BTreeSet::new();
+    for alert in alerts {
+        if alert.process_suspended {
+            if let Some(ref inst) = alert.process_instance_id {
+                if let Some(pid) = parse_pid_from_instance_id(inst) {
+                    pids.insert(pid);
+                }
+            }
+        }
+        if let Ok(ctx) = serde_json::from_str::<serde_json::Value>(&alert.context_json) {
+            if let Some(children) = ctx.get("suspended_children").and_then(|v| v.as_array()) {
+                for item in children {
+                    if let Some(raw_id) = item.as_str() {
+                        if let Some(pid) = parse_pid_from_instance_id(raw_id) {
+                            pids.insert(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pids
+}
+
+fn check_unresolved_suspended_in_db(explicit_db: Option<&Path>) -> u8 {
+    let db_path = explicit_db
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_daemon_db_path);
+
+    match std::fs::symlink_metadata(&db_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(err) => {
+            eprintln!(
+                "Error: failed inspecting LocalEDR database '{}': {err}",
+                db_path.display()
+            );
+            return 1;
+        }
+        Ok(meta) if meta.is_dir() => {
+            eprintln!(
+                "Error: LocalEDR database path '{}' is a directory",
+                db_path.display()
+            );
+            return 1;
+        }
+        Ok(_) => {}
+    }
+
+    let alerts = match LedrStore::list_unresolved_suspended_alerts_read_only(&db_path) {
+        Ok(alerts) => alerts,
+        Err(err) => {
+            eprintln!(
+                "Error: failed querying unresolved suspended alerts in '{}': {err}",
+                db_path.display()
+            );
+            return 1;
+        }
+    };
+
+    if alerts.is_empty() {
+        return 0;
+    }
+
+    let pids = collect_suspended_pids(&alerts);
+    let pid_summary = if pids.is_empty() {
+        "unknown".to_string()
+    } else {
+        pids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    eprintln!(
+        "Blocked uninstall: {} unresolved suspended alert(s) found in '{}' (suspended PIDs: {}). Resolve all pending alerts in the LocalEDR UI before uninstalling.",
+        alerts.len(),
+        db_path.display(),
+        pid_summary
+    );
+    UNRESOLVED_SUSPENDED_EXIT_CODE
+}
+
 fn run_cli_entrypoint_code<I, S>(args: I) -> u8
 where
     I: IntoIterator<Item = S>,
@@ -446,9 +560,13 @@ where
 
     if cli.show_help {
         println!(
-            "ledr-daemon [--foreground | --service | --service-strict] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>] [--bridge-sha256 <hex>] [--bridge-signer <dn>] [--bridge-root-thumbprint <sha1>] [--auth-helper-sha256 <hex>]"
+            "ledr-daemon [--foreground | --service | --service-strict | --check-unresolved-suspended] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>] [--bridge-sha256 <hex>] [--bridge-signer <dn>] [--bridge-root-thumbprint <sha1>] [--auth-helper-sha256 <hex>]"
         );
         return 0;
+    }
+
+    if cli.check_unresolved_suspended {
+        return check_unresolved_suspended_in_db(cli.db_path.as_deref());
     }
 
     init_tracing();
@@ -534,6 +652,39 @@ fn build_daemon_config(
         shutdown_skip_cold_binary_inspect: true,
         ..DaemonConfig::default()
     }
+}
+
+enum ActiveSensorBackend {
+    Etw(Box<WindowsEtwSensor>),
+    Noop(NoopSensorBackend),
+}
+
+impl ActiveSensorBackend {
+    fn set_honeypot_paths(&mut self, paths: Vec<PathBuf>) {
+        if let Self::Etw(sensor) = self {
+            sensor.set_honeypot_paths(paths);
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        match self {
+            Self::Etw(sensor) => sensor.stop(),
+            Self::Noop(noop) => noop.stop(),
+        }
+    }
+}
+
+fn apply_honeypot_refresh_if_changed(
+    last_paths: &mut Vec<PathBuf>,
+    updated_paths: Vec<PathBuf>,
+    apply_fn: impl FnOnce(Vec<PathBuf>),
+) -> bool {
+    if HoneypotManager::path_sets_equal(last_paths, &updated_paths) {
+        return false;
+    }
+    apply_fn(updated_paths.clone());
+    *last_paths = updated_paths;
+    true
 }
 
 async fn run_daemon_until<FReady, FWait>(
@@ -647,10 +798,18 @@ where
         }
     }
 
-    let mut honeypot_mgr = HoneypotManager::new();
-    let honeypot_paths = match honeypot_mgr.deploy_honeypots() {
+    let mut honeypot_mgr = if cli.foreground {
+        HoneypotManager::new()
+    } else {
+        HoneypotManager::for_service()
+    };
+    let mut last_honeypot_paths = match honeypot_mgr.deploy_honeypots() {
         Ok(paths) => {
-            tracing::info!(honeypots = paths.len(), "deployed honeypot canary files");
+            tracing::info!(
+                honeypots = paths.len(),
+                service_mode = !cli.foreground,
+                "deployed honeypot canary files"
+            );
             paths
         }
         Err(err) => {
@@ -667,11 +826,11 @@ where
     let bridge_sender = engine.classified_sender();
     let etw_sink: EventSinkFn = Arc::new(move |ev| bridge_sender.blocking_send(ev).is_ok());
     let mut etw_sensor = WindowsEtwSensor::with_sink(etw_sink, DEFAULT_ETW_SESSION_NAME);
-    etw_sensor.set_honeypot_paths(honeypot_paths);
-    let active_backend: Box<dyn SensorBackend> = match etw_sensor.start() {
+    etw_sensor.set_honeypot_paths(last_honeypot_paths.clone());
+    let mut active_backend = match etw_sensor.start() {
         Ok(()) => {
             tracing::info!("WindowsEtwSensor real-time ETW trace started");
-            Box::new(etw_sensor)
+            ActiveSensorBackend::Etw(Box::new(etw_sensor))
         }
         Err(err) => {
             tracing::warn!(
@@ -681,7 +840,7 @@ where
             drop(etw_sensor);
             let mut noop = NoopSensorBackend;
             let _ = noop.start();
-            Box::new(noop)
+            ActiveSensorBackend::Noop(noop)
         }
     };
 
@@ -715,7 +874,72 @@ where
         "ledr-daemon listening on Named Pipe IPC"
     );
 
-    shutdown_signal.await?;
+    if cli.foreground {
+        shutdown_signal.await?;
+    } else {
+        let mut honeypot_mgr_opt = Some(honeypot_mgr);
+        let mut refresh_ticker = tokio::time::interval(HONEYPOT_REFRESH_INTERVAL);
+        refresh_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume immediate t=0 tick; startup deployment just ran above.
+        refresh_ticker.tick().await;
+        tokio::pin!(shutdown_signal);
+        let mut refresh_in_flight: Option<
+            tokio::task::JoinHandle<(HoneypotManager, Result<bool, ledr_sensor_win::SensorError>)>,
+        > = None;
+
+        loop {
+            tokio::select! {
+                res = &mut shutdown_signal => {
+                    res?;
+                    break;
+                }
+                done = async {
+                    match refresh_in_flight.as_mut() {
+                        Some(handle) => handle.await,
+                        None => std::future::pending().await,
+                    }
+                }, if refresh_in_flight.is_some() => {
+                    refresh_in_flight = None;
+                    match done {
+                        Ok((mgr, refresh_res)) => {
+                            if let Err(err) = &refresh_res {
+                                tracing::warn!(
+                                    error = %err,
+                                    "periodic service honeypot refresh encountered an error"
+                                );
+                            }
+                            let updated_paths = mgr.deployed_paths().to_vec();
+                            if apply_honeypot_refresh_if_changed(
+                                &mut last_honeypot_paths,
+                                updated_paths,
+                                |paths| active_backend.set_honeypot_paths(paths),
+                            ) {
+                                tracing::info!(
+                                    honeypots = last_honeypot_paths.len(),
+                                    "updated ETW sensor honeypot paths after periodic profile refresh"
+                                );
+                            }
+                            honeypot_mgr_opt = Some(mgr);
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(
+                                error = %join_err,
+                                "periodic service honeypot refresh task panicked"
+                            );
+                        }
+                    }
+                }
+                _ = refresh_ticker.tick(), if refresh_in_flight.is_none() && honeypot_mgr_opt.is_some() => {
+                    if let Some(mut mgr) = honeypot_mgr_opt.take() {
+                        refresh_in_flight = Some(tokio::task::spawn_blocking(move || {
+                            let res = mgr.refresh_service_profiles();
+                            (mgr, res)
+                        }));
+                    }
+                }
+            }
+        }
+    }
     tracing::info!("shutdown signal received; initiating graceful shutdown and WAL checkpoint");
     engine.signal_early_shutdown();
 
@@ -1326,5 +1550,309 @@ mod tests {
             stderr.contains("1063") && stderr.contains("--foreground"),
             "expected 1063 and --foreground guidance in stderr, got: {stderr:?}"
         );
+    }
+
+    #[test]
+    fn cli_check_01_parses_check_unresolved_suspended_and_rejects_mode_conflicts() {
+        let check = parse_cli_args(["ledr-daemon", "--check-unresolved-suspended"])
+            .expect("--check-unresolved-suspended parses");
+        assert!(check.check_unresolved_suspended);
+        assert_eq!(check.db_path, None);
+
+        let check_with_db = parse_cli_args([
+            "ledr-daemon",
+            "--check-unresolved-suspended",
+            "--db",
+            r"C:\Temp\check.db",
+        ])
+        .expect("--check-unresolved-suspended --db parses");
+        assert!(check_with_db.check_unresolved_suspended);
+        assert_eq!(
+            check_with_db.db_path,
+            Some(PathBuf::from(r"C:\Temp\check.db"))
+        );
+
+        for conflict in ["--foreground", "--service", "--service-strict"] {
+            let err = parse_cli_args(["ledr-daemon", "--check-unresolved-suspended", conflict])
+                .expect_err("mode conflict must fail");
+            assert!(
+                err.to_string().contains("--check-unresolved-suspended"),
+                "unexpected conflict error for {conflict}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_check_02_missing_db_exits_0_and_corrupt_or_dir_exits_1() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-main-check-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+
+        let missing_db = tmp_dir.join("nonexistent.db");
+        let missing_str = missing_db.to_string_lossy().into_owned();
+        assert_eq!(
+            run_cli_entrypoint_code([
+                "ledr-daemon",
+                "--check-unresolved-suspended",
+                "--db",
+                &missing_str,
+            ]),
+            0,
+            "missing DB must exit 0"
+        );
+        assert!(
+            !missing_db.exists(),
+            "read-only check must NOT create missing DB file"
+        );
+
+        // Passing a directory as --db must fail closed with exit code 1.
+        let dir_str = tmp_dir.to_string_lossy().into_owned();
+        assert_eq!(
+            run_cli_entrypoint_code([
+                "ledr-daemon",
+                "--check-unresolved-suspended",
+                "--db",
+                &dir_str,
+            ]),
+            1,
+            "directory as --db must fail closed with exit 1"
+        );
+
+        // Corrupt non-SQLite file must fail closed with exit code 1.
+        let corrupt_db = tmp_dir.join("corrupt.db");
+        std::fs::write(&corrupt_db, b"not a valid sqlite database").expect("write corrupt db");
+        let corrupt_str = corrupt_db.to_string_lossy().into_owned();
+        assert_eq!(
+            run_cli_entrypoint_code([
+                "ledr-daemon",
+                "--check-unresolved-suspended",
+                "--db",
+                &corrupt_str,
+            ]),
+            1,
+            "corrupt DB must fail closed with exit 1"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cli_check_03_clean_and_resolved_alerts_exit_0_while_wal_store_open() {
+        use ledr_proto::{AlertSeverity, AlertStatus};
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-main-check-clean-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+        let db_path = tmp_dir.join("localedr.db");
+        let store = LedrStore::open(&db_path).expect("open WAL store");
+
+        let alerts = [
+            AlertRecord {
+                alert_id: "al-pending-unsuspended".to_string(),
+                timestamp_ms: 1_000,
+                severity: AlertSeverity::Medium,
+                source_layer: "LAYER_4_BROWSER".to_string(),
+                rule_id: "R-1".to_string(),
+                title: "Pending non-suspended alert".to_string(),
+                process_instance_id: Some("1111:50001".to_string()),
+                process_suspended: false,
+                status: AlertStatus::Pending,
+                context_json: r#"{"suspended_children":[]}"#.to_string(),
+                resolved_at_ms: None,
+            },
+            AlertRecord {
+                alert_id: "al-approved-once".to_string(),
+                timestamp_ms: 2_000,
+                severity: AlertSeverity::High,
+                source_layer: "LAYER_1_CANARY".to_string(),
+                rule_id: "R-2".to_string(),
+                title: "Resolved alert".to_string(),
+                process_instance_id: Some("2222:50002".to_string()),
+                process_suspended: true,
+                status: AlertStatus::ApprovedOnce,
+                context_json: r#"{"suspended_children":["3333:50003"]}"#.to_string(),
+                resolved_at_ms: Some(2_500),
+            },
+            AlertRecord {
+                alert_id: "al-terminated".to_string(),
+                timestamp_ms: 3_000,
+                severity: AlertSeverity::Critical,
+                source_layer: "LAYER_1_CANARY".to_string(),
+                rule_id: "R-3".to_string(),
+                title: "Terminated alert".to_string(),
+                process_instance_id: Some("4444:50004".to_string()),
+                process_suspended: true,
+                status: AlertStatus::TerminatedBlocked,
+                context_json: "{}".to_string(),
+                resolved_at_ms: Some(3_500),
+            },
+        ];
+        for alert in &alerts {
+            store.record_alert(alert).expect("insert alert");
+        }
+
+        // Deliberately keep `store` open in WAL mode without checkpointing.
+        let db_str = db_path.to_string_lossy().into_owned();
+        assert_eq!(
+            run_cli_entrypoint_code([
+                "ledr-daemon",
+                "--check-unresolved-suspended",
+                "--db",
+                &db_str,
+            ]),
+            0,
+            "clean/resolved alerts must exit 0 even while WAL writer is open"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cli_check_04_unresolved_suspended_parent_and_children_exit_3_with_pids() {
+        use ledr_proto::{AlertSeverity, AlertStatus};
+        use std::io::Read as _;
+        use std::process::{Command, Stdio};
+
+        if let Some(db_env) = std::env::var_os("LEDR_TEST_CHECK_SUSPENDED_DB") {
+            let db_str = db_env.to_string_lossy().into_owned();
+            let code = run_cli_entrypoint_code([
+                "ledr-daemon",
+                "--check-unresolved-suspended",
+                "--db",
+                &db_str,
+            ]);
+            std::process::exit(i32::from(code));
+        }
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-main-check-susp-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+
+        let run_child_check = |db_path: &Path| -> (Option<i32>, String) {
+            let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "tests::cli_check_04_unresolved_suspended_parent_and_children_exit_3_with_pids",
+                    "--nocapture",
+                ])
+                .env("LEDR_TEST_CHECK_SUSPENDED_DB", db_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn check child");
+            let mut stderr_pipe = child.stderr.take().expect("stderr");
+            let stderr_handle = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = stderr_pipe.read_to_end(&mut buf);
+                buf
+            });
+            let status = child.wait().expect("wait child");
+            let stderr =
+                String::from_utf8_lossy(&stderr_handle.join().expect("stderr join")).into_owned();
+            (status.code(), stderr)
+        };
+
+        // Case A: Unresolved Pending alert with process_suspended = true (while WAL writer is open).
+        let db_parent = tmp_dir.join("parent_suspended.db");
+        let store_parent = LedrStore::open(&db_parent).expect("open parent db");
+        store_parent
+            .record_alert(&AlertRecord {
+                alert_id: "al-susp-parent".to_string(),
+                timestamp_ms: 10_000,
+                severity: AlertSeverity::Critical,
+                source_layer: "LAYER_1_HONEYPOT".to_string(),
+                rule_id: "L-06".to_string(),
+                title: "Honeypot write".to_string(),
+                process_instance_id: Some("4242:100001".to_string()),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: "{}".to_string(),
+                resolved_at_ms: None,
+            })
+            .expect("insert parent suspended alert");
+        let (code_a, stderr_a) = run_child_check(&db_parent);
+        assert_eq!(code_a, Some(3), "expected exit 3; stderr={stderr_a:?}");
+        assert!(
+            stderr_a.contains("4242") && stderr_a.contains("1 unresolved suspended alert"),
+            "expected PID 4242 and count in stderr: {stderr_a:?}"
+        );
+        drop(store_parent);
+
+        // Case B: Unresolved ExpiredSuspended alert with process_suspended = false and non-empty suspended_children.
+        let db_children = tmp_dir.join("children_suspended.db");
+        let store_children = LedrStore::open(&db_children).expect("open children db");
+        store_children
+            .record_alert(&AlertRecord {
+                alert_id: "al-susp-children".to_string(),
+                timestamp_ms: 20_000,
+                severity: AlertSeverity::High,
+                source_layer: "LAYER_1_CANARY".to_string(),
+                rule_id: "L-05".to_string(),
+                title: "Credential canary access".to_string(),
+                process_instance_id: Some("9001:200001".to_string()),
+                process_suspended: false,
+                status: AlertStatus::ExpiredSuspended,
+                context_json: r#"{"suspended_children":["5150:200002","6160:300003"]}"#.to_string(),
+                resolved_at_ms: None,
+            })
+            .expect("insert suspended_children alert");
+        store_children.checkpoint_truncate().expect("checkpoint");
+        drop(store_children);
+
+        let (code_b, stderr_b) = run_child_check(&db_children);
+        assert_eq!(code_b, Some(3), "expected exit 3; stderr={stderr_b:?}");
+        assert!(
+            stderr_b.contains("5150") && stderr_b.contains("6160") && !stderr_b.contains("9001"),
+            "expected suspended child PIDs 5150, 6160 (not unsuspended parent 9001) in stderr: {stderr_b:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn honeypot_refresh_01_updates_sensor_only_when_path_set_changes() {
+        let mut last = vec![
+            PathBuf::from(r"C:\Users\Alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx"),
+            PathBuf::from(r"C:\Users\Alice\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx"),
+        ];
+        let mut calls = 0usize;
+
+        // Same set in reverse order & different casing -> must NOT trigger update.
+        let unchanged = apply_honeypot_refresh_if_changed(
+            &mut last,
+            vec![
+                PathBuf::from(r"c:\users\alice\desktop\!00_LocalEDR_Canary_DoNotEdit.docx"),
+                PathBuf::from(r"c:\users\alice\documents\!00_LocalEDR_Canary_DoNotEdit.docx"),
+            ],
+            |_| calls += 1,
+        );
+        assert!(!unchanged);
+        assert_eq!(calls, 0);
+
+        // New user profile path added -> MUST trigger update and update `last`.
+        let mut applied_paths = Vec::new();
+        let changed = apply_honeypot_refresh_if_changed(
+            &mut last,
+            vec![
+                PathBuf::from(r"C:\Users\Alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx"),
+                PathBuf::from(r"C:\Users\Alice\Desktop\!00_LocalEDR_Canary_DoNotEdit.docx"),
+                PathBuf::from(r"C:\Users\Bob\Documents\!00_LocalEDR_Canary_DoNotEdit.docx"),
+            ],
+            |paths| {
+                calls += 1;
+                applied_paths = paths;
+            },
+        );
+        assert!(changed);
+        assert_eq!(calls, 1);
+        assert_eq!(applied_paths.len(), 3);
+        assert_eq!(last.len(), 3);
     }
 }

@@ -208,13 +208,63 @@ function Invoke-WithFileLockRetry {
         }
         catch {
             $ex = $_.Exception
-            $isSharingOrAccess = ($ex -is [System.IO.IOException]) -or ($ex -is [System.UnauthorizedAccessException])
+            $isSharingOrAccess = $false
+            $matchedEx = $null
+            $cursor = $ex
+            while ($null -ne $cursor) {
+                if (($cursor -is [System.IO.IOException]) -or ($cursor -is [System.UnauthorizedAccessException])) {
+                    $isSharingOrAccess = $true
+                    $matchedEx = $cursor
+                    break
+                }
+                $cursor = $cursor.InnerException
+            }
             if ((-not $isSharingOrAccess) -or ((Get-Date) -ge $deadline)) {
-                throw "Failed '$Description' within ${TimeoutSeconds}s lock retry budget: $($ex.Message)"
+                $detailMsg = if ($null -ne $matchedEx) { $matchedEx.Message } else { $ex.Message }
+                throw "Failed '$Description' within ${TimeoutSeconds}s lock retry budget: $detailMsg"
             }
             Start-Sleep -Milliseconds 200
         }
     }
+}
+
+function Assert-NoUnresolvedSuspendedAlerts {
+    param(
+        [Parameter(Mandatory = $true)][string]$DaemonExePath,
+        [Parameter(Mandatory = $true)][string]$DbPath
+    )
+    if (-not (Test-Path -LiteralPath $DaemonExePath -PathType Leaf)) {
+        Write-UninstallLog -Level 'INFO' -Message "Daemon binary not found at '$DaemonExePath'; skipping unresolved suspended alert check."
+        return
+    }
+    if (-not (Test-Path -LiteralPath $DbPath -PathType Leaf)) {
+        Write-UninstallLog -Level 'INFO' -Message "Database not found at '$DbPath'; skipping unresolved suspended alert check."
+        return
+    }
+    Assert-NoReparsePointComponent -TargetPath $DaemonExePath -ExpectDirectoryIfExists $false
+    Assert-NoReparsePointComponent -TargetPath $DbPath -ExpectDirectoryIfExists $false
+
+    $checkRc = -1
+    $checkOut = @()
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $checkOut = & $DaemonExePath '--check-unresolved-suspended' '--db' $DbPath 2>&1
+        $checkRc = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+
+    $detail = (($checkOut | ForEach-Object { $_.ToString() }) -join "`n").Trim()
+    if ($checkRc -eq 0) {
+        Write-UninstallLog -Level 'INFO' -Message "Verified zero unresolved suspended alerts in '$DbPath'."
+        return
+    }
+    if ($checkRc -eq 3) {
+        throw "Unresolved suspended process alerts exist in '$DbPath'. Open ledr-ui.exe and resolve all suspended processes (Allow or Terminate) before uninstalling LocalEDR so contained processes do not remain permanently suspended. Detail: $detail"
+    }
+    throw "Unresolved suspended process check failed (exit $checkRc) for '$DbPath'; aborting uninstall to prevent orphaned suspended processes. Detail: $detail"
 }
 
 function Remove-ArpRegistryKey64 {
@@ -262,6 +312,11 @@ if (Test-Path -LiteralPath $normDataDir -PathType Container) {
 }
 
 try {
+    # 0. Abort before stopping service, UI, or deleting DB if unresolved suspended processes exist (L-07)
+    $daemonExe = Join-Path $normInstallDir 'ledr-daemon.exe'
+    $dbPath = Join-Path $normDataDir 'localedr.db'
+    Assert-NoUnresolvedSuspendedAlerts -DaemonExePath $daemonExe -DbPath $dbPath
+
     # 1. Wait up to 10s for ledr-ui.exe exit
     Wait-ForUiExit -TimeoutSeconds $UiWaitSeconds
 

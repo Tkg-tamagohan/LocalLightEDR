@@ -9,7 +9,7 @@
 [ledr_artifact.html](../ledr_artifact.html) は、全ファイル走査型の従来型アンチウイルスや常駐型 Electron GUI を排し、OS カーネルのイベント駆動通知、Rust 製常駐コアデーモン、組み込み SQLite WAL ストア、オンデマンド起動の Tauri v2 UI、および Chrome Manifest V3 拡張機能の連携によって CPU 負荷 1% 未満と常駐メモリ 10〜20 MB 以下の両立を目指している。
 
 設計レビューで抽出した要協議事項 A〜P は 2026-11-18 に、Phase 4 詳細設計の追加論点 5 件は 2026-11-21 に、性能改善 `FU-E2E-03` の追加論点 3 件および IPC 呼び出し元認可の統一 1 件は 2026-11-23 にユーザーが全推奨案を承認して確定した。
-確定した 25 件の仕様判断は [decision-records.md](decision-records.md) に保存しており、本計画書では決定内容や根拠を重複管理せず `決定記録 L-01` 〜 `決定記録 L-25` の ID で参照する。
+確定した 29 件の仕様判断は [decision-records.md](decision-records.md) に保存しており、本計画書では決定内容や根拠を重複管理せず `決定記録 L-01` 〜 `決定記録 L-29` の ID で参照する。
 
 | 決定 ID | 論点 | 計画書内の主な反映先 |
 | :--- | :--- | :--- |
@@ -166,7 +166,7 @@ flowchart LR
 LocalEDR/
 ├── Cargo.toml                  # ワークスペース共通定義 (Phase 0 で凍結)
 ├── docs/
-│   ├── decision-records.md     # 確定仕様決定記録 L-01 〜 L-25
+│   ├── decision-records.md     # 確定仕様決定記録 L-01 〜 L-29
 │   ├── follow-up-notes.md      # 副次申し送り事項と実機 E2E 検証記録
 │   └── implementation-plan.md  # 本実装計画書
 ├── crates/
@@ -614,7 +614,7 @@ Phase 0 から Phase 4 までの全実装項目（Phase 4 は PR #25、PR #26、
 
 ### 現在地の確認方法
 
-実装を再開する際は、はじめに `main` ブランチの最新状態、本計画書の Phase 0〜4 チェックリストの `[x]` 完了状況、および [decision-records.md](decision-records.md) の `L-01` 〜 `L-25` を確認する。
+実装を再開する際は、はじめに `main` ブランチの最新状態、本計画書の Phase 0〜4 チェックリストの `[x]` 完了状況、および [decision-records.md](decision-records.md) の `L-01` 〜 `L-29` を確認する。
 
 ### ブランチ運用とマージ後の基準点更新ルール
 

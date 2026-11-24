@@ -348,6 +348,20 @@ function Assert-NoReparsePointComponent {
     }
 }
 
+function Assert-NoReparsePointsInTree {
+    param([Parameter(Mandatory = $true)][string]$RootDir)
+    if (-not (Test-Path -LiteralPath $RootDir)) {
+        return
+    }
+    Assert-NoReparsePointComponent -TargetPath $RootDir -ExpectDirectoryIfExists $true
+    $entries = @(Get-ChildItem -LiteralPath $RootDir -Recurse -Force -ErrorAction Stop)
+    foreach ($entry in $entries) {
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Reparse point detected inside directory tree: $($entry.FullName)"
+        }
+    }
+}
+
 function Assert-AdminOrSystemOwnerIfExists {
     param([Parameter(Mandatory = $true)][string]$DirectoryPath)
     if (-not (Test-Path -LiteralPath $DirectoryPath)) {
@@ -365,6 +379,32 @@ function Invoke-IcaclsChecked {
         [Parameter(Mandatory = $true)][string]$TargetPath,
         [Parameter(Mandatory = $true)][string[]]$GrantSpecs
     )
+    $dirInfo = New-Object System.IO.DirectoryInfo($TargetPath)
+    $sec = $dirInfo.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+    $sec.SetAccessRuleProtection($true, $false)
+    $existingRules = @($sec.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
+    $seenSids = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($rule in $existingRules) {
+        $sid = $rule.IdentityReference
+        if (($null -ne $sid) -and $seenSids.Add($sid.Value)) {
+            $sec.PurgeAccessRules($sid)
+        }
+    }
+    $inheritFlags = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $propFlags = [System.Security.AccessControl.PropagationFlags]::None
+    foreach ($adminSidStr in @('S-1-5-32-544', 'S-1-5-18')) {
+        $sidObj = New-Object System.Security.Principal.SecurityIdentifier($adminSidStr)
+        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sidObj,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritFlags,
+            $propFlags,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $sec.AddAccessRule($adminRule)
+    }
+    $dirInfo.SetAccessControl($sec)
+
     $argsList = @($TargetPath, '/inheritance:r')
     foreach ($spec in $GrantSpecs) {
         $argsList += '/grant:r'
@@ -373,6 +413,18 @@ function Invoke-IcaclsChecked {
     $res = Invoke-NativeProcess -FilePath 'icacls.exe' -Arguments $argsList
     if ($res.ExitCode -ne 0) {
         throw "icacls failed for '$TargetPath' (exit $($res.ExitCode)): $($res.CombinedOutput)"
+    }
+}
+
+function Reset-DataSubdirInheritedAcl {
+    param([Parameter(Mandatory = $true)][string]$SubdirPath)
+    if (-not (Test-Path -LiteralPath $SubdirPath)) {
+        return
+    }
+    Assert-NoReparsePointsInTree -RootDir $SubdirPath
+    $resetRes = Invoke-NativeProcess -FilePath 'icacls.exe' -Arguments @($SubdirPath, '/reset', '/T')
+    if ($resetRes.ExitCode -ne 0) {
+        throw "icacls /reset /T failed for '$SubdirPath' (exit $($resetRes.ExitCode)): $($resetRes.CombinedOutput)"
     }
 }
 
@@ -562,9 +614,20 @@ function Invoke-WithFileLockRetry {
         }
         catch {
             $ex = $_.Exception
-            $isSharingOrAccess = ($ex -is [System.IO.IOException]) -or ($ex -is [System.UnauthorizedAccessException])
+            $isSharingOrAccess = $false
+            $matchedEx = $null
+            $cursor = $ex
+            while ($null -ne $cursor) {
+                if (($cursor -is [System.IO.IOException]) -or ($cursor -is [System.UnauthorizedAccessException])) {
+                    $isSharingOrAccess = $true
+                    $matchedEx = $cursor
+                    break
+                }
+                $cursor = $cursor.InnerException
+            }
             if ((-not $isSharingOrAccess) -or ((Get-Date) -ge $deadline)) {
-                throw "Failed '$Description' within ${TimeoutSeconds}s lock retry budget: $($ex.Message)"
+                $detailMsg = if ($null -ne $matchedEx) { $matchedEx.Message } else { $ex.Message }
+                throw "Failed '$Description' within ${TimeoutSeconds}s lock retry budget: $detailMsg"
             }
             Start-Sleep -Milliseconds 200
         }
@@ -714,6 +777,7 @@ Invoke-IcaclsChecked -TargetPath $normDataDir -GrantSpecs @('*S-1-5-32-544:(OI)(
 if (-not (Test-Path -LiteralPath $normLogsDir)) {
     [void](New-Item -ItemType Directory -Path $normLogsDir -Force)
 }
+Reset-DataSubdirInheritedAcl -SubdirPath $normLogsDir
 Assert-NoReparsePointComponent -TargetPath $normLogsDir -ExpectDirectoryIfExists $true
 Assert-NoReparsePointComponent -TargetPath $logFilePath -ExpectDirectoryIfExists $false
 
@@ -865,7 +929,11 @@ try {
         '*S-1-5-32-544:(OI)(CI)F',
         '*S-1-5-18:(OI)(CI)F'
     )
-    Write-InstallLog -Level 'INFO' -Message "Applied icacls permissions to '$normInstallDir' and '$normDataDir'."
+    foreach ($dataSubdirName in @('rules', 'logs', 'updates', 'native-messaging')) {
+        $dataSubdirPath = Join-Path $normDataDir $dataSubdirName
+        Reset-DataSubdirInheritedAcl -SubdirPath $dataSubdirPath
+    }
+    Write-InstallLog -Level 'INFO' -Message "Applied icacls permissions to '$normInstallDir', '$normDataDir', and data subdirectories."
 
     # Phase 8: Register machine-scope Native Messaging manifests & apply RX ACL on native-messaging subdir
     $bridgeExe = Join-Path $normInstallDir 'ledr-bridge-nm.exe'
@@ -957,6 +1025,10 @@ catch {
     Write-InstallLog -Level 'ERROR' -Message "Installation failed: $errMsg"
     Write-InstallLog -Level 'WARN' -Message "Starting step-by-step rollback..."
 
+    $rollbackRestoreFailed = $false
+    $rollbackCompleted = $false
+    $rollbackFailedItems = New-Object System.Collections.Generic.List[string]
+
     try {
         if ($startedServiceByInstaller) {
             try {
@@ -1013,8 +1085,15 @@ catch {
                         Write-InstallLog -Level 'INFO' -Message "Rollback restored binary: $binName"
                     }
                     catch {
+                        $rollbackRestoreFailed = $true
+                        $rollbackFailedItems.Add("binary:$binName")
                         Write-InstallLog -Level 'ERROR' -Message "Rollback failed restoring binary '$binName': $($_.Exception.Message)"
                     }
+                }
+                else {
+                    $rollbackRestoreFailed = $true
+                    $rollbackFailedItems.Add("binary:$binName (missing backup)")
+                    Write-InstallLog -Level 'ERROR' -Message "Rollback backup missing for binary '$binName' at '$bakPath'."
                 }
             }
 
@@ -1027,10 +1106,22 @@ catch {
                         Write-InstallLog -Level 'INFO' -Message "Rollback restored rule: rules\$ruleName"
                     }
                     catch {
+                        $rollbackRestoreFailed = $true
+                        $rollbackFailedItems.Add("rule:rules\$ruleName")
                         Write-InstallLog -Level 'ERROR' -Message "Rollback failed restoring rule 'rules\$ruleName': $($_.Exception.Message)"
                     }
                 }
+                else {
+                    $rollbackRestoreFailed = $true
+                    $rollbackFailedItems.Add("rule:rules\$ruleName (missing backup)")
+                    Write-InstallLog -Level 'ERROR' -Message "Rollback backup missing for rule 'rules\$ruleName' at '$bakRule'."
+                }
             }
+        }
+        elseif (($backedUpBinaries.Count -gt 0) -or ($backedUpRules.Count -gt 0)) {
+            $rollbackRestoreFailed = $true
+            $rollbackFailedItems.Add('backup-directory-missing')
+            Write-InstallLog -Level 'ERROR' -Message "Rollback backup directory '$backupDir' is missing; cannot restore backed-up files."
         }
 
         if ($bridgeSetupDone -and ($backedUpBinaries -contains 'ledr-bridge-nm.exe')) {
@@ -1051,8 +1142,10 @@ catch {
 
         if ($serviceCreated) {
             $delRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @('delete', $script:ServiceName)
-            if ($delRes.ExitCode -ne 0) {
-                Write-InstallLog -Level 'WARN' -Message "Rollback failed deleting newly created service '$($script:ServiceName)' (exit $($delRes.ExitCode)): $($delRes.CombinedOutput)"
+            if (($delRes.ExitCode -ne 0) -and ($delRes.ExitCode -ne 1060) -and ($delRes.ExitCode -ne 1072)) {
+                $rollbackRestoreFailed = $true
+                $rollbackFailedItems.Add('service:delete')
+                Write-InstallLog -Level 'ERROR' -Message "Rollback failed deleting newly created service '$($script:ServiceName)' (exit $($delRes.ExitCode)): $($delRes.CombinedOutput)"
             }
             else {
                 Write-InstallLog -Level 'INFO' -Message "Rollback deleted newly created service '$($script:ServiceName)'."
@@ -1066,6 +1159,8 @@ catch {
                 'DisplayName=', $prevServiceConfig.DisplayName
             )
             if ($cfgRollbackRes.ExitCode -ne 0) {
+                $rollbackRestoreFailed = $true
+                $rollbackFailedItems.Add('service:config')
                 Write-InstallLog -Level 'ERROR' -Message "Rollback failed restoring previous service configuration (exit $($cfgRollbackRes.ExitCode)): $($cfgRollbackRes.CombinedOutput)"
             }
             else {
@@ -1074,13 +1169,22 @@ catch {
         }
 
         if ($prevServiceWasRunning) {
-            $startRollbackRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @('start', $script:ServiceName)
-            if ($startRollbackRes.ExitCode -eq 0) {
-                Wait-ForServiceRunning -Name $script:ServiceName -TimeoutSeconds $ServiceWaitSeconds
-                Write-InstallLog -Level 'INFO' -Message "Rollback restarted previously running service '$($script:ServiceName)'."
+            try {
+                $startRollbackRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @('start', $script:ServiceName)
+                if ($startRollbackRes.ExitCode -eq 0) {
+                    Wait-ForServiceRunning -Name $script:ServiceName -TimeoutSeconds $ServiceWaitSeconds
+                    Write-InstallLog -Level 'INFO' -Message "Rollback restarted previously running service '$($script:ServiceName)'."
+                }
+                else {
+                    $rollbackRestoreFailed = $true
+                    $rollbackFailedItems.Add('service:start')
+                    Write-InstallLog -Level 'ERROR' -Message "Rollback failed restarting service '$($script:ServiceName)' (exit $($startRollbackRes.ExitCode)): $($startRollbackRes.CombinedOutput)"
+                }
             }
-            else {
-                Write-InstallLog -Level 'ERROR' -Message "Rollback failed restarting service '$($script:ServiceName)' (exit $($startRollbackRes.ExitCode)): $($startRollbackRes.CombinedOutput)"
+            catch {
+                $rollbackRestoreFailed = $true
+                $rollbackFailedItems.Add('service:start')
+                Write-InstallLog -Level 'ERROR' -Message "Rollback failed waiting for restarted service '$($script:ServiceName)': $($_.Exception.Message)"
             }
         }
 
@@ -1092,10 +1196,22 @@ catch {
             $items = @(Get-ChildItem -LiteralPath $normInstallDir -Force)
             if ($items.Count -eq 0) { Remove-Item -LiteralPath $normInstallDir -Force }
         }
+        $rollbackCompleted = $true
+    }
+    catch {
+        $rollbackRestoreFailed = $true
+        $rollbackFailedItems.Add("rollback-exception:$($_.Exception.Message)")
+        Write-InstallLog -Level 'ERROR' -Message "Rollback encountered an unexpected error: $($_.Exception.Message)"
     }
     finally {
         if ($null -ne $backupDir) {
-            Remove-BackupDirectoryBestEffort -BackupDirPath $backupDir -AllowRebootDelayForUi ($UpdateMode.IsPresent)
+            if ($rollbackCompleted -and (-not $rollbackRestoreFailed)) {
+                Remove-BackupDirectoryBestEffort -BackupDirPath $backupDir -AllowRebootDelayForUi ($UpdateMode.IsPresent)
+            }
+            else {
+                $failedSummary = if ($rollbackFailedItems.Count -gt 0) { $rollbackFailedItems -join ', ' } else { 'unknown rollback error' }
+                Write-InstallLog -Level 'ERROR' -Message "Preserving backup directory '$backupDir' because rollback restoration failed for: $failedSummary"
+            }
         }
         Write-InstallLog -Level 'ERROR' -Message "Rollback finished; exiting with code 1."
         Close-InstallLog

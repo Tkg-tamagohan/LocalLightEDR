@@ -78,6 +78,8 @@ python -m unittest scripts/test_check_invariants.py
 
 2. **ドライラン実行（`workflow_dispatch`）**：GitHub Actions の `Release` ワークフロー（`.github/workflows/release.yml`）を手動実行し、`dry_run: true` を指定します。
    ドライランでは `preflight` と `build` が走り、ジョブ内の一時テスト鍵で `LocalEDR-Setup-vX.Y.Z-win-x64.exe`、`LocalEDR-vX.Y.Z-win-x64.zip`、`LocalEDR-chrome-ext-vX.Y.Z.zip`、`SHA256SUMS.txt`、`update-manifest.json`、および `update-manifest.json.sig` の 6 点を作成して `verify-dist` まで検証し、`publish` ジョブはスキップします。
+   なお、ドライラン時にコンパイルされる `ledr-ui.exe` は一時テスト鍵（`dry-run-test`）を生成する前の段階でリポジトリ内の `packaging/update-public-keys.json` を埋め込んでビルドされます。
+   そのため、ドライランで生成された `ledr-ui.exe` 自体は一時テスト鍵を信頼せず、ドライランが検証する範囲はパッケージング、一時鍵による署名、および `verify-dist` による配布物検証までです。
 
 3. **本番タグリリース**：ドライランが成功したら、注釈付きタグを作成して `origin` へ push してください。
 
@@ -108,7 +110,8 @@ git push origin v0.1.0
 1. 移行版 `v0.2.0` の展開が完了したら、GitHub Secret `LEDR_UPDATE_SIGNING_PRIVATE_KEY` を新秘密鍵へ更新します。
 2. `packaging/update-public-keys.json` の旧鍵を `"status": "revoked"` へ変更します。
 3. 次期リリース（例：`v0.2.1`）を新秘密鍵で署名して公開します。
-   なお、`v0.2.0` 未満の古いクライアントが残っている場合は自動更新できないため、インストーラによる手動更新または `min_updater_version` の引き上げによる `ManualUpdateRequired` 表示で誘導してください。
+   なお、`crates/ledr-updater` は `min_updater_version` 等を解析する `parse_and_validate_manifest` より前に `verify_manifest_signature` で Ed25519 署名を検証します。
+   そのため、新鍵を持たない `v0.2.0` 未満の古いクライアントは署名検証の段階で失敗して `ManualUpdateRequired` を表示できないため、旧鍵の失効後に残存端末を更新するには新しい署名付きインストーラを手動配布してください（`min_updater_version` による `ManualUpdateRequired` の誘導は、署名鍵をすでに信頼している `v0.2.0` 以降のクライアントにのみ機能します）。
 
 ## ロールバック手順
 

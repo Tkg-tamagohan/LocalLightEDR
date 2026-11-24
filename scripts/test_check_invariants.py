@@ -567,6 +567,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             bridge_probe["criteria"]["false_description"],
         ):
             for kw in (
+                "REG_SZ",
                 "REG_EXPAND_SZ",
                 "1,024",
                 "2,048",
@@ -595,12 +596,18 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
         ):
             for kw in (
                 "any_browser_references_manifest_with",
+                "Ok(false)",
+                "Ok(true)",
+                "stops_wow64_fallback",
+                "EmptyString",
                 "32,768",
                 "resolved_path",
                 "UnresolvableExpandSz",
                 "manifest_removed",
             ):
                 self.assertIn(kw, text_field)
+            self.assertNotIn("unshort-circuited", text_field.lower())
+        self.assertNotIn("unshort-circuited", bridge_unreg["description"].lower())
         for kw in (
             "run_unregister_with_ops",
             "Scope::Machine",

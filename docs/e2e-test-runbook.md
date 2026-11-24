@@ -33,7 +33,7 @@ Phase 0（基盤構築と共通型凍結）、Phase 1（プロセス系譜と通
 - **ブラウザイベント抑止と固定拡張 ID（`L-19`、`L-20`）**：`LAYER_4_BROWSER` イベントはブラウザ内 Shadow DOM に警告を出し既定で OS トーストを発火せず、同じ `(種別, 正規化 URL)` は 30 秒間（上限 256 件）重複抑止する。
   拡張は公開鍵ピン留めにより固定 ID `ecelachfiiiiiibpjeomfncgpegbpanh` を持ち、ホスト名 `com.localedr.bridge` で通信する。
 - **IPC 境界と不変条件（`L-08`、`L-09`、`SEC_0002`、`SEC_0003`）**：`L-08` は `ledr-ui` 閉鎖時の UI と WebView2 の 0 プロセス終了、`L-09` と `SEC_0002` は `GetNamedPipeClientProcessId` による保護パスと署名/ハッシュ検証、`SEC_0003` はブリッジ側での `GetNamedPipeServerProcessId` によるデーモンパス検証である。
-- **未完了追跡 ID（[follow-up-notes.md](follow-up-notes.md)）**：`FU-E2E-01` は Phase 2 と 3 の実機検証、`FU-E2E-02` は Phase 4 実機 Chrome 検証、`FU-P4-01` は `ledr-bridge-nm` の `HKLM` 32 ビットレジストリビュー（`KEY_WOW64_32KEY`）未対応の残件を指す。
+- **未完了追跡 ID（[follow-up-notes.md](follow-up-notes.md)）**：`FU-E2E-01` は Phase 2 と 3 の実機検証、`FU-E2E-02` は Phase 4 実機 Chrome 検証、`FU-P4-01` は `ledr-bridge-nm` の `HKLM` 32 ビットおよび 64 ビットレジストリビュー（`KEY_WOW64_32KEY` と `KEY_WOW64_64KEY`）対応（実装および非特権単体テスト完了済みで、管理者権限での実 `HKLM` 書込と削除および `HKLM` のみでの実ブラウザ起動確認は `FU-E2E-02` で実施）を指す。
 
 ### 基準環境と必要な道具
 
@@ -1149,7 +1149,10 @@ if ($LASTEXITCODE -ne 0) { throw "ledr-bridge-nm setup --scope machine に失敗
 - ブラウザ別詳細行（`.browser-detail-row`）の **Chrome 行と Edge 行のそれぞれ** に、対応する `manifest_path` と `Valid` が併記され、他ブラウザのパスが混入していない（既定 2 ディレクトリ `%LOCALAPPDATA%\LocalEDR\native-messaging` と `C:\ProgramData\LocalEDR\native-messaging` の外へ `--manifest-dir` で配置した場合は、仕様どおりファイル I/O を行わず `unverified` と表示される）。
 - `Extension ID` が `ecelachfiiiiiibpjeomfncgpegbpanh` を表示し、`URI Protocol` が `ledr://` の登録スコープを表示している。
 
-なお、現行の `ledr-bridge-nm` は `HKLM` の 32 ビットレジストリビュー（`KEY_WOW64_32KEY`）に対応していないため（`FU-P4-01`）、`HKLM` のみで 32 ビットビューに旧キーが先行存在すると View 3 側の診断は 32 ビット側を優先して検出します。
+なお、`ledr-bridge-nm` は `HKLM` の 32 ビットビュー（`KEY_WOW64_32KEY`）と 64 ビットビュー（`KEY_WOW64_64KEY`）の双方に対応しています（`FU-P4-01`）。
+具体的には、`setup --scope machine` は両ビューへ同一マニフェストパスを冪等登録し、`status` は View 3 診断と同じく 32 ビットビューを先に探索して `EmptyString` で打ち切り、`unregister --scope machine` は両ビューのキーを冪等削除して両ビューに参照が残らないことを確認したうえでマニフェストを削除します。
+また、Chrome と Edge は Native Messaging ホストの探索で `HKLM` より `HKCU` を優先するため、`HKLM` 経由での Native Messaging 起動（拡張ポップアップの `Ping` 応答）を検証するときは `HKCU` に登録が存在しない状態で確認してください。
+手順の `--scope user` 登録も合わせて試す場合は、`--scope user` 登録前に `--scope machine` 単体で `Ping` を確認するか、一時的に `ledr-bridge-nm unregister --scope user` を実行して `HKLM` 経由の `Ping` 成功を確認した後に再度 `setup --scope user` で復元してください。
 
 続いてウィンドウ C で既存の検証用 HTTP サーバを整理したうえでローカル HTTP サーバ（`127.0.0.1:8765`）を起動し、疎通確認後に隔離プロファイルと名前解決ルール付きで Chrome を `Start-Process` 起動してください（シェルを占有しません）。
 非 `https` 環境でも `navigator.clipboard.writeText` を動作させ、かつオリジン間の Mixed Content 誤遮断を防ぐため、テストで使う全 7 つの `.localedr.invalid` オリジンを `--unsafely-treat-insecure-origin-as-secure` へ列挙します。

@@ -576,7 +576,7 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
   // Custom `--manifest-dir` outside default 2 directories renders as `Unverified` (distinct from red `Invalid`)
   // and keeps each browser's manifest_path visible alongside the unverified note in its own detail row.
   const customUnverifiedNote =
-    "manifest path is outside default LocalEDR manifest directories (unverified by UI; inspect the listed manifest file directly or run 'ledr-bridge-nm status' — note: CLI status checks only the 64-bit default registry view, not HKLM WOW64 32-bit view)";
+    "manifest path is outside default LocalEDR manifest directories (unverified by UI; inspect the listed manifest file directly or run 'ledr-bridge-nm status')";
   const chromeCustomPath = "D:\\CustomChrome\\com.localedr.bridge.user.chrome.json";
   const edgeCustomPath = "D:\\CustomEdge\\com.localedr.bridge.machine.edge.json";
   ui.state.localDefenseStatus.browser_shield.manifest_path = chromeCustomPath;
@@ -612,7 +612,7 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
     "Chrome unverified detail row must include Chrome diagnostic message in the same row",
   );
   assert.match(unverifiedChromeRow, /ledr-bridge-nm status/);
-  assert.match(unverifiedChromeRow, /WOW64 32-bit/);
+  assert.doesNotMatch(unverifiedChromeRow, /WOW64 32-bit/);
   assert.ok(
     !unverifiedChromeRow.includes(escapeHtmlText(edgeCustomPath)),
     "Chrome unverified detail row must not include Edge manifest_path",
@@ -630,7 +630,7 @@ test("UI-P4-08: View 3 Browser Shield scopes, browsers, manifest diagnostics & s
     "Edge unverified detail row must include Edge diagnostic message in the same row",
   );
   assert.match(unverifiedEdgeRow, /ledr-bridge-nm status/);
-  assert.match(unverifiedEdgeRow, /WOW64 32-bit/);
+  assert.doesNotMatch(unverifiedEdgeRow, /WOW64 32-bit/);
   assert.ok(
     !unverifiedEdgeRow.includes(escapeHtmlText(chromeCustomPath)),
     "Edge unverified detail row must not include Chrome manifest_path",

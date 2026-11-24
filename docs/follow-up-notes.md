@@ -183,8 +183,8 @@ PR 4C は PR #28（`331602d`）で `main` へマージ済みであり、PR #34�
 
 ### 対象ファイル
 
-- CLI 実装箇所：[setup.rs](../crates/ledr-bridge-nm/src/setup.rs#L136-L2718)（`RegWow64View`、`CHROMIUM_READ_VALUE_MAX_UTF16_UNITS`、`NativeHostRegProbe`、`select_effective_hklm_probe`、`RegistryViewOps`、`win_reg_ops::delete_subkey_tree_idempotent`、`expand_env_strings_win32`、および `run_setup_with_ops` / `run_unregister_with_ops` / `run_status_with_ops`）
-- 単体テスト箇所：[crates/ledr-bridge-nm/src/tests.rs](../crates/ledr-bridge-nm/src/tests.rs#L2703-L4516)（`bridge_19` から `bridge_26`）
+- CLI 実装箇所：[setup.rs](../crates/ledr-bridge-nm/src/setup.rs#L136-L2721)（`RegWow64View`、`CHROMIUM_READ_VALUE_MAX_UTF16_UNITS`、`NativeHostRegProbe`、`select_effective_hklm_probe`、`RegistryViewOps`、`win_reg_ops::delete_subkey_tree_idempotent`、`win_reg_ops::exceeds_chromium_raw_limit`、`expand_env_strings_win32`、および `run_setup_with_ops` / `run_unregister_with_ops` / `run_status_with_ops`）
+- 単体テスト箇所：[crates/ledr-bridge-nm/src/tests.rs](../crates/ledr-bridge-nm/src/tests.rs#L2703-L4901)（`bridge_19` から `bridge_27`）
 - UI 診断注記同期：[defense_status.rs](../apps/ledr-ui/src/defense_status.rs#L109)、[apps/ledr-ui/src/tests.rs](../apps/ledr-ui/src/tests.rs#L2270-L2274)、および [phase4_ui.test.mjs](../apps/ledr-ui/js-tests/phase4_ui.test.mjs#L578-L638)
 
 ### 背景と出典
@@ -204,7 +204,7 @@ PR 4C は PR #28（`331602d`）で `main` へマージ済みであり、PR #34�
   対照的に、View 3 側の [uri_reg.rs](../apps/ledr-ui/src/uri_reg.rs#L197-L317) は `REG_SZ` の読み取りバッファに 1,024 単位の上限を設けず `ERROR_MORE_DATA` に応じて動的に拡張し、`REG_EXPAND_SZ` を `MissingOrInvalidType` として扱う。
   そのため、1,024 単位を超えるエントリや `REG_EXPAND_SZ` エントリを含む非標準の環境では CLI と View 3 の診断結果が異なり得るが、標準の `ledr-bridge-nm setup` は短いリテラルの `REG_SZ` パスを書き込むため通常構成では発生せず、View 3 側を揃える調整は必要に応じた将来の任意改善として残している。
 - **UI 注記の同期**：[defense_status.rs](../apps/ledr-ui/src/defense_status.rs#L109) の `UNVERIFIED_CUSTOM_MANIFEST_MSG` および関連テストから、CLI `status` が 64 ビット既定ビューのみ参照する旨の旧注記を削除した。
-- **非特権自動テスト**：`RegistryViewOps` トレイトと `MockRegistryViewOps` を導入し、`select_effective_hklm_probe` 全境界組み合わせ（`bridge_19`）、`Scope::Machine` の登録、修復、レガシー削除、および他ブラウザ参照保護のモック検証（`bridge_20`）、`Scope::User` 隔離プレフィックス上の実 Win32 FFI 明示ビュー往復回帰（`bridge_21`）、`status` の 32 ビット短絡終了検証（`bridge_22`）、未解決 `REG_EXPAND_SZ` 保護と両ビューカスタムパス個別削除時の `manifest_removed` 検証（`bridge_23`）、隔離 `HKCU` 実 Win32 `REG_EXPAND_SZ` 往復検証（`bridge_24`）、1,024 UTF-16 単位超過時の `status` 64 ビットフォールバックと `unregister` 保護のモック検証（`bridge_25`）、ならびに実 Win32 `1,024` UTF-16 境界と `>1,050` 文字 `REG_EXPAND_SZ` 保護検証（`bridge_26`）を追加した。
+- **非特権自動テスト**：`RegistryViewOps` トレイトと `MockRegistryViewOps` を導入し、`select_effective_hklm_probe` 全境界組み合わせ（`bridge_19`）、`Scope::Machine` の登録、修復、レガシー削除、および他ブラウザ参照保護のモック検証（`bridge_20`）、`Scope::User` 隔離プレフィックス上の実 Win32 FFI 明示ビュー往復回帰（`bridge_21`）、`status` の 32 ビット短絡終了検証（`bridge_22`）、未解決 `REG_EXPAND_SZ` 保護と両ビューカスタムパス個別削除時の `manifest_removed` 検証（`bridge_23`）、隔離 `HKCU` 実 Win32 `REG_EXPAND_SZ` 往復検証（`bridge_24`）、1,024 UTF-16 単位超過時の `status` 64 ビットフォールバックと `unregister` 保護のモック検証（`bridge_25`）、実 Win32 `1,024` UTF-16 境界と `>1,050` 文字 `REG_EXPAND_SZ` 保護検証（`bridge_26`）、ならびにトリム前空白境界と 2,048 バイト非 NUL 終端データの境界検証（`bridge_27`）を追加した。
 
 ### 未検証範囲と実機確認先
 

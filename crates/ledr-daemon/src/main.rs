@@ -24,7 +24,8 @@ use ledr_rules::{
     LoadedRulesDir, DEFAULT_NRD_FEED_URLS,
 };
 use ledr_sensor_win::defense::{
-    process_liveness, remove_verified_honeypot_file, HoneypotManager, ProcessLiveness,
+    process_liveness, remove_verified_honeypot_file_with_identity, HoneypotFileId,
+    HoneypotManager, HoneypotRemoveResult, OwnedHoneypotRecord, ProcessLiveness,
     WindowsDefenseController,
 };
 use ledr_sensor_win::etw::{
@@ -32,7 +33,7 @@ use ledr_sensor_win::etw::{
     DEFAULT_ETW_SESSION_NAME,
 };
 use ledr_sensor_win::privileges::enable_required_privileges;
-use ledr_store::LedrStore;
+use ledr_store::{LedrStore, TrackedHoneypotRecord};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -815,6 +816,7 @@ fn check_unresolved_suspended_in_db_with_probe(
 struct HoneypotCleanupOutcome {
     removed: usize,
     already_absent: usize,
+    skipped_not_owned: usize,
     failed: usize,
     db_records_removed: usize,
     failed_details: Vec<String>,
@@ -828,14 +830,15 @@ fn normalize_honeypot_dedup_key(path: &Path) -> String {
         .to_lowercase()
 }
 
-fn push_unique_honeypot_path(
+fn push_unique_honeypot_target(
     seen: &mut HashSet<String>,
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<(PathBuf, Option<HoneypotFileId>)>,
     path: PathBuf,
+    expected_file_id: Option<HoneypotFileId>,
 ) {
     let key = normalize_honeypot_dedup_key(&path);
     if !key.is_empty() && seen.insert(key) {
-        out.push(path);
+        out.push((path, expected_file_id));
     }
 }
 
@@ -867,14 +870,22 @@ fn current_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn record_honeypots_best_effort(store: &LedrStore, paths: &[PathBuf]) {
-    if paths.is_empty() {
+fn record_honeypots_best_effort(store: &LedrStore, records: &[OwnedHoneypotRecord]) {
+    if records.is_empty() {
         return;
     }
-    if let Err(err) = store.record_honeypot_paths(paths, current_epoch_ms()) {
+    let tracked: Vec<TrackedHoneypotRecord> = records
+        .iter()
+        .map(|rec| TrackedHoneypotRecord {
+            file_path: rec.path.clone(),
+            volume_serial: Some(rec.file_id.volume_serial),
+            file_index: Some(rec.file_id.file_index),
+        })
+        .collect();
+    if let Err(err) = store.record_honeypot_records(&tracked, current_epoch_ms()) {
         tracing::warn!(
             error = %err,
-            honeypots = paths.len(),
+            honeypots = tracked.len(),
             "failed recording deployed honeypot paths in SQLite"
         );
     }
@@ -913,15 +924,22 @@ fn cleanup_honeypots_with_db_and_fallback(
                 db_path.display()
             ));
         }
-        Ok(_) => match LedrStore::list_tracked_honeypot_paths_read_only(db_path) {
-            Ok(paths) => {
+        Ok(_) => match LedrStore::list_tracked_honeypot_records_read_only(db_path) {
+            Ok(records) => {
                 db_readable = true;
-                for path in paths {
-                    let key = normalize_honeypot_dedup_key(&path);
+                for rec in records {
+                    let key = normalize_honeypot_dedup_key(&rec.file_path);
                     if !key.is_empty() {
                         tracked_keys.insert(key);
                     }
-                    push_unique_honeypot_path(&mut seen, &mut targets, path);
+                    let expected_id =
+                        rec.volume_serial
+                            .zip(rec.file_index)
+                            .map(|(volume_serial, file_index)| HoneypotFileId {
+                                volume_serial,
+                                file_index,
+                            });
+                    push_unique_honeypot_target(&mut seen, &mut targets, rec.file_path, expected_id);
                 }
             }
             Err(err) => {
@@ -935,21 +953,29 @@ fn cleanup_honeypots_with_db_and_fallback(
     }
 
     for path in fallback_paths {
-        push_unique_honeypot_path(&mut seen, &mut targets, path.clone());
+        push_unique_honeypot_target(&mut seen, &mut targets, path.clone(), None);
     }
 
     let mut cleaned_tracked_paths = Vec::new();
-    for path in targets {
-        match remove_verified_honeypot_file(&path) {
-            Ok(true) => {
+    for (path, expected_id) in targets {
+        let is_tracked = tracked_keys.contains(&normalize_honeypot_dedup_key(&path));
+        match remove_verified_honeypot_file_with_identity(&path, expected_id) {
+            Ok(HoneypotRemoveResult::Removed) => {
                 outcome.removed += 1;
-                if tracked_keys.contains(&normalize_honeypot_dedup_key(&path)) {
+                if is_tracked {
                     cleaned_tracked_paths.push(path);
                 }
             }
-            Ok(false) => {
+            Ok(HoneypotRemoveResult::AlreadyAbsent) => {
                 outcome.already_absent += 1;
-                if tracked_keys.contains(&normalize_honeypot_dedup_key(&path)) {
+                if is_tracked {
+                    cleaned_tracked_paths.push(path);
+                }
+            }
+            Ok(HoneypotRemoveResult::SkippedNotOwned) => {
+                outcome.skipped_not_owned += 1;
+                if is_tracked {
+                    // File was replaced with a non-LocalEDR file; drop stale tracking row.
                     cleaned_tracked_paths.push(path);
                 }
             }
@@ -1006,10 +1032,11 @@ fn cleanup_honeypots_in_db(explicit_db: Option<&Path>) -> u8 {
     let outcome = cleanup_honeypots_with_db_and_fallback(&db_path, &fallback_paths);
 
     println!(
-        "Honeypot cleanup summary (db='{}'): removed={}, already_absent={}, db_records_removed={}, failed={}",
+        "Honeypot cleanup summary (db='{}'): removed={}, already_absent={}, skipped_not_owned={}, db_records_removed={}, failed={}",
         db_path.display(),
         outcome.removed,
         outcome.already_absent,
+        outcome.skipped_not_owned,
         outcome.db_records_removed,
         outcome.failed
     );
@@ -1303,7 +1330,7 @@ where
             honeypot_mgr.deployed_paths().to_vec()
         }
     };
-    record_honeypots_best_effort(&honeypot_store, &last_honeypot_paths);
+    record_honeypots_best_effort(&honeypot_store, honeypot_mgr.owned_deployed_records());
 
     // Start ETW capture directly into ClassifiedEventSender BEFORE Toolhelp32 snapshot capture so
     // processes spawned or exiting during snapshot enumeration are not missed (BUG_0001, BUG_0006, L-10).
@@ -1417,10 +1444,13 @@ where
                     if let Some(mut mgr) = honeypot_mgr_opt.take() {
                         let refresh_store = honeypot_store.clone();
                         refresh_in_flight = Some(tokio::task::spawn_blocking(move || {
-                            let prev_paths = mgr.deployed_paths().to_vec();
+                            let prev_owned = mgr.owned_deployed_records().to_vec();
                             let res = mgr.refresh_service_profiles();
-                            if !HoneypotManager::path_sets_equal(&prev_paths, mgr.deployed_paths()) {
-                                record_honeypots_best_effort(&refresh_store, mgr.deployed_paths());
+                            if prev_owned != mgr.owned_deployed_records() {
+                                record_honeypots_best_effort(
+                                    &refresh_store,
+                                    mgr.owned_deployed_records(),
+                                );
                             }
                             (mgr, res)
                         }));
@@ -2884,12 +2914,39 @@ mod tests {
         let mut mgr = HoneypotManager::for_user_profiles(vec![profile]);
         let deployed = mgr.deploy_honeypots().expect("deploy userA honeypots");
         assert_eq!(deployed.len(), 3);
+        let owned_records = mgr.owned_deployed_records().to_vec();
+        assert_eq!(owned_records.len(), 3);
 
-        // Fallback-only decoy not tracked in SQLite.
-        let fallback_dir = base.join("UserB").join("Documents");
-        std::fs::create_dir_all(&fallback_dir).unwrap();
-        let fallback_decoy = fallback_dir.join(HONEYPOT_DEFAULT_FILENAME);
-        std::fs::write(&fallback_decoy, b"fallback-decoy").unwrap();
+        // Tamper content on Desktop decoy in-place (ransomware simulation): file_index stays
+        // identical so tracked cleanup must still delete it.
+        let desktop_decoy = desktop.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(&desktop_decoy, b"RANSOMWARE_MODIFIED_PAYLOAD").unwrap();
+
+        // Replace Pictures decoy with a distinct user file (different file_index): tracked
+        // cleanup must preserve the user file and drop only the stale SQLite tracking row.
+        let pictures_decoy = pictures.join(HONEYPOT_DEFAULT_FILENAME);
+        let replacement_tmp = base.join("replacement.docx");
+        let replacement_payload = b"User replaced decoy path with a real document.\r\n";
+        std::fs::write(&replacement_tmp, replacement_payload).unwrap();
+        std::fs::remove_file(&pictures_decoy).unwrap();
+        std::fs::rename(&replacement_tmp, &pictures_decoy).unwrap();
+
+        // Fallback candidate 1: legacy unrecorded decoy with exact known decoy content -> removed.
+        let fallback_legacy_dir = base.join("UserB").join("Documents");
+        std::fs::create_dir_all(&fallback_legacy_dir).unwrap();
+        let fallback_legacy_decoy = fallback_legacy_dir.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(
+            &fallback_legacy_decoy,
+            b"LocalEDR Canary Decoy File - Do Not Modify or Delete.\r\n",
+        )
+        .unwrap();
+
+        // Fallback candidate 2: unrecorded same-named real user document -> preserved cleanly.
+        let fallback_user_dir = base.join("UserC").join("Documents");
+        std::fs::create_dir_all(&fallback_user_dir).unwrap();
+        let fallback_user_doc = fallback_user_dir.join(HONEYPOT_DEFAULT_FILENAME);
+        let fallback_user_payload = b"User C private notes sharing the canary filename.\r\n";
+        std::fs::write(&fallback_user_doc, fallback_user_payload).unwrap();
 
         // Junction-backed decoy tracked in SQLite must be rejected without deleting victim file.
         let victim_decoy = victim.join(HONEYPOT_DEFAULT_FILENAME);
@@ -2909,23 +2966,47 @@ mod tests {
         let evil_decoy = junc_root.join(HONEYPOT_DEFAULT_FILENAME);
 
         let store = LedrStore::open(&db_path).expect("open db");
-        let mut tracked = deployed.clone();
-        tracked.push(evil_decoy.clone());
+        let mut tracked: Vec<TrackedHoneypotRecord> = owned_records
+            .iter()
+            .map(|r| TrackedHoneypotRecord {
+                file_path: r.path.clone(),
+                volume_serial: Some(r.file_id.volume_serial),
+                file_index: Some(r.file_id.file_index),
+            })
+            .collect();
+        tracked.push(TrackedHoneypotRecord {
+            file_path: evil_decoy.clone(),
+            volume_serial: None,
+            file_index: None,
+        });
         store
-            .record_honeypot_paths(&tracked, 1_700_000_000_000)
+            .record_honeypot_records(&tracked, 1_700_000_000_000)
             .expect("record tracked honeypots");
         drop(store);
 
-        let outcome =
-            cleanup_honeypots_with_db_and_fallback(&db_path, std::slice::from_ref(&fallback_decoy));
-        assert_eq!(outcome.removed, 4, "3 tracked + 1 fallback decoy removed");
+        let outcome = cleanup_honeypots_with_db_and_fallback(
+            &db_path,
+            &[fallback_legacy_decoy.clone(), fallback_user_doc.clone()],
+        );
+        assert_eq!(
+            outcome.removed, 3,
+            "Documents + Desktop (modified) + legacy exact fallback removed"
+        );
         assert_eq!(outcome.already_absent, 0);
+        assert_eq!(
+            outcome.skipped_not_owned, 2,
+            "replaced Pictures file + UserC same-named doc skipped"
+        );
         assert_eq!(outcome.failed, 1, "junction target must fail safely");
-        assert_eq!(outcome.db_records_removed, 3);
-        for path in &deployed {
-            assert!(!path.exists(), "tracked decoy {} must be deleted", path.display());
-        }
-        assert!(!fallback_decoy.exists(), "fallback decoy must be deleted");
+        assert_eq!(
+            outcome.db_records_removed, 3,
+            "3 UserA rows (2 removed + 1 stale replaced) cleaned from DB"
+        );
+        assert!(!docs.join(HONEYPOT_DEFAULT_FILENAME).exists());
+        assert!(!desktop_decoy.exists());
+        assert!(!fallback_legacy_decoy.exists());
+        assert_eq!(std::fs::read(&pictures_decoy).unwrap(), replacement_payload);
+        assert_eq!(std::fs::read(&fallback_user_doc).unwrap(), fallback_user_payload);
         assert!(victim_decoy.exists(), "victim decoy behind junction must remain intact");
 
         let remaining =
@@ -2936,17 +3017,23 @@ mod tests {
             "failed tracked path must remain in SQLite while cleaned paths are removed"
         );
 
-        // Missing DB must NOT create a new DB and still deletes fallback decoys cleanly.
+        // Missing DB must NOT create a new DB and still deletes only exact-content fallback decoys.
         let missing_db = base.join("absent").join("localedr.db");
-        let fallback_only = fallback_dir.join(HONEYPOT_DEFAULT_FILENAME);
-        std::fs::write(&fallback_only, b"fallback-only").unwrap();
+        let fallback_exact = fallback_legacy_dir.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(
+            &fallback_exact,
+            b"LocalEDR Canary Decoy File - Do Not Modify or Delete.\r\n",
+        )
+        .unwrap();
         let outcome_no_db = cleanup_honeypots_with_db_and_fallback(
             &missing_db,
-            std::slice::from_ref(&fallback_only),
+            &[fallback_exact.clone(), fallback_user_doc.clone()],
         );
         assert_eq!(outcome_no_db.removed, 1);
+        assert_eq!(outcome_no_db.skipped_not_owned, 1);
         assert_eq!(outcome_no_db.failed, 0);
-        assert!(!fallback_only.exists());
+        assert!(!fallback_exact.exists());
+        assert_eq!(std::fs::read(&fallback_user_doc).unwrap(), fallback_user_payload);
         assert!(!missing_db.exists());
         assert!(!base.join("absent").exists());
 

@@ -136,6 +136,8 @@ CREATE INDEX IF NOT EXISTS idx_dl_sha256_nocase ON download_origins(sha256 COLLA
 CREATE TABLE IF NOT EXISTS honeypot_files (
     normalized_path TEXT PRIMARY KEY,
     file_path       TEXT NOT NULL,
+    volume_serial   INTEGER,
+    file_index      INTEGER,
     created_at_ms   INTEGER NOT NULL,
     last_seen_at_ms INTEGER NOT NULL
 ) WITHOUT ROWID;

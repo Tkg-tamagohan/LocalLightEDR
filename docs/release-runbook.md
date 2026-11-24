@@ -147,7 +147,7 @@ git push origin v0.1.0
 | :--- | :--- | :--- | :--- |
 | `C:\Program Files\LocalEDR\`（4 バイナリ、`uninstall.ps1`、`uninstall.exe`） | 削除 | 削除 | 終了待機上限は UI 10 秒、SCM 15 秒、ロック再試行 5 秒です。 |
 | Windows Service `LocalEDR`（`sc.exe delete LocalEDR`） | 削除 | 削除 | 停止後にサービス登録を削除します。 |
-| 各ユーザーのおとりファイル（`%USERPROFILE%\{Documents,Desktop,Pictures}\!00_LocalEDR_Canary_DoNotEdit.docx`） | 削除 | 削除 | SQLite `honeypot_files` 追跡記録と各ユーザープロファイル一覧に基づき、サービス停止後に `ledr-daemon.exe --cleanup-honeypots` がリパースポイントおよびハードリンクを拒否しつつハンドル上で自動削除します（`L-06`）。 |
+| 各ユーザーのおとりファイル（`%USERPROFILE%\{Documents,Desktop,Pictures}\!00_LocalEDR_Canary_DoNotEdit.docx`） | 削除 | 削除 | SQLite `honeypot_files` 追跡記録（ボリュームおよびファイル識別子を含む）と各ユーザープロファイル一覧に基づき、サービス停止後に `ledr-daemon.exe --cleanup-honeypots` がリパースポイントとハードリンクを拒否しつつハンドル上で自動削除します（`L-06`）。記録済み識別子に一致しない置換後ファイルと、未記録かつ既知デコイ文面に一致しない同名のユーザー文書は削除せず保全します。 |
 | `HKLM` Native Messaging（`KEY_WOW64_32KEY` と `KEY_WOW64_64KEY`）、`ledr://`、AUMID | 削除 | 削除 | `ledr-bridge-nm.exe unregister --scope machine` で解除します。 |
 | ARP 登録（`Uninstall\LocalEDR`） | 削除 | 削除 | 64 ビットレジストリビューから削除します。 |
 | `C:\ProgramData\LocalEDR\localedr.db`（`-wal`、`-shm`） | 保全 | 削除 | 再インストール時の履歴引き継ぎのため既定で残します。 |

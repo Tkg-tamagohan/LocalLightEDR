@@ -21,6 +21,7 @@ use ledr_proto::{
 use rusqlite::{params, Connection};
 use thiserror::Error;
 
+pub use honeypots::TrackedHoneypotRecord;
 use schema::{
     apply_reader_pragmas, apply_writer_pragmas, reader_open_flags, writer_open_flags, SCHEMA_DDL,
 };
@@ -189,6 +190,7 @@ impl LedrStore {
         let writer = Connection::open_with_flags(path, writer_open_flags())?;
         apply_writer_pragmas(&writer)?;
         writer.execute_batch(SCHEMA_DDL)?;
+        honeypots::ensure_honeypot_file_id_columns(&writer)?;
 
         let reader = Connection::open_with_flags(path, reader_open_flags())?;
         apply_reader_pragmas(&reader)?;
@@ -216,6 +218,7 @@ impl LedrStore {
         let conn = Connection::open_in_memory()?;
         apply_writer_pragmas(&conn)?;
         conn.execute_batch(SCHEMA_DDL)?;
+        honeypots::ensure_honeypot_file_id_columns(&conn)?;
 
         let shared = Arc::new(Mutex::new(conn));
         Ok(Self {

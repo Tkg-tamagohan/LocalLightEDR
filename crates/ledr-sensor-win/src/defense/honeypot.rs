@@ -16,9 +16,9 @@ use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_BASIC_INFO,
     FILE_DISPOSITION_INFO, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING,
-    SYNCHRONIZE, VOLUME_NAME_DOS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
 };
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSConnected, WTSDisconnected, WTSEnumerateSessionsW, WTSFreeMemory,
@@ -51,12 +51,46 @@ const ERROR_NO_MORE_ITEMS_U32: u32 = 259;
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
 
+/// Windows volume serial number and file index identifying a specific file object on NTFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoneypotFileId {
+    pub volume_serial: u32,
+    pub file_index: u64,
+}
+
+impl HoneypotFileId {
+    /// Extracts the volume serial and 64-bit file index from `BY_HANDLE_FILE_INFORMATION`.
+    pub fn from_file_info(info: &BY_HANDLE_FILE_INFORMATION) -> Self {
+        Self {
+            volume_serial: info.dwVolumeSerialNumber,
+            file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        }
+    }
+}
+
+/// Deployed honeypot decoy confirmed to be owned by LocalEDR (created exclusively or verified to
+/// contain the exact decoy payload), paired with its kernel file identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedHoneypotRecord {
+    pub path: PathBuf,
+    pub file_id: HoneypotFileId,
+}
+
+/// Outcome of attempting to remove a honeypot decoy file with ownership verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoneypotRemoveResult {
+    Removed,
+    AlreadyAbsent,
+    SkippedNotOwned,
+}
+
 /// Manages deployment and removal of lexicographically-first honeypot decoy files (`L-06`).
 #[derive(Debug, Clone)]
 pub struct HoneypotManager {
     roots: Vec<PathBuf>,
     create_missing_roots: bool,
     deployed_paths: Vec<PathBuf>,
+    owned_records: Vec<OwnedHoneypotRecord>,
 }
 
 impl Default for HoneypotManager {
@@ -74,6 +108,7 @@ impl HoneypotManager {
             roots,
             create_missing_roots: false,
             deployed_paths: Vec::new(),
+            owned_records: Vec::new(),
         }
     }
 
@@ -93,6 +128,7 @@ impl HoneypotManager {
             roots,
             create_missing_roots: false,
             deployed_paths: Vec::new(),
+            owned_records: Vec::new(),
         }
     }
 
@@ -103,6 +139,7 @@ impl HoneypotManager {
             roots,
             create_missing_roots: true,
             deployed_paths: Vec::new(),
+            owned_records: Vec::new(),
         }
     }
 
@@ -114,6 +151,11 @@ impl HoneypotManager {
     /// Returns the paths currently tracked as deployed honeypots.
     pub fn deployed_paths(&self) -> &[PathBuf] {
         &self.deployed_paths
+    }
+
+    /// Returns deployed honeypots confirmed to be LocalEDR-owned along with their file identities.
+    pub fn owned_deployed_records(&self) -> &[OwnedHoneypotRecord] {
+        &self.owned_records
     }
 
     /// Returns `true` if `a` and `b` represent the same set of honeypot file paths
@@ -147,6 +189,14 @@ impl HoneypotManager {
                 .map(normalize_windows_path_key)
                 .is_some_and(|key| allowed_roots.contains(&key));
             parent_allowed && is_safe_existing_file(path)
+        });
+        self.owned_records.retain(|rec| {
+            let parent_allowed = rec
+                .path
+                .parent()
+                .map(normalize_windows_path_key)
+                .is_some_and(|key| allowed_roots.contains(&key));
+            parent_allowed && is_safe_existing_file(&rec.path)
         });
 
         let deploy_result = self.deploy_honeypots();
@@ -190,13 +240,29 @@ impl HoneypotManager {
             let target = root.join(HONEYPOT_DEFAULT_FILENAME);
             let deploy_res = deploy_single_honeypot_in_dir(&verified_dir, &target);
             match deploy_res {
-                Ok(()) => {
+                Ok(maybe_file_id) => {
+                    let target_key = normalize_windows_path_key(&target);
                     if !self
                         .deployed_paths
                         .iter()
-                        .any(|p| normalize_windows_path_key(p) == normalize_windows_path_key(&target))
+                        .any(|p| normalize_windows_path_key(p) == target_key)
                     {
                         self.deployed_paths.push(target.clone());
+                    }
+                    if let Some(file_id) = maybe_file_id {
+                        if let Some(existing) = self
+                            .owned_records
+                            .iter_mut()
+                            .find(|r| normalize_windows_path_key(&r.path) == target_key)
+                        {
+                            existing.path = target.clone();
+                            existing.file_id = file_id;
+                        } else {
+                            self.owned_records.push(OwnedHoneypotRecord {
+                                path: target.clone(),
+                                file_id,
+                            });
+                        }
                     }
                     created.push(target);
                 }
@@ -217,16 +283,29 @@ impl HoneypotManager {
     /// Deletes all tracked honeypot files cleanly, returning the number of files removed.
     pub fn remove_honeypots(&mut self) -> Result<usize, SensorError> {
         let tracked = std::mem::take(&mut self.deployed_paths);
+        let owned = std::mem::take(&mut self.owned_records);
         let mut removed = 0usize;
-        let mut remaining = Vec::new();
 
         for (idx, path) in tracked.iter().enumerate() {
-            match remove_verified_honeypot_file(path) {
-                Ok(true) => removed += 1,
-                Ok(false) => {}
+            let key = normalize_windows_path_key(path);
+            let expected_id = owned
+                .iter()
+                .find(|r| normalize_windows_path_key(&r.path) == key)
+                .map(|r| r.file_id);
+            match remove_verified_honeypot_file_with_identity(path, expected_id) {
+                Ok(HoneypotRemoveResult::Removed) => removed += 1,
+                Ok(HoneypotRemoveResult::AlreadyAbsent | HoneypotRemoveResult::SkippedNotOwned) => {}
                 Err(err) => {
-                    remaining.extend_from_slice(&tracked[idx..]);
-                    self.deployed_paths = remaining;
+                    let remaining_paths = tracked[idx..].to_vec();
+                    let remaining_keys: HashSet<String> = remaining_paths
+                        .iter()
+                        .map(|p| normalize_windows_path_key(p))
+                        .collect();
+                    self.deployed_paths = remaining_paths;
+                    self.owned_records = owned
+                        .into_iter()
+                        .filter(|r| remaining_keys.contains(&normalize_windows_path_key(&r.path)))
+                        .collect();
                     return Err(err);
                 }
             }
@@ -285,10 +364,16 @@ fn verify_no_reparse_ancestors(dir_path: &Path) -> Result<(), SensorError> {
 /// Safely removes a deployed honeypot canary file (`!00_LocalEDR_Canary_DoNotEdit.docx`) via
 /// handle-based TOCTOU-free verification (`L-06`).
 ///
-/// Rejects arbitrary filenames, reparse points at any ancestor or target, non-disk objects,
-/// hardlinks (`nNumberOfLinks != 1`), and path escapes outside the verified parent directory.
-/// Returns `Ok(true)` if removed, `Ok(false)` if the file or its parent directory is already absent.
-pub fn remove_verified_honeypot_file(path: &Path) -> Result<bool, SensorError> {
+/// When `expected_file_id` is `Some`, deletion proceeds only if the open handle's NTFS
+/// `(dwVolumeSerialNumber, nFileIndexHigh/Low)` matches `expected_file_id` (allowing cleanup of
+/// LocalEDR-created decoys even if modified by ransomware, while preserving files replaced with
+/// a different object). When `expected_file_id` is `None`, deletion proceeds only if the open
+/// handle's exact contents match `HONEYPOT_DECOY_CONTENT`, protecting pre-existing user
+/// documents sharing the canary filename.
+pub fn remove_verified_honeypot_file_with_identity(
+    path: &Path,
+    expected_file_id: Option<HoneypotFileId>,
+) -> Result<HoneypotRemoveResult, SensorError> {
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
         return Err(SensorError::Io(std::io::Error::new(
             ErrorKind::InvalidInput,
@@ -314,7 +399,9 @@ pub fn remove_verified_honeypot_file(path: &Path) -> Result<bool, SensorError> {
 
     match verify_no_reparse_ancestors(subdir) {
         Ok(()) => {}
-        Err(SensorError::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(SensorError::Io(err)) if err.kind() == ErrorKind::NotFound => {
+            return Ok(HoneypotRemoveResult::AlreadyAbsent)
+        }
         Err(err) => return Err(err),
     }
 
@@ -325,7 +412,9 @@ pub fn remove_verified_honeypot_file(path: &Path) -> Result<bool, SensorError> {
     };
     let parent_dir = match parent_res {
         Ok(dir) => dir,
-        Err(SensorError::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(SensorError::Io(err)) if err.kind() == ErrorKind::NotFound => {
+            return Ok(HoneypotRemoveResult::AlreadyAbsent)
+        }
         Err(err) => return Err(err),
     };
 
@@ -338,11 +427,26 @@ pub fn remove_verified_honeypot_file(path: &Path) -> Result<bool, SensorError> {
         FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
     ) {
         Ok(h) => h,
-        Err(NtCreateError::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(NtCreateError::Io(err)) if err.kind() == ErrorKind::NotFound => {
+            return Ok(HoneypotRemoveResult::AlreadyAbsent)
+        }
         Err(err) => return Err(SensorError::from(err)),
     };
 
     let info = verify_decoy_file_handle(attr_handle.0, &parent_dir, path)?;
+    match expected_file_id {
+        Some(expected) => {
+            if HoneypotFileId::from_file_info(&info) != expected {
+                return Ok(HoneypotRemoveResult::SkippedNotOwned);
+            }
+        }
+        None => {
+            if !handle_has_known_decoy_content(attr_handle.0, &info, path)? {
+                return Ok(HoneypotRemoveResult::SkippedNotOwned);
+            }
+        }
+    }
+
     let share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     // SAFETY: `attr_handle.0` is an open, verified regular disk file handle (`nNumberOfLinks == 1`).
     let delete_raw = unsafe {
@@ -422,7 +526,16 @@ pub fn remove_verified_honeypot_file(path: &Path) -> Result<bool, SensorError> {
 
     drop(attr_handle);
     drop(delete_handle);
-    Ok(true)
+    Ok(HoneypotRemoveResult::Removed)
+}
+
+/// Safely removes an unindexed honeypot canary file (`!00_LocalEDR_Canary_DoNotEdit.docx`) only
+/// if its exact file contents match `HONEYPOT_DECOY_CONTENT` (`L-06`).
+pub fn remove_verified_honeypot_file(path: &Path) -> Result<bool, SensorError> {
+    Ok(matches!(
+        remove_verified_honeypot_file_with_identity(path, None)?,
+        HoneypotRemoveResult::Removed
+    ))
 }
 
 /// Returns `true` if `a` and `b` contain the same set of honeypot paths (case-insensitive on
@@ -837,10 +950,75 @@ fn write_all_to_handle(handle: HANDLE, mut data: &[u8]) -> Result<(), SensorErro
     Ok(())
 }
 
+fn handle_has_known_decoy_content(
+    attr_handle: HANDLE,
+    info: &BY_HANDLE_FILE_INFORMATION,
+    target_display: &Path,
+) -> Result<bool, SensorError> {
+    let expected_len_u32 = u32::try_from(HONEYPOT_DECOY_CONTENT.len()).unwrap_or(u32::MAX);
+    if info.nFileSizeHigh != 0 || info.nFileSizeLow != expected_len_u32 {
+        return Ok(false);
+    }
+
+    let share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    // SAFETY: `attr_handle` is an open verified regular disk file handle.
+    let read_raw = unsafe {
+        ReOpenFile(
+            attr_handle,
+            FILE_READ_DATA.0 | SYNCHRONIZE.0,
+            share_all,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+        )
+    }
+    .map_err(|err| SensorError::Win32 {
+        api: "ReOpenFile",
+        message: format!(
+            "failed upgrading honeypot handle for read {}: {err}",
+            target_display.display()
+        ),
+    })?;
+    if read_raw.is_invalid() || read_raw.0.is_null() {
+        return Err(SensorError::Io(std::io::Error::other(format!(
+            "ReOpenFile returned invalid read handle for {}",
+            target_display.display()
+        ))));
+    }
+    let read_handle = OwnedHandle(read_raw);
+
+    let max_read = HONEYPOT_DECOY_CONTENT.len() + 1;
+    let mut buf = Vec::with_capacity(max_read);
+    let mut scratch = [0u8; 128];
+    while buf.len() < max_read {
+        let remaining = max_read - buf.len();
+        let to_read = u32::try_from(remaining.min(scratch.len())).unwrap_or(u32::MAX);
+        let mut bytes_read = 0u32;
+        // SAFETY: `read_handle.0` is open with `FILE_READ_DATA | SYNCHRONIZE` and `scratch[..to_read]`
+        // is writable stack memory for the duration of `ReadFile`.
+        let ok = unsafe {
+            ReadFile(
+                read_handle.0,
+                scratch.as_mut_ptr(),
+                to_read,
+                &raw mut bytes_read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(SensorError::Io(std::io::Error::last_os_error()));
+        }
+        if bytes_read == 0 {
+            break;
+        }
+        buf.extend_from_slice(&scratch[..bytes_read as usize]);
+    }
+
+    Ok(buf == HONEYPOT_DECOY_CONTENT)
+}
+
 fn deploy_single_honeypot_in_dir(
     dir: &VerifiedDirectory,
     target_display: &Path,
-) -> Result<(), SensorError> {
+) -> Result<Option<HoneypotFileId>, SensorError> {
     let Some(file_name) = target_display.file_name() else {
         return Err(SensorError::Io(std::io::Error::new(
             ErrorKind::InvalidInput,
@@ -866,7 +1044,7 @@ fn deploy_single_honeypot_in_dir(
                 info.dwFileAttributes,
                 target_display,
             )?;
-            Ok(())
+            Ok(Some(HoneypotFileId::from_file_info(&info)))
         }
         Err(create_err @ (NtCreateError::AlreadyExists | NtCreateError::AccessDenied(_))) => {
             // If `FILE_CREATE` with `FILE_NON_DIRECTORY_FILE` encountered an existing directory,
@@ -885,6 +1063,8 @@ fn deploy_single_honeypot_in_dir(
                 Err(_) => return Err(SensorError::from(create_err)),
             };
             let info = verify_decoy_file_handle(attr_handle.0, dir, target_display)?;
+            let is_known_decoy =
+                handle_has_known_decoy_content(attr_handle.0, &info, target_display)?;
             let share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
             // SAFETY: `attr_handle.0` is an open verified regular disk file handle.
             let write_raw = unsafe {
@@ -914,7 +1094,11 @@ fn deploy_single_honeypot_in_dir(
                 info.dwFileAttributes,
                 target_display,
             )?;
-            Ok(())
+            if is_known_decoy {
+                Ok(Some(HoneypotFileId::from_file_info(&info)))
+            } else {
+                Ok(None)
+            }
         }
         Err(NtCreateError::Io(err)) => Err(SensorError::Io(err)),
     }
@@ -1554,6 +1738,13 @@ extern "system" {
         lp_number_of_bytes_written: *mut u32,
         lp_overlapped: *mut c_void,
     ) -> i32;
+    fn ReadFile(
+        h_file: HANDLE,
+        lp_buffer: *mut u8,
+        n_number_of_bytes_to_read: u32,
+        lp_number_of_bytes_read: *mut u32,
+        lp_overlapped: *mut c_void,
+    ) -> i32;
 }
 
 #[cfg(test)]
@@ -2033,5 +2224,93 @@ mod tests {
             .join("Documents")
             .join(HONEYPOT_DEFAULT_FILENAME);
         assert!(!remove_verified_honeypot_file(&absent_path).expect("missing ancestor"));
+    }
+
+    #[test]
+    fn honeypot_l06_08_ownership_identity_and_content_guards_preserve_user_documents() {
+        let tmp = TempHoneypotDir::new("ownership-guards");
+        let profile = tmp.path().join("UserProfile");
+        let docs = profile.join("Documents");
+        let desktop = profile.join("Desktop");
+        let pictures = profile.join("Pictures");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::create_dir_all(&pictures).unwrap();
+
+        // Pre-existing real user document sharing the canary filename in Documents.
+        let user_doc = docs.join(HONEYPOT_DEFAULT_FILENAME);
+        let user_payload = b"Q4 Financial Report - confidential user document content.\r\n";
+        std::fs::write(&user_doc, user_payload).unwrap();
+
+        let mut mgr = HoneypotManager::for_user_profiles(vec![profile.clone()]);
+        let deployed = mgr.deploy_honeypots().expect("deploy honeypots");
+        assert_eq!(deployed.len(), 3);
+
+        // Only Desktop and Pictures were exclusively created; Documents pre-existing user doc must NOT be owned.
+        let owned = mgr.owned_deployed_records().to_vec();
+        assert_eq!(owned.len(), 2);
+        assert!(owned.iter().all(|r| r.path != user_doc));
+
+        // 1. Pre-existing user document is preserved under unindexed cleanup (expected_file_id = None).
+        assert_eq!(
+            remove_verified_honeypot_file_with_identity(&user_doc, None)
+                .expect("inspect user doc"),
+            HoneypotRemoveResult::SkippedNotOwned
+        );
+        assert_eq!(std::fs::read(&user_doc).unwrap(), user_payload);
+
+        // 2. Exclusively created decoy modified in-place (e.g. ransomware encryption) is STILL deleted
+        //    when expected_file_id matches the recorded NTFS file identity.
+        let desktop_rec = owned
+            .iter()
+            .find(|r| r.path == desktop.join(HONEYPOT_DEFAULT_FILENAME))
+            .expect("desktop owned record")
+            .clone();
+        {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&desktop_rec.path)
+                .expect("overwrite desktop decoy");
+            use std::io::Write as _;
+            f.write_all(b"ENCRYPTED_BY_RANSOMWARE").unwrap();
+        }
+        assert_eq!(
+            remove_verified_honeypot_file_with_identity(&desktop_rec.path, Some(desktop_rec.file_id))
+                .expect("remove modified owned decoy"),
+            HoneypotRemoveResult::Removed
+        );
+        assert!(!desktop_rec.path.exists());
+
+        // 3. Exclusively created decoy replaced by a new user document (different file_index) is
+        //    refused and preserved cleanly.
+        let pictures_rec = owned
+            .iter()
+            .find(|r| r.path == pictures.join(HONEYPOT_DEFAULT_FILENAME))
+            .expect("pictures owned record")
+            .clone();
+        let replacement_tmp = tmp.path().join("user_replacement.docx");
+        let replacement_payload = b"User replaced file with real work.\r\n";
+        std::fs::write(&replacement_tmp, replacement_payload).unwrap();
+        std::fs::remove_file(&pictures_rec.path).unwrap();
+        std::fs::rename(&replacement_tmp, &pictures_rec.path).unwrap();
+        assert_eq!(
+            remove_verified_honeypot_file_with_identity(&pictures_rec.path, Some(pictures_rec.file_id))
+                .expect("skip replaced file"),
+            HoneypotRemoveResult::SkippedNotOwned
+        );
+        assert_eq!(std::fs::read(&pictures_rec.path).unwrap(), replacement_payload);
+
+        // 4. Legacy unrecorded decoy matching exact HONEYPOT_DECOY_CONTENT is deleted even with None.
+        let legacy_dir = tmp.path().join("LegacyUser").join("Documents");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_decoy = legacy_dir.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(&legacy_decoy, HONEYPOT_DECOY_CONTENT).unwrap();
+        assert_eq!(
+            remove_verified_honeypot_file_with_identity(&legacy_decoy, None)
+                .expect("remove legacy exact decoy"),
+            HoneypotRemoveResult::Removed
+        );
+        assert!(!legacy_decoy.exists());
     }
 }

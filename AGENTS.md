@@ -61,8 +61,8 @@
 - `apps/ledr-ui/src/defense_status.rs` はユーザーの機密ファイル（`Cookies`、`.ssh` 等）へ一切アクセスせず、おとりファイル、ブリッジバイナリ、`HKCU` および `HKLM` の読み取り専用レジストリ参照とマニフェスト検証のみを行い、ウィンドウ閉鎖時は `ledr-ui` と WebView2 を 0 プロセスで終了する（`L-08`）。
   マニフェスト検証は既定 2 ディレクトリのホワイトリスト配下だけに限定し、リパースポイント拒否、`FILE_FLAG_OPEN_REPARSE_POINT` と `FILE_READ_ATTRIBUTES` の先行検査、`nNumberOfLinks == 1`、`GetFinalPathNameByHandleW` 閉じ込め、`ReOpenFile` 昇格を経て読み取り、`description` を必須項目として検証する。
   カスタム配置パスに対してはファイル I/O を行わず、`unverified` として検証済み状態と区別する。
-- View 3（`apps/ledr-ui/src/defense_status.rs`）の Native Messaging レジストリ診断では、WOW64 参照を `KEY_WOW64_32KEY -> KEY_WOW64_64KEY` の順で探索し、32 ビット側で `EmptyString` を検出した場合は 64 ビット側へフォールバックせず 32 ビット側で打ち切る。
-  CLI `ledr-bridge-nm` の `HKLM` Native Messaging 操作も同様に WOW64 32 ビット・64 ビット両ビューに対応し、`setup --scope machine` は 32 ビット・64 ビット両ビューへ冪等に登録、`status` は View 3 と一致する順（32 ビット先行、32 ビット側 `EmptyString` で打ち切り）で探索、`unregister` は両ビューを冪等に削除したうえで両ビューの残存参照を確認してからマニフェストファイルを削除する（`HKCU`、URI スキーム、AUMID、グループポリシーは既定ビューのみを維持する）。
+- View 3（`apps/ledr-ui/src/defense_status.rs`）の Native Messaging レジストリ診断では、WOW64 参照を `KEY_WOW64_32KEY -> KEY_WOW64_64KEY` の順で探索し、32 ビット側で `EmptyString` を検出した場合は 64 ビット側へフォールバックせず 32 ビット側で打ち切る（View 3 側の `apps/ledr-ui/src/uri_reg.rs` は `HKLM` 32 ビットビューを含め動的バッファ拡張かつ `REG_SZ` 限定であり、CLI 側との診断境界差異の正本は `docs/follow-up-notes.md` の `FU-P4-01` で管理する）。
+  CLI `ledr-bridge-nm`（`crates/ledr-bridge-nm/src/setup.rs`）の `HKLM` Native Messaging 操作は WOW64 32 ビットおよび 64 ビット両ビューに対応し、`setup --scope machine` の両ビュー冪等登録、Chromium 互換の `REG_SZ` / `REG_EXPAND_SZ` プローブと `stops_wow64_fallback()` による 64 ビット非参照短絡診断、ならびに両ビューのレジストリキー冪等削除後のフェイルクローズ共有マニフェスト保護と両ビュー全登録パス正規化比較による `manifest_removed` 判定を維持する（詳細境界は `.agents/rules/active-defense-guards.md` 項目 8 に従い、`HKCU`、URI スキーム、AUMID、グループポリシーは既定ビューのみを維持する）。
 - View 3 のブラウザ別詳細行（`.browser-detail-row`）には各ブラウザの `manifest_path` と診断表示を併記し、`UI-P4-08` 等の UI 回帰テストではコンテナ全体検索だけで済ませず、ブラウザ単位で詳細行要素を抽出して期待する値が併記されていることと他ブラウザの情報が混入していないことを検証する。
 - 実 Chrome 拡張ロード、実 Native Messaging ホスト起動、実ダウンロードの `:Zone.Identifier` 付与と移動後紐付け、および実 WebView2 終了計測は合成テストでは検証済みと扱わず、Windows 10/11 クライアント SKU の実機 E2E（`FU-E2E-02`）対象として残す。
 

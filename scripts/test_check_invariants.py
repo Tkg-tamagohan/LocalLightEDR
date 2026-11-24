@@ -127,6 +127,16 @@ EXPECTED_QUESTIONS: dict[str, tuple[list[str], float, float]] = {
         0.65,
         0.40,
     ),
+    "bridge_nm_wow64_probe_and_status": (
+        ["crates/ledr-bridge-nm/src/setup.rs"],
+        0.65,
+        0.40,
+    ),
+    "bridge_nm_unregister_manifest_protection": (
+        ["crates/ledr-bridge-nm/src/setup.rs"],
+        0.65,
+        0.40,
+    ),
 }
 
 
@@ -364,7 +374,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.skipTest(f"Global invariant gate script not installed: {exc}")
 
     def test_T1_05_invariants_json_strict_schema_and_gate_loader(self) -> None:
-        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 12 keys and load_custom_questions."""
+        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 14 keys and load_custom_questions."""
         invariants_path = REPO_ROOT / ".agents" / "invariants.json"
         self.assertTrue(invariants_path.is_file(), f"Missing {invariants_path}")
 
@@ -547,6 +557,63 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             "unrelated to collect_unexited_descendants",
         ):
             self.assertIn(kw, pt_desc["instructions"])
+
+        bridge_probe = questions["bridge_nm_wow64_probe_and_status"]
+        bridge_probe_opening, bridge_probe_rest = bridge_probe["instructions"].split("?", 1)
+        for text_field in (
+            bridge_probe_opening,
+            bridge_probe_rest,
+            bridge_probe["criteria"]["true_description"],
+            bridge_probe["criteria"]["false_description"],
+        ):
+            for kw in (
+                "REG_SZ",
+                "REG_EXPAND_SZ",
+                "1,024",
+                "2,048",
+                "UnresolvableExpandSz",
+                "stops_wow64_fallback",
+                "ChromiumReadFallback",
+                "HKCU",
+            ):
+                self.assertIn(kw, text_field)
+        for kw in (
+            "CHROMIUM_READ_VALUE_MAX_UTF16_UNITS",
+            "exceeds_chromium_raw_limit",
+            "ExpandEnvironmentStringsW",
+            "run_status_with_ops",
+            "unrelated to Native Messaging registry probing",
+        ):
+            self.assertIn(kw, bridge_probe["instructions"])
+
+        bridge_unreg = questions["bridge_nm_unregister_manifest_protection"]
+        bridge_unreg_opening, bridge_unreg_rest = bridge_unreg["instructions"].split("?", 1)
+        for text_field in (
+            bridge_unreg_opening,
+            bridge_unreg_rest,
+            bridge_unreg["criteria"]["true_description"],
+            bridge_unreg["criteria"]["false_description"],
+        ):
+            for kw in (
+                "any_browser_references_manifest_with",
+                "Ok(false)",
+                "Ok(true)",
+                "stops_wow64_fallback",
+                "EmptyString",
+                "32,768",
+                "resolved_path",
+                "UnresolvableExpandSz",
+                "manifest_removed",
+            ):
+                self.assertIn(kw, text_field)
+            self.assertNotIn("unshort-circuited", text_field.lower())
+        self.assertNotIn("unshort-circuited", bridge_unreg["description"].lower())
+        for kw in (
+            "run_unregister_with_ops",
+            "Scope::Machine",
+            "unrelated to manifest removal reference checks",
+        ):
+            self.assertIn(kw, bridge_unreg["instructions"])
 
         # Verify offline (even when the global plugin script is not installed) that
         # every path_glob in .agents/invariants.json is reachable through
@@ -825,6 +892,39 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                 "-                    && next_cutoff.is_none_or(|c| e.identity.create_time_100ns < c)\n                     && !visited.contains(&e.identity)",
                 {"process_table_descendant_traversal", "never_suspend_and_create_time"},
             ),
+            (
+                "crates/ledr-bridge-nm/src/setup.rs",
+                "@@ -2445,9 +2445,5 @@",
+                "                     let view32 =\n                         ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6432));",
+                (
+                    "-                    if view32.stops_wow64_fallback() {\n"
+                    "-                        (view32, Some(RegWow64View::Wow6432))\n"
+                    "-                    } else {\n"
+                    "-                        let view64 =\n"
+                    "-                            ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6464));\n"
+                    "-                        select_effective_hklm_probe(view32, view64)\n"
+                    "-                    }\n"
+                    "+                    let view64 =\n"
+                    "+                        ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6464));\n"
+                    "+                    select_effective_hklm_probe(view32, view64)"
+                ),
+                {
+                    "bridge_nm_wow64_probe_and_status",
+                    "bridge_nm_unregister_manifest_protection",
+                    "ipc_caller_auth_and_rw_timeout",
+                    "phase4_nrd_local_only_and_motw",
+                },
+            ),
+            (
+                "crates/ledr-bridge-nm/src/pipe_client.rs",
+                "@@ -1,1 +1,2 @@",
+                " //! 1-request-1-connection Named Pipe IPC client with `SEC_0003` server validation and bounded timeouts.",
+                "+// Verify dry-run custom rule selection excludes setup.rs-only rules.",
+                {
+                    "ipc_caller_auth_and_rw_timeout",
+                    "phase4_nrd_local_only_and_motw",
+                },
+            ),
         ]
 
         for rel_path, hunk_header, context_line, change_lines, expected_keys in cases:
@@ -850,6 +950,9 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                 )
                 if rel_path != "crates/ledr-daemon/src/process_table.rs":
                     self.assertNotIn("process_table_descendant_traversal", questions)
+                if rel_path != "crates/ledr-bridge-nm/src/setup.rs":
+                    self.assertNotIn("bridge_nm_wow64_probe_and_status", questions)
+                    self.assertNotIn("bridge_nm_unregister_manifest_protection", questions)
 
     def test_T1_08_require_gate_script_skips_missing_default_and_fails_bad_env(self) -> None:
         """T1-08: Missing default plugin skips, whereas invalid explicit LEDR_INVARIANT_GATE_SCRIPT fails."""

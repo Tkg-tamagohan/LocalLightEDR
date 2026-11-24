@@ -2217,3 +2217,71 @@ fn firewall_restore_removed_app_blocks_skips_exited_unbound_preemptive_and_marks
         "existing non-startup Preemptive handle must inherit prev_deferred_preemptive_removal on rollback"
     );
 }
+
+fn assert_full_32_entry_merge_case(
+    authorizing: &[&str],
+    cohosted: &[&str],
+    expected: &[String],
+) {
+    let mut target = Vec::with_capacity(MAX_DOMAIN_HINTS_PER_FILTER);
+    target.push("auth0".to_string());
+    target.extend((0..31).map(|i| format!("c{i:02}")));
+    assert_eq!(target.len(), MAX_DOMAIN_HINTS_PER_FILTER);
+
+    let auth_vec = str_vec(authorizing);
+    let cohost_vec = str_vec(cohosted);
+    hints::merge_domain_hints_prioritized(&mut target, &auth_vec, &cohost_vec);
+    assert_eq!(target.len(), MAX_DOMAIN_HINTS_PER_FILTER);
+    assert_eq!(target, expected);
+
+    // Also verify via `WfpRuleManager::ensure_ip_permit_for_domain_hints_prioritized`.
+    let mut fw = WfpRuleManager::new();
+    let defense = StubDefense::new();
+    let exe = r"C:\Tools\app.exe";
+    let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 201));
+    let initial_cohosted: Vec<String> = (0..31).map(|i| format!("c{i:02}")).collect();
+    fw.ensure_ip_permit_for_domain_hints_prioritized(
+        exe,
+        ip,
+        &["auth0"],
+        &initial_cohosted,
+        &defense,
+    )
+    .expect("install full 32-entry permit");
+    fw.ensure_ip_permit_for_domain_hints_prioritized(exe, ip, authorizing, cohosted, &defense)
+        .expect("merge authorizing and cohosted hints");
+    assert_eq!(
+        fw.domain_policy_permit_hints(exe, ip).as_deref(),
+        Some(expected)
+    );
+}
+
+/// Regression test `FU-P3-01-01`:
+/// when a 32-entry `target` (`auth0` + `c00`..`c30`) has `c00` evicted by `auth1` in Loop 1,
+/// passing `cohosted_hints = ["c00", "c01"]` must NOT re-insert `c00`, preserving all 30
+/// remaining cohosted entries `c01`..`c30`.
+#[test]
+fn firewall_fu_p3_01_skips_reinsertion_of_batch_evicted_cohosted_hint_without_extra_eviction() {
+    let mut expected = vec!["auth0".to_string()];
+    expected.extend((1..=30).map(|i| format!("c{i:02}")));
+    expected.push("auth1".to_string());
+
+    assert_full_32_entry_merge_case(&["auth0", "auth1"], &["c00", "c01"], &expected);
+    assert!(!expected.iter().any(|h| h == "c00"));
+}
+
+/// Regression test `FU-P3-01-02`:
+/// under the same 32-entry full condition (`auth0` + `c00`..`c30`), passing a mix of evicted
+/// `c00` and new `c99` must skip `c00` so only `c99` evicts `c01` (1 entry) and appends at tail.
+#[test]
+fn firewall_fu_p3_01_mixed_evicted_and_new_cohosted_hints_evicts_only_one_extra_entry() {
+    let mut expected = vec!["auth0".to_string()];
+    expected.extend((2..=30).map(|i| format!("c{i:02}")));
+    expected.push("auth1".to_string());
+    expected.push("c99".to_string());
+
+    assert_full_32_entry_merge_case(&["auth0", "auth1"], &["c00", "c99"], &expected);
+    assert!(!expected.iter().any(|h| h == "c00"));
+    assert!(!expected.iter().any(|h| h == "c01"));
+    assert_eq!(expected.last().map(String::as_str), Some("c99"));
+}

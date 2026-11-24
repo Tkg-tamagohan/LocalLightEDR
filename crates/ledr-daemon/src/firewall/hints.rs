@@ -48,26 +48,28 @@ pub(super) fn merge_domain_hints_prioritized(
     cohosted_hints: &[String],
 ) {
     let protected: HashSet<&str> = authorizing_hints.iter().map(String::as_str).collect();
+    let mut evicted_in_batch: HashSet<String> = HashSet::new();
 
     for hint in authorizing_hints {
         if target.iter().any(|h| h == hint) {
             continue;
         }
         while target.len() >= MAX_DOMAIN_HINTS_PER_FILTER {
-            if let Some(evict_idx) = target
+            let removed = if let Some(evict_idx) = target
                 .iter()
                 .position(|existing| !protected.contains(existing.as_str()))
             {
-                target.remove(evict_idx);
+                target.remove(evict_idx)
             } else {
-                target.remove(0);
-            }
+                target.remove(0)
+            };
+            evicted_in_batch.insert(removed);
         }
         target.push(hint.clone());
     }
 
     for hint in cohosted_hints {
-        if target.iter().any(|h| h == hint) {
+        if target.iter().any(|h| h == hint) || evicted_in_batch.contains(hint.as_str()) {
             continue;
         }
         if target.len() >= MAX_DOMAIN_HINTS_PER_FILTER {

@@ -1902,6 +1902,7 @@ name = "ledr-ui"
 version = "0.1.0"
 dependencies = [
  "ledr-proto",
+ "ledr-updater",
  "serde",
  "serde_json",
  "tauri",

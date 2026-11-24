@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Launch mode for the on-demand LocalEDR UI binary (`決定記録 L-08`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8,6 +9,21 @@ pub enum LaunchMode {
     Notify(String),
     AlertFocus(String),
     RegisterUri,
+}
+
+/// Verified update arguments for elevated `--apply-verified-update` execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApplyVerifiedUpdateArgs {
+    pub(crate) manifest: PathBuf,
+    pub(crate) sig: PathBuf,
+    pub(crate) installer: PathBuf,
+}
+
+/// Top-level CLI action parsed from process arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CliAction {
+    Launch(LaunchMode),
+    ApplyVerifiedUpdate(ApplyVerifiedUpdateArgs),
 }
 
 fn parse_flag_value<I, S>(flag: &str, arg: &str, iter: &mut I) -> Result<Option<String>, String>
@@ -65,20 +81,100 @@ pub(crate) fn parse_ledr_alert_uri(raw: &str) -> Result<Option<String>, String> 
     Ok(Some(id.to_string()))
 }
 
-/// Parses CLI arguments into a [`LaunchMode`].
+/// Parses CLI arguments into a [`CliAction`].
 ///
-/// Supports `--notify <alert_id>` (one-shot WinRT toast mode),
-/// `--alert-id <id>` (direct alert triage focus mode),
-/// `--register-uri` (per-user `HKCU\Software\Classes\ledr` protocol handler registration),
-/// and `ledr://alert/<id>` / `--uri ledr://alert/<id>` protocol activation (`L-08`, `AUTO-14`).
-pub(crate) fn parse_launch_mode<I, S>(args: I) -> Result<LaunchMode, String>
+/// Supports `--apply-verified-update --manifest <p> --sig <p> --installer <p>`
+/// as well as all GUI [`LaunchMode`] flags (`--notify`, `--alert-id`, `--register-uri`,
+/// `--uri`, `ledr://alert/<id>`).
+pub(crate) fn parse_cli_action<I, S>(args: I) -> Result<CliAction, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut iter = args.into_iter().skip(1);
-    while let Some(arg) = iter.next() {
-        let s = arg.as_ref();
+    let raw_args: Vec<String> = args
+        .into_iter()
+        .skip(1)
+        .map(|s| s.as_ref().to_string())
+        .collect();
+
+    let has_apply_flag = raw_args
+        .iter()
+        .any(|s| s == "--apply-verified-update" || s.starts_with("--apply-verified-update="));
+    let has_apply_subflag = raw_args.iter().any(|s| {
+        s == "--manifest"
+            || s.starts_with("--manifest=")
+            || s == "--sig"
+            || s.starts_with("--sig=")
+            || s == "--installer"
+            || s.starts_with("--installer=")
+    });
+
+    if !has_apply_flag && !has_apply_subflag {
+        return parse_launch_mode_inner(&raw_args).map(CliAction::Launch);
+    }
+
+    if !has_apply_flag {
+        return Err("--manifest, --sig, and --installer require --apply-verified-update".to_string());
+    }
+
+    let mut seen_apply = false;
+    let mut manifest: Option<PathBuf> = None;
+    let mut sig: Option<PathBuf> = None;
+    let mut installer: Option<PathBuf> = None;
+
+    let mut iter = raw_args.iter().map(String::as_str);
+    while let Some(s) = iter.next() {
+        if s == "--apply-verified-update" {
+            if seen_apply {
+                return Err("duplicate --apply-verified-update flag".to_string());
+            }
+            seen_apply = true;
+            continue;
+        }
+        if s.starts_with("--apply-verified-update=") {
+            return Err("--apply-verified-update does not accept a value".to_string());
+        }
+        if let Some(val) = parse_flag_value("--manifest", s, &mut iter)? {
+            if manifest.is_some() {
+                return Err("duplicate --manifest flag".to_string());
+            }
+            manifest = Some(PathBuf::from(val));
+            continue;
+        }
+        if let Some(val) = parse_flag_value("--sig", s, &mut iter)? {
+            if sig.is_some() {
+                return Err("duplicate --sig flag".to_string());
+            }
+            sig = Some(PathBuf::from(val));
+            continue;
+        }
+        if let Some(val) = parse_flag_value("--installer", s, &mut iter)? {
+            if installer.is_some() {
+                return Err("duplicate --installer flag".to_string());
+            }
+            installer = Some(PathBuf::from(val));
+            continue;
+        }
+        return Err(format!(
+            "unexpected argument '{s}' combined with --apply-verified-update"
+        ));
+    }
+
+    let manifest = manifest.ok_or_else(|| "missing --manifest for --apply-verified-update".to_string())?;
+    let sig = sig.ok_or_else(|| "missing --sig for --apply-verified-update".to_string())?;
+    let installer =
+        installer.ok_or_else(|| "missing --installer for --apply-verified-update".to_string())?;
+
+    Ok(CliAction::ApplyVerifiedUpdate(ApplyVerifiedUpdateArgs {
+        manifest,
+        sig,
+        installer,
+    }))
+}
+
+fn parse_launch_mode_inner(raw_args: &[String]) -> Result<LaunchMode, String> {
+    let mut iter = raw_args.iter().map(String::as_str);
+    while let Some(s) = iter.next() {
         if s == "--register-uri" {
             return Ok(LaunchMode::RegisterUri);
         }
@@ -101,4 +197,24 @@ where
         }
     }
     Ok(LaunchMode::Normal)
+}
+
+/// Parses CLI arguments into a [`LaunchMode`].
+///
+/// Supports `--notify <alert_id>` (one-shot WinRT toast mode),
+/// `--alert-id <id>` (direct alert triage focus mode),
+/// `--register-uri` (per-user `HKCU\Software\Classes\ledr` protocol handler registration),
+/// and `ledr://alert/<id>` / `--uri ledr://alert/<id>` protocol activation (`L-08`, `AUTO-14`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn parse_launch_mode<I, S>(args: I) -> Result<LaunchMode, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    match parse_cli_action(args)? {
+        CliAction::Launch(mode) => Ok(mode),
+        CliAction::ApplyVerifiedUpdate(_) => {
+            Err("--apply-verified-update is not a GUI launch mode".to_string())
+        }
+    }
 }

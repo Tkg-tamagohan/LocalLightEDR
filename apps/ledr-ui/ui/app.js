@@ -43,6 +43,12 @@
     triageFeedback: null,
     triageFeedbackByAlert: new Map(),
     triageValidationFeedback: null,
+    daemonVersion: null,
+    updaterStatus: null,
+    updaterActionFeedback: null,
+    updateBannerDismissedVersion: null,
+    isCheckingUpdate: false,
+    isApplyingUpdate: false,
   };
 
   const MAX_TRIAGE_FEEDBACK_ENTRIES = 64;
@@ -140,6 +146,26 @@
     domainCheckInput: document.getElementById("domain-check-input"),
     domainCheckBtn: document.getElementById("domain-check-btn"),
     domainCheckResult: document.getElementById("domain-check-result"),
+    // Updater banner & View 3 panel elements
+    updateBanner: document.getElementById("update-banner"),
+    updateBannerTitle: document.getElementById("update-banner-title"),
+    updateBannerDetail: document.getElementById("update-banner-detail"),
+    updateBannerApplyBtn: document.getElementById("update-banner-apply-btn"),
+    updateBannerNotesBtn: document.getElementById("update-banner-notes-btn"),
+    updateBannerViewBtn: document.getElementById("update-banner-view-btn"),
+    updateBannerDismissBtn: document.getElementById("update-banner-dismiss-btn"),
+    appUpdatePanel: document.getElementById("app-update-panel"),
+    updateStateBadge: document.getElementById("update-state-badge"),
+    updateCheckBtn: document.getElementById("update-check-btn"),
+    updateVersionMismatch: document.getElementById("update-version-mismatch"),
+    updateFeedback: document.getElementById("update-feedback"),
+    updateProgressWrap: document.getElementById("update-progress-wrap"),
+    updateProgressBar: document.getElementById("update-progress-bar"),
+    updateProgressText: document.getElementById("update-progress-text"),
+    updateApplyBtn: document.getElementById("update-apply-btn"),
+    updateCancelBtn: document.getElementById("update-cancel-btn"),
+    updateReleaseNotesBtn: document.getElementById("update-release-notes-btn"),
+    appUpdateDl: document.getElementById("app-update-dl"),
   };
 
   function getInvoke() {
@@ -2863,6 +2889,391 @@
     } else {
       el.domainCheckResult.classList.add("hidden");
     }
+
+    renderAppUpdatePanel();
+  }
+
+  const EXPECTED_CHROME_EXT_ID_FALLBACK = "ecelachfiiiiiibpjeomfncgpegbpanh";
+
+  function parseDaemonVersionFromPing(pingResult) {
+    if (!pingResult) return null;
+    if (typeof pingResult === "object") {
+      const raw = pingResult.daemon_version;
+      return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+    }
+    if (typeof pingResult === "string") {
+      const m = pingResult.match(/ledr-daemon\s+v([^\s()]+)/i);
+      if (m && m[1]) return m[1].trim();
+    }
+    return null;
+  }
+
+  function normalizeUpdaterPhase(raw) {
+    if (!raw || typeof raw !== "string") return "idle";
+    const s = raw.trim();
+    const map = {
+      Idle: "idle",
+      Checking: "checking",
+      UpToDate: "up_to_date",
+      UpdateAvailable: "update_available",
+      ManualUpdateRequired: "manual_update_required",
+      Downloading: "downloading",
+      Verifying: "verifying",
+      LaunchingUpdater: "launching_updater",
+      Error: "error",
+    };
+    return map[s] || s.toLowerCase();
+  }
+
+  function normalizeVersionTag(v) {
+    if (typeof v !== "string") return "";
+    return v.trim().replace(/^v/i, "");
+  }
+
+  function formatBytes(bytes) {
+    if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return "0 B";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  }
+
+  function formatInstallKindLabel(kind) {
+    if (kind === "standard_installed") return "標準インストール";
+    if (kind === "portable_or_dev") return "Portable / Dev";
+    return "不明";
+  }
+
+  function updaterTargetVersion(status) {
+    return status?.manifest?.version || status?.latest_version || null;
+  }
+
+  function applyUpdaterStatusPayload(status) {
+    if (!status || typeof status !== "object") return;
+    const prevTarget = updaterTargetVersion(state.updaterStatus);
+    const nextTarget = updaterTargetVersion(status);
+    if (nextTarget && nextTarget !== prevTarget && nextTarget !== state.updateBannerDismissedVersion) {
+      state.updateBannerDismissedVersion = null;
+    }
+    state.updaterStatus = status;
+    const phase = normalizeUpdaterPhase(status.phase);
+    state.isCheckingUpdate = phase === "checking";
+    state.isApplyingUpdate =
+      phase === "downloading" || phase === "verifying" || phase === "launching_updater";
+    if (status.error_message) {
+      state.updaterActionFeedback = { ok: false, message: status.error_message };
+    } else if (status.notice_message) {
+      state.updaterActionFeedback = { ok: true, message: status.notice_message };
+    } else if (phase !== "error") {
+      state.updaterActionFeedback = null;
+    }
+    renderUpdateBanner();
+    renderAppUpdatePanel();
+  }
+
+  function renderUpdateBanner() {
+    if (!el.updateBanner) return;
+    const status = state.updaterStatus;
+    if (!status) {
+      el.updateBanner.classList.add("hidden");
+      el.updateBanner.classList.remove("is-manual");
+      return;
+    }
+
+    const phase = normalizeUpdaterPhase(status.phase);
+    const targetVersion = updaterTargetVersion(status);
+    const isBannerPhase = phase === "update_available" || phase === "manual_update_required";
+    if (
+      !isBannerPhase ||
+      (targetVersion && state.updateBannerDismissedVersion === targetVersion)
+    ) {
+      el.updateBanner.classList.add("hidden");
+      el.updateBanner.classList.remove("is-manual");
+      return;
+    }
+
+    const appVer = normalizeVersionTag(status.app_version || "") || "-";
+    const latestVer = normalizeVersionTag(targetVersion || "") || "-";
+    const notesUrl = status.release_notes_url || status.manifest?.release_notes_url || null;
+    const canAutoApply =
+      phase === "update_available" &&
+      status.install_kind === "standard_installed" &&
+      status.can_auto_apply !== false;
+
+    el.updateBanner.classList.remove("hidden");
+    el.updateBanner.classList.toggle("is-manual", phase === "manual_update_required");
+
+    if (phase === "manual_update_required") {
+      const minVer = normalizeVersionTag(status.min_updater_version || "") || "-";
+      el.updateBannerTitle.textContent = `手動更新が必要: v${latestVer}`;
+      el.updateBannerDetail.textContent = `現在 v${appVer} / 最小対応 v${minVer}`;
+    } else if (canAutoApply) {
+      el.updateBannerTitle.textContent = `更新あり: v${latestVer}`;
+      el.updateBannerDetail.textContent = `現在 v${appVer}（UAC 昇格後、アプリを終了して更新を適用）`;
+    } else {
+      el.updateBannerTitle.textContent = `更新あり: v${latestVer}（手動更新）`;
+      el.updateBannerDetail.textContent = `Portable / Dev は自動適用不可（現在 v${appVer}）`;
+    }
+
+    el.updateBannerApplyBtn?.classList.toggle("hidden", !canAutoApply);
+    if (el.updateBannerApplyBtn) {
+      el.updateBannerApplyBtn.disabled = state.isApplyingUpdate;
+    }
+    el.updateBannerNotesBtn?.classList.toggle("hidden", !notesUrl);
+  }
+
+  function renderAppUpdatePanel() {
+    if (!el.appUpdateDl) return;
+    const invoke = getInvoke();
+    const status = state.updaterStatus;
+    const phase = status ? normalizeUpdaterPhase(status.phase) : "idle";
+    const isBusy =
+      state.isCheckingUpdate ||
+      state.isApplyingUpdate ||
+      phase === "checking" ||
+      phase === "downloading" ||
+      phase === "verifying" ||
+      phase === "launching_updater";
+
+    const uiVersionRaw = status?.app_version || null;
+    const uiVer = uiVersionRaw ? normalizeVersionTag(uiVersionRaw) : null;
+    const daemonVer = state.isDaemonOnline && state.daemonVersion
+      ? normalizeVersionTag(state.daemonVersion)
+      : null;
+
+    if (el.updateVersionMismatch) {
+      if (state.isDaemonOnline && uiVer && daemonVer && uiVer !== daemonVer) {
+        el.updateVersionMismatch.textContent =
+          `バージョン不一致: UI v${uiVer} / Daemon v${daemonVer}（サービス再起動または再インストールが必要）`;
+        el.updateVersionMismatch.classList.remove("hidden");
+      } else {
+        el.updateVersionMismatch.textContent = "";
+        el.updateVersionMismatch.classList.add("hidden");
+      }
+    }
+
+    if (el.updateStateBadge) {
+      const badgeMap = {
+        idle: { text: "未確認", cls: "badge badge-metric" },
+        checking: { text: "確認中", cls: "badge badge-metric" },
+        up_to_date: { text: "最新", cls: "badge badge-action-allow" },
+        update_available: { text: "更新あり", cls: "badge badge-nrd" },
+        manual_update_required: { text: "手動更新必須", cls: "badge badge-action-block" },
+        downloading: { text: "ダウンロード中", cls: "badge badge-metric" },
+        verifying: { text: "検証中", cls: "badge badge-metric" },
+        launching_updater: { text: "インストーラー起動中", cls: "badge badge-metric" },
+        error: { text: "エラー", cls: "badge badge-action-block" },
+      };
+      const badgeInfo = badgeMap[phase] || badgeMap.idle;
+      el.updateStateBadge.textContent = badgeInfo.text;
+      el.updateStateBadge.className = badgeInfo.cls;
+    }
+
+    if (el.updateFeedback) {
+      const feedbackMsg =
+        status?.error_message ||
+        status?.notice_message ||
+        state.updaterActionFeedback?.message ||
+        null;
+      const isOk = !status?.error_message && (state.updaterActionFeedback ? state.updaterActionFeedback.ok : true);
+      if (feedbackMsg) {
+        el.updateFeedback.textContent = feedbackMsg;
+        el.updateFeedback.className = `triage-feedback ${isOk ? "is-ok" : "is-error"}`;
+        el.updateFeedback.classList.remove("hidden", "is-ok", "is-error");
+        el.updateFeedback.classList.add(isOk ? "is-ok" : "is-error");
+      } else {
+        el.updateFeedback.textContent = "";
+        el.updateFeedback.className = "triage-feedback hidden";
+        el.updateFeedback.classList.remove("is-ok", "is-error");
+        el.updateFeedback.classList.add("hidden");
+      }
+    }
+
+    if (el.updateProgressWrap && el.updateProgressBar && el.updateProgressText) {
+      if (phase === "downloading") {
+        const downloaded = Number(status?.bytes_downloaded || 0);
+        const total = status?.total_bytes;
+        el.updateProgressWrap.classList.remove("hidden");
+        if (typeof total === "number" && total > 0) {
+          const pct = Math.min(100, Math.max(0, Math.round((downloaded / total) * 100)));
+          el.updateProgressBar.setAttribute("value", String(pct));
+          el.updateProgressBar.value = pct;
+          el.updateProgressText.textContent = `${pct}% (${formatBytes(downloaded)} / ${formatBytes(total)})`;
+        } else {
+          el.updateProgressBar.removeAttribute("value");
+          el.updateProgressText.textContent = formatBytes(downloaded);
+        }
+      } else {
+        el.updateProgressWrap.classList.add("hidden");
+      }
+    }
+
+    if (el.updateCheckBtn) {
+      el.updateCheckBtn.disabled = !invoke || isBusy;
+    }
+
+    const canAutoApply =
+      phase === "update_available" &&
+      status?.install_kind === "standard_installed" &&
+      status?.can_auto_apply !== false;
+    if (el.updateApplyBtn) {
+      el.updateApplyBtn.classList.toggle("hidden", !canAutoApply);
+      el.updateApplyBtn.disabled = !invoke || isBusy || !canAutoApply;
+    }
+    if (el.updateCancelBtn) {
+      el.updateCancelBtn.classList.toggle("hidden", phase !== "downloading");
+      el.updateCancelBtn.disabled = !invoke || phase !== "downloading";
+    }
+    const notesUrl = status?.release_notes_url || status?.manifest?.release_notes_url || null;
+    if (el.updateReleaseNotesBtn) {
+      const showNotes = Boolean(notesUrl) && (phase === "update_available" || phase === "manual_update_required");
+      el.updateReleaseNotesBtn.classList.toggle("hidden", !showNotes);
+      el.updateReleaseNotesBtn.disabled = !invoke || !showNotes;
+    }
+
+    const targetVer = updaterTargetVersion(status);
+    const latestDisplay = targetVer ? `v${normalizeVersionTag(targetVer)}` : "-";
+    const lastCheckedDisplay = status?.last_checked_at_ms ? formatTime(status.last_checked_at_ms) : "未確認";
+    const daemonDisplay = state.isDaemonOnline
+      ? (daemonVer ? `v${daemonVer}` : "接続中")
+      : state.isSamplePreview
+        ? "Sample Preview"
+        : "未接続";
+
+    let stateDetail = "未確認";
+    if (phase === "checking") stateDetail = "リリース確認中";
+    else if (phase === "up_to_date") stateDetail = `最新 (${latestDisplay})`;
+    else if (phase === "update_available") {
+      stateDetail = canAutoApply
+        ? `v${normalizeVersionTag(targetVer || "")} 利用可能（UAC 昇格後、アプリを終了して更新を適用）`
+        : `v${normalizeVersionTag(targetVer || "")} 利用可能（Portable / Dev は手動更新のみ）`;
+    } else if (phase === "manual_update_required") {
+      const minVer = normalizeVersionTag(status?.min_updater_version || "") || "-";
+      stateDetail = `最小対応 v${minVer} 以上への手動更新が必要`;
+    } else if (phase === "downloading") stateDetail = "インストーラーを取得中";
+    else if (phase === "verifying") stateDetail = "署名と SHA-256 を検証中";
+    else if (phase === "launching_updater") stateDetail = "昇格アップデータを起動中";
+    else if (phase === "error") stateDetail = status?.error_message || "エラー";
+
+    const expectedExtId =
+      status?.manifest?.chrome_extension?.extension_id ||
+      state.localDefenseStatus?.browser_shield?.expected_extension_id ||
+      EXPECTED_CHROME_EXT_ID_FALLBACK;
+    const extVer = status?.manifest?.chrome_extension?.version
+      ? `v${normalizeVersionTag(status.manifest.chrome_extension.version)}`
+      : null;
+    const extDisplay = `${escapeHtml(expectedExtId)}${extVer ? ` (${escapeHtml(extVer)})` : ""} — Chrome 拡張は自動更新対象外（手動更新）`;
+
+    el.appUpdateDl.innerHTML = `
+      <dt>UI バージョン</dt>
+      <dd class="mono">${uiVer ? `v${escapeHtml(uiVer)}` : "-"}</dd>
+      <dt>Daemon バージョン</dt>
+      <dd class="mono">${escapeHtml(daemonDisplay)}</dd>
+      <dt>導入形態</dt>
+      <dd>${escapeHtml(formatInstallKindLabel(status?.install_kind))}</dd>
+      <dt>更新状態</dt>
+      <dd>${escapeHtml(stateDetail)}</dd>
+      <dt>最新バージョン</dt>
+      <dd class="mono">${escapeHtml(latestDisplay)}</dd>
+      <dt>最終確認</dt>
+      <dd class="mono">${escapeHtml(lastCheckedDisplay)}</dd>
+      <dt>Chrome 拡張</dt>
+      <dd class="mono-wrap">${extDisplay}</dd>
+    `;
+  }
+
+  function dismissUpdateBanner() {
+    const target = updaterTargetVersion(state.updaterStatus);
+    if (target) {
+      state.updateBannerDismissedVersion = target;
+    }
+    renderUpdateBanner();
+  }
+
+  async function handleCheckForUpdates() {
+    const invoke = getInvoke();
+    if (!invoke || state.isCheckingUpdate || state.isApplyingUpdate) return;
+    state.isCheckingUpdate = true;
+    state.updaterActionFeedback = null;
+    renderAppUpdatePanel();
+    try {
+      const view = await invoke("check_for_updates");
+      if (view) {
+        applyUpdaterStatusPayload(view);
+      }
+    } catch (err) {
+      state.updaterActionFeedback = { ok: false, message: formatBackendError(err) };
+      const latest = await invoke("get_updater_status").catch(() => null);
+      if (latest) {
+        state.updaterStatus = latest;
+      }
+    } finally {
+      state.isCheckingUpdate = false;
+      renderUpdateBanner();
+      renderAppUpdatePanel();
+    }
+  }
+
+  async function handleApplyUpdate() {
+    const invoke = getInvoke();
+    const status = state.updaterStatus;
+    if (!invoke || !status) return;
+    const phase = normalizeUpdaterPhase(status.phase);
+    if (
+      phase !== "update_available" ||
+      status.install_kind !== "standard_installed" ||
+      status.can_auto_apply === false ||
+      state.isApplyingUpdate
+    ) {
+      return;
+    }
+    state.isApplyingUpdate = true;
+    state.updaterActionFeedback = null;
+    renderAppUpdatePanel();
+    try {
+      const view = await invoke("apply_update");
+      if (view) {
+        applyUpdaterStatusPayload(view);
+      }
+    } catch (err) {
+      state.updaterActionFeedback = { ok: false, message: formatBackendError(err) };
+      const latest = await invoke("get_updater_status").catch(() => null);
+      if (latest) {
+        state.updaterStatus = latest;
+      }
+    } finally {
+      state.isApplyingUpdate = false;
+      renderUpdateBanner();
+      renderAppUpdatePanel();
+    }
+  }
+
+  async function handleCancelUpdate() {
+    const invoke = getInvoke();
+    if (!invoke) return;
+    try {
+      const view = await invoke("cancel_update_download");
+      if (view) {
+        applyUpdaterStatusPayload(view);
+      }
+    } catch (err) {
+      state.updaterActionFeedback = { ok: false, message: formatBackendError(err) };
+      renderAppUpdatePanel();
+    }
+  }
+
+  async function handleOpenReleaseNotes() {
+    const invoke = getInvoke();
+    const url =
+      state.updaterStatus?.release_notes_url ||
+      state.updaterStatus?.manifest?.release_notes_url ||
+      null;
+    if (!invoke || !url) return;
+    try {
+      await invoke("open_release_notes_url", { url });
+    } catch (err) {
+      state.updaterActionFeedback = { ok: false, message: formatBackendError(err) };
+      renderAppUpdatePanel();
+    }
   }
 
   function syncPolicyFormHints() {
@@ -3107,12 +3518,14 @@
     renderTriageView();
     renderTree();
     renderPolicyView();
+    renderUpdateBanner();
   }
 
   async function refreshAll() {
     const invoke = getInvoke();
     if (!invoke) {
       state.isDaemonOnline = false;
+      state.daemonVersion = null;
       updateDaemonHeader(null, null);
       showOfflineBanner("Tauri IPC bridge unavailable outside Tauri runtime.");
       renderAllViews();
@@ -3123,32 +3536,39 @@
     try {
       // Local defense status (honeypot metadata & HKCU readiness) works even when daemon is offline.
       const localStatusPromise = invoke("fetch_local_defense_status").catch(() => null);
+      const updaterStatusPromise = invoke("get_updater_status").catch(() => null);
 
-      const [localStatus, pingSummary, snapshot, metrics, alertsRes, rulesRes] = await Promise.all([
-        localStatusPromise,
-        invoke("ping_daemon"),
-        invoke("fetch_flight_recorder", {
-          limit: 250,
-          processInstanceId: null,
-        }),
-        invoke("fetch_pipeline_metrics").catch(() => null),
-        invoke("fetch_alerts", {
-          status: null,
-          limit: 200,
-        })
-          .then((data) => ({ ok: true, data }))
-          .catch((err) => ({ ok: false, error: String(err) })),
-        invoke("fetch_rules", {
-          scope: null,
-        })
-          .then((data) => ({ ok: true, data }))
-          .catch((err) => ({ ok: false, error: String(err) })),
-      ]);
+      const [localStatus, updaterStatus, pingSummary, snapshot, metrics, alertsRes, rulesRes] =
+        await Promise.all([
+          localStatusPromise,
+          updaterStatusPromise,
+          invoke("ping_daemon"),
+          invoke("fetch_flight_recorder", {
+            limit: 250,
+            processInstanceId: null,
+          }),
+          invoke("fetch_pipeline_metrics").catch(() => null),
+          invoke("fetch_alerts", {
+            status: null,
+            limit: 200,
+          })
+            .then((data) => ({ ok: true, data }))
+            .catch((err) => ({ ok: false, error: String(err) })),
+          invoke("fetch_rules", {
+            scope: null,
+          })
+            .then((data) => ({ ok: true, data }))
+            .catch((err) => ({ ok: false, error: String(err) })),
+        ]);
 
       const wasSamplePreview = state.isSamplePreview;
       state.localDefenseStatus = localStatus;
+      state.daemonVersion = parseDaemonVersionFromPing(pingSummary);
       state.isDaemonOnline = true;
       state.isSamplePreview = false;
+      if (updaterStatus) {
+        applyUpdaterStatusPayload(updaterStatus);
+      }
       if (wasSamplePreview) {
         state.selectedAlertId = null;
         state.lastSyncedAlertId = null;
@@ -3214,7 +3634,12 @@
       state.localDefenseStatus = await invoke("fetch_local_defense_status").catch(
         () => state.localDefenseStatus,
       );
+      const offlineUpdaterStatus = await invoke("get_updater_status").catch(() => null);
       state.isDaemonOnline = false;
+      state.daemonVersion = null;
+      if (offlineUpdaterStatus) {
+        applyUpdaterStatusPayload(offlineUpdaterStatus);
+      }
       updateDaemonHeader(null, null);
       showOfflineBanner(String(err));
       renderAllViews();
@@ -3225,7 +3650,7 @@
 
   async function loadLaunchMode() {
     const invoke = getInvoke();
-    if (!invoke) return;
+    if (!invoke) return null;
     try {
       const mode = await invoke("get_launch_mode");
       if (mode && mode.mode === "alert_focus" && mode.alert_id) {
@@ -3235,8 +3660,9 @@
         el.launchModePill.classList.remove("hidden");
         switchView("triage");
       }
+      return mode?.mode || null;
     } catch {
-      // Ignore launch mode probe error
+      return null;
     }
   }
 
@@ -3266,6 +3692,7 @@
     const sample = buildSampleData();
     state.isSamplePreview = true;
     state.isDaemonOnline = false;
+    state.daemonVersion = null;
     state.selectedProcessId = null;
     state.lastSyncedAlertId = null;
     state.triageFeedback = null;
@@ -3443,6 +3870,18 @@
     });
   });
 
+  el.updateBannerApplyBtn?.addEventListener("click", handleApplyUpdate);
+  el.updateBannerNotesBtn?.addEventListener("click", handleOpenReleaseNotes);
+  el.updateBannerViewBtn?.addEventListener("click", () => {
+    switchView("policy");
+    el.appUpdatePanel?.scrollIntoView?.({ block: "nearest" });
+  });
+  el.updateBannerDismissBtn?.addEventListener("click", dismissUpdateBanner);
+  el.updateCheckBtn?.addEventListener("click", handleCheckForUpdates);
+  el.updateApplyBtn?.addEventListener("click", handleApplyUpdate);
+  el.updateCancelBtn?.addEventListener("click", handleCancelUpdate);
+  el.updateReleaseNotesBtn?.addEventListener("click", handleOpenReleaseNotes);
+
   if (typeof globalThis !== "undefined" && globalThis.__LEDR_UI_TEST_MODE__) {
     globalThis.__LEDR_UI_EXPORTS__ = {
       normalizeWindowsPath,
@@ -3470,14 +3909,41 @@
       renderPolicyView,
       refreshAll,
       loadSamplePreview,
+      parseDaemonVersionFromPing,
+      normalizeUpdaterPhase,
+      normalizeVersionTag,
+      formatBytes,
+      applyUpdaterStatusPayload,
+      renderUpdateBanner,
+      renderAppUpdatePanel,
+      dismissUpdateBanner,
+      handleCheckForUpdates,
+      handleApplyUpdate,
+      handleCancelUpdate,
+      handleOpenReleaseNotes,
       state,
       el,
     };
   } else {
     document.addEventListener("DOMContentLoaded", async () => {
       syncPolicyFormHints();
-      await loadLaunchMode();
+      const mode = await loadLaunchMode();
       await refreshAll();
+      if (window.__TAURI__?.event?.listen) {
+        try {
+          await window.__TAURI__.event.listen("updater://status-changed", (event) => {
+            if (event?.payload) {
+              applyUpdaterStatusPayload(event.payload);
+            }
+          });
+        } catch {
+          // Ignore event subscription error outside runtime
+        }
+      }
+      if (mode === "normal") {
+        const invoke = getInvoke();
+        invoke?.("trigger_startup_update_check").catch(() => null);
+      }
     });
   }
 })();

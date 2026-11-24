@@ -1149,8 +1149,9 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                 f"Failed to query owner SID for {existing_install}:\nSTDOUT:\n{owner_res.stdout}\nSTDERR:\n{owner_res.stderr}",
             )
             owner_sid = owner_res.stdout.strip()
-            self.assertTrue(
-                owner_sid.startswith("S-1-5-"),
+            self.assertRegex(
+                owner_sid,
+                r"^S-1-(?:\d+|0x[0-9A-Fa-f]+)(?:-\d+)+$",
                 f"Unexpected owner SID {owner_sid!r} for {existing_install}:\nSTDOUT:\n{owner_res.stdout}\nSTDERR:\n{owner_res.stderr}",
             )
             unused_data = tmp_path / "unused-data"

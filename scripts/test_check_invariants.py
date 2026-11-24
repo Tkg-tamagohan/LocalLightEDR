@@ -418,6 +418,10 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.assertIn("parent.pid == root.pid", text_field)
 
         session0 = questions["session0_non_system_and_ui_zero_exit"]
+        session0_opening, session0_rest = session0["instructions"].split("?", 1)
+        self.assertIn("outside --foreground mode", session0_opening)
+        self.assertIn("outside --foreground mode", session0_rest)
+        self.assertIn("outside --foreground mode", session0["criteria"]["true_description"])
         self.assertIn("other than AUTHORIZED_UI_EXE_PATH", session0["instructions"])
         self.assertIn(
             "other than AUTHORIZED_UI_EXE_PATH",

@@ -14,7 +14,7 @@ LocalEDR の Layer 1 から Layer 4 にわたる能動防御処理は、誤動�
 2. おとりとタイムアウト：おとりファイルは書き込み、削除、リネームのみで発火させ読み取りでは発火させない。
    未応答 60 秒到達時は `EXPIRED_SUSPENDED`（`AlertStatus::ExpiredSuspended`）へ遷移させ、自動再開しない。
 3. Session 0 と UI 終了：`--notify` 起動は `WTSQueryUserToken` と `CreateProcessAsUser` で非 SYSTEM のユーザー権限を用い、ウィンドウ閉鎖時は `ledr-ui` と関連 WebView2 プロセスを 0 件にする。
-   `--foreground` 起動時の通知先 `ledr-ui.exe` 選択は `--dev-bypass-auth` 有効時に限定して同フォルダ UI を優先し、認可強制時は `AUTHORIZED_UI_EXE_PATH` へ統一して `L-25` の IPC 認可と乖離させない。
+   通知先 `ledr-ui.exe` の同フォルダ UI 優先は `--foreground` かつ `--dev-bypass-auth` 有効時に限定し、それ以外（認可強制時および非 `--foreground` 起動時）は同フォルダや別フォルダを問わず `AUTHORIZED_UI_EXE_PATH` へ統一して `L-25` の IPC 認可と乖離させない。
 4. IPC 認可とタイムアウト：`Ping` を除く全 IPC コマンドは `CallerAuthPolicy` に従い（`UiOnly`: `ResolveAlert`・`UpsertRule`・`DeleteRule`・`GetFlightRecorder`・`GetAlerts`・`ListRules`・`GetPipelineMetrics` は `AUTHORIZED_UI_EXE_PATH`、`BridgeOnly`: `ReportDownloadOrigin`・`ReportBrowserEvent` は `AUTHORIZED_BRIDGE_EXE_PATH`、`UiOrBridge`: `CheckDomainRisk` は `AUTHORIZED_UI_EXE_PATH` または `AUTHORIZED_BRIDGE_EXE_PATH`）、開発バイパス無効時に `GetNamedPipeClientProcessId` で呼び出し元バイナリを検証し、読み取りと書き込み双方へタイムアウトを設定する。
    これらの IPC 呼び出し元検証（開発バイパス無効かつ SHA-256 ピン単独で完結しない Authenticode 検証経路）ではキャッシュを迂回する `inspect_uncached` を使い、アプリ内のキャッシュ済み判定を再利用せず毎回検証する（`ledr-auth-helper` は `WTD_REVOCATION_CHECK_NONE` を用いるためオンライン CRL/OCSP の失効確認は行わない）。
 5. WFP 動的フィルタ：Phase 3 の WFP エンジンは `FWPM_SESSION_FLAG_DYNAMIC` と独自 SubLayer を必ず使い、異常終了時に恒久ブロックを残さない。

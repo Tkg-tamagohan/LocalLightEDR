@@ -1,0 +1,276 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run with ephemeral test signing key (skip GitHub Release publish)'
+        type: boolean
+        required: true
+        default: true
+      tag:
+        description: 'Release tag to validate (defaults to v<Cargo.toml version>)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve release parameters
+        id: resolve
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          import pathlib
+          import sys
+          import tomllib
+
+          event_name = os.environ.get("EVENT_NAME", "")
+          if event_name == "workflow_dispatch":
+              dry_run = "true" if os.environ.get("INPUT_DRY_RUN", "true").lower() == "true" else "false"
+              raw_tag = os.environ.get("INPUT_TAG", "").strip()
+              if raw_tag:
+                  tag = raw_tag
+              else:
+                  cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+                  ver = cargo["workspace"]["package"]["version"]
+                  tag = f"v{ver}"
+          else:
+              dry_run = "false"
+              tag = os.environ["REF_NAME"].strip()
+
+          if not tag.startswith("v"):
+              print(f"Release tag must start with 'v': {tag!r}", file=sys.stderr)
+              sys.exit(1)
+          version = tag[1:]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"dry_run={dry_run}\n")
+              fh.write(f"tag={tag}\n")
+              fh.write(f"version={version}\n")
+          print(f"Resolved release parameters: tag={tag}, version={version}, dry_run={dry_run}")
+          EOF
+      - name: Compile and test release scripts
+        shell: bash
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: |
+          shopt -s nullglob
+          py_files=(scripts/*.py)
+          python3 -m py_compile "${py_files[@]}"
+          python3 -m unittest scripts/test_release_scripts.py
+      - name: Run release preflight checks
+        shell: bash
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
+          DRY_RUN: ${{ steps.resolve.outputs.dry_run }}
+          LEDR_UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.LEDR_UPDATE_SIGNING_PRIVATE_KEY }}
+          LEDR_UPDATE_SIGNING_KEY_ID: ${{ secrets.LEDR_UPDATE_SIGNING_KEY_ID }}
+        run: |
+          if [ "$DRY_RUN" = "false" ]; then
+            if [ -z "${LEDR_UPDATE_SIGNING_PRIVATE_KEY:-}" ]; then
+              echo "LEDR_UPDATE_SIGNING_PRIVATE_KEY secret is required for non-dry-run releases" >&2
+              exit 1
+            fi
+            python3 scripts/release_verify.py preflight \
+              --expect-tag "$RELEASE_TAG" \
+              --require-active-key \
+              --private-key-env LEDR_UPDATE_SIGNING_PRIVATE_KEY
+          else
+            python3 scripts/release_verify.py preflight --expect-tag "$RELEASE_TAG"
+          fi
+
+  build:
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Ensure NSIS (makensis) is installed
+        shell: pwsh
+        run: |
+          $cmd = Get-Command makensis -ErrorAction SilentlyContinue
+          if (-not $cmd) {
+            $defaultPath = 'C:\Program Files (x86)\NSIS\makensis.exe'
+            if (-not (Test-Path -LiteralPath $defaultPath)) {
+              choco install nsis -y --no-progress
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            if (Test-Path -LiteralPath 'C:\Program Files (x86)\NSIS') {
+              Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files (x86)\NSIS'
+            }
+          }
+      - name: Run Rust workspace clippy and tests
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run Chrome MV3 and Tauri UI Node unit tests
+        shell: bash
+        run: |
+          shopt -s nullglob
+          ext_tests=(extensions/ledr-chrome-mv3/tests/*.test.mjs)
+          if [ "${#ext_tests[@]}" -eq 0 ]; then
+            echo "No Chrome MV3 extension test files matched extensions/ledr-chrome-mv3/tests/*.test.mjs" >&2
+            exit 1
+          fi
+          node --test "${ext_tests[@]}"
+          required_ui_test="apps/ledr-ui/js-tests/phase4_ui.test.mjs"
+          if [ ! -f "$required_ui_test" ]; then
+            echo "Missing required UI test file: $required_ui_test" >&2
+            exit 1
+          fi
+          ui_tests=(apps/ledr-ui/js-tests/*.test.mjs)
+          if [ "${#ui_tests[@]}" -eq 0 ]; then
+            echo "No UI test files matched apps/ledr-ui/js-tests/*.test.mjs" >&2
+            exit 1
+          fi
+          node --test "${ui_tests[@]}"
+      - name: Build release binaries
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p ledr-daemon -p ledr-ui -p ledr-bridge-nm -p ledr-auth-helper
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile NSIS Windows installer
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          $stageDir = Join-Path $env:RUNNER_TEMP 'nsis-out'
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          $outFile = Join-Path $stageDir "LocalEDR-Setup-$($env:RELEASE_TAG)-win-x64.exe"
+          & makensis "/DVERSION=$($env:RELEASE_VERSION)" '/DBIN_DIR=..\..\target\release' '/DRULES_DIR=..\..\rules' "/DOUT_FILE=$outFile" packaging\windows\localedr.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package and sign release artifacts
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          DRY_RUN: ${{ needs.preflight.outputs.dry_run }}
+          LEDR_UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.LEDR_UPDATE_SIGNING_PRIVATE_KEY }}
+          LEDR_UPDATE_SIGNING_KEY_ID: ${{ secrets.LEDR_UPDATE_SIGNING_KEY_ID }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          if (Test-Path -LiteralPath 'dist') {
+            Remove-Item -LiteralPath 'dist' -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
+          $installerExe = Join-Path (Join-Path $env:RUNNER_TEMP 'nsis-out') "LocalEDR-Setup-$tag-win-x64.exe"
+          if ($env:DRY_RUN -eq 'true') {
+            $tmpPub = Join-Path $env:RUNNER_TEMP 'dry-run-public-keys.json'
+            $tmpPriv = Join-Path $env:RUNNER_TEMP 'dry-run-signing.key'
+            python scripts\release_verify.py keygen --key-id dry-run-test --write-public-keys $tmpPub --write-private-key-file $tmpPriv | Out-Null
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            python scripts\build_release_artifacts.py --bin-dir target\release --installer-exe $installerExe --out-dir dist --public-keys $tmpPub --private-key-file $tmpPriv --expect-tag $tag
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          else {
+            python scripts\build_release_artifacts.py --bin-dir target\release --installer-exe $installerExe --out-dir dist --private-key-env LEDR_UPDATE_SIGNING_PRIVATE_KEY --expect-tag $tag
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Upload release distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [preflight, build]
+    if: needs.preflight.outputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - name: Verify distribution artifacts before publishing
+        shell: bash
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          python3 scripts/release_verify.py verify-dist --dist-dir dist --expect-tag "$RELEASE_TAG"
+      - name: Atomically create draft release, upload assets, and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="$RELEASE_TAG"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
+            if [ "$is_draft" != "true" ]; then
+              echo "Release $TAG already exists and is published; refusing to overwrite." >&2
+              exit 1
+            fi
+            existing_assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+            if [ -n "$existing_assets" ]; then
+              while IFS= read -r name; do
+                [ -z "$name" ] && continue
+                gh release delete-asset "$TAG" "$name" --yes
+              done <<< "$existing_assets"
+            fi
+          else
+            gh release create "$TAG" --draft --title "LocalEDR $TAG" --generate-notes
+          fi
+
+          gh release upload "$TAG" \
+            "dist/LocalEDR-Setup-${TAG}-win-x64.exe" \
+            "dist/LocalEDR-${TAG}-win-x64.zip" \
+            "dist/LocalEDR-chrome-ext-${TAG}.zip" \
+            "dist/SHA256SUMS.txt" \
+            --clobber
+
+          gh release upload "$TAG" \
+            "dist/update-manifest.json" \
+            "dist/update-manifest.json.sig" \
+            --clobber
+
+          gh release edit "$TAG" --draft=false

@@ -598,11 +598,47 @@ class TestReleaseScripts(unittest.TestCase):
             encoding="utf-8"
         )
 
-        # Rollback preservation & ACL hardening markers in install.ps1
+        # Rollback preservation & ACL hardening markers in install.ps1 (PS 5.1 + PS 7 compatible)
         self.assertIn("$rollbackRestoreFailed", install_ps1)
         self.assertIn("PurgeAccessRules", install_ps1)
         self.assertIn("SetAccessRuleProtection($true, $false)", install_ps1)
         self.assertIn("Reset-DataSubdirInheritedAcl", install_ps1)
+        self.assertIn("Get-Acl -LiteralPath", install_ps1)
+        self.assertIn("Set-Acl -LiteralPath", install_ps1)
+        self.assertNotIn(".GetAccessControl(", install_ps1)
+        self.assertNotIn(".SetAccessControl(", install_ps1)
+        self.assertNotIn(".GetAccessControl(", uninstall_ps1)
+        self.assertNotIn(".SetAccessControl(", uninstall_ps1)
+
+        # Windows execution of test_release_scripts.py in both ci.yml and release.yml
+        ci_yml = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        ci_win_pkg_match = re.search(
+            r"(?ms)^  windows-packaging-tests:\n(.*?)(?=^  \S|\Z)", ci_yml
+        )
+        self.assertIsNotNone(
+            ci_win_pkg_match, "ci.yml must define windows-packaging-tests job"
+        )
+        ci_win_pkg_block = ci_win_pkg_match.group(1)
+        self.assertIn("runs-on: windows-latest", ci_win_pkg_block)
+        self.assertIn(
+            "if: needs.changes.outputs.windows_packaging == 'true'", ci_win_pkg_block
+        )
+        self.assertIn("PYTHONUTF8: '1'", ci_win_pkg_block)
+        self.assertIn("PYTHONIOENCODING: utf-8", ci_win_pkg_block)
+        self.assertIn("scripts/test_release_scripts.py", ci_win_pkg_block)
+        self.assertIn('"windows-packaging-tests": "windows_packaging"', ci_yml)
+
+        rel_build_match = re.search(
+            r"(?ms)^  build:\n(.*?)(?=^  publish:\n|\Z)", release_yml
+        )
+        self.assertIsNotNone(rel_build_match, "release.yml must define build job")
+        rel_build_block = rel_build_match.group(1)
+        self.assertIn("runs-on: windows-latest", rel_build_block)
+        self.assertIn("PYTHONUTF8: '1'", rel_build_block)
+        self.assertIn("PYTHONIOENCODING: utf-8", rel_build_block)
+        self.assertIn("scripts/test_release_scripts.py", rel_build_block)
 
         # Unresolved suspended alert check in uninstall.ps1
         self.assertIn("--check-unresolved-suspended", uninstall_ps1)
@@ -613,21 +649,33 @@ class TestReleaseScripts(unittest.TestCase):
         self.assertIn(".InnerException", uninstall_ps1)
 
     @unittest.skipUnless(
-        sys.platform == "win32" and shutil.which("powershell.exe") is not None,
+        sys.platform == "win32",
         "requires Windows PowerShell",
     )
     def test_rel_09_powershell_ast_and_retry_behavior(self) -> None:
-        ps_exe = shutil.which("powershell.exe")
-        assert ps_exe is not None
+        shells: list[tuple[str, str]] = []
+        ps51 = shutil.which("powershell.exe")
+        if ps51:
+            shells.append(("powershell.exe", ps51))
+        pwsh = shutil.which("pwsh") or shutil.which("pwsh.exe")
+        if pwsh:
+            shells.append(("pwsh", pwsh))
+        self.assertTrue(
+            shells,
+            "Neither powershell.exe nor pwsh was found on Windows",
+        )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            harness = tmp_path / "verify_ps_helpers.ps1"
-            install_path = REPO_ROOT / "packaging" / "windows" / "install.ps1"
-            uninstall_path = REPO_ROOT / "packaging" / "windows" / "uninstall.ps1"
+        install_path = REPO_ROOT / "packaging" / "windows" / "install.ps1"
+        uninstall_path = REPO_ROOT / "packaging" / "windows" / "uninstall.ps1"
 
-            harness.write_text(
-                f"""
+        for shell_name, shell_exe in shells:
+            with self.subTest(shell=shell_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp_path = Path(tmp)
+                    harness = tmp_path / "verify_ps_helpers.ps1"
+
+                    harness.write_text(
+                        f"""
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -647,7 +695,6 @@ foreach ($p in @('{install_path}', '{uninstall_path}')) {{
 
     # 1. MethodInvocationException wrapping IOException must retry and succeed on 2nd attempt
     $script:attempts = 0
-    $missingPath = Join-Path '{tmp_path}' 'nonexistent-file-for-retry-test.bin'
     Invoke-WithFileLockRetry -TimeoutSeconds 3 -Description "wrapped IOException retry ($p)" -Operation {{
         $script:attempts++
         if ($script:attempts -lt 2) {{
@@ -672,6 +719,80 @@ foreach ($p in @('{install_path}', '{uninstall_path}')) {{
     }}
     if ((-not $threw) -or ($script:nonIoAttempts -ne 1)) {{
         throw "Non-IO exception should fail immediately in 1 attempt in $p (threw=$threw, attempts=$($script:nonIoAttempts))"
+    }}
+}}
+
+# Verify Invoke-IcaclsChecked from install.ps1 purges extraneous explicit ACEs and preserves target SIDs
+$iTokens = $null
+$iErrors = $null
+$iAst = [System.Management.Automation.Language.Parser]::ParseFile('{install_path}', [ref]$iTokens, [ref]$iErrors)
+foreach ($fnName in @('Ensure-NativeHelper', 'Invoke-NativeProcess', 'Invoke-IcaclsChecked')) {{
+    $fnAst = $iAst.FindAll({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $fnName }}, $true) | Select-Object -First 1
+    if ($null -eq $fnAst) {{ throw "Missing function $fnName in install.ps1" }}
+    Invoke-Expression $fnAst.Extent.Text
+}}
+$script:NativeHelperLoaded = $false
+
+$aclTestDir = Join-Path '{tmp_path}' 'acl-hardening-test'
+[void](New-Item -ItemType Directory -Path $aclTestDir -Force)
+try {{
+    $everyoneSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+    $authUsersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')
+    $inheritFlags = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $propFlags = [System.Security.AccessControl.PropagationFlags]::None
+
+    $preAcl = Get-Acl -LiteralPath $aclTestDir
+    $preAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($everyoneSid, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, $inheritFlags, $propFlags, [System.Security.AccessControl.AccessControlType]::Allow)))
+    $preAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($authUsersSid, [System.Security.AccessControl.FileSystemRights]::Modify, $inheritFlags, $propFlags, [System.Security.AccessControl.AccessControlType]::Allow)))
+    Set-Acl -LiteralPath $aclTestDir -AclObject $preAcl
+
+    $beforeExplicit = @((Get-Acl -LiteralPath $aclTestDir).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }})
+    if (($beforeExplicit -notcontains 'S-1-1-0') -or ($beforeExplicit -notcontains 'S-1-5-11')) {{
+        throw "Precondition failed: extraneous explicit ACEs were not added ($($beforeExplicit -join ','))"
+    }}
+
+    Invoke-IcaclsChecked -TargetPath $aclTestDir -GrantSpecs @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F')
+    $afterAdminAcl = Get-Acl -LiteralPath $aclTestDir
+    if (-not $afterAdminAcl.AreAccessRulesProtected) {{
+        throw "Expected inheritance protection on $aclTestDir after Invoke-IcaclsChecked"
+    }}
+    $afterInherited = @($afterAdminAcl.GetAccessRules($false, $true, [System.Security.Principal.SecurityIdentifier]))
+    if ($afterInherited.Count -ne 0) {{
+        throw "Expected 0 inherited rules on $aclTestDir, got $($afterInherited.Count)"
+    }}
+    $afterAdminSids = (@($afterAdminAcl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }} | Sort-Object -Unique)) -join ','
+    if ($afterAdminSids -ne 'S-1-5-18,S-1-5-32-544') {{
+        throw "Expected only SYSTEM and Administrators SIDs after admin hardening, got '$afterAdminSids'"
+    }}
+
+    # Re-add extraneous ACE and test InstallDir/NM-style grant with Users:RX
+    $preAcl2 = Get-Acl -LiteralPath $aclTestDir
+    $preAcl2.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($everyoneSid, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, $inheritFlags, $propFlags, [System.Security.AccessControl.AccessControlType]::Allow)))
+    Set-Acl -LiteralPath $aclTestDir -AclObject $preAcl2
+
+    Invoke-IcaclsChecked -TargetPath $aclTestDir -GrantSpecs @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX')
+    $afterUsersAcl = Get-Acl -LiteralPath $aclTestDir
+    $afterUsersSids = (@($afterUsersAcl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }} | Sort-Object -Unique)) -join ','
+    if ($afterUsersSids -ne 'S-1-5-18,S-1-5-32-544,S-1-5-32-545') {{
+        throw "Expected only SYSTEM, Administrators, and Users SIDs after Users:RX hardening, got '$afterUsersSids'"
+    }}
+}}
+finally {{
+    $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ((Test-Path -LiteralPath $aclTestDir) -and ($null -ne $currentUserSid)) {{
+        try {{
+            $cleanupAcl = Get-Acl -LiteralPath $aclTestDir
+            $cleanupAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $currentUserSid,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )))
+            Set-Acl -LiteralPath $aclTestDir -AclObject $cleanupAcl
+        }}
+        catch {{
+        }}
     }}
 }}
 
@@ -717,21 +838,21 @@ catch {{
 if (-not $caught1) {{ throw "Expected exit code 1 to fail closed" }}
 Write-Output "PS_VERIFY_OK"
 """,
-                encoding="utf-8",
-            )
-            res = subprocess.run(
-                [ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                check=False,
-            )
-            self.assertEqual(
-                res.returncode,
-                0,
-                f"PowerShell harness failed (rc={res.returncode}):\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
-            )
-            self.assertIn("PS_VERIFY_OK", res.stdout)
+                        encoding="utf-8",
+                    )
+                    res = subprocess.run(
+                        [shell_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        check=False,
+                    )
+                    self.assertEqual(
+                        res.returncode,
+                        0,
+                        f"{shell_name} harness failed (rc={res.returncode}):\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+                    )
+                    self.assertIn("PS_VERIFY_OK", res.stdout)
 
 
 if __name__ == "__main__":

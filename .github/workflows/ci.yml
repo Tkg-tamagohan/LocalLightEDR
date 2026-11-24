@@ -19,6 +19,7 @@ jobs:
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
       web: ${{ steps.detect.outputs.web }}
+      windows_packaging: ${{ steps.detect.outputs.windows_packaging }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,27 +44,28 @@ jobs:
           head_sha = os.environ.get("HEAD_SHA", "")
 
 
-          def write_outputs(rust_flag: bool, web_flag: bool) -> None:
+          def write_outputs(rust_flag: bool, web_flag: bool, windows_packaging_flag: bool) -> None:
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                   fh.write(f"rust={'true' if rust_flag else 'false'}\n")
                   fh.write(f"web={'true' if web_flag else 'false'}\n")
+                  fh.write(f"windows_packaging={'true' if windows_packaging_flag else 'false'}\n")
 
 
-          def detect() -> tuple[bool, bool]:
+          def detect() -> tuple[bool, bool, bool]:
               if event_name == "pull_request":
                   base, head = pr_base_sha, head_sha
               elif event_name == "push":
                   if not push_before or push_before == ZERO_SHA:
-                      print("Push has empty or zero before SHA; enabling both rust and web.")
-                      return True, True
+                      print("Push has empty or zero before SHA; enabling all jobs.")
+                      return True, True, True
                   base, head = push_before, head_sha
               else:
-                  print(f"Unhandled event {event_name!r}; enabling both rust and web.")
-                  return True, True
+                  print(f"Unhandled event {event_name!r}; enabling all jobs.")
+                  return True, True, True
 
               if not base or not head:
-                  print("Missing base or head SHA; enabling both rust and web.")
-                  return True, True
+                  print("Missing base or head SHA; enabling all jobs.")
+                  return True, True, True
 
               res = subprocess.run(
                   ["git", "diff", "--no-renames", "-z", "--name-only", base, head],
@@ -72,16 +74,17 @@ jobs:
               )
               if res.returncode != 0:
                   err = res.stderr.decode("utf-8", errors="replace").strip()
-                  print(f"git diff failed (rc={res.returncode}): {err}; enabling both rust and web.")
-                  return True, True
+                  print(f"git diff failed (rc={res.returncode}): {err}; enabling all jobs.")
+                  return True, True, True
 
               files = [p for p in res.stdout.decode("utf-8", errors="replace").split("\0") if p]
               if not files:
-                  print("Empty changed file list; enabling both rust and web.")
-                  return True, True
+                  print("Empty changed file list; enabling all jobs.")
+                  return True, True, True
 
               rust = False
               web = False
+              windows_packaging = False
               default_both_exact = {
                   "Cargo.toml",
                   "Cargo.lock",
@@ -94,6 +97,7 @@ jobs:
                   if path.startswith(".github/workflows/") or path in default_both_exact:
                       rust = True
                       web = True
+                      windows_packaging = True
                       continue
 
                   if (
@@ -108,6 +112,16 @@ jobs:
                       or path.startswith(".cargo/")
                   ):
                       rust = True
+                      windows_packaging = True
+
+                  if (
+                      path.startswith("packaging/")
+                      or path.startswith("scripts/")
+                      or path.startswith("rules/")
+                      or path in {"apps/ledr-ui/tauri.conf.json", "extensions/ledr-chrome-mv3/manifest.json"}
+                      or pathlib.Path(path).suffix.lower() in {".py", ".ps1", ".nsi"}
+                  ):
+                      windows_packaging = True
 
                   if (
                       path.startswith("apps/ledr-ui/")
@@ -135,12 +149,12 @@ jobs:
                   ):
                       web = True
 
-              return rust, web
+              return rust, web, windows_packaging
 
 
-          rust_needed, web_needed = detect()
-          print(f"Outputs: rust={rust_needed}, web={web_needed}")
-          write_outputs(rust_needed, web_needed)
+          rust_needed, web_needed, win_pkg_needed = detect()
+          print(f"Outputs: rust={rust_needed}, web={web_needed}, windows_packaging={win_pkg_needed}")
+          write_outputs(rust_needed, web_needed, win_pkg_needed)
           EOF
 
   static-checks:
@@ -421,10 +435,39 @@ jobs:
           RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
         run: cargo doc --workspace --no-deps --locked
 
+  windows-packaging-tests:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    needs: changes
+    if: needs.changes.outputs.windows_packaging == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile and test Python release and invariant scripts (Windows)
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: |
+          $pyFiles = @(Get-ChildItem scripts\*.py | Select-Object -ExpandProperty FullName)
+          if ($pyFiles.Count -eq 0) {
+            throw "No Python scripts matched scripts\*.py"
+          }
+          python -m py_compile $pyFiles
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest scripts/test_release_scripts.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest scripts/test_check_invariants.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/release_verify.py preflight
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   ci-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [changes, static-checks, rust-windows]
+    needs: [changes, static-checks, rust-windows, windows-packaging-tests]
     if: always()
     steps:
       - name: Verify required CI job results
@@ -443,6 +486,7 @@ jobs:
           flag_map = {
               "static-checks": "web",
               "rust-windows": "rust",
+              "windows-packaging-tests": "windows_packaging",
           }
 
           failed = False
@@ -455,7 +499,7 @@ jobs:
                   print(f"Invalid or missing changes output {flag!r}: {outputs.get(flag)!r}", file=sys.stderr)
                   failed = True
 
-          for job_name in ("changes", "static-checks", "rust-windows"):
+          for job_name in ("changes", "static-checks", "rust-windows", "windows-packaging-tests"):
               actual = needs.get(job_name, {}).get("result")
               if job_name in flag_map:
                   expected = "success" if outputs.get(flag_map[job_name]) == "true" else "skipped"

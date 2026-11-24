@@ -1,11 +1,9 @@
 //! Honeypot decoy file deployment and removal lifecycle (`L-06`).
 
 use std::collections::HashSet;
-use std::ffi::{c_void, OsString};
-use std::fs::OpenOptions;
-use std::io::{ErrorKind, Write};
+use std::ffi::{c_void, OsStr, OsString};
+use std::io::ErrorKind;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use ledr_proto::HONEYPOT_DEFAULT_FILENAME;
@@ -13,9 +11,13 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
 use windows::Win32::Storage::FileSystem::{
-    SetFileAttributesW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
-    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
-    FILE_FLAGS_AND_ATTRIBUTES,
+    CreateFileW, FileBasicInfo, GetFileInformationByHandle, GetFileType,
+    GetFinalPathNameByHandleW, ReOpenFile, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_BASIC_INFO,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
 };
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSConnected, WTSDisconnected, WTSEnumerateSessionsW, WTSFreeMemory,
@@ -28,7 +30,17 @@ const HONEYPOT_DECOY_CONTENT: &[u8] = b"LocalEDR Canary Decoy File - Do Not Modi
 const HONEYPOT_SUBDIRS: [&str; 3] = ["Documents", "Desktop", "Pictures"];
 const PROFILE_LIST_SUBKEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
 
-const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002_u32 as usize as *mut c_void;
+const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002_u32 as i32 as isize as *mut c_void;
+const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+const FILE_OPEN: u32 = 0x0000_0001;
+const FILE_CREATE: u32 = 0x0000_0002;
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
+const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BA_u32 as i32;
 const KEY_READ: u32 = 0x0002_0019;
 const KEY_WOW64_64KEY: u32 = 0x0100;
 const ERROR_SUCCESS_U32: u32 = 0;
@@ -151,26 +163,31 @@ impl HoneypotManager {
         let mut first_error: Option<SensorError> = None;
 
         for root in &self.roots {
-            if self.create_missing_roots {
+            let verified_dir = if self.create_missing_roots {
                 if let Err(err) = std::fs::create_dir_all(root) {
                     if first_error.is_none() {
                         first_error = Some(SensorError::Io(err));
                     }
                     continue;
                 }
-            } else {
-                if !is_safe_existing_directory(root) {
-                    continue;
-                }
-                if let Some(profile_root) = root.parent() {
-                    if !is_safe_existing_directory(profile_root) {
+                match open_verified_directory(root) {
+                    Ok(dir) => dir,
+                    Err(err) => {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
                         continue;
                     }
                 }
-            }
+            } else {
+                let Ok((_, subdir)) = open_verified_profile_and_subdir(root) else {
+                    continue;
+                };
+                subdir
+            };
 
             let target = root.join(HONEYPOT_DEFAULT_FILENAME);
-            let deploy_res = deploy_single_honeypot(&target);
+            let deploy_res = deploy_single_honeypot_in_dir(&verified_dir, &target);
             match deploy_res {
                 Ok(()) => {
                     if !self
@@ -226,62 +243,515 @@ pub fn honeypot_path_sets_equal(a: &[PathBuf], b: &[PathBuf]) -> bool {
     set_a == set_b
 }
 
-fn deploy_single_honeypot(target: &Path) -> Result<(), SensorError> {
-    match std::fs::symlink_metadata(target) {
-        Ok(meta) => {
-            let attrs = meta.file_attributes();
-            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
-                return Err(SensorError::Io(std::io::Error::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "refusing to deploy honeypot onto reparse point: {}",
-                        target.display()
-                    ),
-                )));
+struct VerifiedDirectory {
+    handle: OwnedHandle,
+    final_path: PathBuf,
+}
+
+enum NtCreateError {
+    AlreadyExists,
+    AccessDenied(std::io::Error),
+    Io(std::io::Error),
+}
+
+impl From<NtCreateError> for SensorError {
+    fn from(err: NtCreateError) -> Self {
+        match err {
+            NtCreateError::AlreadyExists => SensorError::Io(std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                "target already exists",
+            )),
+            NtCreateError::AccessDenied(io_err) | NtCreateError::Io(io_err) => {
+                SensorError::Io(io_err)
             }
-            if (attrs & FILE_ATTRIBUTE_DIRECTORY.0) != 0 || !meta.is_file() {
-                return Err(SensorError::Io(std::io::Error::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "refusing to deploy honeypot onto non-file target: {}",
-                        target.display()
-                    ),
-                )));
-            }
-            set_hidden_system_attributes(target, attrs)?;
-            Ok(())
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            // Default OpenOptions preserves the parent folder's inherited DACL so non-elevated
-            // user processes / ransomware can open and touch the decoy file (`L-06`).
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(target)?;
-            file.write_all(HONEYPOT_DECOY_CONTENT)?;
-            file.flush()?;
-            drop(file);
-            let attrs = std::fs::symlink_metadata(target)
-                .map(|m| m.file_attributes())
-                .unwrap_or(0);
-            set_hidden_system_attributes(target, attrs)?;
-            Ok(())
-        }
-        Err(err) => Err(SensorError::Io(err)),
     }
 }
 
-fn set_hidden_system_attributes(path: &Path, existing_attrs: u32) -> Result<(), SensorError> {
+fn nt_status_to_io_error(status: i32) -> std::io::Error {
+    // SAFETY: `RtlNtStatusToDosError` accepts any 32-bit NTSTATUS value.
+    let dos = unsafe { RtlNtStatusToDosError(status) };
+    std::io::Error::from_raw_os_error(i32::try_from(dos).unwrap_or(status))
+}
+
+fn nt_create_file_relative(
+    root_dir: HANDLE,
+    relative_name: &OsStr,
+    desired_access: u32,
+    file_attributes: u32,
+    create_disposition: u32,
+    create_options: u32,
+) -> Result<OwnedHandle, NtCreateError> {
+    let mut name_units: Vec<u16> = relative_name.encode_wide().collect();
+    let byte_len = u16::try_from(name_units.len().saturating_mul(2)).map_err(|_| {
+        NtCreateError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "relative file name exceeds UNICODE_STRING u16 limit",
+        ))
+    })?;
+    let max_byte_len = byte_len.saturating_add(2);
+    name_units.push(0);
+
+    let mut unicode_name = UnicodeString {
+        length: byte_len,
+        maximum_length: max_byte_len,
+        buffer: name_units.as_mut_ptr(),
+    };
+    let mut obj_attr = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: root_dir,
+        object_name: &raw mut unicode_name,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut io_status = IoStatusBlock {
+        status_or_pointer: 0,
+        information: 0,
+    };
+    let mut raw_handle = HANDLE::default();
+    let share_access = (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0;
+
+    // SAFETY: `obj_attr`, `unicode_name`, `io_status`, and `raw_handle` point to valid initialized
+    // stack storage for the duration of `NtCreateFile`, and `root_dir` is an open directory handle.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw_handle,
+            desired_access,
+            &raw mut obj_attr,
+            &raw mut io_status,
+            std::ptr::null_mut(),
+            file_attributes,
+            share_access,
+            create_disposition,
+            create_options,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if status < 0 {
+        if status == STATUS_OBJECT_NAME_COLLISION || status == STATUS_FILE_IS_A_DIRECTORY {
+            return Err(NtCreateError::AlreadyExists);
+        }
+        let io_err = nt_status_to_io_error(status);
+        if status == STATUS_ACCESS_DENIED {
+            return Err(NtCreateError::AccessDenied(io_err));
+        }
+        return Err(NtCreateError::Io(io_err));
+    }
+    if raw_handle.is_invalid() || raw_handle.0.is_null() {
+        return Err(NtCreateError::Io(std::io::Error::other(
+            "NtCreateFile succeeded with invalid handle",
+        )));
+    }
+    Ok(OwnedHandle(raw_handle))
+}
+
+fn query_final_path(handle: HANDLE) -> Result<PathBuf, SensorError> {
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: `handle` is an open file/directory handle and `buf` is valid writable UTF-16 memory.
+        let len = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, VOLUME_NAME_DOS) };
+        if len == 0 {
+            return Err(SensorError::Io(std::io::Error::last_os_error()));
+        }
+        let len_usize = len as usize;
+        if len_usize < buf.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buf[..len_usize])));
+        }
+        if len_usize > 32_768 {
+            return Err(SensorError::Io(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "GetFinalPathNameByHandleW exceeded maximum path buffer",
+            )));
+        }
+        buf.resize(len_usize + 1, 0);
+    }
+}
+
+fn normalize_dos_final_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let trimmed = if let Some(unc) = trimmed.strip_prefix(r"UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        trimmed.to_string()
+    };
+    trimmed
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn open_verified_directory(path: &Path) -> Result<VerifiedDirectory, SensorError> {
+    let wide = encode_wide_nul(path.as_os_str());
+    let share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 path string.
+    let raw = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            share_all,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|err| {
+        SensorError::Io(std::io::Error::new(
+            ErrorKind::NotFound,
+            format!("failed opening directory {}: {err}", path.display()),
+        ))
+    })?;
+    if raw.is_invalid() || raw.0.is_null() {
+        return Err(SensorError::Io(std::io::Error::other(format!(
+            "CreateFileW returned invalid handle for {}",
+            path.display()
+        ))));
+    }
+    let handle = OwnedHandle(raw);
+    verify_directory_handle(handle.0, path)?;
+    let final_path = query_final_path(handle.0)?;
+    Ok(VerifiedDirectory { handle, final_path })
+}
+
+fn verify_directory_handle(
+    handle: HANDLE,
+    path_display: &Path,
+) -> Result<BY_HANDLE_FILE_INFORMATION, SensorError> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is an open Win32 directory handle and `info` is valid out storage.
+    unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(|err| SensorError::Win32 {
+        api: "GetFileInformationByHandle",
+        message: format!("failed inspecting directory {}: {err}", path_display.display()),
+    })?;
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to traverse reparse point directory: {}",
+                path_display.display()
+            ),
+        )));
+    }
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) == 0 {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing non-directory honeypot root: {}",
+                path_display.display()
+            ),
+        )));
+    }
+    Ok(info)
+}
+
+fn open_verified_child_directory(
+    parent: &VerifiedDirectory,
+    child_display: &Path,
+    child_name: &OsStr,
+) -> Result<VerifiedDirectory, SensorError> {
+    let handle = nt_create_file_relative(
+        parent.handle.0,
+        child_name,
+        FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0,
+        0,
+        FILE_OPEN,
+        FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+    )?;
+    verify_directory_handle(handle.0, child_display)?;
+    let final_path = query_final_path(handle.0)?;
+    let Some(final_parent) = final_path.parent() else {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "verified directory {} has no parent",
+                final_path.display()
+            ),
+        )));
+    };
+    if normalize_dos_final_path(final_parent) != normalize_dos_final_path(&parent.final_path) {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "directory {} escaped verified profile root {}",
+                final_path.display(),
+                parent.final_path.display()
+            ),
+        )));
+    }
+    let expected_name = child_name.to_string_lossy();
+    let actual_name = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if !actual_name.eq_ignore_ascii_case(&expected_name) {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "directory final name mismatch: got {actual_name}, expected {expected_name}"
+            ),
+        )));
+    }
+    Ok(VerifiedDirectory { handle, final_path })
+}
+
+fn open_verified_profile_and_subdir(
+    subdir: &Path,
+) -> Result<(VerifiedDirectory, VerifiedDirectory), SensorError> {
+    let Some(profile_root) = subdir.parent() else {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("honeypot subdir missing profile root: {}", subdir.display()),
+        )));
+    };
+    let Some(subdir_name) = subdir.file_name() else {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("honeypot subdir missing leaf name: {}", subdir.display()),
+        )));
+    };
+    let profile_dir = open_verified_directory(profile_root)?;
+    let subdir_dir = open_verified_child_directory(&profile_dir, subdir, subdir_name)?;
+    Ok((profile_dir, subdir_dir))
+}
+
+fn verify_decoy_file_handle(
+    handle: HANDLE,
+    parent_dir: &VerifiedDirectory,
+    target_display: &Path,
+) -> Result<BY_HANDLE_FILE_INFORMATION, SensorError> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is an open Win32 file/object handle and `info` is valid out storage.
+    unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(|err| SensorError::Win32 {
+        api: "GetFileInformationByHandle",
+        message: format!(
+            "failed inspecting honeypot handle {}: {err}",
+            target_display.display()
+        ),
+    })?;
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to deploy honeypot onto reparse point: {}",
+                target_display.display()
+            ),
+        )));
+    }
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0 {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to deploy honeypot onto non-file target: {}",
+                target_display.display()
+            ),
+        )));
+    }
+    // SAFETY: `handle` is an open Win32 handle.
+    if unsafe { GetFileType(handle) } != FILE_TYPE_DISK {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to deploy honeypot onto non-disk target: {}",
+                target_display.display()
+            ),
+        )));
+    }
+    if info.nNumberOfLinks != 1 {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to deploy honeypot onto hardlinked target (links={}): {}",
+                info.nNumberOfLinks,
+                target_display.display()
+            ),
+        )));
+    }
+    let final_target = query_final_path(handle)?;
+    let Some(final_parent) = final_target.parent() else {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "honeypot final path has no parent: {}",
+                final_target.display()
+            ),
+        )));
+    };
+    if normalize_dos_final_path(final_parent) != normalize_dos_final_path(&parent_dir.final_path) {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "honeypot target {} escaped verified directory {}",
+                final_target.display(),
+                parent_dir.final_path.display()
+            ),
+        )));
+    }
+    let expected_name = target_display
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(HONEYPOT_DEFAULT_FILENAME);
+    let actual_name = final_target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if !actual_name.eq_ignore_ascii_case(expected_name) {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "honeypot final filename mismatch: got {actual_name}, expected {expected_name}"
+            ),
+        )));
+    }
+    Ok(info)
+}
+
+fn write_all_to_handle(handle: HANDLE, mut data: &[u8]) -> Result<(), SensorError> {
+    while !data.is_empty() {
+        let chunk_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        let mut written = 0u32;
+        // SAFETY: `handle` is open with `FILE_WRITE_DATA | SYNCHRONIZE` and `data[..chunk_len]` is readable.
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                data.as_ptr(),
+                chunk_len,
+                &raw mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(SensorError::Io(std::io::Error::last_os_error()));
+        }
+        if written == 0 {
+            return Err(SensorError::Io(std::io::Error::new(
+                ErrorKind::WriteZero,
+                "WriteFile wrote 0 bytes to honeypot decoy",
+            )));
+        }
+        data = &data[written as usize..];
+    }
+    Ok(())
+}
+
+fn deploy_single_honeypot_in_dir(
+    dir: &VerifiedDirectory,
+    target_display: &Path,
+) -> Result<(), SensorError> {
+    let Some(file_name) = target_display.file_name() else {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("honeypot path missing filename: {}", target_display.display()),
+        )));
+    };
+
+    // Default `SecurityDescriptor = NULL` in `NtCreateFile` inherits the parent folder's DACL so
+    // non-elevated user processes / ransomware can open and touch the decoy file (`L-06`).
+    match nt_create_file_relative(
+        dir.handle.0,
+        file_name,
+        FILE_WRITE_DATA.0 | FILE_READ_ATTRIBUTES.0 | FILE_WRITE_ATTRIBUTES.0 | SYNCHRONIZE.0,
+        FILE_ATTRIBUTE_NORMAL.0,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+    ) {
+        Ok(file_handle) => {
+            let info = verify_decoy_file_handle(file_handle.0, dir, target_display)?;
+            write_all_to_handle(file_handle.0, HONEYPOT_DECOY_CONTENT)?;
+            set_hidden_system_attributes_by_handle(
+                file_handle.0,
+                info.dwFileAttributes,
+                target_display,
+            )?;
+            Ok(())
+        }
+        Err(create_err @ (NtCreateError::AlreadyExists | NtCreateError::AccessDenied(_))) => {
+            // If `FILE_CREATE` with `FILE_NON_DIRECTORY_FILE` encountered an existing directory,
+            // junction, or file, inspect it attribute-only with `FILE_OPEN_REPARSE_POINT` first
+            // so reparse points and directories are diagnosed without path TOCTOU, then upgrade
+            // the verified file handle via `ReOpenFile` to apply `HIDDEN | SYSTEM`.
+            let attr_handle = match nt_create_file_relative(
+                dir.handle.0,
+                file_name,
+                FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0,
+                0,
+                FILE_OPEN,
+                FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ) {
+                Ok(h) => h,
+                Err(_) => return Err(SensorError::from(create_err)),
+            };
+            let info = verify_decoy_file_handle(attr_handle.0, dir, target_display)?;
+            let share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            // SAFETY: `attr_handle.0` is an open verified regular disk file handle.
+            let write_raw = unsafe {
+                ReOpenFile(
+                    attr_handle.0,
+                    FILE_READ_ATTRIBUTES.0 | FILE_WRITE_ATTRIBUTES.0 | SYNCHRONIZE.0,
+                    share_all,
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                )
+            }
+            .map_err(|err| SensorError::Win32 {
+                api: "ReOpenFile",
+                message: format!(
+                    "failed upgrading honeypot handle {}: {err}",
+                    target_display.display()
+                ),
+            })?;
+            if write_raw.is_invalid() || write_raw.0.is_null() {
+                return Err(SensorError::Io(std::io::Error::other(format!(
+                    "ReOpenFile returned invalid handle for {}",
+                    target_display.display()
+                ))));
+            }
+            let write_handle = OwnedHandle(write_raw);
+            set_hidden_system_attributes_by_handle(
+                write_handle.0,
+                info.dwFileAttributes,
+                target_display,
+            )?;
+            Ok(())
+        }
+        Err(NtCreateError::Io(err)) => Err(SensorError::Io(err)),
+    }
+}
+
+fn set_hidden_system_attributes_by_handle(
+    handle: HANDLE,
+    existing_attrs: u32,
+    path_display: &Path,
+) -> Result<(), SensorError> {
     let desired = (existing_attrs & !FILE_ATTRIBUTE_READONLY.0)
         | FILE_ATTRIBUTE_HIDDEN.0
         | FILE_ATTRIBUTE_SYSTEM.0;
-    let wide = encode_wide_nul(path.as_os_str());
-    // SAFETY: `wide` is a valid NUL-terminated UTF-16 path string.
-    unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(desired)) }
-        .map_err(|err| SensorError::Win32 {
-            api: "SetFileAttributesW",
-            message: format!("failed setting HIDDEN|SYSTEM on {}: {err}", path.display()),
-        })
+    let basic_info = FILE_BASIC_INFO {
+        CreationTime: 0,
+        LastAccessTime: 0,
+        LastWriteTime: 0,
+        ChangeTime: 0,
+        FileAttributes: desired,
+    };
+    // SAFETY: `handle` is open with `FILE_WRITE_ATTRIBUTES` and `basic_info` is a valid
+    // `FILE_BASIC_INFO` struct for the duration of the call.
+    unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileBasicInfo,
+            (&raw const basic_info).cast::<c_void>(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .map_err(|err| SensorError::Win32 {
+        api: "SetFileInformationByHandle",
+        message: format!(
+            "failed setting HIDDEN|SYSTEM on {}: {err}",
+            path_display.display()
+        ),
+    })
 }
 
 fn default_honeypot_roots() -> Vec<PathBuf> {
@@ -308,12 +778,12 @@ pub(crate) fn roots_for_user_profiles(profiles: &[PathBuf]) -> Vec<PathBuf> {
         if !seen_profiles.insert(profile_key) {
             continue;
         }
-        if !is_safe_existing_directory(&clean_profile) {
+        let Ok(profile_dir) = open_verified_directory(&clean_profile) else {
             continue;
-        }
+        };
         for sub in HONEYPOT_SUBDIRS {
             let candidate = clean_profile.join(sub);
-            if !is_safe_existing_directory(&candidate) {
+            if open_verified_child_directory(&profile_dir, &candidate, OsStr::new(sub)).is_err() {
                 continue;
             }
             let root_key = normalize_windows_path_key(&candidate);
@@ -326,22 +796,32 @@ pub(crate) fn roots_for_user_profiles(profiles: &[PathBuf]) -> Vec<PathBuf> {
     roots
 }
 
+#[cfg(test)]
 pub(crate) fn is_safe_existing_directory(path: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    let attrs = meta.file_attributes();
-    (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) == 0 && (attrs & FILE_ATTRIBUTE_DIRECTORY.0) != 0
+    open_verified_directory(path).is_ok()
 }
 
 fn is_safe_existing_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    let Some(parent) = path.parent() else {
         return false;
     };
-    let attrs = meta.file_attributes();
-    (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) == 0
-        && (attrs & FILE_ATTRIBUTE_DIRECTORY.0) == 0
-        && meta.is_file()
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    let Ok(parent_dir) = open_verified_directory(parent) else {
+        return false;
+    };
+    let Ok(handle) = nt_create_file_relative(
+        parent_dir.handle.0,
+        file_name,
+        FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0,
+        0,
+        FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+    ) else {
+        return false;
+    };
+    verify_decoy_file_handle(handle.0, &parent_dir, path).is_ok()
 }
 
 fn sanitize_local_profile_path(path: &Path) -> Option<PathBuf> {
@@ -822,17 +1302,68 @@ extern "system" {
     fn RegCloseKey(h_key: *mut c_void) -> u32;
 }
 
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[repr(C)]
+struct ObjectAttributes {
+    length: u32,
+    root_directory: HANDLE,
+    object_name: *mut UnicodeString,
+    attributes: u32,
+    security_descriptor: *mut c_void,
+    security_quality_of_service: *mut c_void,
+}
+
+#[repr(C)]
+struct IoStatusBlock {
+    status_or_pointer: usize,
+    information: usize,
+}
+
+#[link(name = "ntdll.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+extern "system" {
+    fn NtCreateFile(
+        file_handle: *mut HANDLE,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+        io_status_block: *mut IoStatusBlock,
+        allocation_size: *mut i64,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        ea_buffer: *mut c_void,
+        ea_length: u32,
+    ) -> i32;
+    fn RtlNtStatusToDosError(status: i32) -> u32;
+}
+
 #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
 extern "system" {
     fn ExpandEnvironmentStringsW(lp_src: *const u16, lp_dst: *mut u16, n_size: u32) -> u32;
     fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
+    fn WriteFile(
+        h_file: HANDLE,
+        lp_buffer: *const u8,
+        n_number_of_bytes_to_write: u32,
+        lp_number_of_bytes_written: *mut u32,
+        lp_overlapped: *mut c_void,
+    ) -> i32;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::MetadataExt;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_FLAGS_AND_ATTRIBUTES};
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1103,5 +1634,112 @@ mod tests {
                 root.display()
             );
         }
+    }
+
+    #[test]
+    fn honeypot_p4_srv_05_registry_profile_list_opens_hklm_and_excludes_system_sids() {
+        // Verify HKEY_LOCAL_MACHINE sign-extension opens HKLM\...\ProfileList without ERROR_INVALID_HANDLE.
+        let list_key = reg_open_read_hklm(PROFILE_LIST_SUBKEY)
+            .expect("RegOpenKeyExW(HKEY_LOCAL_MACHINE, ProfileList) must succeed on 64-bit Windows");
+
+        let mut raw_subkeys = Vec::new();
+        let mut idx = 0u32;
+        while let Some(name) = reg_enum_key_name(list_key.0, idx) {
+            raw_subkeys.push(name);
+            idx = idx.saturating_add(1);
+        }
+        assert!(
+            raw_subkeys.iter().any(|s| s.eq_ignore_ascii_case("S-1-5-18")),
+            "ProfileList enumeration must observe S-1-5-18 directly, got: {raw_subkeys:?}"
+        );
+        drop(list_key);
+
+        let discovered = discover_registry_profile_list();
+        for (sid, path) in &discovered {
+            assert!(
+                !is_excluded_profile_sid(sid),
+                "excluded system/service SID leaked from ProfileList: {sid}"
+            );
+            let lower = path.to_string_lossy().to_ascii_lowercase();
+            assert!(
+                !lower.contains(r"\system32\config\systemprofile")
+                    && !lower.contains(r"\serviceprofiles\localservice")
+                    && !lower.contains(r"\serviceprofiles\networkservice"),
+                "system profile path leaked from ProfileList for SID {sid}: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn honeypot_p4_srv_06_handle_based_attributes_hardlink_and_containment_guards() {
+        let tmp = TempHoneypotDir::new("handle-guards");
+        let profile = tmp.path().join("UserProfile");
+        let docs = profile.join("Documents");
+        let desktop = profile.join("Desktop");
+        let victim = tmp.path().join("VictimDir");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+
+        // 1. Pre-existing READONLY decoy file must have READONLY cleared and HIDDEN|SYSTEM applied
+        //    via the open handle (`SetFileInformationByHandle(FileBasicInfo)`).
+        let docs_decoy = docs.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(&docs_decoy, b"existing-decoy-content").unwrap();
+        let docs_decoy_w = encode_wide_nul(docs_decoy.as_os_str());
+        unsafe {
+            SetFileAttributesW(
+                PCWSTR(docs_decoy_w.as_ptr()),
+                FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_READONLY.0),
+            )
+        }
+        .expect("set READONLY on existing decoy");
+
+        // 2. Hardlinked decoy target (nNumberOfLinks > 1) in Desktop must be rejected fail-closed.
+        let outside_file = tmp.path().join("outside_real_file.docx");
+        std::fs::write(&outside_file, b"sensitive-external-data").unwrap();
+        let desktop_hardlink = desktop.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::hard_link(&outside_file, &desktop_hardlink).expect("create hardlink target");
+
+        let mut mgr = HoneypotManager::for_user_profiles(vec![profile.clone()]);
+        let err = mgr
+            .deploy_honeypots()
+            .expect_err("hardlinked decoy target must be rejected");
+        assert!(
+            err.to_string().contains("hardlinked target"),
+            "unexpected hardlink rejection error: {err}"
+        );
+
+        let docs_meta = std::fs::symlink_metadata(&docs_decoy).expect("docs decoy metadata");
+        let docs_attrs = docs_meta.file_attributes();
+        assert_ne!(docs_attrs & FILE_ATTRIBUTE_HIDDEN.0, 0, "expected HIDDEN");
+        assert_ne!(docs_attrs & FILE_ATTRIBUTE_SYSTEM.0, 0, "expected SYSTEM");
+        assert_eq!(
+            docs_attrs & FILE_ATTRIBUTE_READONLY.0,
+            0,
+            "READONLY must be cleared via handle"
+        );
+
+        let outside_meta = std::fs::symlink_metadata(&outside_file).expect("outside metadata");
+        assert_eq!(
+            outside_meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0),
+            0,
+            "rejected hardlink must NOT modify attributes on outside file"
+        );
+
+        // 3. Post-discovery directory junction swap before deploy_honeypots() must be rejected.
+        let race_profile = tmp.path().join("RaceProfile");
+        let race_docs = race_profile.join("Documents");
+        std::fs::create_dir_all(&race_docs).unwrap();
+        let mut mgr_race = HoneypotManager::for_user_profiles(vec![race_profile]);
+        std::fs::remove_dir(&race_docs).unwrap();
+        create_ntfs_junction(&race_docs, &victim);
+
+        let deployed = mgr_race.deploy_honeypots().expect("safe skip of swapped junction");
+        assert!(deployed.is_empty(), "swapped junction root must not deploy");
+        assert!(
+            !victim.join(HONEYPOT_DEFAULT_FILENAME).exists(),
+            "honeypot must never be written into swapped junction target"
+        );
     }
 }

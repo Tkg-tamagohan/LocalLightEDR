@@ -512,6 +512,16 @@ fn clear_cached_manifest_fields(persisted: &mut PersistedUpdateState, clear_late
     }
 }
 
+pub(crate) fn is_http_404_not_found(err: &UpdaterError) -> bool {
+    match err {
+        UpdaterError::HttpError(detail) => {
+            detail == "unexpected HTTP status 404"
+                || detail.starts_with("unexpected HTTP status 404 ")
+        }
+        _ => false,
+    }
+}
+
 fn persist_cleaned_state_best_effort(
     state_path: Option<&Path>,
     persisted: &PersistedUpdateState,
@@ -816,7 +826,11 @@ impl AppUpdateManager {
             }
             Err(err) => {
                 let msg = err.to_string();
-                let view = self.set_error_state(msg.clone());
+                let view = if is_http_404_not_found(&err) {
+                    self.clear_stale_release_and_set_error_state(msg.clone())
+                } else {
+                    self.set_error_state(msg.clone())
+                };
                 op_guard.mark_finished();
                 self.emit_status(&emit, &view);
                 return Err(msg);
@@ -833,7 +847,11 @@ impl AppUpdateManager {
             }
             Err(err) => {
                 let msg = err.to_string();
-                let view = self.set_error_state(msg.clone());
+                let view = if is_http_404_not_found(&err) {
+                    self.clear_stale_release_and_set_error_state(msg.clone())
+                } else {
+                    self.set_error_state(msg.clone())
+                };
                 op_guard.mark_finished();
                 self.emit_status(&emit, &view);
                 return Err(msg);
@@ -961,6 +979,31 @@ impl AppUpdateManager {
         guard.error_message = Some(msg);
         guard.notice_message = None;
         guard.to_status_view(&self.config)
+    }
+
+    fn clear_stale_release_and_set_error_state(&self, msg: String) -> UpdaterStatusView {
+        let (next_persisted, view) = {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            clear_cached_manifest_fields(&mut guard.persisted, true);
+            guard.cached_verified = None;
+            guard.latest_version = None;
+            guard.min_updater_version = None;
+            guard.release_notes_url = None;
+            guard.phase = UpdaterPhase::Error;
+            guard.bytes_downloaded = 0;
+            guard.total_bytes = None;
+            guard.error_message = Some(msg);
+            guard.notice_message = None;
+            (guard.persisted.clone(), guard.to_status_view(&self.config))
+        };
+
+        let state_path = self
+            .config
+            .data_dir
+            .as_deref()
+            .map(update_state_path_from_data_dir);
+        persist_cleaned_state_best_effort(state_path.as_deref(), &next_persisted);
+        view
     }
 
     #[allow(clippy::type_complexity)]
@@ -1149,7 +1192,11 @@ impl AppUpdateManager {
             Err(err) => {
                 self.cleanup_active_staging(&staging_dir);
                 let msg = err.to_string();
-                let view = self.set_error_state(msg.clone());
+                let view = if is_http_404_not_found(&err) {
+                    self.clear_stale_release_and_set_error_state(msg.clone())
+                } else {
+                    self.set_error_state(msg.clone())
+                };
                 op_guard.mark_finished();
                 self.emit_status(&emit, &view);
                 return Err(msg);

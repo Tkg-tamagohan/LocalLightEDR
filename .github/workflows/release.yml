@@ -143,6 +143,23 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run Python release script unit tests (Windows)
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: |
+          $pyFiles = @(Get-ChildItem scripts\*.py | Select-Object -ExpandProperty FullName)
+          if ($pyFiles.Count -eq 0) {
+            throw "No Python scripts matched scripts\*.py"
+          }
+          python -m py_compile $pyFiles
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest scripts/test_release_scripts.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Ensure NSIS (makensis) is installed
         shell: pwsh
         run: |

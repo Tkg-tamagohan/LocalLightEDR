@@ -22,10 +22,12 @@ use ledr_rules::{
     compute_file_sha256_hex, discover_default_prerestricted_interpreters, load_rules_dir,
     LoadedRulesDir, DEFAULT_NRD_FEED_URLS,
 };
-use ledr_sensor_win::defense::{HoneypotManager, WindowsDefenseController};
+use ledr_sensor_win::defense::{
+    process_liveness, HoneypotManager, ProcessLiveness, WindowsDefenseController,
+};
 use ledr_sensor_win::etw::{
-    try_capture_running_processes, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
-    DEFAULT_ETW_SESSION_NAME,
+    inspect_live_process, try_capture_running_processes, EventSinkFn, NoopSensorBackend,
+    WindowsEtwSensor, DEFAULT_ETW_SESSION_NAME,
 };
 use ledr_sensor_win::privileges::enable_required_privileges;
 use ledr_store::LedrStore;
@@ -463,32 +465,165 @@ fn parse_pid_from_instance_id(instance_id: &str) -> Option<u32> {
         })
 }
 
-fn collect_suspended_pids(alerts: &[AlertRecord]) -> BTreeSet<u32> {
-    let mut pids = BTreeSet::new();
-    for alert in alerts {
-        if alert.process_suspended {
-            if let Some(ref inst) = alert.process_instance_id {
-                if let Some(pid) = parse_pid_from_instance_id(inst) {
-                    pids.insert(pid);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveTargetState {
+    Running { create_time_100ns: Option<u64> },
+    Gone,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetLivenessCheck {
+    /// Target is positively confirmed `Gone` or `CreationTime`-mismatched (PID reused).
+    Excluded,
+    /// Target is live with matching identity, or its absence/mismatch cannot be confirmed.
+    Block(Option<u32>),
+}
+
+fn probe_live_target_os(pid: u32) -> LiveTargetState {
+    if pid == 0 {
+        return LiveTargetState::Running {
+            create_time_100ns: None,
+        };
+    }
+    match process_liveness(pid) {
+        ProcessLiveness::Gone => LiveTargetState::Gone,
+        ProcessLiveness::Unknown => LiveTargetState::Unknown,
+        ProcessLiveness::Running => {
+            if let Some(info) = inspect_live_process(pid) {
+                if info.create_time_100ns != 0 {
+                    return LiveTargetState::Running {
+                        create_time_100ns: Some(info.create_time_100ns),
+                    };
                 }
             }
-        }
-        if let Ok(ctx) = serde_json::from_str::<serde_json::Value>(&alert.context_json) {
-            if let Some(children) = ctx.get("suspended_children").and_then(|v| v.as_array()) {
-                for item in children {
-                    if let Some(raw_id) = item.as_str() {
-                        if let Some(pid) = parse_pid_from_instance_id(raw_id) {
-                            pids.insert(pid);
-                        }
-                    }
-                }
+            // Re-check liveness once in case the target finished exiting between the two calls,
+            // failing closed when still `Running` or `Unknown` (`AGENTS.md` Phase 2 invariant).
+            match process_liveness(pid) {
+                ProcessLiveness::Gone => LiveTargetState::Gone,
+                ProcessLiveness::Unknown => LiveTargetState::Unknown,
+                ProcessLiveness::Running => LiveTargetState::Running {
+                    create_time_100ns: None,
+                },
             }
         }
     }
-    pids
+}
+
+fn check_suspended_target_liveness(
+    raw_instance_id: &str,
+    probe: &dyn Fn(u32) -> LiveTargetState,
+) -> TargetLivenessCheck {
+    let trimmed = raw_instance_id.trim();
+    if let Some(ident) = ProcessIdentity::from_instance_id(trimmed) {
+        if ident.pid == 0 {
+            return TargetLivenessCheck::Block(None);
+        }
+        if ident.create_time_100ns == 0 {
+            return match probe(ident.pid) {
+                LiveTargetState::Gone => TargetLivenessCheck::Excluded,
+                LiveTargetState::Unknown | LiveTargetState::Running { .. } => {
+                    TargetLivenessCheck::Block(Some(ident.pid))
+                }
+            };
+        }
+        return match probe(ident.pid) {
+            LiveTargetState::Gone => TargetLivenessCheck::Excluded,
+            LiveTargetState::Unknown => TargetLivenessCheck::Block(Some(ident.pid)),
+            LiveTargetState::Running {
+                create_time_100ns: Some(actual_ct),
+            } if actual_ct != ident.create_time_100ns => TargetLivenessCheck::Excluded,
+            LiveTargetState::Running { .. } => TargetLivenessCheck::Block(Some(ident.pid)),
+        };
+    }
+
+    if let Some(pid) = parse_pid_from_instance_id(trimmed).filter(|&p| p > 0) {
+        return match probe(pid) {
+            LiveTargetState::Gone => TargetLivenessCheck::Excluded,
+            LiveTargetState::Unknown | LiveTargetState::Running { .. } => {
+                TargetLivenessCheck::Block(Some(pid))
+            }
+        };
+    }
+    TargetLivenessCheck::Block(None)
+}
+
+fn collect_live_unresolved_suspended_alerts(
+    alerts: &[AlertRecord],
+    probe: &dyn Fn(u32) -> LiveTargetState,
+) -> (usize, BTreeSet<u32>) {
+    let mut live_alerts = 0usize;
+    let mut live_pids = BTreeSet::new();
+
+    for alert in alerts {
+        let mut alert_blocked = false;
+        if alert.process_suspended {
+            match alert.process_instance_id.as_deref() {
+                Some(inst) => match check_suspended_target_liveness(inst, probe) {
+                    TargetLivenessCheck::Excluded => {}
+                    TargetLivenessCheck::Block(maybe_pid) => {
+                        alert_blocked = true;
+                        if let Some(pid) = maybe_pid {
+                            live_pids.insert(pid);
+                        }
+                    }
+                },
+                None => {
+                    alert_blocked = true;
+                }
+            }
+        }
+
+        match serde_json::from_str::<serde_json::Value>(&alert.context_json) {
+            Ok(ctx) => match ctx.get("suspended_children") {
+                Some(children_val) => {
+                    if let Some(children) = children_val.as_array() {
+                        for item in children {
+                            if let Some(raw_id) = item.as_str() {
+                                match check_suspended_target_liveness(raw_id, probe) {
+                                    TargetLivenessCheck::Excluded => {}
+                                    TargetLivenessCheck::Block(maybe_pid) => {
+                                        alert_blocked = true;
+                                        if let Some(pid) = maybe_pid {
+                                            live_pids.insert(pid);
+                                        }
+                                    }
+                                }
+                            } else {
+                                alert_blocked = true;
+                            }
+                        }
+                    } else if !children_val.is_null() && !alert.process_suspended {
+                        alert_blocked = true;
+                    }
+                }
+                None if !alert.process_suspended => {
+                    alert_blocked = true;
+                }
+                None => {}
+            },
+            Err(_) if !alert.process_suspended => {
+                alert_blocked = true;
+            }
+            Err(_) => {}
+        }
+
+        if alert_blocked {
+            live_alerts += 1;
+        }
+    }
+
+    (live_alerts, live_pids)
 }
 
 fn check_unresolved_suspended_in_db(explicit_db: Option<&Path>) -> u8 {
+    check_unresolved_suspended_in_db_with_probe(explicit_db, &probe_live_target_os)
+}
+
+fn check_unresolved_suspended_in_db_with_probe(
+    explicit_db: Option<&Path>,
+    probe: &dyn Fn(u32) -> LiveTargetState,
+) -> u8 {
     let db_path = explicit_db
         .map(Path::to_path_buf)
         .unwrap_or_else(default_daemon_db_path);
@@ -527,7 +662,11 @@ fn check_unresolved_suspended_in_db(explicit_db: Option<&Path>) -> u8 {
         return 0;
     }
 
-    let pids = collect_suspended_pids(&alerts);
+    let (live_alerts, pids) = collect_live_unresolved_suspended_alerts(&alerts, probe);
+    if live_alerts == 0 {
+        return 0;
+    }
+
     let pid_summary = if pids.is_empty() {
         "unknown".to_string()
     } else {
@@ -538,7 +677,7 @@ fn check_unresolved_suspended_in_db(explicit_db: Option<&Path>) -> u8 {
     };
     eprintln!(
         "Blocked uninstall: {} unresolved suspended alert(s) found in '{}' (suspended PIDs: {}). Resolve all pending alerts in the LocalEDR UI before uninstalling.",
-        alerts.len(),
+        live_alerts,
         db_path.display(),
         pid_summary
     );
@@ -810,7 +949,7 @@ where
                 service_mode = !cli.foreground,
                 "deployed honeypot canary files"
             );
-            paths
+            honeypot_mgr.deployed_paths().to_vec()
         }
         Err(err) => {
             tracing::warn!(
@@ -1716,7 +1855,7 @@ mod tests {
     fn cli_check_04_unresolved_suspended_parent_and_children_exit_3_with_pids() {
         use ledr_proto::{AlertSeverity, AlertStatus};
         use std::io::Read as _;
-        use std::process::{Command, Stdio};
+        use std::process::{Child, Command, Stdio};
 
         if let Some(db_env) = std::env::var_os("LEDR_TEST_CHECK_SUSPENDED_DB") {
             let db_str = db_env.to_string_lossy().into_owned();
@@ -1728,6 +1867,32 @@ mod tests {
             ]);
             std::process::exit(i32::from(code));
         }
+
+        struct ChildKillGuard(Option<Child>);
+        impl Drop for ChildKillGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let spawn_live_dummy = || -> (ChildKillGuard, ProcessIdentity) {
+            let child = Command::new("cmd.exe")
+                .args(["/c", "findstr", ".*"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn harmless live cmd child");
+            let pid = child.id();
+            let ct = inspect_live_process(pid)
+                .map(|info| info.create_time_100ns)
+                .filter(|&ct| ct != 0)
+                .expect("query CreationTime for live cmd child");
+            (ChildKillGuard(Some(child)), ProcessIdentity::new(pid, ct))
+        };
 
         let tmp_dir = std::env::temp_dir().join(format!(
             "ledr-main-check-susp-{}",
@@ -1759,7 +1924,12 @@ mod tests {
             (status.code(), stderr)
         };
 
-        // Case A: Unresolved Pending alert with process_suspended = true (while WAL writer is open).
+        let (_parent_guard, parent_ident) = spawn_live_dummy();
+        let (_child1_guard, child1_ident) = spawn_live_dummy();
+        let (_child2_guard, child2_ident) = spawn_live_dummy();
+
+        // Case A: Unresolved Pending alert with process_suspended = true and matching live
+        // `(pid, create_time_100ns)` (while WAL writer is open).
         let db_parent = tmp_dir.join("parent_suspended.db");
         let store_parent = LedrStore::open(&db_parent).expect("open parent db");
         store_parent
@@ -1770,7 +1940,7 @@ mod tests {
                 source_layer: "LAYER_1_HONEYPOT".to_string(),
                 rule_id: "L-06".to_string(),
                 title: "Honeypot write".to_string(),
-                process_instance_id: Some("4242:100001".to_string()),
+                process_instance_id: Some(parent_ident.instance_id()),
                 process_suspended: true,
                 status: AlertStatus::Pending,
                 context_json: "{}".to_string(),
@@ -1779,15 +1949,18 @@ mod tests {
             .expect("insert parent suspended alert");
         let (code_a, stderr_a) = run_child_check(&db_parent);
         assert_eq!(code_a, Some(3), "expected exit 3; stderr={stderr_a:?}");
+        let parent_pid_str = parent_ident.pid.to_string();
         assert!(
-            stderr_a.contains("4242") && stderr_a.contains("1 unresolved suspended alert"),
-            "expected PID 4242 and count in stderr: {stderr_a:?}"
+            stderr_a.contains(&parent_pid_str) && stderr_a.contains("1 unresolved suspended alert"),
+            "expected PID {parent_pid_str} and count in stderr: {stderr_a:?}"
         );
         drop(store_parent);
 
-        // Case B: Unresolved ExpiredSuspended alert with process_suspended = false and non-empty suspended_children.
+        // Case B: Unresolved ExpiredSuspended alert with process_suspended = false and live
+        // `suspended_children`.
         let db_children = tmp_dir.join("children_suspended.db");
         let store_children = LedrStore::open(&db_children).expect("open children db");
+        let unsuspended_parent_pid = 999_991u32;
         store_children
             .record_alert(&AlertRecord {
                 alert_id: "al-susp-children".to_string(),
@@ -1796,10 +1969,13 @@ mod tests {
                 source_layer: "LAYER_1_CANARY".to_string(),
                 rule_id: "L-05".to_string(),
                 title: "Credential canary access".to_string(),
-                process_instance_id: Some("9001:200001".to_string()),
+                process_instance_id: Some(format!("{unsuspended_parent_pid}:200001")),
                 process_suspended: false,
                 status: AlertStatus::ExpiredSuspended,
-                context_json: r#"{"suspended_children":["5150:200002","6160:300003"]}"#.to_string(),
+                context_json: serde_json::json!({
+                    "suspended_children": [child1_ident.instance_id(), child2_ident.instance_id()]
+                })
+                .to_string(),
                 resolved_at_ms: None,
             })
             .expect("insert suspended_children alert");
@@ -1808,9 +1984,216 @@ mod tests {
 
         let (code_b, stderr_b) = run_child_check(&db_children);
         assert_eq!(code_b, Some(3), "expected exit 3; stderr={stderr_b:?}");
+        let c1_str = child1_ident.pid.to_string();
+        let c2_str = child2_ident.pid.to_string();
         assert!(
-            stderr_b.contains("5150") && stderr_b.contains("6160") && !stderr_b.contains("9001"),
-            "expected suspended child PIDs 5150, 6160 (not unsuspended parent 9001) in stderr: {stderr_b:?}"
+            stderr_b.contains(&c1_str)
+                && stderr_b.contains(&c2_str)
+                && !stderr_b.contains(&unsuspended_parent_pid.to_string()),
+            "expected suspended child PIDs {c1_str}, {c2_str} (not unsuspended parent) in stderr: {stderr_b:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cli_check_05_exited_and_reused_pids_exit_0_while_unknown_and_missing_ct_exit_3() {
+        use ledr_proto::{AlertSeverity, AlertStatus};
+        use std::process::{Child, Command, Stdio};
+
+        struct ChildKillGuard(Option<Child>);
+        impl Drop for ChildKillGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-main-check-liveness-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+
+        // Spawn a real child, capture its (pid, create_time_100ns), then terminate it -> `Gone`.
+        let mut dead_child = Command::new("cmd.exe")
+            .args(["/c", "findstr", ".*"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child to exit");
+        let dead_pid = dead_child.id();
+        let dead_ct = inspect_live_process(dead_pid)
+            .map(|info| info.create_time_100ns)
+            .filter(|&ct| ct != 0)
+            .expect("dead child create_time_100ns");
+        let _ = dead_child.kill();
+        let _ = dead_child.wait();
+        let dead_ident = ProcessIdentity::new(dead_pid, dead_ct);
+
+        let db_gone = tmp_dir.join("gone.db");
+        let store_gone = LedrStore::open(&db_gone).expect("open gone db");
+        store_gone
+            .record_alert(&AlertRecord {
+                alert_id: "al-gone".to_string(),
+                timestamp_ms: 1_000,
+                severity: AlertSeverity::Critical,
+                source_layer: "LAYER_1_HONEYPOT".to_string(),
+                rule_id: "L-06".to_string(),
+                title: "Exited suspended process".to_string(),
+                process_instance_id: Some(dead_ident.instance_id()),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: serde_json::json!({
+                    "suspended_children": [dead_ident.instance_id()]
+                })
+                .to_string(),
+                resolved_at_ms: None,
+            })
+            .expect("insert gone alert");
+        drop(store_gone);
+        assert_eq!(
+            check_unresolved_suspended_in_db(Some(&db_gone)),
+            0,
+            "positively confirmed Gone suspended process must exit 0"
+        );
+
+        // Live child process with mismatched create_time_100ns (PID reused) -> exit 0.
+        let live_child = Command::new("cmd.exe")
+            .args(["/c", "findstr", ".*"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn live child");
+        let live_pid = live_child.id();
+        let live_ct = inspect_live_process(live_pid)
+            .map(|info| info.create_time_100ns)
+            .filter(|&ct| ct != 0)
+            .expect("live child create_time_100ns");
+        let _live_guard = ChildKillGuard(Some(live_child));
+
+        let db_reused = tmp_dir.join("reused.db");
+        let store_reused = LedrStore::open(&db_reused).expect("open reused db");
+        let mismatched_ident = ProcessIdentity::new(live_pid, live_ct.saturating_add(1));
+        store_reused
+            .record_alert(&AlertRecord {
+                alert_id: "al-reused".to_string(),
+                timestamp_ms: 2_000,
+                severity: AlertSeverity::Critical,
+                source_layer: "LAYER_1_HONEYPOT".to_string(),
+                rule_id: "L-06".to_string(),
+                title: "Reused PID alert".to_string(),
+                process_instance_id: Some(mismatched_ident.instance_id()),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: "{}".to_string(),
+                resolved_at_ms: None,
+            })
+            .expect("insert reused alert");
+        drop(store_reused);
+        assert_eq!(
+            check_unresolved_suspended_in_db(Some(&db_reused)),
+            0,
+            "live PID with CreationTime mismatch (PID reused) must exit 0"
+        );
+
+        // Live PID with missing creation time (`pid:0` and `pid` only) -> fail closed exit 3.
+        for (label, raw_id) in [
+            ("zero_ct", format!("{live_pid}:0")),
+            ("missing_ct", live_pid.to_string()),
+        ] {
+            let db_missing_ct = tmp_dir.join(format!("missing_{label}.db"));
+            let store_missing = LedrStore::open(&db_missing_ct).expect("open missing ct db");
+            store_missing
+                .record_alert(&AlertRecord {
+                    alert_id: format!("al-missing-{label}"),
+                    timestamp_ms: 3_000,
+                    severity: AlertSeverity::Critical,
+                    source_layer: "LAYER_1_HONEYPOT".to_string(),
+                    rule_id: "L-06".to_string(),
+                    title: "Missing creation time".to_string(),
+                    process_instance_id: Some(raw_id),
+                    process_suspended: true,
+                    status: AlertStatus::Pending,
+                    context_json: "{}".to_string(),
+                    resolved_at_ms: None,
+                })
+                .expect("insert missing ct alert");
+            drop(store_missing);
+            assert_eq!(
+                check_unresolved_suspended_in_db(Some(&db_missing_ct)),
+                3,
+                "live PID with missing creation time ({label}) must fail closed with exit 3"
+            );
+        }
+
+        // `Unknown` liveness or `Running` without CreationTime must fail closed with exit 3.
+        let db_probe = tmp_dir.join("probe_unknown.db");
+        let store_probe = LedrStore::open(&db_probe).expect("open probe db");
+        let live_ident = ProcessIdentity::new(live_pid, live_ct);
+        store_probe
+            .record_alert(&AlertRecord {
+                alert_id: "al-probe-unknown".to_string(),
+                timestamp_ms: 4_000,
+                severity: AlertSeverity::Critical,
+                source_layer: "LAYER_1_HONEYPOT".to_string(),
+                rule_id: "L-06".to_string(),
+                title: "Probe unknown".to_string(),
+                process_instance_id: Some(live_ident.instance_id()),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: "{}".to_string(),
+                resolved_at_ms: None,
+            })
+            .expect("insert probe unknown alert");
+        drop(store_probe);
+        assert_eq!(
+            check_unresolved_suspended_in_db_with_probe(Some(&db_probe), &|_| {
+                LiveTargetState::Unknown
+            }),
+            3,
+            "ProcessLiveness::Unknown must fail closed with exit 3"
+        );
+        assert_eq!(
+            check_unresolved_suspended_in_db_with_probe(Some(&db_probe), &|_| {
+                LiveTargetState::Running {
+                    create_time_100ns: None,
+                }
+            }),
+            3,
+            "Running process with unavailable CreationTime must fail closed with exit 3"
+        );
+
+        // Mixed alert: parent is Gone, but one child is Running with matching identity -> exit 3.
+        let db_mixed = tmp_dir.join("mixed.db");
+        let store_mixed = LedrStore::open(&db_mixed).expect("open mixed db");
+        store_mixed
+            .record_alert(&AlertRecord {
+                alert_id: "al-mixed".to_string(),
+                timestamp_ms: 5_000,
+                severity: AlertSeverity::Critical,
+                source_layer: "LAYER_1_HONEYPOT".to_string(),
+                rule_id: "L-06".to_string(),
+                title: "Mixed parent gone child running".to_string(),
+                process_instance_id: Some(dead_ident.instance_id()),
+                process_suspended: true,
+                status: AlertStatus::Pending,
+                context_json: serde_json::json!({
+                    "suspended_children": [dead_ident.instance_id(), live_ident.instance_id()]
+                })
+                .to_string(),
+                resolved_at_ms: None,
+            })
+            .expect("insert mixed alert");
+        drop(store_mixed);
+        assert_eq!(
+            check_unresolved_suspended_in_db(Some(&db_mixed)),
+            3,
+            "live suspended child must still block with exit 3 even when parent exited"
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);

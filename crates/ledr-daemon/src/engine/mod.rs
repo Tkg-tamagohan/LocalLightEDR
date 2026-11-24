@@ -37,7 +37,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use ledr_proto::EventLane;
-use ledr_proto::{ActiveDefenseController, AlertStatus, PipelineMetrics, SensorEvent};
+use ledr_proto::{
+    ActiveDefenseController, AlertStatus, PipelineMetrics, ProcessIdentity, SensorEvent,
+};
 use ledr_rules::{EarlyPruner, NrdCache, NrdCancelToken, SigmaEngine};
 use ledr_store::{LedrStore, StoreError};
 use tokio::task::JoinHandle;
@@ -235,6 +237,7 @@ impl StoreWriteGate {
 pub struct DaemonEngine {
     config: DaemonConfig,
     self_pid: u32,
+    self_process_identity: Option<ProcessIdentity>,
     self_exe_normalized: Option<String>,
     store: LedrStore,
     sigma: SigmaEngine,
@@ -473,6 +476,24 @@ impl DaemonEngine {
     /// (`FU-E2E-03` Track 2 self-PID recursion guard).
     pub fn is_helper_pid(&self, pid: u32) -> bool {
         self.inspector.is_helper_pid(pid)
+    }
+
+    /// Returns the verified `(pid, create_time_100ns)` identity of the running daemon process,
+    /// captured via `GetProcessTimes(GetCurrentProcess())` at startup.
+    pub fn self_process_identity(&self) -> Option<ProcessIdentity> {
+        self.self_process_identity
+    }
+
+    /// Returns `true` iff `ident` has a non-zero `create_time_100ns` and strictly matches the
+    /// verified `self_process_identity` (`pid` AND `create_time_100ns`). Never matches by
+    /// executable filename alone (`PRRT_kwDOVyjVyM67eqyB`).
+    pub(super) fn is_verified_self_identity(&self, ident: Option<ProcessIdentity>) -> bool {
+        let (Some(self_id), Some(ev_id)) = (self.self_process_identity, ident) else {
+            return false;
+        };
+        self_id.create_time_100ns != 0
+            && ev_id.create_time_100ns != 0
+            && ev_id == self_id
     }
 
     /// Returns `true` iff `(pid, exe_path)` matches the running daemon's own PID and normalized

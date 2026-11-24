@@ -379,8 +379,9 @@ function Invoke-IcaclsChecked {
         [Parameter(Mandatory = $true)][string]$TargetPath,
         [Parameter(Mandatory = $true)][string[]]$GrantSpecs
     )
-    $dirInfo = New-Object System.IO.DirectoryInfo($TargetPath)
-    $sec = $dirInfo.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+    # Use Get-Acl/Set-Acl (compatible with both Windows PowerShell 5.1 and PowerShell 7+)
+    # without calling SetOwner/SetGroup so only the DACL is modified.
+    $sec = Get-Acl -LiteralPath $TargetPath
     $sec.SetAccessRuleProtection($true, $false)
     $existingRules = @($sec.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
     $seenSids = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -403,7 +404,7 @@ function Invoke-IcaclsChecked {
         )
         $sec.AddAccessRule($adminRule)
     }
-    $dirInfo.SetAccessControl($sec)
+    Set-Acl -LiteralPath $TargetPath -AclObject $sec
 
     $argsList = @($TargetPath, '/inheritance:r')
     foreach ($spec in $GrantSpecs) {

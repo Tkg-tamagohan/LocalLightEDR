@@ -4115,3 +4115,406 @@ fn ui_upd_14_restart_tampered_or_partial_cached_state_fails_closed_and_clears() 
     }
 }
 
+#[test]
+fn ui_upd_15_yanked_404_clears_cached_release_while_transient_errors_preserve_it() {
+    use ledr_updater::UpdaterError;
+    use std::net::TcpListener;
+    use std::sync::{Arc, atomic::AtomicUsize};
+    use updater::{
+        AppUpdateManager, ElevationLaunchResult, InstallKind, PersistedUpdateState, UpdaterPhase,
+        is_http_404_not_found, load_persisted_state, save_persisted_state,
+        staging_root_from_data_dir, update_state_path_from_data_dir,
+    };
+
+    // (A) Narrow HTTP 404 matcher precision.
+    assert!(is_http_404_not_found(&UpdaterError::HttpError(
+        "unexpected HTTP status 404 from https://github.com/Tkg-tamagohan/LocalLightEDR/releases/latest/download/update-manifest.json".to_string()
+    )));
+    assert!(is_http_404_not_found(&UpdaterError::HttpError(
+        "unexpected HTTP status 404".to_string()
+    )));
+    assert!(!is_http_404_not_found(&UpdaterError::HttpError(
+        "unexpected HTTP status 4040 from https://example.com".to_string()
+    )));
+    assert!(!is_http_404_not_found(&UpdaterError::HttpError(
+        "unexpected HTTP status 503 from http://127.0.0.1:4040/update-manifest.json".to_string()
+    )));
+    assert!(!is_http_404_not_found(&UpdaterError::HttpError(
+        "WinHttpConnect(127.0.0.1:404) failed: connection refused".to_string()
+    )));
+    assert!(!is_http_404_not_found(&UpdaterError::Cancelled));
+
+    // (B) HTTP 404 on check_for_updates (manifest 404) clears persisted & in-memory cache;
+    //     restart within 6h cooldown opens in Idle (no update banner) and preserves cooldown.
+    {
+        let tmp = TempTestDir::new("ui-upd-15-check-manifest-404");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let srv = std::thread::spawn(move || {
+            // Check 1: 200 OK manifest + sig
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                let target = read_http_request_target(&mut s);
+                let body = if target.ends_with(".sig") {
+                    TEST_SIG_UPDATE_AVAILABLE
+                } else {
+                    TEST_MANIFEST_UPDATE_AVAILABLE
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                s.write_all(resp.as_bytes()).unwrap();
+            }
+            // Check 2: 404 Not Found on manifest
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = read_http_request_target(&mut s);
+            s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+
+        let mut cfg = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        cfg.now_ms_fn = Arc::new(|| 1_700_000_000_000);
+        let mgr = AppUpdateManager::new(cfg);
+
+        assert_eq!(
+            mgr.check_for_updates_blocking_with(|_| {})
+                .expect("initial check succeeds")
+                .phase,
+            UpdaterPhase::UpdateAvailable
+        );
+
+        let err = mgr
+            .check_for_updates_blocking_with(|_| {})
+            .expect_err("404 manifest check must fail");
+        assert!(err.contains("404"), "unexpected error: {err}");
+
+        let after_404 = mgr.status();
+        assert_eq!(after_404.phase, UpdaterPhase::Error);
+        assert_eq!(after_404.last_checked_at_ms, Some(1_700_000_000_000));
+        assert_eq!(after_404.latest_version, None);
+        assert_eq!(after_404.min_updater_version, None);
+        assert_eq!(after_404.release_notes_url, None);
+        assert!(after_404.manifest.is_none());
+
+        let state_path = update_state_path_from_data_dir(&tmp.0);
+        let persisted = load_persisted_state(&state_path);
+        assert_eq!(persisted.last_checked_at_ms, Some(1_700_000_000_000));
+        assert_eq!(persisted.last_known_latest_version, None);
+        assert_eq!(persisted.cached_manifest_json, None);
+        assert_eq!(persisted.cached_sig_json, None);
+
+        // Restart within 6h cooldown -> Idle without cached manifest.
+        let mut cfg_restarted = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        cfg_restarted.now_ms_fn = Arc::new(|| 1_700_000_060_000);
+        let mgr_restarted = AppUpdateManager::new(cfg_restarted);
+        assert!(
+            !mgr_restarted.should_trigger_startup_auto_check(&LaunchMode::Normal),
+            "cooldown timestamp must remain preserved after 404 cache clear"
+        );
+        let restarted_view = mgr_restarted.status();
+        assert_eq!(restarted_view.phase, UpdaterPhase::Idle);
+        assert_eq!(restarted_view.latest_version, None);
+        assert!(restarted_view.manifest.is_none());
+        let apply_err = mgr_restarted
+            .apply_update_blocking_with(|_| {}, None::<fn()>)
+            .expect_err("apply must not proceed after 404 cache clear");
+        assert!(apply_err.contains("NO_UPDATE_AVAILABLE"));
+
+        srv.join().unwrap();
+    }
+
+    // (C) HTTP 404 on check_for_updates (.sig 404 after manifest 200) also clears persisted cache.
+    {
+        let tmp = TempTestDir::new("ui-upd-15-check-sig-404");
+        let state_path = update_state_path_from_data_dir(&tmp.0);
+        save_persisted_state(
+            &state_path,
+            &PersistedUpdateState {
+                schema_version: 1,
+                last_checked_at_ms: Some(1_700_000_000_000),
+                last_known_latest_version: Some("9.9.9".to_string()),
+                cached_manifest_json: Some(TEST_MANIFEST_UPDATE_AVAILABLE.to_string()),
+                cached_sig_json: Some(TEST_SIG_UPDATE_AVAILABLE.to_string()),
+            },
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                let target = read_http_request_target(&mut s);
+                if target.ends_with(".sig") {
+                    s.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                } else {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        TEST_MANIFEST_UPDATE_AVAILABLE.len(),
+                        TEST_MANIFEST_UPDATE_AVAILABLE
+                    );
+                    s.write_all(resp.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let cfg = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mgr = AppUpdateManager::new(cfg);
+        assert_eq!(mgr.status().phase, UpdaterPhase::UpdateAvailable);
+        assert!(mgr.check_for_updates_blocking_with(|_| {}).is_err());
+
+        let persisted = load_persisted_state(&state_path);
+        assert_eq!(persisted.last_checked_at_ms, Some(1_700_000_000_000));
+        assert_eq!(persisted.last_known_latest_version, None);
+        assert_eq!(persisted.cached_manifest_json, None);
+        assert_eq!(persisted.cached_sig_json, None);
+
+        let mut cfg_restarted = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        cfg_restarted.now_ms_fn = Arc::new(|| 1_700_000_060_000);
+        let mgr_restarted = AppUpdateManager::new(cfg_restarted);
+        assert_eq!(mgr_restarted.status().phase, UpdaterPhase::Idle);
+
+        srv.join().unwrap();
+    }
+
+    // (D) HTTP 404 on apply_update installer download clears persisted cache & staging;
+    //     restart opens in Idle without #update-banner.
+    {
+        let tmp = TempTestDir::new("ui-upd-15-apply-installer-404");
+        let state_path = update_state_path_from_data_dir(&tmp.0);
+        save_persisted_state(
+            &state_path,
+            &PersistedUpdateState {
+                schema_version: 1,
+                last_checked_at_ms: Some(1_700_000_000_000),
+                last_known_latest_version: Some("9.9.9".to_string()),
+                cached_manifest_json: Some(TEST_MANIFEST_UPDATE_AVAILABLE.to_string()),
+                cached_sig_json: Some(TEST_SIG_UPDATE_AVAILABLE.to_string()),
+            },
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            assert!(target.ends_with(".exe"), "unexpected target: {target}");
+            s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+
+        let mut cfg = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        cfg.now_ms_fn = Arc::new(|| 1_700_000_030_000);
+        let mgr = AppUpdateManager::new(cfg);
+        assert_eq!(mgr.status().phase, UpdaterPhase::UpdateAvailable);
+
+        let err = mgr
+            .apply_update_blocking_with(|_| {}, None::<fn()>)
+            .expect_err("404 installer download must fail");
+        assert!(err.contains("404"), "unexpected error: {err}");
+
+        let after_404 = mgr.status();
+        assert_eq!(after_404.phase, UpdaterPhase::Error);
+        assert_eq!(after_404.last_checked_at_ms, Some(1_700_000_000_000));
+        assert_eq!(after_404.latest_version, None);
+        assert_eq!(after_404.min_updater_version, None);
+        assert_eq!(after_404.release_notes_url, None);
+        assert!(after_404.manifest.is_none());
+        assert_eq!(
+            std::fs::read_dir(staging_root_from_data_dir(&tmp.0))
+                .unwrap()
+                .count(),
+            0,
+            "staging dir must be cleaned up after 404 installer failure"
+        );
+
+        let persisted = load_persisted_state(&state_path);
+        assert_eq!(persisted.last_checked_at_ms, Some(1_700_000_000_000));
+        assert_eq!(persisted.last_known_latest_version, None);
+        assert_eq!(persisted.cached_manifest_json, None);
+        assert_eq!(persisted.cached_sig_json, None);
+
+        let mut cfg_restarted = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        cfg_restarted.now_ms_fn = Arc::new(|| 1_700_000_060_000);
+        let mgr_restarted = AppUpdateManager::new(cfg_restarted);
+        assert!(!mgr_restarted.should_trigger_startup_auto_check(&LaunchMode::Normal));
+        let restarted_view = mgr_restarted.status();
+        assert_eq!(restarted_view.phase, UpdaterPhase::Idle);
+        assert_eq!(restarted_view.latest_version, None);
+        assert!(restarted_view.manifest.is_none());
+
+        srv.join().unwrap();
+    }
+
+    // (E) Transient HTTP 503 (even on URLs containing "404") and connection-refused errors
+    //     preserve persisted manifest/sig across restart.
+    {
+        let tmp = TempTestDir::new("ui-upd-15-transient-503-offline");
+        let state_path = update_state_path_from_data_dir(&tmp.0);
+        save_persisted_state(
+            &state_path,
+            &PersistedUpdateState {
+                schema_version: 1,
+                last_checked_at_ms: Some(1_700_000_000_000),
+                last_known_latest_version: Some("9.9.9".to_string()),
+                cached_manifest_json: Some(TEST_MANIFEST_UPDATE_AVAILABLE.to_string()),
+                cached_sig_json: Some(TEST_SIG_UPDATE_AVAILABLE.to_string()),
+            },
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let srv = std::thread::spawn(move || {
+            // 1. check_for_updates -> 503
+            let (mut s1, _) = listener.accept().unwrap();
+            let _ = read_http_request_target(&mut s1);
+            s1.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            // 2. apply_update -> 503
+            let (mut s2, _) = listener.accept().unwrap();
+            let _ = read_http_request_target(&mut s2);
+            s2.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        });
+
+        let mut cfg_503 = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        // Include "404" in URL path to verify 503 is not misclassified as HTTP 404.
+        cfg_503.manifest_url = format!("{base_url}/v404/update-manifest.json");
+        cfg_503.now_ms_fn = Arc::new(|| 1_700_000_030_000);
+        let mgr_503_check = AppUpdateManager::new(cfg_503);
+        assert!(mgr_503_check.check_for_updates_blocking_with(|_| {}).is_err());
+        assert_eq!(mgr_503_check.status().phase, UpdaterPhase::Error);
+
+        let persisted_after_check_503 = load_persisted_state(&state_path);
+        assert_eq!(
+            persisted_after_check_503.cached_manifest_json.as_deref(),
+            Some(TEST_MANIFEST_UPDATE_AVAILABLE)
+        );
+        assert_eq!(
+            persisted_after_check_503.cached_sig_json.as_deref(),
+            Some(TEST_SIG_UPDATE_AVAILABLE)
+        );
+
+        // Restart restores UpdateAvailable; then apply_update hits 503 and must still preserve cache.
+        let mut cfg_apply_503 = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        cfg_apply_503.now_ms_fn = Arc::new(|| 1_700_000_060_000);
+        let mgr_apply_503 = AppUpdateManager::new(cfg_apply_503);
+        assert_eq!(mgr_apply_503.status().phase, UpdaterPhase::UpdateAvailable);
+        assert!(
+            mgr_apply_503
+                .apply_update_blocking_with(|_| {}, None::<fn()>)
+                .is_err()
+        );
+        assert_eq!(mgr_apply_503.status().phase, UpdaterPhase::Error);
+
+        let persisted_after_apply_503 = load_persisted_state(&state_path);
+        assert_eq!(
+            persisted_after_apply_503.cached_manifest_json.as_deref(),
+            Some(TEST_MANIFEST_UPDATE_AVAILABLE)
+        );
+        assert_eq!(
+            persisted_after_apply_503.cached_sig_json.as_deref(),
+            Some(TEST_SIG_UPDATE_AVAILABLE)
+        );
+
+        srv.join().unwrap();
+
+        // Offline / connection-refused error on check_for_updates must also preserve cache.
+        let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead_listener.local_addr().unwrap().port();
+        drop(dead_listener);
+        let dead_base_url = format!("http://127.0.0.1:{dead_port}");
+
+        let mut cfg_offline = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &dead_base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        cfg_offline.now_ms_fn = Arc::new(|| 1_700_000_090_000);
+        let mgr_offline = AppUpdateManager::new(cfg_offline);
+        assert_eq!(mgr_offline.status().phase, UpdaterPhase::UpdateAvailable);
+        assert!(mgr_offline.check_for_updates_blocking_with(|_| {}).is_err());
+        assert_eq!(mgr_offline.status().phase, UpdaterPhase::Error);
+
+        let mut cfg_restarted_final = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &dead_base_url,
+            ElevationLaunchResult::Launched,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        cfg_restarted_final.now_ms_fn = Arc::new(|| 1_700_000_120_000);
+        let mgr_final = AppUpdateManager::new(cfg_restarted_final);
+        let restored_final = mgr_final.status();
+        assert_eq!(restored_final.phase, UpdaterPhase::UpdateAvailable);
+        assert_eq!(restored_final.latest_version.as_deref(), Some("9.9.9"));
+        assert!(restored_final.manifest.is_some());
+    }
+}
+

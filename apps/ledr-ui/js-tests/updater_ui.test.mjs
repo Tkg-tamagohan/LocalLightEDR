@@ -526,3 +526,96 @@ test("UI-UPD-07: index.html updater elements and strict CSP compliance", () => {
   assert.equal(/\sstyle\s*=/i.test(html), false, "no inline style attributes allowed");
   assert.equal(/<script(?![^>]*\bsrc=)/i.test(html), false, "no inline script tags allowed");
 });
+
+test("UI-UPD-08: stale updaterActionFeedback clears on clean status payload and refreshAll", async () => {
+  let updaterResponse = makeStatus({
+    phase: "update_available",
+    app_version: "0.1.0",
+    latest_version: "0.2.0",
+    release_notes_url: "https://github.com/Tkg-tamagohan/LocalLightEDR/releases/tag/v0.2.0",
+    manifest: sampleManifest("0.2.0"),
+  });
+  let failOpenNotes = true;
+
+  const ui = loadAppHarness(async (cmd) => {
+    if (cmd === "ping_daemon") return "ledr-daemon v0.1.0 (proto v1)";
+    if (cmd === "fetch_flight_recorder") {
+      return {
+        processes: [],
+        dns_queries: [],
+        network_events: [],
+        file_canary_events: [],
+        download_origins: [],
+      };
+    }
+    if (cmd === "fetch_alerts" || cmd === "fetch_rules") return [];
+    if (cmd === "get_updater_status") return updaterResponse;
+    if (cmd === "open_release_notes_url") {
+      if (failOpenNotes) {
+        throw new Error("URL_BLOCKED: failed to open release notes");
+      }
+      return null;
+    }
+    return null;
+  });
+
+  await ui.refreshAll();
+  await ui.handleOpenReleaseNotes();
+  assert.ok(ui.state.updaterActionFeedback);
+  assert.equal(ui.state.updaterActionFeedback.ok, false);
+  assert.ok(!ui.el.updateFeedback.classList.contains("hidden"));
+  assert.ok(ui.el.updateFeedback.classList.contains("is-error"));
+
+  // Clean up_to_date payload via applyUpdaterStatusPayload clears stale feedback
+  ui.applyUpdaterStatusPayload(
+    makeStatus({
+      phase: "up_to_date",
+      app_version: "0.1.0",
+      latest_version: "0.1.0",
+      error_message: null,
+      notice_message: null,
+    }),
+  );
+  assert.equal(ui.state.updaterActionFeedback, null);
+  assert.ok(ui.el.updateFeedback.classList.contains("hidden"));
+  assert.equal(ui.el.updateFeedback.textContent, "");
+
+  // Re-trigger feedback error, then verify refreshAll() clears it on clean update_available status
+  ui.applyUpdaterStatusPayload(
+    makeStatus({
+      phase: "update_available",
+      app_version: "0.1.0",
+      latest_version: "0.2.0",
+      release_notes_url: "https://github.com/Tkg-tamagohan/LocalLightEDR/releases/tag/v0.2.0",
+      manifest: sampleManifest("0.2.0"),
+    }),
+  );
+  await ui.handleOpenReleaseNotes();
+  assert.ok(ui.state.updaterActionFeedback);
+  assert.ok(!ui.el.updateFeedback.classList.contains("hidden"));
+
+  updaterResponse = makeStatus({
+    phase: "update_available",
+    app_version: "0.1.0",
+    latest_version: "0.2.0",
+    release_notes_url: "https://github.com/Tkg-tamagohan/LocalLightEDR/releases/tag/v0.2.0",
+    manifest: sampleManifest("0.2.0"),
+    error_message: null,
+    notice_message: null,
+  });
+  await ui.refreshAll();
+  assert.equal(ui.state.updaterActionFeedback, null);
+  assert.ok(ui.el.updateFeedback.classList.contains("hidden"));
+
+  // Error phase with null error_message preserves existing action feedback
+  ui.state.updaterActionFeedback = { ok: false, message: "preserved error" };
+  ui.applyUpdaterStatusPayload(
+    makeStatus({
+      phase: "error",
+      error_message: null,
+      notice_message: null,
+    }),
+  );
+  assert.deepEqual(ui.state.updaterActionFeedback, { ok: false, message: "preserved error" });
+  assert.match(ui.el.updateFeedback.textContent, /preserved error/);
+});

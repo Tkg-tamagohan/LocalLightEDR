@@ -2963,6 +2963,8 @@
       state.updaterActionFeedback = { ok: false, message: status.error_message };
     } else if (status.notice_message) {
       state.updaterActionFeedback = { ok: true, message: status.notice_message };
+    } else if (phase !== "error") {
+      state.updaterActionFeedback = null;
     }
     renderUpdateBanner();
     renderAppUpdatePanel();
@@ -3561,12 +3563,12 @@
 
       const wasSamplePreview = state.isSamplePreview;
       state.localDefenseStatus = localStatus;
-      if (updaterStatus) {
-        state.updaterStatus = updaterStatus;
-      }
       state.daemonVersion = parseDaemonVersionFromPing(pingSummary);
       state.isDaemonOnline = true;
       state.isSamplePreview = false;
+      if (updaterStatus) {
+        applyUpdaterStatusPayload(updaterStatus);
+      }
       if (wasSamplePreview) {
         state.selectedAlertId = null;
         state.lastSyncedAlertId = null;
@@ -3632,11 +3634,12 @@
       state.localDefenseStatus = await invoke("fetch_local_defense_status").catch(
         () => state.localDefenseStatus,
       );
-      state.updaterStatus = await invoke("get_updater_status").catch(
-        () => state.updaterStatus,
-      );
+      const offlineUpdaterStatus = await invoke("get_updater_status").catch(() => null);
       state.isDaemonOnline = false;
       state.daemonVersion = null;
+      if (offlineUpdaterStatus) {
+        applyUpdaterStatusPayload(offlineUpdaterStatus);
+      }
       updateDaemonHeader(null, null);
       showOfflineBanner(String(err));
       renderAllViews();

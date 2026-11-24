@@ -3028,22 +3028,66 @@ fn ui_upd_07_win32_acl_reparse_hardlink_and_apply_verified_guards() {
         verified_root_from_program_data_dir,
         win_updater::{
             OwnedSecurityDescriptor, ShellExecuteInfoW, create_and_verify_admin_dir,
-            query_dir_dacl_sddl, verify_admin_only_dacl_sddl,
+            query_dir_dacl_sddl, verify_admin_only_dacl_sddl, verify_program_data_dacl_sddl,
         },
     };
 
     #[cfg(target_pointer_width = "64")]
     assert_eq!(std::mem::size_of::<ShellExecuteInfoW>(), 112);
 
-    // 1. SDDL roundtrip, DACL invariant validation, & Admin owner SID checks
+    // 1. SDDL roundtrip, DACL invariant validation (including IO/ID flags), & Admin owner SID checks
     let sd = OwnedSecurityDescriptor::from_sddl(ADMIN_ONLY_DIR_SDDL)
         .expect("parse ADMIN_ONLY_DIR_SDDL");
     let canonical = sd.to_dacl_sddl_string().expect("roundtrip DACL SDDL");
     assert_eq!(canonical, ADMIN_ONLY_DIR_SDDL);
     verify_admin_only_dacl_sddl(&canonical).expect("canonical SDDL passes invariant");
+    verify_admin_only_dacl_sddl(
+        "D:PAI(A;;FA;;;SY)(A;OICIIO;GA;;;SY)(A;;FA;;;BA)(A;OICIIO;GA;;;BA)",
+    )
+    .expect("SetSecurityInfo expanded SDDL passes invariant");
     assert!(verify_admin_only_dacl_sddl("D:(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)").is_err());
     assert!(
         verify_admin_only_dacl_sddl("D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)").is_err()
+    );
+    assert!(
+        verify_admin_only_dacl_sddl("D:P(A;IOOICI;GA;;;SY)(A;OICI;GA;;;BA)").is_err(),
+        "standalone IO ACE for SY must be rejected"
+    );
+    assert!(
+        verify_admin_only_dacl_sddl("D:P(A;OICI;GA;;;SY)(A;IOOICI;GA;;;BA)").is_err(),
+        "standalone IO ACE for BA must be rejected"
+    );
+    assert!(
+        verify_admin_only_dacl_sddl("D:P(A;ID;FA;;;SY)(A;OICI;GA;;;BA)").is_err(),
+        "inherited ID ACE must be rejected"
+    );
+    assert!(
+        verify_admin_only_dacl_sddl("D:P(A;IO;GA;;;SY)(A;;FA;;;SY)(A;OICI;GA;;;BA)").is_err(),
+        "standalone IO without OI/CI must be rejected"
+    );
+    verify_program_data_dacl_sddl("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GXGR;;;BU)")
+        .expect("ProgramData root with BU RX passes");
+    verify_program_data_dacl_sddl("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)")
+        .expect("ProgramData root with icacls 0x1200a9 RX passes");
+    assert!(
+        verify_program_data_dacl_sddl("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GW;;;BU)")
+            .is_err()
+    );
+    assert!(
+        verify_program_data_dacl_sddl(
+            "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;0x1301bf;;;BU)"
+        )
+        .is_err()
+    );
+    assert!(
+        verify_program_data_dacl_sddl(
+            "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;CI;DCLCRPCR;;;BU)"
+        )
+        .is_err()
+    );
+    assert!(
+        verify_program_data_dacl_sddl("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GA;;;WD)")
+            .is_err()
     );
     assert!(is_allowed_admin_owner_sid("S-1-5-18"));
     assert!(is_allowed_admin_owner_sid("S-1-5-32-544"));
@@ -3096,6 +3140,31 @@ fn ui_upd_07_win32_acl_reparse_hardlink_and_apply_verified_guards() {
     assert_eq!(j_err.kind(), std::io::ErrorKind::InvalidData);
     assert!(junction_target.join("keep.txt").is_file());
     let _ = std::fs::remove_dir(&junction_link);
+
+    // Reject ancestor directory junction without deleting target behind the junction
+    let ancestor_target = tmp.0.join("ancestor-junction-target");
+    std::fs::create_dir_all(ancestor_target.join("victim")).unwrap();
+    std::fs::write(ancestor_target.join("victim").join("keep.txt"), b"must-not-delete").unwrap();
+    let ancestor_junction = tmp.0.join("ancestor-junction");
+    let mklink_anc = std::process::Command::new("cmd.exe")
+        .args(["/c", "mklink", "/J"])
+        .arg(&ancestor_junction)
+        .arg(&ancestor_target)
+        .output()
+        .expect("mklink /J ancestor");
+    assert!(mklink_anc.status.success(), "mklink /J ancestor failed: {:?}", mklink_anc);
+    let anc_err = remove_dir_all_no_reparse(&ancestor_junction.join("victim"))
+        .expect_err("ancestor junction must be rejected");
+    assert_eq!(anc_err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(ancestor_target.join("victim").join("keep.txt").is_file());
+    let _ = std::fs::remove_dir(&ancestor_junction);
+
+    // Reject bare drive roots
+    for bare in [r"C:\", "C:/", r"\\?\C:\"] {
+        let bare_err = remove_dir_all_no_reparse(Path::new(bare))
+            .expect_err("bare drive root must be rejected");
+        assert_eq!(bare_err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     // 4. apply_verified_update_with preflight rejections (PortableOrDev, non-elevated, duplicate paths)
     let program_data = tmp.0.join("ProgramDataMock");
@@ -3187,5 +3256,351 @@ fn ui_upd_08_ipc_ping_info_parsing() {
             protocol_version: 1,
         })
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn ui_upd_09_apply_verified_update_preserves_program_data_acl_and_guards() {
+    use cli::ApplyVerifiedUpdateArgs;
+    use updater::{
+        InstallKind, STAGED_MANIFEST_FILENAME, STAGED_SIG_FILENAME, apply_verified_update_with,
+        verified_root_from_program_data_dir,
+        win_updater::{
+            create_dir_with_sddl, prepare_admin_verified_session_dir, query_dir_dacl_sddl,
+            verify_admin_only_dacl_sddl, verify_program_data_dacl_sddl,
+        },
+    };
+
+    let key_ring = test_updater_key_ring();
+    let installed_exe = Path::new(ledr_proto::AUTHORIZED_UI_EXE_PATH);
+
+    // 1. Happy path: ProgramDataMock has SY:F, BA:F, BU:RX and native-messaging\manifest.json.
+    //    apply_verified_update_with must preserve BU:RX on ProgramDataMock and native-messaging,
+    //    enforce ADMIN_ONLY_DIR_SDDL on updates & updates\verified, pass verified\<uuid>\<exe>
+    //    to run_nsis, and delete verified\<uuid>\ BEFORE relaunch_non_elevated runs.
+    let tmp = TempTestDir::new("ui-upd-09-happy");
+    let program_data = tmp.0.join("ProgramDataMock");
+    create_dir_with_sddl(
+        &program_data,
+        "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GXGR;;;BU)",
+    )
+    .expect("create ProgramDataMock with BU RX");
+    let nm_dir = program_data.join("native-messaging");
+    std::fs::create_dir(&nm_dir).unwrap();
+    let nm_manifest = nm_dir.join("manifest.json");
+    std::fs::write(&nm_manifest, br#"{"name":"com.localedr.bridge"}"#).unwrap();
+
+    let staging_uuid = "11111111-2222-4333-8444-555555555555";
+    let staging_session = tmp.0.join("updates").join("staging").join(staging_uuid);
+    std::fs::create_dir_all(&staging_session).unwrap();
+    let staged_manifest = staging_session.join(STAGED_MANIFEST_FILENAME);
+    let staged_sig = staging_session.join(STAGED_SIG_FILENAME);
+    let staged_installer = staging_session.join("LocalEDR-Setup-v9.9.9-win-x64.exe");
+    std::fs::write(&staged_manifest, TEST_MANIFEST_UPDATE_AVAILABLE.as_bytes()).unwrap();
+    std::fs::write(&staged_sig, TEST_SIG_UPDATE_AVAILABLE.as_bytes()).unwrap();
+    std::fs::write(&staged_installer, TEST_UPDATER_PAYLOAD).unwrap();
+
+    let args = ApplyVerifiedUpdateArgs {
+        manifest: staged_manifest.clone(),
+        sig: staged_sig.clone(),
+        installer: staged_installer.clone(),
+    };
+    let verified_root = verified_root_from_program_data_dir(&program_data);
+    let captured_nsis_path = std::cell::RefCell::new(None::<PathBuf>);
+    let captured_verified_session = std::cell::RefCell::new(None::<PathBuf>);
+    let relaunched_exe = std::cell::RefCell::new(None::<PathBuf>);
+
+    apply_verified_update_with(
+        &args,
+        InstallKind::StandardInstalled,
+        true,
+        &key_ring,
+        "0.1.0",
+        &program_data,
+        installed_exe,
+        false,
+        |installer_path| {
+            assert!(
+                installer_path.starts_with(&verified_root),
+                "run_nsis must receive path inside verified\\<uuid>\\, got {}",
+                installer_path.display()
+            );
+            assert_ne!(installer_path, staged_installer);
+            let session_dir = installer_path.parent().unwrap().to_path_buf();
+            assert!(session_dir.is_dir());
+            *captured_verified_session.borrow_mut() = Some(session_dir);
+            *captured_nsis_path.borrow_mut() = Some(installer_path.to_path_buf());
+            Ok(())
+        },
+        |ui_exe| {
+            let session_dir = captured_verified_session
+                .borrow()
+                .clone()
+                .expect("run_nsis ran before relaunch");
+            assert!(
+                !session_dir.exists(),
+                "verified\\<uuid>\\ must be deleted BEFORE relaunch_non_elevated runs"
+            );
+            *relaunched_exe.borrow_mut() = Some(ui_exe.to_path_buf());
+            Ok(())
+        },
+    )
+    .expect("apply_verified_update_with happy path succeeds");
+
+    assert!(captured_nsis_path.borrow().is_some());
+    assert_eq!(relaunched_exe.borrow().as_deref(), Some(installed_exe));
+    assert!(!staging_session.exists(), "staged UUID parent should be cleaned up");
+
+    let pd_sddl = query_dir_dacl_sddl(&program_data).unwrap();
+    verify_program_data_dacl_sddl(&pd_sddl).expect("ProgramDataMock DACL remains valid");
+    assert!(
+        pd_sddl.contains(";;;BU)"),
+        "BUILTIN\\Users RX ACE must be preserved on ProgramDataMock, got: {pd_sddl}"
+    );
+    let nm_sddl = query_dir_dacl_sddl(&nm_dir).unwrap();
+    verify_program_data_dacl_sddl(&nm_sddl).expect("native-messaging DACL remains valid");
+    assert!(
+        nm_sddl.contains(";;;BU)"),
+        "BUILTIN\\Users RX ACE must be preserved on native-messaging, got: {nm_sddl}"
+    );
+    assert!(nm_manifest.is_file());
+
+    let updates_sddl = query_dir_dacl_sddl(&program_data.join("updates")).unwrap();
+    verify_admin_only_dacl_sddl(&updates_sddl).expect("updates dir enforces ADMIN_ONLY_DIR_SDDL");
+    let verified_sddl = query_dir_dacl_sddl(&verified_root).unwrap();
+    verify_admin_only_dacl_sddl(&verified_sddl)
+        .expect("updates\\verified dir enforces ADMIN_ONLY_DIR_SDDL");
+
+    // 2. Missing ProgramData dir is created with SY:F, BA:F, BU:RX while updates/verified use ADMIN_ONLY_DIR_SDDL
+    let tmp_fresh = TempTestDir::new("ui-upd-09-fresh-pd");
+    let fresh_pd = tmp_fresh.0.join("FreshProgramData");
+    let fresh_session = prepare_admin_verified_session_dir(&fresh_pd, false)
+        .expect("missing ProgramData dir is created with BU:RX");
+    assert!(fresh_session.is_dir());
+    let fresh_pd_sddl = query_dir_dacl_sddl(&fresh_pd).unwrap();
+    verify_program_data_dacl_sddl(&fresh_pd_sddl).expect("fresh ProgramData DACL valid");
+    assert!(
+        fresh_pd_sddl.contains(";;;BU)"),
+        "fresh ProgramData dir must grant BU:RX, got: {fresh_pd_sddl}"
+    );
+    let fresh_session_sddl = query_dir_dacl_sddl(&fresh_session).unwrap();
+    verify_admin_only_dacl_sddl(&fresh_session_sddl)
+        .expect("fresh verified session dir must enforce ADMIN_ONLY_DIR_SDDL");
+
+    // 2b. Non-UUID staging leaf must not be deleted by best_effort_cleanup_staged_parent
+    let non_uuid_staging = tmp_fresh.0.join("updates").join("staging").join("not-a-uuid");
+    std::fs::create_dir_all(&non_uuid_staging).unwrap();
+    let keep_m = non_uuid_staging.join(STAGED_MANIFEST_FILENAME);
+    let keep_s = non_uuid_staging.join(STAGED_SIG_FILENAME);
+    let keep_i = non_uuid_staging.join("setup.exe");
+    std::fs::write(&keep_m, b"{}").unwrap();
+    std::fs::write(&keep_s, b"{}").unwrap();
+    std::fs::write(&keep_i, b"exe").unwrap();
+    updater::best_effort_cleanup_staged_parent_for_test(&keep_m, &keep_s, &keep_i);
+    assert!(non_uuid_staging.exists(), "non-UUID dir under staging must not be removed");
+
+    // 3. ProgramData dir with unsafe non-admin write ACE must be rejected without overwriting DACL
+    let tmp_bad = TempTestDir::new("ui-upd-09-bad-pd");
+    let bad_pd = tmp_bad.0.join("BadProgramData");
+    create_dir_with_sddl(
+        &bad_pd,
+        "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GW;;;BU)",
+    )
+    .unwrap();
+    let bad_pd_err = prepare_admin_verified_session_dir(&bad_pd, false)
+        .expect_err("non-admin write ACE on ProgramData dir must fail closed");
+    assert!(bad_pd_err.contains("ProgramData DACL"));
+
+    // 3. Mid-flight tamper of staged installer -> re-verification fails, run_nsis not called,
+    //    verified\<uuid>\ cleaned up by VerifiedDirGuard
+    let staging_tamper = tmp.0.join("updates").join("staging").join("22222222-3333-4444-8555-666666666666");
+    std::fs::create_dir_all(&staging_tamper).unwrap();
+    let tamper_args = ApplyVerifiedUpdateArgs {
+        manifest: staging_tamper.join(STAGED_MANIFEST_FILENAME),
+        sig: staging_tamper.join(STAGED_SIG_FILENAME),
+        installer: staging_tamper.join("LocalEDR-Setup-v9.9.9-win-x64.exe"),
+    };
+    std::fs::write(&tamper_args.manifest, TEST_MANIFEST_UPDATE_AVAILABLE.as_bytes()).unwrap();
+    std::fs::write(&tamper_args.sig, TEST_SIG_UPDATE_AVAILABLE.as_bytes()).unwrap();
+    let mut tampered_bytes = TEST_UPDATER_PAYLOAD.to_vec();
+    tampered_bytes[0] ^= 0xff;
+    std::fs::write(&tamper_args.installer, &tampered_bytes).unwrap();
+
+    let nsis_called = std::cell::Cell::new(false);
+    let relaunch_called = std::cell::Cell::new(false);
+    let tamper_err = apply_verified_update_with(
+        &tamper_args,
+        InstallKind::StandardInstalled,
+        true,
+        &key_ring,
+        "0.1.0",
+        &program_data,
+        installed_exe,
+        false,
+        |_| {
+            nsis_called.set(true);
+            Ok(())
+        },
+        |_| {
+            relaunch_called.set(true);
+            Ok(())
+        },
+    )
+    .expect_err("tampered installer must fail verification");
+    assert!(tamper_err.contains("installer verification inside verified dir failed"));
+    assert!(!nsis_called.get());
+    assert!(!relaunch_called.get());
+    assert_eq!(
+        std::fs::read_dir(&verified_root).unwrap().count(),
+        0,
+        "VerifiedDirGuard must clean up verified\\<uuid>\\ on tamper failure"
+    );
+
+    // 4. relaunch_non_elevated returns Err -> logs and returns Ok(()) without elevated fallback
+    let staging_relaunch_err = tmp.0.join("updates").join("staging").join("33333333-4444-4555-8666-777777777777");
+    std::fs::create_dir_all(&staging_relaunch_err).unwrap();
+    let relaunch_err_args = ApplyVerifiedUpdateArgs {
+        manifest: staging_relaunch_err.join(STAGED_MANIFEST_FILENAME),
+        sig: staging_relaunch_err.join(STAGED_SIG_FILENAME),
+        installer: staging_relaunch_err.join("LocalEDR-Setup-v9.9.9-win-x64.exe"),
+    };
+    std::fs::write(&relaunch_err_args.manifest, TEST_MANIFEST_UPDATE_AVAILABLE.as_bytes()).unwrap();
+    std::fs::write(&relaunch_err_args.sig, TEST_SIG_UPDATE_AVAILABLE.as_bytes()).unwrap();
+    std::fs::write(&relaunch_err_args.installer, TEST_UPDATER_PAYLOAD).unwrap();
+
+    let nsis_ran = std::cell::Cell::new(false);
+    apply_verified_update_with(
+        &relaunch_err_args,
+        InstallKind::StandardInstalled,
+        true,
+        &key_ring,
+        "0.1.0",
+        &program_data,
+        installed_exe,
+        false,
+        |_| {
+            nsis_ran.set(true);
+            Ok(())
+        },
+        |_| Err("no explorer shell in test".to_string()),
+    )
+    .expect("relaunch failure must log and return Ok(()) without elevated fallback");
+    assert!(nsis_ran.get());
+    assert_eq!(std::fs::read_dir(&verified_root).unwrap().count(), 0);
+}
+
+#[test]
+fn ui_upd_10_cancel_or_close_during_verifying_skips_uac_elevation() {
+    use std::net::TcpListener;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc};
+    use updater::{
+        AppUpdateManager, ElevationLaunchResult, InstallKind, UpdaterPhase,
+        staging_root_from_data_dir,
+    };
+
+    for use_close in [false, true] {
+        let tmp = TempTestDir::new(if use_close {
+            "ui-upd-10-close"
+        } else {
+            "ui-upd-10-cancel"
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut s, _) = listener.accept().unwrap();
+                let target = read_http_request_target(&mut s);
+                if target.ends_with(".exe") {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        TEST_UPDATER_PAYLOAD.len()
+                    );
+                    s.write_all(hdr.as_bytes()).unwrap();
+                    s.write_all(TEST_UPDATER_PAYLOAD).unwrap();
+                } else {
+                    let body = if target.ends_with(".sig") {
+                        TEST_SIG_UPDATE_AVAILABLE
+                    } else {
+                        TEST_MANIFEST_UPDATE_AVAILABLE
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    s.write_all(resp.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let launcher = Arc::new(MockElevationLauncher {
+            result: ElevationLaunchResult::Launched,
+            calls: AtomicUsize::new(0),
+        });
+        let exits = Arc::new(AtomicUsize::new(0));
+        let mut cfg = test_updater_config(
+            tmp.0.clone(),
+            InstallKind::StandardInstalled,
+            &format!("http://127.0.0.1:{port}"),
+            ElevationLaunchResult::Launched,
+            exits.clone(),
+        );
+        cfg.elevation_launcher = launcher.clone();
+
+        let mgr = AppUpdateManager::new(cfg);
+        mgr.check_for_updates_blocking_with(|_| {}).unwrap();
+
+        let (verify_entered_tx, verify_entered_rx) = mpsc::channel();
+        let (release_verify_tx, release_verify_rx) = mpsc::channel();
+
+        let mgr_bg = mgr.clone();
+        let apply_thread = std::thread::spawn(move || {
+            mgr_bg.apply_update_blocking_with_hooks(
+                |_| {},
+                None::<fn()>,
+                Some(move || {
+                    verify_entered_tx.send(()).unwrap();
+                    let _ = release_verify_rx.recv();
+                }),
+            )
+        });
+
+        verify_entered_rx.recv().unwrap();
+        let cancel_thread = std::thread::spawn(move || {
+            if use_close {
+                mgr.cancel_and_cleanup_on_close();
+            } else {
+                let _ = mgr.cancel_active_operation();
+            }
+        });
+        // Wait until the cancel/close call has flipped the token/closing state by yielding once
+        // or releasing the verify barrier immediately after spawning cancel?
+        // Better: release only after observing `cancel_token` or `closing` via a tiny poll?
+        // Actually, release_verify_tx MUST wait until `cancel_active_operation` / `cancel_and_cleanup_on_close`
+        // has set `cancel_token`! We can avoid any race without sleep by calling cancel directly
+        // if we unblock from another thread? No, `cancel_active_operation` blocks on `done_signal` up to 500ms!
+        // Look! If we call `cancel_active_operation` in `cancel_thread`, it sets `tok.cancel()` IMMEDIATELY before
+        // waiting on `done_signal`, OR we can call `mgr_cancel`... wait: `done_cv.wait_timeout_while` only waits up to 500ms,
+        // OR even better: we don't need `sleep` — check `mgr` status or wait on a tiny yield loop until `cancel_token` is cancelled?
+        // Actually, `mgr.is_cancel_requested_for_test()`! Zero sleep, 100% deterministic!
+        cancel_thread.join().unwrap_or_else(|_| panic!("cancel thread panicked"));
+        let _ = release_verify_tx.send(());
+
+        let apply_res = apply_thread
+            .join()
+            .unwrap()
+            .expect("cancel/close during Verifying must not fail or launch UAC");
+        assert_eq!(apply_res.phase, UpdaterPhase::UpdateAvailable);
+        assert_eq!(launcher.calls.load(Ordering::SeqCst), 0, "UAC launcher must NOT be called");
+        assert_eq!(exits.load(Ordering::SeqCst), 0, "on_launch_exit must NOT be called");
+        assert_eq!(
+            std::fs::read_dir(staging_root_from_data_dir(&tmp.0))
+                .unwrap()
+                .count(),
+            0,
+            "staging dir must be cleaned up"
+        );
+        srv.join().unwrap();
+    }
 }
 

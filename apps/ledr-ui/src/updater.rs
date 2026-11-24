@@ -40,6 +40,9 @@ const INSTALL_DIR_WINDOWS: &str = r"C:\Program Files\LocalEDR";
 
 #[cfg(any(windows, test))]
 pub(crate) const ADMIN_ONLY_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+#[cfg(any(windows, test))]
+pub(crate) const PROGRAM_DATA_ROOT_SDDL: &str =
+    "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;0x1200a9;;;BU)";
 
 /// Installation mode derived from the normalized running executable path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +364,12 @@ struct CachedVerifiedRelease {
     manifest: UpdateManifest,
     manifest_bytes: Vec<u8>,
     sig_bytes: Vec<u8>,
+}
+
+enum VerifyStageResult {
+    Verified,
+    Cancelled,
+    Failed(String),
 }
 
 struct ManagerInner {
@@ -764,6 +773,20 @@ impl AppUpdateManager {
         F: Fn(&UpdaterStatusView),
         B: FnOnce(),
     {
+        self.apply_update_blocking_with_hooks(emit, on_download_started, None::<fn()>)
+    }
+
+    pub(crate) fn apply_update_blocking_with_hooks<F, B, V>(
+        &self,
+        emit: F,
+        on_download_started: Option<B>,
+        on_verifying_started: Option<V>,
+    ) -> Result<UpdaterStatusView, String>
+    where
+        F: Fn(&UpdaterStatusView),
+        B: FnOnce(),
+        V: FnOnce(),
+    {
         let (cancel_token, cached, downloading_view) = {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if guard.closing {
@@ -912,6 +935,16 @@ impl AppUpdateManager {
 
         let verifying_view = {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if cancel_token.is_cancelled() || guard.closing {
+                drop(guard);
+                self.cleanup_active_staging(&staging_dir);
+                let view = self.revert_to_update_available(Some(
+                    "更新の適用をキャンセルしました".to_string(),
+                ));
+                op_guard.mark_finished();
+                self.emit_status(&emit, &view);
+                return Ok(view);
+            }
             guard.phase = UpdaterPhase::Verifying;
             guard.bytes_downloaded = cached.manifest.size_bytes;
             guard.total_bytes = Some(cached.manifest.size_bytes);
@@ -919,16 +952,48 @@ impl AppUpdateManager {
         };
         self.emit_status(&emit, &verifying_view);
 
-        if let Err(err) = self.verify_staged_artifacts(&manifest_path, &sig_path, &installer_path, &cached.manifest) {
-            self.cleanup_active_staging(&staging_dir);
-            let view = self.set_error_state(err.clone());
-            op_guard.mark_finished();
-            self.emit_status(&emit, &view);
-            return Err(err);
+        if let Some(hook) = on_verifying_started {
+            hook();
+        }
+
+        match self.verify_staged_artifacts(
+            &manifest_path,
+            &sig_path,
+            &installer_path,
+            &cached.manifest,
+            &cancel_token,
+        ) {
+            VerifyStageResult::Verified => {}
+            VerifyStageResult::Cancelled => {
+                self.cleanup_active_staging(&staging_dir);
+                let view = self.revert_to_update_available(Some(
+                    "更新の適用をキャンセルしました".to_string(),
+                ));
+                op_guard.mark_finished();
+                self.emit_status(&emit, &view);
+                return Ok(view);
+            }
+            VerifyStageResult::Failed(err) => {
+                self.cleanup_active_staging(&staging_dir);
+                let view = self.set_error_state(err.clone());
+                op_guard.mark_finished();
+                self.emit_status(&emit, &view);
+                return Err(err);
+            }
         }
 
         let launching_view = {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if cancel_token.is_cancelled() || guard.closing {
+                drop(guard);
+                self.cleanup_active_staging(&staging_dir);
+                let view = self.revert_to_update_available(Some(
+                    "更新の適用をキャンセルしました".to_string(),
+                ));
+                op_guard.mark_finished();
+                self.emit_status(&emit, &view);
+                return Ok(view);
+            }
             guard.phase = UpdaterPhase::LaunchingUpdater;
             guard.to_status_view(&self.config)
         };
@@ -969,35 +1034,87 @@ impl AppUpdateManager {
         }
     }
 
+    fn is_closing(&self) -> bool {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.closing
+    }
+
     fn verify_staged_artifacts(
         &self,
         manifest_path: &Path,
         sig_path: &Path,
         installer_path: &Path,
         expected_manifest: &UpdateManifest,
-    ) -> Result<(), String> {
-        let m_bytes = read_verified_bounded_bytes(manifest_path, MAX_MANIFEST_BYTES as u64)
-            .map_err(|e| format!("ステージ済みマニフェスト読み取りに失敗しました: {e}"))?;
-        let s_bytes = read_verified_bounded_bytes(sig_path, MAX_SIG_BYTES as u64)
-            .map_err(|e| format!("ステージ済み署名読み取りに失敗しました: {e}"))?;
+        cancel_token: &CancelToken,
+    ) -> VerifyStageResult {
+        if cancel_token.is_cancelled() || self.is_closing() {
+            return VerifyStageResult::Cancelled;
+        }
+        let m_bytes = match read_verified_bounded_bytes(manifest_path, MAX_MANIFEST_BYTES as u64) {
+            Ok(b) => b,
+            Err(e) => {
+                if cancel_token.is_cancelled() || self.is_closing() {
+                    return VerifyStageResult::Cancelled;
+                }
+                return VerifyStageResult::Failed(format!(
+                    "ステージ済みマニフェスト読み取りに失敗しました: {e}"
+                ));
+            }
+        };
+        let s_bytes = match read_verified_bounded_bytes(sig_path, MAX_SIG_BYTES as u64) {
+            Ok(b) => b,
+            Err(e) => {
+                if cancel_token.is_cancelled() || self.is_closing() {
+                    return VerifyStageResult::Cancelled;
+                }
+                return VerifyStageResult::Failed(format!(
+                    "ステージ済み署名読み取りに失敗しました: {e}"
+                ));
+            }
+        };
         let key_ring = match &self.config.key_ring_override {
             Some(kr) => kr.clone(),
-            None => PublicKeyRing::from_embedded().map_err(|e| e.to_string())?,
+            None => match PublicKeyRing::from_embedded() {
+                Ok(kr) => kr,
+                Err(e) => return VerifyStageResult::Failed(e.to_string()),
+            },
         };
-        let outcome =
-            verify_and_evaluate_manifest(&m_bytes, &s_bytes, &key_ring, &self.config.app_version)
-                .map_err(|e| e.to_string())?;
+        let outcome = match verify_and_evaluate_manifest(
+            &m_bytes,
+            &s_bytes,
+            &key_ring,
+            &self.config.app_version,
+        ) {
+            Ok(out) => out,
+            Err(e) => return VerifyStageResult::Failed(e.to_string()),
+        };
         match outcome {
             UpdateVerificationOutcome::UpdateAvailable { manifest, .. } => {
                 if *manifest != *expected_manifest {
-                    return Err("ステージ済みマニフェストが検証済み内容と一致しません。".to_string());
+                    return VerifyStageResult::Failed(
+                        "ステージ済みマニフェストが検証済み内容と一致しません。".to_string(),
+                    );
                 }
             }
             _ => {
-                return Err("ステージ済みマニフェストのバージョン状態が不正です。".to_string());
+                return VerifyStageResult::Failed(
+                    "ステージ済みマニフェストのバージョン状態が不正です。".to_string(),
+                );
             }
         }
-        verify_installer_file(installer_path, expected_manifest).map_err(|e| e.to_string())
+        if cancel_token.is_cancelled() || self.is_closing() {
+            return VerifyStageResult::Cancelled;
+        }
+        if let Err(e) = verify_installer_file(installer_path, expected_manifest) {
+            if cancel_token.is_cancelled() || self.is_closing() {
+                return VerifyStageResult::Cancelled;
+            }
+            return VerifyStageResult::Failed(e.to_string());
+        }
+        if cancel_token.is_cancelled() || self.is_closing() {
+            return VerifyStageResult::Cancelled;
+        }
+        VerifyStageResult::Verified
     }
 
     fn revert_to_update_available(&self, notice: Option<String>) -> UpdaterStatusView {
@@ -1363,6 +1480,33 @@ fn copy_verified_installer_bounded(
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn is_valid_uuid_dirname(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (idx, &b) in bytes.iter().enumerate() {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            if b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn best_effort_cleanup_staged_parent_for_test(
+    manifest: &Path,
+    sig: &Path,
+    installer: &Path,
+) {
+    best_effort_cleanup_staged_parent(manifest, sig, installer);
+}
+
 #[cfg(windows)]
 fn best_effort_cleanup_staged_parent(manifest: &Path, sig: &Path, installer: &Path) {
     let (Some(pm), Some(ps), Some(pi)) = (manifest.parent(), sig.parent(), installer.parent()) else {
@@ -1374,6 +1518,13 @@ fn best_effort_cleanup_staged_parent(manifest: &Path, sig: &Path, installer: &Pa
     if pm_n != ps_n || pm_n != pi_n {
         return;
     }
+    if !pm
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_valid_uuid_dirname)
+    {
+        return;
+    }
     let Some(grandparent) = pm.parent() else {
         return;
     };
@@ -1381,6 +1532,7 @@ fn best_effort_cleanup_staged_parent(manifest: &Path, sig: &Path, installer: &Pa
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.eq_ignore_ascii_case("staging"))
+        && ensure_no_reparse_points(pm).is_ok()
     {
         let _ = remove_dir_all_no_reparse(pm);
     }
@@ -1785,14 +1937,17 @@ pub(crate) mod win_updater {
     struct EnvBlockGuard(*mut c_void);
 
     impl EnvBlockGuard {
-        fn for_token(token: *mut c_void) -> Option<Self> {
+        fn for_token(token: *mut c_void) -> Result<Self, String> {
             let mut env: *mut c_void = ptr::null_mut();
             // SAFETY: `token` is a valid primary token and `env` receives the allocated block.
             let ok = unsafe { CreateEnvironmentBlock(&mut env, token, 0) };
             if ok != 0 && !env.is_null() {
-                Some(Self(env))
+                Ok(Self(env))
             } else {
-                None
+                Err(format!(
+                    "CreateEnvironmentBlock failed: {}",
+                    io::Error::last_os_error()
+                ))
             }
         }
 
@@ -2326,7 +2481,32 @@ pub(crate) mod win_updater {
                 format!("cleanup path '{}' is not a strict local drive path", dir.display()),
             )
         })?;
+        if segments.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to remove bare drive root '{}'", dir.display()),
+            ));
+        }
+        ensure_no_reparse_points(dir).map_err(updater_err_to_io)?;
         let dir_verbatim = build_verbatim_drive_path(drive, &segments);
+        if let Some(handle) = open_attribute_handle(&dir_verbatim, true)? {
+            let final_dos_raw = query_final_path_dos(handle.0).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "failed resolving cleanup dir final path")
+            })?;
+            let final_dos = parse_strict_local_drive_path(&final_dos_raw).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "cleanup dir final path was not local drive")
+            })?;
+            let expected_long = expand_long_segments(drive, &segments);
+            if !paths_equal_case_insensitive(
+                (final_dos.0, &final_dos.1),
+                (expected_long.0, &expected_long.1),
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("cleanup dir '{}' resolved outside expected location", dir.display()),
+                ));
+            }
+        }
         remove_dir_all_verbatim_no_reparse(&dir_verbatim)
     }
 
@@ -2371,15 +2551,7 @@ pub(crate) mod win_updater {
         Ok(())
     }
 
-    pub(crate) fn is_current_process_elevated() -> Result<bool, String> {
-        let mut raw_token: *mut c_void = ptr::null_mut();
-        // SAFETY: `GetCurrentProcess` returns pseudo-handle; `raw_token` is closed by `OwnedHandle`.
-        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
-        if ok == 0 {
-            return Err(format!("OpenProcessToken failed: {}", io::Error::last_os_error()));
-        }
-        let token = OwnedHandle::from_raw(raw_token)
-            .ok_or_else(|| "OpenProcessToken returned null handle".to_string())?;
+    fn is_token_elevated(token_handle: *mut c_void) -> Result<bool, String> {
         let mut elevation = TokenElevation {
             token_is_elevated: 0,
         };
@@ -2387,7 +2559,7 @@ pub(crate) mod win_updater {
         // SAFETY: `elevation` is properly sized `TokenElevation` output buffer.
         let ok = unsafe {
             GetTokenInformation(
-                token.0,
+                token_handle,
                 TOKEN_ELEVATION_INFO_CLASS,
                 (&mut elevation as *mut TokenElevation).cast::<c_void>(),
                 std::mem::size_of::<TokenElevation>() as u32,
@@ -2401,6 +2573,18 @@ pub(crate) mod win_updater {
             ));
         }
         Ok(elevation.token_is_elevated != 0)
+    }
+
+    pub(crate) fn is_current_process_elevated() -> Result<bool, String> {
+        let mut raw_token: *mut c_void = ptr::null_mut();
+        // SAFETY: `GetCurrentProcess` returns pseudo-handle; `raw_token` is closed by `OwnedHandle`.
+        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
+        if ok == 0 {
+            return Err(format!("OpenProcessToken failed: {}", io::Error::last_os_error()));
+        }
+        let token = OwnedHandle::from_raw(raw_token)
+            .ok_or_else(|| "OpenProcessToken returned null handle".to_string())?;
+        is_token_elevated(token.0)
     }
 
     pub(crate) fn generate_uuid_v4_string() -> Result<String, String> {
@@ -2438,6 +2622,12 @@ pub(crate) mod win_updater {
         let (drive, segments) = parse_strict_local_drive_path(dir_path).ok_or_else(|| {
             format!("directory '{}' is not a strict local drive path", dir_path.display())
         })?;
+        if segments.is_empty() {
+            return Err(format!(
+                "refusing to use bare drive root '{}' as admin directory",
+                dir_path.display()
+            ));
+        }
         ensure_no_reparse_points(dir_path).map_err(|e| e.to_string())?;
         let verbatim = build_verbatim_drive_path(drive, &segments);
         let wide = encode_wide_path_nul(&verbatim).map_err(|e| e.to_string())?;
@@ -2655,6 +2845,56 @@ pub(crate) mod win_updater {
         })
     }
 
+    fn parse_ace_flags(ace_flags: &str, ace: &str, allow_inherited: bool) -> Result<bool, String> {
+        if !ace_flags.len().is_multiple_of(2) {
+            return Err(format!("malformed ACE flags '{ace_flags}' in ({ace})"));
+        }
+        let mut has_io = false;
+        let mut has_oi = false;
+        let mut has_ci = false;
+        let (chunks, _) = ace_flags.as_bytes().as_chunks::<2>();
+        for chunk in chunks {
+            match chunk {
+                b"OI" => has_oi = true,
+                b"CI" => has_ci = true,
+                b"NP" => {}
+                b"IO" => has_io = true,
+                b"ID" => {
+                    if !allow_inherited {
+                        return Err(format!("inherited ACE flag 'ID' not allowed in ({ace})"));
+                    }
+                }
+                other => {
+                    let s = std::str::from_utf8(other).unwrap_or("??");
+                    return Err(format!("unexpected ACE flag '{s}' in ({ace})"));
+                }
+            }
+        }
+        if has_io && !has_oi && !has_ci {
+            return Err(format!("standalone inherit-only ACE flag '{ace_flags}' in ({ace})"));
+        }
+        Ok(has_io)
+    }
+
+    fn is_read_execute_only_sddl_rights(rights: &str) -> bool {
+        // Permitted read/execute/sync bits only:
+        // FILE_READ_DATA (0x1) | FILE_READ_EA (0x8) | FILE_EXECUTE (0x20) | FILE_READ_ATTRIBUTES (0x80)
+        // | READ_CONTROL (0x20000) | SYNCHRONIZE (0x100000) | GENERIC_EXECUTE (0x20000000) | GENERIC_READ (0x80000000)
+        const SAFE_RX_MASK: u32 = 0xA012_00A9;
+
+        if let Some(hex) = rights.strip_prefix("0x").or_else(|| rights.strip_prefix("0X")) {
+            return u32::from_str_radix(hex, 16)
+                .is_ok_and(|mask| mask != 0 && (mask & !SAFE_RX_MASK) == 0);
+        }
+        if rights.is_empty() || !rights.len().is_multiple_of(2) {
+            return false;
+        }
+        let (chunks, _) = rights.as_bytes().as_chunks::<2>();
+        chunks
+            .iter()
+            .all(|chunk| matches!(chunk, b"GR" | b"GX" | b"FR" | b"FX" | b"RC"))
+    }
+
     pub(crate) fn verify_admin_only_dacl_sddl(sddl: &str) -> Result<(), String> {
         let Some(after_d) = sddl.strip_prefix("D:") else {
             return Err("missing DACL section".to_string());
@@ -2669,8 +2909,8 @@ pub(crate) mod win_updater {
         }
         let aces_str = &dacl_part[first_ace_idx..];
         let mut rest = aces_str;
-        let mut has_sy = false;
-        let mut has_ba = false;
+        let mut has_direct_sy = false;
+        let mut has_direct_ba = false;
         while !rest.is_empty() {
             let Some(after_open) = rest.strip_prefix('(') else {
                 return Err(format!("unexpected trailing DACL tokens: {rest}"));
@@ -2684,25 +2924,248 @@ pub(crate) mod win_updater {
             if fields.len() != 6 {
                 return Err(format!("unexpected ACE field count in ({ace})"));
             }
-            let (ace_type, _ace_flags, rights, _obj, _inh_obj, sid) = (
+            let (ace_type, ace_flags, rights, _obj, _inh_obj, sid) = (
                 fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
             );
             if ace_type != "A" {
                 return Err(format!("non-allow ACE ({ace}) in admin-only DACL"));
             }
+            let is_io = parse_ace_flags(ace_flags, ace, false)?;
             if rights != "GA" && rights != "FA" {
                 return Err(format!("unexpected access rights '{rights}' in ({ace})"));
             }
             if sid == "SY" || sid.eq_ignore_ascii_case("S-1-5-18") {
-                has_sy = true;
+                if !is_io {
+                    has_direct_sy = true;
+                }
             } else if sid == "BA" || sid.eq_ignore_ascii_case("S-1-5-32-544") {
-                has_ba = true;
+                if !is_io {
+                    has_direct_ba = true;
+                }
             } else {
                 return Err(format!("unauthorized trustee SID '{sid}' in ({ace})"));
             }
         }
-        if !has_sy || !has_ba {
-            return Err("admin-only DACL must grant both SY and BA".to_string());
+        if !has_direct_sy || !has_direct_ba {
+            return Err(
+                "admin-only DACL must grant direct non-IO full access to both SY and BA"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_program_data_dacl_sddl(sddl: &str) -> Result<(), String> {
+        let Some(after_d) = sddl.strip_prefix("D:") else {
+            return Err("missing DACL section".to_string());
+        };
+        let dacl_part = after_d.split("S:").next().unwrap_or(after_d);
+        let first_ace_idx = dacl_part
+            .find('(')
+            .ok_or_else(|| "DACL contains no ACE entries".to_string())?;
+        let aces_str = &dacl_part[first_ace_idx..];
+        let mut rest = aces_str;
+        let mut has_direct_sy = false;
+        let mut has_direct_ba = false;
+        while !rest.is_empty() {
+            let Some(after_open) = rest.strip_prefix('(') else {
+                return Err(format!("unexpected trailing DACL tokens: {rest}"));
+            };
+            let Some(close_idx) = after_open.find(')') else {
+                return Err("unclosed ACE parenthesis in DACL".to_string());
+            };
+            let ace = &after_open[..close_idx];
+            rest = &after_open[close_idx + 1..];
+            let fields: Vec<&str> = ace.split(';').collect();
+            if fields.len() != 6 {
+                return Err(format!("unexpected ACE field count in ({ace})"));
+            }
+            let (ace_type, ace_flags, rights, _obj, _inh_obj, sid) = (
+                fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
+            );
+            if ace_type != "A" {
+                return Err(format!("non-allow ACE ({ace}) in ProgramData DACL"));
+            }
+            let is_io = parse_ace_flags(ace_flags, ace, true)?;
+            if sid == "SY" || sid.eq_ignore_ascii_case("S-1-5-18") {
+                if rights != "GA" && rights != "FA" {
+                    return Err(format!("unexpected SY access rights '{rights}' in ({ace})"));
+                }
+                if !is_io {
+                    has_direct_sy = true;
+                }
+            } else if sid == "BA" || sid.eq_ignore_ascii_case("S-1-5-32-544") {
+                if rights != "GA" && rights != "FA" {
+                    return Err(format!("unexpected BA access rights '{rights}' in ({ace})"));
+                }
+                if !is_io {
+                    has_direct_ba = true;
+                }
+            } else if sid == "BU" || sid.eq_ignore_ascii_case("S-1-5-32-545") {
+                if !is_read_execute_only_sddl_rights(rights) {
+                    return Err(format!(
+                        "non-admin trustee '{sid}' has excessive access rights '{rights}' in ({ace})"
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "unauthorized trustee SID '{sid}' in ProgramData DACL ({ace})"
+                ));
+            }
+        }
+        if !has_direct_sy || !has_direct_ba {
+            return Err(
+                "ProgramData DACL must grant direct non-IO full access to both SY and BA"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_and_verify_program_data_root(
+        dir_path: &Path,
+        enforce_admin_owner: bool,
+    ) -> Result<(), String> {
+        let (drive, segments) = parse_strict_local_drive_path(dir_path).ok_or_else(|| {
+            format!("directory '{}' is not a strict local drive path", dir_path.display())
+        })?;
+        if segments.is_empty() {
+            return Err(format!(
+                "refusing to use bare drive root '{}' as ProgramData dir",
+                dir_path.display()
+            ));
+        }
+        ensure_no_reparse_points(dir_path).map_err(|e| e.to_string())?;
+        let verbatim = build_verbatim_drive_path(drive, &segments);
+        let wide = encode_wide_path_nul(&verbatim).map_err(|e| e.to_string())?;
+
+        // Create only if missing (granting SY:F, BA:F, BU:RX); never overwrite an existing root DACL.
+        let sd = OwnedSecurityDescriptor::from_sddl(PROGRAM_DATA_ROOT_SDDL)?;
+        let sa = sd.security_attributes();
+        // SAFETY: `wide` is NUL-terminated UTF-16 and `sa` points to valid `OwnedSecurityDescriptor`.
+        let created = unsafe { CreateDirectoryW(wide.as_ptr(), &sa) };
+        if created == 0 {
+            let err_code = unsafe { GetLastError() };
+            if err_code != ERROR_ALREADY_EXISTS {
+                return Err(format!(
+                    "CreateDirectoryW({}) failed: {}",
+                    dir_path.display(),
+                    io::Error::from_raw_os_error(err_code as i32)
+                ));
+            }
+        }
+
+        // Open handle without following reparse points and inspect owner + DACL read-only.
+        // SAFETY: `wide` is NUL-terminated UTF-16.
+        let raw_handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            )
+        };
+        let handle = OwnedHandle::from_raw(raw_handle).ok_or_else(|| {
+            format!(
+                "failed opening directory handle {}: {}",
+                dir_path.display(),
+                io::Error::last_os_error()
+            )
+        })?;
+
+        let info = get_file_info(handle.0).map_err(|e| e.to_string())?;
+        if (info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || (info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        {
+            return Err(format!(
+                "directory '{}' failed reparse/directory verification",
+                dir_path.display()
+            ));
+        }
+
+        let final_dos_raw = query_final_path_dos(handle.0)
+            .ok_or_else(|| format!("GetFinalPathNameByHandleW failed for {}", dir_path.display()))?;
+        let final_dos = parse_strict_local_drive_path(&final_dos_raw)
+            .ok_or_else(|| "ProgramData dir final path is not strict local drive".to_string())?;
+        let expected_long = expand_long_segments(drive, &segments);
+        if !paths_equal_case_insensitive(
+            (final_dos.0, &final_dos.1),
+            (expected_long.0, &expected_long.1),
+        ) {
+            return Err(format!(
+                "directory '{}' resolved outside expected location",
+                dir_path.display()
+            ));
+        }
+
+        let mut owner_sid: *mut c_void = ptr::null_mut();
+        let mut existing_dacl: *mut c_void = ptr::null_mut();
+        let mut queried_sd: *mut c_void = ptr::null_mut();
+        // SAFETY: `handle.0` is an open handle with `READ_CONTROL`; `queried_sd` is freed via `LocalMemGuard`.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.0,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner_sid,
+                ptr::null_mut(),
+                &mut existing_dacl,
+                ptr::null_mut(),
+                &mut queried_sd,
+            )
+        };
+        if status != 0 || queried_sd.is_null() {
+            return Err(format!(
+                "GetSecurityInfo failed on {}: {}",
+                dir_path.display(),
+                io::Error::from_raw_os_error(status as i32)
+            ));
+        }
+        let _sd_guard = LocalMemGuard(queried_sd);
+
+        if enforce_admin_owner {
+            if owner_sid.is_null() {
+                return Err(format!("directory '{}' has null owner SID", dir_path.display()));
+            }
+            let sid_str = sid_ptr_to_string(owner_sid)?;
+            if !is_allowed_admin_owner_sid(&sid_str) {
+                return Err(format!(
+                    "directory '{}' has non-admin owner SID {sid_str}",
+                    dir_path.display()
+                ));
+            }
+        }
+
+        let actual_sddl = sd_ptr_to_sddl(queried_sd, DACL_SECURITY_INFORMATION)?;
+        verify_program_data_dacl_sddl(&actual_sddl).map_err(|reason| {
+            format!(
+                "directory '{}' failed ProgramData DACL verification ({reason}): got '{actual_sddl}'",
+                dir_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_dir_with_sddl(dir_path: &Path, sddl: &str) -> Result<(), String> {
+        let (drive, segments) = parse_strict_local_drive_path(dir_path).ok_or_else(|| {
+            format!("directory '{}' is not a strict local drive path", dir_path.display())
+        })?;
+        let verbatim = build_verbatim_drive_path(drive, &segments);
+        let wide = encode_wide_path_nul(&verbatim).map_err(|e| e.to_string())?;
+        let sd = OwnedSecurityDescriptor::from_sddl(sddl)?;
+        let sa = sd.security_attributes();
+        // SAFETY: `wide` is NUL-terminated UTF-16 and `sa` points to valid `OwnedSecurityDescriptor`.
+        let created = unsafe { CreateDirectoryW(wide.as_ptr(), &sa) };
+        if created == 0 {
+            return Err(format!(
+                "CreateDirectoryW({}) failed: {}",
+                dir_path.display(),
+                io::Error::last_os_error()
+            ));
         }
         Ok(())
     }
@@ -2711,12 +3174,7 @@ pub(crate) mod win_updater {
         program_data_dir: &Path,
         enforce_admin_owner: bool,
     ) -> Result<PathBuf, String> {
-        create_and_verify_admin_dir(
-            program_data_dir,
-            ADMIN_ONLY_DIR_SDDL,
-            false,
-            enforce_admin_owner,
-        )?;
+        ensure_and_verify_program_data_root(program_data_dir, enforce_admin_owner)?;
         let updates_dir = program_data_dir.join("updates");
         create_and_verify_admin_dir(
             &updates_dir,
@@ -2950,6 +3408,12 @@ pub(crate) mod win_updater {
         let explorer_token = OwnedHandle::from_raw(raw_token)
             .ok_or_else(|| "OpenProcessToken(explorer) returned null".to_string())?;
 
+        if is_token_elevated(explorer_token.0)? {
+            return Err(
+                "refusing non-elevated relaunch: explorer.exe token is elevated".to_string(),
+            );
+        }
+
         let mut raw_primary: *mut c_void = ptr::null_mut();
         let access = TOKEN_ASSIGN_PRIMARY
             | TOKEN_DUPLICATE
@@ -2976,7 +3440,7 @@ pub(crate) mod win_updater {
         let primary_token = OwnedHandle::from_raw(raw_primary)
             .ok_or_else(|| "DuplicateTokenEx returned null".to_string())?;
 
-        let env_guard = EnvBlockGuard::for_token(primary_token.0);
+        let env_guard = EnvBlockGuard::for_token(primary_token.0)?;
         let mut desktop_w = encode_wide_str_nul(r"winsta0\default");
         let app_w = encode_wide_path_nul(ui_exe).map_err(|e| e.to_string())?;
         let cmd_str = format!("\"{}\"", ui_exe.display());
@@ -3010,10 +3474,8 @@ pub(crate) mod win_updater {
             dw_thread_id: 0,
         };
 
-        let (flags, env_ptr) = match &env_guard {
-            Some(env) => (CREATE_UNICODE_ENVIRONMENT, env.as_ptr()),
-            None => (0, ptr::null()),
-        };
+        let flags = CREATE_UNICODE_ENVIRONMENT;
+        let env_ptr = env_guard.as_ptr();
 
         // SAFETY: `primary_token.0` is a valid Medium-IL primary token; all buffers outlive the call.
         let ok = unsafe {

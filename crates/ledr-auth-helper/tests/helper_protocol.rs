@@ -49,11 +49,6 @@ impl ChildGuard {
         }
         Ok(status)
     }
-
-    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let mut child = self.0.take().expect("child already consumed");
-        child.wait()
-    }
 }
 
 impl Drop for ChildGuard {
@@ -62,6 +57,24 @@ impl Drop for ChildGuard {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+fn wait_for_exit(
+    child: &mut ChildGuard,
+    timeout: Duration,
+    reason: &str,
+) -> std::process::ExitStatus {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return status;
+        }
+        assert!(
+            start.elapsed() <= timeout,
+            "ledr-auth-helper did not exit for {reason} within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -121,7 +134,9 @@ fn auth_helper_bin_verifies_signed_and_unsigned_requests() {
     assert_eq!(resp2.authenticode, None);
 
     drop(stdin);
-    let status = child.wait().expect("wait for ledr-auth-helper");
+    const EOF_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+    assert!(EOF_EXIT_TIMEOUT < Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS));
+    let status = wait_for_exit(&mut child, EOF_EXIT_TIMEOUT, "EOF shutdown");
     assert_eq!(status.code(), Some(0), "expected clean exit 0, got {status}");
 
     drop(tmp_dir);
@@ -145,16 +160,7 @@ fn auth_helper_bin_self_exits_on_idle_timeout() {
 
     let stdin = child.child_mut().stdin.take().expect("child stdin");
 
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            break status;
-        }
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("ledr-auth-helper did not self-exit on idle timeout within 5s");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait_for_exit(&mut child, Duration::from_secs(5), "idle timeout");
 
     drop(stdin);
     assert_eq!(status.code(), Some(0), "expected clean exit 0, got {status}");

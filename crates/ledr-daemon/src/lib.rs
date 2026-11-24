@@ -9,6 +9,7 @@ pub mod firewall;
 pub mod ipc;
 pub mod notify;
 pub mod process_table;
+pub mod service_win;
 
 pub use channel::{
     ChannelClosedError, ClassifiedEventSender, HighPrioritySendError, OutboundLaneClassifier,

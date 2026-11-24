@@ -208,6 +208,8 @@ PR 4C は PR #28（`331602d`）で `main` へマージ済みであり、PR #34�
 非特権の単体テストおよびモックレジストリ検証では、Windows 10/11 クライアント SKU の管理者権限下における実 `HKLM\SOFTWARE\WOW6432Node\...` への書込と削除、および実 Chrome / Edge での `HKLM` 経由 Native Messaging 起動は検証済みとみなさない。
 これらは後続の統合実機 E2E（`FU-E2E-02`、[e2e-test-runbook.md](e2e-test-runbook.md) の `E2E-P4-00`）にて、`ledr-bridge-nm setup --scope machine` 後の両ビュー登録確認（`reg query HKLM\SOFTWARE\WOW6432Node\...` と `HKLM\SOFTWARE\...`）、`ledr-bridge-nm status --scope machine`、および `ledr-bridge-nm unregister --scope machine` 後の両ビュー消去として実機確認する。
 なお、Chrome と Edge は Native Messaging ホスト探索で `HKLM` より `HKCU` を優先するため、`HKLM` 経由の実ブラウザ起動確認では `HKCU` に登録が存在しない状態（`--scope user` 登録前、または一時 `unregister --scope user` 後）で拡張ポップアップの `Ping` 応答を検証する。
+また、`ledr-bridge-nm setup` 自体はリテラルの `REG_SZ` パスを書き込むが、既存の `HKLM` エントリに `%LOCALAPPDATA%` や `%USERPROFILE%` などユーザー固有環境変数を参照する `REG_EXPAND_SZ` パスが含まれる場合、`ExpandEnvironmentStringsW` は呼び出し元の昇格シェルが持つ環境変数で解決する。
+そのため、実機検証（`FU-E2E-02`）や運用時のクリーンアップでは、管理者シェルで展開された結果がブラウザ実行ユーザーのマニフェストパスと一致するかを確認する。
 
 ## FU-E2E-03 E2E-PERF-01 の WorkingSet64 超過に対する原因分析とメモリ削減
 

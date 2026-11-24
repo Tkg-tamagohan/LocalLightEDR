@@ -28,7 +28,9 @@ use crate::pipe_client::{
 use crate::relay::{read_raw_frame, run_relay_loop, write_raw_frame, FrameExchange, RawFrameError};
 use crate::setup::{
     format_status_text, resolve_bridge_exe_with, resolve_manifest_dir, resolve_ui_exe_with,
-    run_setup_with, run_status_with, run_unregister_with, RegistryTarget,
+    run_setup_with, run_setup_with_ops, run_status_with, run_status_with_ops,
+    run_unregister_with, run_unregister_with_ops, select_effective_hklm_probe,
+    NativeHostRegProbe, RegWow64View, RegistryTarget, RegistryViewOps,
     NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
 };
 
@@ -2695,4 +2697,680 @@ fn bridge_18_cmd_mediated_pipe_inheritance_real_kernel() {
         "missing BRIDGE18_OK marker in grandchild stdout:\nstdout: {stdout_text}\nstderr: {stderr_text}"
     );
     println!("{stdout_text}");
+}
+
+#[test]
+fn bridge_19_select_effective_hklm_probe_exhaustive_matrix() {
+    use NativeHostRegProbe::{Absent, AccessError, EmptyString, InvalidType, Present};
+
+    let p32 = Present(r"C:\ProgramData\LocalEDR\native-messaging\m32.json".to_string());
+    let p64 = Present(r"C:\ProgramData\LocalEDR\native-messaging\m64.json".to_string());
+    let err32 = AccessError("denied-32".to_string());
+    let err64 = AccessError("denied-64".to_string());
+
+    let variants_32 = [
+        p32.clone(),
+        EmptyString,
+        Absent,
+        InvalidType,
+        err32.clone(),
+    ];
+    let variants_64 = [
+        p64.clone(),
+        EmptyString,
+        Absent,
+        InvalidType,
+        err64.clone(),
+    ];
+
+    // Verify all 25 combinations of (view32, view64) follow Chromium's HKLM WOW64 precedence:
+    // - 32-bit Present wins unconditionally over any 64-bit state.
+    // - 32-bit EmptyString stops fallback and wins over any 64-bit state (never masked by 64-bit).
+    // - Only 32-bit Absent / InvalidType / AccessError falls back to 64-bit Present / EmptyString.
+    for v32 in &variants_32 {
+        for v64 in &variants_64 {
+            let expected = match (v32, v64) {
+                (Present(_), _) | (EmptyString, _) => (v32.clone(), Some(RegWow64View::Wow6432)),
+                (_, Present(_)) | (_, EmptyString) => (v64.clone(), Some(RegWow64View::Wow6464)),
+                (Absent, Absent) => (Absent, None),
+                (Absent, _) => (v64.clone(), Some(RegWow64View::Wow6464)),
+                (_, Absent) => (v32.clone(), Some(RegWow64View::Wow6432)),
+                _ => (v32.clone(), Some(RegWow64View::Wow6432)),
+            };
+            assert_eq!(
+                select_effective_hklm_probe(v32.clone(), v64.clone()),
+                expected,
+                "mismatch for view32={v32:?}, view64={v64:?}"
+            );
+        }
+    }
+
+    // Explicit spot checks for critical invariants
+    assert_eq!(
+        select_effective_hklm_probe(EmptyString, p64.clone()),
+        (EmptyString, Some(RegWow64View::Wow6432))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(p32.clone(), p64.clone()),
+        (p32, Some(RegWow64View::Wow6432))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(InvalidType, p64.clone()),
+        (p64.clone(), Some(RegWow64View::Wow6464))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(err32, p64.clone()),
+        (p64, Some(RegWow64View::Wow6464))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(Absent, err64.clone()),
+        (err64, Some(RegWow64View::Wow6464))
+    );
+}
+
+#[test]
+fn bridge_20_mock_registry_machine_wow64_setup_status_unregister() {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type MockNmhMap = HashMap<(Scope, String, Option<RegWow64View>), NativeHostRegProbe>;
+
+    #[derive(Default)]
+    struct MockRegistryViewOps {
+        nmh_entries: Mutex<MockNmhMap>,
+        uri_cmds: Mutex<HashMap<Scope, String>>,
+        aumids: Mutex<HashMap<Scope, String>>,
+    }
+
+    impl MockRegistryViewOps {
+        fn set_entry(
+            &self,
+            scope: Scope,
+            subkey: &str,
+            view: Option<RegWow64View>,
+            probe: NativeHostRegProbe,
+        ) {
+            self.nmh_entries
+                .lock()
+                .unwrap()
+                .insert((scope, subkey.to_string(), view), probe);
+        }
+
+        fn get_entry(
+            &self,
+            scope: Scope,
+            subkey: &str,
+            view: Option<RegWow64View>,
+        ) -> NativeHostRegProbe {
+            self.nmh_entries
+                .lock()
+                .unwrap()
+                .get(&(scope, subkey.to_string(), view))
+                .cloned()
+                .unwrap_or(NativeHostRegProbe::Absent)
+        }
+    }
+
+    impl RegistryViewOps for MockRegistryViewOps {
+        fn ensure_default_sz(
+            &self,
+            target: &RegistryTarget,
+            subkey: &str,
+            view: Option<RegWow64View>,
+            expected: &str,
+        ) -> anyhow::Result<bool> {
+            match target.scope {
+                Scope::Machine => assert!(
+                    view.is_some(),
+                    "Scope::Machine NMH writes must specify an explicit WOW64 view"
+                ),
+                Scope::User => assert!(
+                    view.is_none(),
+                    "Scope::User NMH writes must stay on default view"
+                ),
+            }
+            let mut map = self.nmh_entries.lock().unwrap();
+            let key = (target.scope, subkey.to_string(), view);
+            if matches!(map.get(&key), Some(NativeHostRegProbe::Present(cur)) if cur == expected) {
+                return Ok(false);
+            }
+            map.insert(key, NativeHostRegProbe::Present(expected.to_string()));
+            Ok(true)
+        }
+
+        fn probe_default_sz(
+            &self,
+            target: &RegistryTarget,
+            subkey: &str,
+            view: Option<RegWow64View>,
+        ) -> NativeHostRegProbe {
+            match target.scope {
+                Scope::Machine => assert!(
+                    view.is_some(),
+                    "Scope::Machine NMH probes must specify an explicit WOW64 view"
+                ),
+                Scope::User => assert!(
+                    view.is_none(),
+                    "Scope::User NMH probes must stay on default view"
+                ),
+            }
+            self.get_entry(target.scope, subkey, view)
+        }
+
+        fn delete_subkey_tree_idempotent(
+            &self,
+            target: &RegistryTarget,
+            subkey: &str,
+            view: Option<RegWow64View>,
+        ) -> anyhow::Result<bool> {
+            if subkey == target.uri_subkey() {
+                assert!(view.is_none(), "URI deletion must stay on default view");
+                return Ok(self.uri_cmds.lock().unwrap().remove(&target.scope).is_some());
+            }
+            if subkey == target.aumid_subkey() {
+                assert!(view.is_none(), "AUMID deletion must stay on default view");
+                return Ok(self.aumids.lock().unwrap().remove(&target.scope).is_some());
+            }
+            let mut map = self.nmh_entries.lock().unwrap();
+            Ok(map.remove(&(target.scope, subkey.to_string(), view)).is_some())
+        }
+
+        fn ensure_uri_registered(&self, target: &RegistryTarget, ui_exe: &Path) -> anyhow::Result<bool> {
+            let cmd = crate::setup::format_ledr_uri_command(ui_exe);
+            let mut map = self.uri_cmds.lock().unwrap();
+            if map.get(&target.scope).is_some_and(|cur| cur == &cmd) {
+                return Ok(false);
+            }
+            map.insert(target.scope, cmd);
+            Ok(true)
+        }
+
+        fn ensure_aumid_registered(&self, target: &RegistryTarget) -> anyhow::Result<bool> {
+            let mut map = self.aumids.lock().unwrap();
+            if map
+                .get(&target.scope)
+                .is_some_and(|cur| cur == crate::setup::LEDR_AUMID_DISPLAY_NAME)
+            {
+                return Ok(false);
+            }
+            map.insert(
+                target.scope,
+                crate::setup::LEDR_AUMID_DISPLAY_NAME.to_string(),
+            );
+            Ok(true)
+        }
+
+        fn read_uri_status(&self, target: &RegistryTarget) -> (bool, Option<String>) {
+            let val = self.uri_cmds.lock().unwrap().get(&target.scope).cloned();
+            (val.is_some(), val)
+        }
+
+        fn read_aumid_status(&self, target: &RegistryTarget) -> (bool, Option<String>) {
+            let val = self.aumids.lock().unwrap().get(&target.scope).cloned();
+            (val.is_some(), val)
+        }
+
+        fn read_native_hosts_launch_directly_policy(
+            &self,
+            _target: &RegistryTarget,
+            _browser: BrowserKind,
+        ) -> Option<bool> {
+            None
+        }
+
+        fn verify_local_manifest_for_removal(&self, _path: &Path) -> bool {
+            true
+        }
+    }
+
+    let temp = TempDirGuard::new("ledr-bridge-nm-b20");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    let fake_ui = temp.path().join("ledr-ui.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+    fs::write(&fake_ui, b"MZ-test-ui").unwrap();
+    let manifest_dir = temp.path().join("nm-machine");
+
+    let machine_target = RegistryTarget::for_scope(Scope::Machine);
+    let user_target = RegistryTarget::for_scope(Scope::User);
+    let status_machine = StatusArgs {
+        scope: StatusScope::Machine,
+        extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
+        ping: false,
+        pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+        json: true,
+    };
+
+    // (a) Stale / empty 32-bit shadow in HKLM is exposed as invalid (not masked by 64-bit),
+    //     then repaired by `setup --scope machine` (Option A1) and validated by `status`.
+    let ops = MockRegistryViewOps::default();
+    let chrome_subkey = machine_target.browser_subkey(BrowserKind::Chrome);
+    let edge_subkey = machine_target.browser_subkey(BrowserKind::Edge);
+    let brave_subkey = machine_target.browser_subkey(BrowserKind::Brave);
+
+    let chrome_manifest_path = manifest_dir.join(manifest_filename_for(Scope::Machine, BrowserKind::Chrome));
+    let edge_manifest_path = manifest_dir.join(manifest_filename_for(Scope::Machine, BrowserKind::Edge));
+    let m = build_manifest(&fake_bridge, DEFAULT_CHROME_EXTENSION_ID).unwrap();
+    write_manifest_atomic(&chrome_manifest_path, &m).unwrap();
+    write_manifest_atomic(&edge_manifest_path, &m).unwrap();
+    let chrome_display = crate::manifest::normalize_display_path(&chrome_manifest_path);
+    let edge_display = crate::manifest::normalize_display_path(&edge_manifest_path);
+
+    ops.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::EmptyString,
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(chrome_display.clone()),
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::Present(r"C:\Stale\old.json".to_string()),
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(edge_display.clone()),
+    );
+
+    let pre_report = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &ops,
+    )
+    .expect("status before repair");
+    let pre_chrome = &pre_report.scopes[0].browsers[0];
+    assert!(pre_chrome.registered);
+    assert_eq!(pre_chrome.registry_view.as_deref(), Some("wow64-32"));
+    assert_eq!(pre_chrome.manifest_path, None);
+    let pre_chrome_manifest = pre_chrome.manifest.as_ref().expect("synthetic invalid manifest");
+    assert!(!pre_chrome_manifest.valid);
+    assert!(pre_chrome_manifest
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("empty REG_SZ")));
+    let pre_json = serde_json::to_string(&pre_report).unwrap();
+    assert!(pre_json.contains(r#""registry_view":"wow64-32""#));
+
+    let pre_brave = &pre_report.scopes[0].browsers[2];
+    assert!(!pre_brave.registered);
+    assert_eq!(pre_brave.registry_view, None);
+
+    let setup_args = SetupArgs {
+        scope: Scope::Machine,
+        browsers: vec![BrowserKind::Chrome, BrowserKind::Edge],
+        extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
+        bridge_exe: Some(fake_bridge.clone()),
+        ui_exe: Some(fake_ui),
+        manifest_dir: Some(manifest_dir.clone()),
+        skip_uri: false,
+        json: false,
+    };
+    let setup_first = run_setup_with_ops(&setup_args, &machine_target, &ops).expect("first setup");
+    assert!(setup_first.browsers.iter().all(|b| b.updated));
+    assert_eq!(
+        ops.get_entry(Scope::Machine, &chrome_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::Present(chrome_display.clone())
+    );
+    assert_eq!(
+        ops.get_entry(Scope::Machine, &chrome_subkey, Some(RegWow64View::Wow6464)),
+        NativeHostRegProbe::Present(chrome_display)
+    );
+    assert_eq!(
+        ops.get_entry(Scope::Machine, &edge_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::Present(edge_display.clone())
+    );
+    assert_eq!(
+        ops.get_entry(Scope::Machine, &edge_subkey, Some(RegWow64View::Wow6464)),
+        NativeHostRegProbe::Present(edge_display)
+    );
+
+    let setup_second =
+        run_setup_with_ops(&setup_args, &machine_target, &ops).expect("idempotent second setup");
+    assert!(setup_second.browsers.iter().all(|b| !b.updated));
+    assert!(!setup_second.uri_updated);
+    assert!(!setup_second.aumid_updated);
+
+    let post_report = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &ops,
+    )
+    .expect("status after repair");
+    for entry in post_report.scopes[0].browsers.iter().take(2) {
+        assert!(entry.registered);
+        assert_eq!(entry.registry_view.as_deref(), Some("wow64-32"));
+        assert!(entry.manifest.as_ref().is_some_and(|v| v.valid));
+    }
+
+    // (b) 32-bit-only legacy registration is detected by `status` and removed by `unregister`.
+    let ops_b = MockRegistryViewOps::default();
+    let legacy_32_manifest = manifest_dir.join("com.localedr.bridge.legacy32.json");
+    write_manifest_atomic(&legacy_32_manifest, &m).unwrap();
+    let legacy_32_display = crate::manifest::normalize_display_path(&legacy_32_manifest);
+    ops_b.set_entry(
+        Scope::Machine,
+        &brave_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::Present(legacy_32_display.clone()),
+    );
+
+    let legacy_status = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &ops_b,
+    )
+    .expect("status legacy 32-bit");
+    let brave_status = &legacy_status.scopes[0].browsers[2];
+    assert!(brave_status.registered);
+    assert_eq!(brave_status.registry_view.as_deref(), Some("wow64-32"));
+    assert_eq!(
+        brave_status.manifest_path.as_deref(),
+        Some(legacy_32_display.as_str())
+    );
+    assert!(brave_status.manifest.as_ref().is_some_and(|v| v.valid));
+
+    let unreg_brave = UnregisterArgs {
+        scope: Scope::Machine,
+        browsers: vec![BrowserKind::Brave],
+        manifest_dir: Some(manifest_dir.clone()),
+        keep_uri: true,
+        json: false,
+    };
+    let unreg_res =
+        run_unregister_with_ops(&unreg_brave, &machine_target, Some(&user_target), &ops_b)
+            .expect("unregister legacy 32-bit");
+    assert!(unreg_res.browsers[0].removed);
+    assert!(unreg_res.manifest_removed);
+    assert!(!legacy_32_manifest.exists());
+    assert_eq!(
+        ops_b.get_entry(Scope::Machine, &brave_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::Absent
+    );
+
+    let unreg_repeat =
+        run_unregister_with_ops(&unreg_brave, &machine_target, Some(&user_target), &ops_b)
+            .expect("repeat unregister idempotent");
+    assert!(!unreg_repeat.browsers[0].removed);
+    assert!(!unreg_repeat.manifest_removed);
+
+    let post_unreg_status = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &ops_b,
+    )
+    .expect("status after unregister");
+    assert!(!post_unreg_status.scopes[0].browsers[2].registered);
+    assert_eq!(post_unreg_status.scopes[0].browsers[2].registry_view, None);
+
+    // (c) Cross-browser 32-bit reference prevents deleting shared manifest file.
+    let ops_c = MockRegistryViewOps::default();
+    let manifest_dir_c = temp.path().join("nm-machine-shared");
+    let shared_manifest = manifest_dir_c.join(MANIFEST_FILENAME);
+    write_manifest_atomic(&shared_manifest, &m).unwrap();
+    let shared_display = crate::manifest::normalize_display_path(&shared_manifest);
+    ops_c.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(shared_display.clone()),
+    );
+    ops_c.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::Present(shared_display),
+    );
+
+    let unreg_chrome_only = UnregisterArgs {
+        scope: Scope::Machine,
+        browsers: vec![BrowserKind::Chrome],
+        manifest_dir: Some(manifest_dir_c.clone()),
+        keep_uri: true,
+        json: false,
+    };
+    let res_chrome_only = run_unregister_with_ops(
+        &unreg_chrome_only,
+        &machine_target,
+        Some(&user_target),
+        &ops_c,
+    )
+    .expect("unreg chrome while edge 32-bit still references shared manifest");
+    assert!(res_chrome_only.browsers[0].removed);
+    assert!(
+        !res_chrome_only.manifest_removed,
+        "Edge HKLM 32-bit reference must preserve shared manifest"
+    );
+    assert!(shared_manifest.is_file());
+
+    let unreg_edge_last = UnregisterArgs {
+        scope: Scope::Machine,
+        browsers: vec![BrowserKind::Edge],
+        manifest_dir: Some(manifest_dir_c),
+        keep_uri: true,
+        json: false,
+    };
+    let res_edge_last = run_unregister_with_ops(
+        &unreg_edge_last,
+        &machine_target,
+        Some(&user_target),
+        &ops_c,
+    )
+    .expect("unreg edge removes final 32-bit reference");
+    assert!(res_edge_last.browsers[0].removed);
+    assert!(res_edge_last.manifest_removed);
+    assert!(!shared_manifest.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_21_real_win32_ffi_explicit_wow64_view_roundtrip() {
+    use crate::setup::win_reg_ops;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    use winreg::RegKey;
+
+    assert_eq!(win_reg_ops::KEY_WOW64_64KEY, 0x0100);
+    assert_eq!(win_reg_ops::KEY_WOW64_32KEY, 0x0200);
+
+    // `HKCU\Software\Classes\CLSID` is WOW64-redirected on 64-bit Windows without elevation
+    // (32-bit view maps to `Software\Classes\Wow6432Node\CLSID` while 64-bit stays under
+    // `Software\Classes\CLSID`).
+    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let clsid_subkey = format!(
+        r"Software\Classes\CLSID\{{LocalEDR-Test-Bridge-NM-{}-{seq}}}",
+        std::process::id()
+    );
+    let nested_subkey = format!(r"{clsid_subkey}\LocalServer32");
+    let target = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: None,
+    };
+
+    struct ViewCleanup {
+        target: RegistryTarget,
+        subkey: String,
+    }
+    impl Drop for ViewCleanup {
+        fn drop(&mut self) {
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(
+                &self.target,
+                &self.subkey,
+                Some(RegWow64View::Wow6432),
+            );
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(
+                &self.target,
+                &self.subkey,
+                Some(RegWow64View::Wow6464),
+            );
+        }
+    }
+    let _cleanup = ViewCleanup {
+        target: target.clone(),
+        subkey: clsid_subkey.clone(),
+    };
+
+    // Clean start + idempotent delete when absent
+    assert!(!win_reg_ops::delete_subkey_tree_idempotent(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6432),
+    )
+    .expect("absent 32-bit delete"));
+    assert!(!win_reg_ops::delete_subkey_tree_idempotent(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6464),
+    )
+    .expect("absent 64-bit delete"));
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::Absent
+    );
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        NativeHostRegProbe::Absent
+    );
+
+    let val32 = r"C:\ProgramData\LocalEDR\native-messaging\win32-test-32.json";
+    let val64 = r"C:\ProgramData\LocalEDR\native-messaging\win32-test-64.json";
+
+    // Write 32-bit view (including a child subkey to exercise RegDeleteTreeW + RegDeleteKeyExW).
+    assert!(win_reg_ops::ensure_default_sz(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6432),
+        val32,
+    )
+    .expect("create 32-bit key"));
+    assert!(win_reg_ops::ensure_default_sz(
+        &target,
+        &nested_subkey,
+        Some(RegWow64View::Wow6432),
+        "nested-32",
+    )
+    .expect("create nested 32-bit key"));
+    assert!(!win_reg_ops::ensure_default_sz(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6432),
+        val32,
+    )
+    .expect("idempotent repeat 32-bit ensure"));
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::Present(val32.to_string())
+    );
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        NativeHostRegProbe::Absent
+    );
+
+    // Write 64-bit view independently and verify view isolation.
+    assert!(win_reg_ops::ensure_default_sz(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6464),
+        val64,
+    )
+    .expect("create 64-bit key"));
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        NativeHostRegProbe::Present(val64.to_string())
+    );
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::Present(val32.to_string())
+    );
+
+    // Empty REG_SZ and non-REG_SZ probes in 32-bit view.
+    assert!(win_reg_ops::ensure_default_sz(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6432),
+        "",
+    )
+    .expect("overwrite 32-bit with empty REG_SZ"));
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::EmptyString
+    );
+    assert_eq!(
+        select_effective_hklm_probe(
+            win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6432)),
+            win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        ),
+        (NativeHostRegProbe::EmptyString, Some(RegWow64View::Wow6432))
+    );
+
+    // REG_DWORD in 32-bit view -> InvalidType, falling back to 64-bit Present.
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (k32, _) = hkcu
+        .create_subkey_with_flags(&clsid_subkey, KEY_WRITE | win_reg_ops::KEY_WOW64_32KEY)
+        .unwrap();
+    k32.set_value("", &1u32).unwrap();
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::InvalidType
+    );
+    assert_eq!(
+        select_effective_hklm_probe(
+            win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6432)),
+            win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        ),
+        (
+            NativeHostRegProbe::Present(val64.to_string()),
+            Some(RegWow64View::Wow6464)
+        )
+    );
+
+    // Deleting 32-bit view via explicit FFI deletes tree without affecting 64-bit view, and is idempotent.
+    assert!(win_reg_ops::delete_subkey_tree_idempotent(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6432),
+    )
+    .expect("delete 32-bit tree"));
+    assert!(!win_reg_ops::delete_subkey_tree_idempotent(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6432),
+    )
+    .expect("idempotent repeat 32-bit delete"));
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::Absent
+    );
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        NativeHostRegProbe::Present(val64.to_string())
+    );
+
+    // Deleting 64-bit view via explicit FFI leaves both views Absent and repeats idempotently.
+    assert!(win_reg_ops::delete_subkey_tree_idempotent(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6464),
+    )
+    .expect("delete 64-bit tree"));
+    assert!(!win_reg_ops::delete_subkey_tree_idempotent(
+        &target,
+        &clsid_subkey,
+        Some(RegWow64View::Wow6464),
+    )
+    .expect("idempotent repeat 64-bit delete"));
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&target, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        NativeHostRegProbe::Absent
+    );
 }

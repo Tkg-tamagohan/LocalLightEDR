@@ -133,10 +133,176 @@ pub struct UnregisterOutcome {
     pub aumid_removed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RegWow64View {
+    Wow6432,
+    Wow6464,
+}
+
+impl RegWow64View {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wow6432 => "wow64-32",
+            Self::Wow6464 => "wow64-64",
+        }
+    }
+
+    #[cfg(windows)]
+    fn access_flag(self) -> u32 {
+        match self {
+            Self::Wow6432 => win_reg_ops::KEY_WOW64_32KEY,
+            Self::Wow6464 => win_reg_ops::KEY_WOW64_64KEY,
+        }
+    }
+}
+
+/// Result of probing a Native Messaging Host registry key's default (`""`) value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeHostRegProbe {
+    Present(String),
+    EmptyString,
+    Absent,
+    InvalidType,
+    AccessError(String),
+}
+
+/// Selects the effective `HKLM` Native Messaging Host registry probe across WOW64 32-bit
+/// (`KEY_WOW64_32KEY`) and 64-bit (`KEY_WOW64_64KEY`) views following Chromium's precedence,
+/// returning both the effective probe and the view that produced it (`None` when both are `Absent`).
+///
+/// Chromium stops at the 32-bit view whenever `RegKey::ReadValue(nullptr, &path)` returns
+/// `ERROR_SUCCESS`, including when the `REG_SZ` value is empty (`EmptyString`). Only failed
+/// reads (`Absent`, `InvalidType`, or `AccessError`) fall back to the 64-bit view.
+pub fn select_effective_hklm_probe(
+    view32: NativeHostRegProbe,
+    view64: NativeHostRegProbe,
+) -> (NativeHostRegProbe, Option<RegWow64View>) {
+    match (&view32, &view64) {
+        (NativeHostRegProbe::Present(_) | NativeHostRegProbe::EmptyString, _) => {
+            (view32, Some(RegWow64View::Wow6432))
+        }
+        (_, NativeHostRegProbe::Present(_) | NativeHostRegProbe::EmptyString) => {
+            (view64, Some(RegWow64View::Wow6464))
+        }
+        (NativeHostRegProbe::Absent, NativeHostRegProbe::Absent) => {
+            (NativeHostRegProbe::Absent, None)
+        }
+        (NativeHostRegProbe::Absent, _) => (view64, Some(RegWow64View::Wow6464)),
+        (_, NativeHostRegProbe::Absent) => (view32, Some(RegWow64View::Wow6432)),
+        _ => (view32, Some(RegWow64View::Wow6432)),
+    }
+}
+
+/// Registry operations abstracted for explicit WOW64 view handling and non-privileged unit tests.
+pub trait RegistryViewOps {
+    fn ensure_default_sz(
+        &self,
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+        expected: &str,
+    ) -> Result<bool>;
+
+    fn probe_default_sz(
+        &self,
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+    ) -> NativeHostRegProbe;
+
+    fn delete_subkey_tree_idempotent(
+        &self,
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+    ) -> Result<bool>;
+
+    fn ensure_uri_registered(&self, target: &RegistryTarget, ui_exe: &Path) -> Result<bool>;
+
+    fn ensure_aumid_registered(&self, target: &RegistryTarget) -> Result<bool>;
+
+    fn read_uri_status(&self, target: &RegistryTarget) -> (bool, Option<String>);
+
+    fn read_aumid_status(&self, target: &RegistryTarget) -> (bool, Option<String>);
+
+    fn read_native_hosts_launch_directly_policy(
+        &self,
+        target: &RegistryTarget,
+        browser: BrowserKind,
+    ) -> Option<bool>;
+
+    fn any_existing_shares_identity(&self, candidate: &Path, existing_paths: &[String]) -> bool {
+        win_reg_ops::any_existing_shares_identity(candidate, existing_paths)
+    }
+
+    fn verify_local_manifest_for_removal(&self, path: &Path) -> bool {
+        win_reg_ops::verify_local_manifest_for_removal(path)
+    }
+}
+
+/// Production Windows Registry implementation of [`RegistryViewOps`].
+pub struct WinRegistryViewOps;
+
+impl RegistryViewOps for WinRegistryViewOps {
+    fn ensure_default_sz(
+        &self,
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+        expected: &str,
+    ) -> Result<bool> {
+        win_reg_ops::ensure_default_sz(target, subkey, view, expected)
+    }
+
+    fn probe_default_sz(
+        &self,
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+    ) -> NativeHostRegProbe {
+        win_reg_ops::probe_default_sz(target, subkey, view)
+    }
+
+    fn delete_subkey_tree_idempotent(
+        &self,
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+    ) -> Result<bool> {
+        win_reg_ops::delete_subkey_tree_idempotent(target, subkey, view)
+    }
+
+    fn ensure_uri_registered(&self, target: &RegistryTarget, ui_exe: &Path) -> Result<bool> {
+        win_reg_ops::ensure_uri_registered(target, ui_exe)
+    }
+
+    fn ensure_aumid_registered(&self, target: &RegistryTarget) -> Result<bool> {
+        win_reg_ops::ensure_aumid_registered(target)
+    }
+
+    fn read_uri_status(&self, target: &RegistryTarget) -> (bool, Option<String>) {
+        win_reg_ops::read_uri_status(target)
+    }
+
+    fn read_aumid_status(&self, target: &RegistryTarget) -> (bool, Option<String>) {
+        win_reg_ops::read_aumid_status(target)
+    }
+
+    fn read_native_hosts_launch_directly_policy(
+        &self,
+        target: &RegistryTarget,
+        browser: BrowserKind,
+    ) -> Option<bool> {
+        win_reg_ops::read_native_hosts_launch_directly_policy(target, browser)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BrowserStatusEntry {
     pub browser: BrowserKind,
     pub registry_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_view: Option<String>,
     pub registered: bool,
     pub manifest_path: Option<String>,
     pub manifest: Option<ManifestValidation>,
@@ -692,23 +858,64 @@ pub(crate) fn resolve_local_reparse_target(
 }
 
 #[cfg(windows)]
-mod win_reg_ops {
+pub(crate) mod win_reg_ops {
     use super::{
         build_drive_path, classify_dos_device_target, dos_device_targets_match_volume,
-        format_ledr_uri_command, is_local_drive_type, normalize_display_path,
-        parse_local_drive_path, parse_reparse_data_buffer, parse_volume_guid_path,
-        resolve_local_reparse_target, BrowserKind, DosDeviceTarget, ParsedReparseBuffer,
+        format_ledr_uri_command, is_local_drive_type, parse_local_drive_path,
+        parse_reparse_data_buffer, parse_volume_guid_path, resolve_local_reparse_target,
+        BrowserKind, DosDeviceTarget, NativeHostRegProbe, ParsedReparseBuffer, RegWow64View,
         RegistryTarget, ReparseTargetResolution, Scope, LEDR_AUMID_DISPLAY_NAME,
         LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
     };
-    use anyhow::{Context, Result};
+    use anyhow::Result;
     use std::ffi::c_void;
     use std::io::ErrorKind;
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::ptr;
-    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_SZ};
     use winreg::RegKey;
+
+    pub(crate) const KEY_WOW64_64KEY: u32 = 0x0100;
+    pub(crate) const KEY_WOW64_32KEY: u32 = 0x0200;
+    const HKEY_CURRENT_USER_RAW: isize = 0x8000_0001_u32 as i32 as isize;
+    const HKEY_LOCAL_MACHINE_RAW: isize = 0x8000_0002_u32 as i32 as isize;
+    const DELETE: u32 = 0x0001_0000;
+    const ERROR_SUCCESS: i32 = 0;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PATH_NOT_FOUND: i32 = 3;
+
+    #[link(name = "advapi32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            h_key: isize,
+            lp_sub_key: *const u16,
+            ul_options: u32,
+            sam_desired: u32,
+            phk_result: *mut isize,
+        ) -> i32;
+        fn RegDeleteTreeW(h_key: isize, lp_sub_key: *const u16) -> i32;
+        fn RegDeleteKeyExW(
+            h_key: isize,
+            lp_sub_key: *const u16,
+            sam_desired: u32,
+            reserved: u32,
+        ) -> i32;
+        fn RegCloseKey(h_key: isize) -> i32;
+    }
+
+    struct OwnedRegKey(isize);
+
+    impl Drop for OwnedRegKey {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                // SAFETY: `self.0` is an open HKEY acquired from `RegOpenKeyExW`.
+                unsafe {
+                    let _ = RegCloseKey(self.0);
+                }
+            }
+        }
+    }
 
     const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -1234,6 +1441,47 @@ mod win_reg_ops {
         }
     }
 
+    fn raw_hive(scope: Scope) -> isize {
+        match scope {
+            Scope::User => HKEY_CURRENT_USER_RAW,
+            Scope::Machine => HKEY_LOCAL_MACHINE_RAW,
+        }
+    }
+
+    fn format_key_display(
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+    ) -> String {
+        match view {
+            Some(v) => format!(r"{}\{subkey} [{}]", target.hive_name(), v.as_str()),
+            None => format!(r"{}\{subkey}", target.hive_name()),
+        }
+    }
+
+    fn to_utf16_nul(s: &str) -> Result<Vec<u16>> {
+        if s.is_empty() || s.contains('\0') {
+            anyhow::bail!("registry subkey must be non-empty and must not contain NUL bytes");
+        }
+        Ok(s.encode_utf16().chain(std::iter::once(0)).collect())
+    }
+
+    fn decode_reg_sz_bytes(bytes: &[u8]) -> Option<String> {
+        if !bytes.len().is_multiple_of(2) {
+            return None;
+        }
+        let mut units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        while units.last() == Some(&0) {
+            units.pop();
+        }
+        Some(String::from_utf16_lossy(&units))
+    }
+
     fn annotate_reg_err(scope: Scope, key_display: &str, err: std::io::Error) -> anyhow::Error {
         if scope == Scope::Machine && err.kind() == ErrorKind::PermissionDenied {
             anyhow::anyhow!(
@@ -1247,21 +1495,27 @@ mod win_reg_ops {
     pub(crate) fn ensure_default_sz(
         target: &RegistryTarget,
         subkey: &str,
+        view: Option<RegWow64View>,
         expected: &str,
     ) -> Result<bool> {
         let root = root_key(target.scope);
-        let key_display = format!(r"{}\{subkey}", target.hive_name());
+        let view_flag = view.map_or(0, RegWow64View::access_flag);
+        let key_display = format_key_display(target, subkey, view);
 
-        if let Ok(existing_key) = root.open_subkey_with_flags(subkey, KEY_READ) {
-            if let Ok(current) = existing_key.get_value::<String, _>("") {
-                if current == expected {
-                    return Ok(false);
+        if let Ok(existing_key) = root.open_subkey_with_flags(subkey, KEY_READ | view_flag) {
+            if let Ok(raw) = existing_key.get_raw_value("") {
+                if raw.vtype == REG_SZ {
+                    if let Some(current) = decode_reg_sz_bytes(&raw.bytes) {
+                        if current == expected {
+                            return Ok(false);
+                        }
+                    }
                 }
             }
         }
 
         let (key, _) = root
-            .create_subkey(subkey)
+            .create_subkey_with_flags(subkey, KEY_READ | KEY_WRITE | view_flag)
             .map_err(|err| annotate_reg_err(target.scope, &key_display, err))?;
         key.set_value("", &expected)
             .map_err(|err| annotate_reg_err(target.scope, &key_display, err))?;
@@ -1342,23 +1596,101 @@ mod win_reg_ops {
     pub(crate) fn delete_subkey_tree_idempotent(
         target: &RegistryTarget,
         subkey: &str,
+        view: Option<RegWow64View>,
     ) -> Result<bool> {
-        let root = root_key(target.scope);
-        let key_display = format!(r"{}\{subkey}", target.hive_name());
-        match root.delete_subkey_all(subkey) {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(annotate_reg_err(target.scope, &key_display, err)),
+        let key_display = format_key_display(target, subkey, view);
+        let Some(wow64_view) = view else {
+            let root = root_key(target.scope);
+            return match root.delete_subkey_all(subkey) {
+                Ok(()) => Ok(true),
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+                Err(err) => Err(annotate_reg_err(target.scope, &key_display, err)),
+            };
+        };
+
+        let hive = raw_hive(target.scope);
+        let subkey_w = to_utf16_nul(subkey)?;
+        let view_flag = wow64_view.access_flag();
+        let mut hkey: isize = 0;
+        // SAFETY: `subkey_w` is NUL-terminated UTF-16 and `hkey` is valid out-pointer storage.
+        let open_status = unsafe {
+            RegOpenKeyExW(
+                hive,
+                subkey_w.as_ptr(),
+                0,
+                KEY_READ | KEY_WRITE | DELETE | view_flag,
+                &mut hkey,
+            )
+        };
+        if open_status == ERROR_FILE_NOT_FOUND || open_status == ERROR_PATH_NOT_FOUND {
+            return Ok(false);
+        }
+        if open_status != ERROR_SUCCESS {
+            return Err(annotate_reg_err(
+                target.scope,
+                &key_display,
+                std::io::Error::from_raw_os_error(open_status),
+            ));
+        }
+
+        let opened = OwnedRegKey(hkey);
+        // SAFETY: `opened.0` is a valid open HKEY in `view_flag`; `NULL` deletes all child subkeys and values while leaving the key itself for `RegDeleteKeyExW`.
+        let tree_status = unsafe { RegDeleteTreeW(opened.0, ptr::null()) };
+        drop(opened);
+        if tree_status != ERROR_SUCCESS
+            && tree_status != ERROR_FILE_NOT_FOUND
+            && tree_status != ERROR_PATH_NOT_FOUND
+        {
+            return Err(annotate_reg_err(
+                target.scope,
+                &key_display,
+                std::io::Error::from_raw_os_error(tree_status),
+            ));
+        }
+
+        // SAFETY: `subkey_w` is NUL-terminated UTF-16 and all child subkeys have been removed; `view_flag` targets the explicit WOW64 view.
+        let del_status = unsafe { RegDeleteKeyExW(hive, subkey_w.as_ptr(), view_flag, 0) };
+        if del_status == ERROR_SUCCESS {
+            Ok(true)
+        } else if del_status == ERROR_FILE_NOT_FOUND || del_status == ERROR_PATH_NOT_FOUND {
+            Ok(false)
+        } else {
+            Err(annotate_reg_err(
+                target.scope,
+                &key_display,
+                std::io::Error::from_raw_os_error(del_status),
+            ))
         }
     }
 
-    pub(crate) fn read_default_sz(target: &RegistryTarget, subkey: &str) -> Result<Option<String>> {
+    pub(crate) fn probe_default_sz(
+        target: &RegistryTarget,
+        subkey: &str,
+        view: Option<RegWow64View>,
+    ) -> NativeHostRegProbe {
         let root = root_key(target.scope);
-        match root.open_subkey_with_flags(subkey, KEY_READ) {
-            Ok(key) => Ok(key.get_value::<String, _>("").ok()),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        let view_flag = view.map_or(0, RegWow64View::access_flag);
+        let key_display = format_key_display(target, subkey, view);
+        let key = match root.open_subkey_with_flags(subkey, KEY_READ | view_flag) {
+            Ok(k) => k,
+            Err(err) if err.kind() == ErrorKind::NotFound => return NativeHostRegProbe::Absent,
             Err(err) => {
-                Err(err).with_context(|| format!(r"failed to read {}\{subkey}", target.hive_name()))
+                return NativeHostRegProbe::AccessError(format!(
+                    "failed to read {key_display}: {err}"
+                ));
+            }
+        };
+
+        match key.get_raw_value("") {
+            Ok(raw) if raw.vtype == REG_SZ => match decode_reg_sz_bytes(&raw.bytes) {
+                Some(val) if val.trim().is_empty() => NativeHostRegProbe::EmptyString,
+                Some(val) => NativeHostRegProbe::Present(val.trim().to_string()),
+                None => NativeHostRegProbe::InvalidType,
+            },
+            Ok(_) => NativeHostRegProbe::InvalidType,
+            Err(err) if err.kind() == ErrorKind::NotFound => NativeHostRegProbe::InvalidType,
+            Err(err) => {
+                NativeHostRegProbe::AccessError(format!("failed to read {key_display}: {err}"))
             }
         }
     }
@@ -1401,57 +1733,45 @@ mod win_reg_ops {
         Some(val != 0)
     }
 
-    pub(crate) fn any_browser_references_manifest(
-        target: &RegistryTarget,
-        manifest_display_path: &str,
-    ) -> Result<bool> {
-        let mut remaining_existing = Vec::new();
-        for browser in [BrowserKind::Chrome, BrowserKind::Edge, BrowserKind::Brave] {
-            let subkey = target.browser_subkey(browser);
-            if let Some(existing) = read_default_sz(target, &subkey)? {
-                if existing.eq_ignore_ascii_case(manifest_display_path)
-                    || normalize_display_path(Path::new(&existing))
-                        .eq_ignore_ascii_case(manifest_display_path)
-                {
-                    return Ok(true);
-                }
-                remaining_existing.push(existing);
-            }
-        }
+    pub(crate) fn any_existing_shares_identity(
+        candidate: &Path,
+        remaining_existing: &[String],
+    ) -> bool {
         if remaining_existing.is_empty() {
-            return Ok(false);
+            return false;
         }
 
-        let candidate_id = match query_file_identity(Path::new(manifest_display_path)) {
+        let candidate_id = match query_file_identity(candidate) {
             FileIdentityLookup::Found(id) => id,
-            FileIdentityLookup::NotFound => return Ok(false),
-            FileIdentityLookup::NonLocal | FileIdentityLookup::Indeterminate => return Ok(true),
+            FileIdentityLookup::NotFound => return false,
+            FileIdentityLookup::NonLocal | FileIdentityLookup::Indeterminate => return true,
         };
 
-        for existing in &remaining_existing {
+        for existing in remaining_existing {
             match query_file_identity(Path::new(existing)) {
                 FileIdentityLookup::Found(existing_id) if existing_id == candidate_id => {
-                    return Ok(true);
+                    return true;
                 }
                 FileIdentityLookup::Found(_)
                 | FileIdentityLookup::NotFound
                 | FileIdentityLookup::NonLocal => {}
-                FileIdentityLookup::Indeterminate => return Ok(true),
+                FileIdentityLookup::Indeterminate => return true,
             }
         }
-        Ok(false)
+        false
     }
 }
 
 #[cfg(not(windows))]
-mod win_reg_ops {
-    use super::{BrowserKind, RegistryTarget};
+pub(crate) mod win_reg_ops {
+    use super::{BrowserKind, NativeHostRegProbe, RegWow64View, RegistryTarget};
     use anyhow::{bail, Result};
     use std::path::Path;
 
     pub(crate) fn ensure_default_sz(
         _target: &RegistryTarget,
         _subkey: &str,
+        _view: Option<RegWow64View>,
         _expected: &str,
     ) -> Result<bool> {
         bail!("Windows Registry setup is only supported on Windows")
@@ -1471,15 +1791,17 @@ mod win_reg_ops {
     pub(crate) fn delete_subkey_tree_idempotent(
         _target: &RegistryTarget,
         _subkey: &str,
+        _view: Option<RegWow64View>,
     ) -> Result<bool> {
         bail!("Windows Registry unregister is only supported on Windows")
     }
 
-    pub(crate) fn read_default_sz(
+    pub(crate) fn probe_default_sz(
         _target: &RegistryTarget,
         _subkey: &str,
-    ) -> Result<Option<String>> {
-        Ok(None)
+        _view: Option<RegWow64View>,
+    ) -> NativeHostRegProbe {
+        NativeHostRegProbe::Absent
     }
 
     pub(crate) fn read_uri_status(_target: &RegistryTarget) -> (bool, Option<String>) {
@@ -1497,16 +1819,55 @@ mod win_reg_ops {
         None
     }
 
-    pub(crate) fn any_browser_references_manifest(
-        _target: &RegistryTarget,
-        _manifest_display_path: &str,
-    ) -> Result<bool> {
-        Ok(false)
+    pub(crate) fn any_existing_shares_identity(
+        _candidate: &Path,
+        _remaining_existing: &[String],
+    ) -> bool {
+        false
     }
 
     pub(crate) fn verify_local_manifest_for_removal(_path: &Path) -> bool {
         true
     }
+}
+
+pub(crate) fn any_browser_references_manifest_with<O: RegistryViewOps + ?Sized>(
+    ops: &O,
+    target: &RegistryTarget,
+    manifest_display_path: &str,
+) -> Result<bool> {
+    let views: &[Option<RegWow64View>] = if target.scope == Scope::Machine {
+        &[Some(RegWow64View::Wow6432), Some(RegWow64View::Wow6464)]
+    } else {
+        &[None]
+    };
+
+    let mut remaining_existing = Vec::new();
+    for browser in [BrowserKind::Chrome, BrowserKind::Edge, BrowserKind::Brave] {
+        let subkey = target.browser_subkey(browser);
+        for &view in views {
+            match ops.probe_default_sz(target, &subkey, view) {
+                NativeHostRegProbe::Present(existing) => {
+                    if existing.eq_ignore_ascii_case(manifest_display_path)
+                        || normalize_display_path(Path::new(&existing))
+                            .eq_ignore_ascii_case(manifest_display_path)
+                    {
+                        return Ok(true);
+                    }
+                    remaining_existing.push(existing);
+                }
+                NativeHostRegProbe::Absent
+                | NativeHostRegProbe::EmptyString
+                | NativeHostRegProbe::InvalidType => {}
+                NativeHostRegProbe::AccessError(err) => bail!("{err}"),
+            }
+        }
+    }
+    if remaining_existing.is_empty() {
+        return Ok(false);
+    }
+
+    Ok(ops.any_existing_shares_identity(Path::new(manifest_display_path), &remaining_existing))
 }
 
 /// Runs `ledr-bridge-nm setup` against the standard `HKCU` / `HKLM` registry keys.
@@ -1516,6 +1877,15 @@ pub fn run_setup(args: &SetupArgs) -> Result<SetupOutcome> {
 
 /// Runs `setup` against an explicit [`RegistryTarget`] (allowing isolated unit-test prefixes).
 pub fn run_setup_with(args: &SetupArgs, target: &RegistryTarget) -> Result<SetupOutcome> {
+    run_setup_with_ops(args, target, &WinRegistryViewOps)
+}
+
+/// Runs `setup` against an explicit [`RegistryTarget`] and [`RegistryViewOps`] backend.
+pub fn run_setup_with_ops<O: RegistryViewOps + ?Sized>(
+    args: &SetupArgs,
+    target: &RegistryTarget,
+    ops: &O,
+) -> Result<SetupOutcome> {
     if args.browsers.is_empty() {
         bail!("at least one browser must be specified");
     }
@@ -1535,7 +1905,26 @@ pub fn run_setup_with(args: &SetupArgs, target: &RegistryTarget) -> Result<Setup
         let manifest_written = write_manifest_atomic(&manifest_path, &manifest)?;
         any_manifest_written |= manifest_written;
         let subkey = target.browser_subkey(browser);
-        let updated = win_reg_ops::ensure_default_sz(target, &subkey, &manifest_display)?;
+        let updated = match target.scope {
+            Scope::User => ops.ensure_default_sz(target, &subkey, None, &manifest_display)?,
+            Scope::Machine => {
+                // Option A1: write identical manifest path to both 32-bit and 64-bit HKLM views
+                // so stale/empty 32-bit shadows are repaired idempotently.
+                let updated_32 = ops.ensure_default_sz(
+                    target,
+                    &subkey,
+                    Some(RegWow64View::Wow6432),
+                    &manifest_display,
+                )?;
+                let updated_64 = ops.ensure_default_sz(
+                    target,
+                    &subkey,
+                    Some(RegWow64View::Wow6464),
+                    &manifest_display,
+                )?;
+                updated_32 || updated_64
+            }
+        };
         browser_outcomes.push(BrowserRegistrationOutcome {
             browser,
             registry_key: format!(r"{}\{subkey}", target.hive_name()),
@@ -1548,8 +1937,8 @@ pub fn run_setup_with(args: &SetupArgs, target: &RegistryTarget) -> Result<Setup
     let (uri_registered, uri_updated, aumid_updated) = if args.skip_uri {
         (false, false, false)
     } else {
-        let u_upd = win_reg_ops::ensure_uri_registered(target, &ui_exe)?;
-        let a_upd = win_reg_ops::ensure_aumid_registered(target)?;
+        let u_upd = ops.ensure_uri_registered(target, &ui_exe)?;
+        let a_upd = ops.ensure_aumid_registered(target)?;
         (true, u_upd, a_upd)
     };
 
@@ -1589,6 +1978,16 @@ pub fn run_unregister_with(
     target: &RegistryTarget,
     peer_target: Option<&RegistryTarget>,
 ) -> Result<UnregisterOutcome> {
+    run_unregister_with_ops(args, target, peer_target, &WinRegistryViewOps)
+}
+
+/// Runs `unregister` against an explicit [`RegistryTarget`], optional `peer_target`, and [`RegistryViewOps`] backend.
+pub fn run_unregister_with_ops<O: RegistryViewOps + ?Sized>(
+    args: &UnregisterArgs,
+    target: &RegistryTarget,
+    peer_target: Option<&RegistryTarget>,
+    ops: &O,
+) -> Result<UnregisterOutcome> {
     let manifest_dir = resolve_manifest_dir(args.scope, args.manifest_dir.as_deref())?;
     let manifest_dir_display = normalize_display_path(&manifest_dir);
 
@@ -1596,13 +1995,47 @@ pub fn run_unregister_with(
     let mut candidate_paths = BTreeSet::new();
     for &browser in &args.browsers {
         let subkey = target.browser_subkey(browser);
-        let reg_val = win_reg_ops::read_default_sz(target, &subkey)?;
-        if let Some(ref raw_path) = reg_val {
-            let reg_path = PathBuf::from(raw_path);
-            if is_localedr_manifest_filename(&reg_path) {
-                candidate_paths.insert(reg_path);
+        let reg_val = match target.scope {
+            Scope::User => {
+                let probe = ops.probe_default_sz(target, &subkey, None);
+                if let NativeHostRegProbe::AccessError(err) = probe {
+                    bail!("{err}");
+                }
+                if let NativeHostRegProbe::Present(ref raw_path) = probe {
+                    let reg_path = PathBuf::from(raw_path);
+                    if is_localedr_manifest_filename(&reg_path) {
+                        candidate_paths.insert(reg_path);
+                    }
+                    Some(raw_path.clone())
+                } else {
+                    None
+                }
             }
-        }
+            Scope::Machine => {
+                let probe32 = ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6432));
+                let probe64 = ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6464));
+                if let NativeHostRegProbe::AccessError(err) = &probe32 {
+                    bail!("{err}");
+                }
+                if let NativeHostRegProbe::AccessError(err) = &probe64 {
+                    bail!("{err}");
+                }
+                for probe in [&probe32, &probe64] {
+                    if let NativeHostRegProbe::Present(ref raw_path) = probe {
+                        let reg_path = PathBuf::from(raw_path);
+                        if is_localedr_manifest_filename(&reg_path) {
+                            candidate_paths.insert(reg_path);
+                        }
+                    }
+                }
+                match (&probe32, &probe64) {
+                    (NativeHostRegProbe::Present(p), _) | (_, NativeHostRegProbe::Present(p)) => {
+                        Some(p.clone())
+                    }
+                    _ => None,
+                }
+            }
+        };
         let default_browser_path = manifest_dir.join(manifest_filename_for(args.scope, browser));
         candidate_paths.insert(default_browser_path.clone());
         per_browser_candidates.push((browser, reg_val, default_browser_path));
@@ -1611,7 +2044,22 @@ pub fn run_unregister_with(
     let mut browser_outcomes = Vec::with_capacity(args.browsers.len());
     for (browser, reg_val, _) in &per_browser_candidates {
         let subkey = target.browser_subkey(*browser);
-        let removed = win_reg_ops::delete_subkey_tree_idempotent(target, &subkey)?;
+        let removed = match target.scope {
+            Scope::User => ops.delete_subkey_tree_idempotent(target, &subkey, None)?,
+            Scope::Machine => {
+                let rem32 = ops.delete_subkey_tree_idempotent(
+                    target,
+                    &subkey,
+                    Some(RegWow64View::Wow6432),
+                )?;
+                let rem64 = ops.delete_subkey_tree_idempotent(
+                    target,
+                    &subkey,
+                    Some(RegWow64View::Wow6464),
+                )?;
+                rem32 || rem64
+            }
+        };
         browser_outcomes.push(BrowserUnregisterOutcome {
             browser: *browser,
             registry_key: format!(r"{}\{subkey}", target.hive_name()),
@@ -1624,8 +2072,8 @@ pub fn run_unregister_with(
     let (uri_removed, aumid_removed) = if args.keep_uri {
         (false, false)
     } else {
-        let u_rem = win_reg_ops::delete_subkey_tree_idempotent(target, &target.uri_subkey())?;
-        let a_rem = win_reg_ops::delete_subkey_tree_idempotent(target, &target.aumid_subkey())?;
+        let u_rem = ops.delete_subkey_tree_idempotent(target, &target.uri_subkey(), None)?;
+        let a_rem = ops.delete_subkey_tree_idempotent(target, &target.aumid_subkey(), None)?;
         (u_rem, a_rem)
     };
 
@@ -1633,17 +2081,17 @@ pub fn run_unregister_with(
     for candidate in &candidate_paths {
         let candidate_display = normalize_display_path(candidate);
         let still_in_self =
-            win_reg_ops::any_browser_references_manifest(target, &candidate_display)
-                .unwrap_or(true);
+            any_browser_references_manifest_with(ops, target, &candidate_display).unwrap_or(true);
         let still_in_peer = match peer_target {
-            Some(peer) => win_reg_ops::any_browser_references_manifest(peer, &candidate_display)
-                .unwrap_or(true),
+            Some(peer) => {
+                any_browser_references_manifest_with(ops, peer, &candidate_display).unwrap_or(true)
+            }
             None => false,
         };
         if still_in_self || still_in_peer {
             continue;
         }
-        if !win_reg_ops::verify_local_manifest_for_removal(candidate) {
+        if !ops.verify_local_manifest_for_removal(candidate) {
             continue;
         }
         match std::fs::remove_file(candidate) {
@@ -1703,6 +2151,28 @@ pub fn run_status_with(
     targets: &[RegistryTarget],
     manifest_dir_override: Option<&Path>,
 ) -> Result<StatusReport> {
+    run_status_with_ops(args, targets, manifest_dir_override, &WinRegistryViewOps)
+}
+
+fn synthetic_invalid_manifest(error: String) -> ManifestValidation {
+    ManifestValidation {
+        exists: false,
+        valid: false,
+        bridge_exe_exists: false,
+        extension_id_matched: false,
+        allowed_origins: Vec::new(),
+        path: String::new(),
+        error: Some(error),
+    }
+}
+
+/// Runs `status` against explicit [`RegistryTarget`] entries and a [`RegistryViewOps`] backend.
+pub fn run_status_with_ops<O: RegistryViewOps + ?Sized>(
+    args: &StatusArgs,
+    targets: &[RegistryTarget],
+    manifest_dir_override: Option<&Path>,
+    ops: &O,
+) -> Result<StatusReport> {
     let expected_extension_id = args.extension_id.clone();
     let mut scopes = Vec::with_capacity(targets.len());
 
@@ -1714,24 +2184,55 @@ pub fn run_status_with(
         let mut browsers = Vec::with_capacity(3);
         for browser in [BrowserKind::Chrome, BrowserKind::Edge, BrowserKind::Brave] {
             let subkey = target.browser_subkey(browser);
-            let reg_val = win_reg_ops::read_default_sz(target, &subkey)?;
-            let manifest = reg_val
-                .as_deref()
-                .map(|p| validate_manifest_file(Path::new(p), &expected_extension_id));
+            let (probe, effective_view) = match target.scope {
+                Scope::User => (ops.probe_default_sz(target, &subkey, None), None),
+                Scope::Machine => {
+                    let view32 =
+                        ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6432));
+                    let view64 =
+                        ops.probe_default_sz(target, &subkey, Some(RegWow64View::Wow6464));
+                    select_effective_hklm_probe(view32, view64)
+                }
+            };
+            let (registered, manifest_path, manifest) = match probe {
+                NativeHostRegProbe::Absent => (false, None, None),
+                NativeHostRegProbe::Present(path) => {
+                    let validation = validate_manifest_file(Path::new(&path), &expected_extension_id);
+                    (true, Some(path), Some(validation))
+                }
+                NativeHostRegProbe::EmptyString => (
+                    true,
+                    None,
+                    Some(synthetic_invalid_manifest(
+                        "registry default value is empty REG_SZ".to_string(),
+                    )),
+                ),
+                NativeHostRegProbe::InvalidType => (
+                    true,
+                    None,
+                    Some(synthetic_invalid_manifest(
+                        "registry default value is missing or not REG_SZ".to_string(),
+                    )),
+                ),
+                NativeHostRegProbe::AccessError(err) => {
+                    (true, None, Some(synthetic_invalid_manifest(err)))
+                }
+            };
             let native_hosts_launch_directly =
-                win_reg_ops::read_native_hosts_launch_directly_policy(target, browser);
+                ops.read_native_hosts_launch_directly_policy(target, browser);
             browsers.push(BrowserStatusEntry {
                 browser,
                 registry_key: format!(r"{}\{subkey}", target.hive_name()),
-                registered: reg_val.is_some(),
-                manifest_path: reg_val,
+                registry_view: effective_view.map(|v| v.as_str().to_string()),
+                registered,
+                manifest_path,
                 manifest,
                 native_hosts_launch_directly,
             });
         }
 
-        let (uri_registered, uri_command) = win_reg_ops::read_uri_status(target);
-        let (aumid_registered, aumid_display_name) = win_reg_ops::read_aumid_status(target);
+        let (uri_registered, uri_command) = ops.read_uri_status(target);
+        let (aumid_registered, aumid_display_name) = ops.read_aumid_status(target);
 
         scopes.push(ScopeStatusReport {
             scope: target.scope,
@@ -1883,6 +2384,10 @@ pub fn format_status_text(report: &StatusReport) -> String {
             let state = match (&b.registered, &b.manifest) {
                 (false, _) => "not registered".to_string(),
                 (true, Some(m)) if m.valid => format!("registered & valid ({})", m.path),
+                (true, Some(m)) if m.path.is_empty() => format!(
+                    "registered but INVALID: {}",
+                    m.error.as_deref().unwrap_or("unknown error")
+                ),
                 (true, Some(m)) => format!(
                     "registered but INVALID ({}): {}",
                     m.path,
@@ -1890,6 +2395,11 @@ pub fn format_status_text(report: &StatusReport) -> String {
                 ),
                 (true, None) => "registered".to_string(),
             };
+            let view_note = b
+                .registry_view
+                .as_deref()
+                .map(|v| format!(" [{v}]"))
+                .unwrap_or_default();
             let policy_note = match b.native_hosts_launch_directly {
                 Some(true) => " [policy NativeHostsExecutablesLaunchDirectly=1 (direct)]",
                 Some(false) => {
@@ -1897,7 +2407,10 @@ pub fn format_status_text(report: &StatusReport) -> String {
                 }
                 None => "",
             };
-            lines.push(format!("  {}: {state}{policy_note}", b.browser.display_name()));
+            lines.push(format!(
+                "  {}: {state}{view_note}{policy_note}",
+                b.browser.display_name()
+            ));
         }
         lines.push(format!(
             "  ledr:// URI: {}",

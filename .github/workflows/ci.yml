@@ -103,6 +103,7 @@ jobs:
                           and not path.startswith(("apps/ledr-ui/ui/", "apps/ledr-ui/js-tests/"))
                       )
                       or path.startswith("rules/")
+                      or path == "packaging/update-public-keys.json"
                       or path in {"rust-toolchain", "rust-toolchain.toml"}
                       or path.startswith(".cargo/")
                   ):
@@ -112,9 +113,25 @@ jobs:
                       path.startswith("apps/ledr-ui/")
                       or path.startswith("extensions/")
                       or path.startswith("rules/")
+                      or path.startswith("packaging/")
+                      or path.startswith("scripts/")
                       or path.startswith(".github/")
                       or pathlib.Path(path).suffix.lower()
-                      in {".rs", ".js", ".mjs", ".json", ".html", ".css", ".md", ".yml", ".yaml", ".toml"}
+                      in {
+                          ".rs",
+                          ".js",
+                          ".mjs",
+                          ".json",
+                          ".html",
+                          ".css",
+                          ".md",
+                          ".yml",
+                          ".yaml",
+                          ".toml",
+                          ".py",
+                          ".ps1",
+                          ".nsi",
+                      }
                   ):
                       web = True
 
@@ -266,6 +283,7 @@ jobs:
           required_json_files = [
               "rules/lotl_core.json",
               "rules/default_allowlist.json",
+              "packaging/update-public-keys.json",
               "apps/ledr-ui/tauri.conf.json",
               "apps/ledr-ui/capabilities/default.json",
               "extensions/ledr-chrome-mv3/manifest.json",
@@ -314,7 +332,21 @@ jobs:
               if not p.is_file() or p.stat().st_size == 0 or not p.read_text(encoding="utf-8").strip():
                   errors.append(f"Required UI file missing or empty: {rel}")
 
-          text_exts = {".rs", ".toml", ".json", ".js", ".mjs", ".html", ".css", ".md", ".yml", ".yaml"}
+          text_exts = {
+              ".rs",
+              ".toml",
+              ".json",
+              ".js",
+              ".mjs",
+              ".html",
+              ".css",
+              ".md",
+              ".yml",
+              ".yaml",
+              ".py",
+              ".ps1",
+              ".nsi",
+          }
           conflict_re = re.compile(r"^(?:<{7}(?: |$)|={7}$|>{7}(?: |$))")
 
           for rel in tracked_files:
@@ -340,6 +372,22 @@ jobs:
 
           print(f"Static checks passed ({len(json_files)} JSON files, UI assets, UTF-8 & conflict marker scan).")
           EOF
+      - name: Compile and test Python release and invariant scripts
+        shell: bash
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: |
+          shopt -s nullglob
+          py_files=(scripts/*.py)
+          if [ "${#py_files[@]}" -eq 0 ]; then
+            echo "No Python scripts matched scripts/*.py" >&2
+            exit 1
+          fi
+          python3 -m py_compile "${py_files[@]}"
+          python3 -m unittest scripts/test_release_scripts.py
+          python3 -m unittest scripts/test_check_invariants.py
+          python3 scripts/release_verify.py preflight
 
   rust-windows:
     runs-on: windows-latest

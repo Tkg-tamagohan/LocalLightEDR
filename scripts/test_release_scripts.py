@@ -1088,7 +1088,7 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
             #    PSModulePath sanitization (for Microsoft.PowerShell.Management cmdlets such as
             #    Join-Path/Test-Path/Get-Item before Assert-NoReparsePointComponent) and
             #    Assert-AdminOrSystemOwnerIfExists (Get-Acl on existing_install), failing cleanly
-            #    at missing source binary or owner SID rather than module autoload.
+            #    at the single error expected for existing_install's owner SID rather than module autoload.
             fake_mgmt_dir = fake_sec_dir.parent / "Microsoft.PowerShell.Management"
             fake_mgmt_dir.mkdir(parents=True)
             (fake_mgmt_dir / "Microsoft.PowerShell.Management.psd1").write_text(
@@ -1123,6 +1123,36 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
             empty_src.mkdir()
             existing_install = tmp_path / "existing-install"
             existing_install.mkdir()
+            existing_install_ps = str(existing_install).replace("'", "''")
+            owner_res = subprocess.run(
+                [
+                    ps51,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    (
+                        "Set-StrictMode -Version Latest; "
+                        "$ErrorActionPreference = 'Stop'; "
+                        f"(Get-Acl -LiteralPath '{existing_install_ps}').GetOwner([System.Security.Principal.SecurityIdentifier]).Value"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=_sanitize_ps51_env(),
+                check=False,
+            )
+            self.assertEqual(
+                owner_res.returncode,
+                0,
+                f"Failed to query owner SID for {existing_install}:\nSTDOUT:\n{owner_res.stdout}\nSTDERR:\n{owner_res.stderr}",
+            )
+            owner_sid = owner_res.stdout.strip()
+            self.assertTrue(
+                owner_sid.startswith("S-1-5-"),
+                f"Unexpected owner SID {owner_sid!r} for {existing_install}:\nSTDOUT:\n{owner_res.stdout}\nSTDERR:\n{owner_res.stderr}",
+            )
             unused_data = tmp_path / "unused-data"
             ep_res = subprocess.run(
                 [
@@ -1145,13 +1175,17 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                 env=polluted_env,
                 check=False,
             )
-            self.assertNotEqual(ep_res.returncode, 0)
-            self.assertNotIn("CouldNotAutoloadMatchingModule", ep_res.stderr)
-            self.assertTrue(
-                ("Missing required source binary" in ep_res.stderr)
-                or ("Unsafe owner SID" in ep_res.stderr),
-                f"Unexpected install.ps1 stderr under polluted PSModulePath:\nSTDOUT:\n{ep_res.stdout}\nSTDERR:\n{ep_res.stderr}",
+            diag = (
+                f"owner_sid={owner_sid}\nSTDOUT:\n{ep_res.stdout}\nSTDERR:\n{ep_res.stderr}"
             )
+            self.assertNotEqual(ep_res.returncode, 0, diag)
+            self.assertNotIn("CouldNotAutoloadMatchingModule", ep_res.stderr, diag)
+            if owner_sid in ("S-1-5-32-544", "S-1-5-18"):
+                self.assertIn("Missing required source binary", ep_res.stderr, diag)
+                self.assertNotIn("Unsafe owner SID", ep_res.stderr, diag)
+            else:
+                self.assertIn(f"Unsafe owner SID '{owner_sid}'", ep_res.stderr, diag)
+                self.assertNotIn("Missing required source binary", ep_res.stderr, diag)
 
 
 if __name__ == "__main__":

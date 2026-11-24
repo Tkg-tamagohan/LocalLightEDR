@@ -147,6 +147,7 @@ git push origin v0.1.0
 | :--- | :--- | :--- | :--- |
 | `C:\Program Files\LocalEDR\`（4 バイナリ、`uninstall.ps1`、`uninstall.exe`） | 削除 | 削除 | 終了待機上限は UI 10 秒、SCM 15 秒、ロック再試行 5 秒です。 |
 | Windows Service `LocalEDR`（`sc.exe delete LocalEDR`） | 削除 | 削除 | 停止後にサービス登録を削除します。 |
+| 各ユーザーのおとりファイル（`%USERPROFILE%\{Documents,Desktop,Pictures}\!00_LocalEDR_Canary_DoNotEdit.docx`） | 削除 | 削除 | SQLite `honeypot_files` 追跡記録と各ユーザープロファイル一覧に基づき、サービス停止後に `ledr-daemon.exe --cleanup-honeypots` がリパースポイントおよびハードリンクを拒否しつつハンドル上で自動削除します（`L-06`）。 |
 | `HKLM` Native Messaging（`KEY_WOW64_32KEY` と `KEY_WOW64_64KEY`）、`ledr://`、AUMID | 削除 | 削除 | `ledr-bridge-nm.exe unregister --scope machine` で解除します。 |
 | ARP 登録（`Uninstall\LocalEDR`） | 削除 | 削除 | 64 ビットレジストリビューから削除します。 |
 | `C:\ProgramData\LocalEDR\localedr.db`（`-wal`、`-shm`） | 保全 | 削除 | 再インストール時の履歴引き継ぎのため既定で残します。 |
@@ -155,7 +156,7 @@ git push origin v0.1.0
 | `C:\ProgramData\LocalEDR\logs\installer.log` と `logs\` | 保全 | 削除 | `/PURGE_DATA` 時はログハンドルを閉じてから削除します。 |
 | `C:\ProgramData\LocalEDR\native-messaging\` | 参照なしマニフェストのみ削除（ディレクトリは保全） | 削除 | `HKCU` 参照が残る場合を除き未使用 JSON を削除します。 |
 | `C:\ProgramData\LocalEDR\updates\verified\` | 保全 | 削除 | 更新適用完了後は昇格インストーラ側で一時ディレクトリを削除します。 |
-| ユーザー別領域（`%LOCALAPPDATA%\LocalEDR\`、`HKCU` 登録、各ユーザーのおとりファイル） | 保全 | 保全（対象外） | マシン単位のアンインストール範囲外のため、必要時は各ユーザー環境で `ledr-bridge-nm.exe unregister --scope user` 等を実行してください。 |
+| ユーザー別領域（`%LOCALAPPDATA%\LocalEDR\`、`HKCU` 登録） | 保全 | 保全（対象外） | マシン単位のアンインストール範囲外のため、必要時は各ユーザー環境で `ledr-bridge-nm.exe unregister --scope user` 等を実行してください。 |
 
 ### Native Messaging の検証表示に関する補足
 

@@ -267,6 +267,56 @@ function Assert-NoUnresolvedSuspendedAlerts {
     throw "Unresolved suspended process check failed (exit $checkRc) for '$DbPath'; aborting uninstall to prevent orphaned suspended processes. Detail: $detail"
 }
 
+function Invoke-HoneypotCleanup {
+    param(
+        [Parameter(Mandatory = $true)][string]$DaemonExePath,
+        [Parameter(Mandatory = $true)][string]$DbPath,
+        [int]$TimeoutSeconds = 5
+    )
+    if (-not (Test-Path -LiteralPath $DaemonExePath -PathType Leaf)) {
+        Write-UninstallLog -Level 'WARN' -Message "Daemon binary not found at '$DaemonExePath'; skipping honeypot cleanup."
+        return
+    }
+    Assert-NoReparsePointComponent -TargetPath $DaemonExePath -ExpectDirectoryIfExists $false
+    if (Test-Path -LiteralPath $DbPath -PathType Leaf) {
+        Assert-NoReparsePointComponent -TargetPath $DbPath -ExpectDirectoryIfExists $false
+    }
+
+    $deadline = (Get-Date).AddSeconds([Math]::Max(0, $TimeoutSeconds))
+    while ($true) {
+        $cleanupRc = -1
+        $cleanupOut = @()
+        $prevEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $cleanupOut = & $DaemonExePath '--cleanup-honeypots' '--db' $DbPath 2>&1
+            $cleanupRc = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $prevEap
+        }
+
+        $detail = (($cleanupOut | ForEach-Object { $_.ToString() }) -join "`n").Trim()
+        if ($cleanupRc -eq 0) {
+            Write-UninstallLog -Level 'INFO' -Message "Honeypot cleanup completed: $detail"
+            return
+        }
+        if ($cleanupRc -eq 4) {
+            $hasRetryableLock = $detail -match '(?i)(sharing violation|used by another process|being used by another|access is denied|denied|locked|os error 32|os error 33|os error 5)'
+            $onlyGuardRejection = ($detail -match '(?i)(reparse point|hardlinked target)') -and (-not $hasRetryableLock)
+            if ($hasRetryableLock -and (-not $onlyGuardRejection) -and ((Get-Date) -lt $deadline)) {
+                Start-Sleep -Milliseconds 250
+                continue
+            }
+            Write-UninstallLog -Level 'WARN' -Message "Honeypot cleanup reported partial failure (exit 4); continuing uninstall: $detail"
+            return
+        }
+
+        Write-UninstallLog -Level 'WARN' -Message "Honeypot cleanup failed (exit $cleanupRc); continuing uninstall: $detail"
+        return
+    }
+}
+
 function Remove-ArpRegistryKey64 {
     $baseKey = $null
     $uninstallKey = $null
@@ -322,6 +372,9 @@ try {
 
     # 2. Wait up to 15s for LocalEDR service stop
     Wait-ForServiceStopped -Name $script:ServiceName -TimeoutSeconds $ServiceWaitSeconds
+
+    # 2.5. Remove tracked and discovered honeypot canary files after service stop (L-06)
+    Invoke-HoneypotCleanup -DaemonExePath $daemonExe -DbPath $dbPath -TimeoutSeconds $LockRetrySeconds
 
     # 3. Unregister machine-scope Native Messaging & URI handlers (5s lock retry)
     $bridgeExe = Join-Path $normInstallDir 'ledr-bridge-nm.exe'

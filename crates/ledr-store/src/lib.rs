@@ -3,6 +3,7 @@
 mod alerts;
 mod batch;
 mod diagnostics;
+mod honeypots;
 mod maintenance;
 mod queries;
 mod rules;

@@ -1,8 +1,9 @@
 //! Layer 2 LocalEDR resident core daemon (`--foreground`, `--service`, and `--service-strict` modes).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::future::Future;
+use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -15,15 +16,16 @@ use ledr_daemon::{
     DEFAULT_MAX_CONCURRENT_IPC_CLIENTS,
 };
 use ledr_proto::{
-    AlertRecord, AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, IPC_PIPE_NAME,
-    ProcessIdentity, PROGRAM_DATA_DIR, SensorBackend,
+    AlertRecord, AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH, HONEYPOT_DEFAULT_FILENAME,
+    IPC_PIPE_NAME, ProcessIdentity, PROGRAM_DATA_DIR, SensorBackend,
 };
 use ledr_rules::{
     compute_file_sha256_hex, discover_default_prerestricted_interpreters, load_rules_dir,
     LoadedRulesDir, DEFAULT_NRD_FEED_URLS,
 };
 use ledr_sensor_win::defense::{
-    process_liveness, HoneypotManager, ProcessLiveness, WindowsDefenseController,
+    process_liveness, remove_verified_honeypot_file, HoneypotManager, ProcessLiveness,
+    WindowsDefenseController,
 };
 use ledr_sensor_win::etw::{
     try_capture_running_processes, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
@@ -38,6 +40,7 @@ struct CliArgs {
     foreground: bool,
     service: bool,
     check_unresolved_suspended: bool,
+    cleanup_honeypots: bool,
     dev_bypass_auth: bool,
     disable_nrd_refresh: bool,
     disable_outbound_firewall: bool,
@@ -64,6 +67,7 @@ impl Default for CliArgs {
             foreground: true,
             service: false,
             check_unresolved_suspended: false,
+            cleanup_honeypots: false,
             dev_bypass_auth: false,
             disable_nrd_refresh: false,
             disable_outbound_firewall: false,
@@ -115,6 +119,7 @@ where
                 parsed.foreground = false;
             }
             "--check-unresolved-suspended" => parsed.check_unresolved_suspended = true,
+            "--cleanup-honeypots" => parsed.cleanup_honeypots = true,
             "--dev-bypass-auth" => parsed.dev_bypass_auth = true,
             "--disable-nrd-refresh" => parsed.disable_nrd_refresh = true,
             "--disable-outbound-firewall" => parsed.disable_outbound_firewall = true,
@@ -254,6 +259,13 @@ where
     if parsed.check_unresolved_suspended && (saw_foreground || saw_service || saw_service_strict) {
         anyhow::bail!(
             "--check-unresolved-suspended cannot be combined with --foreground, --service, or --service-strict"
+        );
+    }
+    if parsed.cleanup_honeypots
+        && (saw_foreground || saw_service || saw_service_strict || parsed.check_unresolved_suspended)
+    {
+        anyhow::bail!(
+            "--cleanup-honeypots cannot be combined with --foreground, --service, --service-strict, or --check-unresolved-suspended"
         );
     }
 
@@ -447,6 +459,8 @@ fn run_service_mode(cli: CliArgs) -> Result<(), ServiceRunError> {
 }
 
 const UNRESOLVED_SUSPENDED_EXIT_CODE: u8 = 3;
+const HONEYPOT_CLEANUP_PARTIAL_EXIT_CODE: u8 = 4;
+const FILE_ATTRIBUTE_REPARSE_POINT_MASK: u32 = 0x0000_0400;
 const HONEYPOT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 fn default_daemon_db_path() -> PathBuf {
@@ -797,6 +811,218 @@ fn check_unresolved_suspended_in_db_with_probe(
     UNRESOLVED_SUSPENDED_EXIT_CODE
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HoneypotCleanupOutcome {
+    removed: usize,
+    already_absent: usize,
+    failed: usize,
+    db_records_removed: usize,
+    failed_details: Vec<String>,
+}
+
+fn normalize_honeypot_dedup_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+fn push_unique_honeypot_path(
+    seen: &mut HashSet<String>,
+    out: &mut Vec<PathBuf>,
+    path: PathBuf,
+) {
+    let key = normalize_honeypot_dedup_key(&path);
+    if !key.is_empty() && seen.insert(key) {
+        out.push(path);
+    }
+}
+
+fn collect_fallback_honeypot_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = HoneypotManager::for_service()
+        .roots()
+        .iter()
+        .map(|root| root.join(HONEYPOT_DEFAULT_FILENAME))
+        .collect();
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let lower = profile.to_string_lossy().to_ascii_lowercase();
+        if !lower.contains(r"\system32\config\systemprofile")
+            && !lower.contains(r"\serviceprofiles\localservice")
+            && !lower.contains(r"\serviceprofiles\networkservice")
+        {
+            let base = PathBuf::from(profile);
+            for sub in ["Documents", "Desktop", "Pictures"] {
+                paths.push(base.join(sub).join(HONEYPOT_DEFAULT_FILENAME));
+            }
+        }
+    }
+    paths
+}
+
+fn current_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn record_honeypots_best_effort(store: &LedrStore, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    if let Err(err) = store.record_honeypot_paths(paths, current_epoch_ms()) {
+        tracing::warn!(
+            error = %err,
+            honeypots = paths.len(),
+            "failed recording deployed honeypot paths in SQLite"
+        );
+    }
+}
+
+fn cleanup_honeypots_with_db_and_fallback(
+    db_path: &Path,
+    fallback_paths: &[PathBuf],
+) -> HoneypotCleanupOutcome {
+    let mut outcome = HoneypotCleanupOutcome::default();
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let mut tracked_keys = HashSet::new();
+    let mut db_readable = false;
+
+    match std::fs::symlink_metadata(db_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            outcome.failed += 1;
+            outcome.failed_details.push(format!(
+                "failed inspecting LocalEDR database '{}': {err}",
+                db_path.display()
+            ));
+        }
+        Ok(meta) if meta.is_dir() => {
+            outcome.failed += 1;
+            outcome.failed_details.push(format!(
+                "LocalEDR database path '{}' is a directory",
+                db_path.display()
+            ));
+        }
+        Ok(meta) if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_MASK) != 0 => {
+            outcome.failed += 1;
+            outcome.failed_details.push(format!(
+                "refusing reparse point LocalEDR database '{}'",
+                db_path.display()
+            ));
+        }
+        Ok(_) => match LedrStore::list_tracked_honeypot_paths_read_only(db_path) {
+            Ok(paths) => {
+                db_readable = true;
+                for path in paths {
+                    let key = normalize_honeypot_dedup_key(&path);
+                    if !key.is_empty() {
+                        tracked_keys.insert(key);
+                    }
+                    push_unique_honeypot_path(&mut seen, &mut targets, path);
+                }
+            }
+            Err(err) => {
+                outcome.failed += 1;
+                outcome.failed_details.push(format!(
+                    "failed reading tracked honeypots from '{}': {err}",
+                    db_path.display()
+                ));
+            }
+        },
+    }
+
+    for path in fallback_paths {
+        push_unique_honeypot_path(&mut seen, &mut targets, path.clone());
+    }
+
+    let mut cleaned_tracked_paths = Vec::new();
+    for path in targets {
+        match remove_verified_honeypot_file(&path) {
+            Ok(true) => {
+                outcome.removed += 1;
+                if tracked_keys.contains(&normalize_honeypot_dedup_key(&path)) {
+                    cleaned_tracked_paths.push(path);
+                }
+            }
+            Ok(false) => {
+                outcome.already_absent += 1;
+                if tracked_keys.contains(&normalize_honeypot_dedup_key(&path)) {
+                    cleaned_tracked_paths.push(path);
+                }
+            }
+            Err(err) => {
+                outcome.failed += 1;
+                outcome
+                    .failed_details
+                    .push(format!("{}: {err}", path.display()));
+            }
+        }
+    }
+
+    if db_readable && !cleaned_tracked_paths.is_empty() {
+        match LedrStore::open(db_path) {
+            Ok(store) => {
+                match store.remove_tracked_honeypot_paths(&cleaned_tracked_paths) {
+                    Ok(removed_rows) => {
+                        outcome.db_records_removed = removed_rows;
+                    }
+                    Err(err) => {
+                        outcome.failed += 1;
+                        outcome.failed_details.push(format!(
+                            "failed removing tracked honeypot rows in '{}': {err}",
+                            db_path.display()
+                        ));
+                    }
+                }
+                if let Err(err) = store.checkpoint_truncate() {
+                    outcome.failed += 1;
+                    outcome.failed_details.push(format!(
+                        "failed checkpointing WAL for '{}': {err}",
+                        db_path.display()
+                    ));
+                }
+            }
+            Err(err) => {
+                outcome.failed += 1;
+                outcome.failed_details.push(format!(
+                    "failed opening LocalEDR database '{}' for honeypot cleanup: {err}",
+                    db_path.display()
+                ));
+            }
+        }
+    }
+
+    outcome
+}
+
+fn cleanup_honeypots_in_db(explicit_db: Option<&Path>) -> u8 {
+    let db_path = explicit_db
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_daemon_db_path);
+    let fallback_paths = collect_fallback_honeypot_paths();
+    let outcome = cleanup_honeypots_with_db_and_fallback(&db_path, &fallback_paths);
+
+    println!(
+        "Honeypot cleanup summary (db='{}'): removed={}, already_absent={}, db_records_removed={}, failed={}",
+        db_path.display(),
+        outcome.removed,
+        outcome.already_absent,
+        outcome.db_records_removed,
+        outcome.failed
+    );
+    for detail in &outcome.failed_details {
+        eprintln!("Honeypot cleanup failure: {detail}");
+    }
+    if outcome.failed == 0 {
+        0
+    } else {
+        HONEYPOT_CLEANUP_PARTIAL_EXIT_CODE
+    }
+}
+
 fn run_cli_entrypoint_code<I, S>(args: I) -> u8
 where
     I: IntoIterator<Item = S>,
@@ -812,13 +1038,17 @@ where
 
     if cli.show_help {
         println!(
-            "ledr-daemon [--foreground | --service | --service-strict | --check-unresolved-suspended] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>] [--bridge-sha256 <hex>] [--bridge-signer <dn>] [--bridge-root-thumbprint <sha1>] [--auth-helper-sha256 <hex>]"
+            "ledr-daemon [--foreground | --service | --service-strict | --check-unresolved-suspended | --cleanup-honeypots] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>] [--bridge-sha256 <hex>] [--bridge-signer <dn>] [--bridge-root-thumbprint <sha1>] [--auth-helper-sha256 <hex>]"
         );
         return 0;
     }
 
     if cli.check_unresolved_suspended {
         return check_unresolved_suspended_in_db(cli.db_path.as_deref());
+    }
+
+    if cli.cleanup_honeypots {
+        return cleanup_honeypots_in_db(cli.db_path.as_deref());
     }
 
     init_tracing();
@@ -960,6 +1190,7 @@ where
     );
 
     let (store, db_path) = open_store_with_fallback(cli.db_path.as_deref())?;
+    let honeypot_store = store.clone();
     let loaded_rules = load_rules_or_default(cli.rules_dir.as_deref())?;
     apply_startup_rules(&store, &loaded_rules);
     let LoadedRulesDir {
@@ -1072,6 +1303,7 @@ where
             honeypot_mgr.deployed_paths().to_vec()
         }
     };
+    record_honeypots_best_effort(&honeypot_store, &last_honeypot_paths);
 
     // Start ETW capture directly into ClassifiedEventSender BEFORE Toolhelp32 snapshot capture so
     // processes spawned or exiting during snapshot enumeration are not missed (BUG_0001, BUG_0006, L-10).
@@ -1183,8 +1415,13 @@ where
                 }
                 _ = refresh_ticker.tick(), if refresh_in_flight.is_none() && honeypot_mgr_opt.is_some() => {
                     if let Some(mut mgr) = honeypot_mgr_opt.take() {
+                        let refresh_store = honeypot_store.clone();
                         refresh_in_flight = Some(tokio::task::spawn_blocking(move || {
+                            let prev_paths = mgr.deployed_paths().to_vec();
                             let res = mgr.refresh_service_profiles();
+                            if !HoneypotManager::path_sets_equal(&prev_paths, mgr.deployed_paths()) {
+                                record_honeypots_best_effort(&refresh_store, mgr.deployed_paths());
+                            }
                             (mgr, res)
                         }));
                     }
@@ -2560,5 +2797,166 @@ mod tests {
         assert_eq!(calls, 1);
         assert_eq!(applied_paths.len(), 3);
         assert_eq!(last.len(), 3);
+    }
+
+    #[test]
+    fn cli_cleanup_honeypots_parses_and_rejects_conflicting_modes() {
+        let parsed = parse_cli_args([
+            "ledr-daemon",
+            "--cleanup-honeypots",
+            "--db",
+            r"C:\Temp\localedr.db",
+        ])
+        .expect("parse --cleanup-honeypots with --db");
+        assert!(parsed.cleanup_honeypots);
+        assert_eq!(parsed.db_path, Some(PathBuf::from(r"C:\Temp\localedr.db")));
+
+        for conflict in [
+            "--foreground",
+            "--service",
+            "--service-strict",
+            "--check-unresolved-suspended",
+        ] {
+            let err = parse_cli_args(["ledr-daemon", "--cleanup-honeypots", conflict])
+                .expect_err("conflicting mode must be rejected");
+            assert!(
+                err.to_string().contains("--cleanup-honeypots"),
+                "unexpected error for {conflict}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn honeypot_cleanup_02_deletes_tracked_and_fallback_and_preserves_rejected_records() {
+        use std::process::Command;
+
+        struct TempCleanupDir(PathBuf);
+        impl Drop for TempCleanupDir {
+            fn drop(&mut self) {
+                fn clear(dir: &Path) {
+                    let Ok(entries) = std::fs::read_dir(dir) else {
+                        return;
+                    };
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if let Ok(meta) = std::fs::symlink_metadata(&p) {
+                            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_MASK) != 0 {
+                                let _ = std::fs::remove_dir(&p);
+                                continue;
+                            }
+                            if meta.is_dir() {
+                                clear(&p);
+                            } else {
+                                let _ = Command::new("attrib")
+                                    .args(["-R", "-H", "-S", &p.to_string_lossy()])
+                                    .output();
+                            }
+                        }
+                    }
+                }
+                clear(&self.0);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!(
+            "ledr-daemon-hp-cleanup-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let _guard = TempCleanupDir(base.clone());
+
+        let db_path = base.join("localedr.db");
+        let profile = base.join("UserA");
+        let docs = profile.join("Documents");
+        let desktop = profile.join("Desktop");
+        let pictures = profile.join("Pictures");
+        let victim = base.join("Victim");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::create_dir_all(&pictures).unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+
+        let mut mgr = HoneypotManager::for_user_profiles(vec![profile]);
+        let deployed = mgr.deploy_honeypots().expect("deploy userA honeypots");
+        assert_eq!(deployed.len(), 3);
+
+        // Fallback-only decoy not tracked in SQLite.
+        let fallback_dir = base.join("UserB").join("Documents");
+        std::fs::create_dir_all(&fallback_dir).unwrap();
+        let fallback_decoy = fallback_dir.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(&fallback_decoy, b"fallback-decoy").unwrap();
+
+        // Junction-backed decoy tracked in SQLite must be rejected without deleting victim file.
+        let victim_decoy = victim.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(&victim_decoy, b"victim-decoy").unwrap();
+        let junc_root = base.join("EvilJunction");
+        let mklink = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junc_root.to_string_lossy(),
+                &victim.to_string_lossy(),
+            ])
+            .output()
+            .expect("create junction");
+        assert!(mklink.status.success(), "mklink failed");
+        let evil_decoy = junc_root.join(HONEYPOT_DEFAULT_FILENAME);
+
+        let store = LedrStore::open(&db_path).expect("open db");
+        let mut tracked = deployed.clone();
+        tracked.push(evil_decoy.clone());
+        store
+            .record_honeypot_paths(&tracked, 1_700_000_000_000)
+            .expect("record tracked honeypots");
+        drop(store);
+
+        let outcome =
+            cleanup_honeypots_with_db_and_fallback(&db_path, std::slice::from_ref(&fallback_decoy));
+        assert_eq!(outcome.removed, 4, "3 tracked + 1 fallback decoy removed");
+        assert_eq!(outcome.already_absent, 0);
+        assert_eq!(outcome.failed, 1, "junction target must fail safely");
+        assert_eq!(outcome.db_records_removed, 3);
+        for path in &deployed {
+            assert!(!path.exists(), "tracked decoy {} must be deleted", path.display());
+        }
+        assert!(!fallback_decoy.exists(), "fallback decoy must be deleted");
+        assert!(victim_decoy.exists(), "victim decoy behind junction must remain intact");
+
+        let remaining =
+            LedrStore::list_tracked_honeypot_paths_read_only(&db_path).expect("list remaining");
+        assert_eq!(
+            remaining,
+            vec![evil_decoy],
+            "failed tracked path must remain in SQLite while cleaned paths are removed"
+        );
+
+        // Missing DB must NOT create a new DB and still deletes fallback decoys cleanly.
+        let missing_db = base.join("absent").join("localedr.db");
+        let fallback_only = fallback_dir.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(&fallback_only, b"fallback-only").unwrap();
+        let outcome_no_db = cleanup_honeypots_with_db_and_fallback(
+            &missing_db,
+            std::slice::from_ref(&fallback_only),
+        );
+        assert_eq!(outcome_no_db.removed, 1);
+        assert_eq!(outcome_no_db.failed, 0);
+        assert!(!fallback_only.exists());
+        assert!(!missing_db.exists());
+        assert!(!base.join("absent").exists());
+
+        // CLI entrypoint returns HONEYPOT_CLEANUP_PARTIAL_EXIT_CODE (4) when failures remain.
+        let rc = run_cli_entrypoint_code([
+            "ledr-daemon",
+            "--cleanup-honeypots",
+            "--db",
+            &db_path.to_string_lossy(),
+        ]);
+        assert_eq!(rc, HONEYPOT_CLEANUP_PARTIAL_EXIT_CODE);
     }
 }

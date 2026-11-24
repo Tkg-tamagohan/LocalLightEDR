@@ -690,6 +690,21 @@ class TestReleaseScripts(unittest.TestCase):
         self.assertIn("--check-unresolved-suspended", uninstall_ps1)
         self.assertIn("Assert-NoUnresolvedSuspendedAlerts", uninstall_ps1)
 
+        # Honeypot decoy automatic cleanup in uninstall.ps1 (L-06)
+        self.assertIn("--cleanup-honeypots", uninstall_ps1)
+        self.assertIn("Invoke-HoneypotCleanup", uninstall_ps1)
+        stop_call_idx = uninstall_ps1.index("Wait-ForServiceStopped -Name $script:ServiceName")
+        hp_call_idx = uninstall_ps1.index("Invoke-HoneypotCleanup -DaemonExePath $daemonExe")
+        bin_del_idx = uninstall_ps1.index("$filesToDelete = @($script:BinaryNames)")
+        self.assertLess(stop_call_idx, hp_call_idx)
+        self.assertLess(hp_call_idx, bin_del_idx)
+
+        runbook_md = (REPO_ROOT / "docs" / "release-runbook.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("honeypot_files", runbook_md)
+        self.assertIn("--cleanup-honeypots", runbook_md)
+
         # Both scripts unwrap InnerException in Invoke-WithFileLockRetry
         self.assertIn(".InnerException", install_ps1)
         self.assertIn(".InnerException", uninstall_ps1)
@@ -846,7 +861,7 @@ finally {{
 $tokens = $null
 $errors = $null
 $uAst = [System.Management.Automation.Language.Parser]::ParseFile('{uninstall_path}', [ref]$tokens, [ref]$errors)
-foreach ($fnName in @('Write-UninstallLog', 'Normalize-FullPath', 'Assert-NoReparsePointComponent', 'Assert-NoUnresolvedSuspendedAlerts')) {{
+foreach ($fnName in @('Write-UninstallLog', 'Normalize-FullPath', 'Assert-NoReparsePointComponent', 'Assert-NoUnresolvedSuspendedAlerts', 'Invoke-HoneypotCleanup')) {{
     $fnAst = $uAst.FindAll({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $fnName }}, $true) | Select-Object -First 1
     if ($null -eq $fnAst) {{ throw "Missing function $fnName in uninstall.ps1" }}
     Invoke-Expression $fnAst.Extent.Text
@@ -882,6 +897,42 @@ catch {{
     if ($_.Exception.Message -match 'exit 1') {{ $caught1 = $true }}
 }}
 if (-not $caught1) {{ throw "Expected exit code 1 to fail closed" }}
+
+# Verify Invoke-HoneypotCleanup handles exit 0, exit 4 (warn & continue), and missing binary
+$script:LogBuffer.Clear()
+$hpCmdZero = Join-Path '{tmp_path}' 'daemon_hp_zero.cmd'
+[System.IO.File]::WriteAllText($hpCmdZero, "@echo off`r`necho Honeypot cleanup summary: removed=3`r`nexit /b 0`r`n")
+Invoke-HoneypotCleanup -DaemonExePath $hpCmdZero -DbPath $mockDb -TimeoutSeconds 1
+if (-not (@($script:LogBuffer | Where-Object {{ $_ -match '\[INFO\] Honeypot cleanup completed' }}).Count -eq 1)) {{
+    throw "Expected INFO log on exit 0 from Invoke-HoneypotCleanup"
+}}
+
+$script:LogBuffer.Clear()
+$hpCmdFourGuard = Join-Path '{tmp_path}' 'daemon_hp_four_guard.cmd'
+[System.IO.File]::WriteAllText($hpCmdFourGuard, "@echo off`r`necho Honeypot cleanup failure: reparse point rejected 1>&2`r`nexit /b 4`r`n")
+Invoke-HoneypotCleanup -DaemonExePath $hpCmdFourGuard -DbPath $mockDb -TimeoutSeconds 1
+if (-not (@($script:LogBuffer | Where-Object {{ $_ -match '\[WARN\] Honeypot cleanup reported partial failure \(exit 4\)' }}).Count -eq 1)) {{
+    throw "Expected WARN log on exit 4 guard rejection from Invoke-HoneypotCleanup"
+}}
+
+$script:LogBuffer.Clear()
+$hpRetryFlag = Join-Path '{tmp_path}' 'hp_retry.flag'
+$hpCmdRetry = Join-Path '{tmp_path}' 'daemon_hp_retry.cmd'
+[System.IO.File]::WriteAllText($hpCmdRetry, "@echo off`r`nif exist `"$hpRetryFlag`" (`r`n  echo Honeypot cleanup summary: removed=1`r`n  exit /b 0`r`n)`r`necho retry> `"$hpRetryFlag`"`r`necho Honeypot cleanup failure: sharing violation 1>&2`r`nexit /b 4`r`n")
+Invoke-HoneypotCleanup -DaemonExePath $hpCmdRetry -DbPath $mockDb -TimeoutSeconds 3
+if (-not (Test-Path -LiteralPath $hpRetryFlag)) {{
+    throw "Expected retry flag to be created on first attempt"
+}}
+if (-not (@($script:LogBuffer | Where-Object {{ $_ -match '\[INFO\] Honeypot cleanup completed' }}).Count -eq 1)) {{
+    throw "Expected INFO log after retry succeeded"
+}}
+
+$script:LogBuffer.Clear()
+$hpMissing = Join-Path '{tmp_path}' 'missing-daemon.exe'
+Invoke-HoneypotCleanup -DaemonExePath $hpMissing -DbPath $mockDb -TimeoutSeconds 1
+if (-not (@($script:LogBuffer | Where-Object {{ $_ -match '\[WARN\] Daemon binary not found' }}).Count -eq 1)) {{
+    throw "Expected WARN log when daemon binary is missing"
+}}
 Write-Output "PS_VERIFY_OK"
 """,
                         encoding="utf-8",

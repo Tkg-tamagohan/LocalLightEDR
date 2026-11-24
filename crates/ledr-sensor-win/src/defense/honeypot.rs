@@ -11,13 +11,14 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FileBasicInfo, GetFileInformationByHandle, GetFileType,
+    CreateFileW, FileBasicInfo, FileDispositionInfo, GetFileInformationByHandle, GetFileType,
     GetFinalPathNameByHandleW, ReOpenFile, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
+    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_BASIC_INFO,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
+    FILE_DISPOSITION_INFO, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING,
+    SYNCHRONIZE, VOLUME_NAME_DOS,
 };
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSConnected, WTSDisconnected, WTSEnumerateSessionsW, WTSFreeMemory,
@@ -220,19 +221,208 @@ impl HoneypotManager {
         let mut remaining = Vec::new();
 
         for (idx, path) in tracked.iter().enumerate() {
-            match std::fs::remove_file(path) {
-                Ok(()) => removed += 1,
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
+            match remove_verified_honeypot_file(path) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
                 Err(err) => {
                     remaining.extend_from_slice(&tracked[idx..]);
                     self.deployed_paths = remaining;
-                    return Err(SensorError::Io(err));
+                    return Err(err);
                 }
             }
         }
 
         Ok(removed)
     }
+}
+
+/// Verifies every directory component along `path` (from drive/UNC root down to `path` itself)
+/// using `FILE_FLAG_OPEN_REPARSE_POINT` so junctions or symlinks at any ancestor are rejected.
+fn verify_no_reparse_ancestors(dir_path: &Path) -> Result<(), SensorError> {
+    let mut current = PathBuf::new();
+    let mut has_prefix = false;
+    for comp in dir_path.components() {
+        match comp {
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                has_prefix = true;
+            }
+            Component::RootDir => {
+                current.push(comp.as_os_str());
+                let _ = open_verified_directory(&current)?;
+            }
+            Component::Normal(part) => {
+                if !has_prefix && current.as_os_str().is_empty() {
+                    return Err(SensorError::Io(std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("honeypot directory path must be rooted: {}", dir_path.display()),
+                    )));
+                }
+                current.push(part);
+                let _ = open_verified_directory(&current)?;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(SensorError::Io(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "refusing relative parent component in honeypot path: {}",
+                        dir_path.display()
+                    ),
+                )));
+            }
+        }
+    }
+    if current.as_os_str().is_empty() {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("empty honeypot directory path: {}", dir_path.display()),
+        )));
+    }
+    Ok(())
+}
+
+/// Safely removes a deployed honeypot canary file (`!00_LocalEDR_Canary_DoNotEdit.docx`) via
+/// handle-based TOCTOU-free verification (`L-06`).
+///
+/// Rejects arbitrary filenames, reparse points at any ancestor or target, non-disk objects,
+/// hardlinks (`nNumberOfLinks != 1`), and path escapes outside the verified parent directory.
+/// Returns `Ok(true)` if removed, `Ok(false)` if the file or its parent directory is already absent.
+pub fn remove_verified_honeypot_file(path: &Path) -> Result<bool, SensorError> {
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("honeypot target path missing filename: {}", path.display()),
+        )));
+    };
+    if !file_name.eq_ignore_ascii_case(HONEYPOT_DEFAULT_FILENAME) {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to delete non-honeypot filename '{}': {}",
+                file_name,
+                path.display()
+            ),
+        )));
+    }
+    let Some(subdir) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Err(SensorError::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("honeypot target path missing parent directory: {}", path.display()),
+        )));
+    };
+
+    match verify_no_reparse_ancestors(subdir) {
+        Ok(()) => {}
+        Err(SensorError::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    }
+
+    let parent_res = if subdir.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
+        open_verified_profile_and_subdir(subdir).map(|(_, dir)| dir)
+    } else {
+        open_verified_directory(subdir)
+    };
+    let parent_dir = match parent_res {
+        Ok(dir) => dir,
+        Err(SensorError::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    let attr_handle = match nt_create_file_relative(
+        parent_dir.handle.0,
+        OsStr::new(file_name),
+        FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0,
+        0,
+        FILE_OPEN,
+        FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+    ) {
+        Ok(h) => h,
+        Err(NtCreateError::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(SensorError::from(err)),
+    };
+
+    let info = verify_decoy_file_handle(attr_handle.0, &parent_dir, path)?;
+    let share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    // SAFETY: `attr_handle.0` is an open, verified regular disk file handle (`nNumberOfLinks == 1`).
+    let delete_raw = unsafe {
+        ReOpenFile(
+            attr_handle.0,
+            DELETE.0 | FILE_READ_ATTRIBUTES.0 | FILE_WRITE_ATTRIBUTES.0 | SYNCHRONIZE.0,
+            share_all,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+        )
+    }
+    .map_err(|err| SensorError::Win32 {
+        api: "ReOpenFile",
+        message: format!(
+            "failed upgrading honeypot handle for delete {}: {err}",
+            path.display()
+        ),
+    })?;
+    if delete_raw.is_invalid() || delete_raw.0.is_null() {
+        return Err(SensorError::Io(std::io::Error::other(format!(
+            "ReOpenFile returned invalid delete handle for {}",
+            path.display()
+        ))));
+    }
+    let delete_handle = OwnedHandle(delete_raw);
+
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_READONLY.0) != 0 {
+        let cleared = info.dwFileAttributes & !FILE_ATTRIBUTE_READONLY.0;
+        let desired = if cleared == 0 {
+            FILE_ATTRIBUTE_NORMAL.0
+        } else {
+            cleared
+        };
+        let basic_info = FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: 0,
+            FileAttributes: desired,
+        };
+        // SAFETY: `delete_handle.0` is open with `FILE_WRITE_ATTRIBUTES` and `basic_info` is valid.
+        unsafe {
+            SetFileInformationByHandle(
+                delete_handle.0,
+                FileBasicInfo,
+                (&raw const basic_info).cast::<c_void>(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        }
+        .map_err(|err| SensorError::Win32 {
+            api: "SetFileInformationByHandle",
+            message: format!(
+                "failed clearing READONLY on honeypot {}: {err}",
+                path.display()
+            ),
+        })?;
+    }
+
+    let disp_info = FILE_DISPOSITION_INFO {
+        DeleteFile: true,
+    };
+    // SAFETY: `delete_handle.0` is open with `DELETE` access and `disp_info` is valid stack storage.
+    unsafe {
+        SetFileInformationByHandle(
+            delete_handle.0,
+            FileDispositionInfo,
+            (&raw const disp_info).cast::<c_void>(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    }
+    .map_err(|err| SensorError::Win32 {
+        api: "SetFileInformationByHandle",
+        message: format!(
+            "failed marking honeypot for deletion {}: {err}",
+            path.display()
+        ),
+    })?;
+
+    drop(attr_handle);
+    drop(delete_handle);
+    Ok(true)
 }
 
 /// Returns `true` if `a` and `b` contain the same set of honeypot paths (case-insensitive on
@@ -384,6 +574,15 @@ fn normalize_dos_final_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn windows_error_to_io(err: windows::core::Error) -> std::io::Error {
+    let hresult = err.code().0 as u32;
+    if (hresult & 0xFFFF_0000) == 0x8007_0000 {
+        std::io::Error::from_raw_os_error((hresult & 0xFFFF) as i32)
+    } else {
+        std::io::Error::from(err)
+    }
+}
+
 fn open_verified_directory(path: &Path) -> Result<VerifiedDirectory, SensorError> {
     let wide = encode_wide_nul(path.as_os_str());
     let share_all = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -400,9 +599,10 @@ fn open_verified_directory(path: &Path) -> Result<VerifiedDirectory, SensorError
         )
     }
     .map_err(|err| {
+        let io_err = windows_error_to_io(err);
         SensorError::Io(std::io::Error::new(
-            ErrorKind::NotFound,
-            format!("failed opening directory {}: {err}", path.display()),
+            io_err.kind(),
+            format!("failed opening directory {}: {io_err}", path.display()),
         ))
     })?;
     if raw.is_invalid() || raw.0.is_null() {
@@ -1741,5 +1941,97 @@ mod tests {
             !victim.join(HONEYPOT_DEFAULT_FILENAME).exists(),
             "honeypot must never be written into swapped junction target"
         );
+    }
+
+    #[test]
+    fn honeypot_l06_07_remove_verified_honeypot_file_safety_and_guards() {
+        let tmp = TempHoneypotDir::new("verified-remove");
+        let profile = tmp.path().join("UserProfile");
+        let docs = profile.join("Documents");
+        let desktop = profile.join("Desktop");
+        let pictures = profile.join("Pictures");
+        let victim = tmp.path().join("VictimDir");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::create_dir_all(&pictures).unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+
+        // 1. Standard deployed decoy file removes cleanly and second call returns Ok(false).
+        let mut mgr = HoneypotManager::for_user_profiles(vec![profile.clone()]);
+        let deployed = mgr.deploy_honeypots().expect("deploy honeypots");
+        assert_eq!(deployed.len(), 3);
+        let docs_decoy = docs.join(HONEYPOT_DEFAULT_FILENAME);
+        assert!(remove_verified_honeypot_file(&docs_decoy).expect("remove standard decoy"));
+        assert!(!docs_decoy.exists());
+        assert!(!remove_verified_honeypot_file(&docs_decoy).expect("absent decoy returns false"));
+
+        // 2. READONLY | HIDDEN | SYSTEM decoy file is still deleted via handle attribute clear.
+        let desktop_decoy = desktop.join(HONEYPOT_DEFAULT_FILENAME);
+        let desktop_decoy_w = encode_wide_nul(desktop_decoy.as_os_str());
+        unsafe {
+            SetFileAttributesW(
+                PCWSTR(desktop_decoy_w.as_ptr()),
+                FILE_FLAGS_AND_ATTRIBUTES(
+                    FILE_ATTRIBUTE_READONLY.0 | FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0,
+                ),
+            )
+        }
+        .expect("set READONLY|HIDDEN|SYSTEM");
+        assert!(remove_verified_honeypot_file(&desktop_decoy).expect("remove readonly decoy"));
+        assert!(!desktop_decoy.exists());
+
+        // 3. Non-honeypot filename is rejected without touching the real file.
+        let real_doc = docs.join("important_user_notes.docx");
+        std::fs::write(&real_doc, b"user-data").unwrap();
+        let err = remove_verified_honeypot_file(&real_doc)
+            .expect_err("non-honeypot filename must be rejected");
+        assert!(err.to_string().contains("non-honeypot filename"));
+        assert!(real_doc.exists());
+
+        // 4. Hardlinked decoy target (nNumberOfLinks == 2) is rejected and outside file stays intact.
+        let outside_file = tmp.path().join("outside_real.docx");
+        std::fs::write(&outside_file, b"keep-me").unwrap();
+        let hardlink_decoy = docs.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::hard_link(&outside_file, &hardlink_decoy).expect("create hardlink decoy");
+        let err = remove_verified_honeypot_file(&hardlink_decoy)
+            .expect_err("hardlinked decoy must be rejected");
+        assert!(err.to_string().contains("hardlinked target"));
+        assert!(outside_file.exists());
+        assert!(hardlink_decoy.exists());
+
+        // 5. Reparse points at subdir or profile_root are rejected without deleting victim's decoy.
+        let victim_decoy = victim.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(&victim_decoy, b"victim-decoy").unwrap();
+        let junc_subdir_profile = tmp.path().join("JunctionSubdirProfile");
+        std::fs::create_dir_all(&junc_subdir_profile).unwrap();
+        let junc_docs = junc_subdir_profile.join("Documents");
+        create_ntfs_junction(&junc_docs, &victim);
+        let err = remove_verified_honeypot_file(&junc_docs.join(HONEYPOT_DEFAULT_FILENAME))
+            .expect_err("junction subdir must be rejected");
+        assert!(err.to_string().contains("reparse point"));
+        assert!(victim_decoy.exists());
+
+        let junc_profile_root = tmp.path().join("JunctionProfileRoot");
+        let victim_profile_docs = victim.join("Documents");
+        std::fs::create_dir_all(&victim_profile_docs).unwrap();
+        let victim_profile_decoy = victim_profile_docs.join(HONEYPOT_DEFAULT_FILENAME);
+        std::fs::write(&victim_profile_decoy, b"victim-profile-decoy").unwrap();
+        create_ntfs_junction(&junc_profile_root, &victim);
+        let err = remove_verified_honeypot_file(
+            &junc_profile_root
+                .join("Documents")
+                .join(HONEYPOT_DEFAULT_FILENAME),
+        )
+        .expect_err("junction profile root must be rejected");
+        assert!(err.to_string().contains("reparse point"));
+        assert!(victim_profile_decoy.exists());
+
+        // 6. Missing parent directory returns Ok(false).
+        let absent_path = tmp
+            .path()
+            .join("NeverExisted")
+            .join("Documents")
+            .join(HONEYPOT_DEFAULT_FILENAME);
+        assert!(!remove_verified_honeypot_file(&absent_path).expect("missing ancestor"));
     }
 }

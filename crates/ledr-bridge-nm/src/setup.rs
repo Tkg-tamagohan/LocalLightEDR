@@ -156,12 +156,30 @@ impl RegWow64View {
     }
 }
 
+/// Maximum UTF-16 code-unit length (including the trailing NUL terminator) supported by
+/// Chromium's `base::win::RegKey::ReadValue` and `ExpandEnvironmentStringsW` buffer when
+/// resolving Native Messaging Host registry entries.
+pub const CHROMIUM_READ_VALUE_MAX_UTF16_UNITS: usize = 1024;
+
 /// Result of probing a Native Messaging Host registry key's default (`""`) value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeHostRegProbe {
     Present(String),
     EmptyString,
     UnresolvableExpandSz { raw: String, error: String },
+    /// Value exceeded Chromium's 1,024 UTF-16 code-unit read/expansion buffer limit (including
+    /// NUL) or `ExpandEnvironmentStringsW` failed at the Win32 API level, causing Chromium's
+    /// 32-bit `RegKey::ReadValue` / expansion path to fail and fall back to the 64-bit view.
+    ///
+    /// `resolved_path` preserves a safely expanded path (up to 32,768 UTF-16 units) when
+    /// available so `unregister` / `any_browser_references_manifest_with` can still detect shared
+    /// manifest references, and is `None` when expansion failed or left unresolved `%TOKEN%`
+    /// entries (fail-closed).
+    ChromiumReadFallback {
+        resolved_path: Option<String>,
+        raw: String,
+        error: String,
+    },
     Absent,
     InvalidType,
     AccessError(String),
@@ -210,10 +228,12 @@ pub(crate) fn has_unresolved_env_token(raw: &str, expanded: &str) -> bool {
 /// (`KEY_WOW64_32KEY`) and 64-bit (`KEY_WOW64_64KEY`) views following Chromium's precedence,
 /// returning both the effective probe and the view that produced it (`None` when both are `Absent`).
 ///
-/// Chromium stops at the 32-bit view whenever `RegKey::ReadValue(nullptr, &path)` returns
-/// `ERROR_SUCCESS`, including when the `REG_SZ` / `REG_EXPAND_SZ` value is empty (`EmptyString`)
-/// or unresolvable (`UnresolvableExpandSz`). Only failed reads (`Absent`, `InvalidType`, or
-/// `AccessError`) fall back to the 64-bit view.
+/// Chromium stops at the 32-bit view whenever `RegKey::ReadValue(nullptr, &path)` and
+/// `ExpandEnvironmentStringsW` succeed within Chromium's 1,024 UTF-16 unit buffer, including when
+/// the `REG_SZ` / `REG_EXPAND_SZ` value is empty (`EmptyString`) or unresolvable
+/// (`UnresolvableExpandSz`). Only failed reads (`Absent`, `InvalidType`, `AccessError`, or
+/// `ChromiumReadFallback` when the 1,024 UTF-16 read/expansion buffer is exceeded or
+/// `ExpandEnvironmentStringsW` fails) fall back to the 64-bit view.
 pub fn select_effective_hklm_probe(
     view32: NativeHostRegProbe,
     view64: NativeHostRegProbe,
@@ -906,7 +926,8 @@ pub(crate) mod win_reg_ops {
         parse_local_drive_path, parse_reparse_data_buffer, parse_volume_guid_path,
         resolve_local_reparse_target, BrowserKind, DosDeviceTarget, NativeHostRegProbe,
         ParsedReparseBuffer, RegWow64View, RegistryTarget, ReparseTargetResolution, Scope,
-        LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
+        CHROMIUM_READ_VALUE_MAX_UTF16_UNITS, LEDR_AUMID_DISPLAY_NAME, LEDR_URI_DESCRIPTION,
+        NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
     };
     use anyhow::{Context, Result};
     use std::ffi::c_void;
@@ -1755,6 +1776,11 @@ pub(crate) mod win_reg_ops {
         }
     }
 
+    fn exceeds_chromium_raw_limit(raw_bytes_len: usize, trimmed: &str) -> bool {
+        raw_bytes_len > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2
+            || trimmed.encode_utf16().count() + 1 > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS
+    }
+
     pub(crate) fn probe_default_sz(
         target: &RegistryTarget,
         subkey: &str,
@@ -1775,20 +1801,70 @@ pub(crate) mod win_reg_ops {
 
         match key.get_raw_value("") {
             Ok(raw) if raw.vtype == REG_SZ => match decode_reg_sz_bytes(&raw.bytes) {
-                Some(val) if val.trim().is_empty() => NativeHostRegProbe::EmptyString,
-                Some(val) => NativeHostRegProbe::Present(val.trim().to_string()),
                 None => NativeHostRegProbe::InvalidType,
+                Some(val) => {
+                    let trimmed = val.trim();
+                    if exceeds_chromium_raw_limit(raw.bytes.len(), trimmed) {
+                        let resolved_path = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                        NativeHostRegProbe::ChromiumReadFallback {
+                            resolved_path,
+                            raw: trimmed.to_string(),
+                            error: format!(
+                                "REG_SZ value (raw {} bytes, {} UTF-16 units incl. NUL) exceeds Chromium {CHROMIUM_READ_VALUE_MAX_UTF16_UNITS}-unit read buffer limit",
+                                raw.bytes.len(),
+                                trimmed.encode_utf16().count() + 1
+                            ),
+                        }
+                    } else if trimmed.is_empty() {
+                        NativeHostRegProbe::EmptyString
+                    } else {
+                        NativeHostRegProbe::Present(trimmed.to_string())
+                    }
+                }
             },
             Ok(raw) if raw.vtype == REG_EXPAND_SZ => match decode_reg_sz_bytes(&raw.bytes) {
                 None => NativeHostRegProbe::InvalidType,
                 Some(val) => {
                     let trimmed = val.trim();
+                    let raw_too_long = exceeds_chromium_raw_limit(raw.bytes.len(), trimmed);
                     if trimmed.is_empty() {
-                        NativeHostRegProbe::EmptyString
+                        if raw_too_long {
+                            NativeHostRegProbe::ChromiumReadFallback {
+                                resolved_path: None,
+                                raw: String::new(),
+                                error: format!(
+                                    "REG_EXPAND_SZ value (raw {} bytes) exceeds Chromium {CHROMIUM_READ_VALUE_MAX_UTF16_UNITS}-unit read buffer limit",
+                                    raw.bytes.len()
+                                ),
+                            }
+                        } else {
+                            NativeHostRegProbe::EmptyString
+                        }
                     } else {
                         match expand_env_strings_win32(trimmed) {
                             Ok(expanded) => {
-                                if has_unresolved_env_token(trimmed, &expanded) {
+                                let expanded_units_incl_nul = expanded.encode_utf16().count() + 1;
+                                let expanded_too_long =
+                                    expanded_units_incl_nul > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS;
+                                if raw_too_long || expanded_too_long {
+                                    let expanded_trimmed = expanded.trim();
+                                    let resolved_path =
+                                        if has_unresolved_env_token(trimmed, &expanded)
+                                            || expanded_trimmed.is_empty()
+                                        {
+                                            None
+                                        } else {
+                                            Some(expanded_trimmed.to_string())
+                                        };
+                                    NativeHostRegProbe::ChromiumReadFallback {
+                                        resolved_path,
+                                        raw: trimmed.to_string(),
+                                        error: format!(
+                                            "REG_EXPAND_SZ value '{trimmed}' (raw {} bytes, expanded {expanded_units_incl_nul} UTF-16 units incl. NUL) exceeds Chromium {CHROMIUM_READ_VALUE_MAX_UTF16_UNITS}-unit read/expansion buffer limit",
+                                            raw.bytes.len()
+                                        ),
+                                    }
+                                } else if has_unresolved_env_token(trimmed, &expanded) {
                                     NativeHostRegProbe::UnresolvableExpandSz {
                                         raw: trimmed.to_string(),
                                         error: format!(
@@ -1804,7 +1880,8 @@ pub(crate) mod win_reg_ops {
                                     }
                                 }
                             }
-                            Err(err) => NativeHostRegProbe::UnresolvableExpandSz {
+                            Err(err) => NativeHostRegProbe::ChromiumReadFallback {
+                                resolved_path: None,
                                 raw: trimmed.to_string(),
                                 error: format!(
                                     "failed to expand REG_EXPAND_SZ value '{trimmed}': {err}"
@@ -1974,7 +2051,11 @@ pub(crate) fn any_browser_references_manifest_with<O: RegistryViewOps + ?Sized>(
         let subkey = target.browser_subkey(browser);
         for &view in views {
             match ops.probe_default_sz(target, &subkey, view) {
-                NativeHostRegProbe::Present(existing) => {
+                NativeHostRegProbe::Present(existing)
+                | NativeHostRegProbe::ChromiumReadFallback {
+                    resolved_path: Some(existing),
+                    ..
+                } => {
                     if existing.eq_ignore_ascii_case(manifest_display_path)
                         || normalize_display_path(Path::new(&existing))
                             .eq_ignore_ascii_case(manifest_display_path)
@@ -1983,7 +2064,11 @@ pub(crate) fn any_browser_references_manifest_with<O: RegistryViewOps + ?Sized>(
                     }
                     remaining_existing.push(existing);
                 }
-                NativeHostRegProbe::UnresolvableExpandSz { .. } => return Ok(true),
+                NativeHostRegProbe::UnresolvableExpandSz { .. }
+                | NativeHostRegProbe::ChromiumReadFallback {
+                    resolved_path: None,
+                    ..
+                } => return Ok(true),
                 NativeHostRegProbe::Absent
                 | NativeHostRegProbe::EmptyString
                 | NativeHostRegProbe::InvalidType => {}
@@ -2129,7 +2214,11 @@ pub fn run_unregister_with_ops<O: RegistryViewOps + ?Sized>(
                 let probe = ops.probe_default_sz(target, &subkey, None);
                 match probe {
                     NativeHostRegProbe::AccessError(err) => bail!("{err}"),
-                    NativeHostRegProbe::Present(raw_path) => {
+                    NativeHostRegProbe::Present(raw_path)
+                    | NativeHostRegProbe::ChromiumReadFallback {
+                        resolved_path: Some(raw_path),
+                        ..
+                    } => {
                         let reg_path = PathBuf::from(&raw_path);
                         if is_localedr_manifest_filename(&reg_path) {
                             candidate_paths.insert(reg_path);
@@ -2137,7 +2226,12 @@ pub fn run_unregister_with_ops<O: RegistryViewOps + ?Sized>(
                         browser_reg_paths.push(raw_path.clone());
                         Some(raw_path)
                     }
-                    NativeHostRegProbe::UnresolvableExpandSz { raw, .. } => Some(raw),
+                    NativeHostRegProbe::UnresolvableExpandSz { raw, .. }
+                    | NativeHostRegProbe::ChromiumReadFallback {
+                        resolved_path: None,
+                        raw,
+                        ..
+                    } => Some(raw),
                     NativeHostRegProbe::Absent
                     | NativeHostRegProbe::EmptyString
                     | NativeHostRegProbe::InvalidType => None,
@@ -2156,7 +2250,11 @@ pub fn run_unregister_with_ops<O: RegistryViewOps + ?Sized>(
                 let mut fallback_unresolvable: Option<String> = None;
                 for probe in [&probe32, &probe64] {
                     match probe {
-                        NativeHostRegProbe::Present(raw_path) => {
+                        NativeHostRegProbe::Present(raw_path)
+                        | NativeHostRegProbe::ChromiumReadFallback {
+                            resolved_path: Some(raw_path),
+                            ..
+                        } => {
                             let reg_path = PathBuf::from(raw_path);
                             if is_localedr_manifest_filename(&reg_path) {
                                 candidate_paths.insert(reg_path);
@@ -2166,7 +2264,12 @@ pub fn run_unregister_with_ops<O: RegistryViewOps + ?Sized>(
                                 primary_present = Some(raw_path.clone());
                             }
                         }
-                        NativeHostRegProbe::UnresolvableExpandSz { raw, .. } => {
+                        NativeHostRegProbe::UnresolvableExpandSz { raw, .. }
+                        | NativeHostRegProbe::ChromiumReadFallback {
+                            resolved_path: None,
+                            raw,
+                            ..
+                        } => {
                             if fallback_unresolvable.is_none() {
                                 fallback_unresolvable = Some(raw.clone());
                             }
@@ -2353,7 +2456,8 @@ pub fn run_status_with_ops<O: RegistryViewOps + ?Sized>(
                     let validation = validate_manifest_file(Path::new(&path), &expected_extension_id);
                     (true, Some(path), Some(validation))
                 }
-                NativeHostRegProbe::UnresolvableExpandSz { raw, error } => {
+                NativeHostRegProbe::UnresolvableExpandSz { raw, error }
+                | NativeHostRegProbe::ChromiumReadFallback { raw, error, .. } => {
                     let manifest = synthetic_invalid_manifest_with_path(raw.clone(), error);
                     (true, Some(raw), Some(manifest))
                 }

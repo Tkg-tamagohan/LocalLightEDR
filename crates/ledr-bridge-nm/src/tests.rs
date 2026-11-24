@@ -31,7 +31,7 @@ use crate::setup::{
     resolve_ui_exe_with, run_setup_with, run_setup_with_ops, run_status_with, run_status_with_ops,
     run_unregister_with, run_unregister_with_ops, select_effective_hklm_probe,
     NativeHostRegProbe, RegWow64View, RegistryTarget, RegistryViewOps,
-    NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
+    CHROMIUM_READ_VALUE_MAX_UTF16_UNITS, NATIVE_HOSTS_LAUNCH_DIRECTLY_VALUE,
 };
 
 static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -2702,7 +2702,8 @@ fn bridge_18_cmd_mediated_pipe_inheritance_real_kernel() {
 #[test]
 fn bridge_19_select_effective_hklm_probe_exhaustive_matrix() {
     use NativeHostRegProbe::{
-        Absent, AccessError, EmptyString, InvalidType, Present, UnresolvableExpandSz,
+        Absent, AccessError, ChromiumReadFallback, EmptyString, InvalidType, Present,
+        UnresolvableExpandSz,
     };
 
     let p32 = Present(r"C:\ProgramData\LocalEDR\native-messaging\m32.json".to_string());
@@ -2715,13 +2716,33 @@ fn bridge_19_select_effective_hklm_probe_exhaustive_matrix() {
         raw: r"%LEDR_MISSING_64%\m64.json".to_string(),
         error: "unresolved-64".to_string(),
     };
+    let crfb32 = ChromiumReadFallback {
+        resolved_path: Some(r"C:\Long32\m32.json".to_string()),
+        raw: r"%LEDR_LONG_32%\m32.json".to_string(),
+        error: "exceeds-1024-32".to_string(),
+    };
+    let crfb64 = ChromiumReadFallback {
+        resolved_path: None,
+        raw: r"%LEDR_LONG_64%\m64.json".to_string(),
+        error: "exceeds-1024-64".to_string(),
+    };
     let err32 = AccessError("denied-32".to_string());
     let err64 = AccessError("denied-64".to_string());
+
+    assert!(p32.stops_wow64_fallback());
+    assert!(EmptyString.stops_wow64_fallback());
+    assert!(unres32.stops_wow64_fallback());
+    assert!(!crfb32.stops_wow64_fallback());
+    assert!(!crfb64.stops_wow64_fallback());
+    assert!(!Absent.stops_wow64_fallback());
+    assert!(!InvalidType.stops_wow64_fallback());
+    assert!(!err32.stops_wow64_fallback());
 
     let variants_32 = [
         p32.clone(),
         EmptyString,
         unres32.clone(),
+        crfb32.clone(),
         Absent,
         InvalidType,
         err32.clone(),
@@ -2730,14 +2751,16 @@ fn bridge_19_select_effective_hklm_probe_exhaustive_matrix() {
         p64.clone(),
         EmptyString,
         unres64.clone(),
+        crfb64.clone(),
         Absent,
         InvalidType,
         err64.clone(),
     ];
 
-    // Verify all 36 combinations of (view32, view64) follow Chromium's HKLM WOW64 precedence:
+    // Verify all 49 combinations of (view32, view64) follow Chromium's HKLM WOW64 precedence:
     // - 32-bit Present, EmptyString, and UnresolvableExpandSz stop fallback and win over any 64-bit state.
-    // - Only 32-bit Absent / InvalidType / AccessError falls back to 64-bit Present / EmptyString / UnresolvableExpandSz.
+    // - 32-bit ChromiumReadFallback, Absent, InvalidType, and AccessError fall back to 64-bit
+    //   Present / EmptyString / UnresolvableExpandSz, and prefer ChromiumReadFallback over Absent.
     for v32 in &variants_32 {
         for v64 in &variants_64 {
             let expected = match (v32, v64) {
@@ -2772,6 +2795,26 @@ fn bridge_19_select_effective_hklm_probe_exhaustive_matrix() {
     assert_eq!(
         select_effective_hklm_probe(p32.clone(), p64.clone()),
         (p32, Some(RegWow64View::Wow6432))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(crfb32.clone(), p64.clone()),
+        (p64.clone(), Some(RegWow64View::Wow6464))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(crfb32.clone(), EmptyString),
+        (EmptyString, Some(RegWow64View::Wow6464))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(crfb32.clone(), unres64.clone()),
+        (unres64.clone(), Some(RegWow64View::Wow6464))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(crfb32.clone(), Absent),
+        (crfb32, Some(RegWow64View::Wow6432))
+    );
+    assert_eq!(
+        select_effective_hklm_probe(Absent, crfb64.clone()),
+        (crfb64, Some(RegWow64View::Wow6464))
     );
     assert_eq!(
         select_effective_hklm_probe(Absent, unres64.clone()),
@@ -3994,6 +4037,480 @@ fn bridge_24_real_win32_reg_expand_sz_probe_status_and_unregister() {
     assert!(
         !res_unres.manifest_removed,
         "unresolved REG_EXPAND_SZ on Edge must fail-closed and preserve manifest"
+    );
+    assert!(shared_manifest.is_file());
+}
+
+#[test]
+fn bridge_25_chromium_read_limit_status_fallback_and_mock_unregister() {
+    let temp = TempDirGuard::new("ledr-bridge-nm-b25");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+    let manifest_dir = temp.path().join("nm-machine");
+    let m = build_manifest(&fake_bridge, DEFAULT_CHROME_EXTENSION_ID).unwrap();
+    let m64_path = manifest_dir.join(manifest_filename_for(Scope::Machine, BrowserKind::Chrome));
+    write_manifest_atomic(&m64_path, &m).unwrap();
+    let m64_display = crate::manifest::normalize_display_path(&m64_path);
+
+    let machine_target = RegistryTarget::for_scope(Scope::Machine);
+    let user_target = RegistryTarget::for_scope(Scope::User);
+    let chrome_subkey = machine_target.browser_subkey(BrowserKind::Chrome);
+    let edge_subkey = machine_target.browser_subkey(BrowserKind::Edge);
+    let brave_subkey = machine_target.browser_subkey(BrowserKind::Brave);
+
+    let status_machine = StatusArgs {
+        scope: StatusScope::Machine,
+        extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
+        ping: false,
+        pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+        json: false,
+    };
+
+    // (a) status --scope machine MUST probe Wow6464 when Wow6432 returns ChromiumReadFallback.
+    let ops = MockRegistryViewOps::default();
+    let long_raw = r"%LEDR_LONG_ROOT%\com.localedr.bridge.json".to_string();
+    let long_err = format!(
+        "expanded REG_EXPAND_SZ exceeds {CHROMIUM_READ_VALUE_MAX_UTF16_UNITS} UTF-16 units"
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::ChromiumReadFallback {
+            resolved_path: Some(format!(r"C:\{}\com.localedr.bridge.json", "a".repeat(1060))),
+            raw: long_raw.clone(),
+            error: long_err.clone(),
+        },
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(m64_display.clone()),
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::ChromiumReadFallback {
+            resolved_path: None,
+            raw: long_raw.clone(),
+            error: long_err.clone(),
+        },
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::EmptyString,
+    );
+    ops.set_entry(
+        Scope::Machine,
+        &brave_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::ChromiumReadFallback {
+            resolved_path: Some(format!(r"C:\{}\com.localedr.bridge.json", "b".repeat(1060))),
+            raw: long_raw.clone(),
+            error: long_err.clone(),
+        },
+    );
+
+    let report = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &ops,
+    )
+    .expect("status with ChromiumReadFallback");
+    let calls = ops.take_probe_calls();
+    assert_eq!(
+        calls,
+        vec![
+            (Scope::Machine, chrome_subkey.clone(), Some(RegWow64View::Wow6432)),
+            (Scope::Machine, chrome_subkey.clone(), Some(RegWow64View::Wow6464)),
+            (Scope::Machine, edge_subkey.clone(), Some(RegWow64View::Wow6432)),
+            (Scope::Machine, edge_subkey.clone(), Some(RegWow64View::Wow6464)),
+            (Scope::Machine, brave_subkey.clone(), Some(RegWow64View::Wow6432)),
+            (Scope::Machine, brave_subkey.clone(), Some(RegWow64View::Wow6464)),
+        ],
+        "Wow6464 MUST be probed when Wow6432 returns ChromiumReadFallback"
+    );
+
+    let chrome_status = &report.scopes[0].browsers[0];
+    assert!(chrome_status.registered);
+    assert_eq!(chrome_status.registry_view.as_deref(), Some("wow64-64"));
+    assert_eq!(chrome_status.manifest_path.as_deref(), Some(m64_display.as_str()));
+    assert!(chrome_status.manifest.as_ref().is_some_and(|v| v.valid));
+
+    let edge_status = &report.scopes[0].browsers[1];
+    assert!(edge_status.registered);
+    assert_eq!(edge_status.registry_view.as_deref(), Some("wow64-64"));
+    assert_eq!(edge_status.manifest_path, None);
+    assert!(!edge_status.manifest.as_ref().unwrap().valid);
+
+    let brave_status = &report.scopes[0].browsers[2];
+    assert!(brave_status.registered);
+    assert_eq!(brave_status.registry_view.as_deref(), Some("wow64-32"));
+    assert_eq!(brave_status.manifest_path.as_deref(), Some(long_raw.as_str()));
+    let brave_manifest = brave_status.manifest.as_ref().unwrap();
+    assert!(!brave_manifest.valid);
+    assert_eq!(brave_manifest.path, long_raw);
+    assert_eq!(brave_manifest.error.as_deref(), Some(long_err.as_str()));
+
+    // (b) Remaining ChromiumReadFallback { resolved_path: Some(shared) } and { resolved_path: None }
+    //     both protect a shared manifest from deletion during unregister.
+    let ops_unreg = MockRegistryViewOps::default();
+    ops_unreg.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(m64_display.clone()),
+    );
+    ops_unreg.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::ChromiumReadFallback {
+            resolved_path: Some(m64_display.clone()),
+            raw: long_raw.clone(),
+            error: long_err.clone(),
+        },
+    );
+    let unreg_chrome = UnregisterArgs {
+        scope: Scope::Machine,
+        browsers: vec![BrowserKind::Chrome],
+        manifest_dir: Some(manifest_dir.clone()),
+        keep_uri: true,
+        json: false,
+    };
+    let res_resolved = run_unregister_with_ops(
+        &unreg_chrome,
+        &machine_target,
+        Some(&user_target),
+        &ops_unreg,
+    )
+    .expect("unregister chrome while edge holds ChromiumReadFallback resolved_path");
+    assert!(res_resolved.browsers[0].removed);
+    assert!(
+        !res_resolved.manifest_removed,
+        "ChromiumReadFallback with resolved_path matching shared manifest must protect it"
+    );
+    assert!(m64_path.is_file());
+
+    // Fail-closed when resolved_path is None (expansion failed or unresolved token > 1024 units).
+    ops_unreg.set_entry(
+        Scope::Machine,
+        &chrome_subkey,
+        Some(RegWow64View::Wow6464),
+        NativeHostRegProbe::Present(m64_display),
+    );
+    ops_unreg.set_entry(
+        Scope::Machine,
+        &edge_subkey,
+        Some(RegWow64View::Wow6432),
+        NativeHostRegProbe::ChromiumReadFallback {
+            resolved_path: None,
+            raw: long_raw.clone(),
+            error: long_err,
+        },
+    );
+    let res_none = run_unregister_with_ops(
+        &unreg_chrome,
+        &machine_target,
+        Some(&user_target),
+        &ops_unreg,
+    )
+    .expect("unregister chrome while edge holds ChromiumReadFallback fail-closed");
+    assert!(res_none.browsers[0].removed);
+    assert!(
+        !res_none.manifest_removed,
+        "ChromiumReadFallback with resolved_path=None must fail-closed and protect shared manifest"
+    );
+    assert!(m64_path.is_file());
+
+    // Unregistering Edge with resolved_path=None preserves raw without attempting to delete raw path.
+    let unreg_edge = UnregisterArgs {
+        scope: Scope::Machine,
+        browsers: vec![BrowserKind::Edge],
+        manifest_dir: Some(temp.path().join("unrelated-empty-dir")),
+        keep_uri: true,
+        json: false,
+    };
+    let res_edge = run_unregister_with_ops(
+        &unreg_edge,
+        &machine_target,
+        Some(&user_target),
+        &ops_unreg,
+    )
+    .expect("unregister edge with ChromiumReadFallback resolved_path=None");
+    assert!(res_edge.browsers[0].removed);
+    assert_eq!(res_edge.browsers[0].manifest_path.as_deref(), Some(long_raw.as_str()));
+    assert!(!res_edge.manifest_removed);
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_26_real_win32_chromium_1024_utf16_boundary_and_long_expand_unregister() {
+    use crate::setup::win_reg_ops;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE, REG_EXPAND_SZ, REG_SZ};
+    use winreg::{RegKey, RegValue};
+
+    fn encode_reg_string(s: &str, vtype: winreg::enums::RegType) -> RegValue<'static> {
+        let bytes: Vec<u8> = s
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        RegValue {
+            bytes: bytes.into(),
+            vtype,
+        }
+    }
+
+    struct EnvVarGuard {
+        names: Vec<String>,
+    }
+    impl EnvVarGuard {
+        fn set(&mut self, name: &str, value: &str) {
+            std::env::set_var(name, value);
+            self.names.push(name.to_string());
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for name in &self.names {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    let pid = std::process::id();
+    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let clsid_subkey = format!(
+        r"Software\Classes\CLSID\{{LocalEDR-Test-Bridge26-{pid}-{seq}}}"
+    );
+    let prefix = format!(r"Software\LocalEDR-Test\Bridge26-{pid}-{seq}");
+
+    struct RegCleanup {
+        prefix: String,
+        clsid_subkey: String,
+    }
+    impl Drop for RegCleanup {
+        fn drop(&mut self) {
+            let user = RegistryTarget {
+                scope: Scope::User,
+                key_prefix: None,
+            };
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(&user, &self.prefix, None);
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(
+                &user,
+                &self.clsid_subkey,
+                Some(RegWow64View::Wow6432),
+            );
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(
+                &user,
+                &self.clsid_subkey,
+                Some(RegWow64View::Wow6464),
+            );
+        }
+    }
+    let _reg_cleanup = RegCleanup {
+        prefix: prefix.clone(),
+        clsid_subkey: clsid_subkey.clone(),
+    };
+    let mut env_guard = EnvVarGuard { names: Vec::new() };
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let user_plain = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: None,
+    };
+
+    let (k64, _) = hkcu
+        .create_subkey_with_flags(&clsid_subkey, KEY_WRITE | win_reg_ops::KEY_WOW64_64KEY)
+        .unwrap();
+    let val64 = r"C:\ProgramData\LocalEDR\native-messaging\win32-b26-64.json";
+    k64.set_value("", &val64).unwrap();
+
+    let (k32, _) = hkcu
+        .create_subkey_with_flags(&clsid_subkey, KEY_WRITE | win_reg_ops::KEY_WOW64_32KEY)
+        .unwrap();
+
+    // 1) Boundary on REG_SZ: 1023 chars + NUL = 1024 UTF-16 units fits -> Present (stops fallback);
+    //    1024 chars + NUL = 1025 UTF-16 units exceeds limit -> ChromiumReadFallback (falls back to 64-bit).
+    let exact_1023 = format!(
+        r"C:\{}\m.json",
+        "x".repeat(CHROMIUM_READ_VALUE_MAX_UTF16_UNITS - 1 - 10)
+    );
+    assert_eq!(exact_1023.encode_utf16().count() + 1, CHROMIUM_READ_VALUE_MAX_UTF16_UNITS);
+    k32.set_raw_value("", &encode_reg_string(&exact_1023, REG_SZ))
+        .unwrap();
+    let probe_sz_fit =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert_eq!(probe_sz_fit, NativeHostRegProbe::Present(exact_1023.clone()));
+    assert!(probe_sz_fit.stops_wow64_fallback());
+
+    let over_1024 = format!("{exact_1023}a");
+    assert_eq!(
+        over_1024.encode_utf16().count() + 1,
+        CHROMIUM_READ_VALUE_MAX_UTF16_UNITS + 1
+    );
+    k32.set_raw_value("", &encode_reg_string(&over_1024, REG_SZ))
+        .unwrap();
+    let probe_sz_over =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert!(matches!(
+        &probe_sz_over,
+        NativeHostRegProbe::ChromiumReadFallback {
+            resolved_path: Some(p),
+            raw,
+            ..
+        } if p == &over_1024 && raw == &over_1024
+    ));
+    assert!(!probe_sz_over.stops_wow64_fallback());
+    assert_eq!(
+        select_effective_hklm_probe(
+            probe_sz_over,
+            win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        ),
+        (
+            NativeHostRegProbe::Present(val64.to_string()),
+            Some(RegWow64View::Wow6464)
+        )
+    );
+
+    // 2) Boundary on REG_EXPAND_SZ: expanded 1024 UTF-16 units incl. NUL -> Present;
+    //    expanded > 1024 UTF-16 units incl. NUL -> ChromiumReadFallback { resolved_path: Some(..) }.
+    let var_fit = format!("LEDR_B26_FIT_{pid}_{seq}");
+    let fit_prefix = r"C:\".to_string() + &"f".repeat(CHROMIUM_READ_VALUE_MAX_UTF16_UNITS - 1 - 10);
+    env_guard.set(&var_fit, &fit_prefix);
+    let raw_fit = format!("%{var_fit}%\\m.json");
+    let expected_fit = format!("{fit_prefix}\\m.json");
+    assert_eq!(
+        expected_fit.encode_utf16().count() + 1,
+        CHROMIUM_READ_VALUE_MAX_UTF16_UNITS
+    );
+    k32.set_raw_value("", &encode_reg_string(&raw_fit, REG_EXPAND_SZ))
+        .unwrap();
+    assert_eq!(
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432)),
+        NativeHostRegProbe::Present(expected_fit)
+    );
+
+    let var_over = format!("LEDR_B26_OVER_{pid}_{seq}");
+    let over_prefix = format!("{fit_prefix}z");
+    env_guard.set(&var_over, &over_prefix);
+    let raw_over = format!("%{var_over}%\\m.json");
+    let expected_over = format!("{over_prefix}\\m.json");
+    assert_eq!(
+        expected_over.encode_utf16().count() + 1,
+        CHROMIUM_READ_VALUE_MAX_UTF16_UNITS + 1
+    );
+    k32.set_raw_value("", &encode_reg_string(&raw_over, REG_EXPAND_SZ))
+        .unwrap();
+    let probe_expand_over =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert!(matches!(
+        &probe_expand_over,
+        NativeHostRegProbe::ChromiumReadFallback {
+            resolved_path: Some(p),
+            raw,
+            ..
+        } if p == &expected_over && raw == &raw_over
+    ));
+    assert_eq!(
+        select_effective_hklm_probe(
+            probe_expand_over,
+            win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6464)),
+        ),
+        (
+            NativeHostRegProbe::Present(val64.to_string()),
+            Some(RegWow64View::Wow6464)
+        )
+    );
+
+    // Expanded > 1024 units WITH an unresolved token -> resolved_path is None (fail-closed).
+    let raw_over_unres = format!("%{var_over}%\\%LEDR_MISSING_B26_{pid}_{seq}%\\m.json");
+    k32.set_raw_value("", &encode_reg_string(&raw_over_unres, REG_EXPAND_SZ))
+        .unwrap();
+    let probe_over_unres =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert!(matches!(
+        &probe_over_unres,
+        NativeHostRegProbe::ChromiumReadFallback {
+            resolved_path: None,
+            raw,
+            ..
+        } if raw == &raw_over_unres
+    ));
+
+    // 3) Isolated HKCU end-to-end: Edge has a real Win32 REG_EXPAND_SZ whose expanded path
+    //    exceeds 1,050 UTF-16 units and resolves (via `.\` segments collapsed by
+    //    `parse_local_drive_path` -> `query_file_identity`) to the shared manifest on disk.
+    //    Unregistering Chrome MUST preserve the shared manifest file on disk.
+    let temp = TempDirGuard::new("ledr-bridge-nm-b26");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+    let m = build_manifest(&fake_bridge, DEFAULT_CHROME_EXTENSION_ID).unwrap();
+
+    let isolated_user = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: Some(prefix),
+    };
+    let manifest_dir = temp.path().join("nm-user");
+    let shared_manifest = manifest_dir.join(manifest_filename_for(Scope::User, BrowserKind::Chrome));
+    write_manifest_atomic(&shared_manifest, &m).unwrap();
+    let shared_display = crate::manifest::normalize_display_path(&shared_manifest);
+    let manifest_dir_display = crate::manifest::normalize_display_path(&manifest_dir);
+
+    let long_dir_var = format!("LEDR_B26_SHARED_DIR_{pid}_{seq}");
+    let mut padded_dir = manifest_dir_display;
+    while padded_dir.encode_utf16().count() < 1050 {
+        padded_dir.push_str(r"\.");
+    }
+    env_guard.set(&long_dir_var, &padded_dir);
+    let edge_long_expand = format!(
+        "%{long_dir_var}%\\{}",
+        manifest_filename_for(Scope::User, BrowserKind::Chrome)
+    );
+
+    let chrome_key = isolated_user.browser_subkey(BrowserKind::Chrome);
+    let edge_key = isolated_user.browser_subkey(BrowserKind::Edge);
+    win_reg_ops::ensure_default_sz(&isolated_user, &chrome_key, None, &shared_display).unwrap();
+    let (edge_reg, _) = hkcu.create_subkey_with_flags(&edge_key, KEY_WRITE).unwrap();
+    edge_reg
+        .set_raw_value("", &encode_reg_string(&edge_long_expand, REG_EXPAND_SZ))
+        .unwrap();
+
+    let edge_probe = win_reg_ops::probe_default_sz(&isolated_user, &edge_key, None);
+    match &edge_probe {
+        NativeHostRegProbe::ChromiumReadFallback {
+            resolved_path: Some(expanded),
+            raw,
+            ..
+        } => {
+            assert_eq!(raw, &edge_long_expand);
+            assert!(
+                expanded.encode_utf16().count() + 1 > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS,
+                "expanded path must exceed Chromium 1,024 UTF-16 unit limit"
+            );
+        }
+        other => panic!("expected ChromiumReadFallback with resolved_path, got {other:?}"),
+    }
+
+    let unreg_chrome = UnregisterArgs {
+        scope: Scope::User,
+        browsers: vec![BrowserKind::Chrome],
+        manifest_dir: Some(manifest_dir),
+        keep_uri: true,
+        json: false,
+    };
+    let res = run_unregister_with(&unreg_chrome, &isolated_user, None)
+        .expect("unregister chrome while edge has >1050-unit REG_EXPAND_SZ to shared manifest");
+    assert!(res.browsers[0].removed);
+    assert!(
+        !res.manifest_removed,
+        "shared manifest MUST NOT be deleted when Edge references it via >1024-unit REG_EXPAND_SZ"
     );
     assert!(shared_manifest.is_file());
 }

@@ -7,8 +7,8 @@
 
 | ID | 種別 | 関連 Phase | 概要 | 対応予定 |
 | :--- | :--- | :--- | :--- | :--- |
-| `FU-P3-01` | 副次最適化 | Phase 3 | `merge_domain_hints_prioritized` の満杯 32 件時に起きる非許可同居ヒントの再挿入抑制 | 次回 `crates/ledr-daemon/src/firewall/` 改修時または後続整備 PR（未着手） |
-| `FU-P4-01` | 副次改善 | Phase 4 | `ledr-bridge-nm` の `HKLM` 登録および確認における 32 ビットレジストリビュー（`KEY_WOW64_32KEY`）対応 | 次回 `crates/ledr-bridge-nm/` 改修時または後続整備 PR（未着手、`--scope machine` 必須化時は先行検討） |
+| `FU-P3-01` | 副次最適化 | Phase 3 | `merge_domain_hints_prioritized` の満杯 32 件時に起きる非許可同居ヒントの再挿入抑制 | 実装および単体境界テスト完了済み（本ブランチで対応、`main` マージ待ち） |
+| `FU-P4-01` | 副次改善 | Phase 4 | `ledr-bridge-nm` の `HKLM` 登録および確認における 32 ビットおよび 64 ビットレジストリビュー（`KEY_WOW64_32KEY` / `KEY_WOW64_64KEY`）対応 | 実装および非特権単体テスト完了済み（実 `HKLM` 書込と削除および実ブラウザ読込は `FU-E2E-02` 実機 E2E 対象） |
 | `FU-E2E-01` | 実機 E2E 検証 | Phase 2、Phase 3 | Windows 10 または Windows 11 クライアント SKU 管理者環境での実機検証 | 最新 `main` 上の最終実機 E2E 検証 PR（PR #34、#35、#36、#38、#39、#41、#44 マージ済み） |
 | `FU-E2E-02` | 実機 E2E 検証 | Phase 4 | Windows 10 または Windows 11 クライアント SKU 上での Chrome 拡張、Native Messaging、MOTW、および UI 終了の実機検証 | 最新 `main` 上の最終実機 E2E 検証 PR（PR #34、#39、#41 マージ済み） |
 | `FU-E2E-03` | 性能最適化 | Phase 3、Phase 4 | `E2E-PERF-01` 超過に対する Stage 1〜3 最適化（`ledr-auth-helper` 分離、LRU 上限、非系譜解放、SQLite reader 縮小、`PrivateWorkingSetSize <= 20.0 MB` 基準併記） | PR #39（`7cdb445`）で `main` マージ済み、PR #40（`9e4a3a8`）でルール昇格済み（最終実機 E2E で再確認） |
@@ -25,7 +25,7 @@
 
 残る必須工程は最新 `main` 上で統合実機 E2E（[e2e-test-runbook.md](e2e-test-runbook.md) のルート 1：`FU-E2E-01` および `FU-E2E-02`、ホスト ETW 競合を解消した状態での `E2E-P3-01`、`E2E-P3-03`、および終了済み中間親越しの孫プロセス凍結確認を含む）を実施することである。
 全必須項目の通過を確認した後に、[implementation-plan.md](implementation-plan.md) の未完了チェックリスト 3 件を `[x]` へ更新する。
-なお、未着手の副次改善 2 件のうち `FU-P4-01` は、`--scope machine` を Phase 4 実機 E2E チェックリスト完了の必須条件に含める場合は先行して対応を検討し、任意差異として切り分ける場合は `FU-P3-01` と同じく後続整備 PR へ回す。
+なお、副次改善 2 件（`FU-P3-01` と `FU-P4-01`）は本ブランチでコード改修および合成自動テストまで完了しており、実 `HKLM\SOFTWARE\WOW6432Node\...` への管理者権限書込と削除および実ブラウザでの Native Messaging 読み込み確認のみを `FU-E2E-02` 実機 E2E の対象として残している。
 
 本書で参照する主な識別子と用語の意味を以下に補う。
 
@@ -39,48 +39,37 @@
 
 ### 対象ファイル
 
-- 残存挙動の実装箇所：[firewall/hints.rs](../crates/ledr-daemon/src/firewall/hints.rs#L45-L85)（`merge_domain_hints_prioritized`、Loop 1 は [L52-L67](../crates/ledr-daemon/src/firewall/hints.rs#L52-L67)、Loop 2 は [L69-L84](../crates/ledr-daemon/src/firewall/hints.rs#L69-L84)）
+- 実装箇所：[firewall/hints.rs](../crates/ledr-daemon/src/firewall/hints.rs#L45-L88)（`merge_domain_hints_prioritized`）
+- 境界テスト：[firewall/tests.rs](../crates/ledr-daemon/src/firewall/tests.rs#L2221-L2287)（`FU-P3-01-01` および `FU-P3-01-02`）
 - 主訴を解消した保護ヘルパ：[domain_policy.rs](../crates/ledr-daemon/src/engine/domain_policy.rs#L198-L221)（`extend_authorizing_hints_from_existing_permit`）
 - 保護ヘルパの呼び出し 4 経路：[resolve_alert_with_outcome](../crates/ledr-daemon/src/engine/alerts.rs#L579-L586)（`AllowPermanent`）、[prematerialize_domain_wfp_filters](../crates/ledr-daemon/src/engine/wfp_premat.rs#L354-L361)、[handle_ambiguous_wfp_drop](../crates/ledr-daemon/src/engine/wfp_drops.rs#L1172-L1179)、および [evaluate_and_handle_outbound_connect](../crates/ledr-daemon/src/engine/outbound.rs#L729-L736)
-- 関連する回帰テスト：[cached_permit.rs](../crates/ledr-daemon/src/engine/tests/cached_permit.rs#L383-L541)（DNS 履歴退避後かつ非許可同居ヒントによる満杯 32 件超過時の既存許可根拠維持を検証する `DAEMON-P3-49A` §7）と [phase3_daemon.rs](../crates/ledr-daemon/tests/phase3_daemon.rs#L8136-L8648)（共有 IP 移行時の Permit 維持と安全境界を E2E 検証する `DAEMON-P3-48`）
+- 関連する回帰テスト：[cached_permit.rs](../crates/ledr-daemon/src/engine/tests/cached_permit.rs#L383-L541)（`DAEMON-P3-49A` §7）と [phase3_daemon.rs](../crates/ledr-daemon/tests/phase3_daemon.rs#L8136-L8648)（`DAEMON-P3-48`）
 
 ### 背景と出典
 
 本件は Phase 3 の PR #5（ブランチ `phase-3-wfp-firewall`、マージコミット `3fe1031` / `3fe1031fc3692beab77e0eeb531f27e6e56c888e`）に対する Review #40 で指摘された事項から切り出した副次申し送りである。
 出典のレビュースレッドは `PRRT_kwDOVyjVyM65hO2j`（指摘 ID `BUG_pr-review-job-23fb353b86b648aaa95062ec74d199a4_0001`、指摘対象コミット `4e11596`）であり、満杯の 32 件 Permit フィルタを更新する際のヒント退避順序が論点となった。
 
-### 現行の保証範囲
+### 実装内容と保証範囲
 
-解消済みの主訴と未変更の残存挙動を区別して以下に記す。
-
-#### 解消済み事項
+#### 主訴の先行解消（PR #5 内コミット `3666680`）
 
 Review #40 の主訴だった「満杯 32 件の Permit フィルタを更新するときに有効な既存許可根拠が消える問題」は、コミット `3666680`（`366668061c4ddd06a6a269d40a0b1c5860d7af51`）で解消した。
-具体的には [domain_policy.rs](../crates/ledr-daemon/src/engine/domain_policy.rs#L198-L221) に `extend_authorizing_hints_from_existing_permit` を追加し、Permit の登録と更新を行う 4 経路すべて（[alerts.rs#L579-L586](../crates/ledr-daemon/src/engine/alerts.rs#L579-L586)、[wfp_premat.rs#L354-L361](../crates/ledr-daemon/src/engine/wfp_premat.rs#L354-L361)、[wfp_drops.rs#L1172-L1179](../crates/ledr-daemon/src/engine/wfp_drops.rs#L1172-L1179)、[outbound.rs#L729-L736](../crates/ledr-daemon/src/engine/outbound.rs#L729-L736)）で既存の有効な許可ドメインを事前に保護集合へ組み込んだ。
+具体的には [domain_policy.rs](../crates/ledr-daemon/src/engine/domain_policy.rs#L198-L221) に `extend_authorizing_hints_from_existing_permit` を追加し、Permit の登録と更新を行う 4 経路すべてで既存の有効な許可ドメインを事前に保護集合へ組み込んだ。
+一方、許可ヒント単体で 32 件を超過した場合は上限維持のため古い許可ヒントが保護対象から外れて先入れ先出しで退避される。
 
-この修正により、保護対象となる許可ヒントの総数が上限 `MAX_DOMAIN_HINTS_PER_FILTER`（32 件）以内である限り、非許可の同居ヒントによって上限を超過しても、DNS 履歴から退避された後の既存許可根拠は押し出されない。
-一方、`ensure_ip_permit_for_domain_hints_prioritized` の許可ヒント正規化（[firewall/domain_policy.rs](../crates/ledr-daemon/src/firewall/domain_policy.rs#L142-L145) が呼ぶ `merge_domain_hint` の [firewall/hints.rs#L25-L36](../crates/ledr-daemon/src/firewall/hints.rs#L25-L36)）および `merge_domain_hints_prioritized` の Loop 1（[firewall/hints.rs#L56-L65](../crates/ledr-daemon/src/firewall/hints.rs#L56-L65)）では、許可ヒント単体で 32 件を超過した場合に上限維持のため古い許可ヒントが保護対象から外れて先入れ先出しで退避される。
-非許可の同居ヒントによる満杯 32 件超過かつ DNS 履歴退避後に既存許可根拠が維持される条件は、単体結合テスト `DAEMON-P3-49A` §7（[cached_permit.rs](../crates/ledr-daemon/src/engine/tests/cached_permit.rs#L383-L541)）で検証済みである。
-あわせて、コミット `2c05747`（`2c0574749db91ae07bbdc8782c6b07dd28127c2a`）では共有 IP 移行時の Permit 維持と安全境界（Review #38 / `AUD-P3-01`）を E2E 検証する統合回帰テスト `DAEMON-P3-48`（[phase3_daemon.rs](../crates/ledr-daemon/tests/phase3_daemon.rs#L8136-L8648)）を追加した。
-`3666680` に対する Devin Review #41（`2026-11-19T14:09:13Z`）および `2c05747` に対する最終 Devin Review（`2026-11-19T14:35:04Z`）はいずれも `0 new potential issues` を報告した。
+#### 残存していた同居ヒント再挿入の解消（`FU-P3-01` 完了）
 
-#### 未変更の残存挙動
+`merge_domain_hints_prioritized`（[firewall/hints.rs](../crates/ledr-daemon/src/firewall/hints.rs#L45-L88)）の Loop 1（`authorizing_hints`）実行中に `target` から退避した要素を `evicted_in_batch: HashSet<String>` へ記録し、同一バッチの Loop 2（`cohosted_hints`）では `evicted_in_batch` に含まれるヒントの再挿入をスキップするように修正した。
+退避が発生しない通常経路では `evicted_in_batch` はヒープ確保を行わずに通過する。
 
-[firewall/hints.rs](../crates/ledr-daemon/src/firewall/hints.rs#L45-L85) の `merge_domain_hints_prioritized` では、`target` が上限 `MAX_DOMAIN_HINTS_PER_FILTER`（32 件）に達した状態で Loop 1（[L52-L67](../crates/ledr-daemon/src/firewall/hints.rs#L52-L67)）が新しい許可ヒントを追加するとき、先頭の非保護スロットに置かれた既存非許可同居ドメインを 1 件退避する。
-同じ呼び出しの `cohosted_hints` にその退避済みドメインが含まれると、Loop 2（[L69-L84](../crates/ledr-daemon/src/firewall/hints.rs#L69-L84)）は更新後の `target` に該当要素がないため新規扱いとして末尾へ再挿入する。
-この再挿入によって、同じバッチ内で別の非許可同居ヒントが 1 件余分に押し出される挙動が残っている。
+- **境界テスト `FU-P3-01-01`**（[firewall/tests.rs](../crates/ledr-daemon/src/firewall/tests.rs#L2264-L2271)）：満杯 32 件の `target`（`auth0` と `c00`〜`c30`）へ `authorizing_hints = ["auth0", "auth1"]` と `cohosted_hints = ["c00", "c01"]` を渡したとき、`c00` が再挿入されず `c01`〜`c30` の 30 件がすべて保持されることを直接呼び出しおよび `WfpRuleManager::ensure_ip_permit_for_domain_hints_prioritized` 経由で検証した。
+- **境界テスト `FU-P3-01-02`**（[firewall/tests.rs](../crates/ledr-daemon/src/firewall/tests.rs#L2277-L2287)）：同じ満杯条件で `cohosted_hints = ["c00", "c99"]` を渡したとき、`c00` は再挿入されず、新規の `c99` だけが `c01` を 1 件押し出して末尾へ追加されることを検証した。
+- 既存の `DAEMON-P3-48`、`DAEMON-P3-49A`、保護ヒント 32 件以内の維持、`deny-overrides-allow`、`SEC_0001`、および `SEC_0002` はすべて影響なく維持される。
 
-呼び出し側の 4 経路が既存の有効な許可根拠を保護集合へ組み込み、Loop 2 は保護対象スロットを退避しないため、本挙動は許可ヒント上限 32 件以内の既存許可根拠保護、deny-overrides-allow、`SEC_0001`、および `SEC_0002` のセキュリティ境界へ影響しない。
-非許可同居ヒント同士のローテーション効率にとどまる低優先度の内部改善余地として扱う。
+### 残課題
 
-### 改善方針
-
-`merge_domain_hints_prioritized` の開始時点で `target` に含まれていた非保護ヒントの集合を保持し、Loop 1 で退避された既存非許可同居ヒントを同一バッチの Loop 2 で新規要素として再挿入しないように修正する。
-あわせて、満杯 32 件の `target` へ新規許可ヒントと既存非許可同居ヒントを同時に渡したときに余分な 1 件の押し出しが起きないことを検証する単体境界テストを `crates/ledr-daemon/src/firewall/tests.rs` へ追加する。
-
-### 対応予定タイミング
-
-次回の `crates/ledr-daemon/src/firewall/` 改修時、または Phase 4 以降の保守整備 PR で対応する。
+本件に関するコード上の残課題はない。
 
 ## FU-E2E-01 Windows 10 または Windows 11 クライアント SKU での実機 E2E 検証
 
@@ -182,7 +171,7 @@ Phase 4 は [decision-records.md](decision-records.md) の `L-17`（3 PR 分割�
 #### 現行の完了基準と将来の見直し論点
 
 - **現行基準**：[e2e-test-runbook.md](e2e-test-runbook.md#L1847-L1848) のルート別完了判定基準では、`--scope machine`（`HKLM` 登録と復元）および Microsoft Edge 実ブラウザでの拡張動作確認は未実施差異として PR 本文へ切り分け記録できる任意扱いとしている。
-- **将来の見直し論点**：独立した実機 E2E 検証 PR の着手時にこれらを [implementation-plan.md](implementation-plan.md) の `[x]` 更新必須条件へ引き上げる方針変更を行う場合は、必須化とあわせて `FU-P4-01` の 32 ビットレジストリビュー対応を先行実施するかどうかを判断する。
+- **将来の見直し論点**：独立した実機 E2E 検証 PR の着手時にこれらを [implementation-plan.md](implementation-plan.md) の `[x]` 更新必須条件へ引き上げる方針変更を行う場合は、実 `HKLM\SOFTWARE\WOW6432Node\...` への登録と削除および実ブラウザでの Native Messaging 読み込み確認（`FU-P4-01` の実装に対する実機検証）を必須項目へ組み込むかどうかを判断する。
 
 ### 対応予定タイミング
 
@@ -194,25 +183,30 @@ PR 4C は PR #28（`331602d`）で `main` へマージ済みであり、PR #34�
 
 ### 対象ファイル
 
-- 該当実装箇所：[setup.rs](../crates/ledr-bridge-nm/src/setup.rs#L1230-L1402)（`root_key`、`ensure_default_sz`、`delete_subkey_tree_idempotent`、`read_default_sz`、`read_native_hosts_launch_directly_policy`）
+- CLI 実装箇所：[setup.rs](../crates/ledr-bridge-nm/src/setup.rs#L136-L2415)（`RegWow64View`、`NativeHostRegProbe`、`select_effective_hklm_probe`、`RegistryViewOps`、`win_reg_ops::delete_subkey_tree_idempotent`、および `run_setup_with_ops` / `run_unregister_with_ops` / `run_status_with_ops`）
+- 単体テスト箇所：[crates/ledr-bridge-nm/src/tests.rs](../crates/ledr-bridge-nm/src/tests.rs#L2703-L3376)（`bridge_19`、`bridge_20`、`bridge_21`）
+- UI 診断注記同期：[defense_status.rs](../apps/ledr-ui/src/defense_status.rs#L109)、[apps/ledr-ui/src/tests.rs](../apps/ledr-ui/src/tests.rs#L2270-L2274)、および [phase4_ui.test.mjs](../apps/ledr-ui/js-tests/phase4_ui.test.mjs#L578-L638)
 
 ### 背景と出典
 
 本件は PR #28（ブランチ `phase-4c-ui-browser-integration`、コミット `41f12a0`）に対する Devin Review スレッド `PRRT_kwDOVyjVyM66W9C2`（`apps/ledr-ui` 診断側の `KEY_WOW64_32KEY` 未対応指摘）を一次照合した際に確認した PR 4C 排他範囲外の残件である。
-`crates/ledr-bridge-nm` は PR #26（`6bb8bd3`）で `main` へマージ済みのため、PR 4C の排他境界を保って本書へ切り出した。
+`crates/ledr-bridge-nm` は PR #26（`6bb8bd3`）で `main` へマージ済みのため、PR 4C の排他境界を保って本書へ切り出していた。
 
-### 現行挙動と課題
+### 実装内容と保証範囲
 
-x64 Windows 上の `ledr-bridge-nm` は `RegKey::predef(HKEY_LOCAL_MACHINE)` に対して既定ビュー（64 ビットビュー）のみで `open_subkey_with_flags(..., KEY_READ)`、`create_subkey`、および `delete_subkey_all` を実行している。
-一方、Windows 上の Chrome は Native Messaging Host を探す際に 32 ビットビュー（`KEY_WOW64_32KEY`）も参照するため、既存環境で 32 ビットビュー側に旧登録が残る場合や 32 ビットビューを対象にする場合は、`status` 確認や `setup` と `unregister` の整合に抜けが生じる余地がある。
+- **WOW64 対象境界の分離**：`KEY_WOW64_32KEY` と `KEY_WOW64_64KEY` の両ビュー操作は `Scope::Machine`（`HKLM`）の Native Messaging Host キー（`CHROME_NMH_SUBKEY`、`EDGE_NMH_SUBKEY`、`BRAVE_NMH_SUBKEY`）に限定し、`Scope::User`（`HKCU`）、`ledr://` URI スキーム（`Software\Classes\ledr`）、AUMID（`Software\Classes\AppUserModelId\LocalEDR.AlertUI`）、およびグループポリシー（`Software\Policies\...`）は従来どおり既定ビューのみを維持した。
+- **Win32 明示ビュー削除 FFI**：`winreg::RegKey::delete_subkey_all` が `KEY_WOW64_32KEY` を保持しない罠を避けるため、`advapi32.dll`（`kind = "raw-dylib"`、`modifiers = "+verbatim"`）から `RegOpenKeyExW`、`RegDeleteTreeW`、`RegDeleteKeyExW`、および `RegCloseKey` を直接呼び出して明示ビュー単位で冪等削除する構成とした。
+- **3 操作と View 3 の整合**：`status`、`setup --scope machine`、および `unregister --scope machine` を以下のとおり更新した。
+  - `status`：`NativeHostRegProbe` と純粋関数 `select_effective_hklm_probe` を導入し、[defense_status.rs](../apps/ledr-ui/src/defense_status.rs#L1278-L1351) と同じく 32 ビットビュー優先かつ `EmptyString` で 64 ビット側へのフォールバックを打ち切る判定を実装し、後方互換の任意フィールド `registry_view`（`wow64-32` または `wow64-64`）を出力するようにした。
+  - `setup --scope machine`：32 ビットビューと 64 ビットビューの双方へ同一マニフェストパスを冪等登録し、32 ビット側に残存した旧パスや空文字シャドーも修復する（案 A1）。
+  - `unregister --scope machine`：両ビューから既存登録パスを収集してサブキーを冪等削除し、共有マニフェスト削除前の参照検査（`any_browser_references_manifest_with`）も `HKLM` の 32 ビットビューと 64 ビットビュー双方を対象とした。
+- **UI 注記の同期**：[defense_status.rs](../apps/ledr-ui/src/defense_status.rs#L109) の `UNVERIFIED_CUSTOM_MANIFEST_MSG` および関連テストから、CLI `status` が 64 ビット既定ビューのみ参照する旨の旧注記を削除した。
+- **非特権自動テスト**：`RegistryViewOps` トレイトと `MockRegistryViewOps` を導入し、`select_effective_hklm_probe` 全境界組み合わせ（`bridge_19`）、`Scope::Machine` の登録、修復、レガシー削除、および他ブラウザ参照保護のモック検証（`bridge_20`）、ならびに `Scope::User` 隔離プレフィックス上の実 Win32 FFI 明示ビュー往復回帰（`bridge_21`）を追加した。
 
-### 改善方針
+### 未検証範囲と実機確認先
 
-`HKLM` スコープの Native Messaging Host 登録、確認（`status`）、および解除（`unregister`）について、対象ブラウザの検索順と整合するよう `KEY_WOW64_32KEY` と `KEY_WOW64_64KEY` の扱い（32 ビットビュー側の検出と必要に応じた登録または掃除）を設計し、単体テストを追加する。
-
-### 対応予定タイミング
-
-次回の `crates/ledr-bridge-nm/` 改修時、または Phase 4 以降の保守整備 PR で対応する。
+非特権の単体テストおよびモックレジストリ検証では、Windows 10/11 クライアント SKU の管理者権限下における実 `HKLM\SOFTWARE\WOW6432Node\...` への書込と削除、および実 Chrome / Edge での Native Messaging 読み込みは検証済みとみなさない。
+これらは後続の統合実機 E2E（`FU-E2E-02`）にて、`ledr-bridge-nm setup --scope machine` 後の両ビュー登録確認（`reg query HKLM\SOFTWARE\WOW6432Node\...` と `HKLM\SOFTWARE\...`）、`ledr-bridge-nm status --scope machine`、および `ledr-bridge-nm unregister --scope machine` 後の両ビュー消去として実機確認する。
 
 ## FU-E2E-03 E2E-PERF-01 の WorkingSet64 超過に対する原因分析とメモリ削減
 

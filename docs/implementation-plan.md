@@ -8,8 +8,8 @@
 
 [ledr_artifact.html](../ledr_artifact.html) は、全ファイル走査型の従来型アンチウイルスや常駐型 Electron GUI を排し、OS カーネルのイベント駆動通知、Rust 製常駐コアデーモン、組み込み SQLite WAL ストア、オンデマンド起動の Tauri v2 UI、および Chrome Manifest V3 拡張機能の連携によって CPU 負荷 1% 未満と常駐メモリ 10〜20 MB 以下の両立を目指している。
 
-設計レビューで抽出した要協議事項 A〜P は 2026-11-18 に、Phase 4 詳細設計の追加論点 5 件は 2026-11-21 に、性能改善 `FU-E2E-03` の追加論点 3 件は 2026-11-23 にユーザーが全推奨案を承認して確定した。
-確定した 24 件の仕様判断は [decision-records.md](decision-records.md) に保存しており、本計画書では決定内容や根拠を重複管理せず `決定記録 L-01` 〜 `決定記録 L-24` の ID で参照する。
+設計レビューで抽出した要協議事項 A〜P は 2026-11-18 に、Phase 4 詳細設計の追加論点 5 件は 2026-11-21 に、性能改善 `FU-E2E-03` の追加論点 3 件および IPC 呼び出し元認可の統一 1 件は 2026-11-23 にユーザーが全推奨案を承認して確定した。
+確定した 25 件の仕様判断は [decision-records.md](decision-records.md) に保存しており、本計画書では決定内容や根拠を重複管理せず `決定記録 L-01` 〜 `決定記録 L-25` の ID で参照する。
 
 | 決定 ID | 論点 | 計画書内の主な反映先 |
 | :--- | :--- | :--- |
@@ -37,6 +37,7 @@
 | `決定記録 L-22` | `AUTO-09` 読取専用 SQLite 接続の `cache_size` 縮小とアイドル時解放 | Layer 2 詳細設計、Layer 3 詳細設計 |
 | `決定記録 L-23` | Authenticode 署名検証の専用ワーカー分離とフェイルクローズ | Layer 1〜3 詳細設計（署名検証経路） |
 | `決定記録 L-24` | `E2E-PERF-01` 定常メモリ基準への `PrivateWorkingSetSize` 併記 | 前提と実行環境、実機検証（Track C） |
+| `決定記録 L-25` | 全 IPC コマンドへの呼び出し元バイナリ認可統一（`Ping` 除外） | Layer 2 詳細設計、Layer 4 詳細設計 |
 
 技術的な品質と安全性を確保するための改善 15 項目（`AUTO-01` 〜 `AUTO-15`）は、仕様の意図を変えない範囲で各層の設計へ織り込んでいる。
 
@@ -165,7 +166,7 @@ flowchart LR
 LocalEDR/
 ├── Cargo.toml                  # ワークスペース共通定義 (Phase 0 で凍結)
 ├── docs/
-│   ├── decision-records.md     # 確定仕様決定記録 L-01 〜 L-16
+│   ├── decision-records.md     # 確定仕様決定記録 L-01 〜 L-25
 │   ├── follow-up-notes.md      # 副次申し送り事項と実機 E2E 検証記録
 │   └── implementation-plan.md  # 本実装計画書
 ├── crates/
@@ -352,8 +353,8 @@ Worker 2 が担当する `crates/ledr-rules` と `crates/ledr-daemon` は、`Loc
 通知後 60 秒間（設定変更可）ユーザーから応答がない場合は、サスペンド状態を解除せず維持したままアラート状態を `EXPIRED_SUSPENDED` へ遷移させ、離席中の情報漏洩と編集データの自動強制終了の両方を防ぐ。
 
 Named Pipe（`\\.\pipe\localedr-ipc`）は作成時の DACL を `SYSTEM`、管理者、および対話ユーザーのみに絞る（`決定記録 L-09`）。
-さらにリクエスト受信時は `GetNamedPipeClientProcessId` で呼出元プロセスの実行パスを取得し、`ResolveAlert`、`UpsertRule`、`DeleteRule` 等の状態変更コマンドは管理者保護領域（`C:\Program Files\LocalEDR\ledr-ui.exe`）の正規署名またはハッシュ一致プロセスからのみ認可する（`決定記録 L-09`）。
-ブラウザ拡張からのレポート系コマンド（`ReportDownloadOrigin` 等）も同じく `C:\Program Files\LocalEDR\ledr-bridge-nm.exe` であることを検証し、管理操作への権限越境を防ぐ。
+開発バイパス無効時に `Ping` を除く読取や照会系を含む全 IPC コマンドを受信した際は、`GetNamedPipeClientProcessId` で呼出元プロセスの実行パスを取得し、`CallerAuthPolicy`（`Public`：`Ping`、`UiOnly`：`ResolveAlert`、`UpsertRule`、`DeleteRule` 等の状態変更系および `GetFlightRecorder`、`GetAlerts`、`ListRules`、`GetPipelineMetrics` 等の読取系、`BridgeOnly`：`ReportDownloadOrigin` と `ReportBrowserEvent`、`UiOrBridge`：`CheckDomainRisk`）に基づいて管理者保護領域（`C:\Program Files\LocalEDR\ledr-ui.exe` または `C:\Program Files\LocalEDR\ledr-bridge-nm.exe`）の正規署名またはハッシュ一致プロセスからのみ認可する（`決定記録 L-09`、`決定記録 L-25`）。
+このバイナリ照合における Authenticode 検証経路では、署名検証キャッシュを迂回する `inspect_uncached` を用いる（`決定記録 L-25`）。
 
 フィッシングドメイン判定のため、デーモンは 1 日 1 回公開 NRD フィード（登録 14 日以内）を取得してローカルキャッシュを構築し、ローカル DNS 履歴にない初見ドメイン判定および Punycode（`xn--`）と主要ブランド名との編集距離によるホモグラフ判定を提供する（`決定記録 L-14`）。
 サービス終了シグナルを受信した際は、3 秒以内にチャネル内の残件をフラッシュし、SQLite の `wal_checkpoint(TRUNCATE)` を完了させて終了する（`AUTO-10`）。
@@ -613,7 +614,7 @@ Phase 0 から Phase 4 までの全実装項目（Phase 4 は PR #25、PR #26、
 
 ### 現在地の確認方法
 
-実装を再開する際は、はじめに `main` ブランチの最新状態、本計画書の Phase 0〜4 チェックリストの `[x]` 完了状況、および [decision-records.md](decision-records.md) の `L-01` 〜 `L-24` を確認する。
+実装を再開する際は、はじめに `main` ブランチの最新状態、本計画書の Phase 0〜4 チェックリストの `[x]` 完了状況、および [decision-records.md](decision-records.md) の `L-01` 〜 `L-25` を確認する。
 
 ### ブランチ運用とマージ後の基準点更新ルール
 
@@ -632,7 +633,7 @@ ETW、WFP、Named Pipe DACL、`NtSuspendProcess`、`CreateProcessAsUser`、お�
 #### Phase 4 実機 Chrome E2E 検証（`FU-E2E-02`）用
 
 ```text
-docs/e2e-test-runbook.md（Track B および Track C）、docs/phase4-e2e-runbook.md、docs/follow-up-notes.md の FU-E2E-02、docs/decision-records.md（L-01〜L-24）、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU 環境で Phase 4 の実機 Chrome E2E 検証を実施し、検証結果と合否記録を独立した PR としてまとめてください。
+docs/e2e-test-runbook.md（Track B および Track C）、docs/phase4-e2e-runbook.md、docs/follow-up-notes.md の FU-E2E-02、docs/decision-records.md（L-01〜L-25）、および AGENTS.md に基づき、Windows 10 または Windows 11（x86_64）クライアント SKU 環境で Phase 4 の実機 Chrome E2E 検証を実施し、検証結果と合否記録を独立した PR としてまとめてください。
 ```
 
 #### Phase 2〜3 実機 E2E 検証（`FU-E2E-01`）用

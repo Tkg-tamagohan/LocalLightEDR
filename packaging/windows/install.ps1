@@ -35,7 +35,9 @@ function Ensure-NativeHelper {
         $code = @'
 using System;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 public static class LocalEdrInstallerNative
@@ -127,11 +129,132 @@ public static class LocalEdrInstallerNative
     {
         return MoveFileExW(path, null, MOVEFILE_DELAY_UNTIL_REBOOT);
     }
+
+    public static string QuoteWin32Argument(string arg)
+    {
+        if (string.IsNullOrEmpty(arg))
+        {
+            return "\"\"";
+        }
+        bool needsQuotes = false;
+        for (int i = 0; i < arg.Length; i++)
+        {
+            char c = arg[i];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '"')
+            {
+                needsQuotes = true;
+                break;
+            }
+        }
+        if (!needsQuotes)
+        {
+            return arg;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append('"');
+        int backslashes = 0;
+        for (int i = 0; i < arg.Length; i++)
+        {
+            char c = arg[i];
+            if (c == '\\')
+            {
+                backslashes++;
+            }
+            else if (c == '"')
+            {
+                sb.Append('\\', backslashes * 2 + 1);
+                sb.Append('"');
+                backslashes = 0;
+            }
+            else
+            {
+                if (backslashes > 0)
+                {
+                    sb.Append('\\', backslashes);
+                    backslashes = 0;
+                }
+                sb.Append(c);
+            }
+        }
+        if (backslashes > 0)
+        {
+            sb.Append('\\', backslashes * 2);
+        }
+        sb.Append('"');
+        return sb.ToString();
+    }
+
+    public static int RunProcess(string filePath, string arguments, out string stdOut, out string stdErr)
+    {
+        ProcessStartInfo psi = new ProcessStartInfo();
+        psi.FileName = filePath;
+        psi.Arguments = arguments ?? string.Empty;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+
+        StringBuilder outBuf = new StringBuilder();
+        StringBuilder errBuf = new StringBuilder();
+
+        using (Process proc = new Process())
+        {
+            proc.StartInfo = psi;
+            proc.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e)
+            {
+                if (e.Data != null)
+                {
+                    lock (outBuf) { outBuf.AppendLine(e.Data); }
+                }
+            };
+            proc.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
+            {
+                if (e.Data != null)
+                {
+                    lock (errBuf) { errBuf.AppendLine(e.Data); }
+                }
+            };
+            if (!proc.Start())
+            {
+                throw new InvalidOperationException("Failed to start process: " + filePath);
+            }
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+            proc.WaitForExit();
+            stdOut = outBuf.ToString();
+            stdErr = errBuf.ToString();
+            return proc.ExitCode;
+        }
+    }
 }
 '@
         Add-Type -TypeDefinition $code -Language CSharp
     }
     $script:NativeHelperLoaded = $true
+}
+
+function Invoke-NativeProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    Ensure-NativeHelper
+    $quotedArgs = New-Object System.Collections.Generic.List[string]
+    foreach ($arg in $Arguments) {
+        $quotedArgs.Add([LocalEdrInstallerNative]::QuoteWin32Argument($arg))
+    }
+    $argLine = $quotedArgs -join ' '
+    [string]$stdOut = ''
+    [string]$stdErr = ''
+    $exitCode = [LocalEdrInstallerNative]::RunProcess($FilePath, $argLine, [ref]$stdOut, [ref]$stdErr)
+    $combined = ($stdOut + "`n" + $stdErr).Trim()
+    return [pscustomobject]@{
+        ExitCode       = $exitCode
+        StdOut         = $stdOut
+        StdErr         = $stdErr
+        CombinedOutput = $combined
+        CommandLine    = $argLine
+    }
 }
 
 function Write-InstallLog {
@@ -247,10 +370,9 @@ function Invoke-IcaclsChecked {
         $argsList += '/grant:r'
         $argsList += $spec
     }
-    $output = & icacls.exe @argsList 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $detail = ($output | Out-String).Trim()
-        throw "icacls failed for '$TargetPath' (exit $LASTEXITCODE): $detail"
+    $res = Invoke-NativeProcess -FilePath 'icacls.exe' -Arguments $argsList
+    if ($res.ExitCode -ne 0) {
+        throw "icacls failed for '$TargetPath' (exit $($res.ExitCode)): $($res.CombinedOutput)"
     }
 }
 
@@ -357,11 +479,10 @@ function Wait-ForServiceStopped {
 
     if ($info.Status -ne 'StopPending') {
         Write-InstallLog -Level 'INFO' -Message "Stopping service '$Name' (current state: $($info.Status))."
-        $stopOut = & sc.exe stop $Name 2>&1
-        $rc = $LASTEXITCODE
+        $stopRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @('stop', $Name)
+        $rc = $stopRes.ExitCode
         if (($rc -ne 0) -and ($rc -ne 1062)) {
-            $detail = ($stopOut | Out-String).Trim()
-            throw "sc.exe stop $Name failed (exit $rc): $detail"
+            throw "sc.exe stop $Name failed (exit $rc): $($stopRes.CombinedOutput)"
         }
     }
 
@@ -398,11 +519,11 @@ function Wait-ForServiceRunning {
 
 function Get-PreviousServiceConfig {
     param([Parameter(Mandatory = $true)][string]$Name)
-    $qcOut = & sc.exe qc $Name 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $qcRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @('qc', $Name)
+    if ($qcRes.ExitCode -ne 0) {
         return $null
     }
-    $text = ($qcOut | Out-String)
+    $text = $qcRes.StdOut
     $binPath = $null
     $startType = 'auto'
     $displayName = 'LocalEDR Endpoint Detection & Response'
@@ -483,21 +604,60 @@ function Remove-BackupDirectoryBestEffort {
     if (-not (Test-Path -LiteralPath $BackupDirPath)) {
         return
     }
-    try {
-        Remove-Item -LiteralPath $BackupDirPath -Recurse -Force
-    }
-    catch {
-        if ($AllowRebootDelayForUi) {
-            $uiBak = Join-Path $BackupDirPath 'ledr-ui.exe'
-            if (Test-Path -LiteralPath $uiBak) {
-                Ensure-NativeHelper
-                $okFile = [LocalEdrInstallerNative]::ScheduleDeleteOnReboot($uiBak)
-                $okDir = [LocalEdrInstallerNative]::ScheduleDeleteOnReboot($BackupDirPath)
-                Write-InstallLog -Level 'WARN' -Message "Backup cleanup deferred until reboot for '$uiBak' (scheduledFile=$okFile, scheduledDir=$okDir): $($_.Exception.Message)"
-                return
+
+    $rulesBakDir = Join-Path $BackupDirPath 'rules'
+    if (Test-Path -LiteralPath $rulesBakDir) {
+        $ruleChildren = @(Get-ChildItem -LiteralPath $rulesBakDir -Force -ErrorAction SilentlyContinue)
+        foreach ($rc in $ruleChildren) {
+            try {
+                Remove-Item -LiteralPath $rc.FullName -Recurse -Force
+            }
+            catch {
+                Write-InstallLog -Level 'WARN' -Message "Failed to remove backup rule item '$($rc.FullName)': $($_.Exception.Message)"
             }
         }
-        Write-InstallLog -Level 'WARN' -Message "Failed to remove backup directory '$BackupDirPath': $($_.Exception.Message)"
+        try {
+            $remRules = @(Get-ChildItem -LiteralPath $rulesBakDir -Force -ErrorAction SilentlyContinue)
+            if ($remRules.Count -eq 0) {
+                Remove-Item -LiteralPath $rulesBakDir -Force
+            }
+        }
+        catch {
+            Write-InstallLog -Level 'WARN' -Message "Failed to remove backup rules directory '$rulesBakDir': $($_.Exception.Message)"
+        }
+    }
+
+    $topChildren = @(Get-ChildItem -LiteralPath $BackupDirPath -Force -ErrorAction SilentlyContinue)
+    foreach ($child in $topChildren) {
+        try {
+            Remove-Item -LiteralPath $child.FullName -Recurse -Force
+        }
+        catch {
+            Write-InstallLog -Level 'WARN' -Message "Deferred/locked backup item '$($child.FullName)': $($_.Exception.Message)"
+        }
+    }
+
+    $remaining = @(Get-ChildItem -LiteralPath $BackupDirPath -Force -ErrorAction SilentlyContinue)
+    if ($remaining.Count -eq 0) {
+        try {
+            Remove-Item -LiteralPath $BackupDirPath -Force
+            return
+        }
+        catch {
+            Write-InstallLog -Level 'WARN' -Message "Failed to remove empty backup directory '$BackupDirPath': $($_.Exception.Message)"
+        }
+    }
+
+    $uiBak = Join-Path $BackupDirPath 'ledr-ui.exe'
+    if ($AllowRebootDelayForUi -and (Test-Path -LiteralPath $uiBak)) {
+        Ensure-NativeHelper
+        $okFile = [LocalEdrInstallerNative]::ScheduleDeleteOnReboot($uiBak)
+        $okDir = [LocalEdrInstallerNative]::ScheduleDeleteOnReboot($BackupDirPath)
+        Write-InstallLog -Level 'WARN' -Message "Backup cleanup deferred until reboot for '$uiBak' (scheduledFile=$okFile, scheduledDir=$okDir)."
+    }
+    elseif ($remaining.Count -gt 0) {
+        $remNames = (($remaining | ForEach-Object { $_.Name }) -join ', ')
+        Write-InstallLog -Level 'WARN' -Message "Backup directory '$BackupDirPath' still contains items: $remNames"
     }
 }
 
@@ -657,6 +817,11 @@ try {
     foreach ($binName in $script:BinaryNames) {
         $srcBin = Join-Path $normSourceDir $binName
         $dstBin = Join-Path $normInstallDir $binName
+        if (($binName -eq 'ledr-auth-helper.exe') -and (Test-Path -LiteralPath $dstBin -PathType Leaf)) {
+            Invoke-WithFileLockRetry -TimeoutSeconds $LockRetrySeconds -Description "remove existing ledr-auth-helper.exe before clean copy" -Operation {
+                [System.IO.File]::Delete($dstBin)
+            }
+        }
         Copy-FileStrictNoHardlink -SourcePath $srcBin -DestPath $dstBin -RetrySeconds $LockRetrySeconds
         Write-InstallLog -Level 'INFO' -Message "Installed binary: $dstBin"
     }
@@ -705,10 +870,9 @@ try {
     # Phase 8: Register machine-scope Native Messaging manifests & apply RX ACL on native-messaging subdir
     $bridgeExe = Join-Path $normInstallDir 'ledr-bridge-nm.exe'
     $uiExe = Join-Path $normInstallDir 'ledr-ui.exe'
-    $bridgeOut = & $bridgeExe setup --scope machine --bridge-exe $bridgeExe --ui-exe $uiExe 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $detail = ($bridgeOut | Out-String).Trim()
-        throw "ledr-bridge-nm.exe setup --scope machine failed (exit $LASTEXITCODE): $detail"
+    $bridgeRes = Invoke-NativeProcess -FilePath $bridgeExe -Arguments @('setup', '--scope', 'machine', '--bridge-exe', $bridgeExe, '--ui-exe', $uiExe)
+    if ($bridgeRes.ExitCode -ne 0) {
+        throw "ledr-bridge-nm.exe setup --scope machine failed (exit $($bridgeRes.ExitCode)): $($bridgeRes.CombinedOutput)"
     }
     $bridgeSetupDone = $true
     Write-InstallLog -Level 'INFO' -Message "Configured machine-scope Native Messaging hosts and URI scheme."
@@ -725,40 +889,60 @@ try {
 
     # Phase 9: Create/configure LocalEDR Windows Service with 1s failure recovery (L-16) and start it
     $daemonExe = Join-Path $normInstallDir 'ledr-daemon.exe'
-    $scBinPath = '\"' + $daemonExe + '\" --service'
+    $scBinPath = '"' + $daemonExe + '" --service'
+    $scDisplayName = 'LocalEDR Endpoint Detection & Response'
     if ($prevServiceExists) {
-        $cfgOut = & sc.exe config $script:ServiceName binPath= $scBinPath start= auto obj= LocalSystem DisplayName= "LocalEDR Endpoint Detection & Response" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "sc.exe config $($script:ServiceName) failed (exit $LASTEXITCODE): $(($cfgOut | Out-String).Trim())"
+        $cfgRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @(
+            'config', $script:ServiceName,
+            'binPath=', $scBinPath,
+            'start=', 'auto',
+            'obj=', 'LocalSystem',
+            'DisplayName=', $scDisplayName
+        )
+        if ($cfgRes.ExitCode -ne 0) {
+            throw "sc.exe config $($script:ServiceName) failed (exit $($cfgRes.ExitCode)): $($cfgRes.CombinedOutput)"
         }
         $serviceModified = $true
     }
     else {
-        $crtOut = & sc.exe create $script:ServiceName binPath= $scBinPath start= auto obj= LocalSystem DisplayName= "LocalEDR Endpoint Detection & Response" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "sc.exe create $($script:ServiceName) failed (exit $LASTEXITCODE): $(($crtOut | Out-String).Trim())"
+        $crtRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @(
+            'create', $script:ServiceName,
+            'binPath=', $scBinPath,
+            'start=', 'auto',
+            'obj=', 'LocalSystem',
+            'DisplayName=', $scDisplayName
+        )
+        if ($crtRes.ExitCode -ne 0) {
+            throw "sc.exe create $($script:ServiceName) failed (exit $($crtRes.ExitCode)): $($crtRes.CombinedOutput)"
         }
         $serviceCreated = $true
     }
 
-    $descOut = & sc.exe description $script:ServiceName "LocalEDR resident ETW/WFP/SQLite endpoint detection and response service" 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "sc.exe description $($script:ServiceName) failed (exit $LASTEXITCODE): $(($descOut | Out-String).Trim())"
+    $descRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @(
+        'description', $script:ServiceName,
+        'LocalEDR resident ETW/WFP/SQLite endpoint detection and response service'
+    )
+    if ($descRes.ExitCode -ne 0) {
+        throw "sc.exe description $($script:ServiceName) failed (exit $($descRes.ExitCode)): $($descRes.CombinedOutput)"
     }
 
-    $failOut = & sc.exe failure $script:ServiceName reset= 86400 actions= restart/1000/restart/1000/restart/1000 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "sc.exe failure $($script:ServiceName) failed (exit $LASTEXITCODE): $(($failOut | Out-String).Trim())"
+    $failRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @(
+        'failure', $script:ServiceName,
+        'reset=', '86400',
+        'actions=', 'restart/1000/restart/1000/restart/1000'
+    )
+    if ($failRes.ExitCode -ne 0) {
+        throw "sc.exe failure $($script:ServiceName) failed (exit $($failRes.ExitCode)): $($failRes.CombinedOutput)"
     }
 
-    $flagOut = & sc.exe failureflag $script:ServiceName 1 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "sc.exe failureflag $($script:ServiceName) failed (exit $LASTEXITCODE): $(($flagOut | Out-String).Trim())"
+    $flagRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @('failureflag', $script:ServiceName, '1')
+    if ($flagRes.ExitCode -ne 0) {
+        throw "sc.exe failureflag $($script:ServiceName) failed (exit $($flagRes.ExitCode)): $($flagRes.CombinedOutput)"
     }
 
-    $startOut = & sc.exe start $script:ServiceName 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "sc.exe start $($script:ServiceName) failed (exit $LASTEXITCODE): $(($startOut | Out-String).Trim())"
+    $startRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @('start', $script:ServiceName)
+    if ($startRes.ExitCode -ne 0) {
+        throw "sc.exe start $($script:ServiceName) failed (exit $($startRes.ExitCode)): $($startRes.CombinedOutput)"
     }
     $startedServiceByInstaller = $true
     Wait-ForServiceRunning -Name $script:ServiceName -TimeoutSeconds $ServiceWaitSeconds
@@ -787,7 +971,10 @@ catch {
             $bridgeExe = Join-Path $normInstallDir 'ledr-bridge-nm.exe'
             if (Test-Path -LiteralPath $bridgeExe -PathType Leaf) {
                 try {
-                    $null = & $bridgeExe unregister --scope machine 2>&1
+                    $unregRes = Invoke-NativeProcess -FilePath $bridgeExe -Arguments @('unregister', '--scope', 'machine')
+                    if ($unregRes.ExitCode -ne 0) {
+                        Write-InstallLog -Level 'WARN' -Message "Rollback unregister returned exit $($unregRes.ExitCode): $($unregRes.CombinedOutput)"
+                    }
                 }
                 catch {
                     Write-InstallLog -Level 'WARN' -Message "Rollback unregister best-effort failed: $($_.Exception.Message)"
@@ -851,7 +1038,10 @@ catch {
             $restoredUi = Join-Path $normInstallDir 'ledr-ui.exe'
             if (Test-Path -LiteralPath $restoredBridge -PathType Leaf) {
                 try {
-                    $null = & $restoredBridge setup --scope machine --bridge-exe $restoredBridge --ui-exe $restoredUi 2>&1
+                    $reSetupRes = Invoke-NativeProcess -FilePath $restoredBridge -Arguments @('setup', '--scope', 'machine', '--bridge-exe', $restoredBridge, '--ui-exe', $restoredUi)
+                    if ($reSetupRes.ExitCode -ne 0) {
+                        Write-InstallLog -Level 'WARN' -Message "Rollback bridge re-setup returned exit $($reSetupRes.ExitCode): $($reSetupRes.CombinedOutput)"
+                    }
                 }
                 catch {
                     Write-InstallLog -Level 'WARN' -Message "Rollback bridge re-setup best-effort failed: $($_.Exception.Message)"
@@ -860,19 +1050,37 @@ catch {
         }
 
         if ($serviceCreated) {
-            $null = & sc.exe delete $script:ServiceName 2>&1
-            Write-InstallLog -Level 'INFO' -Message "Rollback deleted newly created service '$($script:ServiceName)'."
+            $delRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @('delete', $script:ServiceName)
+            if ($delRes.ExitCode -ne 0) {
+                Write-InstallLog -Level 'WARN' -Message "Rollback failed deleting newly created service '$($script:ServiceName)' (exit $($delRes.ExitCode)): $($delRes.CombinedOutput)"
+            }
+            else {
+                Write-InstallLog -Level 'INFO' -Message "Rollback deleted newly created service '$($script:ServiceName)'."
+            }
         }
         elseif ($serviceModified -and ($null -ne $prevServiceConfig) -and (-not [string]::IsNullOrWhiteSpace($prevServiceConfig.BinaryPathName))) {
-            $null = & sc.exe config $script:ServiceName binPath= $prevServiceConfig.BinaryPathName start= $prevServiceConfig.StartType DisplayName= $prevServiceConfig.DisplayName 2>&1
-            Write-InstallLog -Level 'INFO' -Message "Rollback restored previous service configuration."
+            $cfgRollbackRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @(
+                'config', $script:ServiceName,
+                'binPath=', $prevServiceConfig.BinaryPathName,
+                'start=', $prevServiceConfig.StartType,
+                'DisplayName=', $prevServiceConfig.DisplayName
+            )
+            if ($cfgRollbackRes.ExitCode -ne 0) {
+                Write-InstallLog -Level 'ERROR' -Message "Rollback failed restoring previous service configuration (exit $($cfgRollbackRes.ExitCode)): $($cfgRollbackRes.CombinedOutput)"
+            }
+            else {
+                Write-InstallLog -Level 'INFO' -Message "Rollback restored previous service configuration."
+            }
         }
 
         if ($prevServiceWasRunning) {
-            $null = & sc.exe start $script:ServiceName 2>&1
-            if ($LASTEXITCODE -eq 0) {
+            $startRollbackRes = Invoke-NativeProcess -FilePath 'sc.exe' -Arguments @('start', $script:ServiceName)
+            if ($startRollbackRes.ExitCode -eq 0) {
                 Wait-ForServiceRunning -Name $script:ServiceName -TimeoutSeconds $ServiceWaitSeconds
                 Write-InstallLog -Level 'INFO' -Message "Rollback restarted previously running service '$($script:ServiceName)'."
+            }
+            else {
+                Write-InstallLog -Level 'ERROR' -Message "Rollback failed restarting service '$($script:ServiceName)' (exit $($startRollbackRes.ExitCode)): $($startRollbackRes.CombinedOutput)"
             }
         }
 

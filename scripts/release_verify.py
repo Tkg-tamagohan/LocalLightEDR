@@ -386,9 +386,13 @@ def validate_single_segment_filename(filename: str) -> None:
         raise ValueError(f"unsafe manifest filename '{filename}'")
 
 
+def _has_whitespace_or_control(text: str) -> bool:
+    return any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+
+
 def validate_download_url(url: str) -> None:
-    if not isinstance(url, str) or not url:
-        raise ValueError("download_url must be non-empty")
+    if not isinstance(url, str) or not url or _has_whitespace_or_control(url):
+        raise ValueError("download_url must be a non-empty string without whitespace or control characters")
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise ValueError(f"download_url must use https: '{url}'")
@@ -397,11 +401,25 @@ def validate_download_url(url: str) -> None:
         raise ValueError(f"download_url host '{host}' is not in ALLOWED_DOWNLOAD_HOSTS")
 
 
-def load_json_strict(path: Path) -> Any:
-    def _reject_const(token: str) -> None:
-        raise ValueError(f"non-standard JSON constant {token!r}")
+def _reject_const(token: str) -> None:
+    raise ValueError(f"non-standard JSON constant {token!r}")
 
-    return json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_const)
+
+def parse_json_bytes_strict(raw_bytes: bytes, *, label: str) -> Any:
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        raise ValueError(f"{label} must not contain UTF-8 BOM")
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"invalid {label} UTF-8: {exc}") from exc
+    try:
+        return json.loads(text, parse_constant=_reject_const)
+    except Exception as exc:
+        raise ValueError(f"invalid {label} JSON: {exc}") from exc
+
+
+def load_json_strict(path: Path) -> Any:
+    return parse_json_bytes_strict(path.read_bytes(), label=path.name)
 
 
 def parse_public_key_ring(path: Path, *, require_active_key: bool) -> dict[str, bytes]:
@@ -410,7 +428,8 @@ def parse_public_key_ring(path: Path, *, require_active_key: bool) -> dict[str, 
     data = load_json_strict(path)
     if not isinstance(data, dict):
         raise ValueError("update-public-keys.json root must be an object")
-    if data.get("schema_version") != KEY_RING_SCHEMA_VERSION:
+    sv = data.get("schema_version")
+    if isinstance(sv, bool) or not isinstance(sv, int) or sv != KEY_RING_SCHEMA_VERSION:
         raise ValueError(
             f"update-public-keys.json schema_version must be {KEY_RING_SCHEMA_VERSION}"
         )
@@ -539,20 +558,20 @@ def validate_manifest_structure(
         raise ValueError(
             f"update-manifest.json size ({len(manifest_bytes)} bytes) outside 1..={MAX_MANIFEST_BYTES}"
         )
-    try:
-        manifest = json.loads(manifest_bytes.decode("utf-8"))
-    except Exception as exc:
-        raise ValueError(f"invalid update-manifest.json UTF-8/JSON: {exc}") from exc
+    manifest = parse_json_bytes_strict(manifest_bytes, label="update-manifest.json")
 
     if not isinstance(manifest, dict):
         raise ValueError("update-manifest.json must be a JSON object")
-    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+    sv = manifest.get("schema_version")
+    if isinstance(sv, bool) or not isinstance(sv, int) or sv != MANIFEST_SCHEMA_VERSION:
         raise ValueError(f"manifest schema_version must be {MANIFEST_SCHEMA_VERSION}")
     if manifest.get("product") != EXPECTED_PRODUCT_NAME:
         raise ValueError(f"manifest product must be '{EXPECTED_PRODUCT_NAME}'")
 
     version = manifest.get("version")
-    parsed_ver = parse_semver_strict(str(version or ""))
+    if not isinstance(version, str):
+        raise ValueError("manifest version must be a string")
+    parsed_ver = parse_semver_strict(version)
     if parsed_ver[3] is not None:
         raise ValueError(f"manifest version '{version}' must not be a prerelease")
     if expect_version is not None and version != expect_version:
@@ -562,20 +581,30 @@ def validate_manifest_structure(
     if manifest.get("tag") != expected_tag:
         raise ValueError(f"manifest tag '{manifest.get('tag')}' != expected '{expected_tag}'")
 
+    released_at = manifest.get("released_at")
+    if released_at is not None and not isinstance(released_at, str):
+        raise ValueError("manifest released_at must be a string if present")
+
     min_ver_raw = manifest.get("min_updater_version")
-    parsed_min = parse_semver_strict(str(min_ver_raw or ""))
+    if not isinstance(min_ver_raw, str):
+        raise ValueError("manifest min_updater_version must be a string")
+    parsed_min = parse_semver_strict(min_ver_raw)
     if compare_semver(parsed_min, parsed_ver) > 0:
         raise ValueError(
             f"min_updater_version '{min_ver_raw}' cannot exceed manifest version '{version}'"
         )
 
     filename = manifest.get("filename")
-    validate_single_segment_filename(str(filename or ""))
+    if not isinstance(filename, str):
+        raise ValueError("manifest filename must be a string")
+    validate_single_segment_filename(filename)
     expected_filename = f"LocalEDR-Setup-v{version}-win-x64.exe"
     if filename != expected_filename:
         raise ValueError(f"manifest filename '{filename}' != expected '{expected_filename}'")
 
-    download_url = str(manifest.get("download_url") or "")
+    download_url = manifest.get("download_url")
+    if not isinstance(download_url, str):
+        raise ValueError("manifest download_url must be a string")
     validate_download_url(download_url)
     expected_dl = f"{RELEASE_URL_PREFIX}download/{expected_tag}/{expected_filename}"
     if download_url != expected_dl:
@@ -590,8 +619,14 @@ def validate_manifest_structure(
         raise ValueError(f"manifest size_bytes '{size_bytes}' out of range")
 
     notes_url = manifest.get("release_notes_url")
-    if not isinstance(notes_url, str) or not notes_url.startswith(RELEASE_URL_PREFIX):
-        raise ValueError(f"manifest release_notes_url must start with '{RELEASE_URL_PREFIX}'")
+    if (
+        not isinstance(notes_url, str)
+        or not notes_url.startswith(RELEASE_URL_PREFIX)
+        or _has_whitespace_or_control(notes_url)
+    ):
+        raise ValueError(
+            f"manifest release_notes_url must start with '{RELEASE_URL_PREFIX}' and contain no whitespace or control characters"
+        )
 
     ext_info = manifest.get("chrome_extension")
     if not isinstance(ext_info, dict):
@@ -620,14 +655,12 @@ def verify_signature_envelope_and_bytes(
 ) -> dict[str, Any]:
     if len(sig_bytes) == 0 or len(sig_bytes) > MAX_SIG_BYTES:
         raise ValueError(f"signature envelope size ({len(sig_bytes)} bytes) outside 1..={MAX_SIG_BYTES}")
-    try:
-        envelope = json.loads(sig_bytes.decode("utf-8"))
-    except Exception as exc:
-        raise ValueError(f"invalid signature envelope UTF-8/JSON: {exc}") from exc
+    envelope = parse_json_bytes_strict(sig_bytes, label="update-manifest.json.sig")
 
     if not isinstance(envelope, dict):
         raise ValueError("signature envelope must be a JSON object")
-    if envelope.get("schema_version") != SIGNATURE_SCHEMA_VERSION:
+    sv = envelope.get("schema_version")
+    if isinstance(sv, bool) or not isinstance(sv, int) or sv != SIGNATURE_SCHEMA_VERSION:
         raise ValueError(f"signature schema_version must be {SIGNATURE_SCHEMA_VERSION}")
     if envelope.get("algorithm") != SIGNATURE_ALGORITHM_ED25519:
         raise ValueError(f"signature algorithm must be '{SIGNATURE_ALGORITHM_ED25519}'")
@@ -827,7 +860,7 @@ def _check_archive_path_safe(member_name: str) -> str:
     parts = member_name.split("/")
     if any(p in {"", ".", ".."} for p in parts):
         raise ValueError(f"invalid archive path segments in '{member_name}'")
-    if any(p in FORBIDDEN_ARCHIVE_SEGMENTS for p in parts):
+    if any(p.lower() in FORBIDDEN_ARCHIVE_SEGMENTS for p in parts):
         raise ValueError(f"forbidden directory in archive path '{member_name}'")
     return member_name
 
@@ -910,9 +943,19 @@ def verify_dist(
         portable_name: portable_sha,
         ext_zip_name: ext_sha,
     }
+    sums_bytes = sums_path.read_bytes()
+    if b"\r" in sums_bytes:
+        raise ValueError("SHA256SUMS.txt must use LF line endings only (CRLF/CR rejected)")
+    if sums_bytes.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("SHA256SUMS.txt must not contain UTF-8 BOM")
+    try:
+        sums_text = sums_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"invalid SHA256SUMS.txt UTF-8: {exc}") from exc
+
     seen_sums: dict[str, str] = {}
-    for line in sums_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
+    for line in sums_text.split("\n"):
+        if not line:
             continue
         m = re.match(r"^([0-9a-f]{64})  (.+)$", line)
         if not m:
@@ -953,7 +996,7 @@ def verify_dist(
         missing_ext = sorted(REQUIRED_EXTENSION_ZIP_FILES - ext_members)
         if missing_ext:
             raise ValueError(f"Chrome extension zip missing required files: {missing_ext}")
-        ext_manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        ext_manifest = parse_json_bytes_strict(zf.read("manifest.json"), label="extension manifest.json")
         if ext_manifest.get("version") != version:
             raise ValueError(f"extension zip manifest.json version != '{version}'")
         if derive_chrome_extension_id(str(ext_manifest.get("key") or "")) != EXPECTED_CHROME_EXTENSION_ID:

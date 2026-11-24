@@ -118,7 +118,7 @@ function Assert-NoReparsePointsInTree {
         return
     }
     Assert-NoReparsePointComponent -TargetPath $RootDir -ExpectDirectoryIfExists $true
-    $entries = Get-ChildItem -LiteralPath $RootDir -Recurse -Force -ErrorAction SilentlyContinue
+    $entries = @(Get-ChildItem -LiteralPath $RootDir -Recurse -Force -ErrorAction Stop)
     foreach ($entry in $entries) {
         if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Reparse point detected inside data directory tree: $($entry.FullName)"

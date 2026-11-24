@@ -116,7 +116,8 @@ def build_release_artifacts(
     manifest_out = out_dir / "update-manifest.json"
     sig_out = out_dir / "update-manifest.json.sig"
 
-    shutil.copyfile(installer_exe, setup_out)
+    if installer_exe.resolve() != setup_out.resolve():
+        shutil.copyfile(installer_exe, setup_out)
 
     # Build deterministic portable ZIP (never includes .pdb or non-distributed rules)
     portable_pairs: list[tuple[str, Path]] = []
@@ -147,7 +148,7 @@ def build_release_artifacts(
         digest = release_verify.sha256_file(artifact)
         hashes[artifact.name] = digest
         checksum_lines.append(f"{digest}  {artifact.name}")
-    sums_out.write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+    sums_out.write_bytes(("\n".join(checksum_lines) + "\n").encode("utf-8"))
 
     ts_utc = released_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     manifest_doc = {

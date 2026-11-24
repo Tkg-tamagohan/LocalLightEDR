@@ -134,7 +134,7 @@ git push origin v0.1.0
 3. 新規作成したサービスは削除し、既存サービスは元の構成へ戻したうえで、更新前に起動していた場合のみ `LocalEDR` を再起動します。
 
 障害解析時は `C:\ProgramData\LocalEDR\logs\installer.log` を確認してください。
-手動でやり直す場合は、ZIP パッケージ展開先から管理者権限の PowerShell で `install.ps1`（更新時は `-UpdateMode`）を実行できます。
+手動でやり直す場合は、ZIP パッケージ展開先から管理者権限の 64 ビット PowerShell（Windows PowerShell 5.1 または PowerShell 7 以上）で `install.ps1`（更新時は `-UpdateMode`）を実行できます。
 
 ## アンインストールとデータ保全一覧
 

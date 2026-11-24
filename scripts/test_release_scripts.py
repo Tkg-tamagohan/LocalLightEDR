@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Specification tests for LocalEDR release scripts (REL-01..REL-05).
+"""Specification tests for LocalEDR release scripts (REL-01..REL-07).
 
 Pure Python 3.11+ stdlib ``unittest`` suite (zero external packages).
 """
@@ -419,6 +419,157 @@ class TestReleaseScripts(unittest.TestCase):
                     os.environ.pop(env_name, None)
                 else:
                     os.environ[env_name] = old_env
+
+    # REL-06: Same-path installer in out_dir and LF-only SHA256SUMS.txt enforcement
+    def test_rel_06_same_path_installer_and_lf_checksums(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_dir, installer_exe, pub_keys = _create_mock_repo(tmp_path, "0.1.0")
+            priv_file = tmp_path / "signing.key"
+            release_verify.run_keygen(
+                key_id="same-path-key",
+                write_public_keys=pub_keys,
+                write_private_key_file=priv_file,
+            )
+
+            out_dir = tmp_path / "dist"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            preplaced_setup = out_dir / "LocalEDR-Setup-v0.1.0-win-x64.exe"
+            shutil.copyfile(installer_exe, preplaced_setup)
+            expected_bytes = preplaced_setup.read_bytes()
+
+            built = build_release_artifacts.build_release_artifacts(
+                repo_root=tmp_path,
+                bin_dir=bin_dir,
+                installer_exe=preplaced_setup,
+                out_dir=out_dir,
+                public_keys_path=pub_keys,
+                private_key_file=priv_file,
+                expect_tag="v0.1.0",
+            )
+            self.assertEqual(Path(built["setup_exe"]).resolve(), preplaced_setup.resolve())
+            self.assertEqual(preplaced_setup.read_bytes(), expected_bytes)
+
+            sums_path = Path(built["sha256sums"])
+            sums_bytes = sums_path.read_bytes()
+            self.assertNotIn(b"\r", sums_bytes)
+            self.assertTrue(sums_bytes.endswith(b"\n"))
+
+            verified = release_verify.verify_dist(
+                dist_dir=out_dir,
+                public_keys_path=pub_keys,
+                expect_tag="v0.1.0",
+                expect_version="0.1.0",
+            )
+            self.assertEqual(verified["tag"], "v0.1.0")
+
+            # CRLF in SHA256SUMS.txt must be rejected by verify_dist
+            crlf_dist = tmp_path / "dist-crlf"
+            shutil.copytree(out_dir, crlf_dist)
+            crlf_sums = crlf_dist / "SHA256SUMS.txt"
+            crlf_sums.write_bytes(sums_bytes.replace(b"\n", b"\r\n"))
+            with self.assertRaisesRegex(ValueError, "LF line endings"):
+                release_verify.verify_dist(dist_dir=crlf_dist, public_keys_path=pub_keys)
+
+    # REL-07: Rust serde_json / u32 parity and case-insensitive archive checks
+    def test_rel_07_serde_u32_parity_and_case_insensitive_archive_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_dir, installer_exe, pub_keys = _create_mock_repo(tmp_path, "0.1.0")
+            priv_file = tmp_path / "signing.key"
+            release_verify.run_keygen(
+                key_id="parity-key",
+                write_public_keys=pub_keys,
+                write_private_key_file=priv_file,
+            )
+            base_dist = tmp_path / "dist-base"
+            build_release_artifacts.build_release_artifacts(
+                repo_root=tmp_path,
+                bin_dir=bin_dir,
+                installer_exe=installer_exe,
+                out_dir=base_dist,
+                public_keys_path=pub_keys,
+                private_key_file=priv_file,
+            )
+
+            seed = release_verify.parse_ed25519_private_seed(priv_file.read_text(encoding="utf-8"))
+            active_keys = release_verify.parse_public_key_ring(pub_keys, require_active_key=True)
+            base_manifest_bytes = (base_dist / "update-manifest.json").read_bytes()
+            base_manifest_doc = json.loads(base_manifest_bytes.decode("utf-8"))
+
+            # 1. schema_version: true rejected in public keys, manifest, and signature envelope
+            bool_keys = tmp_path / "bool-keys.json"
+            kdoc = json.loads(pub_keys.read_text(encoding="utf-8"))
+            kdoc["schema_version"] = True
+            bool_keys.write_text(json.dumps(kdoc), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                release_verify.parse_public_key_ring(bool_keys, require_active_key=False)
+
+            bool_manifest = dict(base_manifest_doc)
+            bool_manifest["schema_version"] = True
+            with self.assertRaises(ValueError):
+                release_verify.validate_manifest_structure(
+                    (json.dumps(bool_manifest, indent=2) + "\n").encode("utf-8")
+                )
+
+            bool_sig_env = {
+                "schema_version": True,
+                "key_id": "parity-key",
+                "algorithm": "ed25519",
+                "signature_b64": base64.b64encode(
+                    release_verify.ed25519_sign(seed, base_manifest_bytes)
+                ).decode("ascii"),
+            }
+            with self.assertRaises(ValueError):
+                release_verify.verify_signature_envelope_and_bytes(
+                    base_manifest_bytes,
+                    json.dumps(bool_sig_env).encode("utf-8"),
+                    active_keys,
+                )
+
+            # 2. Non-standard JSON constants (NaN / Infinity) rejected in manifest & .sig
+            nan_manifest_bytes = base_manifest_bytes.replace(
+                b'"released_at": "' + base_manifest_doc["released_at"].encode("utf-8") + b'"',
+                b'"released_at": NaN',
+            )
+            with self.assertRaises(ValueError):
+                release_verify.validate_manifest_structure(nan_manifest_bytes)
+
+            sig_doc = json.loads((base_dist / "update-manifest.json.sig").read_text(encoding="utf-8"))
+            sig_doc["extra"] = 1
+            nan_sig_bytes = json.dumps(sig_doc).replace(": 1}", ": Infinity}").encode("utf-8")
+            with self.assertRaises(ValueError):
+                release_verify.verify_signature_envelope_and_bytes(
+                    base_manifest_bytes,
+                    nan_sig_bytes,
+                    active_keys,
+                )
+
+            # 3. Control / whitespace characters rejected in release_notes_url and download_url
+            for bad_notes in (
+                base_manifest_doc["release_notes_url"] + "\nhttps://evil.example",
+                base_manifest_doc["release_notes_url"] + "\r",
+                base_manifest_doc["release_notes_url"] + "\t",
+                base_manifest_doc["release_notes_url"] + " extra",
+            ):
+                ctrl_manifest = dict(base_manifest_doc)
+                ctrl_manifest["release_notes_url"] = bad_notes
+                with self.assertRaises(ValueError):
+                    release_verify.validate_manifest_structure(
+                        (json.dumps(ctrl_manifest, indent=2) + "\n").encode("utf-8")
+                    )
+
+            with self.assertRaises(ValueError):
+                release_verify.validate_download_url(base_manifest_doc["download_url"] + "\n")
+
+            # 4. Case-insensitive forbidden archive segments (Tests/, _METADATA/) rejected
+            for bad_entry in ("Tests/leak.test.mjs", "_METADATA/verified_contents.json"):
+                d_case = tmp_path / ("dist-" + bad_entry.split("/")[0].lower())
+                shutil.copytree(base_dist, d_case)
+                with zipfile.ZipFile(d_case / "LocalEDR-chrome-ext-v0.1.0.zip", "a") as zf:
+                    zf.writestr(bad_entry, "{}")
+                with self.assertRaises(ValueError):
+                    release_verify.verify_dist(dist_dir=d_case, public_keys_path=pub_keys)
 
 
 if __name__ == "__main__":

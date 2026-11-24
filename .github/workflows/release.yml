@@ -146,8 +146,21 @@ jobs:
         run: |
           shopt -s nullglob
           ext_tests=(extensions/ledr-chrome-mv3/tests/*.test.mjs)
+          if [ "${#ext_tests[@]}" -eq 0 ]; then
+            echo "No Chrome MV3 extension test files matched extensions/ledr-chrome-mv3/tests/*.test.mjs" >&2
+            exit 1
+          fi
           node --test "${ext_tests[@]}"
+          required_ui_test="apps/ledr-ui/js-tests/phase4_ui.test.mjs"
+          if [ ! -f "$required_ui_test" ]; then
+            echo "Missing required UI test file: $required_ui_test" >&2
+            exit 1
+          fi
           ui_tests=(apps/ledr-ui/js-tests/*.test.mjs)
+          if [ "${#ui_tests[@]}" -eq 0 ]; then
+            echo "No UI test files matched apps/ledr-ui/js-tests/*.test.mjs" >&2
+            exit 1
+          fi
           node --test "${ui_tests[@]}"
       - name: Build release binaries
         shell: pwsh
@@ -160,8 +173,9 @@ jobs:
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          $outFile = "..\..\dist\LocalEDR-Setup-$($env:RELEASE_TAG)-win-x64.exe"
+          $stageDir = Join-Path $env:RUNNER_TEMP 'nsis-out'
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          $outFile = Join-Path $stageDir "LocalEDR-Setup-$($env:RELEASE_TAG)-win-x64.exe"
           & makensis "/DVERSION=$($env:RELEASE_VERSION)" '/DBIN_DIR=..\..\target\release' '/DRULES_DIR=..\..\rules' "/DOUT_FILE=$outFile" packaging\windows\localedr.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package and sign release artifacts
@@ -175,7 +189,11 @@ jobs:
           LEDR_UPDATE_SIGNING_KEY_ID: ${{ secrets.LEDR_UPDATE_SIGNING_KEY_ID }}
         run: |
           $tag = $env:RELEASE_TAG
-          $installerExe = Join-Path (Resolve-Path 'dist').Path "LocalEDR-Setup-$tag-win-x64.exe"
+          if (Test-Path -LiteralPath 'dist') {
+            Remove-Item -LiteralPath 'dist' -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
+          $installerExe = Join-Path (Join-Path $env:RUNNER_TEMP 'nsis-out') "LocalEDR-Setup-$tag-win-x64.exe"
           if ($env:DRY_RUN -eq 'true') {
             $tmpPub = Join-Path $env:RUNNER_TEMP 'dry-run-public-keys.json'
             $tmpPriv = Join-Path $env:RUNNER_TEMP 'dry-run-signing.key'

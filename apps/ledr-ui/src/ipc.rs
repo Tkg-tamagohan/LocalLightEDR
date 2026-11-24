@@ -48,7 +48,7 @@ fn is_default_ipc_pipe(pipe_name: &str) -> bool {
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
-fn normalize_windows_exe_path(raw: &str) -> String {
+pub(crate) fn normalize_windows_exe_path(raw: &str) -> String {
     let trimmed = raw.trim().replace('/', "\\");
     let stripped = if trimmed
         .get(..8)
@@ -369,6 +369,14 @@ pub(crate) fn verify_named_pipe_server_process(pipe: &File) -> Result<(), String
     )
 }
 
+/// Structured daemon handshake version metadata returned by `IpcRequest::Ping`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct DaemonPingInfo {
+    pub daemon_version: String,
+    pub protocol_version: u32,
+}
+
 /// Domain risk lookup result returned by `IpcRequest::CheckDomainRisk` (`L-13`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainRiskView {
@@ -471,6 +479,12 @@ impl IpcClient {
         parse_ping_response(self.send_request(&IpcRequest::Ping)?)
     }
 
+    /// Sends `IpcRequest::Ping` and returns structured daemon version metadata.
+    #[allow(dead_code)]
+    pub fn ping_info(&self) -> Result<DaemonPingInfo, String> {
+        parse_ping_info_response(self.send_request(&IpcRequest::Ping)?)
+    }
+
     /// Fetches a [`FlightRecorderSnapshot`] from `ledr-daemon`.
     pub fn get_flight_recorder(
         &self,
@@ -545,6 +559,20 @@ pub(crate) fn parse_ping_response(response: IpcResponse) -> Result<String, Strin
         } => Ok(format!(
             "ledr-daemon v{daemon_version} (proto v{protocol_version})"
         )),
+        other => Err(unexpected_or_daemon_error(other, "Pong")),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_ping_info_response(response: IpcResponse) -> Result<DaemonPingInfo, String> {
+    match response {
+        IpcResponse::Pong {
+            daemon_version,
+            protocol_version,
+        } => Ok(DaemonPingInfo {
+            daemon_version,
+            protocol_version,
+        }),
         other => Err(unexpected_or_daemon_error(other, "Pong")),
     }
 }

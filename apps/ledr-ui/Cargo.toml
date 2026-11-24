@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ledr-proto = { workspace = true }
+ledr-updater = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = "2.12"

@@ -10,8 +10,11 @@ mod tree;
 
 pub use controller::WindowsDefenseController;
 pub use guard::validate_target_process;
-pub use honeypot::HoneypotManager;
-pub use process_probe::{ProcessLiveness, process_liveness};
+pub use honeypot::{
+    remove_verified_honeypot_file, remove_verified_honeypot_file_with_identity, HoneypotFileId,
+    HoneypotManager, HoneypotRemoveResult, OwnedHoneypotRecord,
+};
+pub use process_probe::{process_liveness, ProcessLiveness};
 pub use tree::collect_live_descendants;
 
 #[cfg(test)]

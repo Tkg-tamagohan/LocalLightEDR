@@ -177,6 +177,7 @@ impl DaemonEngine {
             config.outbound_firewall_enabled,
         ));
         let self_pid = std::process::id();
+        let self_process_identity = capture_self_process_identity(self_pid);
         let self_exe_normalized = match std::env::current_exe() {
             Ok(exe_path) => {
                 let raw = exe_path.to_string_lossy();
@@ -236,6 +237,7 @@ impl DaemonEngine {
         let engine = Arc::new(Self {
             config,
             self_pid,
+            self_process_identity,
             self_exe_normalized,
             store,
             sigma,
@@ -900,4 +902,42 @@ impl DaemonEngine {
         );
         updated_alerts > 0
     }
+}
+
+fn capture_self_process_identity(self_pid: u32) -> Option<ProcessIdentity> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: `GetCurrentProcess()` returns the pseudo-handle for this process and all four
+    // `FILETIME` structs are valid stack-allocated out parameters.
+    if let Err(err) = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } {
+        tracing::warn!(
+            pid = self_pid,
+            error = %err,
+            "GetProcessTimes(GetCurrentProcess()) failed; self canary alert suppression disabled"
+        );
+        return None;
+    }
+    let create_time_100ns =
+        ((u64::from(creation.dwHighDateTime)) << 32) | u64::from(creation.dwLowDateTime);
+    if create_time_100ns == 0 {
+        tracing::warn!(
+            pid = self_pid,
+            "GetProcessTimes(GetCurrentProcess()) returned zero CreationTime; self canary alert suppression disabled"
+        );
+        return None;
+    }
+    Some(ProcessIdentity::new(self_pid, create_time_100ns))
 }

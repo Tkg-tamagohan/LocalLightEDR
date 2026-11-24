@@ -927,6 +927,32 @@ impl DaemonEngine {
             return;
         };
 
+        // PRRT_kwDOVyjVyM67eqyB: Service-mode periodic honeypot deployment/refresh writes
+        // `!00_LocalEDR_Canary_DoNotEdit.docx` from the running `ledr-daemon` process. Suppress
+        // canary alerting/notification ONLY when the event's verified `ProcessIdentity` (`pid` AND
+        // non-zero `create_time_100ns`) strictly matches the daemon's own startup identity.
+        if matches!(category, CanaryCategory::Honeypot)
+            && self.is_verified_self_identity(proc_ctx.proc_identity)
+        {
+            tracing::debug!(
+                pid = *pid,
+                target_path = %target_path,
+                "suppressed self-canary honeypot alert for verified daemon ProcessIdentity"
+            );
+            if let Some(Err(err)) = self.try_store_write(|s| {
+                s.ingest_event_with_exit(
+                    event,
+                    proc_ctx.store_hint.as_deref(),
+                    None,
+                    false,
+                    "SELF_SUPPRESSED",
+                )
+            }) {
+                tracing::warn!(error = %err, "failed to ingest self-suppressed canary event");
+            }
+            return;
+        }
+
         // ANALYSIS_0002: dedup check BEFORE the expensive binary inspection so every
         // repeat event in a canary burst does not re-read the executable on the
         // high-priority lane. This is a read-only check; the dedup mark is only set
@@ -2197,5 +2223,217 @@ mod tests {
         );
 
         engine.shutdown_and_flush().await.expect("shutdown engine");
+    }
+
+    #[tokio::test]
+    async fn self_canary_01_suppresses_only_verified_self_process_identity() {
+        use std::sync::atomic::AtomicUsize;
+
+        use ledr_proto::{AlertSeverity, AlertStatus, CanaryCategory, EventLane};
+
+        use super::super::LiveProcessInspector;
+
+        struct RecordingNotifier {
+            notified: AtomicUsize,
+        }
+        impl NotificationDispatcher for RecordingNotifier {
+            fn notify_alert(&self, _: &AlertRecord) -> Result<(), String> {
+                self.notified.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        struct NoopLiveInspector;
+        impl LiveProcessInspector for NoopLiveInspector {
+            fn inspect_live_process(
+                &self,
+                _pid: u32,
+            ) -> Option<ledr_sensor_win::etw::LiveProcessInfo> {
+                None
+            }
+        }
+
+        let store = LedrStore::open_in_memory().expect("open store");
+        let defense = Arc::new(RecordingWfpDefense::new());
+        let notifier = Arc::new(RecordingNotifier {
+            notified: AtomicUsize::new(0),
+        });
+        let engine = DaemonEngine::start_with_all_dependencies(
+            store.clone(),
+            SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+            EarlyPruner::default(),
+            DaemonConfig::default(),
+            defense,
+            notifier.clone(),
+            Arc::new(EmptyInspector),
+            Arc::new(NoopLiveInspector),
+        );
+
+        let self_ident = engine
+            .self_process_identity()
+            .expect("daemon startup must capture verified self_process_identity");
+        assert_ne!(self_ident.create_time_100ns, 0);
+        let self_exe = std::env::current_exe()
+            .expect("current_exe")
+            .to_string_lossy()
+            .into_owned();
+        let decoy_path = r"C:\Users\Alice\Documents\!00_LocalEDR_Canary_DoNotEdit.docx".to_string();
+        let event_ts_base = super::super::filetime_100ns_to_unix_ms(
+            self_ident.create_time_100ns,
+            super::super::current_unix_ms(),
+        )
+        .saturating_add(1_000);
+
+        // 1. Exact matching `(pid, create_time_100ns)` -> honeypot canary alert and notification
+        //    MUST be suppressed.
+        engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: self_ident,
+                parent_pid: 4,
+                exe_path: self_exe,
+                command_line: "ledr-daemon.exe --service".to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        engine.process_event_with_lane(
+            &SensorEvent::CanaryFileAccess {
+                timestamp_ms: event_ts_base,
+                pid: self_ident.pid,
+                target_path: decoy_path.clone(),
+                category: CanaryCategory::Honeypot,
+                access_mask: 0x2,
+                is_write_or_delete: true,
+            },
+            EventLane::HighPriority,
+        );
+        store.flush_batch().expect("flush self canary");
+        assert!(
+            store
+                .list_alerts(Some(AlertStatus::Pending), 100)
+                .expect("list alerts")
+                .is_empty(),
+            "matching self ProcessIdentity must suppress honeypot canary alert"
+        );
+        assert_eq!(notifier.notified.load(Ordering::Relaxed), 0);
+
+        // 2. Different PID carrying `ledr-daemon.exe` image path MUST still raise Critical alert.
+        let other_pid = if self_ident.pid == u32::MAX {
+            self_ident.pid - 1
+        } else {
+            self_ident.pid + 1
+        };
+        let spoofed_exe = r"C:\Program Files\LocalEDR\ledr-daemon.exe".to_string();
+        engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(other_pid, self_ident.create_time_100ns),
+                parent_pid: 4,
+                exe_path: spoofed_exe.clone(),
+                command_line: spoofed_exe.clone(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        engine.process_event_with_lane(
+            &SensorEvent::CanaryFileAccess {
+                timestamp_ms: event_ts_base + 1_000,
+                pid: other_pid,
+                target_path: decoy_path.clone(),
+                category: CanaryCategory::Honeypot,
+                access_mask: 0x2,
+                is_write_or_delete: true,
+            },
+            EventLane::HighPriority,
+        );
+        store.flush_batch().expect("flush different-pid alert");
+        let alerts_after_other = store
+            .list_alerts(Some(AlertStatus::Pending), 100)
+            .expect("list alerts after other_pid");
+        assert_eq!(alerts_after_other.len(), 1);
+        assert_eq!(alerts_after_other[0].severity, AlertSeverity::Critical);
+        assert_eq!(notifier.notified.load(Ordering::Relaxed), 1);
+
+        // 3. Same `self_pid` with mismatched `create_time_100ns` (PID reuse) carrying
+        //    `ledr-daemon.exe` image path MUST still raise Critical alert.
+        let reused_ident = ProcessIdentity::new(self_ident.pid, self_ident.create_time_100ns + 1);
+        engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: reused_ident,
+                parent_pid: 4,
+                exe_path: spoofed_exe.clone(),
+                command_line: spoofed_exe.clone(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        engine.process_event_with_lane(
+            &SensorEvent::CanaryFileAccess {
+                timestamp_ms: event_ts_base + 2_000,
+                pid: self_ident.pid,
+                target_path: decoy_path.clone(),
+                category: CanaryCategory::Honeypot,
+                access_mask: 0x2,
+                is_write_or_delete: true,
+            },
+            EventLane::HighPriority,
+        );
+        store.flush_batch().expect("flush reused-pid alert");
+        let alerts_after_reused = store
+            .list_alerts(Some(AlertStatus::Pending), 100)
+            .expect("list alerts after reused create_time_100ns");
+        assert_eq!(alerts_after_reused.len(), 2);
+        assert!(alerts_after_reused
+            .iter()
+            .all(|a| a.severity == AlertSeverity::Critical));
+        assert_eq!(notifier.notified.load(Ordering::Relaxed), 2);
+
+        // 4. Same `self_pid` with unverified `create_time_100ns == 0` carrying `ledr-daemon.exe`
+        //    MUST fail closed and still raise Critical alert.
+        let unverified_pid = other_pid.saturating_add(1);
+        let store2 = LedrStore::open_in_memory().expect("open store2");
+        let notifier2 = Arc::new(RecordingNotifier {
+            notified: AtomicUsize::new(0),
+        });
+        let engine2 = DaemonEngine::start_with_all_dependencies(
+            store2.clone(),
+            SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+            EarlyPruner::default(),
+            DaemonConfig::default(),
+            Arc::new(RecordingWfpDefense::new()),
+            notifier2.clone(),
+            Arc::new(EmptyInspector),
+            Arc::new(NoopLiveInspector),
+        );
+        let self_pid2 = engine2.self_process_identity().expect("self_ident2").pid;
+        engine2.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: ProcessIdentity::new(self_pid2, 0),
+                parent_pid: unverified_pid,
+                exe_path: spoofed_exe.clone(),
+                command_line: spoofed_exe,
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        engine2.process_event_with_lane(
+            &SensorEvent::CanaryFileAccess {
+                timestamp_ms: event_ts_base + 3_000,
+                pid: self_pid2,
+                target_path: decoy_path,
+                category: CanaryCategory::Honeypot,
+                access_mask: 0x2,
+                is_write_or_delete: true,
+            },
+            EventLane::HighPriority,
+        );
+        store2.flush_batch().expect("flush unverified alert");
+        let alerts2 = store2
+            .list_alerts(Some(AlertStatus::Pending), 100)
+            .expect("list alerts2");
+        assert_eq!(alerts2.len(), 1);
+        assert_eq!(alerts2[0].severity, AlertSeverity::Critical);
+        assert_eq!(notifier2.notified.load(Ordering::Relaxed), 1);
+
+        engine.shutdown_and_flush().await.expect("shutdown engine");
+        engine2.shutdown_and_flush().await.expect("shutdown engine2");
     }
 }

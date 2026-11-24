@@ -24,6 +24,7 @@ fn unit_schema_tables_indexes_and_all_seven_pragmas() {
         "dns_queries",
         "download_origins",
         "file_canary_events",
+        "honeypot_files",
         "network_events",
         "processes",
     ];

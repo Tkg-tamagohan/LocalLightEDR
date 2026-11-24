@@ -1,10 +1,14 @@
 //! Alert lifecycle, canary event recording, and alert query methods for [`LedrStore`].
 
+use std::path::Path;
+
 use ledr_proto::{AlertRecord, AlertStatus, CanaryCategory, FileCanaryEventRecord};
-use rusqlite::{params, params_from_iter, types::Value, Transaction};
+use rusqlite::{params, params_from_iter, types::Value, Connection, Transaction};
 
 use crate::queries::{clamp_limit, collect_rows, query_optional_row};
-use crate::schema::{row_to_alert, row_to_canary, ALERT_COLS, CANARY_COLS};
+use crate::schema::{
+    reader_open_flags, row_to_alert, row_to_canary, ALERT_COLS, CANARY_COLS,
+};
 use crate::{LedrStore, StoreError};
 
 impl LedrStore {
@@ -44,76 +48,20 @@ impl LedrStore {
     /// `context_json`, using keyset pagination so large alert histories never truncate older
     /// suspended rows (`BUG_0003`, `PRRT_kwDOVyjVyM657t-x`).
     pub fn list_unresolved_suspended_alerts(&self) -> Result<Vec<AlertRecord>, StoreError> {
-        const PAGE_SIZE: usize = 500;
-        // Guard `json_type` and `json_array_length` behind nested `CASE WHEN json_valid(...)`
-        // so malformed legacy `context_json` rows never trigger a SQLite JSON runtime error.
-        const SUSPENDED_PREDICATE: &str = "(
-                 process_suspended = 1
-                 OR CASE
-                      WHEN json_valid(context_json) THEN
-                        CASE
-                          WHEN json_type(context_json, '$.suspended_children') = 'array'
-                          THEN json_array_length(context_json, '$.suspended_children') > 0
-                          ELSE 0
-                        END
-                      ELSE 0
-                    END
-               )";
         let reader = self.lock_reader()?;
-        let pending = AlertStatus::Pending.as_db_str();
-        let expired = AlertStatus::ExpiredSuspended.as_db_str();
-        let first_sql = format!(
-            "SELECT {ALERT_COLS} FROM alerts
-             WHERE status IN (?1, ?2)
-               AND {SUSPENDED_PREDICATE}
-             ORDER BY timestamp_ms ASC, alert_id ASC
-             LIMIT ?3"
-        );
-        let next_sql = format!(
-            "SELECT {ALERT_COLS} FROM alerts
-             WHERE status IN (?1, ?2)
-               AND {SUSPENDED_PREDICATE}
-               AND (timestamp_ms > ?3 OR (timestamp_ms = ?3 AND alert_id > ?4))
-             ORDER BY timestamp_ms ASC, alert_id ASC
-             LIMIT ?5"
-        );
-        let mut first_stmt = reader.prepare(&first_sql)?;
-        let mut next_stmt = reader.prepare(&next_sql)?;
+        query_unresolved_suspended_alerts(&reader)
+    }
 
-        let mut all = Vec::new();
-        let mut cursor: Option<(i64, String)> = None;
-        loop {
-            let mut page = Vec::new();
-            match &cursor {
-                None => {
-                    let mut rows = first_stmt.query(params![pending, expired, PAGE_SIZE as i64])?;
-                    while let Some(row) = rows.next()? {
-                        page.push(row_to_alert(row)?);
-                    }
-                }
-                Some((last_ts, last_id)) => {
-                    let mut rows = next_stmt.query(params![
-                        pending,
-                        expired,
-                        *last_ts,
-                        last_id.as_str(),
-                        PAGE_SIZE as i64
-                    ])?;
-                    while let Some(row) = rows.next()? {
-                        page.push(row_to_alert(row)?);
-                    }
-                }
-            }
-            let fetched = page.len();
-            if let Some(last) = page.last() {
-                cursor = Some((last.timestamp_ms, last.alert_id.clone()));
-            }
-            all.extend(page);
-            if fetched < PAGE_SIZE {
-                break;
-            }
-        }
-        Ok(all)
+    /// Opens an existing SQLite store strictly read-only (compatible with WAL mode while the
+    /// daemon may still be running, without mutating DB state or schema) and returns all
+    /// unresolved (`PENDING` / `EXPIRED_SUSPENDED`) alerts that still record a suspended parent
+    /// (`process_suspended = 1`) or non-empty `$.suspended_children` array.
+    pub fn list_unresolved_suspended_alerts_read_only(
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<AlertRecord>, StoreError> {
+        let conn = Connection::open_with_flags(path.as_ref(), reader_open_flags())?;
+        conn.execute_batch("PRAGMA query_only = ON;\nPRAGMA busy_timeout = 5000;")?;
+        query_unresolved_suspended_alerts(&conn)
     }
 
     /// Lists alerts ordered by newest `timestamp_ms` first, optionally filtered by [`AlertStatus`].
@@ -343,4 +291,76 @@ pub(crate) fn insert_alert_row(tx: &Transaction<'_>, alert: &AlertRecord) -> Res
         ],
     )?;
     Ok(())
+}
+
+fn query_unresolved_suspended_alerts(conn: &Connection) -> Result<Vec<AlertRecord>, StoreError> {
+    const PAGE_SIZE: usize = 500;
+    // Guard `json_type` and `json_array_length` behind nested `CASE WHEN json_valid(...)`
+    // so malformed legacy `context_json` rows never trigger a SQLite JSON runtime error.
+    const SUSPENDED_PREDICATE: &str = "(
+             process_suspended = 1
+             OR CASE
+                  WHEN json_valid(context_json) THEN
+                    CASE
+                      WHEN json_type(context_json, '$.suspended_children') = 'array'
+                      THEN json_array_length(context_json, '$.suspended_children') > 0
+                      ELSE 0
+                    END
+                  ELSE 0
+                END
+           )";
+    let pending = AlertStatus::Pending.as_db_str();
+    let expired = AlertStatus::ExpiredSuspended.as_db_str();
+    let first_sql = format!(
+        "SELECT {ALERT_COLS} FROM alerts
+         WHERE status IN (?1, ?2)
+           AND {SUSPENDED_PREDICATE}
+         ORDER BY timestamp_ms ASC, alert_id ASC
+         LIMIT ?3"
+    );
+    let next_sql = format!(
+        "SELECT {ALERT_COLS} FROM alerts
+         WHERE status IN (?1, ?2)
+           AND {SUSPENDED_PREDICATE}
+           AND (timestamp_ms > ?3 OR (timestamp_ms = ?3 AND alert_id > ?4))
+         ORDER BY timestamp_ms ASC, alert_id ASC
+         LIMIT ?5"
+    );
+    let mut first_stmt = conn.prepare(&first_sql)?;
+    let mut next_stmt = conn.prepare(&next_sql)?;
+
+    let mut all = Vec::new();
+    let mut cursor: Option<(i64, String)> = None;
+    loop {
+        let mut page = Vec::new();
+        match &cursor {
+            None => {
+                let mut rows = first_stmt.query(params![pending, expired, PAGE_SIZE as i64])?;
+                while let Some(row) = rows.next()? {
+                    page.push(row_to_alert(row)?);
+                }
+            }
+            Some((last_ts, last_id)) => {
+                let mut rows = next_stmt.query(params![
+                    pending,
+                    expired,
+                    *last_ts,
+                    last_id.as_str(),
+                    PAGE_SIZE as i64
+                ])?;
+                while let Some(row) = rows.next()? {
+                    page.push(row_to_alert(row)?);
+                }
+            }
+        }
+        let fetched = page.len();
+        if let Some(last) = page.last() {
+            cursor = Some((last.timestamp_ms, last.alert_id.clone()));
+        }
+        all.extend(page);
+        if fetched < PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(all)
 }

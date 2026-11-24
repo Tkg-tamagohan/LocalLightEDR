@@ -12,6 +12,32 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Sanitize PSModulePath when Windows PowerShell 5.1 inherits PowerShell 6/7 module paths (e.g. launched from pwsh)
+# so autoloading inbox modules (Microsoft.PowerShell.Security, CimCmdlets, Microsoft.PowerShell.Management) cannot fail.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $psHomeModules = [System.IO.Path]::Combine($PSHOME, 'Modules')
+    $cleanedModulePaths = New-Object 'System.Collections.Generic.List[string]'
+    $seenModulePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not [string]::IsNullOrWhiteSpace($env:PSModulePath)) {
+        foreach ($entry in ($env:PSModulePath -split ';')) {
+            $trimmed = $entry.Trim()
+            if ([string]::IsNullOrEmpty($trimmed)) {
+                continue
+            }
+            if ($trimmed -match '(?i)[\\/]PowerShell(?:[\\/][^\\/]+)*[\\/]Modules(?:[\\/]|$)') {
+                continue
+            }
+            if ($seenModulePaths.Add($trimmed)) {
+                $cleanedModulePaths.Add($trimmed)
+            }
+        }
+    }
+    if ($seenModulePaths.Add($psHomeModules)) {
+        $cleanedModulePaths.Add($psHomeModules)
+    }
+    $env:PSModulePath = $cleanedModulePaths -join ';'
+}
+
 $script:ServiceName = 'LocalEDR'
 $script:BinaryNames = @(
     'ledr-daemon.exe',
@@ -367,6 +393,12 @@ function Assert-AdminOrSystemOwnerIfExists {
     if (-not (Test-Path -LiteralPath $DirectoryPath)) {
         return
     }
+    if (($PSVersionTable.PSVersion.Major -lt 6) -and ($null -eq (Get-Module -Name 'Microsoft.PowerShell.Security'))) {
+        $secManifest = [System.IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1')
+        if ([System.IO.File]::Exists($secManifest)) {
+            Import-Module -Name $secManifest -ErrorAction Stop
+        }
+    }
     $acl = Get-Acl -LiteralPath $DirectoryPath
     $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
     if (($ownerSid -ne 'S-1-5-32-544') -and ($ownerSid -ne 'S-1-5-18')) {
@@ -379,6 +411,12 @@ function Invoke-IcaclsChecked {
         [Parameter(Mandatory = $true)][string]$TargetPath,
         [Parameter(Mandatory = $true)][string[]]$GrantSpecs
     )
+    if (($PSVersionTable.PSVersion.Major -lt 6) -and ($null -eq (Get-Module -Name 'Microsoft.PowerShell.Security'))) {
+        $secManifest = [System.IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1')
+        if ([System.IO.File]::Exists($secManifest)) {
+            Import-Module -Name $secManifest -ErrorAction Stop
+        }
+    }
     # Use Get-Acl/Set-Acl (compatible with both Windows PowerShell 5.1 and PowerShell 7+)
     # without calling SetOwner/SetGroup so only the DACL is modified.
     $sec = Get-Acl -LiteralPath $TargetPath

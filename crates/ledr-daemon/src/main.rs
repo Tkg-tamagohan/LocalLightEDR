@@ -1,6 +1,6 @@
 //! Layer 2 LocalEDR resident core daemon (`--foreground`, `--service`, and `--service-strict` modes).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -26,8 +26,8 @@ use ledr_sensor_win::defense::{
     process_liveness, HoneypotManager, ProcessLiveness, WindowsDefenseController,
 };
 use ledr_sensor_win::etw::{
-    inspect_live_process, try_capture_running_processes, EventSinkFn, NoopSensorBackend,
-    WindowsEtwSensor, DEFAULT_ETW_SESSION_NAME,
+    try_capture_running_processes, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
+    DEFAULT_ETW_SESSION_NAME,
 };
 use ledr_sensor_win::privileges::enable_required_privileges;
 use ledr_store::LedrStore;
@@ -480,38 +480,144 @@ enum TargetLivenessCheck {
     Block(Option<u32>),
 }
 
+struct OwnedProcessHandle(windows::Win32::Foundation::HANDLE);
+
+impl Drop for OwnedProcessHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() && !self.0.0.is_null() {
+            // SAFETY: `self.0` is an owned Win32 process handle obtained from `OpenProcess`.
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
+fn open_verified_process_handle(
+    pid: u32,
+    access: windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS,
+) -> Result<OwnedProcessHandle, Option<windows::core::Error>> {
+    use windows::Win32::System::Threading::{GetProcessId, OpenProcess};
+
+    // SAFETY: `OpenProcess` takes integer flags and PID; non-null handles are RAII-closed.
+    let raw = unsafe { OpenProcess(access, false, pid) }.map_err(Some)?;
+    if raw.is_invalid() || raw.0.is_null() {
+        return Err(None);
+    }
+    let handle = OwnedProcessHandle(raw);
+    // Reject handles opened via Windows' low-2-bit PID masking (`pid & !3`).
+    // SAFETY: `handle.0` is an open process handle with `PROCESS_QUERY_LIMITED_INFORMATION`.
+    let actual_pid = unsafe { GetProcessId(handle.0) };
+    if actual_pid != pid {
+        return Err(None);
+    }
+    Ok(handle)
+}
+
+fn query_process_creation_time_100ns(handle: windows::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::GetProcessTimes;
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: `handle` is an open process handle and all four `FILETIME` structs are valid.
+    unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }.ok()?;
+    let create_time_100ns =
+        ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64);
+    (create_time_100ns != 0).then_some(create_time_100ns)
+}
+
+fn try_probe_live_target_fast(pid: u32) -> Option<LiveTargetState> {
+    use windows::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE,
+    };
+
+    match open_verified_process_handle(pid, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)
+    {
+        Ok(handle) => {
+            // Non-blocking 0ms check: `WAIT_OBJECT_0` positively confirms kernel process exit
+            // (including exited zombie processes whose handles are still open elsewhere);
+            // `WAIT_TIMEOUT` confirms the process object is unsignaled (genuinely running).
+            // SAFETY: `handle.0` was opened with `PROCESS_SYNCHRONIZE`.
+            let wait_status = unsafe { WaitForSingleObject(handle.0, 0) };
+            if wait_status == WAIT_OBJECT_0 {
+                return Some(LiveTargetState::Gone);
+            }
+            if wait_status == WAIT_TIMEOUT {
+                if let Some(create_time_100ns) = query_process_creation_time_100ns(handle.0) {
+                    return Some(LiveTargetState::Running {
+                        create_time_100ns: Some(create_time_100ns),
+                    });
+                }
+            }
+            None
+        }
+        Err(Some(err)) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+            let handle =
+                open_verified_process_handle(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+            let mut exit_code = 0u32;
+            // SAFETY: `handle.0` was opened with `PROCESS_QUERY_LIMITED_INFORMATION`.
+            unsafe { GetExitCodeProcess(handle.0, &mut exit_code) }.ok()?;
+            if exit_code != STILL_ACTIVE.0 as u32 {
+                return Some(LiveTargetState::Gone);
+            }
+            query_process_creation_time_100ns(handle.0).map(|create_time_100ns| {
+                LiveTargetState::Running {
+                    create_time_100ns: Some(create_time_100ns),
+                }
+            })
+        }
+        Err(_) => None,
+    }
+}
+
 fn probe_live_target_os(pid: u32) -> LiveTargetState {
     if pid == 0 {
         return LiveTargetState::Running {
             create_time_100ns: None,
         };
     }
+    if let Some(state) = try_probe_live_target_fast(pid) {
+        return state;
+    }
+    // Fall back to `process_liveness` when the fast handle probe cannot determine state
+    // (e.g., PID no longer exists, protected process denied `OpenProcess`, or `CreationTime`
+    // could not be read), preserving fail-closed `Unknown` and `Running { create_time_100ns: None }`
+    // invariants (`PRG-002`, `PRG-007`).
     match process_liveness(pid) {
         ProcessLiveness::Gone => LiveTargetState::Gone,
         ProcessLiveness::Unknown => LiveTargetState::Unknown,
-        ProcessLiveness::Running => {
-            if let Some(info) = inspect_live_process(pid) {
-                if info.create_time_100ns != 0 {
-                    return LiveTargetState::Running {
-                        create_time_100ns: Some(info.create_time_100ns),
-                    };
-                }
-            }
-            // Re-check liveness once in case the target finished exiting between the two calls,
-            // failing closed when still `Running` or `Unknown` (`AGENTS.md` Phase 2 invariant).
-            match process_liveness(pid) {
-                ProcessLiveness::Gone => LiveTargetState::Gone,
-                ProcessLiveness::Unknown => LiveTargetState::Unknown,
-                ProcessLiveness::Running => LiveTargetState::Running {
-                    create_time_100ns: None,
-                },
-            }
-        }
+        ProcessLiveness::Running => LiveTargetState::Running {
+            create_time_100ns: None,
+        },
     }
+}
+
+fn probe_pid_memoized(
+    pid: u32,
+    probe_cache: &mut HashMap<u32, LiveTargetState>,
+    probe: &dyn Fn(u32) -> LiveTargetState,
+) -> LiveTargetState {
+    if pid == 0 {
+        return LiveTargetState::Running {
+            create_time_100ns: None,
+        };
+    }
+    if let Some(&cached) = probe_cache.get(&pid) {
+        return cached;
+    }
+    let state = probe(pid);
+    probe_cache.insert(pid, state);
+    state
 }
 
 fn check_suspended_target_liveness(
     raw_instance_id: &str,
+    probe_cache: &mut HashMap<u32, LiveTargetState>,
     probe: &dyn Fn(u32) -> LiveTargetState,
 ) -> TargetLivenessCheck {
     let trimmed = raw_instance_id.trim();
@@ -520,14 +626,14 @@ fn check_suspended_target_liveness(
             return TargetLivenessCheck::Block(None);
         }
         if ident.create_time_100ns == 0 {
-            return match probe(ident.pid) {
+            return match probe_pid_memoized(ident.pid, probe_cache, probe) {
                 LiveTargetState::Gone => TargetLivenessCheck::Excluded,
                 LiveTargetState::Unknown | LiveTargetState::Running { .. } => {
                     TargetLivenessCheck::Block(Some(ident.pid))
                 }
             };
         }
-        return match probe(ident.pid) {
+        return match probe_pid_memoized(ident.pid, probe_cache, probe) {
             LiveTargetState::Gone => TargetLivenessCheck::Excluded,
             LiveTargetState::Unknown => TargetLivenessCheck::Block(Some(ident.pid)),
             LiveTargetState::Running {
@@ -538,7 +644,7 @@ fn check_suspended_target_liveness(
     }
 
     if let Some(pid) = parse_pid_from_instance_id(trimmed).filter(|&p| p > 0) {
-        return match probe(pid) {
+        return match probe_pid_memoized(pid, probe_cache, probe) {
             LiveTargetState::Gone => TargetLivenessCheck::Excluded,
             LiveTargetState::Unknown | LiveTargetState::Running { .. } => {
                 TargetLivenessCheck::Block(Some(pid))
@@ -554,20 +660,23 @@ fn collect_live_unresolved_suspended_alerts(
 ) -> (usize, BTreeSet<u32>) {
     let mut live_alerts = 0usize;
     let mut live_pids = BTreeSet::new();
+    let mut probe_cache: HashMap<u32, LiveTargetState> = HashMap::new();
 
     for alert in alerts {
         let mut alert_blocked = false;
         if alert.process_suspended {
             match alert.process_instance_id.as_deref() {
-                Some(inst) => match check_suspended_target_liveness(inst, probe) {
-                    TargetLivenessCheck::Excluded => {}
-                    TargetLivenessCheck::Block(maybe_pid) => {
-                        alert_blocked = true;
-                        if let Some(pid) = maybe_pid {
-                            live_pids.insert(pid);
+                Some(inst) => {
+                    match check_suspended_target_liveness(inst, &mut probe_cache, probe) {
+                        TargetLivenessCheck::Excluded => {}
+                        TargetLivenessCheck::Block(maybe_pid) => {
+                            alert_blocked = true;
+                            if let Some(pid) = maybe_pid {
+                                live_pids.insert(pid);
+                            }
                         }
                     }
-                },
+                }
                 None => {
                     alert_blocked = true;
                 }
@@ -580,7 +689,11 @@ fn collect_live_unresolved_suspended_alerts(
                     if let Some(children) = children_val.as_array() {
                         for item in children {
                             if let Some(raw_id) = item.as_str() {
-                                match check_suspended_target_liveness(raw_id, probe) {
+                                match check_suspended_target_liveness(
+                                    raw_id,
+                                    &mut probe_cache,
+                                    probe,
+                                ) {
                                     TargetLivenessCheck::Excluded => {}
                                     TargetLivenessCheck::Block(maybe_pid) => {
                                         alert_blocked = true;
@@ -1106,6 +1219,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ledr_sensor_win::etw::inspect_live_process;
 
     #[test]
     fn cli_parses_defaults_and_flags() {
@@ -2197,6 +2311,215 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cli_check_06_memoizes_probe_per_unique_pid_across_alerts_and_children() {
+        use ledr_proto::{AlertSeverity, AlertStatus};
+        use std::cell::RefCell;
+
+        let make_alert = |id: &str,
+                          pid_inst: Option<&str>,
+                          suspended: bool,
+                          children: &[&str]|
+         -> AlertRecord {
+            AlertRecord {
+                alert_id: id.to_string(),
+                timestamp_ms: 1_000,
+                severity: AlertSeverity::Critical,
+                source_layer: "LAYER_1_HONEYPOT".to_string(),
+                rule_id: "L-06".to_string(),
+                title: "Memoization test".to_string(),
+                process_instance_id: pid_inst.map(str::to_string),
+                process_suspended: suspended,
+                status: AlertStatus::Pending,
+                context_json: serde_json::json!({
+                    "suspended_children": children
+                })
+                .to_string(),
+                resolved_at_ms: None,
+            }
+        };
+
+        let counts: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+        let probe = |pid: u32| -> LiveTargetState {
+            *counts.borrow_mut().entry(pid).or_insert(0) += 1;
+            match pid {
+                1001 => LiveTargetState::Running {
+                    create_time_100ns: Some(5000),
+                },
+                1002 => LiveTargetState::Gone,
+                1003 => LiveTargetState::Running {
+                    create_time_100ns: Some(7001),
+                },
+                1005 => LiveTargetState::Unknown,
+                1006 => LiveTargetState::Running {
+                    create_time_100ns: None,
+                },
+                _ => panic!("unexpected probe call for pid {pid}"),
+            }
+        };
+
+        let alerts = vec![
+            // Parent 1001 live; children duplicate 1001, plus Gone 1002 and PID-reused 1003.
+            make_alert("a1", Some("1001:5000"), true, &["1001:5000", "1002:6000", "1003:7000"]),
+            // All targets are Gone or PID-reused -> alert excluded; no extra probes.
+            make_alert("a2", Some("1002:6000"), true, &["1003:7000", "1002:0"]),
+            // Unsuspended parent 1004 must NOT be probed; children reuse 1001 and probe Unknown 1005.
+            make_alert("a3", Some("1004:8000"), false, &["1001:5000", "1005:9000", "1005:9000"]),
+            // Running without CreationTime (1006) fails closed; pid 0 must not invoke probe.
+            make_alert("a4", Some("1006:1000"), true, &["1006:0", "1006", "0:123"]),
+            // Different expected CreationTime on same PIDs uses cached state accurately:
+            // 1001:4999 != 5000 (excluded), 1003:7001 == 7001 (blocked).
+            make_alert("a5", Some("1001:4999"), true, &["1003:7001"]),
+        ];
+
+        let (live_alerts, live_pids) = collect_live_unresolved_suspended_alerts(&alerts, &probe);
+        assert_eq!(live_alerts, 4);
+        assert_eq!(live_pids, BTreeSet::from([1001, 1003, 1005, 1006]));
+        {
+            let recorded = counts.borrow();
+            assert_eq!(recorded.get(&1001).copied(), Some(1));
+            assert_eq!(recorded.get(&1002).copied(), Some(1));
+            assert_eq!(recorded.get(&1003).copied(), Some(1));
+            assert_eq!(recorded.get(&1005).copied(), Some(1));
+            assert_eq!(recorded.get(&1006).copied(), Some(1));
+            assert!(!recorded.contains_key(&1004));
+            assert!(!recorded.contains_key(&0));
+        }
+
+        // Verify DB-backed `check_unresolved_suspended_in_db_with_probe` also invokes probe once per unique PID.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-main-check-memo-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+
+        let db_blocked = tmp_dir.join("memo_blocked.db");
+        let store_blocked = LedrStore::open(&db_blocked).expect("open blocked memo db");
+        for alert in &alerts {
+            store_blocked.record_alert(alert).expect("insert alert");
+        }
+        drop(store_blocked);
+
+        counts.borrow_mut().clear();
+        assert_eq!(
+            check_unresolved_suspended_in_db_with_probe(Some(&db_blocked), &probe),
+            3
+        );
+        {
+            let recorded = counts.borrow();
+            assert_eq!(recorded.len(), 5);
+            for pid in [1001u32, 1002, 1003, 1005, 1006] {
+                assert_eq!(
+                    recorded.get(&pid).copied(),
+                    Some(1),
+                    "expected exactly 1 probe call for pid {pid}"
+                );
+            }
+        }
+
+        // When all duplicate PIDs resolve to Gone or CreationTime-mismatched (reused), exit 0 with 1 probe per unique PID.
+        let db_clear = tmp_dir.join("memo_clear.db");
+        let store_clear = LedrStore::open(&db_clear).expect("open clear memo db");
+        store_clear
+            .record_alert(&make_alert(
+                "c1",
+                Some("1002:6000"),
+                true,
+                &["1002:6000", "1003:7000"],
+            ))
+            .expect("insert c1");
+        store_clear
+            .record_alert(&make_alert(
+                "c2",
+                Some("1003:7000"),
+                true,
+                &["1002:0", "1003:7000"],
+            ))
+            .expect("insert c2");
+        drop(store_clear);
+
+        counts.borrow_mut().clear();
+        assert_eq!(
+            check_unresolved_suspended_in_db_with_probe(Some(&db_clear), &probe),
+            0
+        );
+        {
+            let recorded = counts.borrow();
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(recorded.get(&1002).copied(), Some(1));
+            assert_eq!(recorded.get(&1003).copied(), Some(1));
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cli_check_07_fast_os_probe_distinguishes_live_from_exited_zombie_handle() {
+        use std::process::{Child, Command, Stdio};
+        use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+
+        struct ChildKillGuard(Option<Child>);
+        impl Drop for ChildKillGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        assert_eq!(
+            probe_live_target_os(0),
+            LiveTargetState::Running {
+                create_time_100ns: None
+            }
+        );
+
+        let live_child = Command::new("cmd.exe")
+            .args(["/c", "findstr", ".*"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn live child");
+        let live_pid = live_child.id();
+        let live_ct = inspect_live_process(live_pid)
+            .map(|info| info.create_time_100ns)
+            .filter(|&ct| ct != 0)
+            .expect("live child create_time_100ns");
+        let _live_guard = ChildKillGuard(Some(live_child));
+
+        assert_eq!(
+            probe_live_target_os(live_pid),
+            LiveTargetState::Running {
+                create_time_100ns: Some(live_ct)
+            },
+            "fast OS probe must return exact CreationTime for live process"
+        );
+
+        // Spawn a child, hold an open `PROCESS_QUERY_LIMITED_INFORMATION` handle so the kernel
+        // process object remains alive after termination (zombie state), then terminate it.
+        let mut zombie_child = Command::new("cmd.exe")
+            .args(["/c", "findstr", ".*"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn zombie child");
+        let zombie_pid = zombie_child.id();
+        let _held_handle =
+            open_verified_process_handle(zombie_pid, PROCESS_QUERY_LIMITED_INFORMATION)
+                .expect("open handle to hold zombie process object");
+        let _ = zombie_child.kill();
+        let _ = zombie_child.wait();
+
+        assert_eq!(
+            probe_live_target_os(zombie_pid),
+            LiveTargetState::Gone,
+            "exited zombie process with an open handle must be reported as Gone, not Running"
+        );
     }
 
     #[test]

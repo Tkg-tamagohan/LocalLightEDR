@@ -455,13 +455,13 @@ jobs:
           if ($pyFiles.Count -eq 0) {
             throw "No Python scripts matched scripts\*.py"
           }
-          python -m py_compile $pyFiles
+          python -W error -m py_compile $pyFiles
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest scripts/test_release_scripts.py
+          python -B -W error -m unittest scripts/test_release_scripts.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest scripts/test_check_invariants.py
+          python -B -W error -m unittest scripts/test_check_invariants.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/release_verify.py preflight
+          python -W error scripts/release_verify.py preflight
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   ci-gate:

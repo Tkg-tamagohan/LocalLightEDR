@@ -28,6 +28,52 @@ if str(SCRIPTS_DIR) not in sys.path:
 import build_release_artifacts  # noqa: E402
 import release_verify  # noqa: E402
 
+_PS_CORE_MODULE_PATH_RE = re.compile(
+    r"[\\/]PowerShell(?:[\\/][^\\/]+)*[\\/]Modules(?:[\\/]|$)",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_ps51_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return an environment dict safe for Windows PowerShell 5.1 (powershell.exe).
+
+    When invoked from PowerShell 7+ (pwsh), inherited PSModulePath contains PS 7
+    module directories (e.g. ``C:\\Program Files\\PowerShell\\7\\Modules``) that break
+    inbox module autoloading (``Microsoft.PowerShell.Security``) in powershell.exe.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    ps_mod_key = next(
+        (k for k in env if k.lower() == "psmodulepath"),
+        "PSModulePath",
+    )
+    raw_ps_mod = env.get(ps_mod_key, "")
+    system_root = next(
+        (v for k, v in env.items() if k.lower() == "systemroot" and v),
+        r"C:\Windows",
+    )
+    inbox_modules = (
+        f"{system_root.rstrip(chr(92) + '/')}\\System32\\WindowsPowerShell\\v1.0\\Modules"
+    )
+
+    cleaned: list[str] = []
+    seen_lower: set[str] = set()
+    for raw_entry in raw_ps_mod.split(";"):
+        entry = raw_entry.strip()
+        if not entry or _PS_CORE_MODULE_PATH_RE.search(entry):
+            continue
+        key = entry.lower()
+        if key not in seen_lower:
+            seen_lower.add(key)
+            cleaned.append(entry)
+
+    if inbox_modules.lower() not in seen_lower:
+        cleaned.append(inbox_modules)
+
+    for k in [k for k in env if k.lower() == "psmodulepath"]:
+        del env[k]
+    env["PSModulePath"] = ";".join(cleaned)
+    return env
+
 
 def _create_mock_repo(root: Path, version: str = "0.1.0") -> tuple[Path, Path, Path]:
     (root / "crates").mkdir(parents=True, exist_ok=True)
@@ -675,7 +721,7 @@ class TestReleaseScripts(unittest.TestCase):
                     harness = tmp_path / "verify_ps_helpers.ps1"
 
                     harness.write_text(
-                        f"""
+                        rf"""
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -698,7 +744,7 @@ foreach ($p in @('{install_path}', '{uninstall_path}')) {{
     Invoke-WithFileLockRetry -TimeoutSeconds 3 -Description "wrapped IOException retry ($p)" -Operation {{
         $script:attempts++
         if ($script:attempts -lt 2) {{
-            [System.IO.File]::Delete((Join-Path '{tmp_path}' 'missing-dir\\file.bin'))
+            [System.IO.File]::Delete((Join-Path '{tmp_path}' 'missing-dir\file.bin'))
         }}
     }}
     if ($script:attempts -ne 2) {{
@@ -840,11 +886,13 @@ Write-Output "PS_VERIFY_OK"
 """,
                         encoding="utf-8",
                     )
+                    run_env = _sanitize_ps51_env() if shell_name == "powershell.exe" else None
                     res = subprocess.run(
                         [shell_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
+                        env=run_env,
                         check=False,
                     )
                     self.assertEqual(
@@ -853,6 +901,219 @@ Write-Output "PS_VERIFY_OK"
                         f"{shell_name} harness failed (rc={res.returncode}):\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
                     )
                     self.assertIn("PS_VERIFY_OK", res.stdout)
+
+    def test_rel_10_powershell_polluted_psmodulepath_resilience(self) -> None:
+        # 1. Cross-platform sanitizer unit check: drops PS 6/7 module dirs, preserves PS 5.1 dirs
+        polluted_sample = {
+            "SystemRoot": r"C:\Windows",
+            "PSModulePath": ";".join(
+                [
+                    r"C:\Users\runneradmin\Documents\PowerShell\Modules",
+                    r"C:\Program Files\PowerShell\Modules",
+                    r"C:\Program Files\PowerShell\7\Modules",
+                    r"C:\Program Files\PowerShell\7-preview\Modules",
+                    r"C:\Program Files\WindowsPowerShell\Modules",
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules",
+                ]
+            ),
+        }
+        sanitized = _sanitize_ps51_env(polluted_sample)
+        entries = sanitized["PSModulePath"].split(";")
+        self.assertEqual(
+            entries,
+            [
+                r"C:\Program Files\WindowsPowerShell\Modules",
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules",
+            ],
+        )
+
+        # Missing PSModulePath still populates WindowsPowerShell inbox Modules
+        minimal = _sanitize_ps51_env({"SystemRoot": r"D:\Win"})
+        self.assertEqual(
+            minimal["PSModulePath"],
+            r"D:\Win\System32\WindowsPowerShell\v1.0\Modules",
+        )
+
+        if sys.platform != "win32":
+            return
+        ps51 = shutil.which("powershell.exe")
+        if not ps51:
+            self.skipTest("powershell.exe not found on Windows")
+
+        install_path = REPO_ROOT / "packaging" / "windows" / "install.ps1"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_sec_dir = (
+                tmp_path
+                / "PowerShell"
+                / "7"
+                / "Modules"
+                / "Microsoft.PowerShell.Security"
+            )
+            fake_sec_dir.mkdir(parents=True)
+            (fake_sec_dir / "Microsoft.PowerShell.Security.psd1").write_text(
+                """@{
+    ModuleVersion = '7.0.0.0'
+    PowerShellVersion = '7.4'
+    RootModule = 'Microsoft.PowerShell.Security.dll'
+    CmdletsToExport = @('Get-Acl', 'Set-Acl')
+}
+""",
+                encoding="utf-8",
+            )
+            acl_dir = tmp_path / "acl-target"
+            acl_dir.mkdir()
+
+            polluted_env = os.environ.copy()
+            polluted_env["PSModulePath"] = ";".join(
+                [str(fake_sec_dir.parent), polluted_env.get("PSModulePath", "")]
+            )
+
+            # Negative control: bare Get-Acl in powershell.exe under polluted PSModulePath must fail to autoload
+            neg = subprocess.run(
+                [
+                    ps51,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    f"$ErrorActionPreference = 'Stop'; Get-Acl -LiteralPath '{acl_dir}' | Out-Null",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=polluted_env,
+                check=False,
+            )
+            self.assertNotEqual(neg.returncode, 0)
+            self.assertIn("CouldNotAutoloadMatchingModule", neg.stderr)
+
+            # A. Sanitized PSModulePath allows bare Get-Acl in powershell.exe
+            sanitized_env = _sanitize_ps51_env(polluted_env)
+            pos_sanitized = subprocess.run(
+                [
+                    ps51,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    f"$ErrorActionPreference = 'Stop'; Get-Acl -LiteralPath '{acl_dir}' | Out-Null; Write-Output 'SANITIZED_PS51_OK'",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=sanitized_env,
+                check=False,
+            )
+            self.assertEqual(
+                pos_sanitized.returncode,
+                0,
+                f"Sanitized powershell.exe failed:\nSTDOUT:\n{pos_sanitized.stdout}\nSTDERR:\n{pos_sanitized.stderr}",
+            )
+            self.assertIn("SANITIZED_PS51_OK", pos_sanitized.stdout)
+
+            # B. install.ps1's own Assert-AdminOrSystemOwnerIfExists and Invoke-IcaclsChecked
+            #    must succeed in powershell.exe EVEN WITH polluted PSModulePath
+            install_harness = tmp_path / "verify_install_polluted.ps1"
+            install_harness.write_text(
+                rf"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{install_path}', [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) {{ throw "Parse error in install.ps1" }}
+foreach ($fnName in @('Ensure-NativeHelper', 'Invoke-NativeProcess', 'Assert-AdminOrSystemOwnerIfExists', 'Invoke-IcaclsChecked')) {{
+    $fnAst = $ast.FindAll({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $fnName }}, $true) | Select-Object -First 1
+    if ($null -eq $fnAst) {{ throw "Missing function $fnName in install.ps1" }}
+    Invoke-Expression $fnAst.Extent.Text
+}}
+$script:NativeHelperLoaded = $false
+Invoke-IcaclsChecked -TargetPath '{acl_dir}' -GrantSpecs @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F')
+try {{
+    Assert-AdminOrSystemOwnerIfExists -DirectoryPath '{acl_dir}'
+}}
+catch {{
+    if ($_.Exception.Message -notmatch '^Unsafe owner SID ') {{
+        throw
+    }}
+}}
+Write-Output 'INSTALL_PS1_POLLUTED_OK'
+""",
+                encoding="utf-8",
+            )
+            try:
+                pos_install = subprocess.run(
+                    [
+                        ps51,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(install_harness),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    env=polluted_env,
+                    check=False,
+                )
+                self.assertEqual(
+                    pos_install.returncode,
+                    0,
+                    f"install.ps1 helper failed under polluted PSModulePath:\nSTDOUT:\n{pos_install.stdout}\nSTDERR:\n{pos_install.stderr}",
+                )
+                self.assertIn("INSTALL_PS1_POLLUTED_OK", pos_install.stdout)
+            finally:
+                # Restore current user FullControl so TemporaryDirectory cleanup never hits AccessDenied
+                subprocess.run(
+                    [
+                        ps51,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        (
+                            f"$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; "
+                            f"if ($null -ne $sid) {{ icacls.exe '{acl_dir}' /grant \"*$($sid.Value):(OI)(CI)F\" | Out-Null }}"
+                        ),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=sanitized_env,
+                    check=False,
+                )
+
+            # C. Running install.ps1 entrypoint under polluted PSModulePath exercises top-level
+            #    PSModulePath sanitization and fails cleanly at missing source binary (not module autoload).
+            empty_src = tmp_path / "empty-src"
+            empty_src.mkdir()
+            unused_install = tmp_path / "unused-install"
+            unused_data = tmp_path / "unused-data"
+            ep_res = subprocess.run(
+                [
+                    ps51,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(install_path),
+                    "-SourceDir",
+                    str(empty_src),
+                    "-InstallDir",
+                    str(unused_install),
+                    "-DataDir",
+                    str(unused_data),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=polluted_env,
+                check=False,
+            )
+            self.assertNotEqual(ep_res.returncode, 0)
+            self.assertIn("Missing required source binary", ep_res.stderr)
+            self.assertNotIn("CouldNotAutoloadMatchingModule", ep_res.stderr)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,10 @@
 - 仕様の正は `docs/implementation-plan.md`、`docs/decision-records.md`（L-01 から L-25）、および凍結済みの `crates/ledr-proto/src/lib.rs` に置く。
 - 作業は Phase 単位（1 Phase 1 PR）で進め、`docs/implementation-plan.md` のチェックリスト `[x]` は `main` へのマージ完了後にのみ更新する。
 - `crates/ledr-proto` の既存公開型とシグネチャは後方互換なく変更しない。
+- 文書同期時の整合原則：仕様書、実装計画、フォローアップ記録等を更新する際は以下の 3 点を徹底する。
+  - 仕様参照表の反映先へ記述のない層を案内しない。
+  - 代替手順書の案内先に旧基準が残っている場合は現行の正本基準（`L-24` 等）で合否判定する旨を明記し、現行完了基準と将来の見直し論点を分離する。
+  - 接続時処理とリクエスト別認可のような実行順序は実コード（例：`crates/ledr-daemon/src/ipc/server.rs` の `handle_pipe_client`）と 1 対 1 で揃える。
 
 ## Phase 1 で確立した構造不変条件
 
@@ -57,7 +61,8 @@
 - `apps/ledr-ui/src/defense_status.rs` はユーザーの機密ファイル（`Cookies`、`.ssh` 等）へ一切アクセスせず、おとりファイル、ブリッジバイナリ、`HKCU` および `HKLM` の読み取り専用レジストリ参照とマニフェスト検証のみを行い、ウィンドウ閉鎖時は `ledr-ui` と WebView2 を 0 プロセスで終了する（`L-08`）。
   マニフェスト検証は既定 2 ディレクトリのホワイトリスト配下だけに限定し、リパースポイント拒否、`FILE_FLAG_OPEN_REPARSE_POINT` と `FILE_READ_ATTRIBUTES` の先行検査、`nNumberOfLinks == 1`、`GetFinalPathNameByHandleW` 閉じ込め、`ReOpenFile` 昇格を経て読み取り、`description` を必須項目として検証する。
   カスタム配置パスに対してはファイル I/O を行わず、`unverified` として検証済み状態と区別する。
-- View 3（`apps/ledr-ui/src/defense_status.rs`）の Native Messaging レジストリ診断では、WOW64 参照を `KEY_WOW64_32KEY -> KEY_WOW64_64KEY` の順で探索し、32 ビット側で `EmptyString` を検出した場合は 64 ビット側へフォールバックせず 32 ビット側で打ち切る（CLI `ledr-bridge-nm` の 32 ビットビュー対応は `FU-P4-01` 対象）。
+- View 3（`apps/ledr-ui/src/defense_status.rs`）の Native Messaging レジストリ診断では、WOW64 参照を `KEY_WOW64_32KEY -> KEY_WOW64_64KEY` の順で探索し、32 ビット側で `EmptyString` を検出した場合は 64 ビット側へフォールバックせず 32 ビット側で打ち切る。
+  CLI `ledr-bridge-nm` の `HKLM` Native Messaging 操作も同様に WOW64 32 ビット・64 ビット両ビューに対応し、`setup --scope machine` は 32 ビット・64 ビット両ビューへ冪等に登録、`status` は View 3 と一致する順（32 ビット先行、32 ビット側 `EmptyString` で打ち切り）で探索、`unregister` は両ビューを冪等に削除したうえで両ビューの残存参照を確認してからマニフェストファイルを削除する（`HKCU`、URI スキーム、AUMID、グループポリシーは既定ビューのみを維持する）。
 - View 3 のブラウザ別詳細行（`.browser-detail-row`）には各ブラウザの `manifest_path` と診断表示を併記し、`UI-P4-08` 等の UI 回帰テストではコンテナ全体検索だけで済ませず、ブラウザ単位で詳細行要素を抽出して期待する値が併記されていることと他ブラウザの情報が混入していないことを検証する。
 - 実 Chrome 拡張ロード、実 Native Messaging ホスト起動、実ダウンロードの `:Zone.Identifier` 付与と移動後紐付け、および実 WebView2 終了計測は合成テストでは検証済みと扱わず、Windows 10/11 クライアント SKU の実機 E2E（`FU-E2E-02`）対象として残す。
 
@@ -69,4 +74,4 @@
 - Chrome MV3 拡張テスト（Node 22、PowerShell 5.1 互換）：`$extTests = @(Get-ChildItem extensions\ledr-chrome-mv3\tests\*.test.mjs | Select-Object -ExpandProperty FullName); if ($extTests.Count -eq 0) { throw "No Chrome MV3 extension test files matched." }; node --test $extTests`
 - UI モック DOM テスト（Node 22、PowerShell 5.1 互換）：`$uiTests = @(Get-ChildItem apps\ledr-ui\js-tests\*.test.mjs | Select-Object -ExpandProperty FullName); if ($uiTests.Count -eq 0) { throw "No Tauri UI test files matched." }; node --test $uiTests`（単体実行：`node --test apps/ledr-ui/js-tests/phase4_ui.test.mjs`）
 - 実機 E2E：ターゲット基準は Windows 10 または 11（x86_64）クライアント SKU であり、Server SKU で代替検証した場合は未検証差異として明記する。
-- 検証記録の区別：文書（`docs/follow-up-notes.md`、`docs/implementation-plan.md` 等）や PR 本文へテスト合格を記録する際は、`.github/workflows/ci.yml` で実際に実行されるジョブ範囲（`changes` によるパス別スキップを含む）とローカル別途実行範囲（`scripts/test_check_invariants.py`、不変条件ゲート、実機 E2E 等）を混同せず、CI 未実行またはスキップされたスイートには別途の実行コマンド、環境、結果記録を明記する。
+- 検証記録の区別：文書（`docs/follow-up-notes.md`、`docs/implementation-plan.md` 等）や PR 本文へテスト合格を記録する際は、`.github/workflows/ci.yml` で実際に実行されるジョブ範囲（`changes` によるパス別スキップを含む）とローカル別途実行範囲を混同せず、常に「ローカルでも再実行した CI 相当項目」と「CI 対象外のローカル別途実行項目」（実機計測、PE インポート検査、`scripts/test_check_invariants.py`、不変条件ゲート、実機 E2E 等）を分離して記載し、CI 未実行またはスキップされたスイートには別途の実行コマンド、環境、結果記録を明記する。

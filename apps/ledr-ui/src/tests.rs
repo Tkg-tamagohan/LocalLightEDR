@@ -2329,3 +2329,863 @@ fn ui_p4_13_manifest_allowlist_reparse_hardlink_and_sensitive_file_non_touch() {
         ManifestValidationOutcome::Invalid("manifest file does not exist".to_string())
     );
 }
+
+// ---------------------------------------------------------------------------
+// UI-UPD-01..08: M3 Application Self-Updater & Elevation Tests
+// ---------------------------------------------------------------------------
+
+const TEST_UPDATER_PUB_B64: &str = "QLFG0FBZAXTtFwgmgGJW+TFwP+espLDhcmJFg6B1NJk=";
+const TEST_UPDATER_PAYLOAD: &[u8] = b"LocalEDR-dummy-installer-v9.9.9-payload-0123456789abcdef";
+
+const TEST_MANIFEST_UP_TO_DATE: &str = r#"{"schema_version":1,"product":"LocalEDR","version":"0.1.0","tag":"v0.1.0","released_at":"2026-11-24T00:00:00Z","min_updater_version":"0.1.0","filename":"LocalEDR-Setup-v0.1.0-win-x64.exe","download_url":"https://github.com/Tkg-tamagohan/LocalLightEDR/releases/download/v0.1.0/LocalEDR-Setup-v0.1.0-win-x64.exe","sha256":"82f34eea8e1e68e258b29e4e47ce6bb509d0f7db1f417db88a0da3be18ea8c05","size_bytes":56,"release_notes_url":"https://github.com/Tkg-tamagohan/LocalLightEDR/releases/tag/v0.1.0","chrome_extension":{"extension_id":"ecelachfiiiiiibpjeomfncgpegbpanh","version":"0.1.0"}}"#;
+const TEST_SIG_UP_TO_DATE: &str = r#"{"schema_version":1,"key_id":"test-key-2026","algorithm":"ed25519","signature_b64":"GEln1rT/9Yj2fVS0Yft5RYA9hJkGHIBk0zu7BrktIsbAtaRhh16SX4U7kyNA6AAOBQOMFr9lclyyi5QxUA1EBQ=="}"#;
+
+const TEST_MANIFEST_UPDATE_AVAILABLE: &str = r#"{"schema_version":1,"product":"LocalEDR","version":"9.9.9","tag":"v9.9.9","released_at":"2026-11-24T00:00:00Z","min_updater_version":"0.1.0","filename":"LocalEDR-Setup-v9.9.9-win-x64.exe","download_url":"https://github.com/Tkg-tamagohan/LocalLightEDR/releases/download/v9.9.9/LocalEDR-Setup-v9.9.9-win-x64.exe","sha256":"82f34eea8e1e68e258b29e4e47ce6bb509d0f7db1f417db88a0da3be18ea8c05","size_bytes":56,"release_notes_url":"https://github.com/Tkg-tamagohan/LocalLightEDR/releases/tag/v9.9.9","chrome_extension":{"extension_id":"ecelachfiiiiiibpjeomfncgpegbpanh","version":"9.9.9"}}"#;
+const TEST_SIG_UPDATE_AVAILABLE: &str = r#"{"schema_version":1,"key_id":"test-key-2026","algorithm":"ed25519","signature_b64":"kxaoEV2qNpWm+xJVO+PhQqXLtI47u7wWy/Vow6qKLsTB0kzcvF2CPmMhNoWALYHcj18wZRQop2ABGNgBiqRRAw=="}"#;
+
+const TEST_MANIFEST_MANUAL_REQUIRED: &str = r#"{"schema_version":1,"product":"LocalEDR","version":"9.9.9","tag":"v9.9.9","released_at":"2026-11-24T00:00:00Z","min_updater_version":"5.0.0","filename":"LocalEDR-Setup-v9.9.9-win-x64.exe","download_url":"https://github.com/Tkg-tamagohan/LocalLightEDR/releases/download/v9.9.9/LocalEDR-Setup-v9.9.9-win-x64.exe","sha256":"82f34eea8e1e68e258b29e4e47ce6bb509d0f7db1f417db88a0da3be18ea8c05","size_bytes":56,"release_notes_url":"https://github.com/Tkg-tamagohan/LocalLightEDR/releases/tag/v9.9.9","chrome_extension":{"extension_id":"ecelachfiiiiiibpjeomfncgpegbpanh","version":"9.9.9"}}"#;
+const TEST_SIG_MANUAL_REQUIRED: &str = r#"{"schema_version":1,"key_id":"test-key-2026","algorithm":"ed25519","signature_b64":"N5OrsHqSB9GCdVDr+LUaGnC+dZWK2ARgTnNapiSermlIgzhdFxlQ+02dZs+Xa0LyutHJqeCCvHG1d+TEMckzBw=="}"#;
+
+const TEST_MANIFEST_COLLISION: &str = r#"{"schema_version":1,"product":"LocalEDR","version":"9.9.9","tag":"v9.9.9","released_at":"2026-11-24T00:00:00Z","min_updater_version":"0.1.0","filename":"update-manifest.json","download_url":"https://github.com/Tkg-tamagohan/LocalLightEDR/releases/download/v9.9.9/update-manifest.json","sha256":"82f34eea8e1e68e258b29e4e47ce6bb509d0f7db1f417db88a0da3be18ea8c05","size_bytes":56,"release_notes_url":"https://github.com/Tkg-tamagohan/LocalLightEDR/releases/tag/v9.9.9","chrome_extension":{"extension_id":"ecelachfiiiiiibpjeomfncgpegbpanh","version":"9.9.9"}}"#;
+const TEST_SIG_COLLISION: &str = r#"{"schema_version":1,"key_id":"test-key-2026","algorithm":"ed25519","signature_b64":"N1kHzIggL1tH9c3zEh9KaLo50Ua+cNPVXoh1ozMJxlf+VfnxYNs8dGgYZcRmUSxo1E04iqjnzAyrTwb1Q+mHBA=="}"#;
+
+fn test_updater_key_ring() -> ledr_updater::PublicKeyRing {
+    ledr_updater::PublicKeyRing {
+        schema_version: 1,
+        keys: vec![ledr_updater::PublicKeyEntry {
+            key_id: "test-key-2026".to_string(),
+            public_key_b64: TEST_UPDATER_PUB_B64.to_string(),
+            status: ledr_updater::KeyStatus::Active,
+        }],
+    }
+}
+
+struct MockElevationLauncher {
+    result: updater::ElevationLaunchResult,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl updater::ElevationLauncher for MockElevationLauncher {
+    fn launch_elevated_apply(
+        &self,
+        _manifest_path: &Path,
+        _sig_path: &Path,
+        _installer_path: &Path,
+    ) -> updater::ElevationLaunchResult {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.result.clone()
+    }
+}
+
+fn test_updater_config(
+    data_dir: PathBuf,
+    install_kind: updater::InstallKind,
+    base_url: &str,
+    elevation_result: updater::ElevationLaunchResult,
+    exit_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> updater::UpdaterConfig {
+    updater::UpdaterConfig {
+        app_version: "0.1.0".to_string(),
+        install_kind,
+        data_dir: Some(data_dir),
+        manifest_url: format!("{base_url}/update-manifest.json"),
+        sig_url: format!("{base_url}/update-manifest.json.sig"),
+        http_config: ledr_updater::HttpClientConfig {
+            allow_loopback_http_for_tests: true,
+            ..Default::default()
+        },
+        key_ring_override: Some(test_updater_key_ring()),
+        installer_url_override: Some(format!("{base_url}/installer.exe")),
+        elevation_launcher: std::sync::Arc::new(MockElevationLauncher {
+            result: elevation_result,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        on_launch_exit: std::sync::Arc::new(move || {
+            exit_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }),
+        now_ms_fn: std::sync::Arc::new(|| 1_700_000_000_000),
+    }
+}
+
+fn read_http_request_target(stream: &mut std::net::TcpStream) -> String {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut request_line = String::new();
+    let _ = reader.read_line(&mut request_line);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line == "\r\n" || line == "\n" => break,
+            Ok(_) => {}
+        }
+    }
+    request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string()
+}
+
+#[test]
+fn ui_upd_01_install_kind_classification() {
+    use updater::{InstallKind, classify_install_kind_from_path};
+
+    assert_eq!(
+        classify_install_kind_from_path(Some(Path::new(r"C:\Program Files\LocalEDR\ledr-ui.exe"))),
+        InstallKind::StandardInstalled
+    );
+    assert_eq!(
+        classify_install_kind_from_path(Some(Path::new(
+            "c:/program files/localedr/ledr-ui.exe"
+        ))),
+        InstallKind::StandardInstalled
+    );
+    assert_eq!(
+        classify_install_kind_from_path(Some(Path::new(
+            r"\\?\C:\Program Files\LocalEDR\ledr-ui.exe"
+        ))),
+        InstallKind::StandardInstalled
+    );
+    assert_eq!(
+        classify_install_kind_from_path(Some(Path::new(
+            r"\\?\UNC\server\share\Program Files\LocalEDR\ledr-ui.exe"
+        ))),
+        InstallKind::PortableOrDev
+    );
+    assert_eq!(
+        classify_install_kind_from_path(Some(Path::new(r"D:\Portable\ledr-ui.exe"))),
+        InstallKind::PortableOrDev
+    );
+    assert_eq!(
+        classify_install_kind_from_path(Some(Path::new(
+            r"C:\Users\dev\repo\target\debug\ledr-ui.exe"
+        ))),
+        InstallKind::PortableOrDev
+    );
+    assert_eq!(
+        classify_install_kind_from_path(None),
+        InstallKind::PortableOrDev
+    );
+}
+
+#[test]
+fn ui_upd_02_cli_apply_verified_update_parsing() {
+    use cli::{ApplyVerifiedUpdateArgs, CliAction, parse_cli_action};
+
+    let parsed = parse_cli_action([
+        "ledr-ui",
+        "--apply-verified-update",
+        "--manifest",
+        r"C:\Temp\update-manifest.json",
+        "--sig=C:\\Temp\\update-manifest.json.sig",
+        "--installer",
+        r"C:\Temp\LocalEDR-Setup-v0.2.0-win-x64.exe",
+    ])
+    .expect("valid --apply-verified-update args");
+    assert_eq!(
+        parsed,
+        CliAction::ApplyVerifiedUpdate(ApplyVerifiedUpdateArgs {
+            manifest: PathBuf::from(r"C:\Temp\update-manifest.json"),
+            sig: PathBuf::from(r"C:\Temp\update-manifest.json.sig"),
+            installer: PathBuf::from(r"C:\Temp\LocalEDR-Setup-v0.2.0-win-x64.exe"),
+        })
+    );
+
+    assert!(parse_cli_action(["ledr-ui", "--apply-verified-update=1"]).is_err());
+    assert!(
+        parse_cli_action([
+            "ledr-ui",
+            "--apply-verified-update",
+            "--manifest",
+            r"C:\a.json",
+            "--sig",
+            r"C:\a.sig",
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_cli_action([
+            "ledr-ui",
+            "--apply-verified-update",
+            "--manifest=",
+            "--sig",
+            r"C:\a.sig",
+            "--installer",
+            r"C:\a.exe",
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_cli_action([
+            "ledr-ui",
+            "--apply-verified-update",
+            "--manifest",
+            r"C:\a.json",
+            "--manifest",
+            r"C:\b.json",
+            "--sig",
+            r"C:\a.sig",
+            "--installer",
+            r"C:\a.exe",
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_cli_action([
+            "ledr-ui",
+            "--apply-verified-update",
+            "--notify",
+            "alert-1",
+            "--manifest",
+            r"C:\a.json",
+            "--sig",
+            r"C:\a.sig",
+            "--installer",
+            r"C:\a.exe",
+        ])
+        .is_err()
+    );
+    assert!(parse_cli_action(["ledr-ui", "--manifest", r"C:\a.json"]).is_err());
+    assert_eq!(
+        parse_cli_action(["ledr-ui", "--alert-id", "a-1"]),
+        Ok(CliAction::Launch(LaunchMode::AlertFocus("a-1".to_string())))
+    );
+}
+
+#[test]
+fn ui_upd_03_auto_check_gating_cooldown_corrupt_state_and_gc() {
+    use updater::{
+        PersistedUpdateState, is_auto_check_due, load_persisted_state, run_startup_staging_gc,
+        save_persisted_state, staging_root_from_data_dir, update_state_path_from_data_dir,
+    };
+
+    let tmp = TempTestDir::new("ui-upd-03");
+    let state_path = update_state_path_from_data_dir(&tmp.0);
+    let now_ms = 2_000_000_000_000u64;
+    let cooldown_ms = ledr_updater::AUTO_CHECK_COOLDOWN_SECS * 1000;
+
+    // Missing file -> default state -> Normal is due, others suppressed.
+    let initial = load_persisted_state(&state_path);
+    assert_eq!(initial, PersistedUpdateState::default());
+    assert!(is_auto_check_due(&LaunchMode::Normal, &initial, now_ms));
+    assert!(!is_auto_check_due(
+        &LaunchMode::Notify("a1".to_string()),
+        &initial,
+        now_ms
+    ));
+    assert!(!is_auto_check_due(
+        &LaunchMode::AlertFocus("a1".to_string()),
+        &initial,
+        now_ms
+    ));
+    assert!(!is_auto_check_due(
+        &LaunchMode::RegisterUri,
+        &initial,
+        now_ms
+    ));
+
+    // Cooldown boundary: < 6h suppressed, >= 6h due.
+    let saved = PersistedUpdateState {
+        schema_version: 1,
+        last_checked_at_ms: Some(now_ms),
+        last_known_latest_version: Some("0.2.0".to_string()),
+    };
+    save_persisted_state(&state_path, &saved).expect("atomic save update-state.json");
+    let loaded = load_persisted_state(&state_path);
+    assert_eq!(loaded, saved);
+    assert!(!is_auto_check_due(
+        &LaunchMode::Normal,
+        &loaded,
+        now_ms + cooldown_ms - 1
+    ));
+    assert!(is_auto_check_due(
+        &LaunchMode::Normal,
+        &loaded,
+        now_ms + cooldown_ms
+    ));
+
+    // Corrupt JSON, unknown schema_version, and oversized >64KiB reset cleanly.
+    std::fs::write(&state_path, b"{not valid json").unwrap();
+    assert_eq!(
+        load_persisted_state(&state_path),
+        PersistedUpdateState::default()
+    );
+    std::fs::write(&state_path, br#"{"schema_version":99,"last_checked_at_ms":1}"#).unwrap();
+    assert_eq!(
+        load_persisted_state(&state_path),
+        PersistedUpdateState::default()
+    );
+    std::fs::write(&state_path, vec![b' '; 65 * 1024]).unwrap();
+    assert_eq!(
+        load_persisted_state(&state_path),
+        PersistedUpdateState::default()
+    );
+
+    // 24h staging GC removes stale UUID dirs while preserving fresh UUID dirs.
+    let staging_root = staging_root_from_data_dir(&tmp.0);
+    let (_stale_id, stale_dir) = ledr_updater::create_staging_session_dir(&staging_root).unwrap();
+    let (_fresh_id, fresh_dir) = ledr_updater::create_staging_session_dir(&staging_root).unwrap();
+    let stale_file = stale_dir.join("partial.exe");
+    std::fs::write(&stale_file, b"stale").unwrap();
+    let old_time = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(ledr_updater::STAGING_RETENTION_SECS + 120);
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&stale_dir)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+    }
+
+    let removed = run_startup_staging_gc(&staging_root).expect("startup GC succeeds");
+    assert_eq!(removed, 1);
+    assert!(!stale_dir.exists());
+    assert!(fresh_dir.exists());
+}
+
+#[test]
+fn ui_upd_04_manager_check_states_and_concurrency_guard() {
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use updater::{AppUpdateManager, ElevationLaunchResult, InstallKind, UpdaterPhase};
+
+    let tmp = TempTestDir::new("ui-upd-04");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let (req_seen_tx, req_seen_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        // Request 1 & 2: UpToDate (with barrier on request 1 to test concurrent UPDATE_IN_PROGRESS)
+        for idx in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            if idx == 0 {
+                req_seen_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            let body = if target.ends_with(".sig") {
+                TEST_SIG_UP_TO_DATE
+            } else {
+                TEST_MANIFEST_UP_TO_DATE
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+        // Request 3 & 4: ManualUpdateRequired
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            let body = if target.ends_with(".sig") {
+                TEST_SIG_MANUAL_REQUIRED
+            } else {
+                TEST_MANIFEST_MANUAL_REQUIRED
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+        // Request 5 & 6: Filename collision rejected
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            let body = if target.ends_with(".sig") {
+                TEST_SIG_COLLISION
+            } else {
+                TEST_MANIFEST_COLLISION
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+        // Request 7 & 8: UpdateAvailable
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            let body = if target.ends_with(".sig") {
+                TEST_SIG_UPDATE_AVAILABLE
+            } else {
+                TEST_MANIFEST_UPDATE_AVAILABLE
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+
+    let exit_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mgr = AppUpdateManager::new(test_updater_config(
+        tmp.0.clone(),
+        InstallKind::StandardInstalled,
+        &base_url,
+        ElevationLaunchResult::Launched,
+        exit_count,
+    ));
+    assert_eq!(mgr.status().phase, UpdaterPhase::Idle);
+
+    let mgr_bg = mgr.clone();
+    let check_thread = std::thread::spawn(move || mgr_bg.check_for_updates_blocking_with(|_| {}));
+
+    req_seen_rx.recv().unwrap();
+    let concurrent_err = mgr
+        .check_for_updates_blocking_with(|_| {})
+        .expect_err("concurrent check must reject");
+    assert!(
+        concurrent_err.starts_with("UPDATE_IN_PROGRESS:"),
+        "unexpected concurrent err: {concurrent_err}"
+    );
+    let concurrent_apply = mgr
+        .apply_update_blocking_with(|_| {}, None::<fn()>)
+        .expect_err("concurrent apply must reject");
+    assert!(concurrent_apply.starts_with("UPDATE_IN_PROGRESS:"));
+
+    release_tx.send(()).unwrap();
+    let up_to_date = check_thread.join().unwrap().expect("UpToDate succeeds");
+    assert_eq!(up_to_date.phase, UpdaterPhase::UpToDate);
+    assert_eq!(up_to_date.latest_version.as_deref(), Some("0.1.0"));
+
+    let manual = mgr
+        .check_for_updates_blocking_with(|_| {})
+        .expect("ManualUpdateRequired succeeds");
+    assert_eq!(manual.phase, UpdaterPhase::ManualUpdateRequired);
+    assert_eq!(manual.min_updater_version.as_deref(), Some("5.0.0"));
+
+    let collision_err = mgr
+        .check_for_updates_blocking_with(|_| {})
+        .expect_err("filename collision with update-manifest.json must fail");
+    assert!(collision_err.contains("collides"));
+    assert_eq!(mgr.status().phase, UpdaterPhase::Error);
+
+    let avail = mgr
+        .check_for_updates_blocking_with(|_| {})
+        .expect("UpdateAvailable succeeds");
+    assert_eq!(avail.phase, UpdaterPhase::UpdateAvailable);
+    assert_eq!(avail.latest_version.as_deref(), Some("9.9.9"));
+    assert!(avail.manifest.is_some());
+
+    server.join().unwrap();
+}
+
+#[test]
+fn ui_upd_05_apply_portable_rejection_uac_cancel_and_success() {
+    use std::net::TcpListener;
+    use updater::{
+        AppUpdateManager, ElevationLaunchResult, InstallKind, UpdaterPhase,
+        staging_root_from_data_dir,
+    };
+
+    // 1. PortableOrDev rejects apply_update
+    let tmp_portable = TempTestDir::new("ui-upd-05-portable");
+    let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port1 = listener1.local_addr().unwrap().port();
+    let srv1 = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut s, _) = listener1.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            let body = if target.ends_with(".sig") {
+                TEST_SIG_UPDATE_AVAILABLE
+            } else {
+                TEST_MANIFEST_UPDATE_AVAILABLE
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+    let exits1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mgr_portable = AppUpdateManager::new(test_updater_config(
+        tmp_portable.0.clone(),
+        InstallKind::PortableOrDev,
+        &format!("http://127.0.0.1:{port1}"),
+        ElevationLaunchResult::Launched,
+        exits1.clone(),
+    ));
+    let avail = mgr_portable.check_for_updates_blocking_with(|_| {}).unwrap();
+    assert_eq!(avail.phase, UpdaterPhase::UpdateAvailable);
+    assert!(!avail.can_auto_apply);
+    let portable_err = mgr_portable
+        .apply_update_blocking_with(|_| {}, None::<fn()>)
+        .expect_err("PortableOrDev must reject apply");
+    assert!(portable_err.starts_with("PORTABLE_OR_DEV_MANUAL_UPDATE_ONLY:"));
+    assert_eq!(exits1.load(std::sync::atomic::Ordering::SeqCst), 0);
+    srv1.join().unwrap();
+
+    // 2. UAC UserCancelled (ERROR_CANCELLED): deletes staging, reverts to UpdateAvailable, no exit
+    let tmp_cancel = TempTestDir::new("ui-upd-05-uac-cancel");
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port2 = listener2.local_addr().unwrap().port();
+    let srv2 = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut s, _) = listener2.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            if target.ends_with(".exe") {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    TEST_UPDATER_PAYLOAD.len()
+                );
+                s.write_all(hdr.as_bytes()).unwrap();
+                s.write_all(TEST_UPDATER_PAYLOAD).unwrap();
+            } else {
+                let body = if target.ends_with(".sig") {
+                    TEST_SIG_UPDATE_AVAILABLE
+                } else {
+                    TEST_MANIFEST_UPDATE_AVAILABLE
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                s.write_all(resp.as_bytes()).unwrap();
+            }
+        }
+    });
+    let exits2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mgr_cancel = AppUpdateManager::new(test_updater_config(
+        tmp_cancel.0.clone(),
+        InstallKind::StandardInstalled,
+        &format!("http://127.0.0.1:{port2}"),
+        ElevationLaunchResult::UserCancelled,
+        exits2.clone(),
+    ));
+    mgr_cancel.check_for_updates_blocking_with(|_| {}).unwrap();
+    let after_uac_cancel = mgr_cancel
+        .apply_update_blocking_with(|_| {}, None::<fn()>)
+        .expect("UAC cancel returns Ok(UpdateAvailable)");
+    assert_eq!(after_uac_cancel.phase, UpdaterPhase::UpdateAvailable);
+    assert!(after_uac_cancel.notice_message.is_some());
+    assert_eq!(exits2.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let staging_entries = std::fs::read_dir(staging_root_from_data_dir(&tmp_cancel.0))
+        .unwrap()
+        .count();
+    assert_eq!(staging_entries, 0, "UAC cancel must delete staging dir");
+    srv2.join().unwrap();
+
+    // 3. Elevation Launched: keeps staging dir for elevated child & calls on_launch_exit
+    let tmp_ok = TempTestDir::new("ui-upd-05-ok");
+    let listener3 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port3 = listener3.local_addr().unwrap().port();
+    let srv3 = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut s, _) = listener3.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            if target.ends_with(".exe") {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    TEST_UPDATER_PAYLOAD.len()
+                );
+                s.write_all(hdr.as_bytes()).unwrap();
+                s.write_all(TEST_UPDATER_PAYLOAD).unwrap();
+            } else {
+                let body = if target.ends_with(".sig") {
+                    TEST_SIG_UPDATE_AVAILABLE
+                } else {
+                    TEST_MANIFEST_UPDATE_AVAILABLE
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                s.write_all(resp.as_bytes()).unwrap();
+            }
+        }
+    });
+    let exits3 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mgr_ok = AppUpdateManager::new(test_updater_config(
+        tmp_ok.0.clone(),
+        InstallKind::StandardInstalled,
+        &format!("http://127.0.0.1:{port3}"),
+        ElevationLaunchResult::Launched,
+        exits3.clone(),
+    ));
+    mgr_ok.check_for_updates_blocking_with(|_| {}).unwrap();
+    let launched = mgr_ok
+        .apply_update_blocking_with(|_| {}, None::<fn()>)
+        .expect("elevation launch succeeds");
+    assert_eq!(launched.phase, UpdaterPhase::LaunchingUpdater);
+    assert_eq!(exits3.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let staged_dirs: Vec<_> = std::fs::read_dir(staging_root_from_data_dir(&tmp_ok.0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(staged_dirs.len(), 1);
+    let session_dir = staged_dirs[0].path();
+    assert!(session_dir.join("update-manifest.json").is_file());
+    assert!(session_dir.join("update-manifest.json.sig").is_file());
+    assert!(session_dir.join("LocalEDR-Setup-v9.9.9-win-x64.exe").is_file());
+    srv3.join().unwrap();
+}
+
+#[test]
+fn ui_upd_06_download_cancel_and_close_cleanup() {
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use updater::{
+        AppUpdateManager, ElevationLaunchResult, InstallKind, UpdaterPhase,
+        staging_root_from_data_dir,
+    };
+
+    let tmp = TempTestDir::new("ui-upd-06");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (dl_started_tx, dl_started_rx) = mpsc::channel();
+    let (server_release_tx, server_release_rx) = mpsc::channel();
+
+    let srv = std::thread::spawn(move || {
+        // 1-2: manifest & sig
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let target = read_http_request_target(&mut s);
+            let body = if target.ends_with(".sig") {
+                TEST_SIG_UPDATE_AVAILABLE
+            } else {
+                TEST_MANIFEST_UPDATE_AVAILABLE
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+        // 3: partial installer stream held open until test signals release
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = read_http_request_target(&mut s);
+        let hdr = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            TEST_UPDATER_PAYLOAD.len()
+        );
+        s.write_all(hdr.as_bytes()).unwrap();
+        s.write_all(&TEST_UPDATER_PAYLOAD[..10]).unwrap();
+        s.flush().unwrap();
+        dl_started_tx.send(()).unwrap();
+        let _ = server_release_rx.recv();
+    });
+
+    let exits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mgr = AppUpdateManager::new(test_updater_config(
+        tmp.0.clone(),
+        InstallKind::StandardInstalled,
+        &format!("http://127.0.0.1:{port}"),
+        ElevationLaunchResult::Launched,
+        exits,
+    ));
+    mgr.check_for_updates_blocking_with(|_| {}).unwrap();
+
+    let mgr_bg = mgr.clone();
+    let apply_thread = std::thread::spawn(move || {
+        mgr_bg.apply_update_blocking_with(|_| {}, None::<fn()>)
+    });
+
+    dl_started_rx.recv().unwrap();
+    mgr.cancel_and_cleanup_on_close();
+    let _ = server_release_tx.send(());
+
+    let apply_res = apply_thread.join().unwrap().expect("cancel returns UpdateAvailable");
+    assert_eq!(apply_res.phase, UpdaterPhase::UpdateAvailable);
+    let staging_entries = std::fs::read_dir(staging_root_from_data_dir(&tmp.0))
+        .unwrap()
+        .count();
+    assert_eq!(
+        staging_entries, 0,
+        "incomplete staging dir & file must be removed on close cancel"
+    );
+    srv.join().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn ui_upd_07_win32_acl_reparse_hardlink_and_apply_verified_guards() {
+    use cli::ApplyVerifiedUpdateArgs;
+    use updater::{
+        ADMIN_ONLY_DIR_SDDL, InstallKind, apply_verified_update_with, is_allowed_admin_owner_sid,
+        open_verified_read_file_bounded, remove_dir_all_no_reparse,
+        verified_root_from_program_data_dir,
+        win_updater::{
+            OwnedSecurityDescriptor, ShellExecuteInfoW, create_and_verify_admin_dir,
+            query_dir_dacl_sddl, verify_admin_only_dacl_sddl,
+        },
+    };
+
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(std::mem::size_of::<ShellExecuteInfoW>(), 112);
+
+    // 1. SDDL roundtrip, DACL invariant validation, & Admin owner SID checks
+    let sd = OwnedSecurityDescriptor::from_sddl(ADMIN_ONLY_DIR_SDDL)
+        .expect("parse ADMIN_ONLY_DIR_SDDL");
+    let canonical = sd.to_dacl_sddl_string().expect("roundtrip DACL SDDL");
+    assert_eq!(canonical, ADMIN_ONLY_DIR_SDDL);
+    verify_admin_only_dacl_sddl(&canonical).expect("canonical SDDL passes invariant");
+    assert!(verify_admin_only_dacl_sddl("D:(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)").is_err());
+    assert!(
+        verify_admin_only_dacl_sddl("D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)").is_err()
+    );
+    assert!(is_allowed_admin_owner_sid("S-1-5-18"));
+    assert!(is_allowed_admin_owner_sid("S-1-5-32-544"));
+    assert!(!is_allowed_admin_owner_sid("S-1-5-21-1000-2000-3000-1001"));
+
+    let tmp = TempTestDir::new("ui-upd-07");
+    let acl_dir = tmp.0.join("admin-acl-test");
+    create_and_verify_admin_dir(&acl_dir, ADMIN_ONLY_DIR_SDDL, true, false)
+        .expect("create & verify admin-only DACL dir");
+    let on_disk_sddl = query_dir_dacl_sddl(&acl_dir).unwrap();
+    verify_admin_only_dacl_sddl(&on_disk_sddl)
+        .expect("on-disk DACL must remain protected and admin-only");
+    std::fs::remove_dir(&acl_dir).unwrap();
+
+    // 2. open_verified_read_file_bounded rejects hardlinks (nNumberOfLinks > 1) and oversized files
+    let orig_file = tmp.0.join("orig.bin");
+    std::fs::write(&orig_file, b"hello-world").unwrap();
+    assert!(open_verified_read_file_bounded(&orig_file, 1024).is_ok());
+    assert!(open_verified_read_file_bounded(&orig_file, 4).is_err());
+
+    let hardlink_file = tmp.0.join("hardlink.bin");
+    std::fs::hard_link(&orig_file, &hardlink_file).unwrap();
+    assert!(
+        open_verified_read_file_bounded(&orig_file, 1024).is_err(),
+        "nNumberOfLinks == 2 must be rejected"
+    );
+
+    // 3. remove_dir_all_no_reparse deletes regular tree and rejects directory junctions
+    let clean_tree = tmp.0.join("clean-tree");
+    std::fs::create_dir_all(clean_tree.join("nested")).unwrap();
+    std::fs::write(clean_tree.join("nested").join("a.txt"), b"x").unwrap();
+    remove_dir_all_no_reparse(&clean_tree).expect("regular tree removed");
+    assert!(!clean_tree.exists());
+
+    let junction_target = tmp.0.join("junction-target");
+    std::fs::create_dir_all(&junction_target).unwrap();
+    std::fs::write(junction_target.join("keep.txt"), b"must-not-delete").unwrap();
+    let parent_with_junction = tmp.0.join("parent-with-junction");
+    std::fs::create_dir_all(&parent_with_junction).unwrap();
+    let junction_link = parent_with_junction.join("child-junction");
+    let mklink = std::process::Command::new("cmd.exe")
+        .args(["/c", "mklink", "/J"])
+        .arg(&junction_link)
+        .arg(&junction_target)
+        .output()
+        .expect("mklink /J");
+    assert!(mklink.status.success(), "mklink /J failed: {:?}", mklink);
+    let j_err = remove_dir_all_no_reparse(&parent_with_junction)
+        .expect_err("junction inside cleanup dir must be rejected");
+    assert_eq!(j_err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(junction_target.join("keep.txt").is_file());
+    let _ = std::fs::remove_dir(&junction_link);
+
+    // 4. apply_verified_update_with preflight rejections (PortableOrDev, non-elevated, duplicate paths)
+    let program_data = tmp.0.join("ProgramDataMock");
+    let verified_root = verified_root_from_program_data_dir(&program_data);
+    let args = ApplyVerifiedUpdateArgs {
+        manifest: tmp.0.join("m.json"),
+        sig: tmp.0.join("m.json.sig"),
+        installer: tmp.0.join("setup.exe"),
+    };
+    let key_ring = test_updater_key_ring();
+    let nsis_called = std::cell::Cell::new(false);
+
+    let err_portable = apply_verified_update_with(
+        &args,
+        InstallKind::PortableOrDev,
+        true,
+        &key_ring,
+        "0.1.0",
+        &program_data,
+        Path::new(ledr_proto::AUTHORIZED_UI_EXE_PATH),
+        false,
+        |_| {
+            nsis_called.set(true);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .expect_err("PortableOrDev must fail closed");
+    assert!(err_portable.contains("installed"));
+    assert!(!nsis_called.get());
+    assert!(!verified_root.exists());
+
+    let err_not_elevated = apply_verified_update_with(
+        &args,
+        InstallKind::StandardInstalled,
+        false,
+        &key_ring,
+        "0.1.0",
+        &program_data,
+        Path::new(ledr_proto::AUTHORIZED_UI_EXE_PATH),
+        false,
+        |_| {
+            nsis_called.set(true);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .expect_err("non-elevated token must fail closed");
+    assert!(err_not_elevated.contains("not elevated"));
+    assert!(!nsis_called.get());
+
+    let dup_args = ApplyVerifiedUpdateArgs {
+        manifest: tmp.0.join("same.json"),
+        sig: tmp.0.join("same.json"),
+        installer: tmp.0.join("setup.exe"),
+    };
+    let err_dup = apply_verified_update_with(
+        &dup_args,
+        InstallKind::StandardInstalled,
+        true,
+        &key_ring,
+        "0.1.0",
+        &program_data,
+        Path::new(ledr_proto::AUTHORIZED_UI_EXE_PATH),
+        false,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .expect_err("duplicate input paths must fail closed");
+    assert!(err_dup.contains("3 distinct files"));
+}
+
+#[test]
+fn ui_upd_08_ipc_ping_info_parsing() {
+    use ipc::{DaemonPingInfo, parse_ping_info_response, parse_ping_response};
+
+    let pong = IpcResponse::Pong {
+        daemon_version: "0.2.5".to_string(),
+        protocol_version: 1,
+    };
+    assert_eq!(
+        parse_ping_response(pong.clone()),
+        Ok("ledr-daemon v0.2.5 (proto v1)".to_string())
+    );
+    assert_eq!(
+        parse_ping_info_response(pong),
+        Ok(DaemonPingInfo {
+            daemon_version: "0.2.5".to_string(),
+            protocol_version: 1,
+        })
+    );
+}
+

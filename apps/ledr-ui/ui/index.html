@@ -50,6 +50,27 @@
       </div>
     </div>
 
+    <div id="update-banner" class="update-banner hidden" role="status" aria-live="polite">
+      <div class="banner-text">
+        <strong id="update-banner-title"></strong>
+        <span id="update-banner-detail" class="mono"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="update-banner-apply-btn" type="button" class="btn btn-primary btn-xs hidden">
+          今すぐ更新
+        </button>
+        <button id="update-banner-notes-btn" type="button" class="btn btn-secondary btn-xs hidden">
+          リリースノート
+        </button>
+        <button id="update-banner-view-btn" type="button" class="btn btn-secondary btn-xs">
+          更新画面
+        </button>
+        <button id="update-banner-dismiss-btn" type="button" class="btn btn-ghost btn-xs">
+          閉じる
+        </button>
+      </div>
+    </div>
+
     <main class="app-main">
       <section id="view-triage" class="workspace triage-workspace hidden" aria-label="Alert Triage">
         <section class="panel alert-queue-panel" aria-label="Alert Queue">
@@ -457,6 +478,49 @@
                 <button id="domain-check-btn" type="submit" class="btn btn-secondary btn-xs">Check</button>
               </form>
               <div id="domain-check-result" class="domain-check-result hidden" aria-live="polite"></div>
+            </div>
+          </section>
+
+          <section id="app-update-panel" class="panel policy-side-panel" aria-label="Application Updates">
+            <div class="panel-header">
+              <div class="panel-title-group">
+                <h2>アプリケーション更新</h2>
+                <span id="update-state-badge" class="badge badge-metric">未確認</span>
+              </div>
+              <div class="panel-actions">
+                <button id="update-check-btn" type="button" class="btn btn-secondary btn-xs">
+                  更新を確認
+                </button>
+              </div>
+            </div>
+            <div class="policy-card-scroll">
+              <div
+                id="update-version-mismatch"
+                class="triage-feedback update-mismatch-alert hidden"
+                role="alert"
+              ></div>
+              <div
+                id="update-feedback"
+                class="triage-feedback hidden"
+                role="status"
+                aria-live="polite"
+              ></div>
+              <div id="update-progress-wrap" class="update-progress-wrap hidden">
+                <progress id="update-progress-bar" class="update-progress-bar" max="100" value="0"></progress>
+                <span id="update-progress-text" class="mono">0%</span>
+              </div>
+              <div class="update-actions-row">
+                <button id="update-apply-btn" type="button" class="btn btn-primary btn-xs hidden">
+                  ダウンロードして更新
+                </button>
+                <button id="update-cancel-btn" type="button" class="btn btn-danger-xs hidden">
+                  キャンセル
+                </button>
+                <button id="update-release-notes-btn" type="button" class="btn btn-secondary btn-xs hidden">
+                  リリースノート
+                </button>
+              </div>
+              <dl id="app-update-dl" class="kv-list"></dl>
             </div>
           </section>
         </aside>

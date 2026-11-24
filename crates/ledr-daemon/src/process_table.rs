@@ -1237,34 +1237,16 @@ impl ActiveProcessTable {
                 .is_some_and(|evicted| evicted.emitted_rule_ids.contains(rule_id))
     }
 
-    fn next_incarnation_create_time_100ns(&self, parent: ProcessIdentity) -> Option<u64> {
+    fn next_incarnation_from_index(
+        create_times_by_pid: &HashMap<u32, Vec<u64>>,
+        parent: ProcessIdentity,
+    ) -> Option<u64> {
         if parent.pid == 0 {
             return None;
         }
-        let newer_same_pid = |ident: ProcessIdentity| -> Option<u64> {
-            (ident.pid == parent.pid && ident.create_time_100ns > parent.create_time_100ns)
-                .then_some(ident.create_time_100ns)
-        };
-        let from_entries = self
-            .entries
-            .values()
-            .filter_map(|e| newer_same_pid(e.identity));
-        let from_evicted_live = self
-            .evicted_live_by_pid
-            .get(&parent.pid)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| self.evicted_live.get(id))
-            .filter_map(|ev| newer_same_pid(ev.identity));
-        let from_evicted_exited = self
-            .evicted_exited
-            .values()
-            .filter_map(|ev| newer_same_pid(ev.identity));
-
-        from_entries
-            .chain(from_evicted_live)
-            .chain(from_evicted_exited)
-            .min()
+        let times = create_times_by_pid.get(&parent.pid)?;
+        let idx = times.partition_point(|&t| t <= parent.create_time_100ns);
+        times.get(idx).copied()
     }
 
     /// Collects unexited, non-protected descendant [`ProcessIdentity`] values of `root`
@@ -1286,11 +1268,40 @@ impl ActiveProcessTable {
 
         let mut by_parent_id: HashMap<&str, Vec<&ActiveProcessEntry>> = HashMap::new();
         let mut by_ppid: HashMap<u32, Vec<&ActiveProcessEntry>> = HashMap::new();
+        let mut create_times_by_pid: HashMap<u32, Vec<u64>> = HashMap::new();
+        let mut record_create_time = |ident: ProcessIdentity| {
+            if ident.pid != 0 && ident.create_time_100ns != 0 {
+                create_times_by_pid
+                    .entry(ident.pid)
+                    .or_default()
+                    .push(ident.create_time_100ns);
+            }
+        };
+
         for entry in self.entries.values() {
+            record_create_time(entry.identity);
             if let Some(parent_id) = entry.parent_instance_id.as_deref() {
                 by_parent_id.entry(parent_id).or_default().push(entry);
             } else {
                 by_ppid.entry(entry.ppid).or_default().push(entry);
+            }
+        }
+        for ev in self.evicted_exited.values() {
+            record_create_time(ev.identity);
+        }
+        for (&pid, ids) in &self.evicted_live_by_pid {
+            if pid == 0 {
+                continue;
+            }
+            for id in ids {
+                if let Some(ev) = self.evicted_live.get(id) {
+                    record_create_time(ev.identity);
+                }
+            }
+        }
+        for times in create_times_by_pid.values_mut() {
+            if times.len() > 1 {
+                times.sort_unstable();
             }
         }
 
@@ -1309,36 +1320,40 @@ impl ActiveProcessTable {
 
         while let Some(parent) = queue.pop_front() {
             let parent_id = parent.identity.instance_id();
+            let verified_candidates = by_parent_id.get(parent_id.as_str());
+            let unverified_candidates = (parent.identity.pid != 0)
+                .then(|| by_ppid.get(&parent.identity.pid))
+                .flatten();
+            let next_cutoff = if parent.identity.pid != 0
+                && (verified_candidates.is_some() || unverified_candidates.is_some())
+            {
+                Self::next_incarnation_from_index(&create_times_by_pid, parent.identity)
+            } else {
+                None
+            };
+
             let is_common_candidate = |e: &ActiveProcessEntry| -> bool {
                 e.identity.create_time_100ns != 0
                     && e.identity.create_time_100ns >= parent.identity.create_time_100ns
+                    && next_cutoff.is_none_or(|c| e.identity.create_time_100ns < c)
                     && !visited.contains(&e.identity)
                     && !is_never_suspend_process(&e.exe_path)
             };
 
             let mut children: Vec<&ActiveProcessEntry> = Vec::new();
-            if let Some(verified) = by_parent_id.get(parent_id.as_str()) {
+            if let Some(verified) = verified_candidates {
                 children.extend(verified.iter().copied().filter(|e| is_common_candidate(e)));
             }
 
-            if parent.identity.pid != 0 {
-                if let Some(unverified) = by_ppid.get(&parent.identity.pid) {
-                    let mut next_cutoff: Option<Option<u64>> = None;
-                    for &e in unverified {
-                        if e.pid == parent.identity.pid
-                            || !is_common_candidate(e)
-                            || !parent
-                                .exited_at_ms
-                                .is_none_or(|exit_ms| e.created_at_ms <= exit_ms)
-                        {
-                            continue;
-                        }
-                        let cutoff = *next_cutoff.get_or_insert_with(|| {
-                            self.next_incarnation_create_time_100ns(parent.identity)
-                        });
-                        if cutoff.is_none_or(|c| e.identity.create_time_100ns < c) {
-                            children.push(e);
-                        }
+            if let Some(unverified) = unverified_candidates {
+                for &e in unverified {
+                    if e.pid != parent.identity.pid
+                        && is_common_candidate(e)
+                        && parent
+                            .exited_at_ms
+                            .is_none_or(|exit_ms| e.created_at_ms <= exit_ms)
+                    {
+                        children.push(e);
                     }
                 }
             }
@@ -2424,6 +2439,15 @@ mod tests {
             let child_at = start_test_proc(&mut table, 302, 20_000, 200, r"C:\Tools\at.exe", 500);
             let child_after =
                 start_test_proc(&mut table, 303, 20_001, 200, r"C:\Tools\after.exe", 500);
+            for child in [child_before, child_at, child_after] {
+                assert_eq!(
+                    table
+                        .get_by_instance_id(&child.instance_id())
+                        .expect("ppid-fallback child present")
+                        .parent_instance_id,
+                    None
+                );
+            }
 
             let mid = start_test_proc(&mut table, 200, 10_000, 100, r"C:\Tools\mid.exe", 100);
             assert_eq!(table.on_process_stop(200, 500), Some(mid.instance_id()));
@@ -2454,16 +2478,29 @@ mod tests {
                 }
             }
 
-            assert_eq!(
-                table.collect_unexited_descendants(&root),
-                vec![child_before]
-            );
-            let _ = (child_at, child_after);
+            let got = table.collect_unexited_descendants(&root);
+            assert_eq!(got, vec![child_before]);
+            assert!(!got.contains(&child_at));
+            assert!(!got.contains(&child_after));
         }
 
         // Minimum across multiple sources: `entries` (30_000) + `evicted_exited` (20_000) -> 20_000.
         let mut table = ActiveProcessTable::new(32);
         let root = start_test_proc(&mut table, 100, 1_000, 4, r"C:\Tools\root.exe", 50);
+        let child_before =
+            start_test_proc(&mut table, 301, 19_999, 200, r"C:\Tools\before.exe", 500);
+        let child_between =
+            start_test_proc(&mut table, 302, 25_000, 200, r"C:\Tools\between.exe", 500);
+        for child in [child_before, child_between] {
+            assert_eq!(
+                table
+                    .get_by_instance_id(&child.instance_id())
+                    .expect("ppid-fallback child present")
+                    .parent_instance_id,
+                None
+            );
+        }
+
         let older_reused =
             start_test_proc(&mut table, 200, 20_000, 4, r"C:\Tools\reused_a.exe", 500);
         assert_eq!(
@@ -2471,21 +2508,17 @@ mod tests {
             Some(older_reused.instance_id())
         );
         table.remove_entry(&older_reused.instance_id());
+        assert!(table.evicted_exited.contains_key(&older_reused.instance_id()));
         let _newer_reused =
             start_test_proc(&mut table, 200, 30_000, 4, r"C:\Tools\reused_b.exe", 550);
 
-        let child_before =
-            start_test_proc(&mut table, 301, 19_999, 200, r"C:\Tools\before.exe", 500);
-        let _child_between =
-            start_test_proc(&mut table, 302, 25_000, 200, r"C:\Tools\between.exe", 500);
         let mid = start_test_proc(&mut table, 200, 10_000, 100, r"C:\Tools\mid.exe", 100);
         if let Some(mid_entry) = table.entries.get_mut(&mid.instance_id()) {
             mid_entry.exited_at_ms = Some(500);
         }
-        assert_eq!(
-            table.collect_unexited_descendants(&root),
-            vec![child_before]
-        );
+        let got = table.collect_unexited_descendants(&root);
+        assert_eq!(got, vec![child_before]);
+        assert!(!got.contains(&child_between));
     }
 
     /// `PROC-DESC-07`: Entry with `parent_instance_id == Some(other_parent)` and
@@ -2588,6 +2621,12 @@ mod tests {
     /// `PROC-DESC-09`: `root` boundary conditions: `create_time_100ns == 0`, protected `root` in
     /// `entries` and `evicted_exited`, exited `root` in `entries`, evicted `root` in
     /// `evicted_exited`, and `root` absent from table.
+    ///
+    /// Note: Cases 4 and 5 exercise the direct `ActiveProcessTable::collect_unexited_descendants`
+    /// unit API contract for an already-exited `root`. By contrast, the current production decoy
+    /// freeze path (`engine/events.rs`) invokes descendant collection only after suspending a live
+    /// triggering root process, so real-machine E2E validates live-root -> exited-intermediate ->
+    /// live-descendant freezing separately from this unit boundary contract.
     #[test]
     fn proc_desc_09_root_entry_guards_and_exit_time_sources() {
         // 1. `root.create_time_100ns == 0` -> empty.
@@ -2662,6 +2701,79 @@ mod tests {
             table.collect_unexited_descendants(&absent_root),
             vec![valid_child]
         );
+    }
+
+    /// `PROC-DESC-11`: Same-millisecond PID reuse enforces the 100ns cutoff on verified
+    /// `by_parent_id` links as well when out-of-order children arrive after `mid` exits and before
+    /// successor `C` is registered (`entries`, `evicted_live`, and `evicted_exited`).
+    #[test]
+    fn proc_desc_11_verified_parent_link_enforces_100ns_cutoff_across_all_three_sources() {
+        enum CutoffSource {
+            Entries,
+            EvictedLive,
+            EvictedExited,
+        }
+
+        for source in [
+            CutoffSource::Entries,
+            CutoffSource::EvictedLive,
+            CutoffSource::EvictedExited,
+        ] {
+            let mut table = ActiveProcessTable::new(32);
+            let root = start_test_proc(&mut table, 100, 1_000, 4, r"C:\Tools\root.exe", 50);
+            let mid = start_test_proc(&mut table, 200, 10_000, 100, r"C:\Tools\mid.exe", 100);
+            assert_eq!(table.on_process_stop(200, 500), Some(mid.instance_id()));
+
+            // Children start at the same ms (500) AFTER `mid` exits and BEFORE successor `C` starts,
+            // so `lookup_parent_for` binds `parent_instance_id = Some(mid.instance_id())` on all 3.
+            let d_before =
+                start_test_proc(&mut table, 301, 19_999, 200, r"C:\Tools\d_before.exe", 500);
+            let d_at = start_test_proc(&mut table, 302, 20_000, 200, r"C:\Tools\d_at.exe", 500);
+            let d_after =
+                start_test_proc(&mut table, 303, 25_000, 200, r"C:\Tools\d_after.exe", 500);
+            for child in [d_before, d_at, d_after] {
+                assert_eq!(
+                    table
+                        .get_by_instance_id(&child.instance_id())
+                        .expect("verified child present")
+                        .parent_instance_id
+                        .as_deref(),
+                    Some(mid.instance_id().as_str())
+                );
+            }
+
+            let successor_c =
+                start_test_proc(&mut table, 200, 20_000, 4, r"C:\Tools\successor_c.exe", 500);
+            match source {
+                CutoffSource::Entries => {
+                    assert!(table.entries.contains_key(&successor_c.instance_id()));
+                    assert!(table.evicted_live.is_empty());
+                    assert!(table.evicted_exited.is_empty());
+                }
+                CutoffSource::EvictedLive => {
+                    table.remove_entry(&successor_c.instance_id());
+                    assert!(!table.entries.contains_key(&successor_c.instance_id()));
+                    assert!(table.evicted_live.contains_key(&successor_c.instance_id()));
+                    assert!(table.evicted_exited.is_empty());
+                }
+                CutoffSource::EvictedExited => {
+                    assert_eq!(
+                        table.on_process_stop(200, 550),
+                        Some(successor_c.instance_id())
+                    );
+                    table.remove_entry(&successor_c.instance_id());
+                    assert!(!table.entries.contains_key(&successor_c.instance_id()));
+                    assert!(table.evicted_live.is_empty());
+                    assert!(table.evicted_exited.contains_key(&successor_c.instance_id()));
+                }
+            }
+            assert!(table.entries.contains_key(&mid.instance_id()));
+
+            let got = table.collect_unexited_descendants(&root);
+            assert_eq!(got, vec![d_before]);
+            assert!(!got.contains(&d_at));
+            assert!(!got.contains(&d_after));
+        }
     }
 
     #[test]

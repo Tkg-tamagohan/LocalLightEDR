@@ -1776,9 +1776,15 @@ pub(crate) mod win_reg_ops {
         }
     }
 
-    fn exceeds_chromium_raw_limit(raw_bytes_len: usize, trimmed: &str) -> bool {
-        raw_bytes_len > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2
-            || trimmed.encode_utf16().count() + 1 > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS
+    pub(crate) fn exceeds_chromium_raw_limit(raw_bytes: &[u8], untrimmed: &str) -> bool {
+        const MAX_BYTES: usize = CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2;
+        if raw_bytes.len() > MAX_BYTES {
+            return true;
+        }
+        if raw_bytes.len() == MAX_BYTES && !raw_bytes.ends_with(&[0, 0]) {
+            return true;
+        }
+        untrimmed.encode_utf16().count() + 1 > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS
     }
 
     pub(crate) fn probe_default_sz(
@@ -1803,8 +1809,9 @@ pub(crate) mod win_reg_ops {
             Ok(raw) if raw.vtype == REG_SZ => match decode_reg_sz_bytes(&raw.bytes) {
                 None => NativeHostRegProbe::InvalidType,
                 Some(val) => {
+                    let raw_too_long = exceeds_chromium_raw_limit(&raw.bytes, &val);
                     let trimmed = val.trim();
-                    if exceeds_chromium_raw_limit(raw.bytes.len(), trimmed) {
+                    if raw_too_long {
                         let resolved_path = (!trimmed.is_empty()).then(|| trimmed.to_string());
                         NativeHostRegProbe::ChromiumReadFallback {
                             resolved_path,
@@ -1812,7 +1819,7 @@ pub(crate) mod win_reg_ops {
                             error: format!(
                                 "REG_SZ value (raw {} bytes, {} UTF-16 units incl. NUL) exceeds Chromium {CHROMIUM_READ_VALUE_MAX_UTF16_UNITS}-unit read buffer limit",
                                 raw.bytes.len(),
-                                trimmed.encode_utf16().count() + 1
+                                val.encode_utf16().count() + 1
                             ),
                         }
                     } else if trimmed.is_empty() {
@@ -1825,8 +1832,8 @@ pub(crate) mod win_reg_ops {
             Ok(raw) if raw.vtype == REG_EXPAND_SZ => match decode_reg_sz_bytes(&raw.bytes) {
                 None => NativeHostRegProbe::InvalidType,
                 Some(val) => {
+                    let raw_too_long = exceeds_chromium_raw_limit(&raw.bytes, &val);
                     let trimmed = val.trim();
-                    let raw_too_long = exceeds_chromium_raw_limit(raw.bytes.len(), trimmed);
                     if trimmed.is_empty() {
                         if raw_too_long {
                             NativeHostRegProbe::ChromiumReadFallback {
@@ -1841,17 +1848,16 @@ pub(crate) mod win_reg_ops {
                             NativeHostRegProbe::EmptyString
                         }
                     } else {
-                        match expand_env_strings_win32(trimmed) {
+                        match expand_env_strings_win32(&val) {
                             Ok(expanded) => {
                                 let expanded_units_incl_nul = expanded.encode_utf16().count() + 1;
                                 let expanded_too_long =
                                     expanded_units_incl_nul > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS;
+                                let has_unresolved = has_unresolved_env_token(&val, &expanded);
+                                let expanded_trimmed = expanded.trim();
                                 if raw_too_long || expanded_too_long {
-                                    let expanded_trimmed = expanded.trim();
                                     let resolved_path =
-                                        if has_unresolved_env_token(trimmed, &expanded)
-                                            || expanded_trimmed.is_empty()
-                                        {
+                                        if has_unresolved || expanded_trimmed.is_empty() {
                                             None
                                         } else {
                                             Some(expanded_trimmed.to_string())
@@ -1864,20 +1870,17 @@ pub(crate) mod win_reg_ops {
                                             raw.bytes.len()
                                         ),
                                     }
-                                } else if has_unresolved_env_token(trimmed, &expanded) {
+                                } else if has_unresolved {
                                     NativeHostRegProbe::UnresolvableExpandSz {
                                         raw: trimmed.to_string(),
                                         error: format!(
                                             "REG_EXPAND_SZ value '{trimmed}' contains unresolved environment variable(s) (expanded to '{expanded}')"
                                         ),
                                     }
+                                } else if expanded_trimmed.is_empty() {
+                                    NativeHostRegProbe::EmptyString
                                 } else {
-                                    let expanded_trimmed = expanded.trim();
-                                    if expanded_trimmed.is_empty() {
-                                        NativeHostRegProbe::EmptyString
-                                    } else {
-                                        NativeHostRegProbe::Present(expanded_trimmed.to_string())
-                                    }
+                                    NativeHostRegProbe::Present(expanded_trimmed.to_string())
                                 }
                             }
                             Err(err) => NativeHostRegProbe::ChromiumReadFallback {

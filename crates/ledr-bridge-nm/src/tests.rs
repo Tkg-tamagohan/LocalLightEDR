@@ -4514,3 +4514,388 @@ fn bridge_26_real_win32_chromium_1024_utf16_boundary_and_long_expand_unregister(
     );
     assert!(shared_manifest.is_file());
 }
+
+#[cfg(windows)]
+#[test]
+fn bridge_27_real_win32_untrimmed_buffer_and_non_nul_2048_boundary() {
+    use crate::setup::win_reg_ops;
+    use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_EXPAND_SZ, REG_SZ};
+    use winreg::{RegKey, RegValue};
+
+    fn encode_reg_string(s: &str, vtype: RegType) -> RegValue<'static> {
+        let bytes: Vec<u8> = s
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        RegValue {
+            bytes: bytes.into(),
+            vtype,
+        }
+    }
+
+    fn encode_reg_string_no_nul(s: &str, vtype: RegType) -> RegValue<'static> {
+        let bytes: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        RegValue {
+            bytes: bytes.into(),
+            vtype,
+        }
+    }
+
+    struct EnvVarGuard {
+        names: Vec<String>,
+    }
+    impl EnvVarGuard {
+        fn set(&mut self, name: &str, value: &str) {
+            std::env::set_var(name, value);
+            self.names.push(name.to_string());
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for name in &self.names {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    struct RealClsidMachineOps {
+        chrome_subkey: String,
+        clsid_subkey: String,
+    }
+    impl RegistryViewOps for RealClsidMachineOps {
+        fn ensure_default_sz(
+            &self,
+            _target: &RegistryTarget,
+            _subkey: &str,
+            _view: Option<RegWow64View>,
+            _expected: &str,
+        ) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        fn probe_default_sz(
+            &self,
+            _target: &RegistryTarget,
+            subkey: &str,
+            view: Option<RegWow64View>,
+        ) -> NativeHostRegProbe {
+            if subkey == self.chrome_subkey {
+                let user_plain = RegistryTarget {
+                    scope: Scope::User,
+                    key_prefix: None,
+                };
+                win_reg_ops::probe_default_sz(&user_plain, &self.clsid_subkey, view)
+            } else {
+                NativeHostRegProbe::Absent
+            }
+        }
+        fn delete_subkey_tree_idempotent(
+            &self,
+            _target: &RegistryTarget,
+            _subkey: &str,
+            _view: Option<RegWow64View>,
+        ) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        fn ensure_uri_registered(
+            &self,
+            _target: &RegistryTarget,
+            _ui_exe: &Path,
+        ) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        fn ensure_aumid_registered(&self, _target: &RegistryTarget) -> anyhow::Result<bool> {
+            unreachable!()
+        }
+        fn read_uri_status(&self, _target: &RegistryTarget) -> (bool, Option<String>) {
+            (false, None)
+        }
+        fn read_aumid_status(&self, _target: &RegistryTarget) -> (bool, Option<String>) {
+            (false, None)
+        }
+        fn read_native_hosts_launch_directly_policy(
+            &self,
+            _target: &RegistryTarget,
+            _browser: BrowserKind,
+        ) -> Option<bool> {
+            None
+        }
+    }
+
+    let pid = std::process::id();
+    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let clsid_subkey = format!(
+        r"Software\Classes\CLSID\{{LocalEDR-Test-Bridge27-{pid}-{seq}}}"
+    );
+
+    struct RegCleanup {
+        clsid_subkey: String,
+    }
+    impl Drop for RegCleanup {
+        fn drop(&mut self) {
+            let user = RegistryTarget {
+                scope: Scope::User,
+                key_prefix: None,
+            };
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(
+                &user,
+                &self.clsid_subkey,
+                Some(RegWow64View::Wow6432),
+            );
+            let _ = win_reg_ops::delete_subkey_tree_idempotent(
+                &user,
+                &self.clsid_subkey,
+                Some(RegWow64View::Wow6464),
+            );
+        }
+    }
+    let _reg_cleanup = RegCleanup {
+        clsid_subkey: clsid_subkey.clone(),
+    };
+    let mut env_guard = EnvVarGuard { names: Vec::new() };
+
+    let temp = TempDirGuard::new("ledr-bridge-nm-b27");
+    let fake_bridge = temp.path().join("ledr-bridge-nm.exe");
+    fs::write(&fake_bridge, b"MZ-test").unwrap();
+    let manifest_dir = temp.path().join("nm-machine");
+    let m = build_manifest(&fake_bridge, DEFAULT_CHROME_EXTENSION_ID).unwrap();
+    let m64_path = manifest_dir.join(manifest_filename_for(Scope::Machine, BrowserKind::Chrome));
+    write_manifest_atomic(&m64_path, &m).unwrap();
+    let m64_display = crate::manifest::normalize_display_path(&m64_path);
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let user_plain = RegistryTarget {
+        scope: Scope::User,
+        key_prefix: None,
+    };
+    let (k64, _) = hkcu
+        .create_subkey_with_flags(&clsid_subkey, KEY_WRITE | win_reg_ops::KEY_WOW64_64KEY)
+        .unwrap();
+    k64.set_value("", &m64_display).unwrap();
+
+    let (k32, _) = hkcu
+        .create_subkey_with_flags(
+            &clsid_subkey,
+            KEY_READ | KEY_WRITE | win_reg_ops::KEY_WOW64_32KEY,
+        )
+        .unwrap();
+
+    let machine_target = RegistryTarget::for_scope(Scope::Machine);
+    let chrome_subkey = machine_target.browser_subkey(BrowserKind::Chrome);
+    let machine_ops = RealClsidMachineOps {
+        chrome_subkey,
+        clsid_subkey: clsid_subkey.clone(),
+    };
+    let status_machine = StatusArgs {
+        scope: StatusScope::Machine,
+        extension_id: DEFAULT_CHROME_EXTENSION_ID.to_string(),
+        ping: false,
+        pipe_name: ledr_proto::IPC_PIPE_NAME.to_string(),
+        json: false,
+    };
+
+    // 1) REG_EXPAND_SZ with trailing whitespace where trimmed expansion is 1,024 UTF-16 units
+    //    (incl. NUL) but untrimmed expansion is 1,025 UTF-16 units -> ChromiumReadFallback
+    //    and status --scope machine falls back to 64-bit.
+    let var_fit = format!("LEDR_B27_FIT_{pid}_{seq}");
+    let exact_1023 = format!(
+        r"C:\{}\m.json",
+        "f".repeat(CHROMIUM_READ_VALUE_MAX_UTF16_UNITS - 1 - 10)
+    );
+    assert_eq!(
+        exact_1023.encode_utf16().count() + 1,
+        CHROMIUM_READ_VALUE_MAX_UTF16_UNITS
+    );
+    env_guard.set(&var_fit, &exact_1023);
+
+    let raw_expand_trailing_space = format!("%{var_fit}% ");
+    let raw_expand_trimmed = format!("%{var_fit}%");
+    k32.set_raw_value(
+        "",
+        &encode_reg_string(&raw_expand_trailing_space, REG_EXPAND_SZ),
+    )
+    .unwrap();
+
+    let probe_expand_ws =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert!(
+        matches!(
+            &probe_expand_ws,
+            NativeHostRegProbe::ChromiumReadFallback {
+                resolved_path: Some(p),
+                raw,
+                ..
+            } if p == &exact_1023 && raw == &raw_expand_trimmed
+        ),
+        "trailing whitespace making untrimmed expansion 1,025 UTF-16 units must trigger ChromiumReadFallback, got {probe_expand_ws:?}"
+    );
+    assert!(!probe_expand_ws.stops_wow64_fallback());
+
+    let report_ws = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &machine_ops,
+    )
+    .expect("status --scope machine with untrimmed REG_EXPAND_SZ > 1024");
+    let chrome_ws = &report_ws.scopes[0].browsers[0];
+    assert!(chrome_ws.registered);
+    assert_eq!(chrome_ws.registry_view.as_deref(), Some("wow64-64"));
+    assert_eq!(chrome_ws.manifest_path.as_deref(), Some(m64_display.as_str()));
+    assert!(chrome_ws.manifest.as_ref().is_some_and(|v| v.valid));
+
+    // Also verify REG_SZ with trailing whitespace (1,023 chars + trailing space + NUL = 1,025 units)
+    let sz_trailing_space = format!("{exact_1023} ");
+    k32.set_raw_value("", &encode_reg_string(&sz_trailing_space, REG_SZ))
+        .unwrap();
+    let probe_sz_ws =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert!(
+        matches!(
+            &probe_sz_ws,
+            NativeHostRegProbe::ChromiumReadFallback {
+                resolved_path: Some(p),
+                raw,
+                ..
+            } if p == &exact_1023 && raw == &exact_1023
+        ),
+        "trailing whitespace making untrimmed REG_SZ 1,025 UTF-16 units must trigger ChromiumReadFallback, got {probe_sz_ws:?}"
+    );
+
+    // 2) Exact 2,048-byte REG_SZ without trailing UTF-16 NUL -> ChromiumReadFallback (NOT Present).
+    //    Even when the 1,024th u16 is trailing whitespace (trimmed = 1,023 chars), Chromium's
+    //    2,048-byte buffer lacks a NUL terminator and fails ReadValue.
+    //    (Note: Windows `RegQueryValueExW` may auto-append a 2-byte NUL when reading a
+    //     non-NUL-terminated 2,048-byte REG_SZ, returning 2,050 bytes; we verify both the
+    //     direct 2,048-byte non-NUL guard in `exceeds_chromium_raw_limit` and the end-to-end
+    //     Win32 registry round-trip.)
+    let raw_2048_no_nul = encode_reg_string_no_nul(&sz_trailing_space, REG_SZ);
+    assert_eq!(
+        raw_2048_no_nul.bytes.len(),
+        CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2
+    );
+    assert!(!raw_2048_no_nul.bytes.ends_with(&[0, 0]));
+    assert!(win_reg_ops::exceeds_chromium_raw_limit(
+        &raw_2048_no_nul.bytes,
+        &sz_trailing_space
+    ));
+    let raw_2048_with_nul = encode_reg_string(&exact_1023, REG_SZ);
+    assert_eq!(
+        raw_2048_with_nul.bytes.len(),
+        CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2
+    );
+    assert!(raw_2048_with_nul.bytes.ends_with(&[0, 0]));
+    assert!(!win_reg_ops::exceeds_chromium_raw_limit(
+        &raw_2048_with_nul.bytes,
+        &exact_1023
+    ));
+
+    k32.set_raw_value("", &raw_2048_no_nul).unwrap();
+    let stored_sz = k32.get_raw_value("").unwrap();
+    assert!(
+        stored_sz.bytes.len() > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2
+            || (stored_sz.bytes.len() == CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2
+                && !stored_sz.bytes.ends_with(&[0, 0])),
+        "2,048-byte non-NUL REG_SZ must remain >2048 bytes or lack NUL on readback, got {} bytes",
+        stored_sz.bytes.len()
+    );
+
+    let probe_sz_no_nul =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert!(
+        matches!(
+            &probe_sz_no_nul,
+            NativeHostRegProbe::ChromiumReadFallback {
+                resolved_path: Some(p),
+                raw,
+                ..
+            } if p == &exact_1023 && raw == &exact_1023
+        ),
+        "2,048-byte non-NUL REG_SZ must trigger ChromiumReadFallback, got {probe_sz_no_nul:?}"
+    );
+    assert!(!probe_sz_no_nul.stops_wow64_fallback());
+
+    let report_sz_no_nul = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &machine_ops,
+    )
+    .expect("status --scope machine with 2,048-byte non-NUL REG_SZ");
+    assert_eq!(
+        report_sz_no_nul.scopes[0].browsers[0].registry_view.as_deref(),
+        Some("wow64-64")
+    );
+
+    // 3) Exact 2,048-byte REG_EXPAND_SZ without trailing UTF-16 NUL -> ChromiumReadFallback (NOT Present),
+    //    even when the trimmed/expanded value itself fits comfortably within 1,024 UTF-16 units.
+    let var_short = format!("LEDR_B27_S_{pid}_{seq}");
+    let short_target = r"C:\m.json";
+    env_guard.set(&var_short, short_target);
+    let raw_short_token = format!("%{var_short}%");
+    let pad_len = CHROMIUM_READ_VALUE_MAX_UTF16_UNITS - raw_short_token.encode_utf16().count();
+    let expand_2048_no_nul = format!("{raw_short_token}{}", " ".repeat(pad_len));
+    assert_eq!(
+        expand_2048_no_nul.encode_utf16().count(),
+        CHROMIUM_READ_VALUE_MAX_UTF16_UNITS
+    );
+    let raw_expand_2048_no_nul = encode_reg_string_no_nul(&expand_2048_no_nul, REG_EXPAND_SZ);
+    assert_eq!(
+        raw_expand_2048_no_nul.bytes.len(),
+        CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2
+    );
+    assert!(!raw_expand_2048_no_nul.bytes.ends_with(&[0, 0]));
+    assert!(win_reg_ops::exceeds_chromium_raw_limit(
+        &raw_expand_2048_no_nul.bytes,
+        &expand_2048_no_nul
+    ));
+    k32.set_raw_value("", &raw_expand_2048_no_nul).unwrap();
+    let stored_expand = k32.get_raw_value("").unwrap();
+    assert!(
+        stored_expand.bytes.len() > CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2
+            || (stored_expand.bytes.len() == CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2
+                && !stored_expand.bytes.ends_with(&[0, 0])),
+        "2,048-byte non-NUL REG_EXPAND_SZ must remain >2048 bytes or lack NUL on readback, got {} bytes",
+        stored_expand.bytes.len()
+    );
+
+    let probe_expand_no_nul =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert!(
+        matches!(
+            &probe_expand_no_nul,
+            NativeHostRegProbe::ChromiumReadFallback {
+                resolved_path: Some(p),
+                raw,
+                ..
+            } if p == short_target && raw == &raw_short_token
+        ),
+        "2,048-byte non-NUL REG_EXPAND_SZ must trigger ChromiumReadFallback, got {probe_expand_no_nul:?}"
+    );
+    assert!(!probe_expand_no_nul.stops_wow64_fallback());
+
+    let report_expand_no_nul = run_status_with_ops(
+        &status_machine,
+        std::slice::from_ref(&machine_target),
+        Some(&manifest_dir),
+        &machine_ops,
+    )
+    .expect("status --scope machine with 2,048-byte non-NUL REG_EXPAND_SZ");
+    assert_eq!(
+        report_expand_no_nul.scopes[0].browsers[0]
+            .registry_view
+            .as_deref(),
+        Some("wow64-64")
+    );
+
+    // 4) Control: 2,048-byte REG_SZ WITH trailing NUL (1,023 chars + NUL) fits -> Present (stops fallback).
+    k32.set_raw_value("", &encode_reg_string(&exact_1023, REG_SZ))
+        .unwrap();
+    let stored_fit = k32.get_raw_value("").unwrap();
+    assert_eq!(stored_fit.bytes.len(), CHROMIUM_READ_VALUE_MAX_UTF16_UNITS * 2);
+    assert!(stored_fit.bytes.ends_with(&[0, 0]));
+    let probe_fit =
+        win_reg_ops::probe_default_sz(&user_plain, &clsid_subkey, Some(RegWow64View::Wow6432));
+    assert_eq!(probe_fit, NativeHostRegProbe::Present(exact_1023.clone()));
+    assert!(probe_fit.stops_wow64_fallback());
+}

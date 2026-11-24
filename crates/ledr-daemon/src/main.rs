@@ -2929,18 +2929,9 @@ mod tests {
         assert_eq!(owned_records.len(), 3);
 
         // Tamper content on Desktop decoy in-place (ransomware simulation): file_index stays
-        // identical so tracked cleanup must still delete it. Use OpenOptions (OPEN_EXISTING)
-        // because Windows rejects CREATE_ALWAYS (`std::fs::write`) on HIDDEN|SYSTEM files.
+        // identical so tracked cleanup must still delete it.
         let desktop_decoy = desktop.join(HONEYPOT_DEFAULT_FILENAME);
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&desktop_decoy)
-                .expect("open desktop decoy for overwrite");
-            f.write_all(b"RANSOMWARE_MODIFIED_PAYLOAD").unwrap();
-        }
+        overwrite_existing_honeypot_payload(&desktop_decoy, b"RANSOMWARE_MODIFIED_PAYLOAD");
 
         // Replace Pictures decoy with a distinct user file (different file_index): tracked
         // cleanup must preserve the user file and drop only the stale SQLite tracking row.
@@ -3158,17 +3149,9 @@ mod tests {
         assert_eq!(db_records[0].file_index, Some(new_file_id.file_index));
         drop(store);
 
-        // Modify content via OpenOptions (OPEN_EXISTING) on the HIDDEN|SYSTEM decoy so deletion
+        // Modify content on the HIDDEN|SYSTEM decoy via OPEN_EXISTING + set_len(0) so deletion
         // depends strictly on the updated SQLite file identity while preserving attributes/file_id.
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&decoy_path)
-                .expect("open redeployed decoy for overwrite");
-            f.write_all(b"MODIFIED_AFTER_REDEPLOY").unwrap();
-        }
+        overwrite_existing_honeypot_payload(&decoy_path, b"MODIFIED_AFTER_REDEPLOY");
         let outcome = cleanup_honeypots_with_db_and_fallback(&db_path, &[]);
         assert_eq!(outcome.removed, 1);
         assert_eq!(outcome.skipped_not_owned, 0);
@@ -3178,5 +3161,18 @@ mod tests {
         assert!(LedrStore::list_tracked_honeypot_records_read_only(&db_path)
             .unwrap()
             .is_empty());
+    }
+
+    fn overwrite_existing_honeypot_payload(path: &Path, payload: &[u8]) {
+        use std::io::Write as _;
+        // Open with `.write(true)` only (`OPEN_EXISTING` on Windows) and truncate via `set_len(0)`
+        // so Windows does not reject `CREATE_ALWAYS` / `TRUNCATE_EXISTING` expectations on
+        // `HIDDEN | SYSTEM` files and preserves the existing NTFS `file_index`.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open existing decoy with OPEN_EXISTING");
+        f.set_len(0).expect("truncate existing decoy");
+        f.write_all(payload).expect("write modified decoy payload");
     }
 }

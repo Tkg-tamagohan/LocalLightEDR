@@ -1,12 +1,15 @@
-//! Layer 2 LocalEDR resident core daemon (`--foreground` dev mode and Windows Service scaffold).
+//! Layer 2 LocalEDR resident core daemon (`--foreground`, `--service`, and `--service-strict` modes).
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use ledr_daemon::{
+    service_win::{self, ServiceRunError},
     start_ipc_server, DaemonConfig, DaemonEngine, OutboundEnforcementMode, Session0ToastLauncher,
     DEFAULT_MAX_CONCURRENT_IPC_CLIENTS,
 };
@@ -30,6 +33,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliArgs {
     foreground: bool,
+    service: bool,
     dev_bypass_auth: bool,
     disable_nrd_refresh: bool,
     disable_outbound_firewall: bool,
@@ -54,6 +58,7 @@ impl Default for CliArgs {
     fn default() -> Self {
         Self {
             foreground: true,
+            service: false,
             dev_bypass_auth: false,
             disable_nrd_refresh: false,
             disable_outbound_firewall: false,
@@ -82,13 +87,23 @@ where
     S: Into<OsString>,
 {
     let mut parsed = CliArgs::default();
+    let mut saw_foreground = false;
+    let mut saw_service = false;
     let mut iter = args.into_iter().map(Into::into);
     let _exe = iter.next();
 
     while let Some(arg) = iter.next() {
         let text = arg.to_string_lossy();
         match text.as_ref() {
-            "--foreground" => parsed.foreground = true,
+            "--foreground" => {
+                saw_foreground = true;
+                parsed.foreground = true;
+            }
+            "--service" => {
+                saw_service = true;
+                parsed.service = true;
+                parsed.foreground = false;
+            }
             "--service-strict" => parsed.foreground = false,
             "--dev-bypass-auth" => parsed.dev_bypass_auth = true,
             "--disable-nrd-refresh" => parsed.disable_nrd_refresh = true,
@@ -221,6 +236,10 @@ where
             "--help" | "-h" => parsed.show_help = true,
             other => anyhow::bail!("unrecognized argument: {other}"),
         }
+    }
+
+    if saw_foreground && saw_service {
+        anyhow::bail!("--service cannot be combined with --foreground");
     }
 
     // `--ui-signer` without `--ui-root-thumbprint` can never verify: the caller check
@@ -388,17 +407,89 @@ fn build_daemon_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .context("failed to build Tokio runtime for ledr-daemon")
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = parse_cli_args(std::env::args_os())?;
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+fn run_service_mode(cli: CliArgs) -> Result<(), ServiceRunError> {
+    service_win::run_windows_service(move |control| {
+        let mut shutdown_rx = control.shutdown_receiver();
+        let runtime = build_daemon_runtime()?;
+        let result = runtime.block_on(run_daemon_until(
+            cli,
+            move || control.mark_running(),
+            async move {
+                let _ = shutdown_rx.wait_for(|&stopped| stopped).await;
+                Ok(())
+            },
+        ));
+        // Drop the Tokio runtime inside the service entrypoint before returning
+        // so all worker/blocking threads unwind prior to reporting SERVICE_STOPPED.
+        drop(runtime);
+        result
+    })
+}
+
+fn run_cli_entrypoint_code<I, S>(args: I) -> u8
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let cli = match parse_cli_args(args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            return 1;
+        }
+    };
+
     if cli.show_help {
         println!(
-            "ledr-daemon [--foreground | --service-strict] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>] [--bridge-sha256 <hex>] [--bridge-signer <dn>] [--bridge-root-thumbprint <sha1>] [--auth-helper-sha256 <hex>]"
+            "ledr-daemon [--foreground | --service | --service-strict] [--dev-bypass-auth] [--outbound-mode <enforce|preemptive-only|audit>] [--disable-outbound-firewall] [--resume-suspended-on-shutdown] [--disable-nrd-refresh] [--nrd-feed-url <url>] [--nrd-cache <path>] [--db <path>] [--rules <dir>] [--pipe <name>] [--ui-sha256 <hex>] [--ui-signer <dn>] [--ui-root-thumbprint <sha1>] [--bridge-sha256 <hex>] [--bridge-signer <dn>] [--bridge-root-thumbprint <sha1>] [--auth-helper-sha256 <hex>]"
         );
-        return Ok(());
+        return 0;
     }
 
-    let runtime = build_daemon_runtime()?;
-    runtime.block_on(run_daemon(cli))
+    init_tracing();
+
+    if cli.service {
+        return match run_service_mode(cli) {
+            Ok(()) => 0,
+            Err(ServiceRunError::NotStartedByScm) => {
+                eprintln!(
+                    "ledr-daemon --service must be started by the Windows Service Control Manager (error 1063: ERROR_FAILED_SERVICE_CONTROLLER_CONNECT). Run with --foreground for interactive console execution."
+                );
+                service_win::NON_SCM_EXIT_CODE
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                1
+            }
+        };
+    }
+
+    let runtime = match build_daemon_runtime() {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            return 1;
+        }
+    };
+
+    match runtime.block_on(run_daemon_until(cli, || {}, async {
+        tokio::signal::ctrl_c().await.map_err(anyhow::Error::from)
+    })) {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            1
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    ExitCode::from(run_cli_entrypoint_code(std::env::args_os()))
 }
 
 /// Builds the [`DaemonConfig`] for `ledr-daemon` CLI execution.
@@ -445,9 +536,16 @@ fn build_daemon_config(
     }
 }
 
-async fn run_daemon(cli: CliArgs) -> anyhow::Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+async fn run_daemon_until<FReady, FWait>(
+    cli: CliArgs,
+    on_ready: FReady,
+    shutdown_signal: FWait,
+) -> anyhow::Result<()>
+where
+    FReady: FnOnce(),
+    FWait: Future<Output = anyhow::Result<()>>,
+{
+    init_tracing();
 
     let priv_report = enable_required_privileges();
     tracing::info!(
@@ -609,14 +707,16 @@ async fn run_daemon(cli: CliArgs) -> anyhow::Result<()> {
     );
 
     let ipc_handle = start_ipc_server(Arc::clone(&engine))?;
+    on_ready();
     tracing::info!(
         pipe = %ipc_handle.pipe_name(),
         foreground = cli.foreground,
-        "ledr-daemon listening on Named Pipe IPC; press Ctrl+C to shut down"
+        service = cli.service,
+        "ledr-daemon listening on Named Pipe IPC"
     );
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("Ctrl+C received; initiating graceful shutdown and WAL checkpoint");
+    shutdown_signal.await?;
+    tracing::info!("shutdown signal received; initiating graceful shutdown and WAL checkpoint");
     engine.signal_early_shutdown();
 
     let stop_res = tokio::task::spawn_blocking(move || {
@@ -648,6 +748,7 @@ mod tests {
     fn cli_parses_defaults_and_flags() {
         let def = parse_cli_args(["ledr-daemon"]).expect("default args");
         assert!(def.foreground);
+        assert!(!def.service);
         assert!(!def.dev_bypass_auth);
         assert!(!def.disable_nrd_refresh);
         assert_eq!(def.db_path, None);
@@ -1077,5 +1178,153 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cli_svc_01_service_flag_combinations_and_conflicts() {
+        let svc = parse_cli_args(["ledr-daemon", "--service"]).expect("--service parses");
+        assert!(svc.service);
+        assert!(!svc.foreground, "--service must clear foreground to false");
+
+        let svc_strict = parse_cli_args(["ledr-daemon", "--service", "--service-strict"])
+            .expect("--service --service-strict parses");
+        assert!(svc_strict.service);
+        assert!(!svc_strict.foreground);
+
+        let strict_svc = parse_cli_args(["ledr-daemon", "--service-strict", "--service"])
+            .expect("--service-strict --service parses");
+        assert!(strict_svc.service);
+        assert!(!strict_svc.foreground);
+
+        let svc_fg = parse_cli_args(["ledr-daemon", "--service", "--foreground"])
+            .expect_err("--service --foreground must be rejected");
+        assert!(svc_fg.to_string().contains("--foreground"));
+
+        let fg_svc = parse_cli_args(["ledr-daemon", "--foreground", "--service"])
+            .expect_err("--foreground --service must be rejected");
+        assert!(fg_svc.to_string().contains("--foreground"));
+
+        assert_eq!(
+            run_cli_entrypoint_code(["ledr-daemon", "--help"]),
+            0,
+            "--help must return exit code 0"
+        );
+        assert_eq!(
+            run_cli_entrypoint_code(["ledr-daemon", "--service", "--foreground"]),
+            1,
+            "invalid CLI args must return exit code 1"
+        );
+    }
+
+    #[test]
+    fn cli_svc_02_service_mode_preserves_security_invariants() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ledr-main-svc-inv-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp test dir");
+        let daemon_exe = tmp_dir.join("ledr-daemon.exe");
+        let sibling_ui = tmp_dir.join("ledr-ui.exe");
+        std::fs::write(&sibling_ui, b"stub").expect("create sibling ledr-ui.exe");
+
+        for argv in [
+            &["ledr-daemon", "--service"][..],
+            &["ledr-daemon", "--service", "--dev-bypass-auth"][..],
+            &["ledr-daemon", "--service", "--service-strict"][..],
+        ] {
+            let cli = parse_cli_args(argv.iter().copied()).expect("parse service args");
+            assert!(cli.service);
+            assert!(!cli.foreground);
+            assert_eq!(
+                resolve_ui_exe_path_from(Some(&daemon_exe), cli.foreground, cli.dev_bypass_auth),
+                PathBuf::from(AUTHORIZED_UI_EXE_PATH),
+                "non-foreground --service must always target AUTHORIZED_UI_EXE_PATH"
+            );
+            let cfg = build_daemon_config(&cli, None, None, None, Vec::new(), Vec::new());
+            assert!(cfg.strict_pipe_dacl);
+            assert!(!cfg.resume_suspended_on_shutdown);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cli_svc_03_non_scm_service_launch_exits_2_with_guidance() {
+        use std::io::Read as _;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Instant;
+
+        if std::env::var_os("LEDR_TEST_SCM_1063_CHILD").is_some() {
+            let code = run_cli_entrypoint_code(["ledr-daemon", "--service"]);
+            std::process::exit(i32::from(code));
+        }
+
+        struct ChildGuard(Option<Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+            .args([
+                "--exact",
+                "tests::cli_svc_03_non_scm_service_launch_exits_2_with_guidance",
+                "--nocapture",
+            ])
+            .env("LEDR_TEST_SCM_1063_CHILD", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn --service 1063 child");
+
+        let mut stdout_pipe = child.stdout.take().expect("stdout pipe");
+        let mut stderr_pipe = child.stderr.take().expect("stderr pipe");
+        let stdout_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf);
+            buf
+        });
+
+        let mut guard = ChildGuard(Some(child));
+        let deadline = Duration::from_millis(45_000);
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = guard
+                .0
+                .as_mut()
+                .expect("child present")
+                .try_wait()
+                .expect("try_wait")
+            {
+                guard.0 = None;
+                break status;
+            }
+            assert!(
+                start.elapsed() <= deadline,
+                "ledr-daemon --service child did not return 1063 within {deadline:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        let stdout = String::from_utf8_lossy(&stdout_handle.join().expect("stdout join")).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr_handle.join().expect("stderr join")).into_owned();
+        assert_eq!(
+            status.code(),
+            Some(i32::from(service_win::NON_SCM_EXIT_CODE)),
+            "expected exit code 2 for non-SCM 1063 launch; stdout={stdout:?}, stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("1063") && stderr.contains("--foreground"),
+            "expected 1063 and --foreground guidance in stderr, got: {stderr:?}"
+        );
     }
 }

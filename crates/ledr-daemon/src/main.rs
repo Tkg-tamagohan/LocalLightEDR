@@ -2929,9 +2929,18 @@ mod tests {
         assert_eq!(owned_records.len(), 3);
 
         // Tamper content on Desktop decoy in-place (ransomware simulation): file_index stays
-        // identical so tracked cleanup must still delete it.
+        // identical so tracked cleanup must still delete it. Use OpenOptions (OPEN_EXISTING)
+        // because Windows rejects CREATE_ALWAYS (`std::fs::write`) on HIDDEN|SYSTEM files.
         let desktop_decoy = desktop.join(HONEYPOT_DEFAULT_FILENAME);
-        std::fs::write(&desktop_decoy, b"RANSOMWARE_MODIFIED_PAYLOAD").unwrap();
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&desktop_decoy)
+                .expect("open desktop decoy for overwrite");
+            f.write_all(b"RANSOMWARE_MODIFIED_PAYLOAD").unwrap();
+        }
 
         // Replace Pictures decoy with a distinct user file (different file_index): tracked
         // cleanup must preserve the user file and drop only the stale SQLite tracking row.
@@ -3149,8 +3158,17 @@ mod tests {
         assert_eq!(db_records[0].file_index, Some(new_file_id.file_index));
         drop(store);
 
-        // Modify content so deletion depends strictly on the updated SQLite file identity.
-        std::fs::write(&decoy_path, b"MODIFIED_AFTER_REDEPLOY").unwrap();
+        // Modify content via OpenOptions (OPEN_EXISTING) on the HIDDEN|SYSTEM decoy so deletion
+        // depends strictly on the updated SQLite file identity while preserving attributes/file_id.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&decoy_path)
+                .expect("open redeployed decoy for overwrite");
+            f.write_all(b"MODIFIED_AFTER_REDEPLOY").unwrap();
+        }
         let outcome = cleanup_honeypots_with_db_and_fallback(&db_path, &[]);
         assert_eq!(outcome.removed, 1);
         assert_eq!(outcome.skipped_not_owned, 0);

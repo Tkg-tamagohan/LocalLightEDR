@@ -125,7 +125,7 @@ Windows Server SKU で代替検証を行う場合は、クライアント SKU �
 
 - 実 ETW `Microsoft-Windows-Kernel-File` と `Microsoft-Windows-Kernel-Registry` を購読し、ダミー `Cookies` の Open、おとりファイルへの 1 バイト書込、自動起動レジストリ更新、および `CloseKey` による `KeyObject` キャッシュ無効化が実イベントで動作することを検証する。
 - 実 `NtSuspendProcess` で対象プロセスと子孫プロセスを凍結でき、`explorer.exe` などの Never-Suspend 対象が一切停止しないこと、および `TerminateAndBlock` 実行時の子プロセスツリー終了の非同期挙動に破綻がないことを確かめる。
-- 生存中の発火元プロセスがおとり発火を起こし（`engine/events.rs` の本番凍結経路）、すでに終了済みの非保護中間親プロセス越しに生存中の孫プロセスへ `NtSuspendProcess` が適用されること、および保護対象プロセスや同一ミリ秒 PID 再利用後の後継プロセス配下が誤停止されないことを確認する。
+- 生存中の発火元プロセスがおとり発火を起こし（`engine/events.rs` の本番凍結経路）、すでに終了済みの非保護中間親プロセス越しに生存中の孫プロセスへ `NtSuspendProcess` が適用されること、および保護対象プロセスや同一ミリ秒 PID 再利用後の後継プロセス配下が誤停止されないことを確認する（既存のツリー凍結手順である [e2e-test-runbook.md](e2e-test-runbook.md) の `E2E-P2-03` および [phase2-3-e2e-runbook.md](phase2-3-e2e-runbook.md) のセクション 5 は発火前の中間親終了を確認しないため、既存の `E2E-P2-03` 合格記録と区別できるよう、後続の実機検証 PR で専用手順と結果欄を追加して実施する）。
 - 機密ファイル Open またはおとりファイル書込の検知と即時サスペンドに続いて、Session 0 の `LocalSystem` サービスから `WTSQueryUserToken` と `CreateProcessAsUser` により `ledr-ui.exe --notify <alert_id>` が対話セッションで起動し、検知から 1 秒以内にトースト通知が表示されること、および `HKCU\Software\Classes\ledr` 登録済みの `ledr://alert/<id>` クリック後 1,000 ms 以内に View 1 が開いて 5 秒以内に強制終了または再開が完了することを確認する。
 
 #### Phase 3 実機検証項目

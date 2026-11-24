@@ -30,4 +30,5 @@ description: LocalEDR の ActiveProcessTable、事前 WFP ブロック、ポリ�
   また `is_never_suspend_process("") == false` により未識別の保護プロセス配下へ展開されるのを防ぐため、空または空白のみの `exe_path`（`child.exe_path.trim().is_empty()`）を持つ中間親は BFS キューへ積まずに展開を止める。
 - 受信側が消費やドレインを打ち切って停止または強制終了する経路で有界チャネル（`sync_channel` 等）へ送信する専用ワーカースレッドやリーダースレッドを `join()` する前は、送信側の満杯ブロックによるデッドロックを防ぐため必ず受信端（例として `auth_worker.rs` の `resp_rx`）を先にドロップまたはクローズする（通常終了時に残余要素のドレインが必要なチャネルではドレイン完了後に閉じる）。
 - ブロッキングフック（`add_wfp_app_rule` 等）や同期バリアで停止中のスレッドと並行して非保持であるべき共有ロック（`firewall`、`process_table`）を検査する回帰テストでは、無期限の `.lock()` ではなく有界タイムアウト付きの `try_lock()` ヘルパ（`try_has_active_wfp_filter` 等）を用い、ロック範囲退行をハングではなくタイムアウト失敗として検出する。
-- `ActiveProcessTable` の `ppid` フォールバック経路を検証するユニットテストでは、対象子プロセスを親および後継再誕生プロセスより先に登録し、全フォールバック子に `parent_instance_id == None` を明示アサートして検証済み `by_parent_id` リンクへのすり替わりを防ぐ。
+- `ActiveProcessTable` の `ppid` フォールバック経路を検証するユニットテストでは、全フォールバック子に `parent_instance_id == None` を明示アサートして検証済み `by_parent_id` リンクへのすり替わりを防ぐ。
+  そのため既定では対象子プロセスを親および後継再誕生プロセスより先に登録する（`PROC-DESC-05` のように、生存中の親を残す目的で後継プロセスを先に `evicted_exited` へ退避したうえで子登録時に `parent_instance_id == None` を確認できる境界ケースを除く）。

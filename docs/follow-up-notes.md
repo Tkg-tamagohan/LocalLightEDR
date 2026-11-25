@@ -14,7 +14,7 @@
 | `FU-E2E-03` | 性能最適化 | Phase 3、Phase 4 | `E2E-PERF-01` 超過に対する Stage 1〜3 最適化（`ledr-auth-helper` 分離、LRU 上限、非系譜解放、SQLite reader 縮小、`PrivateWorkingSetSize <= 20.0 MB` 基準併記） | PR #39（`7cdb445`）で `main` マージ済み、PR #40（`9e4a3a8`）でルール昇格済み（最終実機 E2E で再確認） |
 | `FU-E2E-04` | 検知改善 | Phase 1、Phase 3 | 短命プロセス（約 40 ms）での PEB 補完欠落による `command_line` 欠落と `LEDR-LOTL-001`（正規管理ツール悪用検知ルール）未発火の解消 | PR #35（`ed9ae3f`）および PR #36（`1540a1f`）で `main` マージ済み、PR #37（`fac1022`）でルール昇格済み（最終実機 E2E で再確認） |
 | `FU-E2E-05` | 境界改善 | Phase 3 | WFP ドロップの終了済み兄弟プロセス由来の誤帰属抑止および `E2E-P3-06` 停止予算超過時の残余書き込みによる `-wal` 再生成の整理 | PR #38（`b8d9c66`）で `main` マージ済み（最終実機 E2E で再確認） |
-| `FU-P5-01` | ワークフロー検証と残余実機対象 | Phase 5 | `Release`（`dry_run: true`）および `Security Audit` の手動検証、PR #51 修正後の `main` 最終合格、ならびに本番公開と実機インストーラ E2E の残余管理 | PR #51（`10e357f`）で修正を `main` マージ済み、マージ後 `main` 手動検証合格済み（本番 `publish`、本番鍵更新、および実機 NSIS E2E は今後の本番リリース前対象） |
+| `FU-P5-01` | ワークフロー検証と残余実機対象 | Phase 5 | `Release`（`dry_run: true`）および `Security Audit` の手動検証、PR #51 修正後の `main` 最終合格、ならびに本番公開と実機インストーラ E2E の残余管理 | PR #51（`10e357f`）で修正を `main` マージ済み、マージ後 `main` 手動検証合格済み（実機 NSIS E2E はリリース前実機検証、本番 `publish` は初回本番リリース時、本番鍵実更新は本番リリース前後の実機確認対象） |
 
 ### 現在地、推奨着手順、および用語の補足
 
@@ -410,7 +410,8 @@ CI 自動実行とローカル別途実行および手動 `workflow_dispatch` �
 - **マージ後 `main`（`10e357f`）上の `Security Audit`（`workflow_dispatch`, Run `#45557335593`）**：`cargo audit` が 454 クレートを検査し、**脆弱性 0 件**（exit code `0`）で合格した。
   残る許可警告 3 件は Tauri 上流および Linux GTK 依存に由来する `chrono 0.4.45`（`RUSTSEC-2026-0543`、`unmaintained`）、`proc-macro-error 1.0.4`（`RUSTSEC-2024-0370`、`unmaintained`）、および `glib 0.18.5`（`RUSTSEC-2024-0429`、`unsound`、Windows ビルド未使用）である。
 - **マージ後 `main`（`10e357f`）上の `Release`（`workflow_dispatch`, `dry_run: true`, Run `#45557332849`）**：`preflight`（5 秒、出力 `tag=v0.1.0`, `version=0.1.0`, `dry_run=true`）と `build`（20 分 13 秒、`makensis v3.13` 導入確認、NSIS 生成、一時鍵 `dry-run-test` 署名、`verify-dist`、`release-dist` アップロード）が成功し、`publish` はスキップされ、GitHub Release が作成されないことを確認した。
-  取得した `release-dist` の 6 点（`LocalEDR-Setup-v0.1.0-win-x64.exe` `4,941,467` bytes、`LocalEDR-v0.1.0-win-x64.zip` `7,029,060` bytes / 8 エントリ、`LocalEDR-chrome-ext-v0.1.0.zip` `25,248` bytes / 13 エントリ、`SHA256SUMS.txt` `291` bytes、`update-manifest.json` `859` bytes、`update-manifest.json.sig` `191` bytes）について、SHA-256 再計算値と `update-manifest.json` 各項目（`version=0.1.0`、`tag=v0.1.0`、`chrome_extension.extension_id=ecelachfiiiiiibpjeomfncgpegbpanh`）がすべて一致することを確認した。
+  取得した `release-dist` の 6 点について、配布本体 3 点（`LocalEDR-Setup-v0.1.0-win-x64.exe` `4,941,467` bytes、`LocalEDR-v0.1.0-win-x64.zip` `7,029,060` bytes / 8 エントリ、`LocalEDR-chrome-ext-v0.1.0.zip` `25,248` bytes / 13 エントリ）は SHA-256 再計算値と `SHA256SUMS.txt`（`291` bytes）の記載値が全件一致することを確認した。
+  あわせてメタデータおよび署名 2 点について、`update-manifest.json`（`859` bytes）の各項目（`version=0.1.0`、`tag=v0.1.0`、インストーラの `sha256` と `size_bytes`、および `chrome_extension` の `extension_id=ecelachfiiiiiibpjeomfncgpegbpanh` と `sha256`）が実ファイルと一致すること、ならびに `update-manifest.json.sig`（`191` bytes）が非空の署名形式（`key_id=dry-run-test`、`algorithm=ed25519`）であり `build` ジョブ内の `release_verify.verify_dist` で一時公開鍵による署名検証を通過していることを確認した。
 
 ### 未検証範囲と対応予定タイミング
 

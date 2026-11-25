@@ -76,6 +76,17 @@ def _sanitize_ps51_env(base_env: dict[str, str] | None = None) -> dict[str, str]
     return env
 
 
+def _extract_workflow_job_block(workflow_text: str, job_name: str) -> str:
+    """Extract a top-level job block under ``jobs:`` by 2-space YAML indentation."""
+    match = re.search(
+        rf"(?ms)^  {re.escape(job_name)}:\r?\n(.*?)(?=^  [A-Za-z0-9_-]+:\r?\n|\Z)",
+        workflow_text,
+    )
+    if match is None:
+        raise AssertionError(f"Workflow must define job {job_name!r}")
+    return match.group(1)
+
+
 def _create_mock_repo(root: Path, version: str = "0.1.0") -> tuple[Path, Path, Path]:
     (root / "crates").mkdir(parents=True, exist_ok=True)
     (root / "apps" / "ledr-ui").mkdir(parents=True, exist_ok=True)
@@ -625,18 +636,72 @@ class TestReleaseScripts(unittest.TestCase):
         release_yml = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
-        # Checkout ref pinning across preflight, build, publish
-        self.assertGreaterEqual(len(re.findall(r"uses:\s*actions/checkout@v4", release_yml)), 3)
+        # Checkout ref pinning across preflight, verify, build, package, publish
+        self.assertGreaterEqual(len(re.findall(r"uses:\s*actions/checkout@v4", release_yml)), 5)
         self.assertIn("ref: ${{ github.sha }}", release_yml)
         self.assertEqual(
-            release_yml.count("ref: ${{ needs.preflight.outputs.source_sha }}"), 2
+            release_yml.count("ref: ${{ needs.preflight.outputs.source_sha }}"), 4
         )
-        # Non-dry-run tag commit verification & --verify-tag
-        self.assertIn('refs/tags/${RELEASE_TAG}^{commit}', release_yml)
-        self.assertIn('refs/tags/${TAG}^{commit}', release_yml)
-        self.assertIn("--verify-tag", release_yml)
-        # Dry-run key-id override
-        self.assertIn("--key-id dry-run-test", release_yml)
+
+        rel_preflight_block = _extract_workflow_job_block(release_yml, "preflight")
+        self.assertIn("runs-on: ubuntu-latest", rel_preflight_block)
+        self.assertIn("ref: ${{ github.sha }}", rel_preflight_block)
+        self.assertIn('refs/tags/${RELEASE_TAG}^{commit}', rel_preflight_block)
+        self.assertIn("scripts/release_verify.py preflight", rel_preflight_block)
+
+        rel_verify_block = _extract_workflow_job_block(release_yml, "verify")
+        self.assertIn("runs-on: windows-latest", rel_verify_block)
+        self.assertIn("needs: preflight", rel_verify_block)
+        self.assertIn("ref: ${{ needs.preflight.outputs.source_sha }}", rel_verify_block)
+        self.assertIn("CARGO_PROFILE_DEV_DEBUG: line-tables-only", rel_verify_block)
+        self.assertIn("components: clippy", rel_verify_block)
+        self.assertIn('shared-key: "win-x64-dev"', rel_verify_block)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", rel_verify_block)
+        self.assertIn("cargo clippy", rel_verify_block)
+        self.assertIn("cargo test --workspace --locked", rel_verify_block)
+        self.assertIn("phase4_ui.test.mjs", rel_verify_block)
+        self.assertNotIn("LEDR_UPDATE_SIGNING_PRIVATE_KEY", rel_verify_block)
+        self.assertNotIn("LEDR_UPDATE_SIGNING_KEY_ID", rel_verify_block)
+
+        rel_build_block = _extract_workflow_job_block(release_yml, "build")
+        self.assertIn("runs-on: windows-latest", rel_build_block)
+        self.assertIn("needs: preflight", rel_build_block)
+        self.assertIn("ref: ${{ needs.preflight.outputs.source_sha }}", rel_build_block)
+        self.assertIn("PYTHONUTF8: '1'", rel_build_block)
+        self.assertIn("PYTHONIOENCODING: utf-8", rel_build_block)
+        self.assertIn("scripts/test_release_scripts.py", rel_build_block)
+        self.assertIn("makensis.exe", rel_build_block)
+        self.assertIn("/VERSION", rel_build_block)
+        self.assertIn('shared-key: "win-x64-release"', rel_build_block)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", rel_build_block)
+        self.assertIn("cargo build --release", rel_build_block)
+        self.assertIn("unsigned-build-outputs", rel_build_block)
+        self.assertNotIn("LEDR_UPDATE_SIGNING_PRIVATE_KEY", rel_build_block)
+        self.assertNotIn("LEDR_UPDATE_SIGNING_KEY_ID", rel_build_block)
+        self.assertNotIn("cargo clippy", rel_build_block)
+        self.assertNotIn("cargo test", rel_build_block)
+        self.assertNotIn("--use-enhanced-exit-codes", rel_build_block)
+        self.assertNotIn("components: clippy", rel_build_block)
+
+        rel_package_block = _extract_workflow_job_block(release_yml, "package")
+        self.assertIn("runs-on: ubuntu-latest", rel_package_block)
+        self.assertIn("needs: [preflight, verify, build]", rel_package_block)
+        self.assertIn("ref: ${{ needs.preflight.outputs.source_sha }}", rel_package_block)
+        self.assertIn("unsigned-build-outputs", rel_package_block)
+        self.assertIn("scripts/build_release_artifacts.py", rel_package_block)
+        self.assertIn("--key-id dry-run-test", rel_package_block)
+        self.assertIn("scripts/release_verify.py verify-dist", rel_package_block)
+        self.assertIn("release-dist", rel_package_block)
+
+        rel_publish_block = _extract_workflow_job_block(release_yml, "publish")
+        self.assertIn("runs-on: ubuntu-latest", rel_publish_block)
+        self.assertIn("needs: [preflight, verify, build, package]", rel_publish_block)
+        self.assertIn("if: needs.preflight.outputs.dry_run == 'false'", rel_publish_block)
+        self.assertIn("ref: ${{ needs.preflight.outputs.source_sha }}", rel_publish_block)
+        self.assertIn('refs/tags/${TAG}^{commit}', rel_publish_block)
+        self.assertIn("--verify-tag", rel_publish_block)
+        self.assertIn('gh release create "$TAG" --draft --verify-tag', rel_publish_block)
+        self.assertIn('gh release edit "$TAG" --draft=false', rel_publish_block)
 
         install_ps1 = (REPO_ROOT / "packaging" / "windows" / "install.ps1").read_text(
             encoding="utf-8"
@@ -657,17 +722,11 @@ class TestReleaseScripts(unittest.TestCase):
         self.assertNotIn(".GetAccessControl(", uninstall_ps1)
         self.assertNotIn(".SetAccessControl(", uninstall_ps1)
 
-        # Windows execution of test_release_scripts.py in both ci.yml and release.yml
+        # Windows execution of test_release_scripts.py and cache-aligned rust-windows in ci.yml
         ci_yml = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
-        ci_win_pkg_match = re.search(
-            r"(?ms)^  windows-packaging-tests:\n(.*?)(?=^  \S|\Z)", ci_yml
-        )
-        self.assertIsNotNone(
-            ci_win_pkg_match, "ci.yml must define windows-packaging-tests job"
-        )
-        ci_win_pkg_block = ci_win_pkg_match.group(1)
+        ci_win_pkg_block = _extract_workflow_job_block(ci_yml, "windows-packaging-tests")
         self.assertIn("runs-on: windows-latest", ci_win_pkg_block)
         self.assertIn(
             "if: needs.changes.outputs.windows_packaging == 'true'", ci_win_pkg_block
@@ -677,18 +736,21 @@ class TestReleaseScripts(unittest.TestCase):
         self.assertIn("scripts/test_release_scripts.py", ci_win_pkg_block)
         self.assertIn('"windows-packaging-tests": "windows_packaging"', ci_yml)
 
-        rel_build_match = re.search(
-            r"(?ms)^  build:\n(.*?)(?=^  publish:\n|\Z)", release_yml
+        ci_rust_win_block = _extract_workflow_job_block(ci_yml, "rust-windows")
+        self.assertIn("runs-on: windows-latest", ci_rust_win_block)
+        self.assertIn("CARGO_PROFILE_DEV_DEBUG: line-tables-only", ci_rust_win_block)
+        self.assertIn("components: clippy", ci_rust_win_block)
+        self.assertIn('shared-key: "win-x64-dev"', ci_rust_win_block)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", ci_rust_win_block)
+        self.assertIn(
+            "cargo clippy --workspace --all-targets --locked -- -D warnings",
+            ci_rust_win_block,
         )
-        self.assertIsNotNone(rel_build_match, "release.yml must define build job")
-        rel_build_block = rel_build_match.group(1)
-        self.assertIn("runs-on: windows-latest", rel_build_block)
-        self.assertIn("PYTHONUTF8: '1'", rel_build_block)
-        self.assertIn("PYTHONIOENCODING: utf-8", rel_build_block)
-        self.assertIn("scripts/test_release_scripts.py", rel_build_block)
-        self.assertNotIn("--use-enhanced-exit-codes", rel_build_block)
-        self.assertIn("makensis.exe", rel_build_block)
-        self.assertIn("/VERSION", rel_build_block)
+        self.assertIn("cargo test --workspace --locked", ci_rust_win_block)
+        self.assertIn("cargo doc --workspace --no-deps --locked", ci_rust_win_block)
+        self.assertNotIn("cargo check", ci_rust_win_block)
+        self.assertNotIn("-p ledr-daemon --test burst_budget", ci_rust_win_block)
+        self.assertNotIn("-p ledr-store --test ttl_purge_lineage", ci_rust_win_block)
 
         # Unresolved suspended alert check in uninstall.ps1
         self.assertIn("--check-unresolved-suspended", uninstall_ps1)
@@ -712,6 +774,44 @@ class TestReleaseScripts(unittest.TestCase):
         # Both scripts unwrap InnerException in Invoke-WithFileLockRetry
         self.assertIn(".InnerException", install_ps1)
         self.assertIn(".InnerException", uninstall_ps1)
+
+    def test_rel_08b_extract_workflow_job_block_invariants(self) -> None:
+        sample_lf = (
+            "jobs:\n"
+            "  build:\n"
+            "    runs-on: windows-latest\n"
+            "    steps:\n"
+            "      - name: Build\n"
+            "        with:\n"
+            "          key: val\n"
+            "    nested_key:\n"
+            "      foo: bar\n"
+            "  package:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    env:\n"
+            "      SECRET_MARKER: only-in-package\n"
+            "  publish:\n"
+            "    runs-on: ubuntu-latest\n"
+        )
+        sample_crlf = sample_lf.replace("\n", "\r\n")
+
+        for sample in (sample_lf, sample_crlf):
+            build_block = _extract_workflow_job_block(sample, "build")
+            self.assertIn("runs-on: windows-latest", build_block)
+            self.assertIn("nested_key:", build_block)
+            self.assertNotIn("SECRET_MARKER", build_block)
+            self.assertNotIn("runs-on: ubuntu-latest", build_block)
+
+            publish_block = _extract_workflow_job_block(sample, "publish")
+            self.assertIn("runs-on: ubuntu-latest", publish_block)
+            self.assertNotIn("SECRET_MARKER", publish_block)
+
+            with self.assertRaises(AssertionError):
+                _extract_workflow_job_block(sample, "nonexistent")
+            with self.assertRaises(AssertionError):
+                _extract_workflow_job_block(sample, "steps")
+            with self.assertRaises(AssertionError):
+                _extract_workflow_job_block(sample, "nested_key")
 
     @unittest.skipUnless(
         sys.platform == "win32",

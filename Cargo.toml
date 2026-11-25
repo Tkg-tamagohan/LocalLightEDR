@@ -69,3 +69,9 @@ windows-sys = { version = "0.61", features = [
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

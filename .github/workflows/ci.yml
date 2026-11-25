@@ -408,27 +408,23 @@ jobs:
     timeout-minutes: 25
     needs: changes
     if: needs.changes.outputs.rust == 'true'
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Cargo check
-        shell: pwsh
-        run: cargo check --workspace --all-targets --locked
+        with:
+          shared-key: "win-x64-dev"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Cargo clippy
         shell: pwsh
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Cargo test (workspace)
         shell: pwsh
         run: cargo test --workspace --locked
-      - name: Cargo test (ledr-daemon burst_budget)
-        shell: pwsh
-        run: cargo test -p ledr-daemon --test burst_budget --locked -- --nocapture
-      - name: Cargo test (ledr-store ttl_purge_lineage)
-        shell: pwsh
-        run: cargo test -p ledr-store --test ttl_purge_lineage --locked
       - name: Cargo doc (broken intra-doc links)
         shell: pwsh
         env:

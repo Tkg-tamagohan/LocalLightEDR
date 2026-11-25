@@ -77,9 +77,11 @@ python -m unittest scripts/test_check_invariants.py
 ```
 
 2. **ドライラン実行（`workflow_dispatch`）**：GitHub Actions の `Release` ワークフロー（`.github/workflows/release.yml`）を手動実行し、`dry_run: true` を指定します。
-   ドライランでは `preflight` と `build` が走り、ジョブ内の一時テスト鍵で `LocalEDR-Setup-vX.Y.Z-win-x64.exe`、`LocalEDR-vX.Y.Z-win-x64.zip`、`LocalEDR-chrome-ext-vX.Y.Z.zip`、`SHA256SUMS.txt`、`update-manifest.json`、および `update-manifest.json.sig` の 6 点を作成して `verify-dist` まで検証し、`publish` ジョブはスキップします。
-   なお、ドライラン時にコンパイルされる `ledr-ui.exe` は一時テスト鍵（`dry-run-test`）を生成する前の段階でリポジトリ内の `packaging/update-public-keys.json` を埋め込んでビルドされます。
-   そのため、ドライランで生成された `ledr-ui.exe` 自体は一時テスト鍵を信頼せず、ドライランが検証する範囲はパッケージング、一時鍵による署名、および `verify-dist` による配布物検証までです。
+   ドライランでは `preflight` の後に、`verify`（`windows-latest`、Rust 静的解析、ワークスペース単体テスト、Chrome 拡張と UI の Node テスト、`shared-key: "win-x64-dev"`）と `build`（`windows-latest`、Windows 版リリーススクリプト検査、リリース 4 バイナリビルド、未署名 NSIS インストーラ作成、`shared-key: "win-x64-release"`）が並列で走ります。
+   両ジョブがともに成功した後にのみ、`package`（`ubuntu-latest`）が `unsigned-build-outputs` を取得し、一時テスト鍵（`dry-run-test`）で `LocalEDR-Setup-vX.Y.Z-win-x64.exe`、`LocalEDR-vX.Y.Z-win-x64.zip`、`LocalEDR-chrome-ext-vX.Y.Z.zip`、`SHA256SUMS.txt`、`update-manifest.json`、および `update-manifest.json.sig` の 6 点を作成して `verify-dist` まで検証し、`publish` ジョブはスキップします。
+   また、`main` ブランチ上でドライランを実行すると `win-x64-dev`（通常 CI `rust-windows` と共有）および `win-x64-release` のキャッシュが `main` スコープへ保存され、後続の本番タグリリースがそのキャッシュを引き継ぎます。
+   なお、ドライラン時にコンパイルされる `ledr-ui.exe` は `build` ジョブ内でリポジトリの `packaging/update-public-keys.json` を埋め込んでビルドされるため、`package` ジョブで生成する一時テスト鍵（`dry-run-test`）を信頼しません。
+   そのため、ドライランが検証する範囲はパッケージング、一時鍵による署名、および `verify-dist` による配布物検証までです。
 
 3. **本番タグリリース**：ドライランが成功したら、注釈付きタグを作成して `origin` へ push してください。
 

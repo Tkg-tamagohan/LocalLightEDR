@@ -69,8 +69,8 @@
 ## 標準検証コマンド
 
 - 静的検査：`cargo clippy --workspace --all-targets --locked -- -D warnings`
-- 全体テスト：`cargo test --workspace --locked`
-- 負荷と TTL 回帰：`cargo test -p ledr-daemon --test burst_budget --locked -- --nocapture` と `cargo test -p ledr-store --test ttl_purge_lineage --locked`
+- 全体テスト：`cargo test --workspace --locked`（`#[ignore]` 0 件のため、`burst_budget` および `ttl_purge_lineage` も `.github/workflows/ci.yml` の `rust-windows` と `.github/workflows/release.yml` の `verify` では本コマンド内で実行する）
+- 負荷と TTL 回帰（ローカル個別再実行用）：`cargo test -p ledr-daemon --test burst_budget --locked -- --nocapture` と `cargo test -p ledr-store --test ttl_purge_lineage --locked`（CI では重複実行と `windows` クレート feature 集合変化による再コンパイルを防ぐため個別ステップを置かない）
 - Chrome MV3 拡張テスト（Node 22、PowerShell 5.1 互換）：`$extTests = @(Get-ChildItem extensions\ledr-chrome-mv3\tests\*.test.mjs | Select-Object -ExpandProperty FullName); if ($extTests.Count -eq 0) { throw "No Chrome MV3 extension test files matched." }; node --test $extTests`
 - UI モック DOM テスト（Node 22、PowerShell 5.1 互換）：`$uiTests = @(Get-ChildItem apps\ledr-ui\js-tests\*.test.mjs | Select-Object -ExpandProperty FullName); if ($uiTests.Count -eq 0) { throw "No Tauri UI test files matched." }; node --test $uiTests`（単体実行：`node --test apps/ledr-ui/js-tests/phase4_ui.test.mjs`）
 - 実機 E2E：ターゲット基準は Windows 10 または 11（x86_64）クライアント SKU であり、Server SKU で代替検証した場合は未検証差異として明記する。

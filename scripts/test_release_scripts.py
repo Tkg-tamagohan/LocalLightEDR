@@ -1280,12 +1280,19 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
         system_root = os.environ.get("SystemRoot", r"C:\Windows")
 
         for shell_name, shell_exe in shells:
-            for scenario in ("winget_fallback", "fail_fast", "choco_retry_succeeds"):
+            for scenario in (
+                "winget_fallback",
+                "fail_fast",
+                "choco_retry_succeeds",
+                "candidate_path_not_in_path",
+            ):
                 with self.subTest(shell=shell_name, scenario=scenario):
                     with tempfile.TemporaryDirectory() as tmp:
                         tmp_path = Path(tmp)
                         mock_bin = tmp_path / "mock_bin"
                         mock_bin.mkdir()
+                        candidate_dir = tmp_path / "nsis_off_path"
+                        candidate_exe = candidate_dir / "makensis.cmd"
                         script_path = tmp_path / "ensure_nsis.ps1"
                         script_path.write_text(step_script, encoding="utf-8")
                         github_path = tmp_path / "github_path.txt"
@@ -1295,19 +1302,33 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                         flag_file = tmp_path / "choco_attempt1.flag"
                         makensis_cmd = mock_bin / "makensis.cmd"
 
+                        def cmd_write_makensis(target: Path, ver_label: str) -> str:
+                            return (
+                                f'  (\r\n'
+                                f'    echo @echo off\r\n'
+                                f'    echo echo {ver_label}\r\n'
+                                f'    echo exit /b 0\r\n'
+                                f'  ) > "{target}"\r\n'
+                            )
+
                         if scenario == "choco_retry_succeeds":
                             (mock_bin / "choco.cmd").write_text(
                                 f'@echo off\r\n'
                                 f'echo %*>> "{choco_log}"\r\n'
                                 f'if exist "{flag_file}" (\r\n'
-                                f'  (\r\n'
-                                f'    echo @echo off\r\n'
-                                f'    echo echo v3.13-mock\r\n'
-                                f'    echo exit /b 0\r\n'
-                                f'  ) > "{makensis_cmd}"\r\n'
+                                f'{cmd_write_makensis(makensis_cmd, "v3.13-mock")}'
                                 f') else (\r\n'
                                 f'  echo 1> "{flag_file}"\r\n'
                                 f')\r\n'
+                                f'exit /b 0\r\n',
+                                encoding="utf-8",
+                            )
+                        elif scenario == "candidate_path_not_in_path":
+                            (mock_bin / "choco.cmd").write_text(
+                                f'@echo off\r\n'
+                                f'echo %*>> "{choco_log}"\r\n'
+                                f'if not exist "{candidate_dir}" mkdir "{candidate_dir}"\r\n'
+                                f'{cmd_write_makensis(candidate_exe, "v3.13-offpath")}'
                                 f'exit /b 0\r\n',
                                 encoding="utf-8",
                             )
@@ -1321,11 +1342,7 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                             (mock_bin / "winget.cmd").write_text(
                                 f'@echo off\r\n'
                                 f'echo %*>> "{winget_log}"\r\n'
-                                f'(\r\n'
-                                f'  echo @echo off\r\n'
-                                f'  echo echo v3.13-mock\r\n'
-                                f'  echo exit /b 0\r\n'
-                                f') > "{makensis_cmd}"\r\n'
+                                f'{cmd_write_makensis(makensis_cmd, "v3.13-mock")}'
                                 f'exit /b 0\r\n',
                                 encoding="utf-8",
                             )
@@ -1339,9 +1356,14 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                         env["PATH"] = f"{mock_bin};{system_root}\\System32"
                         env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
                         env["GITHUB_PATH"] = str(github_path)
-                        env["LEDR_NSIS_CANDIDATE_PATHS"] = str(
-                            tmp_path / "absent" / "makensis.exe"
-                        )
+                        if scenario == "candidate_path_not_in_path":
+                            env["LEDR_NSIS_CANDIDATE_PATHS"] = (
+                                f"{tmp_path / 'absent' / 'makensis.exe'};{candidate_exe}"
+                            )
+                        else:
+                            env["LEDR_NSIS_CANDIDATE_PATHS"] = str(
+                                tmp_path / "absent" / "makensis.exe"
+                            )
                         env["LEDR_NSIS_RETRY_DELAY_SECONDS"] = "0"
 
                         res = subprocess.run(
@@ -1371,16 +1393,15 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                             if winget_log.exists()
                             else []
                         )
+                        github_path_lines = github_path.read_text(
+                            encoding="utf-8"
+                        ).splitlines()
 
                         if scenario == "winget_fallback":
                             self.assertEqual(res.returncode, 0, diag)
                             self.assertEqual(len(choco_calls), 3, diag)
                             self.assertEqual(len(winget_calls), 1, diag)
-                            self.assertIn(
-                                str(mock_bin),
-                                github_path.read_text(encoding="utf-8"),
-                                diag,
-                            )
+                            self.assertIn(str(mock_bin), github_path_lines, diag)
                             self.assertIn("Verified makensis at", res.stdout, diag)
                             self.assertIn("v3.13-mock", res.stdout, diag)
                         elif scenario == "fail_fast":
@@ -1390,6 +1411,17 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                             self.assertIn(
                                 "makensis.exe was not found",
                                 res.stdout + res.stderr,
+                                diag,
+                            )
+                        elif scenario == "candidate_path_not_in_path":
+                            self.assertEqual(res.returncode, 0, diag)
+                            self.assertEqual(len(choco_calls), 1, diag)
+                            self.assertEqual(len(winget_calls), 0, diag)
+                            self.assertIn(str(candidate_dir), github_path_lines, diag)
+                            self.assertNotIn(str(mock_bin), github_path_lines, diag)
+                            self.assertIn(
+                                f"Verified makensis at {candidate_exe} (version v3.13-offpath)",
+                                res.stdout,
                                 diag,
                             )
                         else:

@@ -685,6 +685,9 @@ class TestReleaseScripts(unittest.TestCase):
         self.assertIn("PYTHONUTF8: '1'", rel_build_block)
         self.assertIn("PYTHONIOENCODING: utf-8", rel_build_block)
         self.assertIn("scripts/test_release_scripts.py", rel_build_block)
+        self.assertIn("--use-enhanced-exit-codes", rel_build_block)
+        self.assertIn("makensis.exe", rel_build_block)
+        self.assertIn("/VERSION", rel_build_block)
 
         # Unresolved suspended alert check in uninstall.ps1
         self.assertIn("--check-unresolved-suspended", uninstall_ps1)

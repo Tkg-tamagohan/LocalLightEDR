@@ -163,15 +163,28 @@ jobs:
       - name: Ensure NSIS (makensis) is installed
         shell: pwsh
         run: |
+          $candidatePaths = if (-not [string]::IsNullOrWhiteSpace($env:LEDR_NSIS_CANDIDATE_PATHS)) {
+            @($env:LEDR_NSIS_CANDIDATE_PATHS -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          }
+          else {
+            @(
+              'C:\Program Files (x86)\NSIS\makensis.exe',
+              'C:\Program Files\NSIS\makensis.exe'
+            )
+          }
+          $retryDelaySeconds = if (-not [string]::IsNullOrWhiteSpace($env:LEDR_NSIS_RETRY_DELAY_SECONDS)) {
+            [int]$env:LEDR_NSIS_RETRY_DELAY_SECONDS
+          }
+          else {
+            10
+          }
+
           function Resolve-MakeNsis {
             $cmd = Get-Command makensis -ErrorAction SilentlyContinue
             if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) {
               return $cmd.Source
             }
-            foreach ($candidate in @(
-              'C:\Program Files (x86)\NSIS\makensis.exe',
-              'C:\Program Files\NSIS\makensis.exe'
-            )) {
+            foreach ($candidate in $candidatePaths) {
               if (Test-Path -LiteralPath $candidate) {
                 return $candidate
               }
@@ -183,15 +196,15 @@ jobs:
           if (-not $makensisPath) {
             for ($attempt = 1; $attempt -le 3; $attempt++) {
               Write-Host "Installing NSIS via Chocolatey (attempt $attempt/3)..."
-              choco install nsis -y --no-progress --use-enhanced-exit-codes
+              choco install nsis -y --no-progress
               $chocoExit = $LASTEXITCODE
               $makensisPath = Resolve-MakeNsis
               if ($makensisPath) {
                 break
               }
               Write-Warning "NSIS was not found after Chocolatey attempt $attempt (exit=$chocoExit)."
-              if ($attempt -lt 3) {
-                Start-Sleep -Seconds (10 * $attempt)
+              if ($attempt -lt 3 -and $retryDelaySeconds -gt 0) {
+                Start-Sleep -Seconds ($retryDelaySeconds * $attempt)
               }
             }
           }

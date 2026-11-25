@@ -70,6 +70,12 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+[profile.release.package."*"]
+codegen-units = 16
+
+[profile.release.package.ledr-ui]
+codegen-units = 16
+
 [profile.dev]
 debug = "line-tables-only"
 

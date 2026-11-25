@@ -128,10 +128,14 @@ jobs:
             python3 scripts/release_verify.py preflight --expect-tag "$RELEASE_TAG"
           fi
 
-  build:
+  verify:
     needs: preflight
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
         with:
@@ -140,9 +144,56 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "win-x64-dev"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Run Rust workspace clippy and tests
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run Chrome MV3 and Tauri UI Node unit tests
+        shell: bash
+        run: |
+          shopt -s nullglob
+          ext_tests=(extensions/ledr-chrome-mv3/tests/*.test.mjs)
+          if [ "${#ext_tests[@]}" -eq 0 ]; then
+            echo "No Chrome MV3 extension test files matched extensions/ledr-chrome-mv3/tests/*.test.mjs" >&2
+            exit 1
+          fi
+          node --test "${ext_tests[@]}"
+          required_ui_test="apps/ledr-ui/js-tests/phase4_ui.test.mjs"
+          if [ ! -f "$required_ui_test" ]; then
+            echo "Missing required UI test file: $required_ui_test" >&2
+            exit 1
+          fi
+          ui_tests=(apps/ledr-ui/js-tests/*.test.mjs)
+          if [ "${#ui_tests[@]}" -eq 0 ]; then
+            echo "No UI test files matched apps/ledr-ui/js-tests/*.test.mjs" >&2
+            exit 1
+          fi
+          node --test "${ui_tests[@]}"
+
+  build:
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "win-x64-release"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -235,34 +286,6 @@ jobs:
             exit $LASTEXITCODE
           }
           Write-Host "Verified makensis at $makensisPath (version $nsisVersion)"
-      - name: Run Rust workspace clippy and tests
-        shell: pwsh
-        run: |
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --workspace --locked
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Run Chrome MV3 and Tauri UI Node unit tests
-        shell: bash
-        run: |
-          shopt -s nullglob
-          ext_tests=(extensions/ledr-chrome-mv3/tests/*.test.mjs)
-          if [ "${#ext_tests[@]}" -eq 0 ]; then
-            echo "No Chrome MV3 extension test files matched extensions/ledr-chrome-mv3/tests/*.test.mjs" >&2
-            exit 1
-          fi
-          node --test "${ext_tests[@]}"
-          required_ui_test="apps/ledr-ui/js-tests/phase4_ui.test.mjs"
-          if [ ! -f "$required_ui_test" ]; then
-            echo "Missing required UI test file: $required_ui_test" >&2
-            exit 1
-          fi
-          ui_tests=(apps/ledr-ui/js-tests/*.test.mjs)
-          if [ "${#ui_tests[@]}" -eq 0 ]; then
-            echo "No UI test files matched apps/ledr-ui/js-tests/*.test.mjs" >&2
-            exit 1
-          fi
-          node --test "${ui_tests[@]}"
       - name: Build release binaries
         shell: pwsh
         run: |
@@ -283,8 +306,56 @@ jobs:
           $outFile = Join-Path $stageDir "LocalEDR-Setup-$($env:RELEASE_TAG)-win-x64.exe"
           & makensis "/DVERSION=$($env:RELEASE_VERSION)" '/DBIN_DIR=..\..\target\release' '/DRULES_DIR=..\..\rules' "/DOUT_FILE=$outFile" packaging\windows\localedr.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Package and sign release artifacts
+      - name: Stage unsigned release build outputs
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          $stageDir = Join-Path $env:RUNNER_TEMP 'unsigned-build-outputs'
+          if (Test-Path -LiteralPath $stageDir) {
+            Remove-Item -LiteralPath $stageDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          $filesToStage = @(
+            'target\release\ledr-daemon.exe',
+            'target\release\ledr-ui.exe',
+            'target\release\ledr-bridge-nm.exe',
+            'target\release\ledr-auth-helper.exe',
+            (Join-Path (Join-Path $env:RUNNER_TEMP 'nsis-out') "LocalEDR-Setup-$($env:RELEASE_TAG)-win-x64.exe")
+          )
+          foreach ($srcPath in $filesToStage) {
+            if (-not (Test-Path -LiteralPath $srcPath -PathType Leaf)) {
+              throw "Missing expected unsigned build output: $srcPath"
+            }
+            Copy-Item -LiteralPath $srcPath -Destination $stageDir -Force
+          }
+      - name: Upload unsigned build outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-build-outputs
+          path: ${{ runner.temp }}/unsigned-build-outputs/*
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    needs: [preflight, verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-build-outputs
+          path: ${{ runner.temp }}/unsigned-build-outputs
+      - name: Package and sign release artifacts
+        shell: bash
         env:
           PYTHONUTF8: '1'
           PYTHONIOENCODING: utf-8
@@ -293,26 +364,23 @@ jobs:
           LEDR_UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.LEDR_UPDATE_SIGNING_PRIVATE_KEY }}
           LEDR_UPDATE_SIGNING_KEY_ID: ${{ secrets.LEDR_UPDATE_SIGNING_KEY_ID }}
         run: |
-          $tag = $env:RELEASE_TAG
-          if (Test-Path -LiteralPath 'dist') {
-            Remove-Item -LiteralPath 'dist' -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
-          $installerExe = Join-Path (Join-Path $env:RUNNER_TEMP 'nsis-out') "LocalEDR-Setup-$tag-win-x64.exe"
-          if ($env:DRY_RUN -eq 'true') {
+          set -euo pipefail
+          BIN_STAGE="${RUNNER_TEMP}/unsigned-build-outputs"
+          INSTALLER_EXE="${BIN_STAGE}/LocalEDR-Setup-${RELEASE_TAG}-win-x64.exe"
+          rm -rf dist
+          mkdir -p dist
+          if [ "$DRY_RUN" = "true" ]; then
             # Ephemeral test keys do not match the public key ring compiled into ledr-ui above;
             # pass --key-id dry-run-test explicitly so LEDR_UPDATE_SIGNING_KEY_ID secret does not break dry-run.
-            $tmpPub = Join-Path $env:RUNNER_TEMP 'dry-run-public-keys.json'
-            $tmpPriv = Join-Path $env:RUNNER_TEMP 'dry-run-signing.key'
-            python scripts\release_verify.py keygen --key-id dry-run-test --write-public-keys $tmpPub --write-private-key-file $tmpPriv | Out-Null
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            python scripts\build_release_artifacts.py --bin-dir target\release --installer-exe $installerExe --out-dir dist --public-keys $tmpPub --key-id dry-run-test --private-key-file $tmpPriv --expect-tag $tag
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          else {
-            python scripts\build_release_artifacts.py --bin-dir target\release --installer-exe $installerExe --out-dir dist --private-key-env LEDR_UPDATE_SIGNING_PRIVATE_KEY --expect-tag $tag
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+            TMP_PUB="${RUNNER_TEMP}/dry-run-public-keys.json"
+            TMP_PRIV="${RUNNER_TEMP}/dry-run-signing.key"
+            python3 scripts/release_verify.py keygen --key-id dry-run-test --write-public-keys "$TMP_PUB" --write-private-key-file "$TMP_PRIV" >/dev/null
+            python3 scripts/build_release_artifacts.py --bin-dir "$BIN_STAGE" --installer-exe "$INSTALLER_EXE" --out-dir dist --public-keys "$TMP_PUB" --key-id dry-run-test --private-key-file "$TMP_PRIV" --expect-tag "$RELEASE_TAG"
+            python3 scripts/release_verify.py verify-dist --dist-dir dist --public-keys "$TMP_PUB" --expect-tag "$RELEASE_TAG"
+          else
+            python3 scripts/build_release_artifacts.py --bin-dir "$BIN_STAGE" --installer-exe "$INSTALLER_EXE" --out-dir dist --private-key-env LEDR_UPDATE_SIGNING_PRIVATE_KEY --expect-tag "$RELEASE_TAG"
+            python3 scripts/release_verify.py verify-dist --dist-dir dist --expect-tag "$RELEASE_TAG"
+          fi
       - name: Upload release distribution artifact
         uses: actions/upload-artifact@v4
         with:
@@ -322,7 +390,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [preflight, build]
+    needs: [preflight, verify, build, package]
     if: needs.preflight.outputs.dry_run == 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 15

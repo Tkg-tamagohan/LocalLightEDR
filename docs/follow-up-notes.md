@@ -15,6 +15,7 @@
 | `FU-E2E-04` | 検知改善 | Phase 1、Phase 3 | 短命プロセス（約 40 ms）での PEB 補完欠落による `command_line` 欠落と `LEDR-LOTL-001`（正規管理ツール悪用検知ルール）未発火の解消 | PR #35（`ed9ae3f`）および PR #36（`1540a1f`）で `main` マージ済み、PR #37（`fac1022`）でルール昇格済み（最終実機 E2E で再確認） |
 | `FU-E2E-05` | 境界改善 | Phase 3 | WFP ドロップの終了済み兄弟プロセス由来の誤帰属抑止および `E2E-P3-06` 停止予算超過時の残余書き込みによる `-wal` 再生成の整理 | PR #38（`b8d9c66`）で `main` マージ済み（最終実機 E2E で再確認） |
 | `FU-P5-01` | ワークフロー検証と残余実機対象 | Phase 5 | `Release`（`dry_run: true`）および `Security Audit` の手動検証、PR #51 修正後の `main` 最終合格、ならびに本番公開と実機インストーラ E2E の残余管理 | PR #51（`10e357f`）で修正を `main` マージ済み、マージ後 `main` 手動検証合格済み（実機 NSIS E2E はリリース前実機検証、本番 `publish` は初回本番リリース時、本番鍵実更新は本番リリース前後の実機確認対象） |
+| `FU-R0-01` | ビルド最適化基準計測 | Phase R0 | リリースビルドおよび CI 高速化改修前のベースライン計測値（`main` `b9bb76a` / CI `10e357f`）の固定と実機未検証境界の分離記録 | Phase R0 計測完了済み（Phase R1 から Phase R3 までの比較基準として固定、`b9bb76a` 上の `L-24` と `L-08` は管理者および対話デスクトップ検証待ち） |
 
 ### 現在地、推奨着手順、および用語の補足
 
@@ -419,3 +420,37 @@ CI 自動実行とローカル別途実行および手動 `workflow_dispatch` �
 - ドライラン時の `ledr-ui.exe` はコンパイル時にリポジトリの `packaging/update-public-keys.json` を埋め込むため一時鍵 `dry-run-test` を信頼せず、本番署名鍵を用いた実更新の検証と適用は本番リリース前後に実機で確認する。
 - Windows 10 または Windows 11 クライアント SKU 実機での NSIS インストーラ導入、アップグレード、およびアンインストール（`uninstall.ps1` のおとり掃除とサービス停止を含む）は、`FU-E2E-01` および `FU-E2E-02` とあわせて実機検証する。
 - Tauri 上流依存に由来する残余許可警告 3 件（`chrono`、`proc-macro-error`、`glib`）は、週次 `Security Audit` スケジュール（`security.yml`）と今後の Tauri マイナーおよびメジャー更新追従で監視を継続する。
+
+## FU-R0-01 Phase R0 ビルドおよび CI 最適化ベースライン計測記録
+
+### 目的と検証範囲の区分
+
+本節は、LocalLightEDR の自動リリースビルドおよび CI 所要時間短縮（Phase R1 から Phase R3）における比較基準（Phase R0）をコード変更なしの `main`（`b9bb76a`）上で固定した記録である。
+GitHub Actions 上の CI 実測値（対象コミット `10e357f`）、ローカル実機上の別途実行値（対象コミット `b9bb76a`）、および管理者権限または対話デスクトップ環境を要するため未実施とした項目を区別して記録する。
+なお、`10e357f..b9bb76a` の差分は本書の `FU-P5-01` 追記（47 行）のみであり、Rust ソース、`Cargo.toml`、`Cargo.lock`、NSIS スクリプト、およびワークフロー定義は同一である。
+
+### CI 自動実行範囲の実測値（`10e357f`）
+
+- **`Release` ドライラン（Run `#45557332849`、`workflow_dispatch`、`dry_run: true`）**：総経過 `1,225 s`（`20m 25s`）、`preflight` `5 s`、`build` `1,213 s`（`20m 13s`）、`publish` スキップとなった。
+  `build` の内訳は、`rust-cache` 復元 `3 s`、Windows Python 検査 `22 s`、NSIS 導入 `27 s`、`clippy` と `cargo test` `542 s`（`9m 02s`）、Node テスト `2 s`、リリース 4 バイナリビルド `490 s`（`8m 10s`）、NSIS コンパイル `8 s`、署名とパッケージング `2 s`、成果物アップロード `2 s`、`rust-cache` 保存 `85 s`（`1m 25s`）である。
+- **配布成果物 6 点の実バイト数（Artifact ID `14996444138`）**：`LocalEDR-Setup-v0.1.0-win-x64.exe` `4,941,467 B`（`4.7126 MiB`）、`LocalEDR-v0.1.0-win-x64.zip` `7,029,060 B`（`6.7034 MiB`）、`LocalEDR-chrome-ext-v0.1.0.zip` `25,248 B`（`24.656 KiB`）、`SHA256SUMS.txt` `291 B`、`update-manifest.json` `859 B`、および `update-manifest.json.sig` `191 B` である。
+- **通常 CI（Run `#45554453166`、`push`）**：総経過 `738 s`（`12m 18s`）、`rust-windows` `722 s`（`12m 02s`：復元 `46 s`、`Cargo check` `114 s`、`Cargo clippy` `29 s`、`Cargo test` `259 s`、`burst_budget` `37 s`、`ttl_purge_lineage` `7 s`、`Cargo doc` `10 s`、保存 `192 s`）であり、30% 以上短縮の目安は `<= 505.4 s` である。
+- **GitHub Actions キャッシュ棚卸し**：全 11 件の合計は `11,490,607,120 B`（`10.7015 GiB`）で既定の `10 GiB` 上限を超過しており、`main` 最新キャッシュは `rust-windows`（ID `11079175832`）が `1,209,659,349 B`（`1.1266 GiB`）、`build`（ID `11080219748`）が `948,156,404 B`（`904.23 MiB`）である。
+
+### ローカル別途実行範囲の実測値（`b9bb76a`）
+
+ローカル計測の実行環境は `Windows 11 Home`（Version `10.0.26300`、64-bit）、`AMD Ryzen 7 7800X3D`（8 物理コア / 16 論理スレッド）、非管理者 PowerShell 5.1（`IsAdmin = False`）、`rustc 1.100.0`、`cargo 1.100.0`、`Python 3.11.9`、`Node v22.18.0` であり、`makensis.exe` は未導入である。
+
+- **リリースビルド時間（`cargo fetch --locked` 後に `cargo build --release --locked -p ledr-daemon -p ledr-ui -p ledr-bridge-nm -p ledr-auth-helper --timings`）**：コールド 1 回目が `178.41 s`（453 コンパイル単位）、ウォーム 3 回が `110.189 s` / `110.413 s` / `110.706 s`、ウォーム中央値が `110.413 s`（40% 以上短縮の目標は `<= 66.248 s`）である。
+  ウォーム中央値の最大ボトルネックは `ledr-ui` バイナリ単体（`107.14 s`、全体の `97.0%`）である。
+- **配布 4 バイナリのバイト数**：`ledr-daemon.exe` `7,740,928 B`（`7.3823 MiB`）、`ledr-ui.exe` `10,402,816 B`（`9.9209 MiB`）、`ledr-bridge-nm.exe` `1,044,992 B`（`0.9966 MiB`）、`ledr-auth-helper.exe` `312,832 B`（`305.50 KiB`）であり、4 バイナリ合計は `19,501,568 B`（`18.5981 MiB`、協議ライン `+2.0 MiB` 加算上限 `<= 21,598,720 B`）である。
+  ローカル `makensis.exe` 未導入のため、NSIS インストーラの比較基準は Run `#45557332849` の `4,941,467 B`（`4.7126 MiB`、ハード上限 `<= 128 MiB` および `+10%` 基準 `<= 5,435,613 B`）を固定する。
+- **`L-23` PE 解析（`scripts/profile_daemon_memory.ps1 -AnalyzePeOnly`）**：`DirectImports` 20 件中の `wintrust.dll` および `crypt32.dll` はいずれも `0` 件であり、推移的到達は Windows システム DLL（`wtsapi32.dll`、`advapi32.dll`、`kernelbase.dll` 等）由来のみであった。
+- **自動検査とテスト実行**：`py_compile`（6 ファイル）、`test_check_invariants.py`（8/8）、`release_verify.py preflight`、Chrome MV3 拡張テスト（19/19）、UI モック DOM テスト（18/18）、`cargo clippy --workspace --all-targets --locked -- -D warnings`、および `burst_budget` 3 回連続（3/3 回とも 12/12）はすべて合格した。
+  `test_release_scripts.py` は `10 PASS / 1 ERROR` となり、`test_rel_09` の `Set-Acl` のみが `IsAdmin = False` の `SeSecurityPrivilege` 不足で失敗した（管理者権限のある CI では 11/11 合格）。
+  `cargo test --workspace --no-fail-fast --locked` は `517 PASS / 3 FAIL` となり、非管理者権限の DACL 制約による `ui_upd_07` および `ui_upd_09` の 2 件と、スイート連続実行時の `ledr-sensor-win` の `sens_p2_13`（`cargo test -p ledr-sensor-win --lib sens_p2_13 --locked` の単独実行では `1/1` 合格）の 1 件がローカル環境制約で失敗した（CI では全 520 件合格）。
+
+### 管理者および対話デスクトップ検証待ちの項目
+
+- **`b9bb76a` 上の `L-24` および `L-08`**：非管理者（`IsAdmin = False`）かつ非対話デスクトップ環境のため、`b9bb76a` 上での実機計測（600 秒アイドルおよび 60 秒高負荷の `L-24` 計測、ならびに `ledr-ui.exe` と WebView2 の閉鎖後 0 プロセス終了 `L-08`）は未実施である。
+  Stage 3（`87be6d5`）の記録値（アイドル `PrivateWorkingSetSize` 中央値 `13.0234 MB`、CPU `0.2054%` 等）は `87be6d5..b9bb76a` 間の 48 ファイル変更を経ているため履歴参照値として区別し、`b9bb76a` の合格実績としては扱わない。

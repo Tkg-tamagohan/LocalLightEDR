@@ -1,7 +1,7 @@
 //! PRAGMA verification and `EXPLAIN QUERY PLAN` diagnostics for [`LedrStore`].
 
 use ledr_proto::RuleScope;
-use rusqlite::{params, DatabaseName};
+use rusqlite::{params, MAIN_DB};
 
 use crate::batch::PID_TIME_WINDOW_LOOKUP_SQL;
 use crate::queries::{find_download_by_path_sql, find_download_by_sha256_sql};
@@ -24,7 +24,7 @@ impl LedrStore {
     /// Verifies that the dedicated reader handle is opened read-only and rejects SQL writes.
     pub fn verify_reader_rejects_writes(&self) -> Result<bool, StoreError> {
         let reader = self.lock_reader()?;
-        if !reader.is_readonly(DatabaseName::Main)? {
+        if !reader.is_readonly(MAIN_DB)? {
             return Ok(false);
         }
         match reader.execute("CREATE TABLE __ledr_ro_probe (id INTEGER)", []) {

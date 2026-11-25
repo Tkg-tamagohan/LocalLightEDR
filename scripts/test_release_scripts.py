@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 import zipfile
 
@@ -685,6 +686,9 @@ class TestReleaseScripts(unittest.TestCase):
         self.assertIn("PYTHONUTF8: '1'", rel_build_block)
         self.assertIn("PYTHONIOENCODING: utf-8", rel_build_block)
         self.assertIn("scripts/test_release_scripts.py", rel_build_block)
+        self.assertNotIn("--use-enhanced-exit-codes", rel_build_block)
+        self.assertIn("makensis.exe", rel_build_block)
+        self.assertIn("/VERSION", rel_build_block)
 
         # Unresolved suspended alert check in uninstall.ps1
         self.assertIn("--check-unresolved-suspended", uninstall_ps1)
@@ -1238,6 +1242,194 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
             else:
                 self.assertIn(f"Unsafe owner SID '{owner_sid}'", ep_res.stderr, diag)
                 self.assertNotIn("Missing required source binary", ep_res.stderr, diag)
+
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "requires Windows PowerShell",
+    )
+    def test_rel_11_ensure_nsis_retry_fallback_and_fail_fast(self) -> None:
+        release_yml = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        step_match = re.search(
+            r"(?m)^      - name: Ensure NSIS \(makensis\) is installed\r?\n"
+            r"        shell: pwsh\r?\n"
+            r"        run: \|\r?\n"
+            r"(?P<body>(?:          [^\n]*\r?\n|\r?\n)+?)"
+            r"(?=^      - name: |\Z)",
+            release_yml,
+        )
+        self.assertIsNotNone(
+            step_match, "Could not extract Ensure NSIS step from release.yml"
+        )
+        step_script = textwrap.dedent(step_match.group("body")).strip() + "\n"
+        self.assertIn("Resolve-MakeNsis", step_script)
+
+        shells: list[tuple[str, str]] = []
+        ps51 = shutil.which("powershell.exe")
+        if ps51:
+            shells.append(("powershell.exe", ps51))
+        pwsh = shutil.which("pwsh") or shutil.which("pwsh.exe")
+        if pwsh:
+            shells.append(("pwsh", pwsh))
+        self.assertTrue(
+            shells,
+            "Neither powershell.exe nor pwsh was found on Windows",
+        )
+
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+
+        for shell_name, shell_exe in shells:
+            for scenario in (
+                "winget_fallback",
+                "fail_fast",
+                "choco_retry_succeeds",
+                "candidate_path_not_in_path",
+            ):
+                with self.subTest(shell=shell_name, scenario=scenario):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        tmp_path = Path(tmp)
+                        mock_bin = tmp_path / "mock_bin"
+                        mock_bin.mkdir()
+                        candidate_dir = tmp_path / "nsis_off_path"
+                        candidate_exe = candidate_dir / "makensis.cmd"
+                        script_path = tmp_path / "ensure_nsis.ps1"
+                        script_path.write_text(step_script, encoding="utf-8")
+                        github_path = tmp_path / "github_path.txt"
+                        github_path.write_text("", encoding="utf-8")
+                        choco_log = tmp_path / "choco.log"
+                        winget_log = tmp_path / "winget.log"
+                        flag_file = tmp_path / "choco_attempt1.flag"
+                        makensis_cmd = mock_bin / "makensis.cmd"
+
+                        def cmd_write_makensis(target: Path, ver_label: str) -> str:
+                            return (
+                                f'  (\r\n'
+                                f'    echo @echo off\r\n'
+                                f'    echo echo {ver_label}\r\n'
+                                f'    echo exit /b 0\r\n'
+                                f'  ) > "{target}"\r\n'
+                            )
+
+                        if scenario == "choco_retry_succeeds":
+                            (mock_bin / "choco.cmd").write_text(
+                                f'@echo off\r\n'
+                                f'echo %*>> "{choco_log}"\r\n'
+                                f'if exist "{flag_file}" (\r\n'
+                                f'{cmd_write_makensis(makensis_cmd, "v3.13-mock")}'
+                                f') else (\r\n'
+                                f'  echo 1> "{flag_file}"\r\n'
+                                f')\r\n'
+                                f'exit /b 0\r\n',
+                                encoding="utf-8",
+                            )
+                        elif scenario == "candidate_path_not_in_path":
+                            (mock_bin / "choco.cmd").write_text(
+                                f'@echo off\r\n'
+                                f'echo %*>> "{choco_log}"\r\n'
+                                f'if not exist "{candidate_dir}" mkdir "{candidate_dir}"\r\n'
+                                f'{cmd_write_makensis(candidate_exe, "v3.13-offpath")}'
+                                f'exit /b 0\r\n',
+                                encoding="utf-8",
+                            )
+                        else:
+                            (mock_bin / "choco.cmd").write_text(
+                                f'@echo off\r\necho %*>> "{choco_log}"\r\nexit /b 0\r\n',
+                                encoding="utf-8",
+                            )
+
+                        if scenario == "winget_fallback":
+                            (mock_bin / "winget.cmd").write_text(
+                                f'@echo off\r\n'
+                                f'echo %*>> "{winget_log}"\r\n'
+                                f'{cmd_write_makensis(makensis_cmd, "v3.13-mock")}'
+                                f'exit /b 0\r\n',
+                                encoding="utf-8",
+                            )
+                        else:
+                            (mock_bin / "winget.cmd").write_text(
+                                f'@echo off\r\necho %*>> "{winget_log}"\r\nexit /b 0\r\n',
+                                encoding="utf-8",
+                            )
+
+                        env = os.environ.copy()
+                        env["PATH"] = f"{mock_bin};{system_root}\\System32"
+                        env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
+                        env["GITHUB_PATH"] = str(github_path)
+                        if scenario == "candidate_path_not_in_path":
+                            env["LEDR_NSIS_CANDIDATE_PATHS"] = (
+                                f"{tmp_path / 'absent' / 'makensis.exe'};{candidate_exe}"
+                            )
+                        else:
+                            env["LEDR_NSIS_CANDIDATE_PATHS"] = str(
+                                tmp_path / "absent" / "makensis.exe"
+                            )
+                        env["LEDR_NSIS_RETRY_DELAY_SECONDS"] = "0"
+
+                        res = subprocess.run(
+                            [
+                                shell_exe,
+                                "-NoProfile",
+                                "-ExecutionPolicy",
+                                "Bypass",
+                                "-File",
+                                str(script_path),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            env=env,
+                            check=False,
+                        )
+                        diag = f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+                        choco_calls = (
+                            choco_log.read_text(encoding="utf-8").splitlines()
+                            if choco_log.exists()
+                            else []
+                        )
+                        winget_calls = (
+                            winget_log.read_text(encoding="utf-8").splitlines()
+                            if winget_log.exists()
+                            else []
+                        )
+                        github_path_lines = github_path.read_text(
+                            encoding="utf-8"
+                        ).splitlines()
+
+                        if scenario == "winget_fallback":
+                            self.assertEqual(res.returncode, 0, diag)
+                            self.assertEqual(len(choco_calls), 3, diag)
+                            self.assertEqual(len(winget_calls), 1, diag)
+                            self.assertIn(str(mock_bin), github_path_lines, diag)
+                            self.assertIn("Verified makensis at", res.stdout, diag)
+                            self.assertIn("v3.13-mock", res.stdout, diag)
+                        elif scenario == "fail_fast":
+                            self.assertEqual(res.returncode, 1, diag)
+                            self.assertEqual(len(choco_calls), 3, diag)
+                            self.assertEqual(len(winget_calls), 1, diag)
+                            self.assertIn(
+                                "makensis.exe was not found",
+                                res.stdout + res.stderr,
+                                diag,
+                            )
+                        elif scenario == "candidate_path_not_in_path":
+                            self.assertEqual(res.returncode, 0, diag)
+                            self.assertEqual(len(choco_calls), 1, diag)
+                            self.assertEqual(len(winget_calls), 0, diag)
+                            self.assertIn(str(candidate_dir), github_path_lines, diag)
+                            self.assertNotIn(str(mock_bin), github_path_lines, diag)
+                            self.assertIn(
+                                f"Verified makensis at {candidate_exe} (version v3.13-offpath)",
+                                res.stdout,
+                                diag,
+                            )
+                        else:
+                            self.assertEqual(res.returncode, 0, diag)
+                            self.assertEqual(len(choco_calls), 2, diag)
+                            self.assertEqual(len(winget_calls), 0, diag)
+                            self.assertIn("Verified makensis at", res.stdout, diag)
+                            self.assertIn("v3.13-mock", res.stdout, diag)
 
 
 if __name__ == "__main__":

@@ -163,17 +163,78 @@ jobs:
       - name: Ensure NSIS (makensis) is installed
         shell: pwsh
         run: |
-          $cmd = Get-Command makensis -ErrorAction SilentlyContinue
-          if (-not $cmd) {
-            $defaultPath = 'C:\Program Files (x86)\NSIS\makensis.exe'
-            if (-not (Test-Path -LiteralPath $defaultPath)) {
-              choco install nsis -y --no-progress
-              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $candidatePaths = if (-not [string]::IsNullOrWhiteSpace($env:LEDR_NSIS_CANDIDATE_PATHS)) {
+            @($env:LEDR_NSIS_CANDIDATE_PATHS -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          }
+          else {
+            @(
+              'C:\Program Files (x86)\NSIS\makensis.exe',
+              'C:\Program Files\NSIS\makensis.exe'
+            )
+          }
+          $retryDelaySeconds = if (-not [string]::IsNullOrWhiteSpace($env:LEDR_NSIS_RETRY_DELAY_SECONDS)) {
+            [int]$env:LEDR_NSIS_RETRY_DELAY_SECONDS
+          }
+          else {
+            10
+          }
+
+          function Resolve-MakeNsis {
+            $cmd = Get-Command makensis -ErrorAction SilentlyContinue
+            if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) {
+              return $cmd.Source
             }
-            if (Test-Path -LiteralPath 'C:\Program Files (x86)\NSIS') {
-              Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files (x86)\NSIS'
+            foreach ($candidate in $candidatePaths) {
+              if (Test-Path -LiteralPath $candidate) {
+                return $candidate
+              }
+            }
+            return $null
+          }
+
+          $makensisPath = Resolve-MakeNsis
+          if (-not $makensisPath) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              Write-Host "Installing NSIS via Chocolatey (attempt $attempt/3)..."
+              choco install nsis -y --no-progress
+              $chocoExit = $LASTEXITCODE
+              $makensisPath = Resolve-MakeNsis
+              if ($makensisPath) {
+                break
+              }
+              Write-Warning "NSIS was not found after Chocolatey attempt $attempt (exit=$chocoExit)."
+              if ($attempt -lt 3 -and $retryDelaySeconds -gt 0) {
+                Start-Sleep -Seconds ($retryDelaySeconds * $attempt)
+              }
             }
           }
+
+          if (-not $makensisPath) {
+            $wingetCmd = Get-Command winget -ErrorAction SilentlyContinue
+            if ($wingetCmd) {
+              Write-Host "Chocolatey NSIS install did not produce makensis.exe; trying winget fallback..."
+              winget install --id NSIS.NSIS -e --silent --accept-package-agreements --accept-source-agreements
+              $makensisPath = Resolve-MakeNsis
+            }
+          }
+
+          if (-not $makensisPath) {
+            Write-Error "makensis.exe was not found after NSIS installation attempts."
+            exit 1
+          }
+
+          $makensisDir = Split-Path -Parent $makensisPath
+          Add-Content -Path $env:GITHUB_PATH -Value $makensisDir
+          if (-not (($env:PATH -split ';') -contains $makensisDir)) {
+            $env:PATH = "$makensisDir;$env:PATH"
+          }
+
+          $nsisVersion = & $makensisPath /VERSION
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "makensis /VERSION failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          Write-Host "Verified makensis at $makensisPath (version $nsisVersion)"
       - name: Run Rust workspace clippy and tests
         shell: pwsh
         run: |

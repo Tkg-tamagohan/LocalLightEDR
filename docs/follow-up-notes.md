@@ -14,6 +14,7 @@
 | `FU-E2E-03` | 性能最適化 | Phase 3、Phase 4 | `E2E-PERF-01` 超過に対する Stage 1〜3 最適化（`ledr-auth-helper` 分離、LRU 上限、非系譜解放、SQLite reader 縮小、`PrivateWorkingSetSize <= 20.0 MB` 基準併記） | PR #39（`7cdb445`）で `main` マージ済み、PR #40（`9e4a3a8`）でルール昇格済み（最終実機 E2E で再確認） |
 | `FU-E2E-04` | 検知改善 | Phase 1、Phase 3 | 短命プロセス（約 40 ms）での PEB 補完欠落による `command_line` 欠落と `LEDR-LOTL-001`（正規管理ツール悪用検知ルール）未発火の解消 | PR #35（`ed9ae3f`）および PR #36（`1540a1f`）で `main` マージ済み、PR #37（`fac1022`）でルール昇格済み（最終実機 E2E で再確認） |
 | `FU-E2E-05` | 境界改善 | Phase 3 | WFP ドロップの終了済み兄弟プロセス由来の誤帰属抑止および `E2E-P3-06` 停止予算超過時の残余書き込みによる `-wal` 再生成の整理 | PR #38（`b8d9c66`）で `main` マージ済み（最終実機 E2E で再確認） |
+| `FU-P5-01` | ワークフロー検証と残余実機対象 | Phase 5 | `Release`（`dry_run: true`）および `Security Audit` の手動検証、PR #51 修正後の `main` 最終合格、ならびに本番公開と実機インストーラ E2E の残余管理 | PR #51（`10e357f`）で修正を `main` マージ済み、マージ後 `main` 手動検証合格済み（実機 NSIS E2E はリリース前実機検証、本番 `publish` は初回本番リリース時、本番鍵実更新は本番リリース前後の実機確認対象） |
 
 ### 現在地、推奨着手順、および用語の補足
 
@@ -372,3 +373,49 @@ PR #35、PR #36、および PR #37 はすべて `main` へマージ済みのた�
 ### 対応予定タイミング
 
 PR #38 は `main` へマージ済みのため、今後は最新 `main` 上の最終実機 E2E（実無応答 UNC 共有での `E2E-P3-06` および `E2E-P4-03` と `E2E-P4-04` を含む）で再確認する。
+
+## FU-P5-01 Release ドライランおよび Security Audit ワークフロー手動検証と残余実機対象
+
+### 対象ファイル
+
+- リリースワークフロー：[.github/workflows/release.yml](../.github/workflows/release.yml#L163-L224)（`Ensure NSIS (makensis) is installed`）
+- セキュリティ監査ワークフロー：[.github/workflows/security.yml](../.github/workflows/security.yml#L1-L25)（`cargo audit`）
+- リリーススクリプト単体テスト：[scripts/test_release_scripts.py](../scripts/test_release_scripts.py#L684-L692)（`test_rel_08`）および [L1249-L1433](../scripts/test_release_scripts.py#L1249-L1433)（`test_rel_11`）
+- 依存関係定義：[Cargo.toml](../Cargo.toml#L36) および [Cargo.lock](../Cargo.lock)
+- ストレージ診断：[crates/ledr-store/src/diagnostics.rs](../crates/ledr-store/src/diagnostics.rs#L4-L28)（`MAIN_DB`）
+- 運用ランブック：[release-runbook.md](release-runbook.md#L70-L95)
+
+### 背景と初回手動検証での障害（PR #49 マージ後 `877a472`）
+
+PR #49 の `main` マージ後に `Release`（`dry_run: true`, Run `#45512573149`）および `Security Audit`（Run `#45512576612`）を `workflow_dispatch` で初めて実機実行したところ、両ワークフローが失敗した。
+
+- **`Release` の失敗（Run `#45512573149`）**：`Ensure NSIS (makensis) is installed` で `choco install nsis -y --no-progress` が Chocolatey V2 フィードから `504 (Gateway Timeout)` を受けて 0 パッケージのまま終了コード `0` で抜けた。
+  導入後の `makensis.exe` 実在確認がなかったため、後続の Rust テストと `--release` ビルド（約 23 分）を経過した後の `Compile NSIS Windows installer` で `makensis` 未認識エラーとなった。
+- **`Security Audit` の失敗（Run `#45512576612`）**：`Cargo.lock` の 456 クレートに対し `cookie 0.18.2`（`RUSTSEC-2026-0594`）、`libsqlite3-sys 0.30.1`（`RUSTSEC-2026-0459`）、および `url 2.5.8`（`RUSTSEC-2026-0592`）の脆弱性 3 件と、`tokio 1.53.2`（`RUSTSEC-2026-0386`）を含む警告 4 件が検出された。
+
+### PR #51（`10e357f`、`main` マージ済み）での対処内容
+
+- **NSIS 導入のフェイルファスト化と動作回帰テスト**：`.github/workflows/release.yml` の `Ensure NSIS (makensis) is installed` へ `Resolve-MakeNsis`（`PATH` および候補パス検索）、Chocolatey 最大 3 回リトライ、未導入時の `winget install --id NSIS.NSIS` フォールバック、導入後の `makensis.exe` 実在確認と `& $makensisPath /VERSION` 検証を追加し、未導入時は終了コード `1` で即座に停止するようにした。
+  あわせて `scripts/test_release_scripts.py` に `test_rel_11_ensure_nsis_retry_fallback_and_fail_fast` を追加し、モック `choco`（終了コード `0` で未生成）とモック `winget` を使って `powershell.exe` と `pwsh` の双方でリトライ、`winget` フォールバック、`PATH` 外候補パスの `GITHUB_PATH` 登録、および即停止を検証した。
+- **依存更新とライセンス確認（`L-01`）**：`Cargo.toml` の `rusqlite` を `0.32` から `0.43`（`rusqlite 0.43.0` / `libsqlite3-sys 0.40.0`）へ更新し、`crates/ledr-store/src/diagnostics.rs` の `DatabaseName::Main` を `rusqlite::MAIN_DB` へ移行した。
+  あわせて `cookie` を `0.18.3`、`url` を `2.5.9`、`tokio` を `1.53.3` へ更新し、`cargo metadata` により追加および更新された 9 クレートすべてが `MIT` または `MIT OR Apache-2.0` であることを確認した。
+
+### マージ後 `main`（`10e357f`）上での最終手動検証結果
+
+CI 自動実行とローカル別途実行および手動 `workflow_dispatch` 実行の範囲を区別した検証結果は次のとおりである。
+
+- **PR #51 時点の CI 自動実行範囲（`.github/workflows/ci.yml`, コミット `aadc918`, Run `#45532586790`）**：`changes`、`static-checks`（Node 22 テスト 19 件 + 18 件および Python 検査）、`windows-packaging-tests`（Windows 上の Python `test_release_scripts.py` 11 件、`test_check_invariants.py` 8 件、`release_verify.py preflight`）、`rust-windows`（`cargo check`、`clippy`、`cargo test --workspace --locked`、`burst_budget`、`ttl_purge_lineage`、`cargo doc`）、および `ci-gate` の 5/5 ジョブに合格した。
+- **ローカル別途実行範囲（Windows 11, `rustc 1.100.0`, Node 22）**：コミット `129e019` 時点で `cargo test --workspace --locked`（28 スイート、520 passed / 0 failed）、`burst_budget`（12 passed）、`ttl_purge_lineage`（12 passed）、`cargo clippy`、`cargo doc`、Chrome MV3 テスト（19 passed）、Tauri UI テスト（18 passed）、および `cargo metadata` ライセンス走査を実施して合格し、最終コミット `aadc918` 時点で `test_release_scripts.py`（11 passed）、`test_check_invariants.py`（8 passed）、および `release_verify.py preflight` の再実行合格を確認した。
+  ローカル環境には `makensis` と `cargo-audit` が未導入のため、両ツールの実動作検証は下記の `workflow_dispatch` 手動実行で補完した。
+- **マージ後 `main`（`10e357f`）上の `Security Audit`（`workflow_dispatch`, Run `#45557335593`）**：`cargo audit` が 454 クレートを検査し、**脆弱性 0 件**（exit code `0`）で合格した。
+  残る許可警告 3 件は Tauri 上流および Linux GTK 依存に由来する `chrono 0.4.45`（`RUSTSEC-2026-0543`、`unmaintained`）、`proc-macro-error 1.0.4`（`RUSTSEC-2024-0370`、`unmaintained`）、および `glib 0.18.5`（`RUSTSEC-2024-0429`、`unsound`、Windows ビルド未使用）である。
+- **マージ後 `main`（`10e357f`）上の `Release`（`workflow_dispatch`, `dry_run: true`, Run `#45557332849`）**：`preflight`（5 秒、出力 `tag=v0.1.0`, `version=0.1.0`, `dry_run=true`）と `build`（20 分 13 秒、`makensis v3.13` 導入確認、NSIS 生成、一時鍵 `dry-run-test` 署名、`verify-dist`、`release-dist` アップロード）が成功し、`publish` はスキップされ、GitHub Release が作成されないことを確認した。
+  取得した `release-dist` の 6 点について、配布本体 3 点（`LocalEDR-Setup-v0.1.0-win-x64.exe` `4,941,467` bytes、`LocalEDR-v0.1.0-win-x64.zip` `7,029,060` bytes / 8 エントリ、`LocalEDR-chrome-ext-v0.1.0.zip` `25,248` bytes / 13 エントリ）は SHA-256 再計算値と `SHA256SUMS.txt`（`291` bytes）の記載値が全件一致することを確認した。
+  あわせてメタデータおよび署名 2 点について、`update-manifest.json`（`859` bytes）の各項目（`version=0.1.0`、`tag=v0.1.0`、インストーラの `sha256` と `size_bytes`、および `chrome_extension` の `extension_id=ecelachfiiiiiibpjeomfncgpegbpanh` と `sha256`）が実ファイルと一致すること、ならびに `update-manifest.json.sig`（`191` bytes）が非空の署名形式（`key_id=dry-run-test`、`algorithm=ed25519`）であり `build` ジョブ内の `release_verify.verify_dist` で一時公開鍵による署名検証を通過していることを確認した。
+
+### 未検証範囲と対応予定タイミング
+
+- `publish` ジョブ本体（`gh release create --draft`、2 段階アップロード、公開切替の原子的順序 `L-27`）は `dry_run: true` の対象外であり、本番タグ（`vX.Y.Z`）発行と `LEDR_UPDATE_SIGNING_PRIVATE_KEY` 登録時の初回本番リリースで検証する。
+- ドライラン時の `ledr-ui.exe` はコンパイル時にリポジトリの `packaging/update-public-keys.json` を埋め込むため一時鍵 `dry-run-test` を信頼せず、本番署名鍵を用いた実更新の検証と適用は本番リリース前後に実機で確認する。
+- Windows 10 または Windows 11 クライアント SKU 実機での NSIS インストーラ導入、アップグレード、およびアンインストール（`uninstall.ps1` のおとり掃除とサービス停止を含む）は、`FU-E2E-01` および `FU-E2E-02` とあわせて実機検証する。
+- Tauri 上流依存に由来する残余許可警告 3 件（`chrono`、`proc-macro-error`、`glib`）は、週次 `Security Audit` スケジュール（`security.yml`）と今後の Tauri マイナーおよびメジャー更新追従で監視を継続する。

@@ -1531,6 +1531,71 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
                             self.assertIn("Verified makensis at", res.stdout, diag)
                             self.assertIn("v3.13-mock", res.stdout, diag)
 
+    # REL-12: Release cache warmup workflow invariants (Phase R3-2)
+    def test_rel_12_release_warmup_workflow_invariants(self) -> None:
+        warmup_path = REPO_ROOT / ".github" / "workflows" / "release-warmup.yml"
+        self.assertTrue(warmup_path.is_file(), "release-warmup.yml must exist")
+        warmup_yml = warmup_path.read_text(encoding="utf-8")
+
+        header_block = warmup_yml.split("\njobs:", 1)[0].split("\r\njobs:", 1)[0]
+        self.assertIn("name: Release Cache Warmup", header_block)
+        self.assertIn("push:", header_block)
+        self.assertIsNotNone(
+            re.search(r"branches:\s*(?:\[\s*main\s*\]|\r?\n\s*-\s*main\b)", header_block),
+            "push trigger must target main branch",
+        )
+        for path_glob in ("Cargo.toml", "**/Cargo.toml", "Cargo.lock", ".cargo/config.toml"):
+            self.assertIn(path_glob, header_block)
+        self.assertIn("schedule:", header_block)
+        self.assertIn("0 3 */6 * *", header_block)
+        self.assertIn("workflow_dispatch:", header_block)
+        self.assertIn("permissions:", header_block)
+        self.assertIn("contents: read", header_block)
+        self.assertIn("concurrency:", header_block)
+        self.assertIn("group: ${{ github.workflow }}-${{ github.ref }}", header_block)
+        self.assertIn("cancel-in-progress: false", header_block)
+
+        warmup_job = _extract_workflow_job_block(warmup_yml, "warmup")
+        self.assertIn("runs-on: windows-latest", warmup_job)
+        self.assertIn("timeout-minutes: 25", warmup_job)
+        self.assertIn("contents: read", warmup_job)
+        self.assertIn("actions/checkout@v4", warmup_job)
+        self.assertIn("dtolnay/rust-toolchain@stable", warmup_job)
+        self.assertIsNone(
+            re.search(
+                r"uses:\s*dtolnay/rust-toolchain@stable\r?\n\s+with:",
+                warmup_job,
+            ),
+            "dtolnay/rust-toolchain@stable must not define with: inputs so cache key matches release.yml build",
+        )
+        self.assertIn("Swatinem/rust-cache@v2", warmup_job)
+        self.assertIn('shared-key: "win-x64-release"', warmup_job)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", warmup_job)
+        self.assertIn(
+            "cargo build --release --locked -p ledr-daemon -p ledr-ui -p ledr-bridge-nm -p ledr-auth-helper",
+            warmup_job,
+        )
+
+        # Security and cache-key isolation invariants
+        self.assertNotIn("contents: write", warmup_yml)
+        self.assertNotIn("LEDR_UPDATE_SIGNING_PRIVATE_KEY", warmup_yml)
+        self.assertNotIn("LEDR_UPDATE_SIGNING_KEY_ID", warmup_yml)
+        self.assertNotIn("secrets.", warmup_yml)
+        self.assertNotIn("components: clippy", warmup_yml)
+        self.assertNotIn("pull_request", warmup_yml)
+        self.assertIsNone(
+            re.search(r"^\s*(?:CARGO_|RUST)[A-Z0-9_]*\s*:", warmup_yml, re.MULTILINE),
+            "release-warmup.yml must not define extra CARGO_* or RUST* env vars",
+        )
+
+        ci_yml = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        ci_gate_block = _extract_workflow_job_block(ci_yml, "ci-gate")
+        self.assertNotIn("release-warmup", ci_gate_block)
+        self.assertNotIn("warmup", ci_gate_block)
+        self.assertNotIn("release-warmup", ci_yml)
+
 
 if __name__ == "__main__":
     unittest.main()

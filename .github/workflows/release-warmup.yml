@@ -1,0 +1,39 @@
+name: Release Cache Warmup
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/config.toml'
+  schedule:
+    - cron: '0 3 */6 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  warmup:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "win-x64-release"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Warm release build cache
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p ledr-daemon -p ledr-ui -p ledr-bridge-nm -p ledr-auth-helper
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

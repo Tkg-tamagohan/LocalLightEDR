@@ -1589,7 +1589,7 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
         self.assertIn('shared-key: "win-x64-release"', warmup_job_active)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", warmup_job_active)
         cache_on_failure_non_false = re.compile(
-            r"^[ \t]*['\"]?cache-on-failure['\"]?[ \t]*:(?![ \t]*['\"]?false['\"]?(?:[ \t]*(?:#.*)?$))",
+            r"""^[ \t]*(?:cache-on-failure|'cache-on-failure'|"cache-on-failure")[ \t]*:(?![ \t]*(?:false|'false'|"false")(?:[ \t]+#.*|[ \t]*)$)""",
             re.MULTILINE | re.IGNORECASE,
         )
         for tolerated_line in (
@@ -1607,6 +1607,9 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
             "          cache-on-failure: 'true'",
             "          cache-on-failure: false_ish",
             "          cache-on-failure: ${{ env.FLAG }}",
+            "          cache-on-failure: false# keep off",
+            '          cache-on-failure: false"',
+            "          cache-on-failure: 'false\"",
         ):
             self.assertIsNotNone(
                 cache_on_failure_non_false.search(rejected_line),

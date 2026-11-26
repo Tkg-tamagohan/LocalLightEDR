@@ -1587,7 +1587,14 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
         self.assertIn("Swatinem/rust-cache@v2", warmup_job)
         self.assertIn('shared-key: "win-x64-release"', warmup_job)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", warmup_job)
-        self.assertNotIn("cache-on-failure", warmup_job)
+        cache_on_failure_non_false = re.compile(
+            r"^[ \t]*['\"]?cache-on-failure['\"]?[ \t]*:[ \t]*(?!['\"]?false['\"]?(?:[ \t]*(?:#.*)?$))",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        self.assertIsNone(
+            cache_on_failure_non_false.search(warmup_job),
+            "warmup job must not enable cache-on-failure",
+        )
         build_cmd = (
             "cargo build --release --locked -p ledr-daemon -p ledr-ui -p ledr-bridge-nm -p ledr-auth-helper"
         )
@@ -1611,7 +1618,10 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
         self.assertIn("Swatinem/rust-cache@v2", rel_build_block)
         self.assertIn('shared-key: "win-x64-release"', rel_build_block)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", rel_build_block)
-        self.assertNotIn("cache-on-failure", rel_build_block)
+        self.assertIsNone(
+            cache_on_failure_non_false.search(rel_build_block),
+            "release.yml build must not enable cache-on-failure",
+        )
         self.assertIn(build_cmd, rel_build_block)
         for label, scope_text in (
             ("release-warmup.yml", warmup_yml),
@@ -1619,7 +1629,11 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
             ("release.yml build", rel_build_block),
         ):
             self.assertIsNone(
-                re.search(r"^\s*(?:CARGO_|RUST)[A-Z0-9_]*\s*:", scope_text, re.MULTILINE),
+                re.search(
+                    r"^[ \t]*['\"]?(?:CARGO_|RUST)[A-Z0-9_]*['\"]?[ \t]*:",
+                    scope_text,
+                    re.MULTILINE,
+                ),
                 f"{label} must not define extra CARGO_* or RUST* env vars that diverge cache keys",
             )
 

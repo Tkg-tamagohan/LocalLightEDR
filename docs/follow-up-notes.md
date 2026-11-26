@@ -521,7 +521,7 @@ Run `#45753387980` の `release-dist` 6 点は `LocalEDR-Setup-v0.1.0-win-x64.ex
 
 ### 管理者および対話デスクトップ検証の引き継ぎ状態（`c4acf22` 実施後）
 
-- **`c4acf22` 上の `L-24`、`L-23`、および `L-08` 実機一括検証**：2026 年 11 月 26 日に `main`（`c4acf22`）上で実施済みであり、`L-08` と `L-23` は合格、`L-24` は `-Mode load` が条件注意付き合格、`-Mode idle` が未達となった。
+- **`c4acf22` 上の `L-24`、`L-23`、および `L-08` 実機一括検証**：2026 年 11 月 26 日に `main`（`c4acf22`）上で実施済みであり、`L-08` と `L-23` は合格、`L-24` は `-Mode idle` が未達、`-Mode load` はプロセス起動負荷未発生のため正式判定を未検証（計測値は参考値）とした。
   実測値、原因切り分け、および静穏環境での `L-24` 再計測を含む残課題は `FU-R1-02` へ記録した。
   Stage 3（`87be6d5`、2026 年 11 月 23 日時点）の記録値（アイドル `PrivateWorkingSetSize` 中央値 `13.0234 MB`、CPU `0.2054%` 等）は引き続き履歴参照値として区別し、`c4acf22` の合格実績としては扱わない。
 - **ルート 1 機能 E2E、実機 NSIS インストーラ E2E、および本番公開**：`FU-E2E-01` と `FU-E2E-02` の統合機能検証、Windows 10 または Windows 11 クライアント SKU 実機での NSIS 導入とアンインストール、および本番タグ発行時の `publish` ジョブと実署名更新確認は、引き続き実機および本番リリース時の確認対象として残す。
@@ -543,10 +543,11 @@ Run `#45753387980` の `release-dist` 6 点は `LocalEDR-Setup-v0.1.0-win-x64.ex
 | :--- | :--- | :--- | :--- |
 | `L-08`（UI 完全終了） | `ledr-ui.exe` 閉鎖後の残存プロセス確認 | `Get-Process ledr-ui` が `0` 件、`msedgewebview2.exe`（`ledr-ui\|LocalEDR` 一致）が `0` 件 | **PASS** |
 | `L-23`（PE 依存隔離） | 両サマリの `pe_transitive_dependencies` | `DirectImports` `20` 件（`wintrust.dll` `0` 件、`crypt32.dll` `0` 件）、`StaticPathsToWintrust` `0` 件、`StaticPathsToCrypt32` `1` 件（OS システム DLL のみ：`wtsapi32.dll -> CRYPT32.dll`）、`peak_authenticode_mapped_mb` `0` | **PASS** |
-| `L-24` `-Mode load` | PID `2268`、`60.253 s` | `e2e_perf_01_mode_pass = true`、`avg_cpu_percent` `0.0487%`（`< 1.0%`）、`latest_working_set_mb` `25.0977 MB`、`interval_peak_working_set_mb` `37.6328 MB`、`os_peak_working_set_mb` `46.6055 MB`（`< 64.34 MB`）、`latest_private_ws_mb` `10.6094 MB`、`peak_private_ws_mb` `22.8867 MB`、`spikes_ge_100mb_count` `0` | **PASS**（負荷条件注意付き） |
+| `L-24` `-Mode load` | PID `2268`、`60.253 s` | `e2e_perf_01_mode_pass = true`、`avg_cpu_percent` `0.0487%`（`< 1.0%`）、`latest_working_set_mb` `25.0977 MB`、`interval_peak_working_set_mb` `37.6328 MB`、`os_peak_working_set_mb` `46.6055 MB`（`< 64.34 MB`）、`latest_private_ws_mb` `10.6094 MB`、`peak_private_ws_mb` `22.8867 MB`、`spikes_ge_100mb_count` `0` | **未検証（参考値）** |
 | `L-24` `-Mode idle` | PID `22436`、`600.328 s` | `e2e_perf_01_mode_pass = false`、`latest_private_ws_mb` `11.2656 MB`、`median_private_ws_mb` `14.0898 MB`（`median_working_set_mb` `28.8926 MB`）、`avg_cpu_percent` `0.068%` は合格、一方 `half_diff_ws_mb` `+6.918 MB`、`half_diff_private_ws_mb` `+6.8399 MB`、`spikes_ge_100mb_count` `1`（`t=543.401s` で `100.5039 MB` WS / `85.6758 MB` PrivateWS）が未達 | **FAIL** |
 
-`-Mode load` の結果には、`sqlite_interval_counts.delta` が `processes: 0`、`dns_queries: 39`、`network_events: 63`、`alerts: 2` であり、[e2e-test-runbook.md](e2e-test-runbook.md) 所定の `cargo build --locked` と複数ブラウザタブ相当のプロセス起動負荷が未発生だったという前提上の制約がある。
+`-Mode load` では [profile_daemon_memory.ps1](../scripts/profile_daemon_memory.ps1#L1654-L1662) の `e2e_perf_01_mode_pass` が CPU とメモリ閾値のみを評価し負荷発生の有無を判定しないため `true` を返したものの、`sqlite_interval_counts.delta` は `processes: 0`、`dns_queries: 39`、`network_events: 63`、`alerts: 2` であり、[e2e-test-runbook.md](e2e-test-runbook.md#L1422) 所定の `cargo build --locked` と複数ブラウザタブ相当のプロセス起動負荷を満たしていない。
+そのため、上記実測値は参考値として残し、正式な `L-24` 高負荷試験の判定は未検証（再計測待ち）として区別する。
 
 `-Mode idle` の各指標の詳細は次のとおりである。
 
@@ -558,8 +559,10 @@ Run `#45753387980` の `release-dist` 6 点は `LocalEDR-Setup-v0.1.0-win-x64.ex
 
 `perf_idle` の未達要因について、既存の記録から確認できた事実と未確認の仮説を区別して以下に整理する。
 
-- **Phase R1 から R3-4 までのコード変更起因ではない**：`git diff --stat b9bb76a..c4acf22 -- crates/` は空（Rust ソース変更 `0` 件）であり、[Cargo.toml](../Cargo.toml) でも `ledr-daemon` 本体は `codegen-units = 1`、`lto = "thin"`、`strip = "symbols"`、および `panic = "unwind"` を維持している。
-- **メモリリークおよび `MEM_IMAGE` や `MEM_MAPPED` 増加ではない**：`perf_idle` の全 `20` スナップショットで `MEM_IMAGE` は `14.9922〜15.1211 MB`（定常区間 `snapshot_006`〜`020` では `14.9961〜15.1211 MB`、`+0.1289 MB` 増、かつ `authenticode_mapped_mb = 0`）、`MEM_MAPPED` は `0.4688 MB` 一定であり、バースト増加分は実質的にすべて `MEM_PRIVATE`（`PAGE_READWRITE`）である。
+- **`crates/` の Rust ソース変更はなく、`ledr-daemon` 本体のリリース設定も不変（依存クレートの `codegen-units` 変更影響は未検証）**：`git diff --stat b9bb76a..c4acf22 -- crates/` は空（Rust ソース変更 `0` 件）であり、[Cargo.toml](../Cargo.toml#L68-L77) でも `ledr-daemon` 本体は `codegen-units = 1`、`lto = "thin"`、`strip = "symbols"`、および `panic = "unwind"` を維持している。
+  一方で、Phase R2A により `[profile.release.package."*"]` と `[profile.release.package.ledr-ui]` の `codegen-units` は `16` へ変更されており、`b9bb76a` との同一条件下 A/B 比較は未実施のため、ビルド設定変更による実行時メモリ影響の有無は未検証である。
+- **採取済みスナップショット区間の内訳と終了尾部（主要ピーク時はスナップショット未採取）**：`perf_idle` の採取済み全 `20` スナップショット（`t=299.51s` の `snapshot_019` までと終了前 `t=600.178s` の `snapshot_020`）では、`MEM_IMAGE` が `14.9922〜15.1211 MB`（定常区間 `snapshot_006`〜`020` では `14.9961〜15.1211 MB`、`+0.1289 MB` 増、かつ `authenticode_mapped_mb = 0`）、`MEM_MAPPED` が `0.4688 MB` 一定であり、採取済み時点の上昇分は実質的に `MEM_PRIVATE`（`PAGE_READWRITE`）であった。
+  `t=440.631s` と `t=543.401s` の主要ピーク時は `QueryWorkingSetEx` スナップショットが未採取であるためページ種別内訳は直接確認できていないものの、`GetProcessMemoryInfo` 集計上の `peak_private_ws_mb` `85.6758 MB` がプライベート作業セット主体の急増を示唆している（確定内訳は未確認）。
   定常開始部（`t=60..240s`、`WS` 中央値 `25.63〜25.65 MB`）と終了尾部（`t=544.5..600.18s`、`WS` 中央値 `26.0938 MB`、`latest_private_ws_mb` `11.2656 MB`、`end_minus_60s_private_ws_mb` `-0.2461 MB`）はいずれも Stage 3（`87be6d5`：`WS` `27.6250 MB`、`PrivateWS` `13.0234 MB`）を下回った。
 - **未達 3 指標の直接要因は `t=277.577s..544.269s`（`t=273..544.5s` 内）の一過性 `MEM_PRIVATE` バーストである**：`timeseries.csv` で `WS >= 40 MB` の急増が `t=277.577s..544.269s` に集中し、`t=440.631s` の `89.5312 MB` と `t=543.401s` の `100.5039 MB`（`PrivateWS` `85.6758 MB`）を記録した直後、2 秒以内に `27.2969 MB` へ解放された。
   この区間が前後半境界 `$midSec = 330.0s` の後半側に偏ったため、`half_diff` 2 指標と `spikes_ge_100mb_count` が基準を超過した。
@@ -573,8 +576,9 @@ Run `#45753387980` の `release-dist` 6 点は `LocalEDR-Setup-v0.1.0-win-x64.ex
 - **CI 自動実行範囲（`.github/workflows/ci.yml`）**：本書のみの更新 PR では `changes` のパス判定により `rust-windows` と `windows-packaging-tests` がスキップされ、`changes`、`static-checks`（Node 22 の拡張テストと UI モック DOM テスト、JS 構文検査、`manifest.json` 公開鍵と `DEFAULT_CHROME_EXTENSION_ID` の一致検査、JSON と UTF-8 と `U+FFFD` と競合マーカー検査、ならびに Python 検査の `py_compile`、`test_release_scripts.py`、`test_check_invariants.py`、および `release_verify.py preflight`）、および `ci-gate` のみが実行される。
   Rust 全体と Windows パッケージングの CI 検証は `c4acf22` 以前の既存マージ済みラン（M5 Run `#45721565868`、Run `#45753387980`、PR #56 Run `#45759151458`、および M6C 手動 `release.yml` Run `#45771821619`）で担保している。
 - **ローカルでも再実行した CI 相当項目（`static-checks` 対象、非特権環境）**：`Windows 11 Home`（Version `10.0.26300`）、非管理者 PowerShell `5.1.26100.9818`、`Python 3.11.9`、および `Node v22.18.0` 上で、`py_compile`（終了コード `0`）、`test_release_scripts.py`（`12 PASS / 1 ERROR`、非管理者 `SeSecurityPrivilege` 制約の `test_rel_09` のみ）、`test_check_invariants.py`（`8/8` 合格）、`release_verify.py preflight`（`Preflight OK`）、Chrome MV3 拡張テスト（`19/19` 合格）、UI モック DOM テスト（`18/18` 合格）、JS 構文検査（`17` 件）、`manifest.json` 公開鍵一致検査、ならびに JSON（`11` 件）と UTF-8 と `U+FFFD` と競合マーカー検査を実行して確認した（非管理者制約の `test_rel_09` を除きすべて通過）。
-- **CI 対象外のローカル固有検証**：同一ローカル環境で `python scripts\check_invariants.py --base main --paths docs/follow-up-notes.md`（`101` ルール合格、`Status: passed`）、`slop_lint.py`（新規エラーと警告 `0` 件、`error 0件、warn 1件、info 8件`）、および UTF-8（BOM なし）、CRLF、`U+FFFD` `0` 件、競合マーカー `0` 件の検査を確認した（`L-24` の実機再計測は本 PR では実施しない）。
+- **CI 対象外のローカル固有検証**：同一ローカル環境で `python scripts\check_invariants.py --base main --paths docs/follow-up-notes.md`（`101` ルール合格、`Status: passed`）、`slop_lint.py --strict docs\follow-up-notes.md`（編集行の新規エラーと警告 `0` 件、ファイル全体では既存 `L83` の `warn 1件` により終了コード `1`、内訳は `error 0件、warn 1件、info 8件`）、および UTF-8（BOM なし）、CRLF、`U+FFFD` `0` 件、競合マーカー `0` 件の検査を確認した（`L-24` の実機再計測は本 PR では実施しない）。
 - **実機残課題（Open Follow-up）**：次回の実機検証に向けて以下の 3 点を引き継ぐ。
-  1. 常駐デスクトップアプリを閉じた静穏環境で、`--outbound-mode preemptive-only --disable-nrd-refresh -MaxSnapshots 60` を指定した `L-24` `-Mode idle`（`600 s`）を再実施し、あわせて `-Mode load`（`60 s`）中に実 `cargo build --locked` とブラウザ 5 タブ相当のプロセス起動負荷を発生させて再計測する。
+  1. 常駐デスクトップアプリを閉じた静穏環境で、[e2e-test-runbook.md](e2e-test-runbook.md#L1358-L1361) に従い `E2E-P3-05` で `feeds_succeeded=2` かつ `feeds_failed=0` を確認済みの公開 2 フィード版実 `nrd-cache.txt` を用意したうえで、`ledr-daemon.exe` を `--outbound-mode preemptive-only --disable-nrd-refresh --nrd-cache <実キャッシュパス>` で起動し、[profile_daemon_memory.ps1](../scripts/profile_daemon_memory.ps1#L27-L44) に `-Mode idle -DurationSec 600 -MaxSnapshots 60` を指定して `L-24` `-Mode idle` を再実施する（公開 2 フィード未達時は参考値扱いとする）。
+     あわせて `-Mode load`（`60 s`）中に実 `cargo build --locked` とブラウザ 5 タブ相当のプロセス起動負荷を発生させて再計測する。
   2. 静穏アイドル条件でも `t=273..544.5s` 型の一過性 `MEM_PRIVATE` バーストが再現する場合は、`ledr-sensor-win` と `ledr-daemon` における一時的な ETW や AMSI バッファの計測と対策を別 PR として切り出して調査する。
   3. 上記の `L-24` 再計測と `FU-E2E-01` および `FU-E2E-02` の統合実機 E2E が完了するまで、[implementation-plan.md](implementation-plan.md) の未完了チェックリスト 3 件（`[ ]`）は未更新のまま維持する。

@@ -95,6 +95,21 @@ git push origin v0.1.0
 
 5. **公開後の事後確認**：GitHub Release ページ上に 6 点すべてのアセットが揃っていること、および `update-manifest.json` の `version`、`tag`、`sha256`、`size_bytes`、`chrome_extension.extension_id` が期待値と一致していることを確認してください。
 
+### リリースキャッシュの事前ウォームアップ
+
+`.github/workflows/release-warmup.yml` は、本番リリースやドライランに先立ち、外部依存クレートのリリースビルドキャッシュ（`shared-key: "win-x64-release"`）を `main` スコープへ事前に温める補助ワークフローです。
+`Swatinem/rust-cache@v2` が保存時にワークスペース内クレートを自動除外する仕組みを利用し、`release.yml` の `build` ジョブと同一のツールチェーン設定で `cargo build --release --locked -p ledr-daemon -p ledr-ui -p ledr-bridge-nm -p ledr-auth-helper` を実行します。
+
+このワークフローは `main` ブランチへの `Cargo.toml`、`**/Cargo.toml`、`Cargo.lock`、または `.cargo/config.toml` の変更を伴う `push`、毎月 1 日基準の 6 日間隔スケジュール（`0 3 */6 * *`、各月 1、7、13、19、25、31 日）、および手動の `workflow_dispatch` で起動します。
+`*/6` 指定は毎月 1 日から数え直すため、月末をまたぐ場合（特に 31 日のある月の翌月 1 日や 2 月末）は実行間隔が 6 日より短くなる点に注意が必要です。
+保存条件を `main` ブランチ（`save-if: ${{ github.ref == 'refs/heads/main' }}`）に限定しているため、キャッシュを共有する `release.yml` の `build` ジョブが次回実行時にそのまま引き継げます。
+また、通常 CI の必須チェック集約ジョブ（`ci-gate`）には組み込まず、権限を `contents: read` に絞ったうえで署名用シークレット（`LEDR_UPDATE_SIGNING_PRIVATE_KEY` 等）も参照しません。
+
+GitHub Actions の仕様により、リポジトリで 60 日間活動がないと定期実行（`schedule`）は自動で無効化されます。
+無効化された場合は、GitHub Actions 画面の「Enable workflow」または `gh workflow enable release-warmup.yml` でワークフロー自体を再有効化してください。
+`gh workflow run` や `main` ブランチでの `release.yml` ドライランはキャッシュを温めるだけで、`schedule` の再有効化にはなりません。
+再有効化後に即時ウォームしたい場合は `gh workflow run release-warmup.yml --ref main` を実行します。
+
 ## 2 段階鍵ローテーション手順
 
 インストール済みの `ledr-ui.exe` はコンパイル時の `packaging/update-public-keys.json` を内蔵しているため、旧鍵をいきなり `revoked` へ変えて新鍵だけで署名すると、旧版クライアントが自己更新できなくなります。

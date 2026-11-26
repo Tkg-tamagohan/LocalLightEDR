@@ -1572,33 +1572,54 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
         self.assertIn("cancel-in-progress: false", header_active)
 
         warmup_job = _extract_workflow_job_block(warmup_yml, "warmup")
-        self.assertIn("runs-on: windows-latest", warmup_job)
-        self.assertIn("timeout-minutes: 25", warmup_job)
-        self.assertIn("contents: read", warmup_job)
-        self.assertIn("actions/checkout@v4", warmup_job)
-        self.assertIn("dtolnay/rust-toolchain@stable", warmup_job)
+        warmup_job_active = re.sub(r"(?m)^[ \t]*#.*$", "", warmup_job)
+        self.assertIn("runs-on: windows-latest", warmup_job_active)
+        self.assertIn("timeout-minutes: 25", warmup_job_active)
+        self.assertIn("contents: read", warmup_job_active)
+        self.assertIn("actions/checkout@v4", warmup_job_active)
+        self.assertIn("dtolnay/rust-toolchain@stable", warmup_job_active)
         self.assertIsNone(
             re.search(
-                r"uses:\s*dtolnay/rust-toolchain@stable\r?\n\s+with:",
-                warmup_job,
+                r"uses:\s*dtolnay/rust-toolchain@stable(?:[ \t]*#[^\r\n]*)?\r?\n\s+with:",
+                warmup_job_active,
             ),
             "dtolnay/rust-toolchain@stable must not define with: inputs so cache key matches release.yml build",
         )
-        self.assertIn("Swatinem/rust-cache@v2", warmup_job)
-        self.assertIn('shared-key: "win-x64-release"', warmup_job)
-        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", warmup_job)
+        self.assertIn("Swatinem/rust-cache@v2", warmup_job_active)
+        self.assertIn('shared-key: "win-x64-release"', warmup_job_active)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", warmup_job_active)
         cache_on_failure_non_false = re.compile(
-            r"^[ \t]*['\"]?cache-on-failure['\"]?[ \t]*:[ \t]*(?!['\"]?false['\"]?(?:[ \t]*(?:#.*)?$))",
+            r"^[ \t]*['\"]?cache-on-failure['\"]?[ \t]*:(?![ \t]*['\"]?false['\"]?(?:[ \t]*(?:#.*)?$))",
             re.MULTILINE | re.IGNORECASE,
         )
+        for tolerated_line in (
+            "          cache-on-failure: false",
+            "          cache-on-failure: 'false' # keep off",
+            '          cache-on-failure: "FALSE"',
+            "          cache-on-failure:false",
+        ):
+            self.assertIsNone(
+                cache_on_failure_non_false.search(tolerated_line),
+                f"cache_on_failure_non_false must tolerate {tolerated_line!r}",
+            )
+        for rejected_line in (
+            "          cache-on-failure: true",
+            "          cache-on-failure: 'true'",
+            "          cache-on-failure: false_ish",
+            "          cache-on-failure: ${{ env.FLAG }}",
+        ):
+            self.assertIsNotNone(
+                cache_on_failure_non_false.search(rejected_line),
+                f"cache_on_failure_non_false must reject {rejected_line!r}",
+            )
         self.assertIsNone(
-            cache_on_failure_non_false.search(warmup_job),
+            cache_on_failure_non_false.search(warmup_job_active),
             "warmup job must not enable cache-on-failure",
         )
         build_cmd = (
             "cargo build --release --locked -p ledr-daemon -p ledr-ui -p ledr-bridge-nm -p ledr-auth-helper"
         )
-        self.assertIn(build_cmd, warmup_job)
+        self.assertIn(build_cmd, warmup_job_active)
 
         # Cross-check cache-key parity with release.yml build job (top-level & build job)
         release_yml = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
@@ -1606,23 +1627,24 @@ Write-Output 'INSTALL_PS1_POLLUTED_OK'
         )
         release_header = release_yml.split("\njobs:", 1)[0].split("\r\njobs:", 1)[0]
         rel_build_block = _extract_workflow_job_block(release_yml, "build")
-        self.assertIn("runs-on: windows-latest", rel_build_block)
-        self.assertIn("dtolnay/rust-toolchain@stable", rel_build_block)
+        rel_build_active = re.sub(r"(?m)^[ \t]*#.*$", "", rel_build_block)
+        self.assertIn("runs-on: windows-latest", rel_build_active)
+        self.assertIn("dtolnay/rust-toolchain@stable", rel_build_active)
         self.assertIsNone(
             re.search(
-                r"uses:\s*dtolnay/rust-toolchain@stable\r?\n\s+with:",
-                rel_build_block,
+                r"uses:\s*dtolnay/rust-toolchain@stable(?:[ \t]*#[^\r\n]*)?\r?\n\s+with:",
+                rel_build_active,
             ),
             "release.yml build dtolnay/rust-toolchain@stable must not define with: inputs",
         )
-        self.assertIn("Swatinem/rust-cache@v2", rel_build_block)
-        self.assertIn('shared-key: "win-x64-release"', rel_build_block)
-        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", rel_build_block)
+        self.assertIn("Swatinem/rust-cache@v2", rel_build_active)
+        self.assertIn('shared-key: "win-x64-release"', rel_build_active)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", rel_build_active)
         self.assertIsNone(
-            cache_on_failure_non_false.search(rel_build_block),
+            cache_on_failure_non_false.search(rel_build_active),
             "release.yml build must not enable cache-on-failure",
         )
-        self.assertIn(build_cmd, rel_build_block)
+        self.assertIn(build_cmd, rel_build_active)
         for label, scope_text in (
             ("release-warmup.yml", warmup_yml),
             ("release.yml header", release_header),

@@ -1,7 +1,7 @@
 # LocalEDR 申し送り事項と実機検証計画
 
 本書は LocalEDR の各 Phase を `main` ブランチへマージした後に残した副次的な改善余地と、合成自動テストでは検証済みと扱わない実機 E2E 検証の対象を管理する。
-仕様の正は [implementation-plan.md](implementation-plan.md)、[decision-records.md](decision-records.md)（L-01 から L-25）、および凍結済みの [crates/ledr-proto/src/lib.rs](../crates/ledr-proto/src/lib.rs) に置き、本書では後続作業へ引き継ぐ個別項目を ID ごとに記録する。
+仕様の正は [implementation-plan.md](implementation-plan.md)、[decision-records.md](decision-records.md)（L-01 から L-29）、および凍結済みの [crates/ledr-proto/src/lib.rs](../crates/ledr-proto/src/lib.rs) に置き、本書では後続作業へ引き継ぐ個別項目を ID ごとに記録する。
 
 ## 項目一覧
 
@@ -16,6 +16,7 @@
 | `FU-E2E-05` | 境界改善 | Phase 3 | WFP ドロップの終了済み兄弟プロセス由来の誤帰属抑止および `E2E-P3-06` 停止予算超過時の残余書き込みによる `-wal` 再生成の整理 | PR #38（`b8d9c66`）で `main` マージ済み（最終実機 E2E で再確認） |
 | `FU-P5-01` | ワークフロー検証と残余実機対象 | Phase 5 | `Release`（`dry_run: true`）および `Security Audit` の手動検証、PR #51 修正後の `main` 最終合格、ならびに本番公開と実機インストーラ E2E の残余管理 | PR #51（`10e357f`）で修正を `main` マージ済み、マージ後 `main` 手動検証合格済み（実機 NSIS E2E はリリース前実機検証、本番 `publish` は初回本番リリース時、本番鍵実更新は本番リリース前後の実機確認対象） |
 | `FU-R0-01` | ビルド最適化基準計測 | Phase R0 | リリースビルドおよび CI 高速化改修前のベースライン計測値（`main` `b9bb76a` / CI `10e357f`）の固定と実機未検証境界の分離記録 | Phase R0 計測完了済み（Phase R1 から Phase R3 までの比較基準として固定、`b9bb76a` 上の `L-24` と `L-08` は管理者および対話デスクトップ検証待ち） |
+| `FU-R1-01` | ビルド最適化統合と最終判定 | Phase R1〜R3-4 | Phase R1〜R2B の統合受け入れ結果（`main` `3f92057`）、Phase R3-1〜R3-4 の検証と採否判定（`d9c3fdd`）、および実機未検証項目の分離記録 | Phase R1〜R3-4 完了済み（PR #53、#54、#56 マージ済み、PR #55、#57 不採用クローズ、R3-4 `Win32_System_Time` 削除見送りおよび分割不採用、最終 `main` 上の `L-24` と `L-08` はユーザー一括実機検証待ち） |
 
 ### 現在地、推奨着手順、および用語の補足
 
@@ -454,3 +455,70 @@ GitHub Actions 上の CI 実測値（対象コミット `10e357f`）、ローカ
 
 - **`b9bb76a` 上の `L-24` および `L-08`**：非管理者（`IsAdmin = False`）かつ非対話デスクトップ環境のため、`b9bb76a` 上での実機計測（600 秒アイドルおよび 60 秒高負荷の `L-24` 計測、ならびに `ledr-ui.exe` と WebView2 の閉鎖後 0 プロセス終了 `L-08`）は未実施である。
   Stage 3（`87be6d5`）の記録値（アイドル `PrivateWorkingSetSize` 中央値 `13.0234 MB`、CPU `0.2054%` 等）は `87be6d5..b9bb76a` 間の 48 ファイル変更を経ているため履歴参照値として区別し、`b9bb76a` の合格実績としては扱わない。
+
+## FU-R1-01 Phase R1 から Phase R3-4 までの最適化統合と最終判定記録
+
+### 目的と検証範囲の区分
+
+本節では Phase R0（`b9bb76a` / `10e357f`、`FU-R0-01`）を基準として実施した Phase R1 から Phase R3-4 までのビルドおよび CI 高速化改修、最終統合受け入れ試験、ならびに不採用実験の検証結果を記録する。
+GitHub Actions 上の CI 自動実行および手動 `workflow_dispatch` 実績、ローカル実機上の別途実行結果、および管理者権限や対話デスクトップを要する未実施項目を分離して示す。
+
+### Phase R1 から Phase R3-4 までの施策別採否と検証概要
+
+| Phase | 対象施策 | 対応 PR と状態 | 採否と根拠の要約 |
+| :--- | :--- | :--- | :--- |
+| Phase R1 | `release.yml` 5 ジョブ並列化、署名分離、キャッシュ分離、`[profile.dev]` 動的切替 | PR #53（`2f1be6e` マージ済み） | **採用**。`preflight`、並列 `verify` と `build`、`package`（`LEDR_UPDATE_SIGNING_PRIVATE_KEY` 隔離、`L-26` と `L-27`）、および `publish` へ分割し、`win-x64-dev` と `win-x64-release` を `main` 限定保存へ分離した。あわせて `ci.yml` の重複ステップ削除、`Cargo.toml` の `debug = "line-tables-only"` 導入、`test_release_scripts.py` 刷新、および `release-runbook.md` と `AGENTS.md` 同期を実施した。 |
+| Phase R2A | 二層 `codegen-units = 16` 導入 | PR #54（`3f92057` マージ済み） | **採用**。`[profile.release.package."*"]` と `[profile.release.package.ledr-ui]` へ `codegen-units = 16` を適用し、配布コア 8 クレートと `ledr-sim` の計 9 クレートは `codegen-units = 1`、`strip = "symbols"`、および `panic = "unwind"`（`AUTO-10`）を維持した。 |
+| Phase R2B | `.cargo/config.toml` による `rust-lld.exe` 検証 | PR #55（`58bfd5e` クローズ） | **不採用（ロールバック）**。PE 属性（`0x8160`）、`.rsrc`、PDB（`RSDS`）、`L-23`、`ci.yml`（`5/5`）、および `release.yml`（NSIS `5,089,846 B`）はすべて合格した一方、ローカルウォーム中央値 `50.501 s`（R2A `48.723 s` 比 `+1.778 s`）および CI `Build release binaries` `586 s`（R2A `main` Run 2 `576 s` 比 `+10 s`、`build` 合計 `698 s`、CI `rust-windows` `453 s`）となり、ローカルと CI の双方で `10 s` 以上短縮するロールバック基準を満たさなかった。 |
+| Phase R3-1 | `verify` ジョブの 2 並列分割 | コード変更なし（見送り） | **不採用**。M5（`3f92057`）の全 3 ランで `verify`（`337 s` / `129 s` / `144 s`）が `build`（`475 s` / `210 s` / `270 s`）より `81 s` から `138 s` 速く、クリティカルパス上にないため分割効果を認めない。 |
+| Phase R3-2 | `.github/workflows/release-warmup.yml` 導入 | PR #56（`d9c3fdd` マージ済み） | **採用**。`main` への `Cargo.toml`、`**/Cargo.toml`、`Cargo.lock`、`.cargo/config.toml` プッシュ、6 日周期 `schedule`（`0 3 */6 * *`）、および `workflow_dispatch` で `win-x64-release` を事前温態化する構成を追加した（`ci-gate` 非組み込み、`test_rel_12` 追加、`release-runbook.md` 同期）。 |
+| Phase R3-3 | Tauri 既定 feature 削減実験 | PR #57（`470ad70` クローズ） | **不採用**。`tauri` を `["wry", "common-controls-v6"]` へ縮小し `Cargo.lock` の `111` 行を削除したが、ローカルウォーム中央値は `53.480 s`（M5 `50.608 s` 比 `+2.872 s`）、CI `build` は `303.0 s`（クリティカルパス `315.0 s`）で短縮せず、並列終端は常に `ledr-daemon`（`CGU=1`、`53.29 s` から `54.11 s`）が支配していた。NSIS 削減幅 `-158,431 B`（`-3.10%`、`4,955,284 B`）もキャッシュキー無効化と既定機能喪失に見合わないためクローズした。 |
+| Phase R3-4 | `windows` 0.62 整理と `build` 分割検討 | 本件（コード変更なし） | **削除見送りおよび分割不採用**。`crates/ledr-sensor-win/Cargo.toml` から `Win32_System_Time` を外して `cargo clippy --workspace --all-targets --locked -- -D warnings` を実行したところ、`Etw` モジュールの `EVENT_TRACE_LOGFILEW` と `OpenTraceW` が `#[cfg(feature = "Win32_System_Time")]` を要求して `E0432` で失敗したため、必須依存として保持を確定した。あわせて `build-core` と `build-ui` 分割および `ledr-ui` クレート分割も不採用とした。 |
+
+Phase R3-4 の判断根拠として、`Win32_System_Time` の精査結果と分割検討の定量データを以下にまとめる。
+
+- **`Win32_System_Time` 必須確認**：`crates/ledr-sensor-win/Cargo.toml` の `Win32_System_Time` を削除した状態で `cargo clippy --workspace --all-targets --locked -- -D warnings` を実行すると、`crates/ledr-sensor-win/src/etw/handlers.rs`（7 行目）、`session.rs`（17 行目と 19 行目）、および `tests.rs`（17 行目）が参照する `EVENT_TRACE_LOGFILEW` と `OpenTraceW` に対して `windows 0.62.2`（`src/Windows/Win32/System/Diagnostics/Etw/mod.rs` の 201 行目から 203 行目および 1566 行目から 1568 行目）が `#[cfg(feature = "Win32_System_Time")]` を付与しているため、`E0432`（終了コード `101`）で失敗した。
+  `Win32_System_Rpc` も `crates/ledr-sensor-win/src/wfp/backend.rs`（25 行目）で使用中であるため `Cargo.toml` と `Cargo.lock` を無変更とし、既存の `Swatinem/rust-cache@v2` キャッシュキー（`fdf92e00`）を保全した（今後メンバー `Cargo.toml` を変更してハッシュが更新された場合も、`.github/workflows/release-warmup.yml` の `**/Cargo.toml` トリガが `main` マージ時に `win-x64-release` を自動再構築する）。
+- **`build-core` と `build-ui` 分割の見送り根拠**：M5（`3f92057`）の `release.yml` が既にコールド `489 s <= 720 s` およびウォーム `227 s` と `289 s <= 360 s` を満たしており、目標超過時の分割条件に該当しない。
+  あわせて `cargo tree --locked --target x86_64-pc-windows-msvc -e normal,build` を重複除去して集計すると、配布 4 バイナリ合計 `258` パッケージのうちコア 3 バイナリ（`84` 件）と `ledr-ui`（`235` 件）が **`61` 個の固有クレート**（重複記号 `(*)` 統合前の一意行交差 `74` 件、事前計画時の概算 `81` 件）を共有しているため、2 分割すると両ランナーでの二重ビルドと `win-x64-release` キャッシュ（`432,524,087 B` = `412.48 MiB`）の重複保存や競合を招く。
+- **`ledr-ui` 内モジュール分割の見送り根拠**：ローカル `--timings` 実測において、`ledr-ui` バイナリ（`CGU=16`）は常に `ledr-daemon` バイナリ（`CGU=1`）より約 `15 s`（R2A で約 `15.2 s`、R3-3 で `14.54 s` から `16.25 s`）先に完了しているため、`defense_status` や `updater` を別クレートへ分離してもクリティカルパス上の短縮は `0 s` にとどまる（`apps/ledr-ui/tauri.conf.json` への `removeUnusedCommands` 不追加も継続）。
+
+### CI 自動実行範囲および Release ドライランとウォームアップの実測値
+
+PR #53（`2f1be6e`）では `Release` ウォーム Run `#45669523939` がクリティカルパス `403 s`（`6m 43s`：`preflight` `6 s`、`verify` `203 s`、`build` `388 s`、`package` `9 s`、`LocalEDR-Setup-v0.1.0-win-x64.exe` `4,940,323 B`）を記録し、`win-x64-dev`（`456,227,459 B`、R0 比 `-62.28%`）と `win-x64-release`（`428,970,983 B`、R0 比 `-54.76%`）を確立した。
+続く Phase R2A マージ後の `main`（`3f92057`）および Phase R3-2 マージ後の `main`（`d9c3fdd`）で確認した公式 CI 実績は次のとおりである。
+
+| 対象項目 | 実行識別子 | 実測値（`main` `3f92057` / `d9c3fdd`） | R0 基準と増減 | 基準判定 |
+| :--- | :--- | :--- | :--- | :--- |
+| 通常 CI `rust-windows` ウォーム時間 | Run `#45721565868`（`3f92057`） | **`224 s`（`3m 44s`）**（`520/520` 合格） | R0 `722 s` 比 **`-68.98%`** | **PASS**（目標 `-30%` 以上 `<= 505.4 s`） |
+| `Release` コールド総壁時計時間 | Run `#45752007842`（`3f92057`、`dry_run: true`） | **`489 s`（`8m 09s`）**（`preflight` `5 s`、`verify` `337 s`、`build` `475 s`、`package` `9 s`） | R0 `1,225 s` 比 **`-60.08%`** | **PASS**（目標 `<= 720 s`） |
+| `Release` ウォーム総壁時計時間（1 回目） | Run `#45752918412`（`3f92057`、`dry_run: true`） | **`227 s`（`3m 47s`）**（`preflight` `5 s`、`verify` `129 s`、`build` `210 s`、`package` `12 s`） | R0 `1,225 s` 比 **`-81.47%`** | **PASS**（目標 `<= 360 s`） |
+| `Release` ウォーム総壁時計時間（2 回目） | Run `#45753387980`（`3f92057`、`dry_run: true`） | **`289 s`（`4m 49s`）**（`preflight` `5 s`、`verify` `144 s`、`build` `270 s`、`package` `14 s`） | R0 `1,225 s` 比 **`-76.41%`** | **PASS**（目標 `<= 360 s`） |
+| `win-x64-dev` キャッシュ容量 | ID `11134347442`（`3f92057`） | **`456,448,071 B`（`435.30 MiB`）** | R0 `1,209,659,349 B` 比 **`-62.27%`** | **PASS**（目標 `-50%` 以上削減） |
+| `win-x64-release` キャッシュ容量 | ID `11134406304`（`3f92057`） | **`432,524,087 B`（`412.48 MiB`）** | R0 `948,156,404 B` 比 **`-54.38%`** | **PASS**（目標 `-50%` 以上削減） |
+| NSIS インストーラサイズ（`release-dist`） | Run `#45753387980`（`3f92057`） | **`5,113,715 B`（`4.8768 MiB`）** | R0 `4,941,467 B` 比 `+172,248 B`（**`+3.49%`**） | **PASS**（`<= 128 MiB` かつ `<= +10%`） |
+| `release-warmup.yml` ライブ実行 | Run `#45760466868`（`d9c3fdd`） | **`3m 57s`**（`Warm release build cache` `197 s`、ID `11134406304` へ `full match: true`） | 該当なし | **PASS**（`ci-gate` 非組み込み） |
+
+M5 の `gh cache delete`（`main` 上の `win-x64-dev`、`win-x64-release`、および旧 PR キャッシュ 4 件を削除）後に実行した Run `#45752007842` では、`verify`（`clippy + test` `280 s` + 保存 `29 s`）および `build`（`Build release binaries` `371 s` + 保存 `33 s`）が新規キャッシュを再生成し、続く Run `#45752918412` と `#45753387980` で双方が `full match: true` で復元された（`Build release binaries` `132 s` と `191 s`）。
+Run `#45753387980` の `release-dist` 6 点は `LocalEDR-Setup-v0.1.0-win-x64.exe`（`5,113,715 B`）のほか、`LocalEDR-v0.1.0-win-x64.zip`（`7,268,348 B`）、`LocalEDR-chrome-ext-v0.1.0.zip`（`25,066 B`）、`SHA256SUMS.txt`（`291 B`）、`update-manifest.json`（`859 B`）、および `update-manifest.json.sig`（`191 B`、`dry-run-test`、`verify-dist OK`）すべてで整合を確認した。
+また PR #56（head `2546154`、`main` マージ先 `d9c3fdd`）の最終 `ci.yml` Run `#45759151458` では `windows-packaging-tests`（`test_release_scripts.py` `13/13` を含む）を含む全 5 ジョブが合格した。
+
+### ローカル別途実行範囲の実測値（M5、M6A/M6B、および M6C）
+
+ローカル環境は `Windows 11 Home`（Version `10.0.26300`、64-bit）、`AMD Ryzen 7 7800X3D`（8 物理コア / 16 論理スレッド）、非管理者 PowerShell 5.1（`IsAdmin = False`）、`rustc 1.100.0`、`cargo 1.100.0`、`Python 3.11.9`、`Node v22.18.0` であり、`makensis.exe` は未導入である。
+
+- **ローカルリリースビルド時間（`cargo build --release --locked -p ledr-daemon -p ledr-ui -p ledr-bridge-nm -p ledr-auth-helper --timings`、M5 `3f92057`）**：ワークスペース 10 クレートのみ削除したウォーム 3 回が `50.608 s`、`50.555 s`、`51.737 s`、中央値 **`50.608 s`** となり、R0 中央値 `110.413 s` 比 **`-54.16%`**（目標 `-40%` 以上 `<= 66.248 s` 達成）を記録した（R2A 単体計測時のコールドは `99.410 s`、ウォーム中央値は `48.723 s` で `-55.87%`）。
+- **配布 4 バイナリのバイト数と PE 属性（M5 `3f92057`）**：`ledr-daemon.exe` `8,038,912 B`、`ledr-ui.exe` `11,136,000 B`、`ledr-bridge-nm.exe` `1,054,720 B`、`ledr-auth-helper.exe` `313,344 B`、合計 **`20,542,976 B`（`19.5913 MiB`）** となり、R0 `19,501,568 B` 比 `+1,041,408 B`（**`+0.9932 MiB`**、協議ライン `+2.0 MiB` 以内）に収まった。
+  全 4 バイナリで `machine = 0x8664` と `dll_characteristics = 0x8160`、`ledr-ui.exe` で `.rsrc`（`RT_ICON`、`RT_GROUP_ICON`、`RT_VERSION`、`RT_MANIFEST`）、ならびに全 `Cargo.toml` で `panic = "abort"` 0 件（`AUTO-10`）を確認した。
+- **`L-23` PE 解析（M5 `3f92057`、`scripts/profile_daemon_memory.ps1 -AnalyzePeOnly`）**：直接インポート 20 件中の `wintrust.dll` と `crypt32.dll` はいずれも `0` 件であり、`StaticPathsToWintrust` は `0` 件、`StaticPathsToCrypt32` は OS 側 `wtsapi32.dll -> CRYPT32.dll` の 1 件のみであった。
+- **M5（`3f92057`）の非管理者環境（`IsAdmin = False`）自動検証スイート**：`cargo clippy --workspace --all-targets --locked -- -D warnings`（0 警告）、`cargo test --workspace --no-fail-fast --locked` `518 PASS / 2 FAIL`（非管理者 DACL 制約による `ui_upd_07` と `ui_upd_09` の `os error 5` のみ、CI では `520/520`）、`burst_budget` `3/3` 回（各 `12/12`）、Chrome MV3 拡張テスト `19/19`、UI モック DOM テスト `18/18`、`py_compile`、`test_check_invariants.py` `8/8`、`release_verify.py preflight`、ライブ `check_invariants.py` `101/101`、および `test_release_scripts.py` `11 PASS / 1 ERROR`（非管理者 `SeSecurityPrivilege` 制約の `test_rel_09` のみ、CI では `12/12`）を確認した。
+- **M6A（PR #56 `2546154` / `d9c3fdd`）および M6B クローズ後復元確認（`d9c3fdd`）**：`test_rel_12` 追加後の `test_release_scripts.py` はローカル `12 PASS / 1 ERROR`（CI `windows-packaging-tests` Run `#45759151458` では `13/13`）となり、M6B クローズ後の `d9c3fdd` 復元確認で `cargo clippy --workspace --all-targets --locked -- -D warnings`（0 警告）、`cargo test --workspace --no-fail-fast --locked` `518 PASS / 2 FAIL`、Chrome MV3 `19/19`、UI `18/18`、および `test_check_invariants.py` `8/8` を再確認した。
+- **M6C（本 PR ブランチ `docs/r3-4-follow-up-notes-sync`、Rust および Cargo 無変更）**：`cargo clippy --workspace --all-targets --locked -- -D warnings`（0 警告）、`burst_budget` `3/3` 回（各 `12/12`）、リリース 4 バイナリビルド（`54.141 s`、合計 `20,542,976 B`）、`L-23` PE 解析（直接インポート 20 件中 `wintrust.dll` `0` 件および `crypt32.dll` `0` 件）、`py_compile`、`test_release_scripts.py` `12 PASS / 1 ERROR`、`test_check_invariants.py` `8/8`、`release_verify.py preflight`、`check_invariants.py --base main --paths docs/follow-up-notes.md`（`skipped_empty_diff`）、Chrome MV3 `19/19`、UI `18/18`、および `slop_lint.py`（新規指摘 0 件）を通過した。
+  なお `cargo test --workspace --no-fail-fast --locked` は `517 PASS / 3 FAIL`（`ui_upd_07` と `ui_upd_09` の `os error 5` に加え、既知の非管理者ローカル `findstr.exe` タイミング競合により `sens_p2_13` が `crates/ledr-sensor-win/src/defense/tests.rs:430` で失敗したものであり、本 PR に Rust コード変更はなく PR #56 CI および M5 では通過）となった。
+
+### 管理者および対話デスクトップ検証待ちの項目（最終 `main` 一括実施対象）
+
+- **最終 `main` 上の `L-24` 定常メモリと CPU 実機計測（Pending User Admin Batch）**：Phase R1 から R3-4 を統合した最終 `main` 上での管理者実機計測（`scripts/profile_daemon_memory.ps1` の 600 秒アイドルと 60 秒高負荷）は、非管理者環境制約のため未実施であり、全非管理者作業の完了後に `FU-E2E-01` および `FU-E2E-03` の最終統合 E2E と合わせて一括実施する。
+  Stage 3（`87be6d5`、2026 年 11 月 23 日時点）の記録値（アイドル `PrivateWorkingSetSize` 中央値 `13.0234 MB`、CPU `0.2054%` 等）は `87be6d5` 時点の履歴参照値として区別し、最終 `main` の合格実績としては扱わない。
+- **最終 `main` 上の `L-08` 対話 UI 完全終了（Pending User Interactive Batch）**：最終 `main` 上で `ledr-ui.exe` を実起動し、ウィンドウ閉鎖後に `ledr-ui.exe` と `msedgewebview2.exe` が 0 プロセスで終了する確認は、対話デスクトップセッションを要するため未実施であり、`L-24` と同じく全非管理者作業完了後に一括実施する。
+- **実機 NSIS インストーラ E2E および本番公開**：Windows 10 または Windows 11 クライアント SKU 実機での NSIS 導入とアンインストール、および本番タグ発行時の `publish` ジョブと実署名更新確認は、`FU-P5-01` 記載のとおり本番リリース前後の実機確認対象として残す。

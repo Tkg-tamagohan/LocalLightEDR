@@ -24,7 +24,7 @@
 - **後方互換性の破壊**：`crates/ledr-proto/src/lib.rs` の公開型、列挙バリアント、フレーミング仕様の非互換変更を指摘してください。
 - **権限、認可、署名分離、TOCTOU**：非 `Ping` IPC での `CallerAuthPolicy` と `inspect_uncached` 強制、`ledr-daemon.exe` への `wintrust.dll` や `crypt32.dll` 依存混入、Session 0 からの SYSTEM 権限 UI 起動、リパースポイントやハードリンク（`nNumberOfLinks == 1`）検査の抜け、アンインストール時の未解決サスペンド検査や ACL 設定前のリパース検査漏れを確認してください。
 - **能動防御とカーネル境界の安全性**：`is_never_suspend_process` と `create_time_100ns` 照合の欠落、子孫追跡での PID 再利用境界、WFP 動的セッション（`FWPM_SESSION_FLAG_DYNAMIC`）外への永続フィルタ残留、BFE コールバック内のブロッキング処理、WinHTTP コールバックのライフタイム破綻を確認してください。
-- **並行処理、ロック順序、停止とロールバック**：ロック順序 `firewall -> process_table` の逆転、BFE 呼び出し中のロック保持、部分失敗時のロールバック漏れ、有界チャネル受信端を閉じる前のスレッド `join()`、3 秒停止予算を阻む待機や定期保守の抑止漏れを確認してください。
+- **並行処理、ロック順序、停止とロールバック**：ロック順序 `firewall -> process_table` の逆転、自動事前遮断の直接 `add_wfp_app_rule` 呼び出しでの両ロック保持、その他の BFE 呼び出し（`ensure_policy_block`、ロールバック再登録、`remove_wfp_rule`）での `process_table` ロック保持（`firewall` 保持は正当）、部分失敗時のロールバック漏れ、有界チャネル受信端を閉じる前のスレッド `join()`、3 秒停止予算を阻む待機や定期保守の抑止漏れを確認してください。
 - **アップデータのフェイルクローズ**：署名検証前のパース、許可ホストやリダイレクト上限およびサイズ上限の逸脱、起動時 `update-state.json` 再検証の抜けを指摘してください。
 - **境界値とエラー処理漏れ**：Win32 `HRESULT`（`0x8007xxxx`）変換漏れ、エラーの握り潰し、空入力や上限超過時のフェイルオープンを指摘してください。
 

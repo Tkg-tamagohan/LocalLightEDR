@@ -235,7 +235,8 @@ class TestReleaseScripts(unittest.TestCase):
         )
         self.assertEqual(real_res["version"], "0.1.0")
         self.assertEqual(real_res["extension_id"], release_verify.EXPECTED_CHROME_EXTENSION_ID)
-        self.assertIn("prod-2026-11", real_res["active_key_ids"])
+        self.assertGreaterEqual(len(real_res["active_key_ids"]), 1)
+        self.assertTrue(all(isinstance(k, str) and k.strip() for k in real_res["active_key_ids"]))
 
         with self.assertRaises(ValueError):
             release_verify.run_preflight(

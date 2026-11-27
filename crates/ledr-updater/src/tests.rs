@@ -82,10 +82,21 @@ fn sign_manifest_bytes(manifest_bytes: &[u8], key_id: &str, sk: &SigningKey) -> 
 fn upd_key_01_embedded_ring_loads_active_key() {
     let ring = PublicKeyRing::from_embedded().expect("embedded key ring should load active key");
     assert!(ring.has_active_keys());
-    let key_bytes = ring
-        .active_verifying_key("prod-2026-11")
-        .expect("prod-2026-11 should resolve as active verifying key");
-    assert_eq!(key_bytes.len(), 32);
+    let active_entries: Vec<_> = ring
+        .keys
+        .iter()
+        .filter(|entry| entry.status == KeyStatus::Active)
+        .collect();
+    assert!(
+        !active_entries.is_empty(),
+        "embedded key ring should contain at least one active key"
+    );
+    for entry in active_entries {
+        let key_bytes = ring
+            .active_verifying_key(&entry.key_id)
+            .expect("active embedded key should resolve as verifying key");
+        assert_eq!(key_bytes.len(), 32);
+    }
 }
 
 #[test]

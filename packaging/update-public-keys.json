@@ -2,9 +2,9 @@
   "schema_version": 1,
   "keys": [
     {
-      "key_id": "placeholder-unconfigured",
-      "public_key_b64": "UNCONFIGURED_PLACEHOLDER",
-      "status": "disabled"
+      "key_id": "prod-2026-11",
+      "public_key_b64": "cgtES0ZOV9pXL+BxxnZ92c6YF0QYAKi1dBOTC/2zTE4=",
+      "status": "active"
     }
   ]
 }

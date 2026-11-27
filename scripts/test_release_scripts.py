@@ -231,10 +231,11 @@ class TestReleaseScripts(unittest.TestCase):
             repo_root=REPO_ROOT,
             public_keys_path=REPO_ROOT / "packaging" / "update-public-keys.json",
             expect_tag="v0.1.0",
-            require_active_key=False,
+            require_active_key=True,
         )
         self.assertEqual(real_res["version"], "0.1.0")
         self.assertEqual(real_res["extension_id"], release_verify.EXPECTED_CHROME_EXTENSION_ID)
+        self.assertIn("prod-2026-11", real_res["active_key_ids"])
 
         with self.assertRaises(ValueError):
             release_verify.run_preflight(
@@ -242,16 +243,32 @@ class TestReleaseScripts(unittest.TestCase):
                 public_keys_path=REPO_ROOT / "packaging" / "update-public-keys.json",
                 expect_tag="v9.9.9",
             )
-        with self.assertRaises(ValueError):
-            release_verify.run_preflight(
-                repo_root=REPO_ROOT,
-                public_keys_path=REPO_ROOT / "packaging" / "update-public-keys.json",
-                require_active_key=True,
-            )
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             _, _, pub_keys = _create_mock_repo(tmp_path, "0.2.0")
+            pub_keys.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "keys": [
+                            {
+                                "key_id": "placeholder-unconfigured",
+                                "public_key_b64": "UNCONFIGURED_PLACEHOLDER",
+                                "status": "disabled",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                release_verify.run_preflight(
+                    repo_root=tmp_path,
+                    public_keys_path=pub_keys,
+                    require_active_key=True,
+                )
+
             # Break tauri.conf.json version sync
             tauri_p = tmp_path / "apps" / "ledr-ui" / "tauri.conf.json"
             t = json.loads(tauri_p.read_text(encoding="utf-8"))

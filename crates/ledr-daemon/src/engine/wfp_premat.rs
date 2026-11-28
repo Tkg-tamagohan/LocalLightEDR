@@ -417,15 +417,17 @@ impl DaemonEngine {
         // identity on disk (fresh SHA-256 via `SEC_0005`) whenever any Permit filter is live.
         // If the binary was overwritten or no longer authorized, immediately revoke stale Permit
         // filters and re-evaluate normal block/pre-emptive rules.
-        let (has_permit, has_app_wide_permit) = {
+        let (has_permit, has_app_wide_permit, has_scoped_permit) = {
             let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
             (
                 fw.has_any_permit_filter_for_exe(trimmed),
                 fw.has_active_filter(trimmed, None, true),
+                fw.has_any_scoped_permit_filter_for_exe(trimmed),
             )
         };
-        if has_permit {
+        if has_permit || has_scoped_permit {
             let rules = self.store.list_network_rules().unwrap_or_default();
+            let scoped_rules = self.store.list_scoped_network_rules().unwrap_or_default();
             let identity = match self.inspect_binary_for_pipeline(trimmed) {
                 InspectOutcome::Completed(id) => id,
                 InspectOutcome::Cancelled => return,
@@ -439,7 +441,22 @@ impl DaemonEngine {
                     .iter()
                     .any(|r| network_allow_rule_identity_matches(r, &identity))
             };
-            if !still_authorized {
+            let scoped_still_authorized = !has_scoped_permit
+                || scoped_rules.iter().any(|r| {
+                    r.scope == RuleScope::NetworkAllow
+                        && r.package_family_name
+                            .as_deref()
+                            .zip(r.package_sid.as_deref())
+                            .is_some_and(|(pfn, sid)| {
+                                let mut probe = r.clone();
+                                probe.allowed_target = None;
+                                ledr_rules::matches_package_wide_network_allow(&probe, &identity)
+                                    && !pfn.trim().is_empty()
+                                    && !sid.trim().is_empty()
+                            })
+                });
+            if (has_permit && !still_authorized) || (has_scoped_permit && !scoped_still_authorized)
+            {
                 tracing::warn!(
                     exe_path = %trimmed,
                     sha256 = ?identity.sha256,
@@ -448,8 +465,14 @@ impl DaemonEngine {
                 self.invalidate_non_protected_steady_pids();
                 let _ = self.deploy_persisted_network_rules();
                 let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                if fw.has_any_permit_filter_for_exe(trimmed) {
+                if has_permit && !still_authorized && fw.has_any_permit_filter_for_exe(trimmed) {
                     fw.revoke_permits_for_exe(trimmed, &*self.defense);
+                }
+                if has_scoped_permit
+                    && !scoped_still_authorized
+                    && fw.has_any_scoped_permit_filter_for_exe(trimmed)
+                {
+                    fw.revoke_scoped_permits_for_exe(trimmed, &*self.defense);
                 }
             }
         }

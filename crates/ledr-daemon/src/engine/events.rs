@@ -9,7 +9,8 @@ use ledr_proto::{
     ProcessIdentity, RuleScope, SensorEvent,
 };
 use ledr_rules::{
-    classify_outbound_risk, is_allowed_by_rules, BinaryIdentity, EventContext, OutboundRiskClass,
+    classify_outbound_risk, is_allowed_by_rules, is_allowed_by_scoped_rules, matches_path_pattern,
+    BinaryIdentity, EventContext, OutboundRiskClass, ProcessScopeContext,
 };
 use ledr_sensor_win::ProcessPackageInfo;
 use ledr_store::{ProcessExtraMetadata, StoreError};
@@ -404,7 +405,46 @@ impl DaemonEngine {
             let matches = self
                 .sigma
                 .evaluate_with_image(&ctx, proc_ctx.proc_exe_path.as_deref());
+            let mut suppressed_by_scoped_process_allow = false;
+            if !matches.is_empty() {
+                if let Some(exe_path) = proc_ctx
+                    .proc_exe_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let scoped_proc_rules = self
+                        .store
+                        .list_scoped_rules(Some(RuleScope::ProcessAllow))
+                        .unwrap_or_default();
+                    let has_path_candidate = scoped_proc_rules.iter().any(|r| {
+                        !r.exe_path_pattern.trim().is_empty()
+                            && matches_path_pattern(exe_path, &r.exe_path_pattern)
+                    });
+                    if has_path_candidate {
+                        if let InspectOutcome::Completed(bin_identity) =
+                            self.inspect_binary_for_pipeline(exe_path)
+                        {
+                            let scope_ctx = ProcessScopeContext {
+                                package_family_name: proc_ctx.package_family_name.as_deref(),
+                                package_sid: proc_ctx.package_sid.as_deref(),
+                                command_line: proc_ctx.proc_command_line.as_deref(),
+                            };
+                            suppressed_by_scoped_process_allow = is_allowed_by_scoped_rules(
+                                &bin_identity,
+                                &scope_ctx,
+                                None,
+                                RuleScope::ProcessAllow,
+                                &scoped_proc_rules,
+                            );
+                        }
+                    }
+                }
+            }
             for m in matches {
+                if suppressed_by_scoped_process_allow {
+                    break;
+                }
                 if let Some(ref inst_id) = proc_ctx.proc_instance_id {
                     // Distinct script bodies evaluated in the same process must each be able to
                     // fire an alert; deduplicate per (instance, rule, content fingerprint).
@@ -1071,13 +1111,28 @@ impl DaemonEngine {
         };
 
         let rules = self.store.list_rules(Some(RuleScope::FileCanaryAllow)).unwrap_or_default();
+        let scoped_canary_rules = self
+            .store
+            .list_scoped_rules(Some(RuleScope::FileCanaryAllow))
+            .unwrap_or_default();
+        let scope_ctx = ProcessScopeContext {
+            package_family_name: proc_ctx.package_family_name.as_deref(),
+            package_sid: proc_ctx.package_sid.as_deref(),
+            command_line: proc_ctx.proc_command_line.as_deref(),
+        };
         let allowed = !exe_path.trim().is_empty()
-            && is_allowed_by_rules(
+            && (is_allowed_by_rules(
                 &bin_identity,
                 Some(target_path),
                 RuleScope::FileCanaryAllow,
                 &rules,
-            );
+            ) || is_allowed_by_scoped_rules(
+                &bin_identity,
+                &scope_ctx,
+                Some(target_path),
+                RuleScope::FileCanaryAllow,
+                &scoped_canary_rules,
+            ));
 
         if allowed {
             if let Some(Err(err)) = self.try_store_write(|s| {

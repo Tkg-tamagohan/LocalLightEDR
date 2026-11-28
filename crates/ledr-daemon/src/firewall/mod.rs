@@ -11,8 +11,9 @@ mod types;
 
 pub use manager::WfpRuleManager;
 pub use types::{
-    parse_literal_target_ip, InstalledWfpFilter, PromotedFilterSnapshot, RemovedAppBlockSnapshot,
-    RemovedBlockSnapshot, RemovedDomainFilterSnapshot, WfpFailedOp, WfpFilterOrigin,
+    parse_literal_target_ip, InstalledScopedWfpFilter, InstalledWfpFilter,
+    PromotedFilterSnapshot, RemovedAppBlockSnapshot, RemovedBlockSnapshot,
+    RemovedDomainFilterSnapshot, ScopedWfpTargetKey, WfpFailedOp, WfpFilterOrigin,
     WfpReconcileDnsContext, WfpReconcileReport, WfpTargetKey, MAX_DOMAIN_HINTS_PER_FILTER,
     MAX_DOMAIN_POLICY_FILTERS,
 };

@@ -924,3 +924,91 @@ fn sens_p3_12_net_event_unsubscribe_failure_keeps_context_alive_and_gates_callba
     assert!(!state.enabled_net_events_by_us);
     assert_eq!(disable_calls, 2);
 }
+
+#[test]
+fn wfp_fu_p4_03_track_b2_scoped_filter_specs_weights_and_transaction_rollback() {
+    use ledr_proto::ActiveDefenseController;
+    use std::net::Ipv4Addr;
+    use std::path::Path;
+
+    let bth = Path::new(r"C:\Windows\System32\backgroundTaskHost.exe");
+    let sid_a = "S-1-15-2-111-222-333";
+
+    // Weight hierarchy: Loopback (15) > Block IP (14) > Permit IP (13) > Block Package (12) > Block App (11) > Permit App (10).
+    assert_eq!(WFP_WEIGHT_BLOCK_PACKAGE, 12);
+    const {
+        assert!(WFP_WEIGHT_PERMIT_SPECIFIC > WFP_WEIGHT_BLOCK_PACKAGE);
+        assert!(WFP_WEIGHT_BLOCK_PACKAGE > WFP_WEIGHT_BLOCK_APP);
+        assert!(WFP_WEIGHT_BLOCK_APP > WFP_WEIGHT_PERMIT_APP);
+    }
+
+    // Scoped package-wide Block builds IPv4+IPv6 specs carrying `package_sid` and weight 12.
+    let block_specs = build_wfp_scoped_filter_specs(bth, Some(sid_a), None, false)
+        .expect("build scoped package-wide block specs");
+    assert_eq!(block_specs.len(), 2);
+    assert!(block_specs.iter().all(|s| {
+        s.package_sid.as_deref() == Some(sid_a)
+            && s.weight == WFP_WEIGHT_BLOCK_PACKAGE
+            && s.action == WfpFilterAction::Block
+    }));
+
+    // Scoped Permit builds IPv4+IPv6 specs carrying `package_sid` and weight 10.
+    let permit_specs = build_wfp_scoped_filter_specs(bth, Some(sid_a), None, true)
+        .expect("build scoped package-wide permit specs");
+    assert_eq!(permit_specs.len(), 2);
+    assert!(permit_specs.iter().all(|s| {
+        s.package_sid.as_deref() == Some(sid_a)
+            && s.weight == WFP_WEIGHT_PERMIT_APP
+            && s.action == WfpFilterAction::Permit
+    }));
+
+    // Scoped remote-IP Permit builds single-stack spec with weight 13.
+    let ip_permit_specs = build_wfp_scoped_filter_specs(
+        bth,
+        Some(sid_a),
+        Some(IpAddr::V4(Ipv4Addr::new(20, 42, 65, 88))),
+        true,
+    )
+    .expect("build scoped IP permit spec");
+    assert_eq!(ip_permit_specs.len(), 1);
+    assert_eq!(ip_permit_specs[0].package_sid.as_deref(), Some(sid_a));
+    assert_eq!(ip_permit_specs[0].weight, WFP_WEIGHT_PERMIT_SPECIFIC);
+
+    // Invalid / non-AppContainer SIDs and protected binaries must be rejected fail-closed.
+    assert!(build_wfp_scoped_filter_specs(bth, Some("S-1-5-18"), None, true).is_err());
+    assert!(build_wfp_scoped_filter_specs(bth, Some(""), None, false).is_err());
+    assert!(
+        build_wfp_scoped_filter_specs(
+            Path::new(r"C:\Windows\System32\svchost.exe"),
+            Some(sid_a),
+            None,
+            false
+        )
+        .is_err()
+    );
+
+    // Engine transaction rollback on second filter failure leaves 0 committed filters.
+    let (backend, state) = MockWfpBackend::new_dynamic();
+    state.lock().unwrap().fail_on_layer = Some(WfpLayer::AleAuthConnectV6);
+    let engine = WfpDynamicEngine::from_backend(Box::new(backend)).expect("create mock engine");
+    assert!(
+        engine
+            .add_scoped_app_rule(bth, Some(sid_a), None, false)
+            .is_err(),
+        "second filter failure must abort transaction"
+    );
+    assert_eq!(engine.active_handle_count(), 0);
+    assert!(state.lock().unwrap().committed_filters.is_empty());
+
+    // Success transaction commits both IPv4 + IPv6 scoped filters under one handle.
+    state.lock().unwrap().fail_on_layer = None;
+    let ctrl = crate::WindowsDefenseController::with_wfp_engine(engine);
+    let handle = ctrl
+        .add_wfp_scoped_app_rule(bth, Some(sid_a), None, true)
+        .expect("WindowsDefenseController scoped add succeeds");
+    assert_ne!(handle, 0);
+    assert_eq!(state.lock().unwrap().committed_filters.len(), 2);
+    ctrl.remove_wfp_rule(handle)
+        .expect("remove scoped rule handle");
+    assert!(state.lock().unwrap().committed_filters.is_empty());
+}

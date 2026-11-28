@@ -36,11 +36,25 @@ pub enum WfpFilterOrigin {
 /// Composite key identifying a concrete WFP filter target managed by the daemon (canonical IP).
 pub type WfpTargetKey = (String, Option<IpAddr>);
 
+/// Composite key identifying a package-scoped WFP filter target (`(exe_key, package_sid_key, canonical_ip)`).
+pub type ScopedWfpTargetKey = (String, String, Option<IpAddr>);
+
 /// Metadata for a live WFP rule handle registered via [`ActiveDefenseController`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledWfpFilter {
     pub handle: u64,
     pub exe_path: String,
+    pub allow: bool,
+    pub origin: WfpFilterOrigin,
+}
+
+/// Metadata for a live package-scoped WFP rule handle (`ALE_APP_ID` + `ALE_PACKAGE_ID`, `FU-P4-03`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledScopedWfpFilter {
+    pub handle: u64,
+    pub exe_path: String,
+    pub package_sid: String,
+    pub package_family_name: Option<String>,
     pub allow: bool,
     pub origin: WfpFilterOrigin,
 }
@@ -70,6 +84,7 @@ pub struct RemovedAppBlockSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WfpFailedOp {
     pub exe_key: String,
+    pub package_sid: Option<String>,
     pub remote_ip: Option<IpAddr>,
     pub is_remove: bool,
     pub is_startup_preemptive: bool,
@@ -97,6 +112,7 @@ pub struct PromotedFilterSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedDomainFilterSnapshot {
     pub exe_path: String,
+    pub package_sid: Option<String>,
     pub remote_ip: IpAddr,
     pub allow: bool,
     pub domain_hints: Vec<String>,

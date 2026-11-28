@@ -907,6 +907,26 @@ pub struct AllowlistRuleRecord {
     pub created_by: String,
 }
 
+/// Row representation for the SQLite `scoped_policy_rules` table (`FU-P4-03`).
+///
+/// Kept separate from [`AllowlistRuleRecord`] / `allowlist_rules` so existing rule queries and
+/// legacy clients never fail or fail-open on package/command-line scoped policy entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedPolicyRuleRecord {
+    pub rule_id: String,
+    pub scope: RuleScope,
+    pub exe_path_pattern: String,
+    pub sha256: Option<String>,
+    pub signer_subject: Option<String>,
+    pub root_thumbprint: Option<String>,
+    pub allowed_target: Option<String>,
+    pub package_family_name: Option<String>,
+    pub package_sid: Option<String>,
+    pub command_line_pattern: Option<String>,
+    pub created_at_ms: i64,
+    pub created_by: String,
+}
+
 /// Row representation for the SQLite `download_origins` table (`AUTO-12`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadOriginRecord {
@@ -955,6 +975,20 @@ pub trait ActiveDefenseController: Send + Sync {
         remote_ip: Option<IpAddr>,
         allow: bool,
     ) -> Result<u64, String>;
+    fn add_wfp_scoped_app_rule(
+        &self,
+        exe_path: &Path,
+        package_sid: Option<&str>,
+        remote_ip: Option<IpAddr>,
+        allow: bool,
+    ) -> Result<u64, String> {
+        match package_sid {
+            None => self.add_wfp_app_rule(exe_path, remote_ip, allow),
+            Some(sid) => Err(format!(
+                "scoped WFP rule with package_sid `{sid}` is not supported by this ActiveDefenseController"
+            )),
+        }
+    }
     fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String>;
 }
 
@@ -996,6 +1030,12 @@ pub enum IpcRequest {
         #[serde(default)]
         path_mode: AllowPermanentPathMode,
     },
+    ResolveAlertScoped {
+        alert_id: String,
+        decision: AlertDecision,
+        #[serde(default)]
+        scope_to_package: bool,
+    },
     UpsertRule {
         rule: AllowlistRuleRecord,
     },
@@ -1003,6 +1043,15 @@ pub enum IpcRequest {
         rule_id: String,
     },
     ListRules {
+        scope: Option<RuleScope>,
+    },
+    UpsertScopedRule {
+        rule: ScopedPolicyRuleRecord,
+    },
+    DeleteScopedRule {
+        rule_id: String,
+    },
+    ListScopedRules {
         scope: Option<RuleScope>,
     },
     ReportDownloadOrigin {
@@ -1032,8 +1081,11 @@ impl IpcRequest {
             self,
             Self::ResolveAlert { .. }
                 | Self::ResolveAlertWithOptions { .. }
+                | Self::ResolveAlertScoped { .. }
                 | Self::UpsertRule { .. }
                 | Self::DeleteRule { .. }
+                | Self::UpsertScopedRule { .. }
+                | Self::DeleteScopedRule { .. }
         )
     }
 }
@@ -1049,6 +1101,7 @@ pub enum IpcResponse {
     FlightRecorder(FlightRecorderSnapshot),
     Alerts(Vec<AlertRecord>),
     Rules(Vec<AllowlistRuleRecord>),
+    ScopedRules(Vec<ScopedPolicyRuleRecord>),
     Metrics(PipelineMetrics),
     DomainRisk {
         domain: String,
@@ -1772,5 +1825,104 @@ mod tests {
         // Unknown `path_mode` must be rejected.
         let invalid_mode_json = r#"{"type":"ResolveAlertWithOptions","payload":{"alert_id":"alert-wa-3","decision":"AllowOnce","path_mode":"ArbitraryWildcard"}}"#;
         assert!(serde_json::from_str::<IpcRequest>(invalid_mode_json).is_err());
+    }
+
+    #[test]
+    fn proto_10_scoped_policy_rule_ipc_and_defense_trait_default() {
+        let rule = ScopedPolicyRuleRecord {
+            rule_id: "SCOPED-1".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+            sha256: None,
+            signer_subject: Some("CN=Microsoft Windows".to_string()),
+            root_thumbprint: Some("0123456789ABCDEF0123456789ABCDEF01234567".to_string()),
+            allowed_target: Some("*.microsoft.com".to_string()),
+            package_family_name: Some("Microsoft.StartExperiencesApp_8wekyb3d8bbwe".to_string()),
+            package_sid: Some("S-1-15-2-111-222-333".to_string()),
+            command_line_pattern: None,
+            created_at_ms: 1_700_000_000_999,
+            created_by: "user_triage".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_str::<ScopedPolicyRuleRecord>(&serde_json::to_string(&rule).unwrap())
+                .unwrap(),
+            rule
+        );
+
+        let upsert = IpcRequest::UpsertScopedRule { rule: rule.clone() };
+        let delete = IpcRequest::DeleteScopedRule {
+            rule_id: "SCOPED-1".to_string(),
+        };
+        let list = IpcRequest::ListScopedRules {
+            scope: Some(RuleScope::NetworkAllow),
+        };
+        let resolve = IpcRequest::ResolveAlertScoped {
+            alert_id: "alert-scoped-1".to_string(),
+            decision: AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+            scope_to_package: true,
+        };
+
+        assert!(upsert.requires_ui_authorization());
+        assert!(delete.requires_ui_authorization());
+        assert!(!list.requires_ui_authorization());
+        assert!(resolve.requires_ui_authorization());
+
+        for req in [&upsert, &delete, &list, &resolve] {
+            let frame = encode_ipc_frame(req).expect("encode scoped IPC request");
+            let decoded: IpcRequest = decode_ipc_frame(&frame).expect("decode scoped IPC request");
+            assert_eq!(&decoded, req);
+        }
+
+        let omitted_scope_json =
+            r#"{"type":"ResolveAlertScoped","payload":{"alert_id":"alert-scoped-2","decision":"AllowOnce"}}"#;
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(omitted_scope_json)
+                .expect("omitted scope_to_package defaults to false"),
+            IpcRequest::ResolveAlertScoped {
+                alert_id: "alert-scoped-2".to_string(),
+                decision: AlertDecision::AllowOnce,
+                scope_to_package: false,
+            }
+        );
+
+        let resp = IpcResponse::ScopedRules(vec![rule]);
+        let resp_frame = encode_ipc_frame(&resp).expect("encode ScopedRules");
+        let decoded_resp: IpcResponse = decode_ipc_frame(&resp_frame).expect("decode ScopedRules");
+        assert_eq!(decoded_resp, resp);
+
+        struct LegacyDefenseStub;
+        impl ActiveDefenseController for LegacyDefenseStub {
+            fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+                Ok(())
+            }
+            fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+                Ok(())
+            }
+            fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+                Ok(())
+            }
+            fn add_wfp_app_rule(
+                &self,
+                _: &Path,
+                _: Option<IpAddr>,
+                allow: bool,
+            ) -> Result<u64, String> {
+                Ok(if allow { 101 } else { 202 })
+            }
+            fn remove_wfp_rule(&self, _: u64) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let stub = LegacyDefenseStub;
+        let exe = Path::new(r"C:\Windows\System32\backgroundTaskHost.exe");
+        assert_eq!(stub.add_wfp_scoped_app_rule(exe, None, None, true), Ok(101));
+        assert!(
+            stub.add_wfp_scoped_app_rule(exe, Some("S-1-15-2-111"), None, true)
+                .is_err(),
+            "default add_wfp_scoped_app_rule must fail closed when package_sid is Some"
+        );
     }
 }

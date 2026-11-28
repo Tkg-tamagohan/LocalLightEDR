@@ -30,6 +30,10 @@ pub const WFP_WEIGHT_BLOCK_SPECIFIC: u8 = 14;
 /// while explicit app-wide `NetworkBlock` rules suppress Permits during daemon reconciliation).
 pub const WFP_WEIGHT_PERMIT_SPECIFIC: u8 = 13;
 
+/// Filter weight for a package-scoped (`ALE_APP_ID` + `ALE_PACKAGE_ID`) Block filter
+/// (overrides app-wide Block/Permit while remaining below explicit remote-IP filters).
+pub const WFP_WEIGHT_BLOCK_PACKAGE: u8 = 12;
+
 /// Filter weight for an app-wide Block filter (overrides app-wide Permit).
 pub const WFP_WEIGHT_BLOCK_APP: u8 = 11;
 
@@ -98,6 +102,7 @@ pub struct WfpFilterSpec {
     pub sublayer_guid: GUID,
     pub provider_guid: GUID,
     pub exe_path: String,
+    pub package_sid: Option<String>,
     pub remote_addr: Option<WfpRemoteAddress>,
     pub action: WfpFilterAction,
     pub weight: u8,
@@ -165,12 +170,57 @@ pub fn build_loopback_permit_filter_specs() -> [WfpLoopbackFilterSpec; 2] {
 
 /// Computes the deterministic `FWP_UINT8` filter weight (`0..=15`) for `(remote_ip, allow)`.
 pub const fn compute_filter_weight(has_remote_ip: bool, allow: bool) -> u8 {
-    match (has_remote_ip, allow) {
-        (true, false) => WFP_WEIGHT_BLOCK_SPECIFIC,
-        (true, true) => WFP_WEIGHT_PERMIT_SPECIFIC,
-        (false, false) => WFP_WEIGHT_BLOCK_APP,
-        (false, true) => WFP_WEIGHT_PERMIT_APP,
+    compute_scoped_filter_weight(has_remote_ip, false, allow)
+}
+
+/// Computes the deterministic `FWP_UINT8` filter weight (`0..=15`) for
+/// `(has_remote_ip, has_package_sid, allow)`.
+pub const fn compute_scoped_filter_weight(
+    has_remote_ip: bool,
+    has_package_sid: bool,
+    allow: bool,
+) -> u8 {
+    match (has_remote_ip, has_package_sid, allow) {
+        (true, _, false) => WFP_WEIGHT_BLOCK_SPECIFIC,
+        (true, _, true) => WFP_WEIGHT_PERMIT_SPECIFIC,
+        (false, true, false) => WFP_WEIGHT_BLOCK_PACKAGE,
+        (false, false, false) => WFP_WEIGHT_BLOCK_APP,
+        (false, _, true) => WFP_WEIGHT_PERMIT_APP,
     }
+}
+
+/// Validates and canonicalizes an AppContainer package SID (`S-1-15-2-...`) for WFP
+/// `FWPM_CONDITION_ALE_PACKAGE_ID` (`FWP_SID`) filtering (`FU-P4-03`).
+pub fn validate_wfp_package_sid(package_sid: &str) -> Result<String, String> {
+    let trimmed = package_sid.trim();
+    if trimmed.is_empty()
+        || trimmed != package_sid
+        || trimmed.len() > 256
+        || !trimmed.is_ascii()
+    {
+        return Err(format!(
+            "refusing WFP scoped rule: invalid AppContainer SID `{package_sid}`"
+        ));
+    }
+    let Some(rest) = trimmed
+        .get(..9)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("S-1-15-2-"))
+        .map(|_| &trimmed[9..])
+    else {
+        return Err(format!(
+            "refusing WFP scoped rule: SID `{package_sid}` is not an AppContainer S-1-15-2-* SID"
+        ));
+    };
+    if rest.is_empty()
+        || !rest
+            .split('-')
+            .all(|sub| !sub.is_empty() && sub.bytes().all(|b| b.is_ascii_digit()) && sub.parse::<u32>().is_ok())
+    {
+        return Err(format!(
+            "refusing WFP scoped rule: malformed AppContainer SID `{package_sid}`"
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Normalizes a Windows path for `FwpmGetAppIdFromFileName0` (stripping extended-length `\\?\`
@@ -221,14 +271,30 @@ pub fn build_wfp_filter_specs(
     remote_ip: Option<IpAddr>,
     allow: bool,
 ) -> Result<Vec<WfpFilterSpec>, String> {
+    build_wfp_scoped_filter_specs(exe_path, None, remote_ip, allow)
+}
+
+/// Builds 1 or 2 [`WfpFilterSpec`] items optionally scoped by `FWPM_CONDITION_ALE_PACKAGE_ID`
+/// (`package_sid`) for atomic registration under one opaque `u64` rule handle (`FU-P4-03`).
+pub fn build_wfp_scoped_filter_specs(
+    exe_path: &Path,
+    package_sid: Option<&str>,
+    remote_ip: Option<IpAddr>,
+    allow: bool,
+) -> Result<Vec<WfpFilterSpec>, String> {
     let normalized = validate_wfp_rule_request(exe_path, allow)?;
+    let validated_sid = package_sid.map(validate_wfp_package_sid).transpose()?;
     let action = if allow {
         WfpFilterAction::Permit
     } else {
         WfpFilterAction::Block
     };
     let canonical_remote = remote_ip.map(canonical_wfp_ip);
-    let weight = compute_filter_weight(canonical_remote.is_some(), allow);
+    let weight = compute_scoped_filter_weight(
+        canonical_remote.is_some(),
+        validated_sid.is_some(),
+        allow,
+    );
 
     let specs = match canonical_remote {
         Some(IpAddr::V4(v4)) => vec![WfpFilterSpec {
@@ -236,6 +302,7 @@ pub fn build_wfp_filter_specs(
             sublayer_guid: LEDR_WFP_SUBLAYER_GUID,
             provider_guid: LEDR_WFP_PROVIDER_GUID,
             exe_path: normalized,
+            package_sid: validated_sid,
             remote_addr: Some(WfpRemoteAddress::from_ip(IpAddr::V4(v4))),
             action,
             weight,
@@ -246,6 +313,7 @@ pub fn build_wfp_filter_specs(
             sublayer_guid: LEDR_WFP_SUBLAYER_GUID,
             provider_guid: LEDR_WFP_PROVIDER_GUID,
             exe_path: normalized,
+            package_sid: validated_sid,
             remote_addr: Some(WfpRemoteAddress::from_ip(IpAddr::V6(v6))),
             action,
             weight,
@@ -257,6 +325,7 @@ pub fn build_wfp_filter_specs(
                 sublayer_guid: LEDR_WFP_SUBLAYER_GUID,
                 provider_guid: LEDR_WFP_PROVIDER_GUID,
                 exe_path: normalized.clone(),
+                package_sid: validated_sid.clone(),
                 remote_addr: None,
                 action,
                 weight,
@@ -267,6 +336,7 @@ pub fn build_wfp_filter_specs(
                 sublayer_guid: LEDR_WFP_SUBLAYER_GUID,
                 provider_guid: LEDR_WFP_PROVIDER_GUID,
                 exe_path: normalized,
+                package_sid: validated_sid,
                 remote_addr: None,
                 action,
                 weight,

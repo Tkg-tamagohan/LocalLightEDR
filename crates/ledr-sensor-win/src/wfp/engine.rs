@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use super::backend::{LiveWfpBackend, WfpBackend};
 use super::net_events::{WfpDropSinkFn, WfpFilterMeta};
-use super::spec::build_wfp_filter_specs;
+use super::spec::build_wfp_scoped_filter_specs;
 
 struct WfpEngineState {
     backend: Box<dyn WfpBackend>,
@@ -87,7 +87,19 @@ impl WfpDynamicEngine {
         remote_ip: Option<IpAddr>,
         allow: bool,
     ) -> Result<u64, String> {
-        let specs = build_wfp_filter_specs(exe_path, remote_ip, allow)?;
+        self.add_scoped_app_rule(exe_path, None, remote_ip, allow)
+    }
+
+    /// Atomically adds a dynamic outbound Block or Permit rule for `exe_path` optionally scoped to
+    /// an AppContainer `package_sid` (`FWPM_CONDITION_ALE_PACKAGE_ID`, `FU-P4-03`).
+    pub fn add_scoped_app_rule(
+        &self,
+        exe_path: &Path,
+        package_sid: Option<&str>,
+        remote_ip: Option<IpAddr>,
+        allow: bool,
+    ) -> Result<u64, String> {
+        let specs = build_wfp_scoped_filter_specs(exe_path, package_sid, remote_ip, allow)?;
         let exe_path_norm = specs[0].exe_path.clone();
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
 

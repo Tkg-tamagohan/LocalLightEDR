@@ -8,13 +8,16 @@ use ledr_proto::{
 };
 use ledr_rules::canonical_ip;
 
-use super::types::{InstalledWfpFilter, WfpFilterOrigin, WfpTargetKey};
+use super::types::{
+    InstalledScopedWfpFilter, InstalledWfpFilter, ScopedWfpTargetKey, WfpFilterOrigin, WfpTargetKey,
+};
 
 /// Tracks active dynamic WFP rule handles, alert containment bindings, wildcard/domain rule
 /// presence, startup-pinned pre-restricted executables, and per-process `AllowOnce` grants.
 #[derive(Debug, Default)]
 pub struct WfpRuleManager {
     pub(super) installed: HashMap<WfpTargetKey, InstalledWfpFilter>,
+    pub(super) scoped_installed: HashMap<ScopedWfpTargetKey, InstalledScopedWfpFilter>,
     pub(super) bound_alerts: HashMap<String, WfpTargetKey>,
     once_allowed_processes: HashMap<String, String>,
     pub(super) startup_preemptive_exes: HashMap<String, String>,
@@ -96,6 +99,24 @@ impl WfpRuleManager {
     /// IPv4-mapped IPv6 addresses into IPv4).
     pub fn target_key(exe_path: &str, remote_ip: Option<IpAddr>) -> WfpTargetKey {
         (Self::exe_key(exe_path), remote_ip.map(canonical_ip))
+    }
+
+    /// Normalizes a Windows AppContainer SID string for case-insensitive lookup keys.
+    pub fn package_sid_key(package_sid: &str) -> String {
+        package_sid.trim().to_ascii_uppercase()
+    }
+
+    /// Builds a canonical [`ScopedWfpTargetKey`] for `(exe_path, package_sid, remote_ip)`.
+    pub fn scoped_target_key(
+        exe_path: &str,
+        package_sid: &str,
+        remote_ip: Option<IpAddr>,
+    ) -> ScopedWfpTargetKey {
+        (
+            Self::exe_key(exe_path),
+            Self::package_sid_key(package_sid),
+            remote_ip.map(canonical_ip),
+        )
     }
 
     /// Returns `true` if `exe_path_pattern` contains wildcard metacharacters (`*` or `?`).
@@ -529,6 +550,109 @@ impl WfpRuleManager {
 
     /// Returns the total number of active WFP filter handles currently tracked.
     pub fn active_filter_count(&self) -> usize {
-        self.installed.len()
+        self.installed.len() + self.scoped_installed.len()
+    }
+
+    /// Returns `true` if a package-scoped WFP filter matching
+    /// `(exe_path, package_sid, canonical(remote_ip), allow)` is currently active.
+    pub fn has_active_scoped_filter(
+        &self,
+        exe_path: &str,
+        package_sid: &str,
+        remote_ip: Option<IpAddr>,
+        allow: bool,
+    ) -> bool {
+        let key = Self::scoped_target_key(exe_path, package_sid, remote_ip);
+        self.scoped_installed
+            .get(&key)
+            .is_some_and(|entry| entry.allow == allow)
+    }
+
+    /// Returns `true` if any package-scoped WFP Permit (`allow: true`) filter is active for `exe_path`.
+    pub fn has_any_scoped_permit_filter_for_exe(&self, exe_path: &str) -> bool {
+        let exe_k = Self::exe_key(exe_path);
+        self.scoped_installed
+            .iter()
+            .any(|((k_exe, _, _), entry)| k_exe == &exe_k && entry.allow)
+    }
+
+    /// Returns `true` if a package-scoped block filter is active for `(exe_path, package_sid, None)`.
+    pub fn active_scoped_app_block(&self, exe_path: &str, package_sid: &str) -> Option<u64> {
+        let key = Self::scoped_target_key(exe_path, package_sid, None);
+        self.scoped_installed
+            .get(&key)
+            .filter(|entry| !entry.allow)
+            .map(|entry| entry.handle)
+    }
+
+    /// Removes all live package-scoped WFP Permit (`allow: true`) filters for `exe_path`.
+    pub fn revoke_scoped_permits_for_exe(
+        &mut self,
+        exe_path: &str,
+        defense: &dyn ActiveDefenseController,
+    ) -> usize {
+        let exe_k = Self::exe_key(exe_path);
+        let permit_keys: Vec<ScopedWfpTargetKey> = self
+            .scoped_installed
+            .iter()
+            .filter(|((k_exe, _, _), entry)| k_exe == &exe_k && entry.allow)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut removed = 0usize;
+        for key in permit_keys {
+            if let Some(entry) = self.scoped_installed.get(&key).cloned() {
+                match defense.remove_wfp_rule(entry.handle) {
+                    Ok(()) => {
+                        self.scoped_installed.remove(&key);
+                        removed += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            exe_path = %entry.exe_path,
+                            package_sid = %entry.package_sid,
+                            remote_ip = ?key.2,
+                            wfp_handle = entry.handle,
+                            error = %err,
+                            "failed to revoke stale scoped WFP Permit filter"
+                        );
+                    }
+                }
+            }
+        }
+        removed
+    }
+
+    /// Removes a specific package-scoped WFP Permit (`allow: true`) filter if present.
+    pub fn revoke_scoped_permit_for_target(
+        &mut self,
+        exe_path: &str,
+        package_sid: &str,
+        remote_ip: Option<IpAddr>,
+        defense: &dyn ActiveDefenseController,
+    ) -> bool {
+        let key = Self::scoped_target_key(exe_path, package_sid, remote_ip);
+        let Some(entry) = self.scoped_installed.get(&key).cloned() else {
+            return false;
+        };
+        if !entry.allow {
+            return false;
+        }
+        match defense.remove_wfp_rule(entry.handle) {
+            Ok(()) => {
+                self.scoped_installed.remove(&key);
+                true
+            }
+            Err(err) => {
+                tracing::warn!(
+                    exe_path = %entry.exe_path,
+                    package_sid = %entry.package_sid,
+                    remote_ip = ?key.2,
+                    wfp_handle = entry.handle,
+                    error = %err,
+                    "failed to revoke stale scoped target WFP Permit filter"
+                );
+                false
+            }
+        }
     }
 }

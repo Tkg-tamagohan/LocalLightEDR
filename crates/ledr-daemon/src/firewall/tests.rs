@@ -5,7 +5,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use ledr_proto::{ActiveDefenseController, AllowlistRuleRecord, ProcessIdentity, RuleScope};
+use ledr_proto::{
+    ActiveDefenseController, AllowlistRuleRecord, ProcessIdentity, RuleScope, ScopedPolicyRuleRecord,
+};
 use ledr_rules::BinaryIdentity;
 
 use crate::engine::BinaryInspector;
@@ -108,6 +110,15 @@ impl ActiveDefenseController for StubDefense {
             return Err(format!("mock WFP add failure for {s}"));
         }
         Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
+    }
+    fn add_wfp_scoped_app_rule(
+        &self,
+        exe_path: &Path,
+        _package_sid: Option<&str>,
+        remote_ip: Option<IpAddr>,
+        allow: bool,
+    ) -> Result<u64, String> {
+        self.add_wfp_app_rule(exe_path, remote_ip, allow)
     }
     fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
         if *self.fail_removes.lock().expect("lock fail_removes") {
@@ -2284,4 +2295,82 @@ fn firewall_fu_p3_01_mixed_evicted_and_new_cohosted_hints_evicts_only_one_extra_
     assert!(!expected.iter().any(|h| h == "c00"));
     assert!(!expected.iter().any(|h| h == "c01"));
     assert_eq!(expected.last().map(String::as_str), Some("c99"));
+}
+
+#[test]
+fn firewall_fu_p4_03_b2_scoped_domain_block_survives_unrelated_reconcile_and_removes_on_delete() {
+    let mut fw = WfpRuleManager::new();
+    let defense = StubDefense::new();
+    let sha = "e".repeat(64);
+    let inspector = StubInspector(sha.clone());
+    let bth = r"C:\Windows\System32\backgroundTaskHost.exe";
+    let sid_a = "S-1-15-2-111-222-333";
+    let pfn_a = "Contoso.PkgA_8wekyb3d8bbwe";
+    let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 99));
+
+    let block_handle = fw
+        .ensure_scoped_domain_policy_block(bth, sid_a, Some(pfn_a), ip, &["evil.example"], &defense)
+        .expect("install scoped domain policy block");
+    assert!(fw.has_active_scoped_filter(bth, sid_a, Some(ip), false));
+
+    let scoped_block_rule = ScopedPolicyRuleRecord {
+        rule_id: "SC-DOM-BLOCK-1".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: bth.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("evil.example".to_string()),
+        package_family_name: Some(pfn_a.to_string()),
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_000,
+        created_by: "test".to_string(),
+    };
+    let unrelated_rule = make_network_rule(
+        "UNRELATED-1",
+        RuleScope::NetworkBlock,
+        r"C:\Tools\unrelated.exe",
+        Some(&sha),
+        Some("203.0.113.50"),
+        1_750_000_000_001,
+    );
+
+    // Unrelated reconciliation while `SC-DOM-BLOCK-1` exists must preserve the scoped DomainPolicy block.
+    let rep_keep = fw.reconcile_persisted_rules_with_scoped(
+        std::slice::from_ref(&unrelated_rule),
+        None,
+        std::slice::from_ref(&scoped_block_rule),
+        None,
+        &[],
+        &WfpReconcileDnsContext::default(),
+        &inspector,
+        &defense,
+    );
+    assert_eq!(rep_keep.failed, 0);
+    assert!(
+        fw.has_active_scoped_filter(bth, sid_a, Some(ip), false),
+        "scoped domain policy block must survive unrelated reconciliation"
+    );
+    assert!(!defense.removed.lock().unwrap().contains(&block_handle));
+
+    // Reconciling after deleting `SC-DOM-BLOCK-1` must remove the scoped DomainPolicy block.
+    let rep_drop = fw.reconcile_persisted_rules_with_scoped(
+        &[unrelated_rule],
+        None,
+        &[],
+        Some(&[scoped_block_rule]),
+        &[],
+        &WfpReconcileDnsContext::default(),
+        &inspector,
+        &defense,
+    );
+    assert_eq!(rep_drop.failed, 0);
+    assert!(!fw.has_active_scoped_filter(bth, sid_a, Some(ip), false));
+    assert!(defense.removed.lock().unwrap().contains(&block_handle));
+    assert_eq!(rep_drop.removed_domain_filters.len(), 1);
+    assert_eq!(
+        rep_drop.removed_domain_filters[0].package_sid.as_deref(),
+        Some(sid_a)
+    );
 }

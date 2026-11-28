@@ -28,11 +28,15 @@ pub(super) fn caller_auth_policy_for_request(req: &IpcRequest) -> CallerAuthPoli
         IpcRequest::Ping => CallerAuthPolicy::Public,
         IpcRequest::ResolveAlert { .. }
         | IpcRequest::ResolveAlertWithOptions { .. }
+        | IpcRequest::ResolveAlertScoped { .. }
         | IpcRequest::UpsertRule { .. }
         | IpcRequest::DeleteRule { .. }
+        | IpcRequest::UpsertScopedRule { .. }
+        | IpcRequest::DeleteScopedRule { .. }
         | IpcRequest::GetFlightRecorder { .. }
         | IpcRequest::GetAlerts { .. }
         | IpcRequest::ListRules { .. }
+        | IpcRequest::ListScopedRules { .. }
         | IpcRequest::GetPipelineMetrics => CallerAuthPolicy::UiOnly,
         IpcRequest::ReportDownloadOrigin { .. } | IpcRequest::ReportBrowserEvent { .. } => {
             CallerAuthPolicy::BridgeOnly
@@ -156,6 +160,10 @@ pub(super) fn dispatch_request(
             Ok(rules) => IpcResponse::Rules(rules),
             Err(err) => store_error_response(err),
         },
+        IpcRequest::ListScopedRules { scope } => match store.list_scoped_rules(scope) {
+            Ok(rules) => IpcResponse::ScopedRules(rules),
+            Err(err) => store_error_response(err),
+        },
         IpcRequest::GetPipelineMetrics => IpcResponse::Metrics(engine.metrics()),
         IpcRequest::CheckDomainRisk { domain } => {
             let assessment = engine.assess_domain(&domain);
@@ -184,19 +192,16 @@ pub(super) fn dispatch_request(
             decision,
             path_mode,
         ),
+        IpcRequest::ResolveAlertScoped {
+            alert_id,
+            decision,
+            scope_to_package,
+        } => resolve_alert_scoped_ipc_response(engine, &alert_id, decision, scope_to_package),
         IpcRequest::UpsertRule { rule } => match engine.upsert_policy_rule(&rule) {
             Ok(_report) => IpcResponse::Ack {
                 message: format!("upserted rule {}", rule.rule_id),
             },
-            Err(PolicyRuleError::Invalid(msg)) => IpcResponse::Error {
-                code: "INVALID_RULE".to_string(),
-                message: msg,
-            },
-            Err(PolicyRuleError::FirewallSync(msg)) => IpcResponse::Error {
-                code: "WFP_SYNC_ERROR".to_string(),
-                message: msg,
-            },
-            Err(PolicyRuleError::Store(err)) => store_error_response(err),
+            Err(err) => policy_rule_error_response(err),
         },
         IpcRequest::DeleteRule { rule_id } => match engine.delete_policy_rule(&rule_id) {
             Ok((true, _report)) => IpcResponse::Ack {
@@ -206,16 +211,26 @@ pub(super) fn dispatch_request(
                 code: "NOT_FOUND".to_string(),
                 message: format!("rule {rule_id} not found"),
             },
-            Err(PolicyRuleError::FirewallSync(msg)) => IpcResponse::Error {
-                code: "WFP_SYNC_ERROR".to_string(),
-                message: msg,
-            },
-            Err(PolicyRuleError::Invalid(msg)) => IpcResponse::Error {
-                code: "INVALID_RULE".to_string(),
-                message: msg,
-            },
-            Err(PolicyRuleError::Store(err)) => store_error_response(err),
+            Err(err) => policy_rule_error_response(err),
         },
+        IpcRequest::UpsertScopedRule { rule } => match engine.upsert_scoped_policy_rule(&rule) {
+            Ok(_report) => IpcResponse::Ack {
+                message: format!("upserted scoped rule {}", rule.rule_id),
+            },
+            Err(err) => policy_rule_error_response(err),
+        },
+        IpcRequest::DeleteScopedRule { rule_id } => {
+            match engine.delete_scoped_policy_rule(&rule_id) {
+                Ok((true, _report)) => IpcResponse::Ack {
+                    message: format!("deleted scoped rule {rule_id}"),
+                },
+                Ok((false, _)) => IpcResponse::Error {
+                    code: "NOT_FOUND".to_string(),
+                    message: format!("scoped rule {rule_id} not found"),
+                },
+                Err(err) => policy_rule_error_response(err),
+            }
+        }
         IpcRequest::ReportDownloadOrigin {
             file_path,
             tab_url,
@@ -265,23 +280,38 @@ pub(super) fn browser_report_error_response(err: BrowserReportError) -> IpcRespo
     }
 }
 
-fn resolve_alert_ipc_response(
+fn resolve_alert_scoped_ipc_response(
     engine: &DaemonEngine,
-    request_name: &str,
     alert_id: &str,
     decision: AlertDecision,
-    path_mode: AllowPermanentPathMode,
+    scope_to_package: bool,
 ) -> IpcResponse {
     tracing::info!(
         alert_id = %alert_id,
         decision = decision_label(&decision),
-        path_mode = ?path_mode,
-        request = request_name,
+        scope_to_package,
+        request = "ResolveAlertScoped",
         "received alert resolve IPC request"
     );
     let wants_block_rule =
         matches!(decision, AlertDecision::TerminateAndBlock { add_block_rule: true });
-    match engine.resolve_alert_with_options_and_outcome(alert_id, decision, path_mode) {
+    format_resolve_alert_outcome(
+        alert_id,
+        "ResolveAlertScoped",
+        wants_block_rule,
+        scope_to_package,
+        engine.resolve_alert_scoped_with_outcome(alert_id, decision, scope_to_package),
+    )
+}
+
+fn format_resolve_alert_outcome(
+    alert_id: &str,
+    request_name: &str,
+    wants_block_rule: bool,
+    scope_to_package: bool,
+    res: Result<crate::engine::ResolvedAlertOutcome, String>,
+) -> IpcResponse {
+    match res {
         Ok(outcome) => {
             tracing::info!(
                 alert_id = %outcome.alert.alert_id,
@@ -299,7 +329,13 @@ fn resolve_alert_ipc_response(
             if let Some(rule_id) = outcome.saved_rule_id.as_deref() {
                 message.push_str(&format!("; rule {rule_id} saved"));
             } else if wants_block_rule {
-                message.push_str("; no NetworkBlock rule saved (executable path unresolved)");
+                if scope_to_package {
+                    message.push_str(
+                        "; no scoped NetworkBlock rule saved (non-AppContainer or unresolved package)",
+                    );
+                } else {
+                    message.push_str("; no NetworkBlock rule saved (executable path unresolved)");
+                }
             }
             IpcResponse::Ack { message }
         }
@@ -324,6 +360,45 @@ fn resolve_alert_ipc_response(
             }
         }
     }
+}
+
+fn policy_rule_error_response(err: PolicyRuleError) -> IpcResponse {
+    match err {
+        PolicyRuleError::Invalid(msg) => IpcResponse::Error {
+            code: "INVALID_RULE".to_string(),
+            message: msg,
+        },
+        PolicyRuleError::FirewallSync(msg) => IpcResponse::Error {
+            code: "WFP_SYNC_ERROR".to_string(),
+            message: msg,
+        },
+        PolicyRuleError::Store(err) => store_error_response(err),
+    }
+}
+
+fn resolve_alert_ipc_response(
+    engine: &DaemonEngine,
+    request_name: &str,
+    alert_id: &str,
+    decision: AlertDecision,
+    path_mode: AllowPermanentPathMode,
+) -> IpcResponse {
+    tracing::info!(
+        alert_id = %alert_id,
+        decision = decision_label(&decision),
+        path_mode = ?path_mode,
+        request = request_name,
+        "received alert resolve IPC request"
+    );
+    let wants_block_rule =
+        matches!(decision, AlertDecision::TerminateAndBlock { add_block_rule: true });
+    format_resolve_alert_outcome(
+        alert_id,
+        request_name,
+        wants_block_rule,
+        false,
+        engine.resolve_alert_with_options_and_outcome(alert_id, decision, path_mode),
+    )
 }
 
 fn decision_label(decision: &AlertDecision) -> &'static str {
@@ -385,6 +460,16 @@ mod tests {
         }
 
         fn add_wfp_app_rule(&self, _: &Path, _: Option<IpAddr>, _: bool) -> Result<u64, String> {
+            Ok(1)
+        }
+
+        fn add_wfp_scoped_app_rule(
+            &self,
+            _: &Path,
+            _: Option<&str>,
+            _: Option<IpAddr>,
+            _: bool,
+        ) -> Result<u64, String> {
             Ok(1)
         }
 
@@ -503,6 +588,15 @@ mod tests {
                 },
             ),
             (
+                "ResolveAlertScoped",
+                CallerAuthPolicy::UiOnly,
+                IpcRequest::ResolveAlertScoped {
+                    alert_id: "missing-alert".to_string(),
+                    decision: AlertDecision::AllowOnce,
+                    scope_to_package: true,
+                },
+            ),
+            (
                 "UpsertRule",
                 CallerAuthPolicy::UiOnly,
                 IpcRequest::UpsertRule {
@@ -514,6 +608,33 @@ mod tests {
                 CallerAuthPolicy::UiOnly,
                 IpcRequest::DeleteRule {
                     rule_id: "R-DISPATCH-TEST".to_string(),
+                },
+            ),
+            (
+                "UpsertScopedRule",
+                CallerAuthPolicy::UiOnly,
+                IpcRequest::UpsertScopedRule {
+                    rule: ledr_proto::ScopedPolicyRuleRecord {
+                        rule_id: "SC-DISPATCH-TEST".to_string(),
+                        scope: RuleScope::NetworkBlock,
+                        exe_path_pattern: r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+                        sha256: None,
+                        signer_subject: None,
+                        root_thumbprint: None,
+                        allowed_target: None,
+                        package_family_name: None,
+                        package_sid: Some("S-1-15-2-100-200".to_string()),
+                        command_line_pattern: None,
+                        created_at_ms: 1_750_000_000_000,
+                        created_by: "dispatch_test".to_string(),
+                    },
+                },
+            ),
+            (
+                "DeleteScopedRule",
+                CallerAuthPolicy::UiOnly,
+                IpcRequest::DeleteScopedRule {
+                    rule_id: "SC-DISPATCH-TEST".to_string(),
                 },
             ),
             (
@@ -536,6 +657,11 @@ mod tests {
                 "ListRules",
                 CallerAuthPolicy::UiOnly,
                 IpcRequest::ListRules { scope: None },
+            ),
+            (
+                "ListScopedRules",
+                CallerAuthPolicy::UiOnly,
+                IpcRequest::ListScopedRules { scope: None },
             ),
             (
                 "GetPipelineMetrics",
@@ -929,6 +1055,157 @@ mod tests {
         assert!(
             matches!(err_resp, IpcResponse::Error { ref code, .. } if code == "RESOLVE_ERROR"),
             "expected RESOLVE_ERROR, got {err_resp:?}"
+        );
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn scoped_rule_crud_and_resolve_alert_scoped_enforce_ui_only_and_isolate_legacy() {
+        let inspector = Arc::new(SpyBinaryInspector::with_authenticode(Some(
+            test_authenticode(),
+        )));
+        let engine = build_engine(false, Arc::clone(&inspector));
+        let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+        let sid_a = "S-1-15-2-100-200-300";
+
+        let scoped_rule = ledr_proto::ScopedPolicyRuleRecord {
+            rule_id: "SC-ROUNDTRIP-01".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: bth_exe.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("evil.example".to_string()),
+            package_family_name: Some("Contoso.PkgA_8wekyb3d8bbwe".to_string()),
+            package_sid: Some(sid_a.to_string()),
+            command_line_pattern: None,
+            created_at_ms: 1_750_000_000_100,
+            created_by: "dispatch_test".to_string(),
+        };
+
+        // 1. Upsert -> ListScopedRules -> legacy ListRules untouched -> Delete -> second Delete NOT_FOUND.
+        let upsert_req = IpcRequest::UpsertScopedRule {
+            rule: scoped_rule.clone(),
+        };
+        assert_eq!(
+            caller_auth_policy_for_request(&upsert_req),
+            CallerAuthPolicy::UiOnly
+        );
+        for denied in [None, Some(r"C:\Temp\rogue.exe"), Some(AUTHORIZED_BRIDGE_EXE_PATH)] {
+            let resp = dispatch_request(&engine, denied, upsert_req.clone());
+            assert!(
+                matches!(resp, IpcResponse::Error { ref code, .. } if code == "UNAUTHORIZED"),
+                "expected UNAUTHORIZED for {denied:?}, got {resp:?}"
+            );
+        }
+        let upsert_ok = dispatch_request(&engine, Some(AUTHORIZED_UI_EXE_PATH), upsert_req);
+        assert!(
+            matches!(upsert_ok, IpcResponse::Ack { ref message } if message.contains("SC-ROUNDTRIP-01")),
+            "expected Ack for UpsertScopedRule, got {upsert_ok:?}"
+        );
+
+        let list_scoped = dispatch_request(
+            &engine,
+            Some(AUTHORIZED_UI_EXE_PATH),
+            IpcRequest::ListScopedRules { scope: None },
+        );
+        match list_scoped {
+            IpcResponse::ScopedRules(rules) => {
+                assert_eq!(rules.len(), 1);
+                assert_eq!(rules[0].rule_id, "SC-ROUNDTRIP-01");
+            }
+            other => panic!("expected ScopedRules response, got {other:?}"),
+        }
+
+        let list_legacy = dispatch_request(
+            &engine,
+            Some(AUTHORIZED_UI_EXE_PATH),
+            IpcRequest::ListRules { scope: None },
+        );
+        match list_legacy {
+            IpcResponse::Rules(rules) => assert!(rules.is_empty(), "legacy rules must stay isolated"),
+            other => panic!("expected legacy Rules response, got {other:?}"),
+        }
+
+        let del_ok = dispatch_request(
+            &engine,
+            Some(AUTHORIZED_UI_EXE_PATH),
+            IpcRequest::DeleteScopedRule {
+                rule_id: "SC-ROUNDTRIP-01".to_string(),
+            },
+        );
+        assert!(matches!(del_ok, IpcResponse::Ack { .. }), "got {del_ok:?}");
+
+        let del_missing = dispatch_request(
+            &engine,
+            Some(AUTHORIZED_UI_EXE_PATH),
+            IpcRequest::DeleteScopedRule {
+                rule_id: "SC-ROUNDTRIP-01".to_string(),
+            },
+        );
+        assert!(
+            matches!(del_missing, IpcResponse::Error { ref code, .. } if code == "NOT_FOUND"),
+            "expected NOT_FOUND on second delete, got {del_missing:?}"
+        );
+
+        // 2. ResolveAlertScoped enforces UiOnly and creates scoped NetworkAllow on authorized UI call.
+        let alert_id = "ALERT-SCOPED-DISPATCH-01";
+        let alert = AlertRecord {
+            alert_id: alert_id.to_string(),
+            timestamp_ms: 1_750_000_000_200,
+            severity: AlertSeverity::Medium,
+            source_layer: "LAYER_3_NETWORK".to_string(),
+            rule_id: "NET_OUTBOUND_ENFORCE".to_string(),
+            title: "Outbound connection".to_string(),
+            process_instance_id: Some("4201:133000000000000000".to_string()),
+            process_suspended: false,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": bth_exe,
+                "signer_subject": "CN=Microsoft Windows",
+                "root_thumbprint": "0123456789ABCDEF0123456789ABCDEF01234567",
+                "package_family_name": "Contoso.PkgA_8wekyb3d8bbwe",
+                "package_sid": sid_a,
+                "dst_ip": "198.51.100.44",
+                "dst_port": 443
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        };
+        engine.store().record_alert(&alert).expect("record alert");
+        let resolve_req = IpcRequest::ResolveAlertScoped {
+            alert_id: alert_id.to_string(),
+            decision: AlertDecision::AllowPermanent {
+                use_signer_if_available: true,
+                allow_dest: Some("api.contoso.com".to_string()),
+            },
+            scope_to_package: true,
+        };
+        assert_eq!(
+            caller_auth_policy_for_request(&resolve_req),
+            CallerAuthPolicy::UiOnly
+        );
+        for denied in [None, Some(r"C:\Temp\rogue.exe"), Some(AUTHORIZED_BRIDGE_EXE_PATH)] {
+            let resp = dispatch_request(&engine, denied, resolve_req.clone());
+            assert!(
+                matches!(resp, IpcResponse::Error { ref code, .. } if code == "UNAUTHORIZED"),
+                "expected UNAUTHORIZED for {denied:?}, got {resp:?}"
+            );
+        }
+        let resolve_ok = dispatch_request(&engine, Some(AUTHORIZED_UI_EXE_PATH), resolve_req);
+        assert!(
+            matches!(resolve_ok, IpcResponse::Ack { ref message } if message.contains("APPROVED_RULE") && message.contains("RULE-SCOPED-ALLOW-")),
+            "expected Ack with scoped rule, got {resolve_ok:?}"
+        );
+        assert!(engine.store().list_rules(None).expect("legacy rules").is_empty());
+        assert_eq!(
+            engine
+                .store()
+                .list_scoped_rules(Some(RuleScope::NetworkAllow))
+                .expect("scoped rules")
+                .len(),
+            1
         );
 
         engine.shutdown_and_flush().await.expect("shutdown");

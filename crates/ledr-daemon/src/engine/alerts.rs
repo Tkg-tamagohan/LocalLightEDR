@@ -2782,4 +2782,181 @@ mod tests {
 
         engine.shutdown_and_flush().await.expect("shutdown");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_policy_upsert_and_process_stop_preserves_deferred_preemptive_removal() {
+        let defense = Arc::new(MockDefense::new());
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let exe_a = r"C:\Users\Alice\Downloads\ContosoConcurrentA.exe";
+        let exe_b = r"C:\Users\Alice\Downloads\ContosoConcurrentB.exe";
+        let signer = "CN=Contoso Tools";
+        let root_tp = "0123456789ABCDEF0123456789ABCDEF01234567";
+        inspector.insert(BinaryIdentity {
+            exe_path: exe_a.to_string(),
+            sha256: Some("a".repeat(64)),
+            authenticode: Some(auth_info(signer, root_tp)),
+        });
+        inspector.insert(BinaryIdentity {
+            exe_path: exe_b.to_string(),
+            sha256: Some("b".repeat(64)),
+            authenticode: Some(auth_info(signer, root_tp)),
+        });
+
+        let p_a = ProcessIdentity::new(4301, 133_000_000_000_000_401);
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: p_a,
+                parent_pid: 4,
+                exe_path: exe_a.to_string(),
+                command_line: exe_a.to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        let alert_a = make_alert(
+            "ALT-CONC-A",
+            "LAYER_3_NETWORK",
+            Some(&p_a.instance_id()),
+            serde_json::json!({
+                "exe_path": exe_a,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "dst_ip": "198.51.100.10"
+            }),
+        );
+        engine.store().record_alert(&alert_a).expect("record alert");
+        {
+            let mut fw = engine
+                .firewall
+                .try_lock()
+                .expect("firewall try_lock before concurrent race");
+            assert!(fw.bind_alert_to_app_block("ALT-CONC-A", exe_a));
+        }
+
+        // Hold `firewall` inside `spawn_blocking` while a second thread executes
+        // `upsert_policy_rule` for unrelated App B. Because
+        // `deploy_persisted_network_rules_with_baseline` must acquire `firewall` BEFORE snapshotting
+        // `process_table`, the second thread blocks before taking its liveness snapshot and cannot
+        // wipe `deferred_preemptive_removals` created during `ProcessStop`.
+        let engine_race = Arc::clone(&engine);
+        let defense_race = Arc::clone(&defense);
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread,
+            "concurrent lock race test requires multi-threaded Tokio runtime"
+        );
+        tokio::task::spawn_blocking(move || {
+            let mut fw_guard = engine_race
+                .firewall
+                .try_lock()
+                .expect("acquire firewall guard for deterministic interleaving");
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let engine_bg = Arc::clone(&engine_race);
+            let rule_b = ledr_proto::AllowlistRuleRecord {
+                rule_id: "RULE-CONC-B".to_string(),
+                scope: RuleScope::NetworkAllow,
+                exe_path_pattern: exe_b.to_string(),
+                sha256: Some("b".repeat(64)),
+                signer_subject: Some(signer.to_string()),
+                root_thumbprint: Some(root_tp.to_string()),
+                allowed_target: Some("198.51.100.20".to_string()),
+                created_at_ms: 1_750_000_000_000,
+                created_by: "user_manual".to_string(),
+            };
+            let bg_handle = std::thread::spawn(move || {
+                let res = engine_bg.upsert_policy_rule(&rule_b);
+                let _ = done_tx.send(res);
+            });
+
+            let wait_dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while engine_race
+                .store()
+                .get_rule("RULE-CONC-B")
+                .expect("query RULE-CONC-B")
+                .is_none()
+            {
+                assert!(
+                    std::time::Instant::now() < wait_dl,
+                    "timed out waiting for upsert_policy_rule to enter WFP reconciliation"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            // Allow the background thread to reach `deploy_persisted_network_rules_with_baseline`.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+
+            // Simulate `ProcessStop` completing under `firewall -> process_table` lock order while
+            // the background sync waits on `firewall`.
+            {
+                let mut table = engine_race
+                    .process_table
+                    .try_lock()
+                    .expect("process_table must not be locked ahead of firewall by policy sync");
+                let stopped = table.on_process_stop(p_a.pid, crate::engine::current_unix_ms());
+                assert!(stopped.is_some());
+            }
+            assert!(!fw_guard.remove_preemptive_block_if_unused(exe_a, &*defense_race));
+            assert!(fw_guard.has_deferred_preemptive_removal(exe_a));
+            drop(fw_guard);
+
+            let upsert_res = done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("upsert_policy_rule must finish within bounded timeout");
+            assert!(upsert_res.is_ok(), "upsert_policy_rule failed: {upsert_res:?}");
+            bg_handle.join().expect("join background upsert thread");
+
+            let check_dl = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match engine_race.firewall.try_lock() {
+                    Ok(fw) => {
+                        assert!(
+                            fw.has_deferred_preemptive_removal(exe_a),
+                            "concurrent policy sync must preserve deferred_preemptive_removals for stopped App A"
+                        );
+                        assert!(fw.active_app_block(exe_a).is_some());
+                        break;
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        assert!(
+                            std::time::Instant::now() < check_dl,
+                            "timed out acquiring firewall lock"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(std::sync::TryLockError::Poisoned(e)) => {
+                        panic!("firewall poisoned: {e}")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("spawn_blocking race task panicked");
+
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-CONC-A",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: Some("198.51.100.10".to_string()),
+                },
+                AllowPermanentPathMode::Exact,
+            )
+            .expect("dest-scoped approval succeeds");
+
+        {
+            let fw = engine
+                .firewall
+                .try_lock()
+                .expect("firewall try_lock after alert resolve");
+            assert!(
+                fw.active_app_block(exe_a).is_none(),
+                "stopped App A must release its Preemptive block after final alert resolves"
+            );
+            assert!(!fw.has_deferred_preemptive_removal(exe_a));
+        }
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
 }

@@ -15,11 +15,12 @@ use ipc::{
     parse_ack_response, parse_alerts_response, parse_flight_recorder_response,
     parse_metrics_response, parse_ping_response, parse_rules_response,
 };
+use commands::ResolveAlertInvokePayload;
 use ledr_proto::{
-    AlertDecision, AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord, CanaryCategory,
-    DnsQueryRecord, FileCanaryEventRecord, FlightRecorderSnapshot, IpcRequest, IpcResponse,
-    NetworkEventRecord, PipelineMetrics, ProcessRecord, RuleScope, decode_ipc_frame,
-    encode_ipc_frame,
+    AlertDecision, AlertRecord, AlertSeverity, AlertStatus, AllowPermanentPathMode,
+    AllowlistRuleRecord, CanaryCategory, DnsQueryRecord, FileCanaryEventRecord,
+    FlightRecorderSnapshot, IpcRequest, IpcResponse, NetworkEventRecord, PipelineMetrics,
+    ProcessRecord, RuleScope, decode_ipc_frame, encode_ipc_frame,
 };
 use notify::{
     ToastAlertSummary, base64_encode, build_notify_oneshot_event, build_winrt_toast_xml,
@@ -726,6 +727,146 @@ fn ui_p2_04_ipc_resolve_alert_all_decisions_roundtrip() {
     .expect("missing alert roundtrip");
     let err = parse_ack_response(err_resp).expect_err("not found returns Err");
     assert!(err.contains("NOT_FOUND"));
+}
+
+#[test]
+fn ui_p4_resolve_alert_invoke_payload_camel_case_binding() {
+    let wildcard_json = r#"{
+        "alertId": "alert-wa-1",
+        "decision": {
+            "AllowPermanent": {
+                "use_signer_if_available": true,
+                "allow_dest": null
+            }
+        },
+        "pathMode": "WindowsAppsVersionWildcard"
+    }"#;
+    let parsed_wildcard: ResolveAlertInvokePayload =
+        serde_json::from_str(wildcard_json).expect("WindowsAppsVersionWildcard payload should bind");
+    assert_eq!(parsed_wildcard.alert_id, "alert-wa-1");
+    assert_eq!(
+        parsed_wildcard.decision,
+        AlertDecision::AllowPermanent {
+            use_signer_if_available: true,
+            allow_dest: None,
+        }
+    );
+    assert_eq!(
+        parsed_wildcard.path_mode,
+        AllowPermanentPathMode::WindowsAppsVersionWildcard
+    );
+
+    let omitted_json = r#"{
+        "alertId": "alert-wa-2",
+        "decision": "AllowOnce"
+    }"#;
+    let parsed_omitted: ResolveAlertInvokePayload =
+        serde_json::from_str(omitted_json).expect("omitted pathMode should default to Exact");
+    assert_eq!(parsed_omitted.alert_id, "alert-wa-2");
+    assert_eq!(parsed_omitted.decision, AlertDecision::AllowOnce);
+    assert_eq!(parsed_omitted.path_mode, AllowPermanentPathMode::Exact);
+
+    let exact_json = r#"{
+        "alertId": "alert-wa-3",
+        "decision": {
+            "AllowPermanent": {
+                "use_signer_if_available": true,
+                "allow_dest": "example.com"
+            }
+        },
+        "pathMode": "Exact"
+    }"#;
+    let parsed_exact: ResolveAlertInvokePayload =
+        serde_json::from_str(exact_json).expect("explicit Exact pathMode should bind");
+    assert_eq!(parsed_exact.alert_id, "alert-wa-3");
+    assert_eq!(parsed_exact.path_mode, AllowPermanentPathMode::Exact);
+
+    let invalid_json = r#"{
+        "alertId": "alert-wa-4",
+        "decision": "AllowOnce",
+        "pathMode": "ArbitraryWildcard"
+    }"#;
+    let err = serde_json::from_str::<ResolveAlertInvokePayload>(invalid_json)
+        .expect_err("unknown pathMode string must fail serde deserialization");
+    assert!(
+        err.to_string().contains("ArbitraryWildcard") || err.to_string().contains("unknown variant"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn ui_p4_ipc_resolve_alert_with_options_wire_selection() {
+    let mut saw_legacy = false;
+    let mut saw_wildcard = false;
+    let mut stream = MockIpcStream::new(|req| match req {
+        IpcRequest::ResolveAlert { alert_id, decision } => {
+            assert_eq!(alert_id, "alert-exact-1");
+            assert_eq!(
+                decision,
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                }
+            );
+            saw_legacy = true;
+            IpcResponse::Ack {
+                message: "resolved legacy exact".to_string(),
+            }
+        }
+        IpcRequest::ResolveAlertWithOptions {
+            alert_id,
+            decision,
+            path_mode,
+        } => {
+            assert_eq!(alert_id, "alert-wildcard-1");
+            assert_eq!(
+                decision,
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: Some("api.example.com".to_string()),
+                }
+            );
+            assert_eq!(
+                path_mode,
+                AllowPermanentPathMode::WindowsAppsVersionWildcard
+            );
+            saw_wildcard = true;
+            IpcResponse::Ack {
+                message: "resolved wildcard".to_string(),
+            }
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let ack_exact = IpcClient::resolve_alert_with_options_over_stream(
+        &mut stream,
+        "alert-exact-1".to_string(),
+        AlertDecision::AllowPermanent {
+            use_signer_if_available: true,
+            allow_dest: None,
+        },
+        AllowPermanentPathMode::Exact,
+    )
+    .expect("Exact mode roundtrip");
+    assert_eq!(ack_exact, "resolved legacy exact");
+
+    let ack_wildcard = IpcClient::resolve_alert_with_options_over_stream(
+        &mut stream,
+        "alert-wildcard-1".to_string(),
+        AlertDecision::AllowPermanent {
+            use_signer_if_available: true,
+            allow_dest: Some("api.example.com".to_string()),
+        },
+        AllowPermanentPathMode::WindowsAppsVersionWildcard,
+    )
+    .expect("WindowsAppsVersionWildcard mode roundtrip");
+    assert_eq!(ack_wildcard, "resolved wildcard");
+
+    assert!(saw_legacy, "Exact mode must send legacy IpcRequest::ResolveAlert");
+    assert!(
+        saw_wildcard,
+        "WindowsAppsVersionWildcard mode must send IpcRequest::ResolveAlertWithOptions"
+    );
 }
 
 #[test]

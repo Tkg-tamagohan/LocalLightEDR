@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use ledr_proto::{
-    AlertDecision, AlertRecord, AlertStatus, AllowlistRuleRecord, ProcessIdentity, RuleScope,
+    build_windows_apps_version_wildcard_pattern, AlertDecision, AlertRecord, AlertStatus,
+    AllowPermanentPathMode, AllowlistRuleRecord, ProcessIdentity, RuleScope,
 };
 use ledr_rules::{
     matches_app_wide_network_block, matches_network_block_rule, matches_network_target,
@@ -50,6 +51,21 @@ impl DaemonEngine {
         alert_id: &str,
         decision: AlertDecision,
     ) -> Result<ResolvedAlertOutcome, String> {
+        self.resolve_alert_with_options_and_outcome(
+            alert_id,
+            decision,
+            AllowPermanentPathMode::Exact,
+        )
+    }
+
+    /// Like [`DaemonEngine::resolve_alert_with_outcome`], with explicit
+    /// [`AllowPermanentPathMode`] control for `AllowPermanent` decisions.
+    pub fn resolve_alert_with_options_and_outcome(
+        &self,
+        alert_id: &str,
+        decision: AlertDecision,
+        path_mode: AllowPermanentPathMode,
+    ) -> Result<ResolvedAlertOutcome, String> {
         let _resolve_guard = self.resolve_lock.lock().unwrap_or_else(|e| e.into_inner());
         let write_guard = StoreWriteGate::enter_op(&self.store_write_gate)
             .ok_or_else(|| "daemon store writes closed for shutdown".to_string())?;
@@ -64,6 +80,15 @@ impl DaemonEngine {
             return Err(format!(
                 "alert {alert_id} is already resolved ({})",
                 alert.status.as_db_str()
+            ));
+        }
+
+        if path_mode != AllowPermanentPathMode::Exact
+            && !matches!(decision, AlertDecision::AllowPermanent { .. })
+        {
+            return Err(format!(
+                "path_mode {:?} is only valid with AllowPermanent decision for alert {alert_id}",
+                path_mode
             ));
         }
 
@@ -176,7 +201,11 @@ impl DaemonEngine {
         let mut root_thumbprint = json_non_empty_str(&ctx_val, "/root_thumbprint")
             .filter(|tp| !tp.trim().is_empty() && !tp.trim().chars().all(|c| c == '0'));
 
-        if (sha256.is_none() || (signer_subject.is_some() && root_thumbprint.is_none()))
+        let needs_wildcard_signer = path_mode == AllowPermanentPathMode::WindowsAppsVersionWildcard
+            && (signer_subject.is_none() || root_thumbprint.is_none());
+        if (sha256.is_none()
+            || (signer_subject.is_some() && root_thumbprint.is_none())
+            || needs_wildcard_signer)
             && exe_path.is_some()
         {
             if let Some(ref exe) = exe_path {
@@ -187,12 +216,15 @@ impl DaemonEngine {
                 if signer_subject.is_none() || root_thumbprint.is_none() {
                     if let Some(auth) = inspected.authenticode {
                         if signer_subject.is_none() {
-                            signer_subject = Some(auth.signer_subject);
+                            let subj = auth.signer_subject.trim();
+                            if !subj.is_empty() {
+                                signer_subject = Some(subj.to_string());
+                            }
                         }
                         if root_thumbprint.is_none() {
                             let tp = auth.root_thumbprint.trim();
                             if !tp.is_empty() && !tp.chars().all(|c| c == '0') {
-                                root_thumbprint = Some(auth.root_thumbprint);
+                                root_thumbprint = Some(tp.to_string());
                             }
                         }
                     }
@@ -351,28 +383,60 @@ impl DaemonEngine {
                     RuleScope::FileCanaryAllow
                 };
 
+                let valid_signer_subject = signer_subject
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
                 let valid_root_thumbprint = root_thumbprint
-                    .filter(|tp| !tp.trim().is_empty() && !tp.trim().chars().all(|c| c == '0'));
+                    .map(|tp| tp.trim().to_string())
+                    .filter(|tp| !tp.is_empty() && !tp.chars().all(|c| c == '0'));
 
-                let (rule_sha256, rule_signer, rule_thumbprint) =
-                    if use_signer_if_available
-                        && signer_subject.is_some()
-                        && valid_root_thumbprint.is_some()
-                    {
-                        (None, signer_subject, valid_root_thumbprint)
-                    } else {
-                        let hash = sha256.ok_or_else(|| {
+                let (exe_path_pattern, rule_sha256, rule_signer, rule_thumbprint) = match path_mode
+                {
+                    AllowPermanentPathMode::Exact => {
+                        if use_signer_if_available
+                            && valid_signer_subject.is_some()
+                            && valid_root_thumbprint.is_some()
+                        {
+                            (exe.clone(), None, valid_signer_subject, valid_root_thumbprint)
+                        } else {
+                            let hash = sha256.ok_or_else(|| {
+                                format!(
+                                    "cannot create unsigned allowlist rule without SHA-256 digest for {exe} (L-04)"
+                                )
+                            })?;
+                            (exe.clone(), Some(hash), None, None)
+                        }
+                    }
+                    AllowPermanentPathMode::WindowsAppsVersionWildcard => {
+                        if !use_signer_if_available {
+                            return Err(format!(
+                                "WindowsApps version wildcard rule for alert {alert_id} requires use_signer_if_available=true (L-04)"
+                            ));
+                        }
+                        let signer = valid_signer_subject.ok_or_else(|| {
                             format!(
-                                "cannot create unsigned allowlist rule without SHA-256 digest for {exe} (L-04)"
+                                "cannot create WindowsApps version wildcard allowlist rule without verified Authenticode signer_subject for {exe} (L-04)"
                             )
                         })?;
-                        (Some(hash), None, None)
-                    };
+                        let thumbprint = valid_root_thumbprint.ok_or_else(|| {
+                            format!(
+                                "cannot create WindowsApps version wildcard allowlist rule without non-zero root_thumbprint for {exe} (L-04)"
+                            )
+                        })?;
+                        let pattern = build_windows_apps_version_wildcard_pattern(&exe)
+                            .ok_or_else(|| {
+                                format!(
+                                    "executable path `{exe}` is not a valid WindowsApps package executable for version wildcard"
+                                )
+                            })?;
+                        (pattern, None, Some(signer), Some(thumbprint))
+                    }
+                };
 
                 let rule = AllowlistRuleRecord {
                     rule_id: format!("RULE-ALLOW-{}", Uuid::new_v4()),
                     scope,
-                    exe_path_pattern: exe.clone(),
+                    exe_path_pattern,
                     sha256: rule_sha256,
                     signer_subject: rule_signer,
                     root_thumbprint: rule_thumbprint,
@@ -1443,4 +1507,1006 @@ fn json_non_empty_str(val: &serde_json::Value, pointer: &str) -> Option<String> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    use ledr_proto::{
+        ActiveDefenseController, AlertDecision, AlertRecord, AlertSeverity, AlertStatus,
+        AllowPermanentPathMode, AuthenticodeInfo, ProcessIdentity, RuleScope, SensorEvent,
+    };
+    use ledr_rules::{
+        evaluate_outbound_policy, is_allowed_by_rules, BinaryIdentity, EarlyPruner,
+        OutboundDecision, SigmaEngine,
+    };
+    use ledr_store::LedrStore;
+
+    use crate::engine::{BinaryInspector, DaemonConfig, DaemonEngine, EventLane, NotificationDispatcher};
+    use crate::firewall::WfpRuleManager;
+
+    struct MapInspector {
+        entries: RwLock<HashMap<String, BinaryIdentity>>,
+    }
+
+    impl MapInspector {
+        fn new() -> Self {
+            Self {
+                entries: RwLock::new(HashMap::new()),
+            }
+        }
+
+        fn insert(&self, id: BinaryIdentity) {
+            self.entries
+                .write()
+                .unwrap()
+                .insert(WfpRuleManager::exe_key(&id.exe_path), id);
+        }
+    }
+
+    impl BinaryInspector for MapInspector {
+        fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+            self.entries
+                .read()
+                .unwrap()
+                .get(&WfpRuleManager::exe_key(exe_path))
+                .cloned()
+                .unwrap_or_else(|| BinaryIdentity {
+                    exe_path: exe_path.to_string(),
+                    sha256: None,
+                    authenticode: None,
+                })
+        }
+    }
+
+    struct StubNotifier;
+    impl NotificationDispatcher for StubNotifier {
+        fn notify_alert(&self, _: &AlertRecord) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct MockDefense {
+        next_handle: AtomicU64,
+        fail_add_for: Mutex<Option<String>>,
+        terminated_calls: AtomicUsize,
+        fail_removes: AtomicBool,
+    }
+
+    impl MockDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(10),
+                fail_add_for: Mutex::new(None),
+                terminated_calls: AtomicUsize::new(0),
+                fail_removes: AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail_add_for(&self, pat: Option<&str>) {
+            *self.fail_add_for.lock().unwrap() = pat.map(|s| s.to_ascii_lowercase());
+        }
+
+        fn terminated_calls(&self) -> usize {
+            self.terminated_calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl ActiveDefenseController for MockDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            self.terminated_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+        fn add_wfp_app_rule(
+            &self,
+            exe_path: &Path,
+            _remote_ip: Option<IpAddr>,
+            _allow: bool,
+        ) -> Result<u64, String> {
+            let lower = exe_path.to_string_lossy().to_ascii_lowercase();
+            if let Some(ref pat) = *self.fail_add_for.lock().unwrap() {
+                if lower.contains(pat) {
+                    return Err(format!("mock WFP add error for {lower}"));
+                }
+            }
+            Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
+        }
+        fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+            if self.fail_removes.load(Ordering::Acquire) {
+                return Err(format!("mock WFP remove error for {filter_id}"));
+            }
+            Ok(())
+        }
+    }
+
+    async fn build_engine(
+        defense: Arc<MockDefense>,
+        inspector: Arc<MapInspector>,
+        outbound_firewall_enabled: bool,
+    ) -> Arc<DaemonEngine> {
+        let store = LedrStore::open_in_memory().expect("in-memory store");
+        let engine = DaemonEngine::start_with_dependencies(
+            store,
+            SigmaEngine::default(),
+            EarlyPruner::default(),
+            DaemonConfig {
+                outbound_firewall_enabled,
+                ..DaemonConfig::default()
+            },
+            defense,
+            Arc::new(StubNotifier),
+            inspector,
+        );
+        if let Some(h) = engine.worker_handle.lock().await.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        engine
+    }
+
+    fn auth_info(signer: &str, thumbprint: &str) -> AuthenticodeInfo {
+        AuthenticodeInfo {
+            signer_subject: signer.to_string(),
+            root_thumbprint: thumbprint.to_string(),
+        }
+    }
+
+    fn make_alert(
+        alert_id: &str,
+        source_layer: &str,
+        proc_inst: Option<&str>,
+        context_json: serde_json::Value,
+    ) -> AlertRecord {
+        AlertRecord {
+            alert_id: alert_id.to_string(),
+            timestamp_ms: 1_750_000_000_000,
+            severity: AlertSeverity::Medium,
+            source_layer: source_layer.to_string(),
+            rule_id: "TEST_RULE".to_string(),
+            title: "Test alert".to_string(),
+            process_instance_id: proc_inst.map(str::to_string),
+            process_suspended: false,
+            status: AlertStatus::Pending,
+            context_json: context_json.to_string(),
+            resolved_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_network_allow_unlimited_and_dest_scoped_allow_new_version_and_reject_spoofed_or_other_pkg() {
+        let defense = Arc::new(MockDefense::new());
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let signer = "CN=Contoso Store Publisher";
+        let root_tp = "0123456789ABCDEF0123456789ABCDEF01234567";
+        let exe_v1 = r"C:\Program Files\WindowsApps\Contoso.StoreApp_1.0.0.0_x64__8wekyb3d8bbwe\StoreApp.exe";
+        let exe_v2 = r"C:\Program Files\WindowsApps\Contoso.StoreApp_2.0.0.0_x64__8wekyb3d8bbwe\StoreApp.exe";
+        let other_pkg_exe =
+            r"C:\Program Files\WindowsApps\Other.StoreApp_1.0.0.0_x64__8wekyb3d8bbwe\StoreApp.exe";
+        let expected_pattern =
+            r"C:\Program Files\WindowsApps\Contoso.StoreApp_*_x64__8wekyb3d8bbwe\StoreApp.exe";
+
+        // 1. Unlimited NetworkAllow
+        let alert_unlim = make_alert(
+            "ALT-NET-UNLIM",
+            "LAYER_3_NETWORK",
+            Some("1101:133000000000000000"),
+            serde_json::json!({
+                "exe_path": exe_v1,
+                "sha256": "a".repeat(64),
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "dst_ip": "198.51.100.10"
+            }),
+        );
+        engine
+            .store()
+            .record_alert(&alert_unlim)
+            .expect("record alert_unlim");
+
+        let outcome = engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-NET-UNLIM",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            )
+            .expect("unlimited wildcard NetworkAllow succeeds");
+        assert!(outcome.saved_rule_id.is_some());
+
+        let rules = engine
+            .store()
+            .list_rules(Some(RuleScope::NetworkAllow))
+            .expect("list rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].exe_path_pattern, expected_pattern);
+        assert_eq!(rules[0].sha256, None);
+        assert_eq!(rules[0].signer_subject.as_deref(), Some(signer));
+        assert_eq!(rules[0].root_thumbprint.as_deref(), Some(root_tp));
+        assert_eq!(rules[0].allowed_target, None);
+
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 50));
+        // New version with matching signer + thumbprint is ALLOWED.
+        let v2_valid = BinaryIdentity {
+            exe_path: exe_v2.to_string(),
+            sha256: Some("b".repeat(64)),
+            authenticode: Some(auth_info(signer, root_tp)),
+        };
+        assert!(matches!(
+            evaluate_outbound_policy(&v2_valid, dst_ip, None, &rules),
+            OutboundDecision::AllowedByRule { .. }
+        ));
+
+        // Same wildcard path with UNSIGNED binary -> REJECTED.
+        let v2_unsigned = BinaryIdentity {
+            exe_path: exe_v2.to_string(),
+            sha256: Some("b".repeat(64)),
+            authenticode: None,
+        };
+        assert!(matches!(
+            evaluate_outbound_policy(&v2_unsigned, dst_ip, None, &rules),
+            OutboundDecision::UnknownFirstConnect
+        ));
+
+        // Same wildcard path with DIFFERENT signer_subject -> REJECTED.
+        let v2_wrong_signer = BinaryIdentity {
+            exe_path: exe_v2.to_string(),
+            sha256: Some("b".repeat(64)),
+            authenticode: Some(auth_info("CN=Evil Spoofer", root_tp)),
+        };
+        assert!(matches!(
+            evaluate_outbound_policy(&v2_wrong_signer, dst_ip, None, &rules),
+            OutboundDecision::UnknownFirstConnect
+        ));
+
+        // Same wildcard path with DIFFERENT root_thumbprint -> REJECTED.
+        let v2_wrong_tp = BinaryIdentity {
+            exe_path: exe_v2.to_string(),
+            sha256: Some("b".repeat(64)),
+            authenticode: Some(auth_info(signer, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF")),
+        };
+        assert!(matches!(
+            evaluate_outbound_policy(&v2_wrong_tp, dst_ip, None, &rules),
+            OutboundDecision::UnknownFirstConnect
+        ));
+
+        // Different package even with identical signer + thumbprint -> REJECTED.
+        let other_pkg = BinaryIdentity {
+            exe_path: other_pkg_exe.to_string(),
+            sha256: Some("c".repeat(64)),
+            authenticode: Some(auth_info(signer, root_tp)),
+        };
+        assert!(matches!(
+            evaluate_outbound_policy(&other_pkg, dst_ip, None, &rules),
+            OutboundDecision::UnknownFirstConnect
+        ));
+
+        // 2. Destination-scoped NetworkAllow
+        engine
+            .store()
+            .delete_rule(&rules[0].rule_id)
+            .expect("clear unlimited rule");
+        let alert_dest = make_alert(
+            "ALT-NET-DEST",
+            "LAYER_3_NETWORK",
+            Some("1102:133000000000000000"),
+            serde_json::json!({
+                "exe_path": exe_v1,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "dst_ip": "198.51.100.77",
+                "domain_hint": "api.contoso.example"
+            }),
+        );
+        engine
+            .store()
+            .record_alert(&alert_dest)
+            .expect("record alert_dest");
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-NET-DEST",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: Some("api.contoso.example".to_string()),
+                },
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            )
+            .expect("dest-scoped wildcard NetworkAllow succeeds");
+        let dest_rules = engine
+            .store()
+            .list_rules(Some(RuleScope::NetworkAllow))
+            .expect("list dest rules");
+        assert_eq!(dest_rules.len(), 1);
+        assert_eq!(dest_rules[0].exe_path_pattern, expected_pattern);
+        assert_eq!(
+            dest_rules[0].allowed_target.as_deref(),
+            Some("api.contoso.example")
+        );
+        assert_eq!(dest_rules[0].sha256, None);
+        assert!(matches!(
+            evaluate_outbound_policy(&v2_valid, dst_ip, Some("api.contoso.example"), &dest_rules),
+            OutboundDecision::AllowedByRule { .. }
+        ));
+        assert!(matches!(
+            evaluate_outbound_policy(&v2_valid, dst_ip, Some("other.example"), &dest_rules),
+            OutboundDecision::UnknownFirstConnect
+        ));
+        assert!(matches!(
+            evaluate_outbound_policy(&v2_wrong_signer, dst_ip, Some("api.contoso.example"), &dest_rules),
+            OutboundDecision::UnknownFirstConnect
+        ));
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn wildcard_file_canary_allow_unlimited_and_dest_scoped_work_and_reject_mismatches() {
+        let defense = Arc::new(MockDefense::new());
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let signer = "CN=Contoso Store Publisher";
+        let root_tp = "0123456789ABCDEF0123456789ABCDEF01234567";
+        let exe_v1 = r"C:\Program Files\WindowsApps\Contoso.Editor_1.2.0.0_arm64__8wekyb3d8bbwe\Editor.exe";
+        let exe_v2 = r"C:\Program Files\WindowsApps\Contoso.Editor_1.3.0.0_arm64__8wekyb3d8bbwe\Editor.exe";
+        let other_pkg = r"C:\Program Files\WindowsApps\Other.Editor_1.3.0.0_arm64__8wekyb3d8bbwe\Editor.exe";
+        let target_decoy = r"C:\Users\alice\Documents\decoy.docx";
+
+        let alert_unlim = make_alert(
+            "ALT-CANARY-UNLIM",
+            "LAYER_2_BEHAVIOR",
+            Some("1201:133000000000000000"),
+            serde_json::json!({
+                "exe_path": exe_v1,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "category": "DECOY_MODIFIED",
+                "target_path": target_decoy
+            }),
+        );
+        engine
+            .store()
+            .record_alert(&alert_unlim)
+            .expect("record alert_unlim");
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-CANARY-UNLIM",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            )
+            .expect("wildcard FileCanaryAllow succeeds");
+
+        let rules = engine
+            .store()
+            .list_rules(Some(RuleScope::FileCanaryAllow))
+            .expect("list FileCanaryAllow");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].exe_path_pattern,
+            r"C:\Program Files\WindowsApps\Contoso.Editor_*_arm64__8wekyb3d8bbwe\Editor.exe"
+        );
+        assert_eq!(rules[0].sha256, None);
+        assert_eq!(rules[0].signer_subject.as_deref(), Some(signer));
+        assert_eq!(rules[0].root_thumbprint.as_deref(), Some(root_tp));
+
+        let v2_valid = BinaryIdentity {
+            exe_path: exe_v2.to_string(),
+            sha256: None,
+            authenticode: Some(auth_info(signer, root_tp)),
+        };
+        assert!(is_allowed_by_rules(
+            &v2_valid,
+            Some(target_decoy),
+            RuleScope::FileCanaryAllow,
+            &rules
+        ));
+
+        let v2_unsigned = BinaryIdentity {
+            exe_path: exe_v2.to_string(),
+            sha256: Some("d".repeat(64)),
+            authenticode: None,
+        };
+        assert!(!is_allowed_by_rules(
+            &v2_unsigned,
+            Some(target_decoy),
+            RuleScope::FileCanaryAllow,
+            &rules
+        ));
+
+        let v2_wrong_signer = BinaryIdentity {
+            exe_path: exe_v2.to_string(),
+            sha256: None,
+            authenticode: Some(auth_info("CN=Other", root_tp)),
+        };
+        assert!(!is_allowed_by_rules(
+            &v2_wrong_signer,
+            Some(target_decoy),
+            RuleScope::FileCanaryAllow,
+            &rules
+        ));
+
+        let v2_wrong_tp = BinaryIdentity {
+            exe_path: exe_v2.to_string(),
+            sha256: None,
+            authenticode: Some(auth_info(signer, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")),
+        };
+        assert!(!is_allowed_by_rules(
+            &v2_wrong_tp,
+            Some(target_decoy),
+            RuleScope::FileCanaryAllow,
+            &rules
+        ));
+
+        let other = BinaryIdentity {
+            exe_path: other_pkg.to_string(),
+            sha256: None,
+            authenticode: Some(auth_info(signer, root_tp)),
+        };
+        assert!(!is_allowed_by_rules(
+            &other,
+            Some(target_decoy),
+            RuleScope::FileCanaryAllow,
+            &rules
+        ));
+
+        // Scoped FileCanaryAllow (`allow_dest: Some(...)`)
+        engine
+            .store()
+            .delete_rule(&rules[0].rule_id)
+            .expect("delete unlim");
+        let alert_scoped = make_alert(
+            "ALT-CANARY-SCOPED",
+            "LAYER_2_BEHAVIOR",
+            Some("1202:133000000000000000"),
+            serde_json::json!({
+                "exe_path": exe_v1,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "category": "DECOY_MODIFIED",
+                "target_path": target_decoy
+            }),
+        );
+        engine
+            .store()
+            .record_alert(&alert_scoped)
+            .expect("record alert_scoped");
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-CANARY-SCOPED",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: Some(target_decoy.to_string()),
+                },
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            )
+            .expect("scoped FileCanaryAllow succeeds");
+        let scoped_rules = engine
+            .store()
+            .list_rules(Some(RuleScope::FileCanaryAllow))
+            .expect("list scoped FileCanaryAllow");
+        assert_eq!(scoped_rules.len(), 1);
+        assert_eq!(scoped_rules[0].allowed_target.as_deref(), Some(target_decoy));
+        assert!(is_allowed_by_rules(
+            &v2_valid,
+            Some(target_decoy),
+            RuleScope::FileCanaryAllow,
+            &scoped_rules
+        ));
+        assert!(!is_allowed_by_rules(
+            &v2_valid,
+            Some(r"C:\Users\alice\Documents\other.docx"),
+            RuleScope::FileCanaryAllow,
+            &scoped_rules
+        ));
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn wildcard_signer_lookup_prefers_context_json_and_falls_back_to_inspector() {
+        let defense = Arc::new(MockDefense::new());
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let exe_ctx = r"C:\Program Files\WindowsApps\Contoso.CtxPref_1.0.0.0_x64__8wekyb3d8bbwe\App.exe";
+        let exe_fb = r"C:\Program Files\WindowsApps\Contoso.Fallback_1.0.0.0_x64__8wekyb3d8bbwe\App.exe";
+
+        // Disk inspector has a DIFFERENT signer for exe_ctx, but context_json must win.
+        inspector.insert(BinaryIdentity {
+            exe_path: exe_ctx.to_string(),
+            sha256: Some("1".repeat(64)),
+            authenticode: Some(auth_info(
+                "CN=Disk Signer Should Not Override",
+                "1111111111111111111111111111111111111111",
+            )),
+        });
+        // Disk inspector has valid signer for exe_fb; context_json has sha256 only (no signer).
+        inspector.insert(BinaryIdentity {
+            exe_path: exe_fb.to_string(),
+            sha256: Some("2".repeat(64)),
+            authenticode: Some(auth_info(
+                "CN=Fallback Disk Signer",
+                "2222222222222222222222222222222222222222",
+            )),
+        });
+
+        let a_ctx = make_alert(
+            "ALT-CTX-PREF",
+            "LAYER_2_BEHAVIOR",
+            Some("1301:133000000000000000"),
+            serde_json::json!({
+                "exe_path": exe_ctx,
+                "signer_subject": "CN=Context Recorded Signer",
+                "root_thumbprint": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            }),
+        );
+        let a_fb = make_alert(
+            "ALT-CTX-FB",
+            "LAYER_2_BEHAVIOR",
+            Some("1302:133000000000000000"),
+            serde_json::json!({
+                "exe_path": exe_fb,
+                "sha256": "2".repeat(64)
+            }),
+        );
+        engine.store().record_alert(&a_ctx).expect("record a_ctx");
+        engine.store().record_alert(&a_fb).expect("record a_fb");
+
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-CTX-PREF",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            )
+            .expect("context_json signer wins");
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-CTX-FB",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            )
+            .expect("fallback inspector fills missing signer even when sha256 was in context_json");
+
+        let rules = engine
+            .store()
+            .list_rules(Some(RuleScope::FileCanaryAllow))
+            .expect("list rules");
+        assert_eq!(rules.len(), 2);
+        let r_ctx = rules
+            .iter()
+            .find(|r| r.exe_path_pattern.contains("Contoso.CtxPref_*"))
+            .expect("r_ctx");
+        assert_eq!(
+            r_ctx.signer_subject.as_deref(),
+            Some("CN=Context Recorded Signer")
+        );
+        assert_eq!(
+            r_ctx.root_thumbprint.as_deref(),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
+        let r_fb = rules
+            .iter()
+            .find(|r| r.exe_path_pattern.contains("Contoso.Fallback_*"))
+            .expect("r_fb");
+        assert_eq!(
+            r_fb.signer_subject.as_deref(),
+            Some("CN=Fallback Disk Signer")
+        );
+        assert_eq!(
+            r_fb.root_thumbprint.as_deref(),
+            Some("2222222222222222222222222222222222222222")
+        );
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn wildcard_fail_closed_rejects_invalid_inputs_without_saving_rule_or_mutating_alert() {
+        let defense = Arc::new(MockDefense::new());
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let wa_exe =
+            r"C:\Program Files\WindowsApps\Contoso.StoreApp_1.0.0.0_x64__8wekyb3d8bbwe\StoreApp.exe";
+        let non_wa_exe = r"C:\Tools\app.exe";
+        let alias_exe = r"C:\Users\alice\AppData\Local\Microsoft\WindowsApps\StoreApp.exe";
+        let valid_signer = "CN=Contoso Store Publisher";
+        let valid_tp = "0123456789ABCDEF0123456789ABCDEF01234567";
+
+        let cases: Vec<(&str, AlertRecord, AlertDecision)> = vec![
+            (
+                "use_signer_if_available_false",
+                make_alert(
+                    "FC-1",
+                    "LAYER_3_NETWORK",
+                    Some("2001:133000000000000000"),
+                    serde_json::json!({
+                        "exe_path": wa_exe,
+                        "sha256": "a".repeat(64),
+                        "signer_subject": valid_signer,
+                        "root_thumbprint": valid_tp
+                    }),
+                ),
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: false,
+                    allow_dest: None,
+                },
+            ),
+            (
+                "unsigned_binary_with_sha256_must_not_fallback",
+                make_alert(
+                    "FC-2",
+                    "LAYER_3_NETWORK",
+                    Some("2002:133000000000000000"),
+                    serde_json::json!({
+                        "exe_path": wa_exe,
+                        "sha256": "a".repeat(64)
+                    }),
+                ),
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+            ),
+            (
+                "signer_with_all_zero_root_thumbprint",
+                make_alert(
+                    "FC-3",
+                    "LAYER_3_NETWORK",
+                    Some("2003:133000000000000000"),
+                    serde_json::json!({
+                        "exe_path": wa_exe,
+                        "sha256": "a".repeat(64),
+                        "signer_subject": valid_signer,
+                        "root_thumbprint": "0".repeat(40)
+                    }),
+                ),
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+            ),
+            (
+                "non_windowsapps_path",
+                make_alert(
+                    "FC-4",
+                    "LAYER_3_NETWORK",
+                    Some("2004:133000000000000000"),
+                    serde_json::json!({
+                        "exe_path": non_wa_exe,
+                        "signer_subject": valid_signer,
+                        "root_thumbprint": valid_tp
+                    }),
+                ),
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+            ),
+            (
+                "localappdata_execution_alias_path",
+                make_alert(
+                    "FC-5",
+                    "LAYER_3_NETWORK",
+                    Some("2005:133000000000000000"),
+                    serde_json::json!({
+                        "exe_path": alias_exe,
+                        "signer_subject": valid_signer,
+                        "root_thumbprint": valid_tp
+                    }),
+                ),
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+            ),
+            (
+                "allow_once_rejected_with_wildcard_mode",
+                make_alert(
+                    "FC-6",
+                    "LAYER_3_NETWORK",
+                    Some("2006:133000000000000000"),
+                    serde_json::json!({
+                        "exe_path": wa_exe,
+                        "signer_subject": valid_signer,
+                        "root_thumbprint": valid_tp
+                    }),
+                ),
+                AlertDecision::AllowOnce,
+            ),
+            (
+                "terminate_and_block_rejected_with_wildcard_mode",
+                make_alert(
+                    "FC-7",
+                    "LAYER_3_NETWORK",
+                    Some("2007:133000000000000000"),
+                    serde_json::json!({
+                        "exe_path": wa_exe,
+                        "signer_subject": valid_signer,
+                        "root_thumbprint": valid_tp
+                    }),
+                ),
+                AlertDecision::TerminateAndBlock {
+                    add_block_rule: true,
+                },
+            ),
+            (
+                "processless_layer_4_browser_rejected",
+                make_alert(
+                    "FC-8",
+                    "LAYER_4_BROWSER",
+                    None,
+                    serde_json::json!({
+                        "url": "https://example.invalid/phish",
+                        "exe_path": wa_exe,
+                        "signer_subject": valid_signer,
+                        "root_thumbprint": valid_tp
+                    }),
+                ),
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+            ),
+        ];
+
+        for (label, alert, decision) in cases {
+            let aid = alert.alert_id.clone();
+            engine.store().record_alert(&alert).expect("record alert");
+            let res = engine.resolve_alert_with_options_and_outcome(
+                &aid,
+                decision,
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            );
+            assert!(res.is_err(), "{label} must fail closed");
+            let persisted = engine
+                .store()
+                .get_alert(&aid)
+                .expect("query alert")
+                .expect("alert exists");
+            assert_eq!(
+                persisted.status,
+                AlertStatus::Pending,
+                "{label} must leave alert Pending"
+            );
+        }
+
+        assert!(
+            engine
+                .store()
+                .list_rules(None)
+                .expect("list_rules")
+                .is_empty(),
+            "no rules may be persisted on fail-closed rejections"
+        );
+        assert_eq!(
+            defense.terminated_calls(),
+            0,
+            "TerminateAndBlock with wildcard path_mode must reject before terminating"
+        );
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn wildcard_approval_succeeds_when_old_binary_deleted_and_releases_transient_containment() {
+        let defense = Arc::new(MockDefense::new());
+        // Empty inspector simulates old version folder already deleted from disk before approval.
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let signer = "CN=Contoso Store Publisher";
+        let root_tp = "0123456789ABCDEF0123456789ABCDEF01234567";
+
+        // Case A: Running process, unlimited wildcard approval, old binary deleted on disk.
+        let exe_running =
+            r"C:\Program Files\WindowsApps\Contoso.RunApp_1.0.0.0_x64__8wekyb3d8bbwe\RunApp.exe";
+        let p_run = ProcessIdentity::new(3001, 133_000_000_000_000_001);
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: p_run,
+                parent_pid: 4,
+                exe_path: exe_running.to_string(),
+                command_line: exe_running.to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        {
+            let mut fw = engine.firewall.lock().unwrap();
+            let h = defense
+                .add_wfp_app_rule(Path::new(exe_running), None, false)
+                .unwrap();
+            assert!(fw
+                .register_transient_containment("ALT-TC-RUN", exe_running, h, &*defense)
+                .is_some());
+        }
+        let alert_run = make_alert(
+            "ALT-TC-RUN",
+            "LAYER_3_NETWORK",
+            Some(&p_run.instance_id()),
+            serde_json::json!({
+                "exe_path": exe_running,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "dst_ip": "198.51.100.80"
+            }),
+        );
+        engine.store().record_alert(&alert_run).expect("record run");
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-TC-RUN",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            )
+            .expect("deleted old binary running wildcard approval succeeds");
+        {
+            let fw = engine.firewall.lock().unwrap();
+            assert!(fw.active_app_block(exe_running).is_none());
+            assert!(!fw.is_alert_bound("ALT-TC-RUN"));
+        }
+
+        // Case B: Exited process, destination-scoped wildcard approval, old binary deleted on disk.
+        let exe_exited =
+            r"C:\Program Files\WindowsApps\Contoso.ExitApp_1.0.0.0_x64__8wekyb3d8bbwe\ExitApp.exe";
+        let p_exit = ProcessIdentity::new(3002, 133_000_000_000_000_002);
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: p_exit,
+                parent_pid: 4,
+                exe_path: exe_exited.to_string(),
+                command_line: exe_exited.to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        {
+            let mut fw = engine.firewall.lock().unwrap();
+            let h = defense
+                .add_wfp_app_rule(Path::new(exe_exited), None, false)
+                .unwrap();
+            assert!(fw
+                .register_transient_containment("ALT-TC-EXIT", exe_exited, h, &*defense)
+                .is_some());
+        }
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStop {
+                pid: p_exit.pid,
+                exit_time_100ns: p_exit.create_time_100ns + 10_000,
+                exit_code: 0,
+            },
+            EventLane::HighPriority,
+        );
+        let alert_exit = make_alert(
+            "ALT-TC-EXIT",
+            "LAYER_3_NETWORK",
+            Some(&p_exit.instance_id()),
+            serde_json::json!({
+                "exe_path": exe_exited,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "dst_ip": "198.51.100.81",
+                "domain_hint": "api.contoso.example"
+            }),
+        );
+        engine
+            .store()
+            .record_alert(&alert_exit)
+            .expect("record exit");
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-TC-EXIT",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: Some("api.contoso.example".to_string()),
+                },
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            )
+            .expect("deleted old binary exited dest-scoped wildcard approval succeeds");
+        {
+            let fw = engine.firewall.lock().unwrap();
+            assert!(!fw.has_any_app_filter(exe_exited));
+            assert!(!fw.is_alert_bound("ALT-TC-EXIT"));
+        }
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn wildcard_wfp_sync_failure_rolls_back_saved_rule() {
+        let defense = Arc::new(MockDefense::new());
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let exe =
+            r"C:\Program Files\WindowsApps\Contoso.FailSync_1.0.0.0_x64__8wekyb3d8bbwe\FailSync.exe";
+        let signer = "CN=Contoso Store Publisher";
+        let root_tp = "0123456789ABCDEF0123456789ABCDEF01234567";
+        inspector.insert(BinaryIdentity {
+            exe_path: exe.to_string(),
+            sha256: Some("f".repeat(64)),
+            authenticode: Some(auth_info(signer, root_tp)),
+        });
+
+        let proc_id = ProcessIdentity::new(3003, 133_000_000_000_000_003);
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: proc_id,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+
+        let alert = make_alert(
+            "ALT-WFP-SYNC-FAIL",
+            "LAYER_3_NETWORK",
+            Some(&proc_id.instance_id()),
+            serde_json::json!({
+                "exe_path": exe,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "dst_ip": "198.51.100.82"
+            }),
+        );
+        engine.store().record_alert(&alert).expect("record alert");
+
+        defense.set_fail_add_for(Some("contoso.failsync"));
+        let res = engine.resolve_alert_with_options_and_outcome(
+            "ALT-WFP-SYNC-FAIL",
+            AlertDecision::AllowPermanent {
+                use_signer_if_available: true,
+                allow_dest: None,
+            },
+            AllowPermanentPathMode::WindowsAppsVersionWildcard,
+        );
+        assert!(res.is_err(), "WFP sync failure must return Err");
+        assert!(
+            engine
+                .store()
+                .list_rules(None)
+                .expect("list_rules")
+                .is_empty(),
+            "compensating rollback_saved_rule must delete saved wildcard rule on WFP failure"
+        );
+        assert_eq!(
+            engine
+                .store()
+                .get_alert("ALT-WFP-SYNC-FAIL")
+                .expect("get_alert")
+                .expect("alert exists")
+                .status,
+            AlertStatus::Pending
+        );
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
 }

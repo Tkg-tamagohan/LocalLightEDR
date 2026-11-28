@@ -1,9 +1,9 @@
 //! Named Pipe IPC client communicating with `ledr-daemon` over `\\.\pipe\localedr-ipc`.
 
 use ledr_proto::{
-    AlertDecision, AlertRecord, AlertStatus, AllowlistRuleRecord, FlightRecorderSnapshot,
-    IPC_PIPE_NAME, IpcRequest, IpcResponse, PipelineMetrics, RuleScope, read_ipc_frame,
-    write_ipc_frame,
+    AlertDecision, AlertRecord, AlertStatus, AllowPermanentPathMode, AllowlistRuleRecord,
+    FlightRecorderSnapshot, IPC_PIPE_NAME, IpcRequest, IpcResponse, PipelineMetrics, RuleScope,
+    read_ipc_frame, write_ipc_frame,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -521,6 +521,54 @@ impl IpcClient {
     ) -> Result<String, String> {
         let req = IpcRequest::ResolveAlert { alert_id, decision };
         parse_ack_response(self.send_request(&req)?)
+    }
+
+    pub(crate) fn build_resolve_alert_request(
+        alert_id: String,
+        decision: AlertDecision,
+        path_mode: AllowPermanentPathMode,
+    ) -> IpcRequest {
+        match path_mode {
+            AllowPermanentPathMode::Exact => IpcRequest::ResolveAlert { alert_id, decision },
+            AllowPermanentPathMode::WindowsAppsVersionWildcard => {
+                IpcRequest::ResolveAlertWithOptions {
+                    alert_id,
+                    decision,
+                    path_mode,
+                }
+            }
+        }
+    }
+
+    /// Resolves an alert with the given [`AlertDecision`] and [`AllowPermanentPathMode`] (`L-07`).
+    ///
+    /// Uses legacy [`IpcRequest::ResolveAlert`] via [`Self::resolve_alert`] when
+    /// `path_mode == AllowPermanentPathMode::Exact` and [`IpcRequest::ResolveAlertWithOptions`]
+    /// only for [`AllowPermanentPathMode::WindowsAppsVersionWildcard`].
+    pub fn resolve_alert_with_options(
+        &self,
+        alert_id: String,
+        decision: AlertDecision,
+        path_mode: AllowPermanentPathMode,
+    ) -> Result<String, String> {
+        match path_mode {
+            AllowPermanentPathMode::Exact => self.resolve_alert(alert_id, decision),
+            AllowPermanentPathMode::WindowsAppsVersionWildcard => {
+                let req = Self::build_resolve_alert_request(alert_id, decision, path_mode);
+                parse_ack_response(self.send_request(&req)?)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_alert_with_options_over_stream<S: Read + Write>(
+        stream: &mut S,
+        alert_id: String,
+        decision: AlertDecision,
+        path_mode: AllowPermanentPathMode,
+    ) -> Result<String, String> {
+        let req = Self::build_resolve_alert_request(alert_id, decision, path_mode);
+        parse_ack_response(Self::send_request_over_stream(stream, &req)?)
     }
 
     /// Lists allowlist/blocklist policy rules from `ledr-daemon`, optionally filtered by [`RuleScope`].

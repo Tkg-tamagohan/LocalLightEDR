@@ -4,10 +4,29 @@ use ledr_proto::{AllowlistRuleRecord, RuleScope};
 
 use super::BinaryIdentity;
 
-/// Performs ASCII case-insensitive wildcard (`*`) matching with `/` and `\` normalization.
+const WINDOWS_APPS_NORMALIZED_PREFIX: [char; 29] = [
+    'c', ':', '\\', 'p', 'r', 'o', 'g', 'r', 'a', 'm', ' ', 'f', 'i', 'l', 'e', 's', '\\', 'w',
+    'i', 'n', 'd', 'o', 'w', 's', 'a', 'p', 'p', 's', '\\',
+];
+
+fn normalize_pattern_chars(raw: &str) -> Vec<char> {
+    let normalized: Vec<char> = raw.chars().map(normalize_path_char).collect();
+    if normalized.starts_with(&['\\', '\\', '?', '\\'])
+        && !normalized.starts_with(&['\\', '\\', '?', '\\', 'u', 'n', 'c', '\\'])
+    {
+        normalized[4..].to_vec()
+    } else {
+        normalized
+    }
+}
+
+/// Performs ASCII case-insensitive wildcard (`*`) matching with `/` and `\` normalization,
+/// stripping leading non-UNC `\\?\` prefixes and confining `*` within path segments for
+/// `C:\Program Files\WindowsApps\` patterns.
 pub fn matches_path_pattern(exe_path: &str, pattern: &str) -> bool {
-    let s: Vec<char> = exe_path.chars().map(normalize_path_char).collect();
-    let p: Vec<char> = pattern.chars().map(normalize_path_char).collect();
+    let s = normalize_pattern_chars(exe_path);
+    let p = normalize_pattern_chars(pattern);
+    let star_forbids_backslash = p.starts_with(&WINDOWS_APPS_NORMALIZED_PREFIX);
 
     let (mut si, mut pi) = (0usize, 0usize);
     let (mut star_pi, mut match_si) = (None, 0usize);
@@ -21,6 +40,9 @@ pub fn matches_path_pattern(exe_path: &str, pattern: &str) -> bool {
             match_si = si;
             pi += 1;
         } else if let Some(sp) = star_pi {
+            if star_forbids_backslash && s[match_si] == '\\' {
+                return false;
+            }
             pi = sp + 1;
             match_si += 1;
             si = match_si;
@@ -244,4 +266,62 @@ fn extract_cn(rdns: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matcher_01_windows_apps_segment_confinement_and_extended_prefix() {
+        let pattern = crate::build_windows_apps_version_wildcard_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\App.exe",
+        )
+        .expect("build wildcard pattern");
+        assert_eq!(
+            pattern,
+            r"C:\Program Files\WindowsApps\Contoso.App_*_x64__8wekyb3d8bbwe\App.exe"
+        );
+
+        // Matches updated version with runtime `\\?\` prefix, forward slashes, or lowercase.
+        assert!(matches_path_pattern(
+            r"\\?\C:\Program Files\WindowsApps\Contoso.App_2.5.1.0_x64__8wekyb3d8bbwe\App.exe",
+            &pattern
+        ));
+        assert!(matches_path_pattern(
+            r"c:/program files/windowsapps/contoso.app_2.5.1.0_x64__8wekyb3d8bbwe/app.exe",
+            &pattern
+        ));
+        assert!(matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_2.5.1.0_x64__8wekyb3d8bbwe\App.exe",
+            &format!(r"\\?\{pattern}")
+        ));
+
+        // Non-UNC `\\?\` stripping must NOT strip `\\?\UNC\`.
+        assert!(!matches_path_pattern(
+            r"\\?\UNC\C:\Program Files\WindowsApps\Contoso.App_2.5.1.0_x64__8wekyb3d8bbwe\App.exe",
+            &pattern
+        ));
+
+        // Rejects spoofed subpath under a different architecture/package because `*` in a
+        // `c:\program files\windowsapps\` pattern must not cross `\`.
+        assert!(!matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_arm64__8wekyb3d8bbwe\sub_x64__8wekyb3d8bbwe\App.exe",
+            &pattern
+        ));
+        assert!(!matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\nested\App.exe",
+            &pattern
+        ));
+
+        // Preserves existing cross-`\` `*` matching for non-WindowsApps patterns.
+        assert!(matches_path_pattern(
+            r"C:\Users\Alice\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies",
+            r"*\Google\Chrome\User Data\*"
+        ));
+        assert!(matches_path_pattern(
+            r"\\?\C:\Users\Alice\AppData\Local\Google\Chrome\User Data\Default\Cookies",
+            r"*\Google\Chrome\User Data\*\Cookies"
+        ));
+    }
 }

@@ -1,0 +1,277 @@
+[
+  {
+    "name": "valid_standard_empty_resource_id",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe",
+    "expected": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_*_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe"
+  },
+  {
+    "name": "valid_non_empty_resource_id",
+    "input": "C:\\Program Files\\WindowsApps\\Contoso.App-1_10.0.22621.1_arm64_split.scale-100_8wekyb3d8bbwe\\App.exe",
+    "expected": "C:\\Program Files\\WindowsApps\\Contoso.App-1_*_arm64_split.scale-100_8wekyb3d8bbwe\\App.exe"
+  },
+  {
+    "name": "valid_nested_rel_path",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_1.20.11781.0_x64__8wekyb3d8bbwe\\bin\\sub\\WindowsTerminal.exe",
+    "expected": "C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_*_x64__8wekyb3d8bbwe\\bin\\sub\\WindowsTerminal.exe"
+  },
+  {
+    "name": "valid_extended_length_prefix",
+    "input": "\\\\?\\C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe",
+    "expected": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_*_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe"
+  },
+  {
+    "name": "valid_forward_slashes_and_ascii_whitespace_trim",
+    "input": "  C:/Program Files/WindowsApps/Microsoft.Paint_11.2404.1020.0_neutral__8wekyb3d8bbwe/PaintApp/mspaint.exe\t\r\n",
+    "expected": "C:\\Program Files\\WindowsApps\\Microsoft.Paint_*_neutral__8wekyb3d8bbwe\\PaintApp\\mspaint.exe"
+  },
+  {
+    "name": "valid_lowercase_prefix_preserves_component_case",
+    "input": "c:\\program files\\windowsapps\\Contoso.MyApp_0.0.0.65535_Arm64_Res.1_0123456789AbC\\SubDir\\MyApp.EXE",
+    "expected": "C:\\Program Files\\WindowsApps\\Contoso.MyApp_*_Arm64_Res.1_0123456789AbC\\SubDir\\MyApp.EXE"
+  },
+  {
+    "name": "valid_boundary_lengths_x86_and_min_exe",
+    "input": "C:\\Program Files\\WindowsApps\\AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA_1.0.0.0_x86_RRRRRRRRRRRRRRRRRRRRRRRRRRRRRR_0123456789abc\\a.exe",
+    "expected": "C:\\Program Files\\WindowsApps\\AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA_*_x86_RRRRRRRRRRRRRRRRRRRRRRRRRRRRRR_0123456789abc\\a.exe"
+  },
+  {
+    "name": "valid_arm_arch",
+    "input": "C:\\Program Files\\WindowsApps\\Contoso.ArmApp_2.1.3.4_arm__8wekyb3d8bbwe\\ArmApp.exe",
+    "expected": "C:\\Program Files\\WindowsApps\\Contoso.ArmApp_*_arm__8wekyb3d8bbwe\\ArmApp.exe"
+  },
+  {
+    "name": "reject_non_system_drive_d",
+    "input": "D:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_app_execution_alias_stub",
+    "input": "C:\\Users\\alice\\AppData\\Local\\Microsoft\\WindowsApps\\wt.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_localappdata_windowsapps_package_stub",
+    "input": "C:\\Users\\alice\\AppData\\Local\\Microsoft\\WindowsApps\\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\\winget.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_unc_extended_prefix",
+    "input": "\\\\?\\UNC\\server\\share\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_unc_extended_prefix_lowercase",
+    "input": "\\\\?\\unc\\server\\share\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_unc_share_path",
+    "input": "\\\\server\\share\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_device_namespace_dot",
+    "input": "\\\\.\\C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_nt_object_namespace",
+    "input": "\\??\\C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_empty_string",
+    "input": "",
+    "expected": null
+  },
+  {
+    "name": "reject_ascii_whitespace_only",
+    "input": "  \t\r\n  ",
+    "expected": null
+  },
+  {
+    "name": "reject_exact_29_byte_prefix_only",
+    "input": "C:\\Program Files\\WindowsApps\\",
+    "expected": null
+  },
+  {
+    "name": "reject_28_byte_prefix_without_trailing_slash",
+    "input": "C:\\Program Files\\WindowsApps",
+    "expected": null
+  },
+  {
+    "name": "reject_direct_exe_under_windowsapps",
+    "input": "C:\\Program Files\\WindowsApps\\Standalone.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_non_exe_extension",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.dll",
+    "expected": null
+  },
+  {
+    "name": "reject_bare_dot_exe_filename",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_trailing_backslash",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe\\",
+    "expected": null
+  },
+  {
+    "name": "reject_empty_segment_double_backslash",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_dot_segment",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\.\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_dotdot_segment",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\..\\Other\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_wildcard_asterisk_in_input",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_*_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_wildcard_question_mark_in_input",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\Start?ExperiencesApp.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_colon_ads_in_remainder",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe:ads",
+    "expected": null
+  },
+  {
+    "name": "reject_package_full_name_4_parts",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64_8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_package_full_name_6_parts",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64_res_extra_8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_name_empty",
+    "input": "C:\\Program Files\\WindowsApps\\_1.0.0.0_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_name_51_chars",
+    "input": "C:\\Program Files\\WindowsApps\\AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA_1.0.0.0_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_name_invalid_char_space",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft App_1.0.0.0_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_version_3_parts",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_version_5_parts",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0.1_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_version_leading_zero",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.01.0.0_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_version_plus_sign",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.+1.0.0_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_version_overflow_65536",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.65536_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_version_empty_component",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1..0.0_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_invalid_arch_amd64",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_amd64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_resource_id_31_chars",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64_RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR_8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_resource_id_invalid_char",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64_res$1_8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_publisher_id_12_chars",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbw\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_publisher_id_14_chars",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwea\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_publisher_id_forbidden_i",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwi\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_publisher_id_forbidden_l",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwl\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_publisher_id_forbidden_o",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwo\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_publisher_id_forbidden_u",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwu\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_publisher_id_forbidden_uppercase_I",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwI\\App.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_control_char_nul",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwe\\App\u0000.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_control_char_del",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwe\\App\u007f.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_internal_tab_control_char",
+    "input": "C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwe\\App\tName.exe",
+    "expected": null
+  },
+  {
+    "name": "reject_non_ascii_leading_whitespace",
+    "input": "\u00a0C:\\Program Files\\WindowsApps\\Microsoft.App_1.0.0.0_x64__8wekyb3d8bbwe\\App.exe",
+    "expected": null
+  }
+]

@@ -448,8 +448,8 @@ fn upsert_process_row(
             END,
             user_sid = COALESCE(excluded.user_sid, processes.user_sid),
             origin_url = COALESCE(excluded.origin_url, processes.origin_url),
-            package_family_name = COALESCE(excluded.package_family_name, processes.package_family_name),
-            package_sid = COALESCE(excluded.package_sid, processes.package_sid),
+            package_family_name = COALESCE(processes.package_family_name, excluded.package_family_name),
+            package_sid = COALESCE(processes.package_sid, excluded.package_sid),
             exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)"
     } else {
         "INSERT INTO processes (
@@ -471,8 +471,8 @@ fn upsert_process_row(
             END,
             user_sid = COALESCE(excluded.user_sid, processes.user_sid),
             origin_url = COALESCE(excluded.origin_url, processes.origin_url),
-            package_family_name = COALESCE(excluded.package_family_name, processes.package_family_name),
-            package_sid = COALESCE(excluded.package_sid, processes.package_sid),
+            package_family_name = COALESCE(processes.package_family_name, excluded.package_family_name),
+            package_sid = COALESCE(processes.package_sid, excluded.package_sid),
             exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)"
     };
     tx.execute(

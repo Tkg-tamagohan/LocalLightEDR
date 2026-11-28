@@ -5472,7 +5472,8 @@ async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_fall
 
     let app_a = r"C:\Tools\pkg_drop_a.exe";
     let app_b = r"C:\Tools\pkg_drop_b.exe";
-    for exe in [app_a, app_b] {
+    let app_c = r"C:\Tools\pkg_drop_c.exe";
+    for exe in [app_a, app_b, app_c] {
         inspector.insert(
             exe,
             BinaryIdentity {
@@ -5507,6 +5508,7 @@ async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_fall
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
     let id_a = ProcessIdentity::new(42_001, unix_ms_to_filetime(now_ms - 5_000));
     let id_b = ProcessIdentity::new(42_002, unix_ms_to_filetime(now_ms - 5_000));
+    let id_c = ProcessIdentity::new(42_003, unix_ms_to_filetime(now_ms - 5_000));
     let sender = engine.sender();
 
     sender
@@ -5541,9 +5543,25 @@ async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_fall
         )
         .await
         .expect("send start B");
-    wait_high_priority_processed(&engine, 2, "two ProcessStarts").await;
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_c,
+                parent_pid: 4,
+                exe_path: app_c.to_string(),
+                command_line: "pkg_drop_c.exe".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.DropC_3".to_string()),
+                package_sid: Some("S-1-15-2-match-c".to_string()),
+            },
+        )
+        .await
+        .expect("send start C");
+    wait_high_priority_processed(&engine, 3, "three ProcessStarts").await;
 
-    // A: WFP drop event SID overrides table SID.
+    // A: Mismatched WFP drop event SID keeps event SID and clears candidate PFN to avoid mixing packages.
     assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
         os_filter_id: 501,
         rule_handle: 501,
@@ -5555,7 +5573,7 @@ async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_fall
         package_sid: Some("S-1-15-2-wfp-override-a".to_string()),
     }));
 
-    // B: WFP drop event has package_sid == None -> falls back to table TokenAppContainerSid.
+    // B: WFP drop event has package_sid == None -> falls back to table TokenAppContainerSid and PFN.
     assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
         os_filter_id: 502,
         rule_handle: 502,
@@ -5567,9 +5585,21 @@ async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_fall
         package_sid: None,
     }));
 
+    // C: Case-insensitive matching SID preserves both candidate PFN and event SID.
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 503,
+        rule_handle: 503,
+        exe_path: app_c.to_string(),
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 13)),
+        dst_port: 443,
+        timestamp_ms: now_ms,
+        package_sid: Some("s-1-15-2-match-c".to_string()),
+    }));
+
     let deadline = Instant::now() + Duration::from_secs(2);
-    while store.list_alerts(None, 10).expect("list").len() < 2 {
-        assert!(Instant::now() < deadline, "timed out waiting for two WFP drop alerts");
+    while store.list_alerts(None, 10).expect("list").len() < 3 {
+        assert!(Instant::now() < deadline, "timed out waiting for three WFP drop alerts");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     engine.shutdown_and_flush().await.expect("shutdown");
@@ -5580,7 +5610,10 @@ async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_fall
         .find(|a| a.process_instance_id.as_deref() == Some(id_a.instance_id().as_str()))
         .expect("alert A");
     let ctx_a: serde_json::Value = serde_json::from_str(&alert_a.context_json).expect("ctx A");
-    assert_eq!(ctx_a["package_family_name"], "Contoso.DropA_1");
+    assert!(
+        ctx_a["package_family_name"].is_null(),
+        "mismatched WFP package_sid must clear candidate package_family_name, got {ctx_a}"
+    );
     assert_eq!(ctx_a["package_sid"], "S-1-15-2-wfp-override-a");
 
     let alert_b = alerts
@@ -5590,6 +5623,14 @@ async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_fall
     let ctx_b: serde_json::Value = serde_json::from_str(&alert_b.context_json).expect("ctx B");
     assert_eq!(ctx_b["package_family_name"], "Contoso.DropB_2");
     assert_eq!(ctx_b["package_sid"], "S-1-15-2-table-fallback-b");
+
+    let alert_c = alerts
+        .iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(id_c.instance_id().as_str()))
+        .expect("alert C");
+    let ctx_c: serde_json::Value = serde_json::from_str(&alert_c.context_json).expect("ctx C");
+    assert_eq!(ctx_c["package_family_name"], "Contoso.DropC_3");
+    assert_eq!(ctx_c["package_sid"], "s-1-15-2-match-c");
 }
 
 #[tokio::test]
@@ -5855,4 +5896,99 @@ async fn daemon_fu_p4_03_04_canary_backfill_populates_package_attrs_in_store_and
         serde_json::from_str(&alerts[0].context_json).expect("parse canary context");
     assert_eq!(ctx["package_family_name"], "Canary.App_abcde");
     assert_eq!(ctx["package_sid"], "S-1-15-2-44-55-66");
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_05_process_stop_sigma_alert_preserves_package_attrs() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    inspector.insert(
+        bth_exe,
+        BinaryIdentity {
+            exe_path: bth_exe.to_string(),
+            sha256: Some("e".repeat(64)),
+            authenticode: None,
+        },
+    );
+
+    let sigma_rule = SigmaRule {
+        id: "TEST-FU-P4-03-STOP".to_string(),
+        title: "BackgroundTaskHost Image Exit Rule".to_string(),
+        severity: AlertSeverity::Medium,
+        description: None,
+        conditions: vec![FieldCondition {
+            field: SigmaField::Image,
+            modifier: MatchModifier::EndsWith,
+            values: vec![r"\backgroundTaskHost.exe".to_string()],
+        }],
+    };
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(vec![sigma_rule]).expect("compile sigma rule"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let pid = 45_005u32;
+    let id = ProcessIdentity::new(pid, unix_ms_to_filetime(now_ms - 2_000));
+    let sender = engine.sender();
+
+    // `EarlyPruner::default()` suppresses Sigma evaluation on `ProcessStart` for
+    // `backgroundTaskHost.exe`, leaving `ProcessStop` as the first rule match.
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:Contoso.StopHost".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.StopHost_1".to_string()),
+                package_sid: Some("S-1-15-2-stop-1".to_string()),
+            },
+        )
+        .await
+        .expect("send start");
+    wait_high_priority_processed(&engine, 1, "ProcessStart before stop").await;
+
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid,
+            exit_code: 0,
+            exit_time_100ns: unix_ms_to_filetime(now_ms),
+        })
+        .await
+        .expect("send stop");
+    wait_high_priority_processed(&engine, 2, "ProcessStop").await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let alerts = store.list_alerts(None, 10).expect("list alerts");
+    assert_eq!(alerts.len(), 1, "ProcessStop should fire the Sigma Image rule once");
+    assert_eq!(alerts[0].source_layer, "LAYER_2_RULES");
+    assert_eq!(alerts[0].rule_id, "TEST-FU-P4-03-STOP");
+    assert_eq!(
+        alerts[0].process_instance_id.as_deref(),
+        Some(id.instance_id().as_str())
+    );
+    let ctx: serde_json::Value =
+        serde_json::from_str(&alerts[0].context_json).expect("parse stop alert context");
+    assert_eq!(ctx["package_family_name"], "Contoso.StopHost_1");
+    assert_eq!(ctx["package_sid"], "S-1-15-2-stop-1");
 }

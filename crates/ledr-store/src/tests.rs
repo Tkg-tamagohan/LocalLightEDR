@@ -1232,6 +1232,72 @@ fn store_fu_p4_03_idempotent_package_column_migration_and_non_clobbering_roundtr
         })
     );
 
+    // Conflicting non-NULL values in a subsequent upsert must preserve first-non-NULL values.
+    store
+        .ingest_event_with_extra_metadata(
+            &dup_none,
+            None,
+            None,
+            None,
+            ProcessExtraMetadata {
+                package_family_name: Some("Conflicting.App_99999"),
+                package_sid: Some("S-1-15-2-99-99-99"),
+                ..Default::default()
+            },
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest conflicting metadata on id_both");
+    // Missing column (package_sid == None on id_pfn_only) still backfills while preserving existing PFN.
+    let id_pfn_only = cases[1].0;
+    let pfn_only_ev = SensorEvent::ProcessStart {
+        identity: id_pfn_only,
+        parent_pid: 4,
+        exe_path: cases[1].1.to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_extra_metadata(
+            &pfn_only_ev,
+            None,
+            None,
+            None,
+            ProcessExtraMetadata {
+                package_family_name: Some("ShouldNotReplace.Broker"),
+                package_sid: Some("S-1-15-2-filled-sid"),
+                ..Default::default()
+            },
+            false,
+            "OBSERVED",
+        )
+        .expect("backfill missing sid via ingest");
+    // Whitespace-only values normalize to None and update_process_package_metadata rejects empty updates.
+    assert!(
+        !store
+            .update_process_package_metadata(&id_pfn_only.instance_id(), Some("   "), Some("\t\n"))
+            .expect("whitespace-only metadata is a no-op")
+    );
+    store.flush_batch().expect("flush conflicting and backfill checks");
+    assert_eq!(
+        store
+            .get_process_package_info(&id_both.instance_id())
+            .expect("verify first-non-null preserved"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Contoso.App_12345".to_string()),
+            package_sid: Some("S-1-15-2-10-20-30".to_string()),
+        })
+    );
+    assert_eq!(
+        store
+            .get_process_package_info(&id_pfn_only.instance_id())
+            .expect("verify null-only backfill on ingest"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+            package_sid: Some("S-1-15-2-filled-sid".to_string()),
+        })
+    );
+
     // 5. update_process_package_metadata updates both pending batch entries and committed rows via COALESCE.
     let id_pending = ProcessIdentity::new(205, 133_800_000_000_000_500);
     let ev_pending = SensorEvent::ProcessStart {

@@ -121,14 +121,15 @@ fn normalize_package_sid_key(package_sid: Option<&str>) -> Option<String> {
 
 /// Bounded overflow fallback queue for [`QueuedWfpDrop`] events when `wfp_drop_tx` is temporarily
 /// full inside a non-blocking BFE net-event callback (`L-10`, `BUG_0006` overflow guarantee).
-/// Deduplicates identical `(exe_key, package_sid, dst_ip)` tuples and coalesces per `exe_key` if
-/// even the secondary queue reaches `capacity` so blocked apps still reach operator triage.
+/// Deduplicates identical `(exe_key, package_sid, dst_ip)` tuples and coalesces per
+/// `(exe_key, package_sid)` if even the secondary queue reaches `capacity` so blocked apps/packages
+/// still reach operator triage without cross-package suppression.
 #[derive(Debug, Default)]
 pub(super) struct WfpDropOverflowQueue {
     queue: VecDeque<QueuedWfpDrop>,
     active_keys: HashSet<(String, Option<String>, IpAddr)>,
-    coalesced_by_exe: HashMap<String, QueuedWfpDrop>,
-    coalesced_order: VecDeque<String>,
+    coalesced_by_exe: HashMap<(String, Option<String>), QueuedWfpDrop>,
+    coalesced_order: VecDeque<(String, Option<String>)>,
     last_coalesced: Option<(String, IpAddr)>,
     capacity: usize,
 }
@@ -152,10 +153,9 @@ impl WfpDropOverflowQueue {
         if self.active_keys.contains(&dedup_key) {
             return OverflowPushOutcome::Deduplicated;
         }
-        if let Some(existing) = self.coalesced_by_exe.get_mut(&item.exe_key) {
-            if canonical_ip(existing.dst_ip) == canon_dst
-                && normalize_package_sid_key(existing.package_sid.as_deref()) == sid_key
-            {
+        let coalesce_key = (item.exe_key.clone(), sid_key);
+        if let Some(existing) = self.coalesced_by_exe.get_mut(&coalesce_key) {
+            if canonical_ip(existing.dst_ip) == canon_dst {
                 *existing = item;
                 return OverflowPushOutcome::Deduplicated;
             }
@@ -165,9 +165,8 @@ impl WfpDropOverflowQueue {
             self.queue.push_back(item);
             return OverflowPushOutcome::Queued;
         }
-        let exe_k = item.exe_key.clone();
         if let std::collections::hash_map::Entry::Occupied(mut entry) =
-            self.coalesced_by_exe.entry(exe_k.clone())
+            self.coalesced_by_exe.entry(coalesce_key.clone())
         {
             self.last_coalesced = Some((item.exe_path.clone(), canon_dst));
             entry.insert(item);
@@ -180,8 +179,8 @@ impl WfpDropOverflowQueue {
             };
             self.coalesced_by_exe.remove(&evicted);
         }
-        self.coalesced_order.push_back(exe_k.clone());
-        self.coalesced_by_exe.insert(exe_k, item);
+        self.coalesced_order.push_back(coalesce_key.clone());
+        self.coalesced_by_exe.insert(coalesce_key, item);
         OverflowPushOutcome::CoalescedNewExe
     }
 
@@ -199,8 +198,8 @@ impl WfpDropOverflowQueue {
             self.active_keys.remove(&dedup_key);
             return Some(item);
         }
-        while let Some(exe_k) = self.coalesced_order.pop_front() {
-            if let Some(item) = self.coalesced_by_exe.remove(&exe_k) {
+        while let Some(coalesce_key) = self.coalesced_order.pop_front() {
+            if let Some(item) = self.coalesced_by_exe.remove(&coalesce_key) {
                 return Some(item);
             }
         }
@@ -1097,6 +1096,20 @@ impl DaemonEngine {
                 .unwrap_or_else(|e| e.into_inner());
             history.lookup_domains_for_process(&cand.instance_id, item.dst_ip)
         };
+        let event_sid = item
+            .package_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let cand_sid = cand
+            .package_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let sid_mismatch = matches!(
+            (event_sid, cand_sid),
+            (Some(ev), Some(cd)) if !ev.eq_ignore_ascii_case(cd)
+        );
         let proc_ctx = ResolvedProcessContext {
             proc_identity: Some(cand.identity),
             proc_instance_id: Some(cand.instance_id.clone()),
@@ -1116,11 +1129,14 @@ impl DaemonEngine {
             motw_referrer: cand.motw_referrer.clone(),
             motw_frame_url: cand.motw_frame_url.clone(),
             motw_zone_id: cand.motw_zone_id,
-            package_family_name: cand.package_family_name.clone(),
-            package_sid: item
-                .package_sid
-                .clone()
-                .or_else(|| cand.package_sid.clone()),
+            package_family_name: if sid_mismatch {
+                None
+            } else {
+                cand.package_family_name.clone()
+            },
+            package_sid: event_sid
+                .map(str::to_owned)
+                .or_else(|| cand_sid.map(str::to_owned)),
             proc_sha256: None,
             proc_created_at_ms: None,
         };
@@ -1731,6 +1747,7 @@ mod unit_tests {
         let mut q = WfpDropOverflowQueue::new(4);
         let exe = r"C:\Windows\System32\backgroundTaskHost.exe";
         let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 44));
+        let dst2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 45));
 
         assert_eq!(
             q.push(make_drop_item(exe, Some("S-1-15-2-111"), dst)),
@@ -1760,6 +1777,44 @@ mod unit_tests {
             q.push(make_drop_item(exe, Some("S-1-15-2-111"), dst)),
             OverflowPushOutcome::Queued
         );
+
+        // Secondary coalescing map must also preserve distinct packages on the same exe/IP.
+        let mut q_sec = WfpDropOverflowQueue::new(2);
+        assert_eq!(
+            q_sec.push(make_drop_item("other_a.exe", None, dst)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q_sec.push(make_drop_item("other_b.exe", None, dst)),
+            OverflowPushOutcome::Queued
+        );
+        // Primary queue is full (2/2). Both packages on `backgroundTaskHost.exe` enter coalesced map.
+        assert_eq!(
+            q_sec.push(make_drop_item(exe, Some("S-1-15-2-111"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q_sec.push(make_drop_item(exe, Some(" s-1-15-2-111 "), dst)),
+            OverflowPushOutcome::Deduplicated
+        );
+        assert_eq!(
+            q_sec.push(make_drop_item(exe, Some("S-1-15-2-222"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        // Distinct destination for package 111 overwrites only package 111, leaving 222 intact.
+        assert_eq!(
+            q_sec.push(make_drop_item(exe, Some("S-1-15-2-111"), dst2)),
+            OverflowPushOutcome::CoalescedOverwritten
+        );
+        let _ = q_sec.pop().expect("primary 1");
+        let _ = q_sec.pop().expect("primary 2");
+        let sec1 = q_sec.pop().expect("secondary pkg 111");
+        let sec2 = q_sec.pop().expect("secondary pkg 222");
+        assert!(q_sec.pop().is_none());
+        assert_eq!(sec1.package_sid.as_deref(), Some("S-1-15-2-111"));
+        assert_eq!(sec1.dst_ip, dst2);
+        assert_eq!(sec2.package_sid.as_deref(), Some("S-1-15-2-222"));
+        assert_eq!(sec2.dst_ip, dst);
     }
 
     #[test]

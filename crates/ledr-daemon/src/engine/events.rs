@@ -1517,10 +1517,19 @@ impl DaemonEngine {
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
-                let (id, exe_path) = match table.on_process_stop_with_exe(*pid, event_ts_ms) {
-                    Some((inst_id, exe)) => (Some(inst_id), Some(exe)),
-                    None => (None, None),
-                };
+                let (id, exe_path, pkg_pfn, pkg_sid) =
+                    match table.on_process_stop_with_exe(*pid, event_ts_ms) {
+                        Some((inst_id, exe)) => {
+                            let (pfn, sid) = table
+                                .get_by_instance_id(&inst_id)
+                                .map(|entry| {
+                                    (entry.package_family_name.clone(), entry.package_sid.clone())
+                                })
+                                .unwrap_or((None, None));
+                            (Some(inst_id), Some(exe), pfn, sid)
+                        }
+                        None => (None, None, None, None),
+                    };
                 ResolvedProcessContext {
                     proc_identity: None,
                     proc_instance_id: id.clone(),
@@ -1540,8 +1549,8 @@ impl DaemonEngine {
                     motw_referrer: None,
                     motw_frame_url: None,
                     motw_zone_id: None,
-                    package_family_name: None,
-                    package_sid: None,
+                    package_family_name: pkg_pfn,
+                    package_sid: pkg_sid,
                     proc_sha256: None,
                     proc_created_at_ms: None,
                 }

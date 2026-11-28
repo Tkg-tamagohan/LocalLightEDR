@@ -455,9 +455,34 @@ impl DaemonEngine {
         }
 
         let exe_key = WfpRuleManager::exe_key(trimmed);
+        let has_static_risk = matches!(
+            risk,
+            OutboundRiskClass::HighRiskPath | OutboundRiskClass::ScriptInterpreter
+        );
+        let is_preemptive_still_needed = |fw: &WfpRuleManager| -> bool {
+            if fw.is_startup_preemptive(trimmed) {
+                return true;
+            }
+            let table = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if has_static_risk {
+                table.has_active_exe_key(&exe_key)
+            } else {
+                table.has_active_motw_for_exe_key(&exe_key)
+            }
+        };
         let (has_wildcards, is_startup_pinned) = {
-            let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+            let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
             if fw.has_any_app_filter(trimmed) {
+                if !fw.has_once_allowed_for_exe(&exe_key)
+                    && (fw.has_pending_preemptive_removal(trimmed)
+                        || fw.has_deferred_preemptive_removal(trimmed))
+                    && is_preemptive_still_needed(&fw)
+                {
+                    fw.clear_pending_preemptive_removal(trimmed);
+                }
                 return;
             }
             (
@@ -560,25 +585,6 @@ impl DaemonEngine {
         if !is_preemptive_risk {
             return;
         }
-
-        let has_static_risk = matches!(
-            risk,
-            OutboundRiskClass::HighRiskPath | OutboundRiskClass::ScriptInterpreter
-        );
-        let is_preemptive_still_needed = |fw: &WfpRuleManager| -> bool {
-            if fw.is_startup_preemptive(trimmed) {
-                return true;
-            }
-            let table = self
-                .process_table
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if has_static_risk {
-                table.has_active_exe_key(&exe_key)
-            } else {
-                table.has_active_motw_for_exe_key(&exe_key)
-            }
-        };
 
         // Bug #2 & PRRT_kwDOVyjVyM66jl1W: Do not re-apply an app-wide automatic Preemptive WFP
         // block while another running sibling instance holds an active AllowOnce grant, and avoid

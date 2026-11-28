@@ -6,8 +6,8 @@ use crate::updater::{
     AppUpdateManager, UpdaterStatusView, emit_updater_status, open_release_notes_url_validated,
 };
 use ledr_proto::{
-    AlertDecision, AlertRecord, AlertStatus, AllowlistRuleRecord, FlightRecorderSnapshot,
-    PipelineMetrics, RuleScope,
+    AlertDecision, AlertRecord, AlertStatus, AllowPermanentPathMode, AllowlistRuleRecord,
+    FlightRecorderSnapshot, PipelineMetrics, RuleScope,
 };
 
 #[tauri::command]
@@ -46,16 +46,39 @@ pub(crate) async fn fetch_alerts(
         .map_err(|err| format!("IPC background task failed: {err}"))?
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResolveAlertInvokePayload {
+    pub alert_id: String,
+    pub decision: AlertDecision,
+    #[serde(default)]
+    pub path_mode: AllowPermanentPathMode,
+}
+
+pub(crate) async fn execute_resolve_alert_action(
+    client: IpcClient,
+    payload: ResolveAlertInvokePayload,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        client.resolve_alert_with_options(payload.alert_id, payload.decision, payload.path_mode)
+    })
+    .await
+    .map_err(|err| format!("IPC background task failed: {err}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn resolve_alert_action(
     client: tauri::State<'_, IpcClient>,
     alert_id: String,
     decision: AlertDecision,
+    path_mode: Option<AllowPermanentPathMode>,
 ) -> Result<String, String> {
-    let client = client.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || client.resolve_alert(alert_id, decision))
-        .await
-        .map_err(|err| format!("IPC background task failed: {err}"))?
+    let payload = ResolveAlertInvokePayload {
+        alert_id,
+        decision,
+        path_mode: path_mode.unwrap_or_default(),
+    };
+    execute_resolve_alert_action(client.inner().clone(), payload).await
 }
 
 #[tauri::command]

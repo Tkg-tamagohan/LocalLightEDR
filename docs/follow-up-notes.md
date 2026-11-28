@@ -18,6 +18,8 @@
 | `FU-R0-01` | ビルド最適化基準計測 | Phase R0 | リリースビルドおよび CI 高速化改修前のベースライン計測値（`main` `b9bb76a` / CI `10e357f`）の固定と実機未検証境界の分離記録 | Phase R0 計測完了済み（Phase R1 から Phase R3 までの比較基準として固定、`b9bb76a` 上の `L-24` と `L-08` は管理者および対話デスクトップ検証待ち） |
 | `FU-R1-01` | ビルド最適化統合と最終判定 | Phase R1〜R3-4 | Phase R1〜R2B の統合受け入れ結果（`main` `3f92057`）、Phase R3-1〜R3-4 の検証と採否判定（`d9c3fdd`）、および実機未検証項目の分離記録 | Phase R1〜R3-4 完了済み（PR #53、#54、#56、#58 マージ済み、PR #55、#57 不採用クローズ、R3-4 `Win32_System_Time` 削除見送りおよび分割不採用、`c4acf22` 実機一括検証の結果と残課題は `FU-R1-02` へ引き継ぎ） |
 | `FU-R1-02` | `main` `c4acf22` 実機一括検証と残課題 | Phase R1〜R3-4 統合後 | `main`（`c4acf22`）上の `L-08`、`L-23`、および `L-24` 実機検証結果、原因切り分け、および静穏環境再計測と ETW/AMSI 調査の残課題 | `L-08` と `L-23` は合格、`L-24` `-Mode load` はプロセス起動負荷未発生のため未検証（参考値）、`-Mode idle` は未達（静穏環境での `L-24` 再計測と再現時 ETW/AMSI バッファ調査待ち） |
+| `FU-P4-02` | 機能追加と実機検証対象 | Phase 4 | View 1 の WindowsApps バージョン部ワイルドカード永続許可仕様と実機確認対象 | 実装および自動テストは本ブランチで対応（実ストアアプリ更新前後の通信許可継続と `AppExecutionAlias` 除外は Windows 10 または 11 クライアント SKU 実機確認待ち） |
+| `FU-P4-03` | 後続拡張設計 | Phase 4 | 汎用ホストプロセス（`backgroundTaskHost.exe` 等）向け後方互換プロトコル、ルール、および WFP 拡張設計 | 単一設計として確定記録済み（事前 API スパイク約 1 日および Track B-1 から Track B-3 の 3 本の後続 PR へ分離して実装予定） |
 
 ### 現在地、推奨着手順、および用語の補足
 
@@ -582,3 +584,87 @@ Run `#45753387980` の `release-dist` 6 点は `LocalEDR-Setup-v0.1.0-win-x64.ex
      あわせて `-Mode load`（`60 s`）中に実 `cargo build --locked` とブラウザ 5 タブ相当のプロセス起動負荷を発生させて再計測する。
   2. 静穏アイドル条件でも `t=273..544.5s` 型の一過性 `MEM_PRIVATE` バーストが再現する場合は、`ledr-sensor-win` と `ledr-daemon` における一時的な ETW や AMSI バッファの計測と対策を別 PR として切り出して調査する。
   3. 上記の `L-24` 再計測と `FU-E2E-01` および `FU-E2E-02` の統合実機 E2E が完了するまで、[implementation-plan.md](implementation-plan.md) の未完了チェックリスト 3 件（`[ ]`）は未更新のまま維持する。
+
+## FU-P4-02 View 1 の WindowsApps バージョン部ワイルドカード永続許可と実機確認対象
+
+### 対象ファイル
+
+- プロトコルおよび共通テストベクタ：[crates/ledr-proto/src/lib.rs](../crates/ledr-proto/src/lib.rs)（`AllowPermanentPathMode`、`build_windows_apps_version_wildcard_pattern`、`IpcRequest::ResolveAlertWithOptions`）および [windows_apps_wildcard_vectors.json](../crates/ledr-proto/tests/fixtures/windows_apps_wildcard_vectors.json)
+- ルール照合：[matcher.rs](../crates/ledr-rules/src/allowlist/matcher.rs) および [crates/ledr-rules/src/lib.rs](../crates/ledr-rules/src/lib.rs)（`matches_path_pattern` の非 UNC `\\?\` 正規化と `WindowsApps` パターンのセグメント内 `*` 閉じ込め、ならびに変換関数の再エクスポート）
+- デーモン認可、解決、および WFP 整合：[dispatch.rs](../crates/ledr-daemon/src/ipc/dispatch.rs)（`ResolveAlertWithOptions` の `CallerAuthPolicy::UiOnly` 登録）、[alerts.rs](../crates/ledr-daemon/src/engine/alerts.rs)（`resolve_alert_with_options_and_outcome`）、および [reconcile.rs](../crates/ledr-daemon/src/firewall/reconcile.rs)（終了済み非起動ピン留め `Preemptive` ブロック解放）
+- Tauri ブリッジおよび View 1 UI：[apps/ledr-ui/src/ipc.rs](../apps/ledr-ui/src/ipc.rs)、[apps/ledr-ui/src/commands.rs](../apps/ledr-ui/src/commands.rs)、[apps/ledr-ui/ui/index.html](../apps/ledr-ui/ui/index.html)、[apps/ledr-ui/ui/app.js](../apps/ledr-ui/ui/app.js)、および [phase4_ui.test.mjs](../apps/ledr-ui/js-tests/phase4_ui.test.mjs)
+
+### 背景と実装仕様
+
+`C:\Program Files\WindowsApps\<PackageFullName>\<RelPath>` 配下の署名済みストアアプリは `GeneralUnknown` として監視され、通信やファイル操作時にアラートが発生し得る。
+従来の View 1 の「Allow Permanent Rule」は具体フルパスをそのまま `exe_path_pattern` として `allowlist_rules` テーブルへ保存するため、Microsoft Store の自動更新で `<PackageFullName>` 内のバージョン部が変化するたびに照合不一致となり、再アラートと一時遮断が繰り返されていた。
+
+この運用負荷を解消しつつ最小権限を維持するため、バージョン部のみを `*` へ置換する永続許可を以下の境界条件で実装する。
+
+- **29 バイトプレフィックス強制と `AppExecutionAlias` 除外**：入力パスは正規化後に先頭 29 バイトが `C:\Program Files\WindowsApps\`（ASCII 大文字小文字無視、システムドライブ `C:` 固定）へ一致する場合のみ対象とする。
+  これにより `%LOCALAPPDATA%\Microsoft\WindowsApps\` 配下の 0 バイト `AppExecutionAlias` リパースポイントスタブや、非特権ユーザーが作成し得る非システムドライブおよび `subst` ドライブを除外する。
+- **厳密な 7 ステップ変換仕様（Rust と JS の共通規則）**：前後の ASCII 空白除去と ASCII 制御文字（`0x00..=0x1F` と `0x7F`）拒否（ステップ 1）、`/` から `\` への置換および `\\?\UNC\`、UNC（`\\`）、`\\.\`、`\??\` を拒否した上での非 UNC `\\?\` 先頭 4 バイト除去（ステップ 2）、先頭 29 バイト一致確認（ステップ 3）、30 バイト目以降（`[29..]`）での `*`、`?`、`:`、末尾 `\`、空セグメント、`.`、`..` の拒否（ステップ 4）、`<PackageFullName>` と `<RelPath>` への分割および最終セグメントの 5 バイト以上かつ `.exe` 終端検証（ステップ 5）、`<PackageFullName>` の `_` 5 分割検証（`<Name>` が `1..=50` 文字 `[A-Za-z0-9.-]`、`<Version>` が `.` 4 要素の `0..=65535` ASCII 数字かつ `+` および先頭ゼロ不可、`<Arch>` が `x86`、`x64`、`arm`、`arm64`、`neutral` のいずれか、`<ResourceId>` が `0..=30` 文字 `[A-Za-z0-9.-]`、`<PublisherId>` が厳密 13 文字の Crockford Base32 `[0-9a-hjkmnp-tv-z]`）（ステップ 6）、ならびに固定プレフィックスと `<Version>` のみを `*` へ置換して残りの文字ケースを保持したパターン生成（ステップ 7）を実行する。
+- **セグメント内 `*` 閉じ込め**：`matches_path_pattern` は非 UNC `\\?\` を除去した上で、正規化後パターンが `WindowsApps` バージョンワイルドカード形式（`c:\program files\windowsapps\<Name>_*_<Arch>_<ResourceId>_<PublisherId>\<RelPath>`）に一致する場合に限り `*` がパス区切り `\` を跨がない（`s[si] != '\\'`）制限を適用し、同一署名者の別パッケージ配下にある偽装サブパスとの誤一致を防止する。
+  View 3 で手動登録された汎用パターン（`C:\Program Files\WindowsApps\*\App.exe` 等）や既存の `"*\Google\Chrome\User Data\*"` 等の互換性は変更せず維持する。
+- **`L-04` 署名必須とフェイルクローズ**：View 1 の「Wildcard Store app version」チェックボックスは既定 OFF とし、`AllowPermanentPathMode::WindowsAppsVersionWildcard` 指定時は `use_signer_if_available == true`、非空 `signer_subject`、非空かつ非オールゼロ `root_thumbprint`（`L-04`）、および有効パターン生成をすべて必須とする。
+  いずれか 1 つでも欠ける場合、またはプロセス紐付きのない `LAYER_4_BROWSER` や `AllowPermanent` 以外の決定が指定された場合は SHA-256 ルールへフォールバックせずエラーで拒否する（`LAYER_3_NETWORK` のアプリ単位 WFP アラートでは `process_instance_id` 未特定でも `exe_path` と検証済み署名が揃えば許可を作成でき、`NetworkAllow` と `FileCanaryAllow` の双方および宛先限定に対応して `AllowlistRuleRecord` の `sha256` は `None` とする）。
+- **後方互換 IPC と WFP 解放**：既存の `AlertDecision` と `IpcRequest::ResolveAlert` は無変更のまま維持し、`Exact` 時は `ResolveAlert`、ワイルドカード選択時のみ `CallerAuthPolicy::UiOnly` の `ResolveAlertWithOptions` を送信する。
+  `TransientContainment` は既存の解決経路で確実に解放し、終了済みプロセスの非起動ピン留め `Preemptive` ブロックは不要な `PersistedPolicy` Permit チャーンを起こさずに解放する（再起動済みの生存プロセスやオーバーフロー状態がある場合は `Preemptive` ブロックの削除を抑止する）。
+
+### 実機未検証境界（Windows 10 または Windows 11 クライアント SKU 確認対象）
+
+合成単体テストおよび UI モック DOM テストは実ストアアプリの更新やカーネル挙動を代替しないため、Windows 10 または Windows 11（x86_64）クライアント SKU 実機で以下の 3 点を別途検証する。
+
+1. 実 Microsoft Store アプリ（例として `Microsoft.StartExperiencesApp`）のアラートに対し、View 1 で「Wildcard Store app version」を ON にして「Allow Permanent Rule」を実行したとき、View 3 に `C:\Program Files\WindowsApps\<Name>_*_<Arch>_<ResourceId>_<PublisherId>\<RelPath>` と Authenticode 署名付きルールが登録されて通信が許可されること。
+2. ストアアプリ更新後（新バージョンディレクトリ配下のバイナリ起動および通信時）に、宛先無制限の `NetworkAllow` ルールではユーザー再アラートおよび遮断なしで通信許可が継続すること、ならびに宛先限定（IP、CIDR、またはドメイン）ルールかつ事前遮断対象（MOTW 等）では新版初回接続時の WFP ドロップ評価（`outbound.rs`）を経てユーザー再アラートなしに IP Permit が追加され通信が継続すること（初回接続の 1 パケットドロップを伴う境界を含む）。
+3. `%LOCALAPPDATA%\Microsoft\WindowsApps\` 配下の `AppExecutionAlias` スタブ経由または該当パスでは、ワイルドカード対象外として View 1 に「Wildcard Store app version」チェックボックスが表示されないこと。
+
+なお、個別ストアアプリごとの実機署名文字列（`signer_subject`）の棚卸しを要する `rules/default_allowlist.json` への既定ルール追加は、本件の対象外として分離する。
+
+## FU-P4-03 汎用ホストプロセス（backgroundTaskHost.exe 等）向け後方互換プロトコル、ルール、および WFP 拡張設計
+
+### 背景と確定した運用境界
+
+`C:\Windows\System32\backgroundTaskHost.exe` 等の汎用ホストプロセスは、単一のシステムバイナリかつ同一の Microsoft Windows 署名を持ちながら、起動引数（`-ServerName:...`）や AppContainer パッケージコンテキストに応じて Microsoft 標準タスクとサードパーティ製ストアアプリタスクの双方を実行する。
+現行の `AllowlistRuleRecord` は実行ファイルパス、ハッシュ、署名、および通信先しか保持しないため、宛先無制限（`allowed_target: null`）の許可を与えるとサードパーティ製タスクの通信まで全許可してしまう。
+
+本項目では後続実装に向けた単一アーキテクチャ設計を以下のとおり確定し、未決の選択肢を残さない。
+
+- **無条件許可の不採用**：`backgroundTaskHost.exe` 等に対する `allowed_target: null` の無条件 `NetworkAllow` は採用しない。
+- **非 AppContainer タスクの Layer 3 境界**：拡張実装後も、AppContainer パッケージ SID を持たない非パッケージ型の `-ServerName:` タスクは Layer 3（WFP）でのパッケージ分離対象外と確定し、宛先ドメインまたは IP 限定ルールあるいは `AllowOnce` 運用を継続する。
+
+### 識別軸と適用可能スコープの分離
+
+- **AppContainer と Package 識別（`package_family_name` と `package_sid`）**：WFP の `FWPM_LAYER_ALE_AUTH_CONNECT_V4` および `FWPM_LAYER_ALE_AUTH_CONNECT_V6` は `FWPM_CONDITION_ALE_APP_ID` と `FWPM_CONDITION_ALE_PACKAGE_ID`（`FWP_SID`）の複合条件を持つ。
+  そのため、Layer 3（`NetworkAllow` と `NetworkBlock`）のカーネル強制および Layer 1 と Layer 2（`ProcessAllow` と `FileCanaryAllow`）の全 4 スコープへ適用する。
+  パッケージ単位の WFP フィルタ数はユーザーが明示登録したパッケージ数（想定数件から数十件）に有界となる。
+- **コマンドライン引数識別（`command_line_pattern`）**：長さ `1..=512` 文字、ASCII 制御文字禁止、およびエスケープなしの `*` ワイルドカード（ASCII 大文字小文字無視）として定義する。
+  WFP カーネルはコマンドライン条件を持たずユーザー空間 PEB には書き換え耐性がないため、Layer 3（`NetworkAllow` と `NetworkBlock`）での使用は禁止し、起動時 ETW 捕捉値を用いる Layer 1 と Layer 2（`ProcessAllow` と `FileCanaryAllow`）に限定する。
+
+### 後方互換データモデル、IPC、および原子的解決設計
+
+- **既存公開型と既存テーブルの凍結維持**：既存の `AllowlistRuleRecord`、`ProcessRecord`、`ActiveDefenseController::add_wfp_app_rule`、および SQLite の `allowlist_rules` テーブルは変更しない。
+  `crates/ledr-store/src/schema.rs` の `row_to_rule` は未知の `scope` 文字列に対して `StoreError::InvalidValue` を返して `list_rules()` 全体を失敗させるほか、既存行の共有は旧コード参照時に汎用ホスト全許可へフェイルオープンする危険があるためである。
+- **プロセス属性保存と UI 受け渡し**：`processes` テーブルへ nullable 列 `package_family_name TEXT` と `package_sid TEXT` を冪等な `ALTER TABLE` マイグレーションで追加し、アラート生成時に `alerts.context_json` へ両フィールドを埋め込む。
+  これにより公開型 `ProcessRecord` を変更せずに View 1 へパッケージ情報を渡せる。
+- **専用テーブル `scoped_policy_rules`**：全 4 スコープ（`RuleScope`）を格納する専用テーブル `scoped_policy_rules` を新設し、列は `rule_id`、`scope`、`exe_path_pattern`、`sha256`、`signer_subject`、`root_thumbprint`、`allowed_target`、`package_family_name`、`package_sid`、`command_line_pattern`、`created_at_ms`、`created_by` とする。
+- **新規 IPC 型（すべて `CallerAuthPolicy::UiOnly`）**：新規型 `ScopedPolicyRuleRecord` と CRUD 用の `UpsertScopedRule`、`DeleteScopedRule`、および `ListScopedRules` に加え、View 1 でプロセス再開、終了、状態遷移、および補償ロールバックを原子的に実行する `ResolveAlertScoped { alert_id, decision, scope_to_package: bool }` を追加する。
+  汎用ホストプロセスに対して `scope_to_package: true` で `TerminateAndBlock { add_block_rule: true }` を実行したとき、対象プロセスに `package_sid` があればパッケージ単位 `NetworkBlock` を `scoped_policy_rules` へ保存し、非 AppContainer の場合は OS 全体のホスト遮断を防ぐため永続ブロック保存をスキップする。
+- **トレイト拡張**：`ActiveDefenseController` へデフォルト実装付きの `add_wfp_scoped_app_rule(&self, exe_path: &Path, package_sid: Option<&str>, remote_ip: Option<IpAddr>, allow: bool) -> Result<u64, String>` を追加し、`package_sid` が `None` のときは `add_wfp_app_rule` へ委譲し、`Some(_)` のときは既定実装として `Err`（フェイルクローズ）を返す。
+
+### 事前 API スパイク（約 1 日）の合格基準と不合格時フォールバック
+
+- **合格基準**：第 1 に、`windows` クレートで `FWPM_CONDITION_ALE_PACKAGE_ID` 付きフィルタが BFE に受理され、同一 `backgroundTaskHost.exe` の異なる AppContainer SID 間で通信許可と遮断が分離されることを確認する。
+  第 2 に、`FwpmNetEventSubscribe1` の `FWPM_NET_EVENT_HEADER3`（取得不可ビルドではプロセス表のトークン `TokenAppContainerSid` へフォールバック）および起動時 `GetPackageFamilyName` の値が `DeriveAppContainerSidFromAppContainerName` で導出した SID と一致することを確認する。
+- **不合格時フォールバック**：カーネルでの `FWPM_CONDITION_ALE_PACKAGE_ID` 事前フィルタ設置が環境制約により不成立の場合は、BFE へのアプリ全体 Permit 登録を行わず、プロセス起動時トークンから取得した `package_sid` を用いたデーモン空間 `evaluate_outbound_policy` 評価と通信先 IP 限定の一時 Permit 運用へ縮退する。
+
+### 段階的な実装計画（計約 4.5〜5 日）と各 PR の受け入れ基準
+
+本拡張は上記の事前 API スパイク（約 1 日）の完了後、以下の 3 本の独立した PR へ分割して進める。
+
+1. **Track B-1（1 PR、約 1 日）**：プロセス起動時トークンおよび WFP イベントからの `package_family_name` と `package_sid` 収集、`processes` 補助列マイグレーション、ならびに `alerts.context_json` 出力を実装する。
+   受け入れ基準は、既存 `ProcessRecord` 無変更のまま単体テストと実機ストアタスク起動の双方で両フィールドが記録されることとする。
+2. **Track B-2（1 PR、約 1.5〜2 日）**：`scoped_policy_rules` ストア、バリデーション（`NetworkAllow` は `L-04` 署名、非空 `package_family_name`、および `package_sid` を必須とし、`command_line_pattern` 単独は不可）、ならびに `add_wfp_scoped_app_rule` と `ResolveAlertScoped` を実装する。
+   受け入れ基準は、同一ホスト上の別 `package_sid` が通信許可されないこと、旧 `list_rules()` が影響を受けないこと、および WFP 同期失敗時に保存済みルールが補償ロールバックされることとする。
+3. **Track B-3（1 PR、約 1 日）**：View 1（パッケージ単位の許可と遮断チェック）および View 3（スコープ付きルール一覧、作成、および削除）の UI 実装と実機 E2E を実施する。
+   受け入れ基準は、UI モック DOM テスト全件合格、ならびに Windows 10 または Windows 11 実機で `backgroundTaskHost.exe` の特定パッケージのみを恒久許可できることとする。

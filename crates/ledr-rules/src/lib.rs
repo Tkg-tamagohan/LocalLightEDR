@@ -12,6 +12,7 @@ use std::fs;
 use std::path::Path;
 
 use ledr_proto::{AllowlistRuleRecord, RuleScope, SensorEvent};
+pub use ledr_proto::{build_windows_apps_version_wildcard_pattern, AllowPermanentPathMode};
 use sha2::Digest as _;
 use thiserror::Error;
 

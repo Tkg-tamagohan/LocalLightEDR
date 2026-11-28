@@ -4,10 +4,104 @@ use ledr_proto::{AllowlistRuleRecord, RuleScope};
 
 use super::BinaryIdentity;
 
-/// Performs ASCII case-insensitive wildcard (`*`) matching with `/` and `\` normalization.
+const WINDOWS_APPS_NORMALIZED_PREFIX: [char; 29] = [
+    'c', ':', '\\', 'p', 'r', 'o', 'g', 'r', 'a', 'm', ' ', 'f', 'i', 'l', 'e', 's', '\\', 'w',
+    'i', 'n', 'd', 'o', 'w', 's', 'a', 'p', 'p', 's', '\\',
+];
+
+fn normalize_pattern_chars(raw: &str) -> Vec<char> {
+    let normalized: Vec<char> = raw.chars().map(normalize_path_char).collect();
+    if normalized.starts_with(&['\\', '\\', '?', '\\'])
+        && !normalized.starts_with(&['\\', '\\', '?', '\\', 'u', 'n', 'c', '\\'])
+    {
+        normalized[4..].to_vec()
+    } else {
+        normalized
+    }
+}
+
+#[inline]
+fn is_lower_msix_name_char(ch: char) -> bool {
+    ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '.' || ch == '-'
+}
+
+#[inline]
+fn is_lower_crockford_base32(ch: char) -> bool {
+    matches!(
+        ch,
+        '0'..='9' | 'a'..='h' | 'j'..='k' | 'm'..='n' | 'p'..='t' | 'v'..='z'
+    )
+}
+
+fn is_windows_apps_version_wildcard_pattern(p: &[char]) -> bool {
+    if p.len() <= WINDOWS_APPS_NORMALIZED_PREFIX.len()
+        || !p.starts_with(&WINDOWS_APPS_NORMALIZED_PREFIX)
+    {
+        return false;
+    }
+    let remainder = &p[WINDOWS_APPS_NORMALIZED_PREFIX.len()..];
+    if remainder.contains(&'?') || remainder.contains(&':') || remainder.last() == Some(&'\\') {
+        return false;
+    }
+    let segments: Vec<&[char]> = remainder.split(|&ch| ch == '\\').collect();
+    if segments.len() < 2
+        || segments
+            .iter()
+            .any(|seg| seg.is_empty() || *seg == ['.'] || *seg == ['.', '.'])
+    {
+        return false;
+    }
+
+    let mut pkg_parts = segments[0].split(|&ch| ch == '_');
+    let (Some(name), Some(version), Some(arch), Some(resource_id), Some(publisher_id), None) = (
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+    ) else {
+        return false;
+    };
+
+    if !(1..=50).contains(&name.len()) || !name.iter().copied().all(is_lower_msix_name_char) {
+        return false;
+    }
+    if version != ['*'] {
+        return false;
+    }
+    if !matches!(
+        arch,
+        ['x', '8', '6']
+            | ['x', '6', '4']
+            | ['a', 'r', 'm']
+            | ['a', 'r', 'm', '6', '4']
+            | ['n', 'e', 'u', 't', 'r', 'a', 'l']
+    ) {
+        return false;
+    }
+    if resource_id.len() > 30 || !resource_id.iter().copied().all(is_lower_msix_name_char) {
+        return false;
+    }
+    if publisher_id.len() != 13 || !publisher_id.iter().copied().all(is_lower_crockford_base32) {
+        return false;
+    }
+
+    if segments[1..].iter().any(|seg| seg.contains(&'*')) {
+        return false;
+    }
+    let last_segment = segments[segments.len() - 1];
+    last_segment.len() >= 5 && last_segment.ends_with(&['.', 'e', 'x', 'e'])
+}
+
+/// Performs ASCII case-insensitive wildcard (`*`) matching with `/` and `\` normalization,
+/// stripping leading non-UNC `\\?\` prefixes and confining `*` within path segments only for
+/// `C:\Program Files\WindowsApps\<Name>_*_<Arch>_<ResourceId>_<PublisherId>\<RelPath>`
+/// version-wildcard patterns (preserving cross-segment `*` matching for generic manual rules).
 pub fn matches_path_pattern(exe_path: &str, pattern: &str) -> bool {
-    let s: Vec<char> = exe_path.chars().map(normalize_path_char).collect();
-    let p: Vec<char> = pattern.chars().map(normalize_path_char).collect();
+    let s = normalize_pattern_chars(exe_path);
+    let p = normalize_pattern_chars(pattern);
+    let star_forbids_backslash = is_windows_apps_version_wildcard_pattern(&p);
 
     let (mut si, mut pi) = (0usize, 0usize);
     let (mut star_pi, mut match_si) = (None, 0usize);
@@ -21,6 +115,9 @@ pub fn matches_path_pattern(exe_path: &str, pattern: &str) -> bool {
             match_si = si;
             pi += 1;
         } else if let Some(sp) = star_pi {
+            if star_forbids_backslash && s[match_si] == '\\' {
+                return false;
+            }
             pi = sp + 1;
             match_si += 1;
             si = match_si;
@@ -244,4 +341,73 @@ fn extract_cn(rdns: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matcher_01_windows_apps_segment_confinement_and_extended_prefix() {
+        let pattern = crate::build_windows_apps_version_wildcard_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\App.exe",
+        )
+        .expect("build wildcard pattern");
+        assert_eq!(
+            pattern,
+            r"C:\Program Files\WindowsApps\Contoso.App_*_x64__8wekyb3d8bbwe\App.exe"
+        );
+
+        // Matches updated version with runtime `\\?\` prefix, forward slashes, or lowercase.
+        assert!(matches_path_pattern(
+            r"\\?\C:\Program Files\WindowsApps\Contoso.App_2.5.1.0_x64__8wekyb3d8bbwe\App.exe",
+            &pattern
+        ));
+        assert!(matches_path_pattern(
+            r"c:/program files/windowsapps/contoso.app_2.5.1.0_x64__8wekyb3d8bbwe/app.exe",
+            &pattern
+        ));
+        assert!(matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_2.5.1.0_x64__8wekyb3d8bbwe\App.exe",
+            &format!(r"\\?\{pattern}")
+        ));
+
+        // Non-UNC `\\?\` stripping must NOT strip `\\?\UNC\`.
+        assert!(!matches_path_pattern(
+            r"\\?\UNC\C:\Program Files\WindowsApps\Contoso.App_2.5.1.0_x64__8wekyb3d8bbwe\App.exe",
+            &pattern
+        ));
+
+        // Rejects spoofed subpath under a different architecture/package because `*` in a
+        // `c:\program files\windowsapps\` pattern must not cross `\`.
+        assert!(!matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_arm64__8wekyb3d8bbwe\sub_x64__8wekyb3d8bbwe\App.exe",
+            &pattern
+        ));
+        assert!(!matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\nested\App.exe",
+            &pattern
+        ));
+
+        // Preserves existing cross-`\` `*` matching for generic View 3 manual patterns,
+        // including patterns rooted under `C:\Program Files\WindowsApps\`.
+        assert!(matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\bin\App.exe",
+            r"C:\Program Files\WindowsApps\*\App.exe"
+        ));
+        assert!(matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\bin\App.exe",
+            r"C:\Program Files\WindowsApps\*"
+        ));
+
+        // Preserves existing cross-`\` `*` matching for non-WindowsApps patterns.
+        assert!(matches_path_pattern(
+            r"C:\Users\Alice\AppData\Local\Google\Chrome\User Data\Default\Network\Cookies",
+            r"*\Google\Chrome\User Data\*"
+        ));
+        assert!(matches_path_pattern(
+            r"\\?\C:\Users\Alice\AppData\Local\Google\Chrome\User Data\Default\Cookies",
+            r"*\Google\Chrome\User Data\*\Cookies"
+        ));
+    }
 }

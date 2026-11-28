@@ -62,6 +62,14 @@ function createMockElement(id = "", initialDataset = {}) {
       if (!listeners.has(type)) listeners.set(type, []);
       listeners.get(type).push(fn);
     },
+    dispatchEvent(event) {
+      const type = typeof event === "string" ? event : event?.type;
+      const handlers = listeners.get(type) || [];
+      for (const fn of handlers) {
+        fn(event);
+      }
+      return true;
+    },
     reset() {
       this.value = "";
     },
@@ -1145,4 +1153,342 @@ test("UI-P4-12: ExpiredSuspended processless LAYER_4_BROWSER alert resolves via 
   assert.equal(feedback?.ok, true);
   assert.match(feedback?.message || "", /resolved to APPROVED_ONCE/);
   assert.match(ui.el.triageActionStatus.textContent, /resolved to APPROVED_ONCE/);
+});
+
+test("UI-P4-13: WindowsApps wildcard pattern matches shared Rust/JS test vectors", () => {
+  const ui = loadAppHarness();
+  const vectorsPath = path.join(
+    repoRoot,
+    "crates/ledr-proto/tests/fixtures/windows_apps_wildcard_vectors.json",
+  );
+  const vectors = JSON.parse(fs.readFileSync(vectorsPath, "utf8"));
+  assert.ok(Array.isArray(vectors) && vectors.length > 0, "expected non-empty vector fixture");
+
+  for (const vec of vectors) {
+    assert.equal(
+      ui.buildWindowsAppsVersionWildcardPattern(vec.input),
+      vec.expected,
+      `vector failed: ${vec.name} (input=${JSON.stringify(vec.input)})`,
+    );
+  }
+});
+
+test("UI-P4-14: View 1 WindowsApps store wildcard truth table & index.html markup", async () => {
+  const html = fs.readFileSync(indexHtmlPath, "utf8");
+  assert.match(
+    html,
+    /<span id="signer-constraint-note" class="tier-constraint"><\/span>\s*<div id="opt-store-wildcard-row" class="tier-option hidden">\s*<input id="opt-store-wildcard" type="checkbox" \/>\s*<label for="opt-store-wildcard">Wildcard Store app version<\/label>\s*<\/div>\s*<span id="store-wildcard-note" class="tier-constraint hidden"><\/span>\s*<div class="tier-input-group">/,
+  );
+
+  const windowsAppsExe =
+    "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe";
+  const expectedPattern =
+    "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_*_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe";
+  const validThumbprint = "a".repeat(40);
+  const validSigner = "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US";
+
+  const makeAlert = (id, overrides = {}, ctxOverrides = {}) => ({
+    alert_id: id,
+    timestamp_ms: 1_732_300_000_000,
+    severity: "Medium",
+    source_layer: "LAYER_3_NETWORK",
+    rule_id: "NET-OUTBOUND-UNKNOWN",
+    title: "Store App Outbound",
+    process_instance_id: `${id}:100`,
+    process_suspended: true,
+    status: "Pending",
+    resolved_at_ms: null,
+    context_json: JSON.stringify({
+      exe_path: windowsAppsExe,
+      dst_ip: "93.184.216.34",
+      dst_port: 443,
+      signer_subject: validSigner,
+      root_thumbprint: validThumbprint,
+      ...ctxOverrides,
+    }),
+    ...overrides,
+  });
+
+  const invokeCalls = [];
+  const ui = loadAppHarness(async (cmd, args) => {
+    invokeCalls.push({ cmd, args });
+    if (cmd === "resolve_alert_action") {
+      return `resolved ${args.alertId} (${args.pathMode || "omitted"})`;
+    }
+    if (cmd === "ping_daemon") return "ledr-daemon v0.1.0 (proto v1)";
+    if (cmd === "fetch_flight_recorder") {
+      return {
+        processes: [],
+        dns_queries: [],
+        network_events: [],
+        file_canary_events: [],
+        download_origins: [],
+      };
+    }
+    if (cmd === "fetch_alerts") return ui.state.alerts;
+    if (cmd === "fetch_rules") return [];
+    return null;
+  });
+  ui.state.isSamplePreview = false;
+  ui.state.isDaemonOnline = true;
+
+  const signedWaAlert = makeAlert("wa-signed");
+  const signedWaNoThumbAlert = makeAlert("wa-signed-null-thumb", {}, { root_thumbprint: null });
+  const emptyThumbAlert = makeAlert("wa-empty-thumb", {}, { root_thumbprint: "" });
+  const zeroThumbAlert = makeAlert("wa-zero-thumb", {}, { root_thumbprint: "0".repeat(40) });
+  const nonWaAlert = makeAlert("non-wa", {}, { exe_path: "C:\\Program Files\\Example\\app.exe" });
+  const browserAlert = {
+    alert_id: "browser-1",
+    timestamp_ms: 1_732_300_000_100,
+    severity: "High",
+    source_layer: "LAYER_4_BROWSER",
+    rule_id: "BROWSER-CLICKFIX",
+    title: "ClickFix",
+    process_instance_id: null,
+    process_suspended: false,
+    status: "Pending",
+    resolved_at_ms: null,
+    context_json: JSON.stringify({
+      event_type: "ClickFixPastejacking",
+      url: "https://verify.invalid/",
+    }),
+  };
+
+  ui.state.alerts = [
+    signedWaAlert,
+    signedWaNoThumbAlert,
+    emptyThumbAlert,
+    zeroThumbAlert,
+    nonWaAlert,
+    browserAlert,
+  ];
+
+  const syncSelected = (alertObj, detailsOverride = null) => {
+    ui.state.selectedAlertId = alertObj.alert_id;
+    const { byId } = ui.buildHierarchy(ui.state.snapshot);
+    const details = detailsOverride || ui.extractAlertDetails(alertObj, byId);
+    ui.syncResolutionControls(alertObj, details);
+    return details;
+  };
+
+  // 1. Signed WindowsApps alert: visible, enabled, default OFF, note hidden
+  syncSelected(signedWaAlert);
+  assert.equal(ui.el.optStoreWildcardRow.classList.contains("hidden"), false);
+  assert.equal(ui.el.optStoreWildcard.disabled, false);
+  assert.equal(ui.el.optStoreWildcard.checked, false);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), true);
+  assert.equal(ui.el.storeWildcardNote.textContent, "");
+
+  // 2. Check opt-store-wildcard ON -> shows Pattern note and sends WindowsAppsVersionWildcard
+  ui.el.optStoreWildcard.checked = true;
+  ui.el.optStoreWildcard.dispatchEvent({ type: "change" });
+  assert.equal(ui.el.optStoreWildcard.disabled, false);
+  assert.equal(ui.el.optStoreWildcard.checked, true);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), false);
+  assert.equal(ui.el.storeWildcardNote.textContent, `Pattern: ${expectedPattern}`);
+
+  await ui.handleResolveAlert("allow_permanent");
+  const wildcardInvoke = invokeCalls.find(
+    (c) => c.cmd === "resolve_alert_action" && c.args.alertId === "wa-signed",
+  );
+  assert.ok(wildcardInvoke);
+  assert.equal(wildcardInvoke.args.pathMode, "WindowsAppsVersionWildcard");
+
+  // 3. Uncheck opt-store-wildcard OFF -> hides note and sends Exact
+  ui.el.optStoreWildcard.checked = false;
+  ui.el.optStoreWildcard.dispatchEvent({ type: "change" });
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), true);
+  assert.equal(ui.el.storeWildcardNote.textContent, "");
+
+  invokeCalls.length = 0;
+  await ui.handleResolveAlert("allow_permanent");
+  const exactInvoke = invokeCalls.find(
+    (c) => c.cmd === "resolve_alert_action" && c.args.alertId === "wa-signed",
+  );
+  assert.ok(exactInvoke);
+  assert.equal(exactInvoke.args.pathMode, "Exact");
+
+  // 4. opt-use-signer OFF -> forces opt-store-wildcard OFF + disabled + Requires Authenticode signer
+  ui.el.optStoreWildcard.checked = true;
+  ui.el.optStoreWildcard.dispatchEvent({ type: "change" });
+  assert.equal(ui.el.optStoreWildcard.checked, true);
+
+  ui.el.optUseSigner.checked = false;
+  ui.el.optUseSigner.dispatchEvent({ type: "change" });
+  assert.equal(ui.el.optStoreWildcard.checked, false);
+  assert.equal(ui.el.optStoreWildcard.disabled, true);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), false);
+  assert.equal(ui.el.storeWildcardNote.textContent, "Requires Authenticode signer");
+
+  // 5. Re-enabling opt-use-signer clears note & re-enables (stays unchecked until user opts in)
+  ui.el.optUseSigner.checked = true;
+  ui.el.optUseSigner.dispatchEvent({ type: "change" });
+  assert.equal(ui.el.optStoreWildcard.disabled, false);
+  assert.equal(ui.el.optStoreWildcard.checked, false);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), true);
+  assert.equal(ui.el.storeWildcardNote.textContent, "");
+
+  // 6. null rootThumbprint with valid signerSubject remains enabled
+  syncSelected(signedWaNoThumbAlert);
+  assert.equal(ui.el.optStoreWildcardRow.classList.contains("hidden"), false);
+  assert.equal(ui.el.optStoreWildcard.disabled, false);
+
+  // 7. Empty and all-zero rootThumbprint disable with Requires Authenticode signer
+  syncSelected(emptyThumbAlert);
+  assert.equal(ui.el.optStoreWildcardRow.classList.contains("hidden"), false);
+  assert.equal(ui.el.optStoreWildcard.disabled, true);
+  assert.equal(ui.el.optStoreWildcard.checked, false);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), false);
+  assert.equal(ui.el.storeWildcardNote.textContent, "Requires Authenticode signer");
+
+  syncSelected(zeroThumbAlert);
+  assert.equal(ui.el.optStoreWildcardRow.classList.contains("hidden"), false);
+  assert.equal(ui.el.optStoreWildcard.disabled, true);
+  assert.equal(ui.el.optStoreWildcard.checked, false);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), false);
+  assert.equal(ui.el.storeWildcardNote.textContent, "Requires Authenticode signer");
+
+  // 8. Switching alerts resets opt-store-wildcard.checked = false
+  syncSelected(signedWaAlert);
+  ui.el.optStoreWildcard.checked = true;
+  ui.el.optStoreWildcard.dispatchEvent({ type: "change" });
+  assert.equal(ui.el.optStoreWildcard.checked, true);
+
+  syncSelected(signedWaNoThumbAlert);
+  assert.equal(ui.el.optStoreWildcard.checked, false);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), true);
+
+  // 9. Resolved alert disables checkbox (while preserving current checked state & note if checked, or hidden if unchecked)
+  const resolvedWaAlert = makeAlert("wa-resolved", {
+    status: "ApprovedRule",
+    process_suspended: false,
+    resolved_at_ms: 1_732_300_050_000,
+  });
+  ui.state.alerts.push(resolvedWaAlert);
+  syncSelected(resolvedWaAlert);
+  assert.equal(ui.el.optStoreWildcardRow.classList.contains("hidden"), false);
+  assert.equal(ui.el.optStoreWildcard.disabled, true);
+  assert.equal(ui.el.optStoreWildcard.checked, false);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), true);
+
+  // While staying on same alert as it becomes resolved with checkbox checked, note stays visible & disabled
+  syncSelected(signedWaAlert);
+  ui.el.optStoreWildcard.checked = true;
+  ui.el.optStoreWildcard.dispatchEvent({ type: "change" });
+  signedWaAlert.status = "ApprovedRule";
+  syncSelected(signedWaAlert);
+  assert.equal(ui.el.optStoreWildcard.disabled, true);
+  assert.equal(ui.el.optStoreWildcard.checked, true);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), false);
+  assert.equal(ui.el.storeWildcardNote.textContent, `Pattern: ${expectedPattern}`);
+
+  // 10. Non-WindowsApps and processless LAYER_4_BROWSER alerts hide row and clear state
+  syncSelected(nonWaAlert);
+  assert.equal(ui.el.optStoreWildcardRow.classList.contains("hidden"), true);
+  assert.equal(ui.el.optStoreWildcard.disabled, true);
+  assert.equal(ui.el.optStoreWildcard.checked, false);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), true);
+  assert.equal(ui.el.storeWildcardNote.textContent, "");
+
+  syncSelected(browserAlert);
+  assert.equal(ui.el.optStoreWildcardRow.classList.contains("hidden"), true);
+  assert.equal(ui.el.optStoreWildcard.disabled, true);
+  assert.equal(ui.el.optStoreWildcard.checked, false);
+  assert.equal(ui.el.storeWildcardNote.classList.contains("hidden"), true);
+  assert.equal(ui.el.storeWildcardNote.textContent, "");
+});
+
+test("UI-P4-15: New UI + old daemon rejection recovers cleanly and retries with Exact", async () => {
+  const windowsAppsExe =
+    "C:\\Program Files\\WindowsApps\\Microsoft.StartExperiencesApp_1.199.0.0_x64__8wekyb3d8bbwe\\StartExperiencesApp.exe";
+  const alertObj = {
+    alert_id: "wa-old-daemon-1",
+    timestamp_ms: 1_732_300_100_000,
+    severity: "Medium",
+    source_layer: "LAYER_3_NETWORK",
+    rule_id: "NET-OUTBOUND-UNKNOWN",
+    title: "Store App Outbound",
+    process_instance_id: "900:1",
+    process_suspended: true,
+    status: "Pending",
+    resolved_at_ms: null,
+    context_json: JSON.stringify({
+      exe_path: windowsAppsExe,
+      dst_ip: "93.184.216.34",
+      dst_port: 443,
+      signer_subject: "CN=Microsoft Corporation",
+      root_thumbprint: "b".repeat(40),
+    }),
+  };
+
+  let resolved = false;
+  const resolvePayloads = [];
+  const ui = loadAppHarness(async (cmd, args) => {
+    if (cmd === "resolve_alert_action") {
+      resolvePayloads.push(args);
+      if (args.pathMode === "WindowsAppsVersionWildcard") {
+        throw new Error(
+          "IPC deserialize error: unknown variant `ResolveAlertWithOptions`, expected one of ...",
+        );
+      }
+      resolved = true;
+      return "resolved APPROVED_RULE (exact)";
+    }
+    if (cmd === "ping_daemon") return "ledr-daemon v0.1.0 (proto v1)";
+    if (cmd === "fetch_flight_recorder") {
+      return {
+        processes: [],
+        dns_queries: [],
+        network_events: [],
+        file_canary_events: [],
+        download_origins: [],
+      };
+    }
+    if (cmd === "fetch_alerts") {
+      return [
+        resolved
+          ? { ...alertObj, status: "ApprovedRule", resolved_at_ms: 1_732_300_105_000 }
+          : { ...alertObj },
+      ];
+    }
+    if (cmd === "fetch_rules") return [];
+    return null;
+  });
+
+  ui.state.isSamplePreview = false;
+  ui.state.isDaemonOnline = true;
+  ui.state.alerts = [{ ...alertObj }];
+  ui.state.selectedAlertId = alertObj.alert_id;
+  ui.state.alertQueueFilter = "all";
+
+  const { byId } = ui.buildHierarchy(ui.state.snapshot);
+  ui.syncResolutionControls(ui.state.alerts[0], ui.extractAlertDetails(ui.state.alerts[0], byId));
+
+  // User enables wildcard -> old daemon rejects ResolveAlertWithOptions
+  ui.el.optStoreWildcard.checked = true;
+  ui.el.optStoreWildcard.dispatchEvent({ type: "change" });
+  await ui.handleResolveAlert("allow_permanent");
+
+  assert.equal(resolvePayloads.length, 1);
+  assert.equal(resolvePayloads[0].pathMode, "WindowsAppsVersionWildcard");
+  assert.equal(ui.state.isResolvingAlert, false);
+  assert.equal(ui.el.triageActionStatus.classList.contains("hidden"), false);
+  assert.match(ui.el.triageActionStatus.className, /\bis-error\b/);
+  assert.equal(ui.el.triageActionStatus.getAttribute("role"), "alert");
+  assert.match(ui.el.triageActionStatus.textContent, /ResolveAlertWithOptions/);
+  assert.equal(ui.el.optStoreWildcard.disabled, false);
+  assert.equal(ui.el.btnAllowPermanent.disabled, false);
+
+  // User unchecks wildcard and retries -> sends Exact and succeeds
+  ui.el.optStoreWildcard.checked = false;
+  ui.el.optStoreWildcard.dispatchEvent({ type: "change" });
+  await ui.handleResolveAlert("allow_permanent");
+
+  assert.equal(resolvePayloads.length, 2);
+  assert.equal(resolvePayloads[1].pathMode, "Exact");
+  assert.equal(ui.state.isResolvingAlert, false);
+  assert.equal(ui.state.alerts[0].status, "ApprovedRule");
+  assert.match(ui.el.triageActionStatus.className, /\bis-ok\b/);
+  assert.equal(ui.el.triageActionStatus.getAttribute("role"), "status");
+  assert.match(ui.el.triageActionStatus.textContent, /resolved APPROVED_RULE/);
 });

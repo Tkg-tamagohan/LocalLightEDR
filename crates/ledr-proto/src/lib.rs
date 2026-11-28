@@ -627,6 +627,161 @@ impl AlertDecision {
     }
 }
 
+/// Executable path pattern derivation mode for `AllowPermanent` rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AllowPermanentPathMode {
+    /// Persist the exact executable path (default, legacy behavior).
+    #[default]
+    Exact,
+    /// Replace only the version segment of `C:\Program Files\WindowsApps\<PackageFullName>\...`
+    /// with `*`. Requires verified Authenticode signer + non-zero root thumbprint (`L-04`).
+    WindowsAppsVersionWildcard,
+}
+
+#[inline]
+const fn is_msix_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'.' || b == b'-'
+}
+
+#[inline]
+const fn is_crockford_base32_byte(b: u8) -> bool {
+    matches!(
+        b.to_ascii_lowercase(),
+        b'0'..=b'9' | b'a'..=b'h' | b'j'..=b'k' | b'm'..=b'n' | b'p'..=b't' | b'v'..=b'z'
+    )
+}
+
+/// Derives a version-wildcard allowlist pattern for a signed Microsoft Store package executable
+/// under `C:\Program Files\WindowsApps\<PackageFullName>\<RelPath>`.
+///
+/// Returns `None` if `exe_path` fails any of the strict 7-step structural, drive/prefix,
+/// metacharacter, traversal, or MSIX `<PackageFullName>` validation checks.
+pub fn build_windows_apps_version_wildcard_pattern(exe_path: &str) -> Option<String> {
+    const WINDOWS_APPS_PREFIX: &str = r"C:\Program Files\WindowsApps\";
+
+    // 1. Trim only ASCII whitespace; reject empty strings or any ASCII control characters.
+    let trimmed = exe_path.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
+    if trimmed.is_empty() || trimmed.bytes().any(|b| b <= 0x1F || b == 0x7F) {
+        return None;
+    }
+
+    // 2. Normalize `/` -> `\` and reject device / NT / UNC namespaces.
+    let normalized = trimmed.replace('/', "\\");
+    if strip_ascii_prefix_ignore_case(&normalized, r"\\?\unc\").is_some()
+        || strip_ascii_prefix_ignore_case(&normalized, r"\\.\").is_some()
+        || strip_ascii_prefix_ignore_case(&normalized, r"\??\").is_some()
+    {
+        return None;
+    }
+    let candidate = if let Some(after_ext) = normalized.strip_prefix(r"\\?\") {
+        if strip_ascii_prefix_ignore_case(after_ext, r"unc\").is_some()
+            || after_ext.starts_with(r"\\")
+        {
+            return None;
+        }
+        after_ext
+    } else if normalized.starts_with(r"\\") {
+        return None;
+    } else {
+        normalized.as_str()
+    };
+
+    // 3. Enforce system-drive `C:\Program Files\WindowsApps\` 29-byte prefix (ASCII case-insensitive).
+    if candidate.len() <= WINDOWS_APPS_PREFIX.len()
+        || !candidate.is_char_boundary(WINDOWS_APPS_PREFIX.len())
+    {
+        return None;
+    }
+    let (prefix, remainder) = candidate.split_at(WINDOWS_APPS_PREFIX.len());
+    if !prefix.eq_ignore_ascii_case(WINDOWS_APPS_PREFIX) {
+        return None;
+    }
+
+    // 4. Reject metacharacters, ADS colons, trailing `\`, empty segments, `.`, and `..` in `[29..]`.
+    if remainder.contains(['*', '?', ':']) || remainder.ends_with('\\') {
+        return None;
+    }
+    let segments: Vec<&str> = remainder.split('\\').collect();
+    if segments
+        .iter()
+        .any(|seg| seg.is_empty() || *seg == "." || *seg == "..")
+    {
+        return None;
+    }
+
+    // 5. Require at least `<PackageFullName>\<RelPath>` ending with `.exe` (length >= 5).
+    if segments.len() < 2 {
+        return None;
+    }
+    let package_full_name = segments[0];
+    let last_segment = segments[segments.len() - 1];
+    if last_segment.len() < 5
+        || !last_segment.as_bytes()[last_segment.len() - 4..].eq_ignore_ascii_case(b".exe")
+    {
+        return None;
+    }
+
+    // 6. Validate `<Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>`.
+    let mut pkg_parts = package_full_name.split('_');
+    let (Some(name), Some(version), Some(arch), Some(resource_id), Some(publisher_id), None) = (
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+    ) else {
+        return None;
+    };
+
+    if !(1..=50).contains(&name.len()) || !name.bytes().all(is_msix_name_char) {
+        return None;
+    }
+
+    let mut ver_parts = version.split('.');
+    let (Some(v0), Some(v1), Some(v2), Some(v3), None) = (
+        ver_parts.next(),
+        ver_parts.next(),
+        ver_parts.next(),
+        ver_parts.next(),
+        ver_parts.next(),
+    ) else {
+        return None;
+    };
+    for part in [v0, v1, v2, v3] {
+        if !(1..=5).contains(&part.len())
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+            || part.parse::<u16>().is_err()
+        {
+            return None;
+        }
+    }
+
+    if !(arch.eq_ignore_ascii_case("x86")
+        || arch.eq_ignore_ascii_case("x64")
+        || arch.eq_ignore_ascii_case("arm")
+        || arch.eq_ignore_ascii_case("arm64")
+        || arch.eq_ignore_ascii_case("neutral"))
+    {
+        return None;
+    }
+
+    if resource_id.len() > 30 || !resource_id.bytes().all(is_msix_name_char) {
+        return None;
+    }
+
+    if publisher_id.len() != 13 || !publisher_id.bytes().all(is_crockford_base32_byte) {
+        return None;
+    }
+
+    // 7. Emit canonical prefix + case-preserved `<Name>_*_<Arch>_<ResourceId>_<PublisherId>\<RelPath>`.
+    let rel_path = &remainder[package_full_name.len() + 1..];
+    Some(format!(
+        "{WINDOWS_APPS_PREFIX}{name}_*_{arch}_{resource_id}_{publisher_id}\\{rel_path}"
+    ))
+}
+
 /// Scope of a persisted allowlist or blocklist policy rule (`L-04`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleScope {
@@ -835,6 +990,12 @@ pub enum IpcRequest {
         alert_id: String,
         decision: AlertDecision,
     },
+    ResolveAlertWithOptions {
+        alert_id: String,
+        decision: AlertDecision,
+        #[serde(default)]
+        path_mode: AllowPermanentPathMode,
+    },
     UpsertRule {
         rule: AllowlistRuleRecord,
     },
@@ -869,7 +1030,10 @@ impl IpcRequest {
     pub const fn requires_ui_authorization(&self) -> bool {
         matches!(
             self,
-            Self::ResolveAlert { .. } | Self::UpsertRule { .. } | Self::DeleteRule { .. }
+            Self::ResolveAlert { .. }
+                | Self::ResolveAlertWithOptions { .. }
+                | Self::UpsertRule { .. }
+                | Self::DeleteRule { .. }
         )
     }
 }
@@ -1523,5 +1687,90 @@ mod tests {
             !is_never_suspend_process(&format!(r"{alt_drive}:\Windows\System32\svchost.exe")),
             "alternate drive {alt_drive}:\\Windows\\System32\\svchost.exe must NOT be protected"
         );
+    }
+
+    #[test]
+    fn proto_08_windows_apps_wildcard_vectors_fixture() {
+        #[derive(Deserialize)]
+        struct WildcardVector {
+            name: String,
+            input: String,
+            expected: Option<String>,
+        }
+
+        let vectors: Vec<WildcardVector> = serde_json::from_str(include_str!(
+            "../tests/fixtures/windows_apps_wildcard_vectors.json"
+        ))
+        .expect("parse windows_apps_wildcard_vectors.json");
+        assert!(!vectors.is_empty(), "fixture must not be empty");
+
+        for vector in vectors {
+            assert_eq!(
+                build_windows_apps_version_wildcard_pattern(&vector.input),
+                vector.expected,
+                "vector `{}` failed for input `{:?}`",
+                vector.name,
+                vector.input
+            );
+        }
+    }
+
+    #[test]
+    fn proto_09_resolve_alert_with_options_ipc_compat() {
+        assert_eq!(IPC_PROTOCOL_VERSION, 1);
+        assert_eq!(
+            AllowPermanentPathMode::default(),
+            AllowPermanentPathMode::Exact
+        );
+
+        let legacy = IpcRequest::ResolveAlert {
+            alert_id: "alert-legacy".to_string(),
+            decision: AlertDecision::AllowPermanent {
+                use_signer_if_available: true,
+                allow_dest: None,
+            },
+        };
+        let legacy_json = serde_json::to_string(&legacy).expect("serialize legacy ResolveAlert");
+        assert_eq!(
+            legacy_json,
+            r#"{"type":"ResolveAlert","payload":{"alert_id":"alert-legacy","decision":{"AllowPermanent":{"use_signer_if_available":true,"allow_dest":null}}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&legacy_json).expect("deserialize legacy"),
+            legacy
+        );
+
+        let req_wildcard = IpcRequest::ResolveAlertWithOptions {
+            alert_id: "alert-wa-1".to_string(),
+            decision: AlertDecision::AllowPermanent {
+                use_signer_if_available: true,
+                allow_dest: Some("api.example.com".to_string()),
+            },
+            path_mode: AllowPermanentPathMode::WindowsAppsVersionWildcard,
+        };
+        assert!(req_wildcard.requires_ui_authorization());
+
+        let frame = encode_ipc_frame(&req_wildcard).expect("encode ResolveAlertWithOptions");
+        let decoded: IpcRequest =
+            decode_ipc_frame(&frame).expect("decode ResolveAlertWithOptions");
+        assert_eq!(decoded, req_wildcard);
+
+        // Omitted `path_mode` defaults to `AllowPermanentPathMode::Exact`.
+        let omitted_mode_json = r#"{"type":"ResolveAlertWithOptions","payload":{"alert_id":"alert-wa-2","decision":"AllowOnce"}}"#;
+        let parsed_omitted: IpcRequest =
+            serde_json::from_str(omitted_mode_json).expect("deserialize omitted path_mode");
+        assert!(parsed_omitted.requires_ui_authorization());
+        assert_eq!(
+            parsed_omitted,
+            IpcRequest::ResolveAlertWithOptions {
+                alert_id: "alert-wa-2".to_string(),
+                decision: AlertDecision::AllowOnce,
+                path_mode: AllowPermanentPathMode::Exact,
+            }
+        );
+
+        // Unknown `path_mode` must be rejected.
+        let invalid_mode_json = r#"{"type":"ResolveAlertWithOptions","payload":{"alert_id":"alert-wa-3","decision":"AllowOnce","path_mode":"ArbitraryWildcard"}}"#;
+        assert!(serde_json::from_str::<IpcRequest>(invalid_mode_json).is_err());
     }
 }

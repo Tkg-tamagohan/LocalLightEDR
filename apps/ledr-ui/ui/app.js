@@ -99,6 +99,9 @@
     btnAllowPermanent: document.getElementById("btn-allow-permanent"),
     optUseSigner: document.getElementById("opt-use-signer"),
     signerConstraintNote: document.getElementById("signer-constraint-note"),
+    optStoreWildcardRow: document.getElementById("opt-store-wildcard-row"),
+    optStoreWildcard: document.getElementById("opt-store-wildcard"),
+    storeWildcardNote: document.getElementById("store-wildcard-note"),
     optAllowDest: document.getElementById("opt-allow-dest"),
     targetScopeNote: document.getElementById("target-scope-note"),
     // View 2 elements
@@ -314,6 +317,132 @@
       out = out.replace(/\\+$/, "");
     }
     return out.toLowerCase();
+  }
+
+  function toAsciiLower(value) {
+    return value.replace(/[A-Z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) + 32));
+  }
+
+  function buildWindowsAppsVersionWildcardPattern(exePath) {
+    if (typeof exePath !== "string") return null;
+    const WINDOWS_APPS_PREFIX = "C:\\Program Files\\WindowsApps\\";
+    const WINDOWS_APPS_PREFIX_LOWER = "c:\\program files\\windowsapps\\";
+
+    // 1. Trim only ASCII whitespace; reject empty strings or any ASCII control characters.
+    const trimmed = exePath.replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+    if (!trimmed) return null;
+    for (let i = 0; i < trimmed.length; i += 1) {
+      const code = trimmed.charCodeAt(i);
+      if (code <= 0x1f || code === 0x7f) {
+        return null;
+      }
+    }
+
+    // 2. Normalize `/` -> `\` and reject device / NT / UNC namespaces.
+    const normalized = trimmed.replaceAll("/", "\\");
+    const normLower = toAsciiLower(normalized);
+    if (
+      normLower.startsWith("\\\\?\\unc\\") ||
+      normLower.startsWith("\\\\.\\") ||
+      normLower.startsWith("\\??\\")
+    ) {
+      return null;
+    }
+    let candidate;
+    if (normalized.startsWith("\\\\?\\")) {
+      const afterExt = normalized.slice(4);
+      if (toAsciiLower(afterExt).startsWith("unc\\") || afterExt.startsWith("\\\\")) {
+        return null;
+      }
+      candidate = afterExt;
+    } else if (normalized.startsWith("\\\\")) {
+      return null;
+    } else {
+      candidate = normalized;
+    }
+
+    // 3. Enforce system-drive `C:\Program Files\WindowsApps\` 29-byte prefix (ASCII case-insensitive).
+    if (
+      candidate.length <= WINDOWS_APPS_PREFIX.length ||
+      toAsciiLower(candidate.slice(0, WINDOWS_APPS_PREFIX.length)) !== WINDOWS_APPS_PREFIX_LOWER
+    ) {
+      return null;
+    }
+    const remainder = candidate.slice(WINDOWS_APPS_PREFIX.length);
+
+    // 4. Reject metacharacters, ADS colons, trailing `\`, empty segments, `.`, and `..` in `[29..]`.
+    if (
+      remainder.includes("*") ||
+      remainder.includes("?") ||
+      remainder.includes(":") ||
+      remainder.endsWith("\\")
+    ) {
+      return null;
+    }
+    const segments = remainder.split("\\");
+    if (segments.some((seg) => seg === "" || seg === "." || seg === "..")) {
+      return null;
+    }
+
+    // 5. Require at least `<PackageFullName>\<RelPath>` ending with `.exe` (length >= 5).
+    if (segments.length < 2) {
+      return null;
+    }
+    const packageFullName = segments[0];
+    const lastSegment = segments[segments.length - 1];
+    if (lastSegment.length < 5 || toAsciiLower(lastSegment.slice(-4)) !== ".exe") {
+      return null;
+    }
+
+    // 6. Validate `<Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>`.
+    const pkgParts = packageFullName.split("_");
+    if (pkgParts.length !== 5) {
+      return null;
+    }
+    const [name, version, arch, resourceId, publisherId] = pkgParts;
+
+    if (!/^[A-Za-z0-9.-]{1,50}$/.test(name)) {
+      return null;
+    }
+
+    const verParts = version.split(".");
+    if (verParts.length !== 4) {
+      return null;
+    }
+    for (const part of verParts) {
+      if (!/^[0-9]{1,5}$/.test(part)) {
+        return null;
+      }
+      if (part.length > 1 && part.startsWith("0")) {
+        return null;
+      }
+      if (Number(part) > 65535) {
+        return null;
+      }
+    }
+
+    const archLower = toAsciiLower(arch);
+    if (
+      archLower !== "x86" &&
+      archLower !== "x64" &&
+      archLower !== "arm" &&
+      archLower !== "arm64" &&
+      archLower !== "neutral"
+    ) {
+      return null;
+    }
+
+    if (!/^[A-Za-z0-9.-]{0,30}$/.test(resourceId)) {
+      return null;
+    }
+
+    if (!/^[0-9a-hjkmnp-tv-zA-HJKMNP-TV-Z]{13}$/.test(publisherId)) {
+      return null;
+    }
+
+    // 7. Emit canonical prefix + case-preserved `<Name>_*_<Arch>_<ResourceId>_<PublisherId>\<RelPath>`.
+    const relPath = remainder.slice(packageFullName.length + 1);
+    return `${WINDOWS_APPS_PREFIX}${name}_*_${arch}_${resourceId}_${publisherId}\\${relPath}`;
   }
 
   function formatShortSha256(hex) {
@@ -1167,7 +1296,7 @@
 
     const sha256 = ctx.sha256 || proc?.sha256 || null;
     const signerSubject = ctx.signer_subject || proc?.signer_subject || null;
-    const rootThumbprint = ctx.root_thumbprint || null;
+    const rootThumbprint = ctx.root_thumbprint ?? null;
 
     const parentExePath = ctx.parent_exe_path || parentProc?.exe_path || null;
     const parentCommandLine =
@@ -2029,9 +2158,76 @@
     }
   }
 
+  function syncStoreWildcardControls(unresolved, policy, hasValidSigner, wildcardPattern) {
+    if (policy.isProcesslessBrowser || policy.allowPermanentDisabled || wildcardPattern === null) {
+      el.optStoreWildcardRow?.classList.add("hidden");
+      if (el.optStoreWildcard) {
+        el.optStoreWildcard.disabled = true;
+        el.optStoreWildcard.checked = false;
+      }
+      if (el.storeWildcardNote) {
+        el.storeWildcardNote.classList.add("hidden");
+        el.storeWildcardNote.textContent = "";
+      }
+      return;
+    }
+
+    el.optStoreWildcardRow?.classList.remove("hidden");
+
+    if (!unresolved || state.isResolvingAlert) {
+      if (el.optStoreWildcard) {
+        el.optStoreWildcard.disabled = true;
+      }
+      if (el.storeWildcardNote) {
+        if (el.optStoreWildcard?.checked) {
+          el.storeWildcardNote.textContent = `Pattern: ${wildcardPattern}`;
+          el.storeWildcardNote.classList.remove("hidden");
+        } else {
+          el.storeWildcardNote.classList.add("hidden");
+          el.storeWildcardNote.textContent = "";
+        }
+      }
+      return;
+    }
+
+    if (!hasValidSigner || !el.optUseSigner.checked) {
+      if (el.optStoreWildcard) {
+        el.optStoreWildcard.disabled = true;
+        el.optStoreWildcard.checked = false;
+      }
+      if (el.storeWildcardNote) {
+        el.storeWildcardNote.textContent = "Requires Authenticode signer";
+        el.storeWildcardNote.classList.remove("hidden");
+      }
+      return;
+    }
+
+    if (el.optStoreWildcard) {
+      el.optStoreWildcard.disabled = false;
+    }
+    if (el.optStoreWildcard?.checked) {
+      if (el.storeWildcardNote) {
+        el.storeWildcardNote.textContent = `Pattern: ${wildcardPattern}`;
+        el.storeWildcardNote.classList.remove("hidden");
+      }
+    } else if (el.storeWildcardNote) {
+      el.storeWildcardNote.classList.add("hidden");
+      el.storeWildcardNote.textContent = "";
+    }
+  }
+
   function syncResolutionControls(alert, details) {
     const unresolved = isUnresolvedAlert(alert);
     const hasSigner = Boolean(details.signerSubject);
+    const hasValidSigner =
+      typeof details.signerSubject === "string" &&
+      details.signerSubject.trim().length > 0 &&
+      (details.rootThumbprint === null ||
+        details.rootThumbprint === undefined ||
+        (typeof details.rootThumbprint === "string" &&
+          details.rootThumbprint.trim().length > 0 &&
+          !/^0+$/.test(details.rootThumbprint.trim())));
+    const wildcardPattern = buildWindowsAppsVersionWildcardPattern(details.exePath);
     const policy = getBrowserAlertResolutionPolicy(alert, details);
     state.selectedAlertIsNetwork = Boolean(details.isNetworkAlert);
 
@@ -2048,6 +2244,9 @@
       }
       el.optAddBlockRule.checked = !policy.addBlockRuleDisabled;
       el.optUseSigner.checked = !policy.allowPermanentDisabled && hasSigner;
+      if (el.optStoreWildcard) {
+        el.optStoreWildcard.checked = false;
+      }
       el.optAllowDest.value = "";
     }
     if (
@@ -2075,6 +2274,7 @@
       el.optAllowDest.disabled = true;
       el.btnAllowPermanent.disabled = true;
       el.signerConstraintNote.textContent = policy.allowPermanentConstraint;
+      syncStoreWildcardControls(unresolved, policy, hasValidSigner, wildcardPattern);
       el.targetScopeNote.classList.add("hidden");
       el.btnAllowOnce.disabled = !unresolved || state.isResolvingAlert;
       renderDetailTriageFeedback(alert.alert_id);
@@ -2091,6 +2291,8 @@
     } else {
       el.signerConstraintNote.textContent = "";
     }
+
+    syncStoreWildcardControls(unresolved, policy, hasValidSigner, wildcardPattern);
 
     el.optAddBlockRule.disabled = !unresolved || state.isResolvingAlert;
     el.optAllowDest.disabled = !unresolved || state.isResolvingAlert;
@@ -2121,6 +2323,7 @@
 
     let decision;
     let previewStatus;
+    let useStoreWildcard = false;
     const addBlockRule = Boolean(el.optAddBlockRule.checked);
     if (kind === "terminate") {
       decision = {
@@ -2142,6 +2345,9 @@
         renderTriageView();
         return;
       }
+      useStoreWildcard = Boolean(
+        el.optStoreWildcard && !el.optStoreWildcard.disabled && el.optStoreWildcard.checked,
+      );
       decision = {
         AllowPermanent: {
           use_signer_if_available:
@@ -2185,11 +2391,16 @@
     clearAlertTriageFeedback(alert.alert_id);
     renderTriageView();
 
+    const invokeArgs = {
+      alertId: alert.alert_id,
+      decision,
+    };
+    if (kind === "allow_permanent") {
+      invokeArgs.pathMode = useStoreWildcard ? "WindowsAppsVersionWildcard" : "Exact";
+    }
+
     try {
-      const ackMessage = await invoke("resolve_alert_action", {
-        alertId: alert.alert_id,
-        decision,
-      });
+      const ackMessage = await invoke("resolve_alert_action", invokeArgs);
       // The daemon's Ack message already reports whether the requested rule was
       // actually saved; do not re-derive it from the checkbox state (ANALYSIS_0001).
       setAlertTriageFeedback(alert.alert_id, true, ackMessage);
@@ -3811,6 +4022,17 @@
     renderTree();
   });
 
+  function resyncSelectedAlertControls() {
+    if (!state.selectedAlertId) return;
+    const selected = state.alerts.find((a) => a.alert_id === state.selectedAlertId);
+    if (!selected) return;
+    const { byId } = buildHierarchy(state.snapshot);
+    syncResolutionControls(selected, extractAlertDetails(selected, byId));
+  }
+
+  el.optUseSigner?.addEventListener("change", resyncSelectedAlertControls);
+  el.optStoreWildcard?.addEventListener("change", resyncSelectedAlertControls);
+
   el.btnTerminateBlock.addEventListener("click", () => handleResolveAlert("terminate"));
   el.btnAllowOnce.addEventListener("click", () => handleResolveAlert("allow_once"));
   el.btnAllowPermanent.addEventListener("click", () => handleResolveAlert("allow_permanent"));
@@ -3885,6 +4107,7 @@
   if (typeof globalThis !== "undefined" && globalThis.__LEDR_UI_TEST_MODE__) {
     globalThis.__LEDR_UI_EXPORTS__ = {
       normalizeWindowsPath,
+      buildWindowsAppsVersionWildcardPattern,
       formatShortSha256,
       formatMotwSourceLabel,
       formatMotwZoneLabel,

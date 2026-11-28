@@ -5,7 +5,8 @@ use std::path::Path;
 
 use ledr_proto::{ActiveDefenseController, AllowlistRuleRecord, RuleScope};
 use ledr_rules::{
-    evaluate_outbound_policy, matches_network_block_rule, BinaryIdentity, OutboundDecision,
+    evaluate_outbound_policy, matches_app_wide_network_allow, matches_app_wide_network_block,
+    matches_network_block_rule, matches_path_pattern, BinaryIdentity, OutboundDecision,
 };
 
 use crate::engine::BinaryInspector;
@@ -104,6 +105,11 @@ impl WfpRuleManager {
         let mut keys_to_promote: Vec<WfpTargetKey> = Vec::new();
         let mut keys_to_demote_preemptive: Vec<WfpTargetKey> = Vec::new();
         let mut domain_hint_updates: Vec<(WfpTargetKey, Vec<String>)> = Vec::new();
+        let active_exe_keys: HashSet<String> = active_concrete_exes
+            .iter()
+            .map(|p| Self::exe_key(p))
+            .collect();
+        let mut deferred_handles_to_clear: Vec<u64> = Vec::new();
         for (key, entry) in &self.installed {
             match &entry.origin {
                 WfpFilterOrigin::PersistedPolicy => match plan.desired.get(key) {
@@ -430,9 +436,63 @@ impl WfpRuleManager {
                             }
                             keys_to_remove.push(key.clone());
                         }
+                    } else if matches!(entry.origin, WfpFilterOrigin::Preemptive)
+                        && key.1.is_none()
+                        && !entry.allow
+                        && !self.startup_preemptive_exes.contains_key(&key.0)
+                    {
+                        let is_exe_live = active_exe_keys.contains(&key.0)
+                            || dns_ctx.live_exe_overflow_any
+                            || dns_ctx.overflow_live_exe_keys.contains(&key.0);
+                        if active_exe_keys.contains(&key.0)
+                            && self.deferred_preemptive_removals.contains(&entry.handle)
+                        {
+                            deferred_handles_to_clear.push(entry.handle);
+                        }
+                        let release_for_deferred_or_allow =
+                            if !is_exe_live
+                                && self.deferred_preemptive_removals.contains(&entry.handle)
+                                && !self.bound_alerts.values().any(|k| k == key)
+                            {
+                                // Deferred removal whose bound alerts are all resolved and whose
+                                // executable is confirmed inactive: remove without disk I/O or
+                                // creating a PersistedPolicy Permit.
+                                true
+                            } else {
+                                let has_app_wide_allow_path_match = rules.iter().any(|r| {
+                                    r.scope == RuleScope::NetworkAllow
+                                        && r.allowed_target
+                                            .as_deref()
+                                            .is_none_or(|s| s.trim().is_empty())
+                                        && !r.exe_path_pattern.trim().is_empty()
+                                        && matches_path_pattern(
+                                            &entry.exe_path,
+                                            &r.exe_path_pattern,
+                                        )
+                                });
+                                if has_app_wide_allow_path_match {
+                                    let identity = identity_cache
+                                        .entry(key.0.clone())
+                                        .or_insert_with(|| inspector.inspect(&entry.exe_path));
+                                    rules
+                                        .iter()
+                                        .any(|r| matches_app_wide_network_allow(r, identity))
+                                        && !rules
+                                            .iter()
+                                            .any(|r| matches_app_wide_network_block(r, identity))
+                                } else {
+                                    false
+                                }
+                            };
+                        if release_for_deferred_or_allow {
+                            keys_to_remove.push(key.clone());
+                        }
                     }
                 }
             }
+        }
+        for handle in deferred_handles_to_clear {
+            self.deferred_preemptive_removals.remove(&handle);
         }
 
         let mut failed_exe_keys: HashSet<String> = HashSet::new();
@@ -791,5 +851,319 @@ impl WfpRuleManager {
                 self.bind_alert_to_app_block(alert_id, &snap.block.exe_path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use ledr_proto::{
+        ActiveDefenseController, AllowlistRuleRecord, AuthenticodeInfo, ProcessIdentity, RuleScope,
+    };
+    use ledr_rules::BinaryIdentity;
+
+    use super::*;
+
+    struct CountingInspector {
+        identities: HashMap<String, BinaryIdentity>,
+        calls: AtomicUsize,
+    }
+
+    impl CountingInspector {
+        fn new(entries: Vec<BinaryIdentity>) -> Self {
+            let mut identities = HashMap::new();
+            for id in entries {
+                identities.insert(WfpRuleManager::exe_key(&id.exe_path), id);
+            }
+            Self {
+                identities,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl BinaryInspector for CountingInspector {
+        fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.identities
+                .get(&WfpRuleManager::exe_key(exe_path))
+                .cloned()
+                .unwrap_or_else(|| BinaryIdentity {
+                    exe_path: exe_path.to_string(),
+                    sha256: None,
+                    authenticode: None,
+                })
+        }
+    }
+
+    struct CountingDefense {
+        next_handle: AtomicU64,
+        adds: Mutex<Vec<(String, Option<IpAddr>, bool)>>,
+        removes: Mutex<Vec<u64>>,
+    }
+
+    impl CountingDefense {
+        fn new() -> Self {
+            Self {
+                next_handle: AtomicU64::new(100),
+                adds: Mutex::new(Vec::new()),
+                removes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take_counts(&self) -> (usize, usize) {
+            let mut adds = self.adds.lock().unwrap();
+            let mut removes = self.removes.lock().unwrap();
+            let res = (adds.len(), removes.len());
+            adds.clear();
+            removes.clear();
+            res
+        }
+    }
+
+    impl ActiveDefenseController for CountingDefense {
+        fn suspend_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume_process(&self, _: &ProcessIdentity) -> Result<(), String> {
+            Ok(())
+        }
+        fn terminate_process(&self, _: &ProcessIdentity, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_wfp_app_rule(
+            &self,
+            exe_path: &Path,
+            remote_ip: Option<IpAddr>,
+            allow: bool,
+        ) -> Result<u64, String> {
+            self.adds
+                .lock()
+                .unwrap()
+                .push((exe_path.to_string_lossy().into_owned(), remote_ip, allow));
+            Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
+        }
+        fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+            self.removes.lock().unwrap().push(filter_id);
+            Ok(())
+        }
+    }
+
+    fn wildcard_allow_rule(
+        rule_id: &str,
+        exe_pattern: &str,
+        allowed_target: Option<&str>,
+    ) -> AllowlistRuleRecord {
+        AllowlistRuleRecord {
+            rule_id: rule_id.to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: exe_pattern.to_string(),
+            sha256: None,
+            signer_subject: Some("CN=Contoso Store Publisher".to_string()),
+            root_thumbprint: Some("0123456789ABCDEF0123456789ABCDEF01234567".to_string()),
+            allowed_target: allowed_target.map(str::to_string),
+            created_at_ms: 1_750_000_000_000,
+            created_by: "user_triage".to_string(),
+        }
+    }
+
+    #[test]
+    fn reconcile_releases_deferred_unbound_preemptive_without_disk_io_and_zero_churn_next_pass() {
+        let exe_old = r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\App.exe";
+        let pattern = r"C:\Program Files\WindowsApps\Contoso.App_*_x64__8wekyb3d8bbwe\App.exe";
+        let defense = CountingDefense::new();
+        // Old binary already deleted on disk (inspector returns None) — must not even be inspected.
+        let inspector = CountingInspector::new(Vec::new());
+        let mut fw = WfpRuleManager::new();
+
+        let h = defense
+            .add_wfp_app_rule(Path::new(exe_old), None, false)
+            .unwrap();
+        assert!(fw.register_preemptive_block(exe_old, h, &defense));
+        assert!(fw.bind_alert_to_app_block("ALT-DEFERRED-1", exe_old));
+        // Process exits while alert is still bound -> marked deferred.
+        assert!(!fw.remove_preemptive_block_if_unused(exe_old, &defense));
+        assert!(fw.has_deferred_preemptive_removal(exe_old));
+        let _ = defense.take_counts();
+
+        let rules = vec![wildcard_allow_rule("R-WA-1", pattern, Some("api.contoso.example"))];
+
+        // While alert is still bound, Pass must NOT release the deferred Preemptive block.
+        let report_bound = fw.reconcile_persisted_rules(&rules, &[], &inspector, &defense);
+        assert_eq!(report_bound.removed, 0);
+        assert!(fw.active_app_block(exe_old).is_some());
+        assert_eq!(defense.take_counts(), (0, 0));
+
+        // Alert resolves (e.g. via release_transient_containment_for_alert unbinding `ALT-DEFERRED-1`).
+        fw.unbind_alert("ALT-DEFERRED-1");
+
+        // Pass N: releases the deferred unbound Preemptive block with ZERO disk I/O and NO PersistedPolicy Permit.
+        let report_n = fw.reconcile_persisted_rules(&rules, &[], &inspector, &defense);
+        assert_eq!(report_n.removed, 1);
+        assert_eq!(report_n.applied, 0);
+        assert_eq!(inspector.calls(), 0, "deferred unbound removal must not inspect disk");
+        assert!(!fw.has_any_app_filter(exe_old));
+        assert!(!fw.has_deferred_preemptive_removal(exe_old));
+        assert_eq!(defense.take_counts(), (0, 1));
+
+        // Pass N+1: completely stable with 0 BFE adds and 0 BFE removes.
+        let report_n1 = fw.reconcile_persisted_rules(&rules, &[], &inspector, &defense);
+        assert_eq!(report_n1.applied, 0);
+        assert_eq!(report_n1.removed, 0);
+        assert_eq!(defense.take_counts(), (0, 0));
+    }
+
+    #[test]
+    fn reconcile_releases_non_deferred_exited_preemptive_only_for_app_wide_allow_without_churn() {
+        let exe_exited =
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\App.exe";
+        let pattern =
+            r"C:\Program Files\WindowsApps\Contoso.App_*_x64__8wekyb3d8bbwe\App.exe";
+        let defense = CountingDefense::new();
+        let inspector = CountingInspector::new(vec![BinaryIdentity {
+            exe_path: exe_exited.to_string(),
+            sha256: Some("b".repeat(64)),
+            authenticode: Some(AuthenticodeInfo {
+                signer_subject: "CN=Contoso Store Publisher".to_string(),
+                root_thumbprint: "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+            }),
+        }]);
+        let mut fw = WfpRuleManager::new();
+
+        let h = defense
+            .add_wfp_app_rule(Path::new(exe_exited), None, false)
+            .unwrap();
+        assert!(fw.register_preemptive_block(exe_exited, h, &defense));
+        let _ = defense.take_counts();
+
+        // Destination-scoped wildcard NetworkAllow must NOT release non-deferred app-wide Preemptive block
+        // and must not even perform disk inspection.
+        let dest_scoped = vec![wildcard_allow_rule("R-WA-DEST", pattern, Some("203.0.113.10"))];
+        let report_dest = fw.reconcile_persisted_rules(&dest_scoped, &[], &inspector, &defense);
+        assert_eq!(report_dest.removed, 0);
+        assert_eq!(report_dest.applied, 0);
+        assert_eq!(inspector.calls(), 0);
+        assert!(fw.active_app_block(exe_exited).is_some());
+        assert_eq!(defense.take_counts(), (0, 0));
+
+        // App-wide wildcard NetworkAllow + matching app-wide NetworkBlock must NOT release (deny-overrides-allow).
+        let app_wide_allow = wildcard_allow_rule("R-WA-APP", pattern, None);
+        let app_wide_block = AllowlistRuleRecord {
+            rule_id: "R-WA-BLK".to_string(),
+            scope: RuleScope::NetworkBlock,
+            exe_path_pattern: pattern.to_string(),
+            sha256: None,
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: None,
+            created_at_ms: 1_750_000_000_001,
+            created_by: "user_quarantine".to_string(),
+        };
+        let report_blocked = fw.reconcile_persisted_rules(
+            &[app_wide_allow.clone(), app_wide_block],
+            &[],
+            &inspector,
+            &defense,
+        );
+        assert_eq!(report_blocked.removed, 0);
+        assert!(fw.active_app_block(exe_exited).is_some());
+        assert_eq!(defense.take_counts(), (0, 0));
+
+        // App-wide wildcard NetworkAllow alone: Pass N removes Preemptive block without creating Permit.
+        let rules_allow = vec![app_wide_allow];
+        let report_n = fw.reconcile_persisted_rules(&rules_allow, &[], &inspector, &defense);
+        assert_eq!(report_n.removed, 1);
+        assert_eq!(report_n.applied, 0);
+        assert!(!fw.has_any_app_filter(exe_exited));
+        assert_eq!(defense.take_counts(), (0, 1));
+
+        // Pass N+1: 0 BFE add/remove churn.
+        let report_n1 = fw.reconcile_persisted_rules(&rules_allow, &[], &inspector, &defense);
+        assert_eq!(report_n1.removed, 0);
+        assert_eq!(report_n1.applied, 0);
+        assert_eq!(defense.take_counts(), (0, 0));
+    }
+
+    #[test]
+    fn reconcile_keeps_deferred_preemptive_block_when_exe_restarted_or_overflow_live() {
+        let exe = r"C:\Users\Alice\Downloads\RestartedHelper.exe";
+        let defense = CountingDefense::new();
+        let inspector = CountingInspector::new(Vec::new());
+        let mut fw = WfpRuleManager::new();
+
+        let h = defense.add_wfp_app_rule(Path::new(exe), None, false).unwrap();
+        assert!(fw.register_preemptive_block(exe, h, &defense));
+        assert!(fw.bind_alert_to_app_block("ALT-OLD-1", exe));
+        assert!(!fw.remove_preemptive_block_if_unused(exe, &defense));
+        assert!(fw.has_deferred_preemptive_removal(exe));
+        fw.unbind_alert("ALT-OLD-1");
+        let _ = defense.take_counts();
+
+        let dest_scoped = vec![AllowlistRuleRecord {
+            rule_id: "R-DEST-ONLY".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some("c".repeat(64)),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("203.0.113.50".to_string()),
+            created_at_ms: 1_750_000_000_000,
+            created_by: "user_triage".to_string(),
+        }];
+
+        // 1. Live in `active_concrete_exes`: keeps block AND clears stale deferred flag.
+        let rep_live = fw.reconcile_persisted_rules(
+            &dest_scoped,
+            &[exe.to_string()],
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_live.removed, 0);
+        assert!(fw.active_app_block(exe).is_some());
+        assert!(!fw.has_deferred_preemptive_removal(exe));
+        assert_eq!(defense.take_counts(), (0, 0));
+
+        // 2. Fail closed when overflow flags indicate unenumerated live processes.
+        assert!(fw.bind_alert_to_app_block("ALT-OLD-2", exe));
+        assert!(!fw.remove_preemptive_block_if_unused(exe, &defense));
+        fw.unbind_alert("ALT-OLD-2");
+        assert!(fw.has_deferred_preemptive_removal(exe));
+
+        let mut overflow_ctx = WfpReconcileDnsContext::default();
+        overflow_ctx.overflow_live_exe_keys.insert(WfpRuleManager::exe_key(exe));
+        let rep_ov_key = fw.reconcile_persisted_rules_with_dns_context(
+            &dest_scoped,
+            None,
+            &[],
+            &overflow_ctx,
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_ov_key.removed, 0);
+        assert!(fw.active_app_block(exe).is_some());
+
+        let overflow_any_ctx = WfpReconcileDnsContext {
+            live_exe_overflow_any: true,
+            ..Default::default()
+        };
+        let rep_ov_any = fw.reconcile_persisted_rules_with_dns_context(
+            &dest_scoped,
+            None,
+            &[],
+            &overflow_any_ctx,
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_ov_any.removed, 0);
+        assert!(fw.active_app_block(exe).is_some());
     }
 }

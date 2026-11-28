@@ -1,7 +1,8 @@
 //! IPC request authorization enforcement and command dispatch to `DaemonEngine`.
 
 use ledr_proto::{
-    AlertDecision, IpcRequest, IpcResponse, AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH,
+    AlertDecision, AllowPermanentPathMode, IpcRequest, IpcResponse, AUTHORIZED_BRIDGE_EXE_PATH,
+    AUTHORIZED_UI_EXE_PATH,
 };
 
 use crate::engine::{BrowserEventOutcome, BrowserReportError, DaemonEngine, PolicyRuleError};
@@ -26,6 +27,7 @@ pub(super) fn caller_auth_policy_for_request(req: &IpcRequest) -> CallerAuthPoli
     match req {
         IpcRequest::Ping => CallerAuthPolicy::Public,
         IpcRequest::ResolveAlert { .. }
+        | IpcRequest::ResolveAlertWithOptions { .. }
         | IpcRequest::UpsertRule { .. }
         | IpcRequest::DeleteRule { .. }
         | IpcRequest::GetFlightRecorder { .. }
@@ -164,56 +166,24 @@ pub(super) fn dispatch_request(
                 matched_brand: assessment.matched_brand,
             }
         }
-        IpcRequest::ResolveAlert { alert_id, decision } => {
-            tracing::info!(
-                alert_id = %alert_id,
-                decision = decision_label(&decision),
-                "received ResolveAlert IPC request"
-            );
-            let wants_block_rule =
-                matches!(decision, AlertDecision::TerminateAndBlock { add_block_rule: true });
-            match engine.resolve_alert_with_outcome(&alert_id, decision) {
-                Ok(outcome) => {
-                    tracing::info!(
-                        alert_id = %outcome.alert.alert_id,
-                        source_layer = %outcome.alert.source_layer,
-                        status = %outcome.alert.status.as_db_str(),
-                        saved_rule_id = ?outcome.saved_rule_id,
-                        "completed ResolveAlert IPC request"
-                    );
-                    let mut message = format!(
-                        "alert {} resolved to {}",
-                        outcome.alert.alert_id,
-                        outcome.alert.status.as_db_str()
-                    );
-                    if let Some(rule_id) = outcome.saved_rule_id.as_deref() {
-                        message.push_str(&format!("; rule {rule_id} saved"));
-                    } else if wants_block_rule {
-                        message.push_str("; no NetworkBlock rule saved (executable path unresolved)");
-                    }
-                    IpcResponse::Ack { message }
-                }
-                Err(msg) => {
-                    let code = if msg.contains("not found") {
-                        "NOT_FOUND"
-                    } else if msg.contains("already resolved") {
-                        "ALREADY_RESOLVED"
-                    } else {
-                        "RESOLVE_ERROR"
-                    };
-                    tracing::warn!(
-                        alert_id = %alert_id,
-                        code = code,
-                        error = %msg,
-                        "ResolveAlert IPC request failed"
-                    );
-                    IpcResponse::Error {
-                        code: code.to_string(),
-                        message: msg,
-                    }
-                }
-            }
-        }
+        IpcRequest::ResolveAlert { alert_id, decision } => resolve_alert_ipc_response(
+            engine,
+            "ResolveAlert",
+            &alert_id,
+            decision,
+            AllowPermanentPathMode::Exact,
+        ),
+        IpcRequest::ResolveAlertWithOptions {
+            alert_id,
+            decision,
+            path_mode,
+        } => resolve_alert_ipc_response(
+            engine,
+            "ResolveAlertWithOptions",
+            &alert_id,
+            decision,
+            path_mode,
+        ),
         IpcRequest::UpsertRule { rule } => match engine.upsert_policy_rule(&rule) {
             Ok(_report) => IpcResponse::Ack {
                 message: format!("upserted rule {}", rule.rule_id),
@@ -295,6 +265,67 @@ pub(super) fn browser_report_error_response(err: BrowserReportError) -> IpcRespo
     }
 }
 
+fn resolve_alert_ipc_response(
+    engine: &DaemonEngine,
+    request_name: &str,
+    alert_id: &str,
+    decision: AlertDecision,
+    path_mode: AllowPermanentPathMode,
+) -> IpcResponse {
+    tracing::info!(
+        alert_id = %alert_id,
+        decision = decision_label(&decision),
+        path_mode = ?path_mode,
+        request = request_name,
+        "received alert resolve IPC request"
+    );
+    let wants_block_rule =
+        matches!(decision, AlertDecision::TerminateAndBlock { add_block_rule: true });
+    match engine.resolve_alert_with_options_and_outcome(alert_id, decision, path_mode) {
+        Ok(outcome) => {
+            tracing::info!(
+                alert_id = %outcome.alert.alert_id,
+                source_layer = %outcome.alert.source_layer,
+                status = %outcome.alert.status.as_db_str(),
+                saved_rule_id = ?outcome.saved_rule_id,
+                request = request_name,
+                "completed alert resolve IPC request"
+            );
+            let mut message = format!(
+                "alert {} resolved to {}",
+                outcome.alert.alert_id,
+                outcome.alert.status.as_db_str()
+            );
+            if let Some(rule_id) = outcome.saved_rule_id.as_deref() {
+                message.push_str(&format!("; rule {rule_id} saved"));
+            } else if wants_block_rule {
+                message.push_str("; no NetworkBlock rule saved (executable path unresolved)");
+            }
+            IpcResponse::Ack { message }
+        }
+        Err(msg) => {
+            let code = if msg.contains("not found") {
+                "NOT_FOUND"
+            } else if msg.contains("already resolved") {
+                "ALREADY_RESOLVED"
+            } else {
+                "RESOLVE_ERROR"
+            };
+            tracing::warn!(
+                alert_id = %alert_id,
+                code = code,
+                error = %msg,
+                request = request_name,
+                "alert resolve IPC request failed"
+            );
+            IpcResponse::Error {
+                code: code.to_string(),
+                message: msg,
+            }
+        }
+    }
+}
+
 fn decision_label(decision: &AlertDecision) -> &'static str {
     match decision {
         AlertDecision::AllowOnce => "AllowOnce",
@@ -323,9 +354,10 @@ mod tests {
     use std::sync::Arc;
 
     use ledr_proto::{
-        ActiveDefenseController, AlertDecision, AllowlistRuleRecord, AuthenticodeInfo,
-        BrowserSecurityEventType, IpcRequest, IpcResponse, ProcessIdentity, RuleScope,
-        AUTHORIZED_BRIDGE_EXE_PATH, AUTHORIZED_UI_EXE_PATH,
+        ActiveDefenseController, AlertDecision, AlertRecord, AlertSeverity, AlertStatus,
+        AllowPermanentPathMode, AllowlistRuleRecord, AuthenticodeInfo, BrowserSecurityEventType,
+        IpcRequest, IpcResponse, ProcessIdentity, RuleScope, AUTHORIZED_BRIDGE_EXE_PATH,
+        AUTHORIZED_UI_EXE_PATH,
     };
     use ledr_rules::{BinaryIdentity, EarlyPruner, SigmaEngine};
     use ledr_store::LedrStore;
@@ -456,6 +488,18 @@ mod tests {
                 IpcRequest::ResolveAlert {
                     alert_id: "missing-alert".to_string(),
                     decision: AlertDecision::AllowOnce,
+                },
+            ),
+            (
+                "ResolveAlertWithOptions",
+                CallerAuthPolicy::UiOnly,
+                IpcRequest::ResolveAlertWithOptions {
+                    alert_id: "missing-alert".to_string(),
+                    decision: AlertDecision::AllowPermanent {
+                        use_signer_if_available: true,
+                        allow_dest: None,
+                    },
+                    path_mode: AllowPermanentPathMode::WindowsAppsVersionWildcard,
                 },
             ),
             (
@@ -753,6 +797,139 @@ mod tests {
             assert_not_auth_rejection(label, &resp);
         }
         assert_eq!(inspector.uncached_calls(), 0);
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn resolve_alert_with_options_enforces_ui_only_and_dispatches_wildcard() {
+        let inspector = Arc::new(SpyBinaryInspector::with_authenticode(Some(
+            test_authenticode(),
+        )));
+        let engine = build_engine(false, Arc::clone(&inspector));
+
+        let store_exe = r"C:\Program Files\WindowsApps\Contoso.StoreApp_1.2.3.0_x64__8wekyb3d8bbwe\StoreApp.exe";
+        let alert_id = "ALERT-WA-DISPATCH-01";
+        let alert = AlertRecord {
+            alert_id: alert_id.to_string(),
+            timestamp_ms: 1_750_000_000_000,
+            severity: AlertSeverity::Medium,
+            source_layer: "LAYER_3_NETWORK".to_string(),
+            rule_id: "NET_OUTBOUND_ENFORCE".to_string(),
+            title: "Outbound connection".to_string(),
+            process_instance_id: Some("4200:133000000000000000".to_string()),
+            process_suspended: false,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": store_exe,
+                "signer_subject": "CN=Contoso Store Publisher",
+                "root_thumbprint": "0123456789ABCDEF0123456789ABCDEF01234567",
+                "dst_ip": "198.51.100.44",
+                "dst_port": 443
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        };
+        engine.store().record_alert(&alert).expect("record alert");
+
+        let req = IpcRequest::ResolveAlertWithOptions {
+            alert_id: alert_id.to_string(),
+            decision: AlertDecision::AllowPermanent {
+                use_signer_if_available: true,
+                allow_dest: None,
+            },
+            path_mode: AllowPermanentPathMode::WindowsAppsVersionWildcard,
+        };
+        assert_eq!(
+            caller_auth_policy_for_request(&req),
+            CallerAuthPolicy::UiOnly
+        );
+
+        for denied in [
+            None,
+            Some(r"C:\Temp\rogue.exe"),
+            Some(AUTHORIZED_BRIDGE_EXE_PATH),
+        ] {
+            let resp = dispatch_request(&engine, denied, req.clone());
+            assert!(
+                matches!(resp, IpcResponse::Error { ref code, .. } if code == "UNAUTHORIZED"),
+                "expected UNAUTHORIZED for {denied:?}, got {resp:?}"
+            );
+        }
+
+        // Alert must still be Pending after unauthorized rejections.
+        assert_eq!(
+            engine
+                .store()
+                .get_alert(alert_id)
+                .expect("query alert")
+                .expect("alert exists")
+                .status,
+            AlertStatus::Pending
+        );
+
+        // Authorized UI caller succeeds and saves the wildcard rule.
+        let ok_resp = dispatch_request(&engine, Some(AUTHORIZED_UI_EXE_PATH), req.clone());
+        assert!(
+            matches!(ok_resp, IpcResponse::Ack { ref message } if message.contains("APPROVED_RULE") && message.contains("RULE-ALLOW-")),
+            "expected Ack with saved rule, got {ok_resp:?}"
+        );
+
+        let rules = engine
+            .store()
+            .list_rules(Some(RuleScope::NetworkAllow))
+            .expect("list NetworkAllow");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].exe_path_pattern,
+            r"C:\Program Files\WindowsApps\Contoso.StoreApp_*_x64__8wekyb3d8bbwe\StoreApp.exe"
+        );
+        assert_eq!(rules[0].sha256, None);
+
+        // Second attempt on resolved alert maps to ALREADY_RESOLVED.
+        let dup_resp = dispatch_request(&engine, Some(AUTHORIZED_UI_EXE_PATH), req);
+        assert!(
+            matches!(dup_resp, IpcResponse::Error { ref code, .. } if code == "ALREADY_RESOLVED"),
+            "expected ALREADY_RESOLVED, got {dup_resp:?}"
+        );
+
+        // Missing alert maps to NOT_FOUND.
+        let missing_resp = dispatch_request(
+            &engine,
+            Some(AUTHORIZED_UI_EXE_PATH),
+            IpcRequest::ResolveAlertWithOptions {
+                alert_id: "missing-wa-alert".to_string(),
+                decision: AlertDecision::AllowOnce,
+                path_mode: AllowPermanentPathMode::Exact,
+            },
+        );
+        assert!(
+            matches!(missing_resp, IpcResponse::Error { ref code, .. } if code == "NOT_FOUND"),
+            "expected NOT_FOUND, got {missing_resp:?}"
+        );
+
+        // Invalid path_mode + decision combination on pending alert maps to RESOLVE_ERROR.
+        let bad_alert = AlertRecord {
+            alert_id: "ALERT-WA-DISPATCH-02".to_string(),
+            ..alert
+        };
+        engine
+            .store()
+            .record_alert(&bad_alert)
+            .expect("record bad_alert");
+        let err_resp = dispatch_request(
+            &engine,
+            Some(AUTHORIZED_UI_EXE_PATH),
+            IpcRequest::ResolveAlertWithOptions {
+                alert_id: "ALERT-WA-DISPATCH-02".to_string(),
+                decision: AlertDecision::AllowOnce,
+                path_mode: AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            },
+        );
+        assert!(
+            matches!(err_resp, IpcResponse::Error { ref code, .. } if code == "RESOLVE_ERROR"),
+            "expected RESOLVE_ERROR, got {err_resp:?}"
+        );
 
         engine.shutdown_and_flush().await.expect("shutdown");
     }

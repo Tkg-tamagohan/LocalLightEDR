@@ -20,9 +20,10 @@ use super::hints::{
 };
 use super::manager::WfpRuleManager;
 use super::types::{
-    InstalledScopedWfpFilter, InstalledWfpFilter, PromotedFilterSnapshot, RemovedAppBlockSnapshot,
-    RemovedBlockSnapshot, RemovedDomainFilterSnapshot, ScopedWfpTargetKey, WfpFailedOp,
-    WfpFilterOrigin, WfpReconcileDnsContext, WfpReconcileReport, WfpTargetKey,
+    InstalledScopedWfpFilter, InstalledWfpFilter, PromotedFilterSnapshot,
+    PromotedScopedFilterSnapshot, RemovedAppBlockSnapshot, RemovedBlockSnapshot,
+    RemovedDomainFilterSnapshot, ScopedWfpTargetKey, WfpFailedOp, WfpFilterOrigin,
+    WfpReconcileDnsContext, WfpReconcileReport, WfpTargetKey,
 };
 
 impl WfpRuleManager {
@@ -808,7 +809,9 @@ impl WfpRuleManager {
         // 6. Reconcile package-scoped WFP filters (`ALE_APP_ID` + `ALE_PACKAGE_ID`, `FU-P4-03`).
         let mut scoped_keys_to_remove: Vec<ScopedWfpTargetKey> = Vec::new();
         let mut scoped_removal_sources: HashMap<ScopedWfpTargetKey, Vec<String>> = HashMap::new();
+        let mut scoped_removal_hints: HashMap<ScopedWfpTargetKey, Vec<String>> = HashMap::new();
         let mut scoped_keys_to_promote: Vec<ScopedWfpTargetKey> = Vec::new();
+        let mut scoped_domain_hint_updates: Vec<(ScopedWfpTargetKey, Vec<String>)> = Vec::new();
         for (key, entry) in &self.scoped_installed {
             match &entry.origin {
                 WfpFilterOrigin::PersistedPolicy => match scoped_plan.desired.get(key) {
@@ -828,7 +831,9 @@ impl WfpRuleManager {
                                 scoped_rules,
                                 identity,
                                 &entry.package_sid,
+                                entry.package_family_name.as_deref(),
                                 key.2,
+                                &[],
                                 entry.allow,
                                 &mut combined_srcs,
                             );
@@ -852,13 +857,32 @@ impl WfpRuleManager {
                         if *desired_allow == entry.allow {
                             scoped_keys_to_promote.push(key.clone());
                         } else {
-                            let combined_srcs = scoped_plan
+                            let mut combined_srcs = scoped_plan
                                 .desired_sources
                                 .get(key)
                                 .cloned()
                                 .unwrap_or_default();
+                            if let (Some(prev_scoped), Some(ip)) = (prev_scoped_rules, key.2) {
+                                let identity = identity_cache
+                                    .entry(key.0.clone())
+                                    .or_insert_with(|| inspector.inspect(&entry.exe_path));
+                                Self::collect_removed_prev_scoped_sources(
+                                    prev_scoped,
+                                    scoped_rules,
+                                    identity,
+                                    &entry.package_sid,
+                                    entry.package_family_name.as_deref(),
+                                    Some(ip),
+                                    domain_hints,
+                                    entry.allow,
+                                    &mut combined_srcs,
+                                );
+                            }
                             if !combined_srcs.is_empty() {
                                 scoped_removal_sources.insert(key.clone(), combined_srcs);
+                            }
+                            if !domain_hints.is_empty() {
+                                scoped_removal_hints.insert(key.clone(), domain_hints.clone());
                             }
                             scoped_keys_to_remove.push(key.clone());
                         }
@@ -870,6 +894,9 @@ impl WfpRuleManager {
                             .get(&(key.0.clone(), key.1.clone(), None))
                             .is_some_and(|(_, _, allow)| !*allow);
                     if entry.allow && app_wide_blocked {
+                        if !domain_hints.is_empty() {
+                            scoped_removal_hints.insert(key.clone(), domain_hints.clone());
+                        }
                         scoped_keys_to_remove.push(key.clone());
                         continue;
                     }
@@ -886,7 +913,7 @@ impl WfpRuleManager {
                         command_line: None,
                     };
                     let still_valid = if !entry.allow {
-                        matches!(
+                        let static_blocked = matches!(
                             evaluate_outbound_policy_with_scoped(
                                 identity,
                                 &scope_ctx,
@@ -896,20 +923,102 @@ impl WfpRuleManager {
                                 scoped_rules,
                             ),
                             OutboundDecision::BlockedByRule { .. }
-                        ) || domain_hints.iter().any(|h| {
-                            !h.is_empty()
-                                && matches!(
+                        );
+                        let mut surviving_hints: Vec<String> = Vec::with_capacity(domain_hints.len());
+                        for hint in domain_hints {
+                            let Some(hint_norm) = normalize_domain_hint(hint) else {
+                                continue;
+                            };
+                            if dns_ctx
+                                .superseded_block_hints
+                                .contains(&(key.0.clone(), ip, hint_norm.clone()))
+                            {
+                                continue;
+                            }
+                            let h_opt = Some(hint_norm.as_str());
+                            let hint_still_blocked = if static_blocked {
+                                matches!(
                                     evaluate_outbound_policy_with_scoped(
                                         identity,
                                         &scope_ctx,
                                         ip,
-                                        Some(h.as_str()),
+                                        h_opt,
+                                        rules,
+                                        scoped_rules,
+                                    ),
+                                    OutboundDecision::BlockedByRule { .. }
+                                ) && (scoped_rules.iter().any(|r| {
+                                    matches_scoped_network_block_rule(
+                                        r, identity, &scope_ctx, ip, h_opt,
+                                    ) && !matches_scoped_network_block_rule(
+                                        r, identity, &scope_ctx, ip, None,
+                                    )
+                                }) || rules.iter().any(|r| {
+                                    matches_network_block_rule(r, identity, ip, h_opt)
+                                        && !matches_network_block_rule(r, identity, ip, None)
+                                }))
+                            } else {
+                                matches!(
+                                    evaluate_outbound_policy_with_scoped(
+                                        identity,
+                                        &scope_ctx,
+                                        ip,
+                                        h_opt,
                                         rules,
                                         scoped_rules,
                                     ),
                                     OutboundDecision::BlockedByRule { .. }
                                 )
-                        })
+                            };
+                            if hint_still_blocked {
+                                merge_domain_hint(&mut surviving_hints, &hint_norm);
+                            }
+                        }
+                        if let Some(live_doms) =
+                            dns_ctx.active_block_domains.get(&(key.0.clone(), ip))
+                        {
+                            for dom in live_doms {
+                                let Some(norm_dom) = normalize_domain_hint(dom) else {
+                                    continue;
+                                };
+                                let domain_specifically_blocked = matches!(
+                                    evaluate_outbound_policy_with_scoped(
+                                        identity,
+                                        &scope_ctx,
+                                        ip,
+                                        Some(norm_dom.as_str()),
+                                        rules,
+                                        scoped_rules,
+                                    ),
+                                    OutboundDecision::BlockedByRule { .. }
+                                ) && (scoped_rules.iter().any(|r| {
+                                    matches_scoped_network_block_rule(
+                                        r,
+                                        identity,
+                                        &scope_ctx,
+                                        ip,
+                                        Some(norm_dom.as_str()),
+                                    ) && !matches_scoped_network_block_rule(
+                                        r, identity, &scope_ctx, ip, None,
+                                    )
+                                }) || rules.iter().any(|r| {
+                                    matches_network_block_rule(
+                                        r,
+                                        identity,
+                                        ip,
+                                        Some(norm_dom.as_str()),
+                                    ) && !matches_network_block_rule(r, identity, ip, None)
+                                }));
+                                if domain_specifically_blocked {
+                                    merge_domain_hint(&mut surviving_hints, &norm_dom);
+                                }
+                            }
+                        }
+                        let keep = static_blocked || !surviving_hints.is_empty();
+                        if keep && &surviving_hints != domain_hints {
+                            scoped_domain_hint_updates.push((key.clone(), surviving_hints));
+                        }
+                        keep
                     } else if domain_hints.is_empty() {
                         matches!(
                             evaluate_outbound_policy_with_scoped(
@@ -971,10 +1080,15 @@ impl WfpRuleManager {
                                 scoped_rules,
                                 identity,
                                 &entry.package_sid,
+                                entry.package_family_name.as_deref(),
                                 Some(ip),
+                                domain_hints,
                                 entry.allow,
                                 srcs,
                             );
+                        }
+                        if !domain_hints.is_empty() {
+                            scoped_removal_hints.insert(key.clone(), domain_hints.clone());
                         }
                         scoped_keys_to_remove.push(key.clone());
                     }
@@ -1014,6 +1128,7 @@ impl WfpRuleManager {
                         );
                         let source_rule_ids =
                             scoped_removal_sources.remove(&key).unwrap_or_default();
+                        let domain_hints = scoped_removal_hints.remove(&key).unwrap_or_default();
                         failed_scoped_keys.insert((key.0.clone(), key.1.clone()));
                         report.failed += 1;
                         report.failed_ops.push(WfpFailedOp {
@@ -1024,7 +1139,7 @@ impl WfpRuleManager {
                             is_startup_preemptive: false,
                             newly_required: false,
                             source_rule_ids,
-                            domain_hints: Vec::new(),
+                            domain_hints,
                             error: err,
                         });
                     }
@@ -1107,8 +1222,31 @@ impl WfpRuleManager {
                 continue;
             }
             if let Some(entry) = self.scoped_installed.get_mut(&key) {
+                report
+                    .promoted_scoped_backups
+                    .push(PromotedScopedFilterSnapshot {
+                        key: key.clone(),
+                        prev_origin: entry.origin.clone(),
+                    });
                 entry.origin = WfpFilterOrigin::PersistedPolicy;
                 report.promoted += 1;
+            }
+        }
+
+        for (key, surviving_hints) in scoped_domain_hint_updates {
+            if failed_scoped_keys.contains(&(key.0.clone(), key.1.clone())) {
+                continue;
+            }
+            if let Some(entry) = self.scoped_installed.get_mut(&key) {
+                report
+                    .promoted_scoped_backups
+                    .push(PromotedScopedFilterSnapshot {
+                        key: key.clone(),
+                        prev_origin: entry.origin.clone(),
+                    });
+                entry.origin = WfpFilterOrigin::DomainPolicy {
+                    domain_hints: surviving_hints,
+                };
             }
         }
 
@@ -1135,6 +1273,19 @@ impl WfpRuleManager {
                 if snap.prev_deferred_preemptive_removal {
                     self.deferred_preemptive_removals.insert(handle);
                 }
+            }
+        }
+    }
+
+    /// Restores package-scoped filter origins overwritten during a failed reconciliation pass whose
+    /// SQLite mutation was rolled back (`BUG_0003`).
+    pub fn restore_promoted_scoped_filter_states(
+        &mut self,
+        backups: &[PromotedScopedFilterSnapshot],
+    ) {
+        for snap in backups {
+            if let Some(entry) = self.scoped_installed.get_mut(&snap.key) {
+                entry.origin = snap.prev_origin.clone();
             }
         }
     }

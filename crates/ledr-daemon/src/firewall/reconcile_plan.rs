@@ -475,12 +475,15 @@ impl WfpRuleManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn collect_removed_prev_scoped_sources(
         prev_rules: &[ScopedPolicyRuleRecord],
         rules: &[ScopedPolicyRuleRecord],
         identity: &BinaryIdentity,
         package_sid: &str,
+        package_family_name: Option<&str>,
         remote_ip: Option<IpAddr>,
+        domain_hints: &[String],
         allow: bool,
         out: &mut Vec<String>,
     ) {
@@ -492,22 +495,43 @@ impl WfpRuleManager {
             if !sid_ok {
                 return false;
             }
+            let effective_pfn = package_family_name.or(r.package_family_name.as_deref());
             match (remote_ip, allow) {
                 (Some(ip), true) => {
                     let ctx = ProcessScopeContext {
-                        package_family_name: r.package_family_name.as_deref(),
+                        package_family_name: effective_pfn,
                         package_sid: Some(package_sid),
                         command_line: None,
                     };
                     matches_scoped_network_allow_rule(r, identity, &ctx, ip, None)
+                        || domain_hints.iter().any(|h| {
+                            !h.is_empty()
+                                && matches_scoped_network_allow_rule(
+                                    r,
+                                    identity,
+                                    &ctx,
+                                    ip,
+                                    Some(h.as_str()),
+                                )
+                        })
                 }
                 (Some(ip), false) => {
                     let ctx = ProcessScopeContext {
-                        package_family_name: None,
+                        package_family_name: effective_pfn,
                         package_sid: Some(package_sid),
                         command_line: None,
                     };
                     matches_scoped_network_block_rule(r, identity, &ctx, ip, None)
+                        || domain_hints.iter().any(|h| {
+                            !h.is_empty()
+                                && matches_scoped_network_block_rule(
+                                    r,
+                                    identity,
+                                    &ctx,
+                                    ip,
+                                    Some(h.as_str()),
+                                )
+                        })
                 }
                 (None, true) => matches_package_wide_network_allow(r, identity),
                 (None, false) => matches_package_wide_network_block(r, identity),

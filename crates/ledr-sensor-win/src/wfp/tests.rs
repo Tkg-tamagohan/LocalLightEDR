@@ -934,15 +934,19 @@ fn wfp_fu_p4_03_track_b2_scoped_filter_specs_weights_and_transaction_rollback() 
     let bth = Path::new(r"C:\Windows\System32\backgroundTaskHost.exe");
     let sid_a = "S-1-15-2-111-222-333";
 
-    // Weight hierarchy: Loopback (15) > Block IP (14) > Permit IP (13) > Block Package (12) > Block App (11) > Permit App (10).
-    assert_eq!(WFP_WEIGHT_BLOCK_PACKAGE, 12);
+    // Weight hierarchy: Loopback (15) > Block IP / Package (14 == 14) > Permit IP (13) > Permit Package (12) > Block App (11) > Permit App (10).
+    assert_eq!(WFP_WEIGHT_BLOCK_PACKAGE, 14);
+    assert_eq!(WFP_WEIGHT_PERMIT_PACKAGE, 12);
     const {
-        assert!(WFP_WEIGHT_PERMIT_SPECIFIC > WFP_WEIGHT_BLOCK_PACKAGE);
-        assert!(WFP_WEIGHT_BLOCK_PACKAGE > WFP_WEIGHT_BLOCK_APP);
+        assert!(WFP_WEIGHT_LOOPBACK_PERMIT > WFP_WEIGHT_BLOCK_PACKAGE);
+        assert!(WFP_WEIGHT_BLOCK_PACKAGE == WFP_WEIGHT_BLOCK_SPECIFIC);
+        assert!(WFP_WEIGHT_BLOCK_PACKAGE > WFP_WEIGHT_PERMIT_SPECIFIC);
+        assert!(WFP_WEIGHT_PERMIT_SPECIFIC > WFP_WEIGHT_PERMIT_PACKAGE);
+        assert!(WFP_WEIGHT_PERMIT_PACKAGE > WFP_WEIGHT_BLOCK_APP);
         assert!(WFP_WEIGHT_BLOCK_APP > WFP_WEIGHT_PERMIT_APP);
     }
 
-    // Scoped package-wide Block builds IPv4+IPv6 specs carrying `package_sid` and weight 12.
+    // Scoped package-wide Block builds IPv4+IPv6 specs carrying `package_sid` and weight 14.
     let block_specs = build_wfp_scoped_filter_specs(bth, Some(sid_a), None, false)
         .expect("build scoped package-wide block specs");
     assert_eq!(block_specs.len(), 2);
@@ -952,13 +956,14 @@ fn wfp_fu_p4_03_track_b2_scoped_filter_specs_weights_and_transaction_rollback() 
             && s.action == WfpFilterAction::Block
     }));
 
-    // Scoped Permit builds IPv4+IPv6 specs carrying `package_sid` and weight 10.
+    // Scoped package-wide Permit builds IPv4+IPv6 specs carrying `package_sid` and weight 12
+    // (beats app-wide TransientContainment / Preemptive Block weight 11).
     let permit_specs = build_wfp_scoped_filter_specs(bth, Some(sid_a), None, true)
         .expect("build scoped package-wide permit specs");
     assert_eq!(permit_specs.len(), 2);
     assert!(permit_specs.iter().all(|s| {
         s.package_sid.as_deref() == Some(sid_a)
-            && s.weight == WFP_WEIGHT_PERMIT_APP
+            && s.weight == WFP_WEIGHT_PERMIT_PACKAGE
             && s.action == WfpFilterAction::Permit
     }));
 

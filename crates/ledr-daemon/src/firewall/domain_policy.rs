@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 
+#[cfg(doc)]
+use ledr_proto::ScopedPolicyRuleRecord;
 use ledr_proto::{is_never_suspend_process, ActiveDefenseController, AllowlistRuleRecord};
 use ledr_rules::{
     canonical_ip, evaluate_outbound_policy, matches_network_target, BinaryIdentity,
@@ -751,6 +753,184 @@ impl WfpRuleManager {
             }
         }
         removed
+    }
+
+    /// Scoped mirror of [`WfpRuleManager::invalidate_stale_domain_blocks_for_query`] for
+    /// package-scoped (`ALE_APP_ID` + `ALE_PACKAGE_ID`) [`WfpFilterOrigin::DomainPolicy`] IP Block
+    /// filters (`BUG_0001`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn invalidate_stale_scoped_domain_blocks_for_query(
+        &mut self,
+        exe_path: &str,
+        query_name: &str,
+        new_ips: &[IpAddr],
+        static_blocked_by_sid_ip: &HashSet<(String, IpAddr)>,
+        active_blocking_domains_by_sid_ip: &HashMap<(String, IpAddr), Vec<String>>,
+        superseded_pairs: &HashSet<(String, IpAddr, String)>,
+        defense: &dyn ActiveDefenseController,
+    ) -> usize {
+        let exe_k = Self::exe_key(exe_path);
+        let Some(norm_query) = normalize_domain_hint(query_name) else {
+            return 0;
+        };
+        let new_canon: HashSet<IpAddr> = new_ips.iter().map(|ip| canonical_ip(*ip)).collect();
+        let has_v4 = new_canon.iter().any(IpAddr::is_ipv4);
+        let has_v6 = new_canon.iter().any(IpAddr::is_ipv6);
+        let static_blocked_canon: HashSet<(String, IpAddr)> = static_blocked_by_sid_ip
+            .iter()
+            .map(|(sid_k, ip)| (Self::package_sid_key(sid_k), canonical_ip(*ip)))
+            .collect();
+        let mut active_by_sid_ip_canon: HashMap<(String, IpAddr), Vec<String>> =
+            HashMap::with_capacity(active_blocking_domains_by_sid_ip.len());
+        for ((sid_k, ip), doms) in active_blocking_domains_by_sid_ip {
+            let entry = active_by_sid_ip_canon
+                .entry((Self::package_sid_key(sid_k), canonical_ip(*ip)))
+                .or_default();
+            for dom in doms {
+                merge_domain_hint(entry, dom);
+            }
+        }
+        let norm_superseded: HashSet<(String, IpAddr, String)> = superseded_pairs
+            .iter()
+            .filter_map(|(sid_k, ip, dom)| {
+                normalize_domain_hint(dom)
+                    .map(|norm| (Self::package_sid_key(sid_k), canonical_ip(*ip), norm))
+            })
+            .collect();
+
+        let mut stale_keys: Vec<super::types::ScopedWfpTargetKey> = Vec::new();
+        let mut updated_hints: Vec<(super::types::ScopedWfpTargetKey, Vec<String>)> = Vec::new();
+
+        for (k, entry) in &self.scoped_installed {
+            if k.0 != exe_k || entry.allow {
+                continue;
+            }
+            let Some(ip) = k.2 else {
+                continue;
+            };
+            let WfpFilterOrigin::DomainPolicy { domain_hints } = &entry.origin else {
+                continue;
+            };
+
+            let had_non_empty_hints = !domain_hints.is_empty();
+            let same_family = (has_v4 && ip.is_ipv4()) || (has_v6 && ip.is_ipv6());
+            let mut next_hints: Vec<String> = Vec::with_capacity(domain_hints.len());
+
+            if had_non_empty_hints {
+                for raw_hint in domain_hints {
+                    let Some(hint_norm) = normalize_domain_hint(raw_hint) else {
+                        continue;
+                    };
+                    let is_domain_hint =
+                        !hint_norm.contains('/') && parse_literal_target_ip(&hint_norm).is_none();
+                    let matches_migrated_query = !new_canon.contains(&ip)
+                        && same_family
+                        && is_domain_hint
+                        && (hint_norm == norm_query
+                            || (hint_norm.contains('*')
+                                && matches_network_target(&hint_norm, ip, Some(&norm_query))));
+                    let is_superseded =
+                        norm_superseded.contains(&(k.1.clone(), ip, hint_norm.clone()));
+                    if !matches_migrated_query && !is_superseded {
+                        merge_domain_hint(&mut next_hints, &hint_norm);
+                    }
+                }
+            }
+
+            if let Some(active_doms) = active_by_sid_ip_canon.get(&(k.1.clone(), ip)) {
+                for dom in active_doms {
+                    merge_domain_hint(&mut next_hints, dom);
+                }
+            }
+
+            let keep = static_blocked_canon.contains(&(k.1.clone(), ip))
+                || active_by_sid_ip_canon.contains_key(&(k.1.clone(), ip))
+                || !had_non_empty_hints
+                || !next_hints.is_empty();
+
+            if keep {
+                if &next_hints != domain_hints {
+                    updated_hints.push((k.clone(), next_hints));
+                }
+            } else {
+                stale_keys.push(k.clone());
+            }
+        }
+
+        for (key, next_hints) in updated_hints {
+            if let Some(entry) = self.scoped_installed.get_mut(&key) {
+                entry.origin = WfpFilterOrigin::DomainPolicy {
+                    domain_hints: next_hints,
+                };
+            }
+        }
+
+        let mut removed = 0usize;
+        for key in stale_keys {
+            if let Some(entry) = self.scoped_installed.get(&key).cloned() {
+                match defense.remove_wfp_rule(entry.handle) {
+                    Ok(()) => {
+                        self.scoped_installed.remove(&key);
+                        removed += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            exe_path = %entry.exe_path,
+                            package_sid = %entry.package_sid,
+                            remote_ip = ?key.2,
+                            wfp_handle = entry.handle,
+                            error = %err,
+                            "failed removing stale scoped DomainPolicy WFP block filter after domain IP migration"
+                        );
+                    }
+                }
+            }
+        }
+        removed
+    }
+
+    pub fn scoped_domain_policy_blocks(
+        &self,
+        exe_path: &str,
+    ) -> Vec<(String, Option<String>, IpAddr, Vec<String>)> {
+        let exe_k = Self::exe_key(exe_path);
+        let mut out: Vec<(String, Option<String>, IpAddr, Vec<String>)> = self
+            .scoped_installed
+            .iter()
+            .filter_map(|(k, entry)| {
+                if k.0 != exe_k || entry.allow {
+                    return None;
+                }
+                let ip = k.2?;
+                let WfpFilterOrigin::DomainPolicy { domain_hints } = &entry.origin else {
+                    return None;
+                };
+                Some((
+                    entry.package_sid.clone(),
+                    entry.package_family_name.clone(),
+                    ip,
+                    domain_hints.clone(),
+                ))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.to_string().cmp(&b.2.to_string())));
+        out
+    }
+
+    pub fn all_scoped_domain_policy_blocks_with_hints(&self) -> Vec<(String, IpAddr, Vec<String>)> {
+        self.scoped_installed
+            .iter()
+            .filter_map(|(k, entry)| {
+                let ip = k.2?;
+                if entry.allow {
+                    return None;
+                }
+                let WfpFilterOrigin::DomainPolicy { domain_hints } = &entry.origin else {
+                    return None;
+                };
+                Some((k.0.clone(), ip, domain_hints.clone()))
+            })
+            .collect()
     }
 
     pub fn domain_policy_blocks(&self, exe_path: &str) -> Vec<(IpAddr, Vec<String>)> {

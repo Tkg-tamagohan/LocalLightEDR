@@ -18,8 +18,8 @@ pub use net_events::{
 pub use spec::{
     LEDR_WFP_PROVIDER_GUID, LEDR_WFP_SUBLAYER_GUID, LEDR_WFP_SUBLAYER_WEIGHT,
     WFP_WEIGHT_BLOCK_APP, WFP_WEIGHT_BLOCK_PACKAGE, WFP_WEIGHT_BLOCK_SPECIFIC,
-    WFP_WEIGHT_LOOPBACK_PERMIT, WFP_WEIGHT_PERMIT_APP, WFP_WEIGHT_PERMIT_SPECIFIC, WfpFilterAction,
-    WfpFilterSpec, WfpLayer, WfpLoopbackCondition, WfpLoopbackFilterSpec, WfpRemoteAddress,
+    WFP_WEIGHT_LOOPBACK_PERMIT, WFP_WEIGHT_PERMIT_APP, WFP_WEIGHT_PERMIT_PACKAGE,
+    WFP_WEIGHT_PERMIT_SPECIFIC, WfpFilterAction, WfpFilterSpec, WfpLayer, WfpLoopbackCondition, WfpLoopbackFilterSpec, WfpRemoteAddress,
     build_loopback_permit_filter_specs, build_wfp_filter_specs, build_wfp_scoped_filter_specs,
     canonical_wfp_ip, compute_filter_weight, compute_scoped_filter_weight,
     ipv4_to_wfp_host_order, ipv6_to_wfp_network_order, normalize_wfp_exe_path,

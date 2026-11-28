@@ -23,16 +23,23 @@ pub const LEDR_WFP_SUBLAYER_WEIGHT: u16 = 0x8000;
 /// (registered without `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT` so other sublayers keep veto rights).
 pub const WFP_WEIGHT_LOOPBACK_PERMIT: u8 = 15;
 
-/// Filter weight for an explicit remote-IP Block filter.
+/// Filter weight for an explicit remote-IP Block filter (and package-wide Block filters so
+/// `deny-overrides-allow` holds even when explicit remote-IP Permits exist for the shared host).
 pub const WFP_WEIGHT_BLOCK_SPECIFIC: u8 = 14;
 
-/// Filter weight for an explicit remote-IP Permit filter (overrides pre-emptive app-wide block
-/// while explicit app-wide `NetworkBlock` rules suppress Permits during daemon reconciliation).
+/// Filter weight for a package-scoped (`ALE_APP_ID` + `ALE_PACKAGE_ID`) Block filter (`14`,
+/// co-equal with explicit remote-IP Block and strictly above IP/package Permits).
+pub const WFP_WEIGHT_BLOCK_PACKAGE: u8 = 14;
+
+/// Filter weight for an explicit remote-IP Permit filter (overrides package-wide Permit and
+/// pre-emptive app-wide block while explicit app-wide `NetworkBlock` rules suppress Permits).
 pub const WFP_WEIGHT_PERMIT_SPECIFIC: u8 = 13;
 
-/// Filter weight for a package-scoped (`ALE_APP_ID` + `ALE_PACKAGE_ID`) Block filter
-/// (overrides app-wide Block/Permit while remaining below explicit remote-IP filters).
-pub const WFP_WEIGHT_BLOCK_PACKAGE: u8 = 12;
+/// Filter weight for a package-scoped (`ALE_APP_ID` + `ALE_PACKAGE_ID`) Permit filter (`12`,
+/// above app-wide `TransientContainment` / `Preemptive` Block `11` so another package's transient
+/// containment on a shared host never breaks already-allowed packages, while explicit app-wide
+/// `NetworkBlock` reconciliation/enforcement removes conflicting scoped Permits).
+pub const WFP_WEIGHT_PERMIT_PACKAGE: u8 = 12;
 
 /// Filter weight for an app-wide Block filter (overrides app-wide Permit).
 pub const WFP_WEIGHT_BLOCK_APP: u8 = 11;
@@ -182,10 +189,11 @@ pub const fn compute_scoped_filter_weight(
 ) -> u8 {
     match (has_remote_ip, has_package_sid, allow) {
         (true, _, false) => WFP_WEIGHT_BLOCK_SPECIFIC,
-        (true, _, true) => WFP_WEIGHT_PERMIT_SPECIFIC,
         (false, true, false) => WFP_WEIGHT_BLOCK_PACKAGE,
+        (true, _, true) => WFP_WEIGHT_PERMIT_SPECIFIC,
+        (false, true, true) => WFP_WEIGHT_PERMIT_PACKAGE,
         (false, false, false) => WFP_WEIGHT_BLOCK_APP,
-        (false, _, true) => WFP_WEIGHT_PERMIT_APP,
+        (false, false, true) => WFP_WEIGHT_PERMIT_APP,
     }
 }
 

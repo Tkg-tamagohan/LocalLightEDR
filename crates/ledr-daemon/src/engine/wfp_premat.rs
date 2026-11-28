@@ -2,12 +2,17 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 
-use ledr_proto::{is_never_suspend_process, AllowlistRuleRecord, RuleScope};
+use ledr_proto::{
+    is_never_suspend_process, AllowlistRuleRecord, RuleScope, ScopedPolicyRuleRecord,
+};
 use ledr_rules::{
-    canonical_ip, classify_outbound_risk, evaluate_outbound_policy, is_external_ip,
+    canonical_ip, classify_outbound_risk, evaluate_outbound_policy,
+    evaluate_outbound_policy_with_scoped, is_external_ip, is_valid_app_container_sid,
     matches_app_wide_network_allow, matches_app_wide_network_block, matches_network_block_rule,
-    matches_network_target, matches_path_pattern, parse_cidr_target, BinaryIdentity,
-    OutboundDecision, OutboundRiskClass,
+    matches_network_target, matches_package_wide_network_allow,
+    matches_package_wide_network_block, matches_path_pattern, matches_scoped_network_allow_rule,
+    matches_scoped_network_block_rule, parse_cidr_target, BinaryIdentity, OutboundDecision,
+    OutboundRiskClass, ProcessScopeContext,
 };
 
 use crate::firewall::{parse_literal_target_ip, WfpRuleManager};
@@ -53,15 +58,20 @@ impl DaemonEngine {
 
         // Zero-overhead fast path when neither domain-scoped persisted network rules nor existing
         // `DomainPolicy` filters for `exe_path` exist.
-        let (has_domain_rules, candidate_blocks, candidate_permits) = {
+        let (has_domain_rules, candidate_blocks, candidate_permits, scoped_candidate_blocks) = {
             let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
             (
                 fw.has_domain_network_rules(),
                 fw.domain_policy_blocks(exe_path),
                 fw.domain_policy_permits_with_hints(exe_path),
+                fw.scoped_domain_policy_blocks(exe_path),
             )
         };
-        if !has_domain_rules && candidate_blocks.is_empty() && candidate_permits.is_empty() {
+        if !has_domain_rules
+            && candidate_blocks.is_empty()
+            && candidate_permits.is_empty()
+            && scoped_candidate_blocks.is_empty()
+        {
             return;
         }
 
@@ -80,29 +90,45 @@ impl DaemonEngine {
         // When a domain moves to a new IP set, purge any stale `DomainPolicy` Block filter
         // left behind by an earlier resolution of `norm_query` (or a previously superseded domain)
         // unless the old IP is still blocked by a static rule or another active DNS record
-        // (`BUG_..._0003`), and prune migrated/superseded hints from existing `DomainPolicy`
-        // Permits so later blocks on the migrated domain cannot falsely revoke unrelated Permits.
+        // (`BUG_..._0003`, `BUG_0001`), and prune migrated/superseded hints from existing
+        // `DomainPolicy` Permits so later blocks on the migrated domain cannot falsely revoke
+        // unrelated Permits.
         let exe_k = WfpRuleManager::exe_key(exe_path);
         let mut cached_rules: Option<Vec<AllowlistRuleRecord>> = None;
         let mut cached_identity: Option<BinaryIdentity> = None;
-        if !candidate_blocks.is_empty() || !candidate_permits.is_empty() {
+        if !candidate_blocks.is_empty()
+            || !candidate_permits.is_empty()
+            || !scoped_candidate_blocks.is_empty()
+        {
             let rules = self.store.list_network_rules().unwrap_or_default();
+            let scoped_rules = if scoped_candidate_blocks.is_empty() {
+                Vec::new()
+            } else {
+                self.store.list_scoped_network_rules().unwrap_or_default()
+            };
             let bin_identity = match self.inspect_binary_for_pipeline(exe_path) {
                 InspectOutcome::Completed(id) => id,
                 InspectOutcome::Cancelled => return,
             };
-            let (active_dns_entries, superseded_block_pairs, current_domain_entries, superseded_permit_pairs) = {
+            let (
+                active_dns_entries,
+                superseded_block_pairs,
+                superseded_scoped_block_pairs,
+                current_domain_entries,
+                superseded_permit_pairs,
+            ) = {
                 let history = self
                     .process_dns_history
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let active = if candidate_blocks.is_empty() {
+                let active = if candidate_blocks.is_empty() && scoped_candidate_blocks.is_empty() {
                     Vec::new()
                 } else {
                     history.active_domains_by_ip_for_exe(&exe_k)
                 };
                 let mut sup_blocks: HashSet<(IpAddr, String)> = HashSet::new();
-                let mut cand_ips: Vec<IpAddr> = Vec::with_capacity(candidate_blocks.len());
+                let mut cand_ips: Vec<IpAddr> =
+                    Vec::with_capacity(candidate_blocks.len() + scoped_candidate_blocks.len());
                 for (cand_ip, cand_hints) in &candidate_blocks {
                     for cand_hint in cand_hints {
                         let norm_hint = cand_hint.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -110,6 +136,21 @@ impl DaemonEngine {
                             && history.is_domain_ip_superseded(&exe_k, &norm_hint, *cand_ip)
                         {
                             sup_blocks.insert((*cand_ip, norm_hint));
+                        }
+                    }
+                    if !cand_ips.contains(cand_ip) {
+                        cand_ips.push(*cand_ip);
+                    }
+                }
+                let mut sup_scoped_blocks: HashSet<(String, IpAddr, String)> = HashSet::new();
+                for (pkg_sid, _, cand_ip, cand_hints) in &scoped_candidate_blocks {
+                    let sid_k = WfpRuleManager::package_sid_key(pkg_sid);
+                    for cand_hint in cand_hints {
+                        let norm_hint = cand_hint.trim().trim_end_matches('.').to_ascii_lowercase();
+                        if !norm_hint.is_empty()
+                            && history.is_domain_ip_superseded(&exe_k, &norm_hint, *cand_ip)
+                        {
+                            sup_scoped_blocks.insert((sid_k.clone(), *cand_ip, norm_hint));
                         }
                     }
                     if !cand_ips.contains(cand_ip) {
@@ -132,7 +173,7 @@ impl DaemonEngine {
                         }
                     }
                 }
-                (active, sup_blocks, current, sup_permits)
+                (active, sup_blocks, sup_scoped_blocks, current, sup_permits)
             };
 
             let mut static_blocked_ips: HashSet<IpAddr> = HashSet::new();
@@ -146,8 +187,9 @@ impl DaemonEngine {
             }
             let mut active_blocking_domains_by_ip: HashMap<IpAddr, Vec<String>> = HashMap::new();
             for (entry_ip, entry_dom) in current_domain_entries
-                .into_iter()
-                .chain(active_dns_entries)
+                .iter()
+                .cloned()
+                .chain(active_dns_entries.iter().cloned())
             {
                 let matches_domain_block = rules.iter().any(|r| {
                     matches_network_block_rule(r, &bin_identity, entry_ip, Some(&entry_dom))
@@ -157,6 +199,78 @@ impl DaemonEngine {
                     let list = active_blocking_domains_by_ip.entry(entry_ip).or_default();
                     if !list.iter().any(|existing| existing == &entry_dom) {
                         list.push(entry_dom);
+                    }
+                }
+            }
+
+            let mut static_blocked_by_sid_ip: HashSet<(String, IpAddr)> = HashSet::new();
+            let mut active_blocking_domains_by_sid_ip: HashMap<(String, IpAddr), Vec<String>> =
+                HashMap::new();
+            if !scoped_candidate_blocks.is_empty() {
+                let mut distinct_sid_ips: HashMap<(String, IpAddr), (String, Option<String>)> =
+                    HashMap::new();
+                for (pkg_sid, pkg_pfn, cand_ip, _) in &scoped_candidate_blocks {
+                    let sid_k = WfpRuleManager::package_sid_key(pkg_sid);
+                    distinct_sid_ips
+                        .entry((sid_k, *cand_ip))
+                        .or_insert_with(|| (pkg_sid.clone(), pkg_pfn.clone()));
+                }
+                for ((sid_k, cand_ip), (pkg_sid, pkg_pfn)) in &distinct_sid_ips {
+                    let scope_ctx = ProcessScopeContext {
+                        package_family_name: pkg_pfn.as_deref(),
+                        package_sid: Some(pkg_sid.as_str()),
+                        command_line: None,
+                    };
+                    if matches!(
+                        evaluate_outbound_policy_with_scoped(
+                            &bin_identity,
+                            &scope_ctx,
+                            *cand_ip,
+                            None,
+                            &rules,
+                            &scoped_rules,
+                        ),
+                        OutboundDecision::BlockedByRule { .. }
+                    ) {
+                        static_blocked_by_sid_ip.insert((sid_k.clone(), *cand_ip));
+                    }
+                    for (entry_ip, entry_dom) in current_domain_entries
+                        .iter()
+                        .chain(active_dns_entries.iter())
+                    {
+                        if entry_ip != cand_ip {
+                            continue;
+                        }
+                        let matches_domain_block = scoped_rules.iter().any(|r| {
+                            matches_scoped_network_block_rule(
+                                r,
+                                &bin_identity,
+                                &scope_ctx,
+                                *entry_ip,
+                                Some(entry_dom),
+                            ) && !matches_scoped_network_block_rule(
+                                r,
+                                &bin_identity,
+                                &scope_ctx,
+                                *entry_ip,
+                                None,
+                            )
+                        }) || rules.iter().any(|r| {
+                            matches_network_block_rule(
+                                r,
+                                &bin_identity,
+                                *entry_ip,
+                                Some(entry_dom),
+                            ) && !matches_network_block_rule(r, &bin_identity, *entry_ip, None)
+                        });
+                        if matches_domain_block {
+                            let list = active_blocking_domains_by_sid_ip
+                                .entry((sid_k.clone(), *entry_ip))
+                                .or_default();
+                            if !list.iter().any(|existing| existing == entry_dom) {
+                                list.push(entry_dom.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -171,6 +285,17 @@ impl DaemonEngine {
                         &static_blocked_ips,
                         &active_blocking_domains_by_ip,
                         &superseded_block_pairs,
+                        &*self.defense,
+                    );
+                }
+                if !scoped_candidate_blocks.is_empty() {
+                    fw.invalidate_stale_scoped_domain_blocks_for_query(
+                        exe_path,
+                        norm_query,
+                        &all_canon_ips,
+                        &static_blocked_by_sid_ip,
+                        &active_blocking_domains_by_sid_ip,
+                        &superseded_scoped_block_pairs,
                         &*self.defense,
                     );
                 }
@@ -417,12 +542,13 @@ impl DaemonEngine {
         // identity on disk (fresh SHA-256 via `SEC_0005`) whenever any Permit filter is live.
         // If the binary was overwritten or no longer authorized, immediately revoke stale Permit
         // filters and re-evaluate normal block/pre-emptive rules.
-        let (has_permit, has_app_wide_permit, has_scoped_permit) = {
+        let (has_permit, has_app_wide_permit, has_scoped_permit, has_wildcard_rules) = {
             let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
             (
                 fw.has_any_permit_filter_for_exe(trimmed),
                 fw.has_active_filter(trimmed, None, true),
                 fw.has_any_scoped_permit_filter_for_exe(trimmed),
+                fw.has_wildcard_network_rules(),
             )
         };
         if has_permit || has_scoped_permit {
@@ -475,6 +601,10 @@ impl DaemonEngine {
                     fw.revoke_scoped_permits_for_exe(trimmed, &*self.defense);
                 }
             }
+        }
+
+        if has_wildcard_rules {
+            self.materialize_scoped_wildcard_wfp_rules_for_exe(trimmed);
         }
 
         let exe_key = WfpRuleManager::exe_key(trimmed);
@@ -665,6 +795,170 @@ impl DaemonEngine {
                     error = %err,
                     "pre-emptive WFP block unavailable on ProcessStart"
                 );
+            }
+        }
+    }
+
+    /// Materializes wildcard-exe `ScopedPolicyRuleRecord` (`NetworkBlock` / `NetworkAllow`) rules
+    /// onto newly launched concrete executables on `ProcessStart` so late-started packages cannot
+    /// bypass wildcard scoped blocks on their initial outbound packet (`SEC_0002`).
+    fn materialize_scoped_wildcard_wfp_rules_for_exe(&self, trimmed: &str) {
+        if is_never_suspend_process(trimmed)
+            || is_never_suspend_process(trimmed.trim_end_matches(['.', ' ']))
+        {
+            return;
+        }
+        let scoped_rules = self.store.list_scoped_network_rules().unwrap_or_default();
+        let matching_scoped: Vec<&ScopedPolicyRuleRecord> = scoped_rules
+            .iter()
+            .filter(|r| {
+                matches!(r.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow)
+                    && r.command_line_pattern.is_none()
+                    && r.package_sid
+                        .as_deref()
+                        .is_some_and(is_valid_app_container_sid)
+                    && !r.exe_path_pattern.trim().is_empty()
+                    && WfpRuleManager::is_wildcard_pattern(&r.exe_path_pattern)
+                    && matches_path_pattern(trimmed, &r.exe_path_pattern)
+            })
+            .collect();
+        if matching_scoped.is_empty() {
+            return;
+        }
+
+        let needs_inspect = matching_scoped.iter().any(|r| {
+            r.scope == RuleScope::NetworkAllow
+                || r.sha256.as_deref().is_some_and(|s| !s.trim().is_empty())
+                || r.signer_subject
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+        });
+        let identity = if needs_inspect {
+            match self.inspect_binary_for_pipeline(trimmed) {
+                InspectOutcome::Completed(id) => id,
+                InspectOutcome::Cancelled => return,
+            }
+        } else {
+            BinaryIdentity {
+                exe_path: trimmed.to_string(),
+                sha256: None,
+                authenticode: None,
+            }
+        };
+
+        let mut by_sid: HashMap<String, (String, Vec<&ScopedPolicyRuleRecord>)> = HashMap::new();
+        for r in matching_scoped {
+            let sid_raw = r.package_sid.as_deref().unwrap_or("").trim();
+            let sid_k = WfpRuleManager::package_sid_key(sid_raw);
+            by_sid
+                .entry(sid_k)
+                .or_insert_with(|| (sid_raw.to_string(), Vec::new()))
+                .1
+                .push(r);
+        }
+
+        for (_sid_k, (sid_raw, pkg_rules)) in by_sid {
+            let has_pkg_block = pkg_rules
+                .iter()
+                .any(|r| matches_package_wide_network_block(r, &identity));
+            if has_pkg_block {
+                let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                if !fw.has_active_scoped_filter(trimmed, &sid_raw, None, false) {
+                    if let Err(err) =
+                        fw.ensure_scoped_policy_block(trimmed, &sid_raw, None, &*self.defense)
+                    {
+                        tracing::warn!(
+                            exe_path = %trimmed,
+                            package_sid = %sid_raw,
+                            error = %err,
+                            "failed to apply wildcard package-scoped NetworkBlock WFP filter on ProcessStart"
+                        );
+                    }
+                }
+                continue;
+            }
+
+            let block_ctx = ProcessScopeContext {
+                package_family_name: None,
+                package_sid: Some(&sid_raw),
+                command_line: None,
+            };
+            let mut blocked_ips: HashSet<IpAddr> = HashSet::new();
+            for rule in &pkg_rules {
+                if rule.scope != RuleScope::NetworkBlock {
+                    continue;
+                }
+                if let Some(ip) = rule
+                    .allowed_target
+                    .as_deref()
+                    .and_then(parse_literal_target_ip)
+                {
+                    if matches_scoped_network_block_rule(rule, &identity, &block_ctx, ip, None) {
+                        blocked_ips.insert(ip);
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        if !fw.has_active_scoped_filter(trimmed, &sid_raw, Some(ip), false) {
+                            if let Err(err) = fw.ensure_scoped_policy_block(
+                                trimmed,
+                                &sid_raw,
+                                Some(ip),
+                                &*self.defense,
+                            ) {
+                                tracing::warn!(
+                                    exe_path = %trimmed,
+                                    package_sid = %sid_raw,
+                                    remote_ip = %ip,
+                                    error = %err,
+                                    "failed to apply wildcard scoped IP NetworkBlock WFP filter on ProcessStart"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            let has_pkg_allow = pkg_rules
+                .iter()
+                .any(|r| matches_package_wide_network_allow(r, &identity));
+            if has_pkg_allow {
+                let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                if !fw.has_active_scoped_filter(trimmed, &sid_raw, None, true) {
+                    let _ = fw.ensure_scoped_policy_permit(trimmed, &sid_raw, &*self.defense);
+                }
+                continue;
+            }
+
+            for rule in &pkg_rules {
+                if rule.scope != RuleScope::NetworkAllow {
+                    continue;
+                }
+                if let Some(ip) = rule
+                    .allowed_target
+                    .as_deref()
+                    .and_then(parse_literal_target_ip)
+                {
+                    if blocked_ips.contains(&ip) {
+                        continue;
+                    }
+                    let allow_ctx = ProcessScopeContext {
+                        package_family_name: rule.package_family_name.as_deref(),
+                        package_sid: Some(&sid_raw),
+                        command_line: None,
+                    };
+                    if matches_scoped_network_allow_rule(rule, &identity, &allow_ctx, ip, None) {
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        if !fw.has_active_scoped_filter(trimmed, &sid_raw, Some(ip), true) {
+                            let _ = fw.ensure_scoped_ip_permit(
+                                trimmed,
+                                &sid_raw,
+                                rule.package_family_name.as_deref(),
+                                ip,
+                                &[] as &[&str],
+                                &[] as &[&str],
+                                &*self.defense,
+                            );
+                        }
+                    }
+                }
             }
         }
     }

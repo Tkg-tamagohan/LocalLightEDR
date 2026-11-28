@@ -2833,6 +2833,15 @@ fn rules_fu_p4_03_track_b2_scoped_validation_cmd_wildcard_and_isolation() {
         r"C:\Windows\System32\backgroundTaskHost.exe -ServerName:Contoso.Task1",
         "*-servername:contoso.*"
     ));
+    // BUG_0004: pattern `*` must take precedence over literal `*` in command_line input.
+    assert!(matches_command_line_pattern(
+        "tool.exe *.log",
+        "tool.exe *log"
+    ));
+    assert!(matches_command_line_pattern(
+        "tool.exe --flag *.log --mode=prod",
+        "tool.exe * *.log *prod"
+    ));
     assert!(!matches_command_line_pattern(
         "foo /bar",
         r"foo \bar"
@@ -2930,6 +2939,16 @@ fn rules_fu_p4_03_track_b2_scoped_validation_cmd_wildcard_and_isolation() {
     let mut bad_proc_no_scope = proc_allow.clone();
     bad_proc_no_scope.command_line_pattern = None;
     assert!(validate_scoped_policy_rule(&bad_proc_no_scope).is_err());
+
+    // ANALYSIS_0002: ProcessAllow rejects non-empty allowed_target; FileCanaryAllow accepts it.
+    let mut bad_proc_target = proc_allow.clone();
+    bad_proc_target.allowed_target = Some(r"C:\Users\*\Documents\*.txt".to_string());
+    assert!(validate_scoped_policy_rule(&bad_proc_target).is_err());
+
+    let mut canary_target_ok = proc_allow.clone();
+    canary_target_ok.scope = RuleScope::FileCanaryAllow;
+    canary_target_ok.allowed_target = Some(r"C:\Users\*\Documents\*.txt".to_string());
+    assert!(validate_scoped_policy_rule(&canary_target_ok).is_ok());
 
     // 3. Layer 3 isolation & deny-overrides-allow across all 4 legacy/scoped combinations.
     let identity = BinaryIdentity {

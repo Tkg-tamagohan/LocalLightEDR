@@ -6251,6 +6251,23 @@ async fn daemon_fu_p4_03_b2_cross_package_isolation_and_legacy_list_isolation() 
         .await
         .expect("send net B");
     wait_high_priority_processed(&engine, 4, "two NetworkConnect events").await;
+
+    // ANALYSIS_0001: With Package B transiently contained (`TransientContainment` app block active on
+    // shared backgroundTaskHost.exe, alert still Pending), Package A must STILL connect to a brand-new
+    // IP cleanly (`WFP_WEIGHT_PERMIT_PACKAGE = 12 > WFP_WEIGHT_BLOCK_APP = 11`).
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_a.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 79)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send net A2 while B contained");
+    wait_high_priority_processed(&engine, 5, "Package A connect while B contained").await;
+
     ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await.expect("shutdown");
 
@@ -6260,6 +6277,7 @@ async fn daemon_fu_p4_03_b2_cross_package_isolation_and_legacy_list_isolation() 
         alerts[0].process_instance_id.as_deref(),
         Some(id_b.instance_id().as_str())
     );
+    assert!(!defense.suspends().contains(&id_a));
     let ctx_b: serde_json::Value = serde_json::from_str(&alerts[0].context_json).expect("ctx B");
     assert_eq!(ctx_b["package_sid"], sid_b);
     assert_eq!(ctx_b["package_family_name"], pfn_b);
@@ -7070,5 +7088,190 @@ async fn daemon_fu_p4_03_b2_layer1_process_allow_and_layer2_canary_scoped_eval()
     assert_eq!(
         canary_alerts[0].process_instance_id.as_deref(),
         Some(id_canary_bad.instance_id().as_str())
+    );
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_b2_r1_domain_block_delete_failure_rollback_and_wildcard_late_start_sec_0002() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    let late_exe = r"C:\Tools\LatePkg_1\worker.exe";
+    let signer = "CN=Microsoft Windows";
+    let root_tp = "ab".repeat(20);
+    for exe in [bth_exe, late_exe] {
+        inspector.insert(
+            exe,
+            BinaryIdentity {
+                exe_path: exe.to_string(),
+                sha256: Some("e".repeat(64)),
+                authenticode: Some(AuthenticodeInfo {
+                    signer_subject: signer.to_string(),
+                    root_thumbprint: root_tp.clone(),
+                }),
+            },
+        );
+    }
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let sid_a = "S-1-15-2-7100-1";
+    let pfn_a = "Contoso.DomainBlk_8wekyb3d8bbwe";
+    let dom_block_rule = ScopedPolicyRuleRecord {
+        rule_id: "SC-DOM-BLK-R1".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("blocked.example".to_string()),
+        package_family_name: Some(pfn_a.to_string()),
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_000,
+        created_by: "test_r1".to_string(),
+    };
+    engine
+        .upsert_scoped_policy_rule(&dom_block_rule)
+        .expect("upsert pure domain scoped NetworkBlock");
+
+    let sid_late = "S-1-15-2-7200-2";
+    let wildcard_block_rule = ScopedPolicyRuleRecord {
+        rule_id: "SC-WILD-LATE-R1".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: r"C:\Tools\LatePkg_*\worker.exe".to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        package_family_name: Some("Contoso.LatePkg_8wekyb3d8bbwe".to_string()),
+        package_sid: Some(sid_late.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_001,
+        created_by: "test_r1".to_string(),
+    };
+    engine
+        .upsert_scoped_policy_rule(&wildcard_block_rule)
+        .expect("upsert wildcard scoped NetworkBlock before launch");
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id_a = ProcessIdentity::new(47_601, unix_ms_to_filetime(now_ms - 1_000));
+    let id_late = ProcessIdentity::new(47_602, unix_ms_to_filetime(now_ms - 500));
+    let sender = engine.sender();
+
+    // 1. Materialize pure domain scoped NetworkBlock on IP 198.51.100.210, then fail delete -> rollback!
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_a,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:DomBlk".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some(pfn_a.to_string()),
+                package_sid: Some(sid_a.to_string()),
+            },
+        )
+        .await
+        .expect("send start bth");
+    let blocked_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 210));
+    sender
+        .send_high_priority(SensorEvent::DnsQuery {
+            pid: id_a.pid,
+            query_name: "blocked.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![blocked_ip],
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send dns");
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_a.pid,
+            protocol: 6,
+            dst_ip: blocked_ip,
+            dst_port: 443,
+            domain_hint: Some("blocked.example".to_string()),
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send net to materialize domain block");
+    wait_high_priority_processed(&engine, 3, "domain block materialization").await;
+
+    assert!(
+        defense.added_scoped_wfp().iter().any(|c| {
+            c.exe_path.eq_ignore_ascii_case(bth_exe)
+                && c.package_sid.as_deref() == Some(sid_a)
+                && c.remote_ip == Some(blocked_ip)
+                && !c.allow
+        }),
+        "expected materialized scoped IP block for blocked.example"
+    );
+
+    defense.set_fail_next_remove(true);
+    let del_err = engine.delete_scoped_policy_rule(&dom_block_rule.rule_id);
+    assert!(
+        matches!(del_err, Err(ledr_daemon::PolicyRuleError::FirewallSync(_))),
+        "BUG_0002: failed BFE removal of domain block must return FirewallSync error, got {del_err:?}"
+    );
+    assert!(
+        store
+            .get_scoped_rule(&dom_block_rule.rule_id)
+            .expect("query")
+            .is_some(),
+        "BUG_0002: SQLite domain block rule must be restored on BFE removal failure"
+    );
+
+    // 2. SEC_0002: Late ProcessStart matching wildcard scoped NetworkBlock must immediately
+    // materialize a package-scoped WFP Block before any NetworkConnect event.
+    let scoped_before = defense.added_scoped_wfp().len();
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_late,
+                parent_pid: 4,
+                exe_path: late_exe.to_string(),
+                command_line: "worker.exe".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.LatePkg_8wekyb3d8bbwe".to_string()),
+                package_sid: Some(sid_late.to_string()),
+            },
+        )
+        .await
+        .expect("send late ProcessStart");
+    wait_high_priority_processed(&engine, 4, "late ProcessStart wildcard materialization").await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let new_scoped = &defense.added_scoped_wfp()[scoped_before..];
+    assert!(
+        new_scoped.iter().any(|c| {
+            c.exe_path.eq_ignore_ascii_case(late_exe)
+                && c.package_sid.as_deref() == Some(sid_late)
+                && c.remote_ip.is_none()
+                && !c.allow
+        }),
+        "SEC_0002: expected wildcard scoped NetworkBlock materialized immediately on late ProcessStart, got {new_scoped:?}"
     );
 }

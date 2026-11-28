@@ -74,12 +74,12 @@ pub fn matches_command_line_pattern(command_line: &str, pattern: &str) -> bool {
     let (mut star_pi, mut match_si) = (None, 0usize);
 
     while si < s.len() {
-        if pi < p.len() && p[pi] == s[si] {
-            si += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        if pi < p.len() && p[pi] == '*' {
             star_pi = Some(pi);
             match_si = si;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == s[si] {
+            si += 1;
             pi += 1;
         } else if let Some(sp) = star_pi {
             pi = sp + 1;
@@ -236,6 +236,17 @@ pub fn validate_scoped_policy_rule(rule: &ScopedPolicyRuleRecord) -> Result<(), 
             }
         }
         RuleScope::ProcessAllow | RuleScope::FileCanaryAllow => {
+            if rule.scope == RuleScope::ProcessAllow
+                && rule
+                    .allowed_target
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty())
+            {
+                return Err(
+                    "allowed_target is forbidden for Layer 1 ProcessAllow rules (FU-P4-03)"
+                        .to_string(),
+                );
+            }
             if sha.is_none() && (signer.is_none() || thumbprint.is_none()) {
                 return Err(format!(
                     "{:?} scoped rule requires sha256 or signer_subject + root_thumbprint (L-04)",

@@ -262,6 +262,34 @@ impl WfpRuleManager {
                 origin: WfpFilterOrigin::PersistedPolicy,
             },
         );
+        // When installing an explicit app-wide persisted NetworkBlock, revoke any conflicting
+        // package-scoped Permit filters for this executable (`deny-overrides-allow`, since
+        // `WFP_WEIGHT_PERMIT_PACKAGE` = 12 > `WFP_WEIGHT_BLOCK_APP` = 11).
+        if canon_ip.is_none() {
+            let exe_k = Self::exe_key(exe_path);
+            let conflicting_scoped: Vec<(super::types::ScopedWfpTargetKey, u64)> = self
+                .scoped_installed
+                .iter()
+                .filter(|(k, e)| k.0 == exe_k && e.allow)
+                .map(|(k, e)| (k.clone(), e.handle))
+                .collect();
+            for (skey, shandle) in conflicting_scoped {
+                match defense.remove_wfp_rule(shandle) {
+                    Ok(()) => {
+                        self.scoped_installed.remove(&skey);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            exe_path = %exe_path,
+                            package_sid = %skey.1,
+                            wfp_handle = shandle,
+                            error = %err,
+                            "failed removing conflicting scoped WFP Permit while enforcing app-wide NetworkBlock"
+                        );
+                    }
+                }
+            }
+        }
         Ok(handle)
     }
 
@@ -362,7 +390,9 @@ impl WfpRuleManager {
         if sid_trimmed.is_empty() {
             return Err("refusing scoped WFP permit with empty package_sid".to_string());
         }
-        if self.active_app_block(trimmed).is_some()
+        if self
+            .active_app_block(trimmed)
+            .is_some_and(|(_, origin)| origin == WfpFilterOrigin::PersistedPolicy)
             || self.active_scoped_app_block(trimmed, sid_trimmed).is_some()
         {
             return Err(format!(

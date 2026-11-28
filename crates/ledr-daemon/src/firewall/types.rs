@@ -106,6 +106,14 @@ pub struct PromotedFilterSnapshot {
     pub prev_deferred_preemptive_removal: bool,
 }
 
+/// Snapshot of a package-scoped filter origin promoted or updated during reconciliation so SQLite
+/// rollback restores its pre-reconcile [`WfpFilterOrigin`] faithfully (`BUG_0003`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotedScopedFilterSnapshot {
+    pub key: ScopedWfpTargetKey,
+    pub prev_origin: WfpFilterOrigin,
+}
+
 /// Snapshot of a [`WfpFilterOrigin::DomainPolicy`] filter removed during reconciliation so
 /// SQLite rollback can re-install it in BFE (since `reconcile_persisted_rules` only rebuilds
 /// static [`WfpFilterOrigin::PersistedPolicy`] filters).
@@ -130,6 +138,9 @@ pub struct WfpReconcileDnsContext {
     /// Normalized `(exe_key, canonical_ip, domain_hint)` tuples known to be superseded in
     /// `ProcessDnsHistory` for currently installed `DomainPolicy` Permits.
     pub superseded_permit_hints: HashSet<(String, IpAddr, String)>,
+    /// Normalized `(exe_key, canonical_ip, domain_hint)` tuples known to be superseded in
+    /// `ProcessDnsHistory` for currently installed scoped `DomainPolicy` Blocks (`BUG_0001`).
+    pub superseded_block_hints: HashSet<(String, IpAddr, String)>,
     /// Fail-closed flag indicating `ActiveProcessTable::evicted_live_overflow_any` is active so
     /// deferred `Preemptive` block removals cannot fire while unenumerated live processes exist.
     pub live_exe_overflow_any: bool,
@@ -147,6 +158,7 @@ pub struct WfpReconcileReport {
     pub failed: usize,
     pub failed_ops: Vec<WfpFailedOp>,
     pub promoted_backups: Vec<PromotedFilterSnapshot>,
+    pub promoted_scoped_backups: Vec<PromotedScopedFilterSnapshot>,
     pub removed_domain_filters: Vec<RemovedDomainFilterSnapshot>,
     pub removed_app_blocks: Vec<RemovedAppBlockSnapshot>,
 }

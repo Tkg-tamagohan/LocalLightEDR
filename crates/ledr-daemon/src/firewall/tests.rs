@@ -2374,3 +2374,235 @@ fn firewall_fu_p4_03_b2_scoped_domain_block_survives_unrelated_reconcile_and_rem
         Some(sid_a)
     );
 }
+
+#[test]
+fn firewall_fu_p4_03_b2_r1_bug_0001_0002_0003_scoped_domain_dns_delete_fail_and_promote_rollback() {
+    let mut fw = WfpRuleManager::new();
+    let defense = StubDefense::new();
+    let sha = "a".repeat(64);
+    let signer = "CN=Microsoft Windows";
+    let root_tp = "ab".repeat(20);
+    let inspector = StubInspector(sha.clone());
+    let bth = r"C:\Windows\System32\backgroundTaskHost.exe";
+    let sid_a = "S-1-15-2-100-200-300";
+    let pfn_a = "Contoso.PkgA_8wekyb3d8bbwe";
+    let old_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+    let new_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11));
+
+    // BUG_0001: DNS migration of blocked.example (old_ip -> new_ip) invalidates stale scoped block
+    // on old_ip while preserving another active domain block on the same (sid, ip).
+    let h_old = fw
+        .ensure_scoped_domain_policy_block(
+            bth,
+            sid_a,
+            Some(pfn_a),
+            old_ip,
+            &["blocked.example"],
+            &defense,
+        )
+        .expect("install scoped domain block");
+    let removed_cnt = fw.invalidate_stale_scoped_domain_blocks_for_query(
+        bth,
+        "blocked.example",
+        &[new_ip],
+        &HashSet::new(),
+        &HashMap::new(),
+        &HashSet::new(),
+        &defense,
+    );
+    assert_eq!(removed_cnt, 1);
+    assert!(!fw.has_active_scoped_filter(bth, sid_a, Some(old_ip), false));
+    assert!(defense.removed.lock().unwrap().contains(&h_old));
+
+    // Also via reconcile_persisted_rules_with_scoped superseded_block_hints (`BUG_0001`):
+    let scoped_dom_block = ScopedPolicyRuleRecord {
+        rule_id: "SC-DOM-BLOCK-MIGRATE".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: bth.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("blocked.example".to_string()),
+        package_family_name: Some(pfn_a.to_string()),
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_000,
+        created_by: "test".to_string(),
+    };
+    let h_old2 = fw
+        .ensure_scoped_domain_policy_block(
+            bth,
+            sid_a,
+            Some(pfn_a),
+            old_ip,
+            &["blocked.example"],
+            &defense,
+        )
+        .expect("reinstall scoped block");
+    let mut dns_ctx = WfpReconcileDnsContext::default();
+    dns_ctx.superseded_block_hints.insert((
+        WfpRuleManager::exe_key(bth),
+        old_ip,
+        "blocked.example".to_string(),
+    ));
+    let rep_sup = fw.reconcile_persisted_rules_with_scoped(
+        &[],
+        None,
+        std::slice::from_ref(&scoped_dom_block),
+        None,
+        &[],
+        &dns_ctx,
+        &inspector,
+        &defense,
+    );
+    assert_eq!(rep_sup.failed, 0);
+    assert!(!fw.has_active_scoped_filter(bth, sid_a, Some(old_ip), false));
+    assert!(defense.removed.lock().unwrap().contains(&h_old2));
+
+    // BUG_0002: Removing a pure domain-scoped NetworkBlock when BFE remove fails preserves
+    // `domain_hints` and `source_rule_ids` so `failure_summary_for_scoped_rules` reports failure.
+    let _h_blk = fw
+        .ensure_scoped_domain_policy_block(
+            bth,
+            sid_a,
+            Some(pfn_a),
+            old_ip,
+            &["blocked.example"],
+            &defense,
+        )
+        .expect("install block for delete failure");
+    defense.set_fail_removes(true);
+    let rep_del_fail = fw.reconcile_persisted_rules_with_scoped(
+        &[],
+        None,
+        &[],
+        Some(std::slice::from_ref(&scoped_dom_block)),
+        &[],
+        &WfpReconcileDnsContext::default(),
+        &inspector,
+        &defense,
+    );
+    defense.set_fail_removes(false);
+    assert_eq!(rep_del_fail.failed, 1);
+    assert_eq!(
+        rep_del_fail.failed_ops[0].domain_hints,
+        vec!["blocked.example".to_string()]
+    );
+    assert!(
+        rep_del_fail
+            .failure_summary_for_scoped_rules(&[&scoped_dom_block])
+            .is_some(),
+        "BUG_0002: failed removal of pure domain-scoped block must match rule"
+    );
+    // Clean up failed block filter.
+    let _ = fw.reconcile_persisted_rules_with_scoped(
+        &[],
+        None,
+        &[],
+        Some(std::slice::from_ref(&scoped_dom_block)),
+        &[],
+        &WfpReconcileDnsContext::default(),
+        &inspector,
+        &defense,
+    );
+
+    // BUG_0003: Multi-exe partial failure rollback preserves promoted scoped DomainPolicy Permit.
+    struct SignedInspector {
+        sha: String,
+        signer: String,
+        root_tp: String,
+    }
+    impl BinaryInspector for SignedInspector {
+        fn inspect(&self, exe_path: &str) -> BinaryIdentity {
+            BinaryIdentity {
+                exe_path: exe_path.to_string(),
+                sha256: Some(self.sha.clone()),
+                authenticode: Some(ledr_proto::AuthenticodeInfo {
+                    signer_subject: self.signer.clone(),
+                    root_thumbprint: self.root_tp.clone(),
+                }),
+            }
+        }
+    }
+    let signed_inspector = SignedInspector {
+        sha,
+        signer: signer.to_string(),
+        root_tp: root_tp.clone(),
+    };
+    let app_a = r"C:\Tools\MultiPkg\a.exe";
+    let app_b_fail = r"C:\Tools\MultiPkg\fail_b.exe";
+    defense.add_fail_exe("fail_b.exe");
+    let dom_allow_a = ScopedPolicyRuleRecord {
+        rule_id: "SC-MULTI-DOM-A".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: app_a.to_string(),
+        sha256: None,
+        signer_subject: Some(signer.to_string()),
+        root_thumbprint: Some(root_tp.clone()),
+        allowed_target: Some("api.contoso.com".to_string()),
+        package_family_name: Some(pfn_a.to_string()),
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_010,
+        created_by: "test".to_string(),
+    };
+    let existing_a_permit = dom_allow_a.clone();
+    let h_dom_a = fw
+        .ensure_scoped_ip_permit(
+            app_a,
+            sid_a,
+            Some(pfn_a),
+            new_ip,
+            &["api.contoso.com"],
+            &[] as &[&str],
+            &defense,
+        )
+        .expect("install existing domain permit on app_a")
+        .expect("handle present");
+
+    let wildcard_ip_permit = ScopedPolicyRuleRecord {
+        rule_id: "SC-MULTI-WILD-IP".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: r"C:\Tools\MultiPkg\*.exe".to_string(),
+        sha256: None,
+        signer_subject: Some(signer.to_string()),
+        root_thumbprint: Some(root_tp),
+        allowed_target: Some(new_ip.to_string()),
+        package_family_name: Some(pfn_a.to_string()),
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_020,
+        created_by: "test".to_string(),
+    };
+    let rep_partial = fw.reconcile_persisted_rules_with_scoped(
+        &[],
+        None,
+        &[existing_a_permit.clone(), wildcard_ip_permit],
+        Some(std::slice::from_ref(&existing_a_permit)),
+        &[app_a.to_string(), app_b_fail.to_string()],
+        &WfpReconcileDnsContext::default(),
+        &signed_inspector,
+        &defense,
+    );
+    assert_eq!(rep_partial.failed, 1);
+    assert_eq!(rep_partial.promoted_scoped_backups.len(), 1);
+    // Simulate compensation rollback: restore promoted scoped backups BEFORE re-reconciling
+    // with the rolled-back rule list (`[existing_a_permit]`).
+    fw.restore_promoted_scoped_filter_states(&rep_partial.promoted_scoped_backups);
+    let rep_comp = fw.reconcile_persisted_rules_with_scoped(
+        &[],
+        None,
+        std::slice::from_ref(&existing_a_permit),
+        None,
+        &[app_a.to_string()],
+        &WfpReconcileDnsContext::default(),
+        &signed_inspector,
+        &defense,
+    );
+    assert_eq!(rep_comp.failed, 0);
+    assert!(
+        fw.has_active_scoped_filter(app_a, sid_a, Some(new_ip), true),
+        "BUG_0003: existing DomainPolicy Permit on app_a must survive partial rollback"
+    );
+    assert!(!defense.removed.lock().unwrap().contains(&h_dom_a));
+}

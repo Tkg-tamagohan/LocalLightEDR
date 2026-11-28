@@ -146,8 +146,9 @@ impl DaemonEngine {
                 .active_exe_liveness_snapshot();
             let mut dns_ctx = {
                 let blocks = fw.all_domain_policy_blocks();
+                let scoped_blocks = fw.all_scoped_domain_policy_blocks_with_hints();
                 let permits = fw.all_domain_policy_permits_with_hints();
-                if blocks.is_empty() && permits.is_empty() {
+                if blocks.is_empty() && scoped_blocks.is_empty() && permits.is_empty() {
                     WfpReconcileDnsContext::default()
                 } else {
                     let dns_hist = self
@@ -159,6 +160,29 @@ impl DaemonEngine {
                         let doms = dns_hist.domains_for_exe_ip(&exe_k, ip);
                         if !doms.is_empty() {
                             ctx.active_block_domains.insert((exe_k, ip), doms);
+                        }
+                    }
+                    for (exe_k, ip, hints) in scoped_blocks {
+                        let doms = dns_hist.domains_for_exe_ip(&exe_k, ip);
+                        if !doms.is_empty() {
+                            let entry = ctx
+                                .active_block_domains
+                                .entry((exe_k.clone(), ip))
+                                .or_default();
+                            for dom in doms {
+                                if !entry.contains(&dom) {
+                                    entry.push(dom);
+                                }
+                            }
+                        }
+                        for hint in hints {
+                            let norm = hint.trim().trim_end_matches('.').to_ascii_lowercase();
+                            if !norm.is_empty()
+                                && dns_hist.is_domain_ip_superseded(&exe_k, &norm, ip)
+                            {
+                                ctx.superseded_block_hints
+                                    .insert((exe_k.clone(), ip, norm));
+                            }
                         }
                     }
                     for (exe_k, ip, hints) in permits {
@@ -271,9 +295,14 @@ impl DaemonEngine {
     }
 
     pub(super) fn compensate_failed_wfp_report(&self, report: &WfpReconcileReport) {
-        if !report.promoted_backups.is_empty() {
+        if !report.promoted_backups.is_empty() || !report.promoted_scoped_backups.is_empty() {
             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-            fw.restore_promoted_filter_states(&report.promoted_backups);
+            if !report.promoted_backups.is_empty() {
+                fw.restore_promoted_filter_states(&report.promoted_backups);
+            }
+            if !report.promoted_scoped_backups.is_empty() {
+                fw.restore_promoted_scoped_filter_states(&report.promoted_scoped_backups);
+            }
         }
         let _ = self.deploy_persisted_network_rules();
         if !report.removed_domain_filters.is_empty() || !report.removed_app_blocks.is_empty() {

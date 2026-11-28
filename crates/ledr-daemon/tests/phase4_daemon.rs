@@ -5712,28 +5712,38 @@ async fn daemon_fu_p4_03_03_ambiguous_wfp_drop_disambiguates_package_by_sid_with
     }));
 
     let deadline = Instant::now() + Duration::from_secs(2);
-    while store.list_alerts(None, 10).expect("list").len() < 2 {
+    while store.list_alerts(None, 10).expect("list").len() < 3 {
         assert!(Instant::now() < deadline, "timed out waiting for ambiguous drop alerts");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     engine.shutdown_and_flush().await.expect("shutdown");
 
     let alerts = store.list_alerts(None, 10).expect("list alerts");
-    let matched_alert = alerts
+    let shared_alerts: Vec<serde_json::Value> = alerts
         .iter()
-        .find(|a| {
-            serde_json::from_str::<serde_json::Value>(&a.context_json)
-                .ok()
-                .and_then(|v| v.get("dst_ip").and_then(|d| d.as_str()).map(str::to_owned))
-                .as_deref()
-                == Some("198.51.100.44")
-        })
-        .expect("alert for shared_dst");
-    let matched_ctx: serde_json::Value =
-        serde_json::from_str(&matched_alert.context_json).expect("matched ctx");
-    assert_eq!(matched_ctx["attribution"], "app_level_ambiguous");
-    assert_eq!(matched_ctx["package_family_name"], "PkgA_111");
-    assert_eq!(matched_ctx["package_sid"], "S-1-15-2-111");
+        .filter_map(|a| serde_json::from_str::<serde_json::Value>(&a.context_json).ok())
+        .filter(|ctx| ctx.get("dst_ip").and_then(|d| d.as_str()) == Some("198.51.100.44"))
+        .collect();
+    assert_eq!(
+        shared_alerts.len(),
+        2,
+        "distinct package_sid drops on shared IP must emit two alerts, got {shared_alerts:?}"
+    );
+    let alert_a = shared_alerts
+        .iter()
+        .find(|ctx| ctx.get("package_sid").and_then(|s| s.as_str()) == Some("S-1-15-2-111"))
+        .expect("alert for PkgA_111");
+    assert_eq!(alert_a["attribution"], "app_level_ambiguous");
+    assert_eq!(alert_a["package_family_name"], "PkgA_111");
+    assert_eq!(alert_a["package_sid"], "S-1-15-2-111");
+
+    let alert_b = shared_alerts
+        .iter()
+        .find(|ctx| ctx.get("package_sid").and_then(|s| s.as_str()) == Some("S-1-15-2-222"))
+        .expect("alert for PkgB_222");
+    assert_eq!(alert_b["attribution"], "app_level_ambiguous");
+    assert_eq!(alert_b["package_family_name"], "PkgB_222");
+    assert_eq!(alert_b["package_sid"], "S-1-15-2-222");
 
     let unguessed_alert = alerts
         .iter()

@@ -114,6 +114,7 @@ pub(crate) fn sid_ptr_to_string(sid: *const c_void) -> Result<String, u32> {
         let code = std::io::Error::last_os_error()
             .raw_os_error()
             .and_then(|c| u32::try_from(c).ok())
+            .filter(|&c| c != 0)
             .unwrap_or(1);
         return Err(code);
     }
@@ -215,7 +216,9 @@ pub(crate) fn query_token_app_container_sid(
     }
     .map_err(|err| map_windows_error_to_pkg_err(&err))?;
 
-    if buf.len() < std::mem::size_of::<TOKEN_APPCONTAINER_INFORMATION>() {
+    if (needed as usize) < std::mem::size_of::<TOKEN_APPCONTAINER_INFORMATION>()
+        || (needed as usize) > buf.len()
+    {
         return Err(PackageAttrQueryError::InvalidData);
     }
     // SAFETY: `buf` is at least `size_of::<TOKEN_APPCONTAINER_INFORMATION>()` bytes; `read_unaligned` avoids alignment UB.

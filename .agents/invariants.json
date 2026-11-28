@@ -232,6 +232,39 @@
         "true_description": "The Git diff in crates/ledr-bridge-nm/src/setup.rs permits manifest deletion (Ok(false)) in any_browser_references_manifest_with without checking both 32-bit and 64-bit HKLM views across all browsers (such as skipping the 64-bit view on stops_wow64_fallback() like EmptyString or non-matching Present), drops 32,768 UTF-16 unit expanded resolved_path protection, allows manifest deletion instead of early-returning Ok(true) fail-closed on UnresolvableExpandSz or resolved_path=None, or omits normalized comparison across all 32-bit and 64-bit registered paths when computing per-browser manifest_removed.",
         "false_description": "The Git diff preserves checking both 32-bit and 64-bit HKLM views across all browsers before permitting manifest deletion (Ok(false)) in any_browser_references_manifest_with (without skipping the 64-bit view on stops_wow64_fallback() like EmptyString or non-matching Present, while preserving early return Ok(true) on a manifest match or fail-closed entry), 32,768 UTF-16 unit expanded resolved_path protection, fail-closed Ok(true) non-deletion on UnresolvableExpandSz and resolved_path=None, and normalized multi-view path matching for per-browser manifest_removed (keeping HKCU default-view only), or is unrelated to manifest removal reference checks, unregister multi-view path tracking, or their shared helpers."
       }
+    },
+    "windowsapps_wildcard_segment_scope": {
+      "heading": "WindowsApps Version Wildcard Segment-Scoped Matching",
+      "description": "crates/ledr-rules/src/allowlist/matcher.rs の matches_path_pattern において、非 UNC \\\\?\\ 正規化と is_windows_apps_version_wildcard_pattern 一致時限定の * の \\ 跨ぎ禁止を維持し、WindowsApps 始まりパターン全般への一律制限拡大で View 3 手動汎用パターン互換性を破壊しない。",
+      "source_file": ".agents/rules/daemon-wfp-process-invariants.md",
+      "path_globs": [
+        "crates/ledr-rules/src/allowlist/matcher.rs"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff in crates/ledr-rules/src/allowlist/matcher.rs weaken matches_path_pattern by omitting non-UNC \\\\?\\ normalization or allowing * to cross \\ when is_windows_apps_version_wildcard_pattern holds, or conversely broaden the single-segment * restriction to all patterns starting with c:\\program files\\windowsapps\\ and break View 3 manual wildcard patterns (such as C:\\Program Files\\WindowsApps\\*\\App.exe)? Answer Yes only if the diff weakens non-UNC \\\\?\\ stripping or single-segment * confinement on is_windows_apps_version_wildcard_pattern matches, or applies single-segment * confinement broadly to all WindowsApps-prefixed patterns instead of restricting it to is_windows_apps_version_wildcard_pattern. Answer No if matches_path_pattern preserves non-UNC \\\\?\\ normalization and restricts single-segment * matching strictly to is_windows_apps_version_wildcard_pattern patterns (preserving View 3 manual WindowsApps wildcard compatibility), or is unrelated to matches_path_pattern.",
+      "criteria": {
+        "true_description": "The Git diff weakens matches_path_pattern non-UNC \\\\?\\ normalization or single-segment * confinement for is_windows_apps_version_wildcard_pattern patterns, or over-broadens single-segment * confinement to all WindowsApps-prefixed patterns and breaks View 3 manual wildcard compatibility.",
+        "false_description": "The Git diff preserves matches_path_pattern non-UNC \\\\?\\ normalization and scopes single-segment * confinement strictly to is_windows_apps_version_wildcard_pattern patterns while keeping View 3 manual WindowsApps wildcard compatibility intact, or is unrelated to matches_path_pattern."
+      }
+    },
+    "preemptive_deferred_removal_and_lock_order": {
+      "heading": "Preemptive Block Pending-Removal Clear, Deferred Removal Preservation, and Lock Order",
+      "description": "wfp_premat.rs の既存フィルタ早期リターン前の clear_pending_preemptive_removal 呼び出し、policy.rs の deploy_persisted_network_rules_with_baseline における firewall -> process_table 順での active_exe_liveness_snapshot() 取得と即時解放（process_table 先行ロックによる ProcessStop TOCTOU 禁止）、および reconcile.rs の生存プロセスとオーバーフロー時フェイルクローズ（live_exe_overflow_any / overflow_live_exe_keys）該当時の deferred_preemptive_removals 由来フィルタ撤去抑止（稼働確認時にフィルタを残して古いフラグのみを消す処理は除外）を維持する。",
+      "source_file": ".agents/rules/daemon-wfp-process-invariants.md",
+      "path_globs": [
+        "crates/ledr-daemon/src/engine/wfp_premat.rs",
+        "crates/ledr-daemon/src/engine/policy.rs",
+        "crates/ledr-daemon/src/firewall/reconcile.rs",
+        "crates/ledr-daemon/src/process_table.rs"
+      ],
+      "threshold": 0.65,
+      "warn_threshold": 0.40,
+      "instructions": "Does the Git diff weaken preemptive WFP block lifecycle or lock-ordering invariants by: (1) omitting clear_pending_preemptive_removal before an early return when an existing filter is already active in wfp_premat.rs (maybe_apply_preemptive_wfp_block_with_motw); (2) violating the firewall -> process_table lock order in policy.rs deploy_persisted_network_rules_with_baseline (including acquiring process_table before firewall or failing to immediately release process_table after active_exe_liveness_snapshot(), which introduces a ProcessStop TOCTOU on deferred_preemptive_removals); or (3) allowing reconcile.rs (reconcile_persisted_rules_with_baseline) to remove a preemptive WFP block filter because of deferred_preemptive_removals when the executable has live processes or fail-closed overflow holds (live_exe_overflow_any or overflow_live_exe_keys)? Answer Yes only if clear_pending_preemptive_removal before existing-filter early return is omitted, deploy_persisted_network_rules_with_baseline breaks firewall -> process_table lock ordering or retains process_table after active_exe_liveness_snapshot(), or reconcile_persisted_rules_with_baseline removes the preemptive block filter via deferred_preemptive_removals despite live processes, live_exe_overflow_any, or overflow_live_exe_keys. Answer No if clearing only the stale deferred_preemptive_removals flag upon live-process confirmation while keeping the block filter intact is preserved, and if clear_pending_preemptive_removal before early return, firewall -> process_table ordering with immediate release after active_exe_liveness_snapshot() in deploy_persisted_network_rules_with_baseline, and live/overflow (live_exe_overflow_any / overflow_live_exe_keys) suppression of deferred-removal filter deletion remain enforced, or the diff is unrelated.",
+      "criteria": {
+        "true_description": "The Git diff omits clear_pending_preemptive_removal before an existing-filter early return, breaks firewall -> process_table lock ordering or delays releasing process_table around active_exe_liveness_snapshot() in deploy_persisted_network_rules_with_baseline, or removes the preemptive block filter via deferred_preemptive_removals despite live executables or fail-closed overflow states (live_exe_overflow_any / overflow_live_exe_keys).",
+        "false_description": "The Git diff preserves clear_pending_preemptive_removal before existing-filter early returns, enforces firewall -> process_table lock order with immediate release after active_exe_liveness_snapshot() in deploy_persisted_network_rules_with_baseline, and suppresses deferred_preemptive_removals-driven block filter removal whenever live processes or fail-closed overflow states (live_exe_overflow_any / overflow_live_exe_keys) apply (allowing only stale deferred_preemptive_removals flag cleanup when an active executable keeps its block filter), or is unrelated."
+      }
     }
   }
 }

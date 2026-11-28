@@ -27,3 +27,10 @@ apps/ledr-ui/src-tauri/gen/
 .DS_Store
 Thumbs.db
 *.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Chrome MV3 local load cache
+extensions/ledr-chrome-mv3/_metadata/

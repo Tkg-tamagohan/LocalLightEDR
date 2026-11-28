@@ -1,8 +1,8 @@
 # Review Guidelines
 
 本ファイルは Devin Review 向けの PR レビュー指針です。
-アーキテクチャ規約と Phase 別の不変条件は `AGENTS.md` に集約済みのため重複記載しません。
-`AGENTS.md` とあわせて参照し、バグ、セキュリティ欠陥、並行処理の不整合、後方互換破壊に焦点を絞ってください。
+共通のアーキテクチャ規約と標準検証コマンドは `AGENTS.md` に集約し、Phase 別およびサブシステム別の不変条件は `AGENTS.md` で案内する `.agents/rules/`（`daemon-wfp-process-invariants.md`、`active-defense-guards.md`、`browser-ui-invariants.md`）へ分離済みのため重複記載しません。
+`AGENTS.md` および変更対象に対応する `.agents/rules/*.md` とあわせて参照し、バグ、セキュリティ欠陥、並行処理の不整合、後方互換破壊に焦点を絞ってください。
 
 ## レビュー言語
 

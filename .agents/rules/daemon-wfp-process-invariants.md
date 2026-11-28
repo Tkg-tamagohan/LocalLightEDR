@@ -1,6 +1,6 @@
 ---
 trigger: model_decision
-description: LocalEDR のデーモン起動および停止順序、TwoLaneSender 有界チャネル、PID 解決、ActiveProcessTable、事前 WFP ブロック、ポリシーロールバック、定期保守、NRD 更新スレッド非ブロッキング停止とキャンセル、補助 SystemTrace ETW セッション、または統合および並行ロック競合回帰テストを設計、実装、レビューするとき
+description: LocalEDR のデーモン起動および停止順序、TwoLaneSender 有界チャネル、PID 解決、ActiveProcessTable、事前 WFP ブロック、ポリシーロールバック、定期保守、有界チャネル付きワーカーの停止（NRD 更新スレッドの非ブロッキング停止とキャンセルを含む）、補助 SystemTrace ETW セッション、または統合および並行ロック競合回帰テストを設計、実装、レビューするとき
 ---
 
 # デーモン基盤、プロセス追跡、および NRD 停止の不変条件

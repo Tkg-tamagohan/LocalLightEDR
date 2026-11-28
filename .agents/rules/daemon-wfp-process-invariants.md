@@ -1,13 +1,23 @@
 ---
 trigger: model_decision
-description: LocalEDR の ActiveProcessTable、事前 WFP ブロック、ポリシーロールバック、イベントループ定期スイープと低頻度定期保守、有界チャネル付きワーカーの停止、補助 SystemTrace ETW セッション、または並行ロック競合回帰テストを設計、実装、レビューするとき
+description: LocalEDR のデーモン起動および停止順序、TwoLaneSender 有界チャネル、PID 解決、ActiveProcessTable、事前 WFP ブロック、ポリシーロールバック、定期保守、有界チャネル付きワーカーの停止（NRD 更新スレッドの非ブロッキング停止とキャンセルを含む）、補助 SystemTrace ETW セッション、または統合および並行ロック競合回帰テストを設計、実装、レビューするとき
 ---
 
-# デーモン境界とプロセス追跡の不変条件（FU-E2E-03 および FU-E2E-04 以降）
+# デーモン基盤、プロセス追跡、および NRD 停止の不変条件
 
-`ledr-daemon` および関連クレート（`ledr-sensor-win`、`ledr-store`、`ledr-auth-helper` 等）の実機 E2E 是正（`FU-E2E-03`、`FU-E2E-04` 等）で確立した構造不変条件を定める。
+`ledr-daemon` および関連クレート（`ledr-sensor-win`、`ledr-store`、`ledr-rules`、`ledr-auth-helper` 等）の Phase 1〜3 および実機 E2E 是正（`FU-E2E-03`、`FU-E2E-04`、`FU-E2E-05` 等）で確立した構造不変条件を定める。
 
 ## 不変条件
+
+- センサーから `DaemonEngine` への供給は `TwoLaneSender`（`HIGH_PRIORITY_CHANNEL_CAPACITY = 1024` / `TELEMETRY_CHANNEL_CAPACITY = 8192`）直結とし、前段へ無制限チャネルを挟まない。
+- デーモン起動順序は「`prior_running_candidates` の事前取得、ETW 開始、`try_capture_running_processes`（取得失敗と空を `Result` で区別）、親やコマンドライン補完時の `should_evaluate_sigma` 再評価付き統合、`reconcile_stale_running_processes` の実行」の順を崩さない。
+- PID 解決は時間窓と `create_time_100ns` 降順タイブレーク（`idx_processes_pid_created`）を維持し、先着新プロセスより古いスナップショットには `exited_at_ms` を推定記録し、`upsert_process_row` の既設定終了時刻維持を守る。
+- 停止処理は通常終了時に `ControlTraceW` 後の残余 ETW バッファを回収してからドレインし、`purge_expired` はバッチ間で書き込みロックを解放して停止要求時に 3 秒予算内チェックポイントへ譲る。
+- ホットパスのテレメトリ解決では `emitted_rule_ids` 等を含むエントリ全体を `.clone()` せず必要フィールドだけを抽出する。
+- NRD 更新スレッドの停止は `spawn_blocking` を使わず `NrdThreadHandle`（`oneshot` と `InFlightGuard::drop`）で非ブロッキング待機し、ワーカー未チェックポイント時は待機前に `checkpoint_truncate` を優先実行し、予算超過時はデタッチして Tokio `Runtime::drop` のハングを防ぐ。
+  ファイル形式 NRD は `read_bounded_reader_cancellable`（`NRD_FILE_READ_CHUNK_BYTES = 64 * 1024`）で各チャンク前後および `ErrorKind::Interrupted` 再試行前にキャンセルを確認し、`NrdCancelToken::enter_blocking_read()` によりブロッキング読み取り突入を壁時計スリープなしで観測可能に保つ。
+  応答しない実 UNC/SMB 共有での NRD 挙動は合成テストでは検証済みと扱わず、Windows 10/11 クライアント SKU の実機 E2E 対象として残す。
+- 統合テストでは優先度レーン分離をまたぐ異レーン完了バリアおよび終了済み込み `active_process_table_len()` による同期を禁止し、`GateBinaryInspector` のようなマルチスレッド Tokio 上の同期ブロッキングモックには `RuntimeFlavor::MultiThread` ガード付き `block_in_place` を使う。
 
 - 補助 `SystemTrace` セッション（`{session_name}-SysProc`）は主 ETW セッションのプロバイダ有効化より先に起動を試行し（失敗時は PEB 検査へフォールバックして主セッション起動を続行する）、起動成功後に主セッション起動の任意ステップが失敗したときは RAII ガード（`AuxStartupGuard`）で停止とコンシューマスレッド join をロールバックする。
 - `ProcessStart` 以外の登録経路（おとり先行バックフィル等）から `ActiveProcessTable` へ登録する場合も起動時防御（`apply_process_launch_guards`）を即時適用し、呼び出し側の起動時防御と MOTW の適用省略判定は `skip_store_ingest` ではなく `skip_launch_guards`（`launch_guards_applied && !upgraded_exe` が真なら省略）で行う。

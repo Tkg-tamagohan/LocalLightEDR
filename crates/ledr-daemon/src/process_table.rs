@@ -971,6 +971,20 @@ impl ActiveProcessTable {
         out
     }
 
+    /// Returns `(active_exe_paths, evicted_live_overflow_any, overflowed_evicted_live_exes)`
+    /// atomically under the caller's single lock acquisition so reconciliation can fail closed
+    /// against deferred preemptive block removal whenever capacity overflow hid live keys.
+    pub fn active_exe_liveness_snapshot(&self) -> (Vec<String>, bool, HashSet<String>) {
+        (
+            self.active_exe_paths(),
+            self.evicted_live_overflow_any,
+            self.overflowed_evicted_live_exes
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+    }
+
     /// Zero-allocation check returning `true` if any currently unexited process matches
     /// `target_exe_key` (as normalized by `WfpRuleManager::exe_key`), including live processes
     /// displaced from `entries` under capacity pressure (`PRRT_kwDOVyjVyM66ksZW`).

@@ -604,19 +604,19 @@ Run `#45753387980` の `release-dist` 6 点は `LocalEDR-Setup-v0.1.0-win-x64.ex
 - **29 バイトプレフィックス強制と `AppExecutionAlias` 除外**：入力パスは正規化後に先頭 29 バイトが `C:\Program Files\WindowsApps\`（ASCII 大文字小文字無視、システムドライブ `C:` 固定）へ一致する場合のみ対象とする。
   これにより `%LOCALAPPDATA%\Microsoft\WindowsApps\` 配下の 0 バイト `AppExecutionAlias` リパースポイントスタブや、非特権ユーザーが作成し得る非システムドライブおよび `subst` ドライブを除外する。
 - **厳密な 7 ステップ変換仕様（Rust と JS の共通規則）**：前後の ASCII 空白除去と ASCII 制御文字（`0x00..=0x1F` と `0x7F`）拒否（ステップ 1）、`/` から `\` への置換および `\\?\UNC\`、UNC（`\\`）、`\\.\`、`\??\` を拒否した上での非 UNC `\\?\` 先頭 4 バイト除去（ステップ 2）、先頭 29 バイト一致確認（ステップ 3）、30 バイト目以降（`[29..]`）での `*`、`?`、`:`、末尾 `\`、空セグメント、`.`、`..` の拒否（ステップ 4）、`<PackageFullName>` と `<RelPath>` への分割および最終セグメントの 5 バイト以上かつ `.exe` 終端検証（ステップ 5）、`<PackageFullName>` の `_` 5 分割検証（`<Name>` が `1..=50` 文字 `[A-Za-z0-9.-]`、`<Version>` が `.` 4 要素の `0..=65535` ASCII 数字かつ `+` および先頭ゼロ不可、`<Arch>` が `x86`、`x64`、`arm`、`arm64`、`neutral` のいずれか、`<ResourceId>` が `0..=30` 文字 `[A-Za-z0-9.-]`、`<PublisherId>` が厳密 13 文字の Crockford Base32 `[0-9a-hjkmnp-tv-z]`）（ステップ 6）、ならびに固定プレフィックスと `<Version>` のみを `*` へ置換して残りの文字ケースを保持したパターン生成（ステップ 7）を実行する。
-- **セグメント内 `*` 閉じ込め**：`matches_path_pattern` は非 UNC `\\?\` を除去した上で、正規化後パターンが `c:\program files\windowsapps\` で始まる場合に限り `*` がパス区切り `\` を跨がない（`s[si] != '\\'`）制限を適用し、同一署名者の別パッケージ配下にある偽装サブパスとの誤一致を防止する。
-  既存の `"*\Google\Chrome\User Data\*"` 等の互換性は変更せず維持する。
+- **セグメント内 `*` 閉じ込め**：`matches_path_pattern` は非 UNC `\\?\` を除去した上で、正規化後パターンが `WindowsApps` バージョンワイルドカード形式（`c:\program files\windowsapps\<Name>_*_<Arch>_<ResourceId>_<PublisherId>\<RelPath>`）に一致する場合に限り `*` がパス区切り `\` を跨がない（`s[si] != '\\'`）制限を適用し、同一署名者の別パッケージ配下にある偽装サブパスとの誤一致を防止する。
+  View 3 で手動登録された汎用パターン（`C:\Program Files\WindowsApps\*\App.exe` 等）や既存の `"*\Google\Chrome\User Data\*"` 等の互換性は変更せず維持する。
 - **`L-04` 署名必須とフェイルクローズ**：View 1 の「Wildcard Store app version」チェックボックスは既定 OFF とし、`AllowPermanentPathMode::WindowsAppsVersionWildcard` 指定時は `use_signer_if_available == true`、非空 `signer_subject`、非空かつ非オールゼロ `root_thumbprint`（`L-04`）、および有効パターン生成をすべて必須とする。
-  いずれか 1 つでも欠ける場合、またはプロセス紐付きのない `LAYER_4_BROWSER` や `AllowPermanent` 以外の決定が指定された場合は SHA-256 ルールへフォールバックせずエラーで拒否する（`NetworkAllow` と `FileCanaryAllow` の双方および宛先限定に対応し、保存する `AllowlistRuleRecord` の `sha256` は `None` とする）。
+  いずれか 1 つでも欠ける場合、またはプロセス紐付きのない `LAYER_4_BROWSER` や `AllowPermanent` 以外の決定が指定された場合は SHA-256 ルールへフォールバックせずエラーで拒否する（`LAYER_3_NETWORK` のアプリ単位 WFP アラートでは `process_instance_id` 未特定でも `exe_path` と検証済み署名が揃えば許可を作成でき、`NetworkAllow` と `FileCanaryAllow` の双方および宛先限定に対応して `AllowlistRuleRecord` の `sha256` は `None` とする）。
 - **後方互換 IPC と WFP 解放**：既存の `AlertDecision` と `IpcRequest::ResolveAlert` は無変更のまま維持し、`Exact` 時は `ResolveAlert`、ワイルドカード選択時のみ `CallerAuthPolicy::UiOnly` の `ResolveAlertWithOptions` を送信する。
-  `TransientContainment` は既存の解決経路で確実に解放し、終了済みプロセスの非起動ピン留め `Preemptive` ブロックは不要な `PersistedPolicy` Permit チャーンを起こさずに解放する。
+  `TransientContainment` は既存の解決経路で確実に解放し、終了済みプロセスの非起動ピン留め `Preemptive` ブロックは不要な `PersistedPolicy` Permit チャーンを起こさずに解放する（再起動済みの生存プロセスやオーバーフロー状態がある場合は `Preemptive` ブロックの削除を抑止する）。
 
 ### 実機未検証境界（Windows 10 または Windows 11 クライアント SKU 確認対象）
 
 合成単体テストおよび UI モック DOM テストは実ストアアプリの更新やカーネル挙動を代替しないため、Windows 10 または Windows 11（x86_64）クライアント SKU 実機で以下の 3 点を別途検証する。
 
 1. 実 Microsoft Store アプリ（例として `Microsoft.StartExperiencesApp`）のアラートに対し、View 1 で「Wildcard Store app version」を ON にして「Allow Permanent Rule」を実行したとき、View 3 に `C:\Program Files\WindowsApps\<Name>_*_<Arch>_<ResourceId>_<PublisherId>\<RelPath>` と Authenticode 署名付きルールが登録されて通信が許可されること。
-2. ストアアプリ更新後（新バージョンディレクトリ配下のバイナリ起動および通信時）に、同一ルールによって再アラートや一時遮断なしで通信許可が継続すること。
+2. ストアアプリ更新後（新バージョンディレクトリ配下のバイナリ起動および通信時）に、宛先無制限の `NetworkAllow` ルールではユーザー再アラートおよび遮断なしで通信許可が継続すること、ならびに宛先限定（IP、CIDR、またはドメイン）ルールかつ事前遮断対象（MOTW 等）では新版初回接続時の WFP ドロップ評価（`outbound.rs`）を経てユーザー再アラートなしに IP Permit が追加され通信が継続すること（初回接続の 1 パケットドロップを伴う境界を含む）。
 3. `%LOCALAPPDATA%\Microsoft\WindowsApps\` 配下の `AppExecutionAlias` スタブ経由または該当パスでは、ワイルドカード対象外として View 1 に「Wildcard Store app version」チェックボックスが表示されないこと。
 
 なお、個別ストアアプリごとの実機署名文字列（`signer_subject`）の棚卸しを要する `rules/default_allowlist.json` への既定ルール追加は、本件の対象外として分離する。

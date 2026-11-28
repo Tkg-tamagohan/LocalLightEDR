@@ -114,6 +114,11 @@ pub struct WfpReconcileDnsContext {
     /// Normalized `(exe_key, canonical_ip, domain_hint)` tuples known to be superseded in
     /// `ProcessDnsHistory` for currently installed `DomainPolicy` Permits.
     pub superseded_permit_hints: HashSet<(String, IpAddr, String)>,
+    /// Fail-closed flag indicating `ActiveProcessTable::evicted_live_overflow_any` is active so
+    /// deferred `Preemptive` block removals cannot fire while unenumerated live processes exist.
+    pub live_exe_overflow_any: bool,
+    /// Normalized `exe_key`s tracked in `ActiveProcessTable::overflowed_evicted_live_exes`.
+    pub overflow_live_exe_keys: HashSet<String>,
 }
 
 /// Summary of a persisted-rule reconciliation pass against [`ActiveDefenseController`].

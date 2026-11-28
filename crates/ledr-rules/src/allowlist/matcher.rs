@@ -20,13 +20,88 @@ fn normalize_pattern_chars(raw: &str) -> Vec<char> {
     }
 }
 
+#[inline]
+fn is_lower_msix_name_char(ch: char) -> bool {
+    ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '.' || ch == '-'
+}
+
+#[inline]
+fn is_lower_crockford_base32(ch: char) -> bool {
+    matches!(
+        ch,
+        '0'..='9' | 'a'..='h' | 'j'..='k' | 'm'..='n' | 'p'..='t' | 'v'..='z'
+    )
+}
+
+fn is_windows_apps_version_wildcard_pattern(p: &[char]) -> bool {
+    if p.len() <= WINDOWS_APPS_NORMALIZED_PREFIX.len()
+        || !p.starts_with(&WINDOWS_APPS_NORMALIZED_PREFIX)
+    {
+        return false;
+    }
+    let remainder = &p[WINDOWS_APPS_NORMALIZED_PREFIX.len()..];
+    if remainder.contains(&'?') || remainder.contains(&':') || remainder.last() == Some(&'\\') {
+        return false;
+    }
+    let segments: Vec<&[char]> = remainder.split(|&ch| ch == '\\').collect();
+    if segments.len() < 2
+        || segments
+            .iter()
+            .any(|seg| seg.is_empty() || *seg == ['.'] || *seg == ['.', '.'])
+    {
+        return false;
+    }
+
+    let mut pkg_parts = segments[0].split(|&ch| ch == '_');
+    let (Some(name), Some(version), Some(arch), Some(resource_id), Some(publisher_id), None) = (
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+        pkg_parts.next(),
+    ) else {
+        return false;
+    };
+
+    if !(1..=50).contains(&name.len()) || !name.iter().copied().all(is_lower_msix_name_char) {
+        return false;
+    }
+    if version != ['*'] {
+        return false;
+    }
+    if !matches!(
+        arch,
+        ['x', '8', '6']
+            | ['x', '6', '4']
+            | ['a', 'r', 'm']
+            | ['a', 'r', 'm', '6', '4']
+            | ['n', 'e', 'u', 't', 'r', 'a', 'l']
+    ) {
+        return false;
+    }
+    if resource_id.len() > 30 || !resource_id.iter().copied().all(is_lower_msix_name_char) {
+        return false;
+    }
+    if publisher_id.len() != 13 || !publisher_id.iter().copied().all(is_lower_crockford_base32) {
+        return false;
+    }
+
+    if segments[1..].iter().any(|seg| seg.contains(&'*')) {
+        return false;
+    }
+    let last_segment = segments[segments.len() - 1];
+    last_segment.len() >= 5 && last_segment.ends_with(&['.', 'e', 'x', 'e'])
+}
+
 /// Performs ASCII case-insensitive wildcard (`*`) matching with `/` and `\` normalization,
-/// stripping leading non-UNC `\\?\` prefixes and confining `*` within path segments for
-/// `C:\Program Files\WindowsApps\` patterns.
+/// stripping leading non-UNC `\\?\` prefixes and confining `*` within path segments only for
+/// `C:\Program Files\WindowsApps\<Name>_*_<Arch>_<ResourceId>_<PublisherId>\<RelPath>`
+/// version-wildcard patterns (preserving cross-segment `*` matching for generic manual rules).
 pub fn matches_path_pattern(exe_path: &str, pattern: &str) -> bool {
     let s = normalize_pattern_chars(exe_path);
     let p = normalize_pattern_chars(pattern);
-    let star_forbids_backslash = p.starts_with(&WINDOWS_APPS_NORMALIZED_PREFIX);
+    let star_forbids_backslash = is_windows_apps_version_wildcard_pattern(&p);
 
     let (mut si, mut pi) = (0usize, 0usize);
     let (mut star_pi, mut match_si) = (None, 0usize);
@@ -312,6 +387,17 @@ mod tests {
         assert!(!matches_path_pattern(
             r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\nested\App.exe",
             &pattern
+        ));
+
+        // Preserves existing cross-`\` `*` matching for generic View 3 manual patterns,
+        // including patterns rooted under `C:\Program Files\WindowsApps\`.
+        assert!(matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\bin\App.exe",
+            r"C:\Program Files\WindowsApps\*\App.exe"
+        ));
+        assert!(matches_path_pattern(
+            r"C:\Program Files\WindowsApps\Contoso.App_1.0.0.0_x64__8wekyb3d8bbwe\bin\App.exe",
+            r"C:\Program Files\WindowsApps\*"
         ));
 
         // Preserves existing cross-`\` `*` matching for non-WindowsApps patterns.

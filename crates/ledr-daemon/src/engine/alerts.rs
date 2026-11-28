@@ -2509,4 +2509,175 @@ mod tests {
 
         engine.shutdown_and_flush().await.expect("shutdown");
     }
+
+    #[tokio::test]
+    async fn wildcard_allows_app_level_layer3_alert_without_process_instance_id() {
+        let defense = Arc::new(MockDefense::new());
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let exe_v1 =
+            r"C:\Program Files\WindowsApps\Contoso.AppLevel_1.0.0.0_x64__8wekyb3d8bbwe\App.exe";
+        let exe_v2 =
+            r"C:\Program Files\WindowsApps\Contoso.AppLevel_2.0.0.0_x64__8wekyb3d8bbwe\App.exe";
+        let signer = "CN=Contoso Store Publisher";
+        let root_tp = "0123456789ABCDEF0123456789ABCDEF01234567";
+        inspector.insert(BinaryIdentity {
+            exe_path: exe_v2.to_string(),
+            sha256: Some("2".repeat(64)),
+            authenticode: Some(auth_info(signer, root_tp)),
+        });
+
+        // App-level LAYER_3_NETWORK alert (`process_instance_id: None`, e.g., ambiguous WFP drop)
+        // succeeds when `exe_path` and verified signer/root_thumbprint are present, unlike
+        // `LAYER_4_BROWSER` processless alerts.
+        let alert = make_alert(
+            "ALT-L3-NO-PROC",
+            "LAYER_3_NETWORK",
+            None,
+            serde_json::json!({
+                "exe_path": exe_v1,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "dst_ip": "198.51.100.90"
+            }),
+        );
+        engine.store().record_alert(&alert).expect("record alert");
+
+        let outcome = engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-L3-NO-PROC",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: None,
+                },
+                AllowPermanentPathMode::WindowsAppsVersionWildcard,
+            )
+            .expect("app-level LAYER_3_NETWORK wildcard approval succeeds");
+        assert!(outcome.saved_rule_id.is_some());
+
+        let rules = engine.store().list_network_rules().expect("list_network_rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].exe_path_pattern,
+            r"C:\Program Files\WindowsApps\Contoso.AppLevel_*_x64__8wekyb3d8bbwe\App.exe"
+        );
+        assert!(matches!(
+            evaluate_outbound_policy(
+                &inspector.inspect(exe_v2),
+                "198.51.100.90".parse().unwrap(),
+                None,
+                &rules,
+            ),
+            OutboundDecision::AllowedByRule { .. }
+        ));
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn restarted_app_keeps_preemptive_block_when_old_alert_receives_dest_scoped_allow() {
+        let defense = Arc::new(MockDefense::new());
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let exe = r"C:\Users\Alice\Downloads\ContosoRestartable.exe";
+        let signer = "CN=Contoso Tools";
+        let root_tp = "0123456789ABCDEF0123456789ABCDEF01234567";
+        inspector.insert(BinaryIdentity {
+            exe_path: exe.to_string(),
+            sha256: Some("a".repeat(64)),
+            authenticode: Some(auth_info(signer, root_tp)),
+        });
+
+        // 1. First instance starts (`HighRiskPath` -> Preemptive block) and gets bound alert.
+        let p1 = ProcessIdentity::new(4101, 133_000_000_000_000_101);
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: p1,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        let alert_old = make_alert(
+            "ALT-RESTART-OLD",
+            "LAYER_3_NETWORK",
+            Some(&p1.instance_id()),
+            serde_json::json!({
+                "exe_path": exe,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "dst_ip": "198.51.100.10"
+            }),
+        );
+        engine.store().record_alert(&alert_old).expect("record alert");
+        {
+            let mut fw = engine.firewall.lock().unwrap();
+            assert!(fw.bind_alert_to_app_block("ALT-RESTART-OLD", exe));
+        }
+
+        // 2. First instance exits while `ALT-RESTART-OLD` is unresolved -> deferred_preemptive_removals set.
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStop {
+                pid: p1.pid,
+                exit_time_100ns: p1.create_time_100ns + 10_000,
+                exit_code: 0,
+            },
+            EventLane::HighPriority,
+        );
+        {
+            let fw = engine.firewall.lock().unwrap();
+            assert!(fw.has_deferred_preemptive_removal(exe));
+            assert!(fw.active_app_block(exe).is_some());
+        }
+
+        // 3. Same executable restarts while old alert is still pending -> must reclaim & clear deferred.
+        let p2 = ProcessIdentity::new(4102, 133_000_000_000_000_202);
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: p2,
+                parent_pid: 4,
+                exe_path: exe.to_string(),
+                command_line: exe.to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        {
+            let fw = engine.firewall.lock().unwrap();
+            assert!(
+                !fw.has_deferred_preemptive_removal(exe),
+                "restarted live process must clear deferred_preemptive_removals"
+            );
+            assert!(fw.active_app_block(exe).is_some());
+        }
+
+        // 4. Resolve the old alert with destination-scoped AllowPermanent (`198.51.100.10` only).
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-RESTART-OLD",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: Some("198.51.100.10".to_string()),
+                },
+                AllowPermanentPathMode::Exact,
+            )
+            .expect("dest-scoped approval succeeds");
+
+        // 5. App-wide Preemptive block must remain active while Permit exists only for `198.51.100.10`.
+        {
+            let fw = engine.firewall.lock().unwrap();
+            assert!(
+                fw.active_app_block(exe).is_some(),
+                "restarted app must keep its app-wide Preemptive block after dest-scoped approval"
+            );
+            assert!(fw.has_active_filter(exe, Some("198.51.100.10".parse().unwrap()), true));
+            assert!(!fw.has_active_filter(exe, Some("203.0.113.99".parse().unwrap()), true));
+        }
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
 }

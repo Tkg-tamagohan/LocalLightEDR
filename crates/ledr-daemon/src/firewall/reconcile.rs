@@ -105,6 +105,11 @@ impl WfpRuleManager {
         let mut keys_to_promote: Vec<WfpTargetKey> = Vec::new();
         let mut keys_to_demote_preemptive: Vec<WfpTargetKey> = Vec::new();
         let mut domain_hint_updates: Vec<(WfpTargetKey, Vec<String>)> = Vec::new();
+        let active_exe_keys: HashSet<String> = active_concrete_exes
+            .iter()
+            .map(|p| Self::exe_key(p))
+            .collect();
+        let mut deferred_handles_to_clear: Vec<u64> = Vec::new();
         for (key, entry) in &self.installed {
             match &entry.origin {
                 WfpFilterOrigin::PersistedPolicy => match plan.desired.get(key) {
@@ -436,12 +441,22 @@ impl WfpRuleManager {
                         && !entry.allow
                         && !self.startup_preemptive_exes.contains_key(&key.0)
                     {
+                        let is_exe_live = active_exe_keys.contains(&key.0)
+                            || dns_ctx.live_exe_overflow_any
+                            || dns_ctx.overflow_live_exe_keys.contains(&key.0);
+                        if active_exe_keys.contains(&key.0)
+                            && self.deferred_preemptive_removals.contains(&entry.handle)
+                        {
+                            deferred_handles_to_clear.push(entry.handle);
+                        }
                         let release_for_deferred_or_allow =
-                            if self.deferred_preemptive_removals.contains(&entry.handle)
+                            if !is_exe_live
+                                && self.deferred_preemptive_removals.contains(&entry.handle)
                                 && !self.bound_alerts.values().any(|k| k == key)
                             {
-                                // Deferred removal whose bound alerts are all resolved: remove
-                                // without disk I/O or creating a PersistedPolicy Permit.
+                                // Deferred removal whose bound alerts are all resolved and whose
+                                // executable is confirmed inactive: remove without disk I/O or
+                                // creating a PersistedPolicy Permit.
                                 true
                             } else {
                                 let has_app_wide_allow_path_match = rules.iter().any(|r| {
@@ -475,6 +490,9 @@ impl WfpRuleManager {
                     }
                 }
             }
+        }
+        for handle in deferred_handles_to_clear {
+            self.deferred_preemptive_removals.remove(&handle);
         }
 
         let mut failed_exe_keys: HashSet<String> = HashSet::new();
@@ -1073,5 +1091,79 @@ mod tests {
         assert_eq!(report_n1.removed, 0);
         assert_eq!(report_n1.applied, 0);
         assert_eq!(defense.take_counts(), (0, 0));
+    }
+
+    #[test]
+    fn reconcile_keeps_deferred_preemptive_block_when_exe_restarted_or_overflow_live() {
+        let exe = r"C:\Users\Alice\Downloads\RestartedHelper.exe";
+        let defense = CountingDefense::new();
+        let inspector = CountingInspector::new(Vec::new());
+        let mut fw = WfpRuleManager::new();
+
+        let h = defense.add_wfp_app_rule(Path::new(exe), None, false).unwrap();
+        assert!(fw.register_preemptive_block(exe, h, &defense));
+        assert!(fw.bind_alert_to_app_block("ALT-OLD-1", exe));
+        assert!(!fw.remove_preemptive_block_if_unused(exe, &defense));
+        assert!(fw.has_deferred_preemptive_removal(exe));
+        fw.unbind_alert("ALT-OLD-1");
+        let _ = defense.take_counts();
+
+        let dest_scoped = vec![AllowlistRuleRecord {
+            rule_id: "R-DEST-ONLY".to_string(),
+            scope: RuleScope::NetworkAllow,
+            exe_path_pattern: exe.to_string(),
+            sha256: Some("c".repeat(64)),
+            signer_subject: None,
+            root_thumbprint: None,
+            allowed_target: Some("203.0.113.50".to_string()),
+            created_at_ms: 1_750_000_000_000,
+            created_by: "user_triage".to_string(),
+        }];
+
+        // 1. Live in `active_concrete_exes`: keeps block AND clears stale deferred flag.
+        let rep_live = fw.reconcile_persisted_rules(
+            &dest_scoped,
+            &[exe.to_string()],
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_live.removed, 0);
+        assert!(fw.active_app_block(exe).is_some());
+        assert!(!fw.has_deferred_preemptive_removal(exe));
+        assert_eq!(defense.take_counts(), (0, 0));
+
+        // 2. Fail closed when overflow flags indicate unenumerated live processes.
+        assert!(fw.bind_alert_to_app_block("ALT-OLD-2", exe));
+        assert!(!fw.remove_preemptive_block_if_unused(exe, &defense));
+        fw.unbind_alert("ALT-OLD-2");
+        assert!(fw.has_deferred_preemptive_removal(exe));
+
+        let mut overflow_ctx = WfpReconcileDnsContext::default();
+        overflow_ctx.overflow_live_exe_keys.insert(WfpRuleManager::exe_key(exe));
+        let rep_ov_key = fw.reconcile_persisted_rules_with_dns_context(
+            &dest_scoped,
+            None,
+            &[],
+            &overflow_ctx,
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_ov_key.removed, 0);
+        assert!(fw.active_app_block(exe).is_some());
+
+        let overflow_any_ctx = WfpReconcileDnsContext {
+            live_exe_overflow_any: true,
+            ..Default::default()
+        };
+        let rep_ov_any = fw.reconcile_persisted_rules_with_dns_context(
+            &dest_scoped,
+            None,
+            &[],
+            &overflow_any_ctx,
+            &inspector,
+            &defense,
+        );
+        assert_eq!(rep_ov_any.removed, 0);
+        assert!(fw.active_app_block(exe).is_some());
     }
 }

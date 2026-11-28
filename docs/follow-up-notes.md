@@ -654,9 +654,23 @@ Run `#45753387980` の `release-dist` 6 点は `LocalEDR-Setup-v0.1.0-win-x64.ex
 
 ### 事前 API スパイク（約 1 日）の合格基準と不合格時フォールバック
 
-- **合格基準**：第 1 に、`windows` クレートで `FWPM_CONDITION_ALE_PACKAGE_ID` 付きフィルタが BFE に受理され、同一 `backgroundTaskHost.exe` の異なる AppContainer SID 間で通信許可と遮断が分離されることを確認する。
-  第 2 に、`FwpmNetEventSubscribe1` の `FWPM_NET_EVENT_HEADER3`（取得不可ビルドではプロセス表のトークン `TokenAppContainerSid` へフォールバック）および起動時 `GetPackageFamilyName` の値が `DeriveAppContainerSidFromAppContainerName` で導出した SID と一致することを確認する。
+- **合格基準**：第 1 に、`windows` クレートで `FWPM_CONDITION_ALE_PACKAGE_ID` 付きフィルタが BFE に受理され、同一システムバイナリ（`backgroundTaskHost.exe` 等）の異なる AppContainer SID 間で通信許可と遮断が分離されることを確認する。
+  第 2 に、`FwpmNetEventSubscribe1` の `FWPM_NET_EVENT_HEADER2`（実測で `packageSid` 取得を確認済みであり、取得不可ビルドやイベント欠損時はプロセス表のトークン `TokenAppContainerSid` へフォールバック）および起動時 `GetPackageFamilyName` の値が `DeriveAppContainerSidFromAppContainerName` で導出した SID と一致することを確認する。
 - **不合格時フォールバック**：カーネルでの `FWPM_CONDITION_ALE_PACKAGE_ID` 事前フィルタ設置が環境制約により不成立の場合は、BFE へのアプリ全体 Permit 登録を行わず、プロセス起動時トークンから取得した `package_sid` を用いたデーモン空間 `evaluate_outbound_policy` 評価と通信先 IP 限定の一時 Permit 運用へ縮退する。
+
+#### 事前 API スパイク実測結果（2026-11-28、合格）
+
+- **検証環境と診断ツール**：Windows クライアント SKU（`DisplayVersion=26H2`、`Build=26300.9974`、`Edition=Core`、x86_64、管理者 PowerShell）上で、実機診断ツール [spike_wfp_package_id.rs](../crates/ledr-sensor-win/examples/spike_wfp_package_id.rs)（[Cargo.toml](../Cargo.toml) の `windows` 依存へ `Win32_Security_Isolation` と `Win32_Storage_Packaging_Appx` を追加）を用いて検証した。
+- **合格基準 1（BFE 受理および同一バイナリ異 SID 分離）**：`C:\Windows\System32\backgroundTaskHost.exe` と `C:\Windows\System32\curl.exe` の双方で `FWPM_CONDITION_ALE_APP_ID` と `FWPM_CONDITION_ALE_PACKAGE_ID`（`FWP_SID`）の複合条件フィルタ（IPv4 と IPv6 の Permit と Block 計 4 本）がすべて `ERROR_SUCCESS` で受理され、動的セッション終了時に自動消去されることを確認した。
+  `backgroundTaskHost.exe` 自体の実通信による分離確認は本スパイク単体では未検証であるため、代替として `--self-test-wfp` により同一システムバイナリ `C:\Windows\System32\curl.exe` を 2 つの一時 AppContainer SID から `http://1.1.1.1/` へ接続させた結果、Permit 側 SID は `exit_code=0`（56ms）、Block 側 SID は `exit_code=7`（26ms）となり、同一バイナリに対する SID 単位の通信分離を確認した。
+  `backgroundTaskHost.exe` 実起動トラフィックでの最終許可と遮断の確認は Track B-3 の実機 E2E へ引き継ぐ。
+- **合格基準 2（SID 導出一致および WFP ネットイベント `packageSid`）**：管理者権限による稼働中プロセス全件走査（`open_denied=0`、計 361〜363 プロセス、`backgroundTaskHost.exe` 2 本を含む）で、パッケージ付き AppContainer プロセス 12 件すべてについて `DeriveAppContainerSidFromAppContainerName(GetPackageFamilyName)` と `GetTokenInformation(TokenAppContainerSid)` の完全一致（`sid_mismatch=0`）を確認した。
+  さらに `--self-test-wfp` の Block ドロップ時に、現行 [net_events.rs](../crates/ledr-sensor-win/src/wfp/net_events.rs) が使用する `FwpmNetEventSubscribe1`（`FWPM_NET_EVENT2` と `FWPM_NET_EVENT_HEADER2`）で `FWPM_NET_EVENT_FLAG_PACKAGE_ID_SET`（`flag_pkg=true`）と Block 側 SID に一致する `header.packageSid` を捕捉した。
+- **Track B-1〜B-3 へ反映する実測境界**：
+  1. `FwpmNetEventSubscribe1`（`FWPM_NET_EVENT_HEADER2.packageSid`）のみで `packageSid` を取得できるため、`FwpmNetEventSubscribe2` への移行は不要とする。
+  2. `RuntimeBroker.exe`、`MicrosoftStartFeedProvider.exe`、`StartMenuExperienceHost.exe`、`SnippingTool.exe`、`gamingservices.exe` 等は `GetPackageFamilyName` が非空でも `TokenAppContainerSid` が `None`（`PFN_ONLY_NON_APPCONTAINER`）であり、逆に `fontdrvhost.exe` や `DefenderAiPlatformHost.exe` は `TokenAppContainerSid` のみを持つ（`TOKEN_SID_ONLY`）。
+     そのため Track B-1 と Track B-2 では `package_family_name` と `package_sid` をそれぞれ独立した `Option<String>` として取得し、`PFN_ONLY_NON_APPCONTAINER` に対して `DeriveAppContainerSidFromAppContainerName` で架空の `package_sid` を補完しない。
+- **判定**：BFE の `backgroundTaskHost.exe` 用フィルタ受理、代替バイナリ `curl.exe` による異 SID 通信分離および `FWPM_NET_EVENT_HEADER2.packageSid` 捕捉、ならびに `GetPackageFamilyName` と `TokenAppContainerSid` の双方を取得できたパッケージ付き AppContainer プロセス 12 件の SID 導出一致を確認したため、合格基準 1 と 2 を代替検証範囲を含め合格と判定し、フォールバック設計へ縮退せず Track B-1 の実装へ進む。
 
 ### 段階的な実装計画（計約 4.5〜5 日）と各 PR の受け入れ基準
 

@@ -17,7 +17,7 @@
 各層の詳細な構造不変条件は `.agents/rules/` 配下の `model_decision` ルールへ分離して管理する。
 該当領域の設計、実装、レビュー時は必ず対応するルールを参照する。
 
-- **デーモン基盤、プロセス追跡、NRD 停止、統合テスト同期**：`.agents/rules/daemon-wfp-process-invariants.md`（`TwoLaneSender` 有界チャネル、起動および停止順序、PID 解決、`ActiveProcessTable`、事前 WFP ブロック、ポリシーロールバック、定期保守、補助 `SystemTrace` ETW、NRD 非ブロッキング停止とキャンセル）
+- **デーモン基盤、プロセス追跡、NRD 停止、統合テスト同期**：`.agents/rules/daemon-wfp-process-invariants.md`（`TwoLaneSender` 有界チャネル、起動および停止順序、PID 解決、`ActiveProcessTable`、事前 WFP ブロックと `deferred_preemptive_removals` 保護、ポリシーロールバック、定期保守、`WindowsApps` バージョンワイルドカード照合、補助 `SystemTrace` ETW、NRD 非ブロッキング停止とキャンセル）
 - **能動防御、WFP/DNS/BFE、および特権境界**：`.agents/rules/active-defense-guards.md`（サスペンドや `TerminateAndBlock` と `ProcessLiveness` と `rollback_saved_rule`、おとりファイル、ETW レジストリ `CloseKey` 監視、Session 0 通知、IPC 認可と `dev_bypass_auth`、`--prepare-dir`、WFP 動的フィルタとドメイン由来フィルタ、デュアルスタック DNS 履歴、BFE 有界キュー、インストーラとアンインストールとアップデータ、`HRESULT` 変換）
 - **ブラウザ連携、MOTW、ブリッジ、および UI 診断**：`.agents/rules/browser-ui-invariants.md`（MOTW 3 段階帰属と移動後事前 WFP ブロック、`LAYER_4_BROWSER`、`ledr-bridge-nm` 中継と `HKLM` WOW64 プローブと削除保護、Chrome MV3 拡張、`apps/ledr-ui` View 3 マニフェスト検証と WOW64 診断と `.browser-detail-row` 回帰規約）
 

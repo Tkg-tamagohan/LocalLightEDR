@@ -1,6 +1,6 @@
 ---
 trigger: model_decision
-description: LocalEDR のデーモン起動および停止順序、TwoLaneSender 有界チャネル、PID 解決、ActiveProcessTable、事前 WFP ブロック、ポリシーロールバック、定期保守、有界チャネル付きワーカーの停止（NRD 更新スレッドの非ブロッキング停止とキャンセルを含む）、補助 SystemTrace ETW セッション、または統合および並行ロック競合回帰テストを設計、実装、レビューするとき
+description: LocalEDR のデーモン起動および停止順序、TwoLaneSender 有界チャネル、PID 解決、ActiveProcessTable、事前 WFP ブロック、deferred_preemptive_removals 保護と deploy_persisted_network_rules_with_baseline、WindowsApps バージョンワイルドカード照合（matches_path_pattern）、ポリシーロールバック、定期保守、有界チャネル付きワーカーの停止（NRD 更新スレッドの非ブロッキング停止とキャンセルを含む）、補助 SystemTrace ETW セッション、または統合および並行ロック競合回帰テストを設計、実装、レビューするとき
 ---
 
 # デーモン基盤、プロセス追跡、および NRD 停止の不変条件
@@ -27,8 +27,12 @@ description: LocalEDR のデーモン起動および停止順序、TwoLaneSender
   この自動事前遮断（`Preemptive`）の直接登録では `add_wfp_app_rule` 実行前と登録コミット直前に `firewall -> process_table` 順で起動時固定（startup-pinned）または要件を満たす稼働中プロセス（静的リスクありなら稼働中プロセス、静的リスクなしなら MOTW 付きの稼働中プロセス `has_active_motw_for_exe_key`）の存否を再検証し、実行前に不要なら登録を中断し、コミット直前に不要なら `process_table` 解放後に即時解放（`discard_obsolete_preemptive_block`）して削除失敗ハンドルだけを `pending_preemptive_removals` へ積む。
   定期スイープ（`sweep_unused_preemptive_blocks`）は `pending_preemptive_removals` のみを対象に毎スイープ確認し、再稼働した実行ファイルは削除せず解除待ちから取り消し、引き続き解除対象となるブロックのみ毎スイープ再試行して警告ログだけ連続失敗回数が 2 の累乗の回に間引く。
 - 未解決アラート参照により見送った非起動時 `Preemptive` ブロックの削除要求は `deferred_preemptive_removals` へ分離記録し、最終アラート解除時に `firewall -> process_table` 順（`remove_wfp_rule` 呼び出し中は `process_table` 非保持）で再試行する。
+  あわせて `wfp_premat.rs`（`maybe_apply_preemptive_wfp_block_with_motw`）の既存フィルタ早期リターン経路では必ず早期リターン前に `clear_pending_preemptive_removal` で解除待ちを取り消し、`policy.rs` の `deploy_persisted_network_rules_with_baseline` は必ず `firewall -> process_table` 順で `active_exe_liveness_snapshot()` を取得して `process_table` ロックを即時解放する（`process_table` を `firewall` より先に取得するとスナップショット取得と `firewall` ロック取得の間に `ProcessStop` が割り込み `deferred_preemptive_removals` を消失させる TOCTOU が生じるため禁止）。
+  さらに `reconcile.rs` の `reconcile_persisted_rules_with_baseline` は、生存プロセスまたはオーバーフロー時フェイルクローズ（`live_exe_overflow_any` / `overflow_live_exe_keys`）に該当する実行ファイルについて、`deferred_preemptive_removals` にある非起動時 `Preemptive` ブロックの解放を抑止する。
   定期アラート期限切れと残留事前遮断スイープ（`run_periodic_expiry_and_sweep`）は `pipeline.rs` の Tier 2c（Tier 1〜2b 後、Tier 3 テレメトリ前）でデーモン停止未要求時（`!nrd_cancel.is_cancelled()`）にのみ実行し、停止要求後（`nrd_cancel.is_cancelled()`）は抑止して 3 秒終了予算を守る。
   60 秒周期の読取メモリ解放（`L-22`）などの低頻度定期保守も `select!` 単独に置かず、非タイマ起床で次回期限（`last_mem_maintenance_at` 基準）を先送りしない形で `Tier 2c` 後かつ Tier 3 テレメトリ受信前の期限チェック（`Tier 2c-mem`）とアイドル待機時の `sleep_until` の双方で駆動し、停止要求およびドレイン打ち切り開始時（`nrd_cancel.is_cancelled()`、`store.is_shutdown_requested()`、または `is_shutdown_drain_cutoff()`）は抑止する。
+- `crates/ledr-rules/src/allowlist/matcher.rs` の `matches_path_pattern` は、非 UNC `\\?\` を除去したうえで `is_windows_apps_version_wildcard_pattern` に一致する `C:\Program Files\WindowsApps\<Name>_*_<Arch>_<ResourceId>_<PublisherId>\<RelPath>` 形式のパターンに限定して `*` の `\` 跨ぎを禁止する。
+  `c:\program files\windowsapps\` 始まりパターン全般へ一律に `\` 跨ぎ禁止を拡大してはならない（View 3 で手動登録された汎用パターン `C:\Program Files\WindowsApps\*\App.exe` 等のサブフォルダ一致互換性を破壊するため）。
 - ポリシー更新のロールバックでは、昇格フィルタの解除待ち状態（`pending_preemptive_removals` の連続失敗回数と `deferred_preemptive_removals`）をスナップショット（`PromotedFilterSnapshot`）から復元（`restore_promoted_filter_states`）する。
   また撤去済みアプリブロックの解除待ち状態と紐付けアラートをスナップショット（`RemovedBlockSnapshot`、`RemovedAppBlockSnapshot` の `removed_app_blocks`）へ保持し、復元時（`restore_lifted_block`、`restore_removed_app_blocks`）に非起動時 `Preemptive` の新規登録ハンドルへは解除待ち状態（未紐付き時は削除失敗回数と直後のアラート再紐付けを含む遅延解除、紐付き時は遅延解除へ統合）を引き継ぐ一方、既存の非起動時 `Preemptive` ハンドルが残存して新規登録を省略する早期リターン経路では遅延解除フラグ（`prev_deferred_preemptive_removal` および再紐付け時の昇格分）のみを引き継ぎ削除失敗回数は復元しない。
 - 撤去済み非起動時 `Preemptive` ブロックをロールバック復元（`restore_removed_app_blocks`）する際は、`firewall -> process_table` 順（`firewall` ロック保持下の BFE 再登録前に `process_table` ロックを解放）で対象実行ファイルの稼働状況を再確認し、未紐付きかつ終了済みなら復元を抑止し、アラート紐付きかつ終了済みなら遅延解除フラグを付与して最終アラート解除時に回収する。

@@ -137,6 +137,21 @@ EXPECTED_QUESTIONS: dict[str, tuple[list[str], float, float]] = {
         0.65,
         0.40,
     ),
+    "windowsapps_wildcard_segment_scope": (
+        ["crates/ledr-rules/src/allowlist/matcher.rs"],
+        0.65,
+        0.40,
+    ),
+    "preemptive_deferred_removal_and_lock_order": (
+        [
+            "crates/ledr-daemon/src/engine/wfp_premat.rs",
+            "crates/ledr-daemon/src/engine/policy.rs",
+            "crates/ledr-daemon/src/firewall/reconcile.rs",
+            "crates/ledr-daemon/src/process_table.rs",
+        ],
+        0.65,
+        0.40,
+    ),
 }
 
 
@@ -374,7 +389,7 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             self.skipTest(f"Global invariant gate script not installed: {exc}")
 
     def test_T1_05_invariants_json_strict_schema_and_gate_loader(self) -> None:
-        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 14 keys and load_custom_questions."""
+        """T1-05: .agents/invariants.json is strict BOM-free UTF-8 JSON matching all 16 keys and load_custom_questions."""
         invariants_path = REPO_ROOT / ".agents" / "invariants.json"
         self.assertTrue(invariants_path.is_file(), f"Missing {invariants_path}")
 
@@ -614,6 +629,36 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
             "unrelated to manifest removal reference checks",
         ):
             self.assertIn(kw, bridge_unreg["instructions"])
+
+        wa_wildcard = questions["windowsapps_wildcard_segment_scope"]
+        for text_field in (
+            wa_wildcard["instructions"],
+            wa_wildcard["criteria"]["true_description"],
+            wa_wildcard["criteria"]["false_description"],
+        ):
+            for kw in (
+                "matches_path_pattern",
+                "is_windows_apps_version_wildcard_pattern",
+                "WindowsApps",
+            ):
+                self.assertIn(kw, text_field)
+
+        preemptive_lock = questions["preemptive_deferred_removal_and_lock_order"]
+        for text_field in (
+            preemptive_lock["instructions"],
+            preemptive_lock["criteria"]["true_description"],
+            preemptive_lock["criteria"]["false_description"],
+        ):
+            for kw in (
+                "clear_pending_preemptive_removal",
+                "deploy_persisted_network_rules_with_baseline",
+                "active_exe_liveness_snapshot",
+                "deferred_preemptive_removals",
+                "live_exe_overflow_any",
+                "overflow_live_exe_keys",
+                "firewall -> process_table",
+            ):
+                self.assertIn(kw, text_field)
 
         # Verify offline (even when the global plugin script is not installed) that
         # every path_glob in .agents/invariants.json is reachable through
@@ -890,7 +935,39 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                 "@@ -1336,4 +1336,3 @@",
                 "                 e.identity.create_time_100ns != 0\n                     && e.identity.create_time_100ns >= parent.identity.create_time_100ns",
                 "-                    && next_cutoff.is_none_or(|c| e.identity.create_time_100ns < c)\n                     && !visited.contains(&e.identity)",
-                {"process_table_descendant_traversal", "never_suspend_and_create_time"},
+                {
+                    "process_table_descendant_traversal",
+                    "never_suspend_and_create_time",
+                    "preemptive_deferred_removal_and_lock_order",
+                },
+            ),
+            (
+                "crates/ledr-rules/src/allowlist/matcher.rs",
+                "@@ -101,4 +101,4 @@",
+                " pub fn matches_path_pattern(exe_path: &str, pattern: &str) -> bool {\n     let s = normalize_pattern_chars(exe_path);\n     let p = normalize_pattern_chars(pattern);",
+                "-    let star_forbids_backslash = is_windows_apps_version_wildcard_pattern(&p);\n+    let star_forbids_backslash = false;",
+                {"windowsapps_wildcard_segment_scope"},
+            ),
+            (
+                "crates/ledr-daemon/src/engine/wfp_premat.rs",
+                "@@ -482,3 +482,2 @@",
+                "                     && is_preemptive_still_needed(&fw)\n                 {",
+                "-                    fw.clear_pending_preemptive_removal(trimmed);",
+                {"preemptive_deferred_removal_and_lock_order"},
+            ),
+            (
+                "crates/ledr-daemon/src/engine/policy.rs",
+                "@@ -111,4 +111,4 @@",
+                "             let (active_exes, live_exe_overflow_any, overflow_live_exe_keys) = self\n                 .process_table\n                 .lock()",
+                "-                .unwrap_or_else(|e| e.into_inner())\n+                .unwrap_or_else(|e| e.into_inner()) // verify lock order rule selection",
+                {"preemptive_deferred_removal_and_lock_order"},
+            ),
+            (
+                "crates/ledr-daemon/src/firewall/reconcile.rs",
+                "@@ -444,3 +444,3 @@",
+                "                         let is_exe_live = active_exe_keys.contains(&key.0)\n                             || dns_ctx.live_exe_overflow_any",
+                "-                            || dns_ctx.overflow_live_exe_keys.contains(&key.0);\n+                            && false;",
+                {"preemptive_deferred_removal_and_lock_order"},
             ),
             (
                 "crates/ledr-bridge-nm/src/setup.rs",
@@ -953,6 +1030,15 @@ class TestCheckInvariantsWrapper(unittest.TestCase):
                 if rel_path != "crates/ledr-bridge-nm/src/setup.rs":
                     self.assertNotIn("bridge_nm_wow64_probe_and_status", questions)
                     self.assertNotIn("bridge_nm_unregister_manifest_protection", questions)
+                if rel_path != "crates/ledr-rules/src/allowlist/matcher.rs":
+                    self.assertNotIn("windowsapps_wildcard_segment_scope", questions)
+                if rel_path not in {
+                    "crates/ledr-daemon/src/engine/wfp_premat.rs",
+                    "crates/ledr-daemon/src/engine/policy.rs",
+                    "crates/ledr-daemon/src/firewall/reconcile.rs",
+                    "crates/ledr-daemon/src/process_table.rs",
+                }:
+                    self.assertNotIn("preemptive_deferred_removal_and_lock_order", questions)
 
     def test_T1_08_require_gate_script_skips_missing_default_and_fails_bad_env(self) -> None:
         """T1-08: Missing default plugin skips, whereas invalid explicit LEDR_INVARIANT_GATE_SCRIPT fails."""

@@ -130,6 +130,7 @@ pub(super) struct WfpDropOverflowQueue {
     active_keys: HashSet<(String, Option<String>, IpAddr)>,
     coalesced_by_exe: HashMap<(String, Option<String>), QueuedWfpDrop>,
     coalesced_order: VecDeque<(String, Option<String>)>,
+    coalesced_exe_counts: HashMap<String, usize>,
     last_coalesced: Option<(String, IpAddr)>,
     capacity: usize,
 }
@@ -141,9 +142,54 @@ impl WfpDropOverflowQueue {
             active_keys: HashSet::new(),
             coalesced_by_exe: HashMap::new(),
             coalesced_order: VecDeque::new(),
+            coalesced_exe_counts: HashMap::new(),
             last_coalesced: None,
             capacity: capacity.max(1),
         }
+    }
+
+    fn remove_coalesced_entry(
+        &mut self,
+        key: &(String, Option<String>),
+    ) -> Option<QueuedWfpDrop> {
+        let removed = self.coalesced_by_exe.remove(key)?;
+        if let Some(count) = self.coalesced_exe_counts.get_mut(&key.0) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.coalesced_exe_counts.remove(&key.0);
+            }
+        }
+        Some(removed)
+    }
+
+    fn evict_coalesced_fair(&mut self, incoming_exe: &str) -> Option<(String, Option<String>)> {
+        // Tier 1: Reclaim an extra slot from any executable holding >1 package slot so shared
+        // host executables cannot starve unrelated single-slot executables.
+        // Tier 2: Reclaim the incoming executable's own existing slot if it already has >=1 slot.
+        // Tier 3: Fall back to oldest FIFO across single-slot executables.
+        let target_idx = self
+            .coalesced_order
+            .iter()
+            .position(|(exe, _)| self.coalesced_exe_counts.get(exe).copied().unwrap_or(0) > 1)
+            .or_else(|| {
+                (self
+                    .coalesced_exe_counts
+                    .get(incoming_exe)
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1)
+                    .then(|| {
+                        self.coalesced_order
+                            .iter()
+                            .position(|(exe, _)| exe == incoming_exe)
+                    })
+                    .flatten()
+            })
+            .or_else(|| (!self.coalesced_order.is_empty()).then_some(0));
+        let idx = target_idx?;
+        let key = self.coalesced_order.remove(idx)?;
+        self.remove_coalesced_entry(&key);
+        Some(key)
     }
 
     pub(super) fn push(&mut self, item: QueuedWfpDrop) -> OverflowPushOutcome {
@@ -172,16 +218,30 @@ impl WfpDropOverflowQueue {
             entry.insert(item);
             return OverflowPushOutcome::CoalescedOverwritten;
         }
+        let mut evicted_same_exe = false;
         while self.coalesced_by_exe.len() >= self.capacity {
-            let Some(evicted) = self.coalesced_order.pop_front() else {
+            let Some((ev_exe, _)) = self.evict_coalesced_fair(&coalesce_key.0) else {
                 self.coalesced_by_exe.clear();
+                self.coalesced_exe_counts.clear();
+                self.coalesced_order.clear();
                 break;
             };
-            self.coalesced_by_exe.remove(&evicted);
+            if ev_exe == coalesce_key.0 {
+                evicted_same_exe = true;
+                self.last_coalesced = Some((item.exe_path.clone(), canon_dst));
+            }
         }
         self.coalesced_order.push_back(coalesce_key.clone());
+        *self
+            .coalesced_exe_counts
+            .entry(coalesce_key.0.clone())
+            .or_insert(0) += 1;
         self.coalesced_by_exe.insert(coalesce_key, item);
-        OverflowPushOutcome::CoalescedNewExe
+        if evicted_same_exe {
+            OverflowPushOutcome::CoalescedOverwritten
+        } else {
+            OverflowPushOutcome::CoalescedNewExe
+        }
     }
 
     pub(super) fn take_last_coalesced(&mut self) -> Option<(String, IpAddr)> {
@@ -199,7 +259,7 @@ impl WfpDropOverflowQueue {
             return Some(item);
         }
         while let Some(coalesce_key) = self.coalesced_order.pop_front() {
-            if let Some(item) = self.coalesced_by_exe.remove(&coalesce_key) {
+            if let Some(item) = self.remove_coalesced_entry(&coalesce_key) {
                 return Some(item);
             }
         }
@@ -1815,6 +1875,86 @@ mod unit_tests {
         assert_eq!(sec1.dst_ip, dst2);
         assert_eq!(sec2.package_sid.as_deref(), Some("S-1-15-2-222"));
         assert_eq!(sec2.dst_ip, dst);
+    }
+
+    #[test]
+    fn overflow_queue_secondary_fair_eviction_protects_other_exe_sole_slot() {
+        let bth = r"C:\Windows\System32\backgroundTaskHost.exe";
+        let other = r"C:\Tools\other.exe";
+        let third = r"C:\Tools\third.exe";
+        let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 44));
+
+        // Case A: cap = 2, primary full; secondary receives other.exe, bth+PkgA, then bth+PkgB.
+        // bth+PkgB must reclaim bth+PkgA rather than evicting other.exe's sole slot.
+        let mut q2 = WfpDropOverflowQueue::new(2);
+        assert_eq!(
+            q2.push(make_drop_item("p1.exe", None, dst)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q2.push(make_drop_item("p2.exe", None, dst)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q2.push(make_drop_item(other, None, dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q2.push(make_drop_item(bth, Some("S-1-15-2-111"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q2.push(make_drop_item(bth, Some("S-1-15-2-222"), dst)),
+            OverflowPushOutcome::CoalescedOverwritten
+        );
+        let _ = q2.pop().expect("p1");
+        let _ = q2.pop().expect("p2");
+        let rem_a1 = q2.pop().expect("other survives");
+        let rem_a2 = q2.pop().expect("bth 222 survives");
+        assert!(q2.pop().is_none());
+        assert_eq!(rem_a1.exe_path, other);
+        assert_eq!(rem_a2.exe_path, bth);
+        assert_eq!(rem_a2.package_sid.as_deref(), Some("S-1-15-2-222"));
+
+        // Case B: cap = 3, primary full; secondary has [other, bth+111, bth+222].
+        // Pushing brand-new third.exe reclaims multi-slot bth+111 before other's sole slot.
+        let mut q3 = WfpDropOverflowQueue::new(3);
+        for name in ["p1.exe", "p2.exe", "p3.exe"] {
+            assert_eq!(
+                q3.push(make_drop_item(name, None, dst)),
+                OverflowPushOutcome::Queued
+            );
+        }
+        assert_eq!(
+            q3.push(make_drop_item(other, None, dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q3.push(make_drop_item(bth, Some("S-1-15-2-111"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q3.push(make_drop_item(bth, Some("S-1-15-2-222"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q3.push(make_drop_item(third, None, dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        for _ in 0..3 {
+            let _ = q3.pop().expect("primary item");
+        }
+        let sec: Vec<(String, Option<String>)> = std::iter::from_fn(|| q3.pop())
+            .map(|i| (i.exe_path, i.package_sid))
+            .collect();
+        assert_eq!(
+            sec,
+            vec![
+                (other.to_string(), None),
+                (bth.to_string(), Some("S-1-15-2-222".to_string())),
+                (third.to_string(), None),
+            ]
+        );
     }
 
     #[test]

@@ -1518,16 +1518,8 @@ impl DaemonEngine {
             }
             SensorEvent::ProcessStop { pid, .. } => {
                 let (id, exe_path, pkg_pfn, pkg_sid) =
-                    match table.on_process_stop_with_exe(*pid, event_ts_ms) {
-                        Some((inst_id, exe)) => {
-                            let (pfn, sid) = table
-                                .get_by_instance_id(&inst_id)
-                                .map(|entry| {
-                                    (entry.package_family_name.clone(), entry.package_sid.clone())
-                                })
-                                .unwrap_or((None, None));
-                            (Some(inst_id), Some(exe), pfn, sid)
-                        }
+                    match table.on_process_stop_with_package(*pid, event_ts_ms) {
+                        Some((inst_id, exe, pfn, sid)) => (Some(inst_id), Some(exe), pfn, sid),
                         None => (None, None, None, None),
                     };
                 ResolvedProcessContext {

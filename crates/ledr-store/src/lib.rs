@@ -73,6 +73,22 @@ pub struct PurgeStats {
     pub downloads_deleted: usize,
 }
 
+/// Supplementary non-frozen process attributes persisted alongside a `ProcessStart` event (`FU-P4-03`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessExtraMetadata<'a> {
+    pub origin_url: Option<&'a str>,
+    pub sha256: Option<&'a str>,
+    pub package_family_name: Option<&'a str>,
+    pub package_sid: Option<&'a str>,
+}
+
+/// Package and AppContainer attributes persisted on a `processes` row (`FU-P4-03`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessPackageRecord {
+    pub package_family_name: Option<String>,
+    pub package_sid: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct BufferedEvent {
     event: SensorEvent,
@@ -91,6 +107,10 @@ struct BufferedEvent {
     origin_url: Option<String>,
     /// Lowercase hex SHA-256 attached on `ProcessStart` when known; `None` for every other event.
     sha256: Option<String>,
+    /// Package family name attached on `ProcessStart` when known; `None` for every other event.
+    package_family_name: Option<String>,
+    /// AppContainer package SID attached on `ProcessStart` when known; `None` for every other event.
+    package_sid: Option<String>,
 }
 
 const MAX_PENDING_SUPERSEDED_EXITS: usize = 1_024;
@@ -190,6 +210,7 @@ impl LedrStore {
         let writer = Connection::open_with_flags(path, writer_open_flags())?;
         apply_writer_pragmas(&writer)?;
         writer.execute_batch(SCHEMA_DDL)?;
+        schema::ensure_process_package_columns(&writer)?;
         honeypots::ensure_honeypot_file_id_columns(&writer)?;
 
         let reader = Connection::open_with_flags(path, reader_open_flags())?;
@@ -218,6 +239,7 @@ impl LedrStore {
         let conn = Connection::open_in_memory()?;
         apply_writer_pragmas(&conn)?;
         conn.execute_batch(SCHEMA_DDL)?;
+        schema::ensure_process_package_columns(&conn)?;
         honeypots::ensure_honeypot_file_id_columns(&conn)?;
 
         let shared = Arc::new(Mutex::new(conn));
@@ -451,6 +473,53 @@ impl LedrStore {
         Ok(updated_in_batch || rows_affected > 0)
     }
 
+    /// Backfills missing `package_family_name` and `package_sid` on a `ProcessStart` without
+    /// overwriting already-populated columns (`COALESCE`), updating both any pending batch buffer
+    /// entry and committed `processes` row under the canonical `writer -> batch` lock order.
+    pub fn update_process_package_metadata(
+        &self,
+        process_instance_id: &str,
+        package_family_name: Option<&str>,
+        package_sid: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let clean_instance = process_instance_id.trim();
+        let clean_pfn = normalize_optional_str(package_family_name);
+        let clean_sid = normalize_optional_str(package_sid);
+        if clean_instance.is_empty() || (clean_pfn.is_none() && clean_sid.is_none()) {
+            return Ok(false);
+        }
+
+        let writer = self.lock_writer()?;
+        let mut updated_in_batch = false;
+        {
+            let mut batch = self.lock_batch()?;
+            for buffered in &mut batch.events {
+                if let SensorEvent::ProcessStart { identity, .. } = &buffered.event {
+                    if identity.instance_id() == clean_instance {
+                        if buffered.package_family_name.is_none() && clean_pfn.is_some() {
+                            buffered.package_family_name = clean_pfn.clone();
+                            updated_in_batch = true;
+                        }
+                        if buffered.package_sid.is_none() && clean_sid.is_some() {
+                            buffered.package_sid = clean_sid.clone();
+                            updated_in_batch = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let rows_affected = writer.execute(
+            "UPDATE processes
+             SET package_family_name = COALESCE(package_family_name, ?1),
+                 package_sid = COALESCE(package_sid, ?2)
+             WHERE process_instance_id = ?3",
+            params![clean_pfn, clean_sid, clean_instance],
+        )?;
+
+        Ok(updated_in_batch || rows_affected > 0)
+    }
+
     /// Flushes all buffered events and executes `PRAGMA wal_checkpoint(TRUNCATE);` (`AUTO-10`).
     pub fn checkpoint_truncate(&self) -> Result<(), StoreError> {
         let _ = self.checkpoint_truncate_with_deadline(
@@ -546,6 +615,12 @@ pub(crate) fn normalize_sha256(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_ascii_lowercase)
+}
+
+pub(crate) fn normalize_optional_str(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]

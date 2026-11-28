@@ -18,12 +18,46 @@ pub use self::file_canary::{
     prefilter_and_classify_canary, prefilter_and_classify_canary_u16,
 };
 pub use self::session::{
-    DEFAULT_ETW_SESSION_NAME, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
+    DEFAULT_ETW_SESSION_NAME, EventSinkFn, NoopSensorBackend, PackageAwareEventSinkFn,
+    WindowsEtwSensor,
 };
 pub use self::snapshot::{
-    LiveSiblingCheck, capture_running_processes, find_other_live_processes_for_exe_key,
-    try_capture_running_processes,
+    CapturedProcessSnapshot, LiveSiblingCheck, capture_running_processes,
+    find_other_live_processes_for_exe_key, try_capture_running_processes,
+    try_capture_running_processes_with_package,
 };
+
+/// Package and AppContainer attributes gathered from a live process handle/token (`FU-P4-03`).
+///
+/// Both fields are collected independently without synthesizing a `package_sid` from
+/// `package_family_name` when `TokenAppContainerSid` is absent (`PFN_ONLY_NON_APPCONTAINER`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessPackageInfo {
+    pub package_family_name: Option<String>,
+    pub package_sid: Option<String>,
+}
+
+impl ProcessPackageInfo {
+    /// Returns `true` when neither `package_family_name` nor `package_sid` is populated.
+    pub fn is_empty(&self) -> bool {
+        self.package_family_name.is_none() && self.package_sid.is_none()
+    }
+
+    /// Trims whitespace and converts empty strings to `None` on both fields.
+    pub fn normalized(self) -> Self {
+        Self {
+            package_family_name: normalize_optional_attr(self.package_family_name),
+            package_sid: normalize_optional_attr(self.package_sid),
+        }
+    }
+}
+
+fn normalize_optional_attr(raw: Option<String>) -> Option<String> {
+    raw.and_then(|s| {
+        let trimmed = s.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
 
 /// Live process attributes retrieved on demand via Win32 `OpenProcess` / `GetProcessTimes` /
 /// `QueryFullProcessImageNameW` / `NtQueryInformationProcess`.
@@ -32,6 +66,8 @@ pub struct LiveProcessInfo {
     pub create_time_100ns: u64,
     pub exe_path: Option<String>,
     pub command_line: Option<String>,
+    pub package_family_name: Option<String>,
+    pub package_sid: Option<String>,
 }
 
 /// On-demand process inspection fallback for ETW cross-provider ordering races (e.g., when
@@ -43,6 +79,8 @@ pub fn inspect_live_process(pid: u32) -> Option<LiveProcessInfo> {
         create_time_100ns: info.create_time_100ns,
         exe_path: info.exe_path,
         command_line: info.command_line,
+        package_family_name: info.package_family_name,
+        package_sid: info.package_sid,
     })
 }
 

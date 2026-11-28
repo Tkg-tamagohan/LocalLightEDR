@@ -3694,6 +3694,7 @@ async fn daemon_p3_25_wfp_drop_sink_correlation_dedup_and_weak_ref() {
         dst_ip: drop_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 10,
+        package_sid: None,
     };
     assert!(engine.ingest_wfp_drop_event(ev1.clone()));
     // Rapid retry within 250ms is deduplicated!
@@ -4004,6 +4005,7 @@ async fn daemon_p3_28_wfp_drop_waits_for_delayed_dns_allow_and_suspends_on_timeo
         dst_ip: allowed_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 10,
+        package_sid: None,
     }));
 
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -4045,6 +4047,7 @@ async fn daemon_p3_28_wfp_drop_waits_for_delayed_dns_allow_and_suspends_on_timeo
         dst_ip: raw_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 400,
+        package_sid: None,
     }));
     assert!(
         wait_until(1_500, || {
@@ -4118,6 +4121,7 @@ async fn daemon_p3_29_wfp_drop_multi_instance_disambiguation_and_ambiguous_app_a
         dst_ip: ambig_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 10,
+        package_sid: None,
     }));
 
     assert!(
@@ -4155,6 +4159,7 @@ async fn daemon_p3_29_wfp_drop_multi_instance_disambiguation_and_ambiguous_app_a
         dst_ip: ambig_ip,
         dst_port: 444,
         timestamp_ms: now_ms + 400,
+        package_sid: None,
     }));
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
@@ -4231,6 +4236,7 @@ async fn daemon_p3_29_wfp_drop_multi_instance_disambiguation_and_ambiguous_app_a
         dst_ip: shared_ip,
         dst_port: 8443,
         timestamp_ms: now_ms + 700,
+        package_sid: None,
     }));
     assert!(
         wait_until(1_500, || {
@@ -4711,6 +4717,7 @@ async fn daemon_p3_32_wfp_drop_ignores_unrelated_pid_dns_and_allows_ambiguous_ci
         dst_ip: dom_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 10,
+        package_sid: None,
     }));
 
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4778,6 +4785,7 @@ async fn daemon_p3_32_wfp_drop_ignores_unrelated_pid_dns_and_allows_ambiguous_ci
         dst_ip: cidr_ip_ok,
         dst_port: 443,
         timestamp_ms: now_ms + 100,
+        package_sid: None,
     }));
     assert!(
         wait_until(1_500, || {
@@ -4800,6 +4808,7 @@ async fn daemon_p3_32_wfp_drop_ignores_unrelated_pid_dns_and_allows_ambiguous_ci
         dst_ip: cidr_ip_fail,
         dst_port: 443,
         timestamp_ms: now_ms + 150,
+        package_sid: None,
     }));
     assert!(
         wait_until(1_500, || {
@@ -4918,6 +4927,7 @@ async fn daemon_p3_33_wfp_drop_not_starved_by_telemetry_burst_and_overflow() {
         dst_ip: first_drop_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 1,
+        package_sid: None,
     }));
 
     assert!(
@@ -4952,6 +4962,7 @@ async fn daemon_p3_33_wfp_drop_not_starved_by_telemetry_burst_and_overflow() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, i)),
             dst_port: 8443,
             timestamp_ms: now_ms + 100 + i64::from(i),
+            package_sid: None,
         }));
     }
     assert!(
@@ -5754,6 +5765,7 @@ async fn daemon_p3_39_rotated_or_stale_dns_history_stops_blocking_cidr_allowed_i
         dst_ip: old_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 30,
+        package_sid: None,
     }));
     assert!(
         wait_until(1_000, || engine.has_active_wfp_filter(
@@ -5815,6 +5827,7 @@ async fn daemon_p3_39_rotated_or_stale_dns_history_stops_blocking_cidr_allowed_i
         dst_ip: shared_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 5_000,
+        package_sid: None,
     }));
     assert!(
         wait_until(1_000, || {
@@ -5841,6 +5854,7 @@ async fn daemon_p3_39_rotated_or_stale_dns_history_stops_blocking_cidr_allowed_i
         dst_ip: shared_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 70_000,
+        package_sid: None,
     }));
     assert!(
         wait_until(1_000, || engine.has_active_wfp_filter(
@@ -5936,6 +5950,7 @@ async fn daemon_p3_40_unrelated_domain_permit_removal_failure_scoped_away_from_g
         dst_ip: shared_ip,
         dst_port: 443,
         timestamp_ms: now_ms + 10,
+        package_sid: None,
     }));
     assert!(
         wait_until(1_000, || {
@@ -6521,6 +6536,7 @@ async fn daemon_p3_43_dual_stack_out_of_order_dns_permit_and_stale_drop_rejectio
         dst_ip: v4_next,
         dst_port: 443,
         timestamp_ms: base_ts + 3_300,
+        package_sid: None,
     }));
 
     // Synchronize via a Tier-3 Telemetry event: `run_pipeline` drains Tier-2b (`wfp_drop_rx`)
@@ -6740,6 +6756,7 @@ async fn daemon_p3_44_deterministic_wfp_drop_overflow_coalescing_preserves_lates
             dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, i)),
             dst_port: 8443,
             timestamp_ms: now_ms + i64::from(i),
+            package_sid: None,
         }));
     }
     // Distinct other apps fill the remaining 3 slots of `coalesced_by_exe` (total 4 == cap 4,
@@ -6758,6 +6775,7 @@ async fn daemon_p3_44_deterministic_wfp_drop_overflow_coalescing_preserves_lates
             dst_ip,
             dst_port: 8443,
             timestamp_ms: now_ms + id as i64,
+            package_sid: None,
         }));
     }
 
@@ -7250,6 +7268,7 @@ async fn daemon_p3_46_shared_ip_late_allowed_dns_vs_earlier_wfp_drop_and_deny_ov
             dst_ip: shared_ip,
             dst_port: 443,
             timestamp_ms: base_ts + 2_050,
+            package_sid: None,
         }));
         let tel_before = engine.metrics().telemetry_processed;
         engine
@@ -7336,6 +7355,7 @@ async fn daemon_p3_46_shared_ip_late_allowed_dns_vs_earlier_wfp_drop_and_deny_ov
             dst_ip: shared_ip,
             dst_port: 8443,
             timestamp_ms: base_ts + 2_100,
+            package_sid: None,
         }));
         let tel_before = engine.metrics().telemetry_processed;
         engine
@@ -7556,6 +7576,7 @@ async fn daemon_p3_46_shared_ip_late_allowed_dns_vs_earlier_wfp_drop_and_deny_ov
             dst_ip: shared_ip,
             dst_port: 443,
             timestamp_ms: base_ts + 2_600,
+            package_sid: None,
         }));
         let tel_before = engine2.metrics().telemetry_processed;
         engine2
@@ -8003,6 +8024,7 @@ impl P348Harness {
             dst_ip,
             dst_port,
             timestamp_ms,
+            package_sid: None,
         }));
         let tel_before = self.engine.metrics().telemetry_processed;
         self.engine
@@ -9078,6 +9100,7 @@ async fn daemon_p3_53_single_process_freeze_retry_dedup_and_grace_own_dns_allow(
             dst_ip,
             dst_port: 443,
             timestamp_ms: now_ms,
+            package_sid: None,
         }));
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert!(
@@ -9095,6 +9118,7 @@ async fn daemon_p3_53_single_process_freeze_retry_dedup_and_grace_own_dns_allow(
             dst_ip,
             dst_port: 443,
             timestamp_ms: now_ms + 280,
+            package_sid: None,
         }));
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert!(
@@ -9178,6 +9202,7 @@ async fn daemon_p3_53_single_process_freeze_retry_dedup_and_grace_own_dns_allow(
             dst_ip,
             dst_port: 443,
             timestamp_ms: now_ms + 10,
+            package_sid: None,
         }));
         tokio::time::sleep(Duration::from_millis(40)).await;
 
@@ -9286,6 +9311,7 @@ async fn daemon_p3_53_single_process_freeze_retry_dedup_and_grace_own_dns_allow(
             dst_ip,
             dst_port: 443,
             timestamp_ms: now_ms,
+            package_sid: None,
         }));
 
         assert!(

@@ -9,9 +9,9 @@ use std::sync::{Arc, RwLock};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWPM_NET_EVENT2, FWPM_NET_EVENT_CLASSIFY_DROP2, FWPM_NET_EVENT_FLAG_IP_PROTOCOL_SET,
-    FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET, FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET,
-    FWPM_NET_EVENT_HEADER2, FWPM_NET_EVENT_TYPE, FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
-    FWP_IP_VERSION_V4, FWP_IP_VERSION_V6,
+    FWPM_NET_EVENT_FLAG_PACKAGE_ID_SET, FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET,
+    FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET, FWPM_NET_EVENT_HEADER2, FWPM_NET_EVENT_TYPE,
+    FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWP_IP_VERSION_V4, FWP_IP_VERSION_V6,
 };
 
 /// Metadata indexed per OS WFP filter ID so BFE net-event drop callbacks can map dropped
@@ -34,6 +34,7 @@ pub struct WfpDropEvent {
     pub dst_ip: IpAddr,
     pub dst_port: u16,
     pub timestamp_ms: i64,
+    pub package_sid: Option<String>,
 }
 
 /// Callback sink invoked when a LocalEDR-managed WFP block filter drops an outbound connection.
@@ -90,6 +91,18 @@ pub fn parse_wfp_classify_drop_fields(
 
     let ft_100ns = crate::etw::tdh::filetime_to_u64(header.timeStamp);
     let timestamp_ms = crate::etw::tdh::filetime_100ns_to_unix_ms(ft_100ns);
+    let package_sid = if (header.flags & FWPM_NET_EVENT_FLAG_PACKAGE_ID_SET) != 0
+        && !header.packageSid.is_null()
+    {
+        crate::etw::tdh::sid_ptr_to_string(header.packageSid.cast::<c_void>())
+            .ok()
+            .and_then(|sid| {
+                let trimmed = sid.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            })
+    } else {
+        None
+    };
 
     Some(WfpDropEvent {
         os_filter_id: drop_info.filterId,
@@ -99,6 +112,7 @@ pub fn parse_wfp_classify_drop_fields(
         dst_ip,
         dst_port,
         timestamp_ms,
+        package_sid,
     })
 }
 

@@ -9,7 +9,7 @@ use crate::schema::{
     row_to_canary, row_to_dns, row_to_download, row_to_network, row_to_process, CANARY_COLS,
     DNS_COLS, DOWNLOAD_COLS, NETWORK_COLS, PROCESS_COLS,
 };
-use crate::{LedrStore, StoreError};
+use crate::{LedrStore, ProcessPackageRecord, StoreError};
 
 impl LedrStore {
     /// Queries a [`FlightRecorderSnapshot`] via the separated read-only connection.
@@ -192,6 +192,32 @@ impl LedrStore {
             .query_row("SELECT 1 FROM download_origins LIMIT 1", [], |row| row.get(0))
             .optional()?;
         Ok(found.is_some())
+    }
+
+    /// Queries the supplementary `package_family_name` and `package_sid` columns for
+    /// `process_instance_id` without altering the frozen [`ProcessRecord`] contract (`FU-P4-03`).
+    pub fn get_process_package_info(
+        &self,
+        process_instance_id: &str,
+    ) -> Result<Option<ProcessPackageRecord>, StoreError> {
+        let clean = process_instance_id.trim();
+        if clean.is_empty() {
+            return Ok(None);
+        }
+        let reader = self.lock_reader()?;
+        query_optional_row(
+            &reader,
+            "SELECT package_family_name, package_sid
+             FROM processes
+             WHERE process_instance_id = ?1",
+            params![clean],
+            |row| {
+                Ok(ProcessPackageRecord {
+                    package_family_name: row.get(0)?,
+                    package_sid: row.get(1)?,
+                })
+            },
+        )
     }
 }
 

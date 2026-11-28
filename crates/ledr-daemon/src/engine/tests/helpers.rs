@@ -241,6 +241,7 @@ pub(super) fn make_queued_drop(
         protocol: 6,
         timestamp_ms,
         os_filter_id,
+        package_sid: None,
     }
 }
 

@@ -9,7 +9,7 @@ use ledr_proto::{
 use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::alerts::insert_alert_row;
-use crate::{BufferedEvent, LedrStore, StoreError};
+use crate::{BufferedEvent, LedrStore, ProcessExtraMetadata, StoreError};
 
 const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
 const TICKS_PER_MS: u64 = 10_000;
@@ -102,6 +102,36 @@ impl LedrStore {
         is_nrd: bool,
         action: &str,
     ) -> Result<bool, StoreError> {
+        self.ingest_event_with_extra_metadata(
+            event,
+            parent_instance_id,
+            exited_at_ms,
+            superseded_process_exit,
+            ProcessExtraMetadata {
+                origin_url,
+                sha256,
+                package_family_name: None,
+                package_sid: None,
+            },
+            is_nrd,
+            action,
+        )
+    }
+
+    /// Same as [`Self::ingest_event_with_process_metadata`], additionally persisting
+    /// `package_family_name` and `package_sid` on `ProcessStart` inside the same SQLite
+    /// transaction (`FU-P4-03`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_event_with_extra_metadata(
+        &self,
+        event: &SensorEvent,
+        parent_instance_id: Option<&str>,
+        exited_at_ms: Option<i64>,
+        superseded_process_exit: Option<(&str, i64)>,
+        extra: ProcessExtraMetadata<'_>,
+        is_nrd: bool,
+        action: &str,
+    ) -> Result<bool, StoreError> {
         if matches!(event, SensorEvent::ScriptEvaluated { .. }) {
             // Evaluated in-memory by Layer 2 SigmaEngine and stored in alerts.context_json on match.
             tracing::trace!("skipping direct telemetry table buffering for ScriptEvaluated");
@@ -123,15 +153,22 @@ impl LedrStore {
                 None
             },
             origin_url: if is_process_start {
-                origin_url
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
+                crate::normalize_optional_str(extra.origin_url)
             } else {
                 None
             },
             sha256: if is_process_start {
-                crate::normalize_sha256(sha256)
+                crate::normalize_sha256(extra.sha256)
+            } else {
+                None
+            },
+            package_family_name: if is_process_start {
+                crate::normalize_optional_str(extra.package_family_name)
+            } else {
+                None
+            },
+            package_sid: if is_process_start {
+                crate::normalize_optional_str(extra.package_sid)
             } else {
                 None
             },
@@ -239,9 +276,9 @@ impl LedrStore {
                     .unwrap_or(exit_ms)
                     .max(adjusted.created_at_ms),
             );
-            upsert_process_row(&tx, &adjusted, false)?;
+            upsert_process_row(&tx, &adjusted, false, None, None)?;
         } else {
-            upsert_process_row(&tx, process, false)?;
+            upsert_process_row(&tx, process, false, None, None)?;
         }
         tx.commit()?;
         if pending_exit_ms.is_some() {
@@ -382,12 +419,15 @@ fn upsert_process_row(
     tx: &Transaction<'_>,
     process: &ProcessRecord,
     preserve_existing_identity_fields: bool,
+    package_family_name: Option<&str>,
+    package_sid: Option<&str>,
 ) -> Result<(), StoreError> {
     let sql = if preserve_existing_identity_fields {
         "INSERT INTO processes (
             process_instance_id, pid, parent_instance_id, ppid, exe_path, command_line,
-            sha256, signer_subject, is_trusted_os, user_sid, origin_url, created_at_ms, exited_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            sha256, signer_subject, is_trusted_os, user_sid, origin_url,
+            package_family_name, package_sid, created_at_ms, exited_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(process_instance_id) DO UPDATE SET
             pid = excluded.pid,
             parent_instance_id = COALESCE(excluded.parent_instance_id, processes.parent_instance_id),
@@ -408,12 +448,15 @@ fn upsert_process_row(
             END,
             user_sid = COALESCE(excluded.user_sid, processes.user_sid),
             origin_url = COALESCE(excluded.origin_url, processes.origin_url),
+            package_family_name = COALESCE(excluded.package_family_name, processes.package_family_name),
+            package_sid = COALESCE(excluded.package_sid, processes.package_sid),
             exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)"
     } else {
         "INSERT INTO processes (
             process_instance_id, pid, parent_instance_id, ppid, exe_path, command_line,
-            sha256, signer_subject, is_trusted_os, user_sid, origin_url, created_at_ms, exited_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            sha256, signer_subject, is_trusted_os, user_sid, origin_url,
+            package_family_name, package_sid, created_at_ms, exited_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(process_instance_id) DO UPDATE SET
             pid = excluded.pid,
             parent_instance_id = COALESCE(excluded.parent_instance_id, processes.parent_instance_id),
@@ -428,6 +471,8 @@ fn upsert_process_row(
             END,
             user_sid = COALESCE(excluded.user_sid, processes.user_sid),
             origin_url = COALESCE(excluded.origin_url, processes.origin_url),
+            package_family_name = COALESCE(excluded.package_family_name, processes.package_family_name),
+            package_sid = COALESCE(excluded.package_sid, processes.package_sid),
             exited_at_ms = COALESCE(processes.exited_at_ms, excluded.exited_at_ms)"
     };
     tx.execute(
@@ -444,6 +489,8 @@ fn upsert_process_row(
             i64::from(process.is_trusted_os),
             process.user_sid,
             process.origin_url,
+            package_family_name,
+            package_sid,
             process.created_at_ms,
             process.exited_at_ms,
         ],
@@ -541,7 +588,13 @@ fn write_buffered_events(
                             .max(record.created_at_ms),
                     );
                 }
-                upsert_process_row(tx, &record, true)?;
+                upsert_process_row(
+                    tx,
+                    &record,
+                    true,
+                    item.package_family_name.as_deref(),
+                    item.package_sid.as_deref(),
+                )?;
                 if let Some((superseded_id, superseded_exit_ms)) = &item.superseded_process_exit {
                     if superseded_id != &record.process_instance_id {
                         let updated = tx.execute(

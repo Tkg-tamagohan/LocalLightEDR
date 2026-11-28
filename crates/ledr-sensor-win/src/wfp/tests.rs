@@ -459,6 +459,7 @@ fn sens_p3_09_parse_wfp_classify_drop_fields_v4_v6_flags_and_filter_matching() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
             dst_port: 443,
             timestamp_ms: expected_ts_ms,
+            package_sid: None,
         }
     );
 
@@ -595,6 +596,88 @@ fn sens_p3_09_parse_wfp_classify_drop_fields_v4_v6_flags_and_filter_matching() {
     .expect("drop without protocol/port flags still extracts remote addr");
     assert_eq!(partial.protocol, 0);
     assert_eq!(partial.dst_port, 0);
+    assert_eq!(partial.package_sid, None);
+
+    // 5. Package SID extraction follows `FWPM_NET_EVENT_FLAG_PACKAGE_ID_SET` and non-null `packageSid`.
+    {
+        use std::ffi::c_void;
+        use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_NET_EVENT_FLAG_PACKAGE_ID_SET;
+        use windows::Win32::Security::SID;
+
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut *mut c_void) -> i32;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+        }
+        struct LocalSid(*mut c_void);
+        impl Drop for LocalSid {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: allocated by `ConvertStringSidToSidW`.
+                    unsafe {
+                        let _ = LocalFree(self.0);
+                    }
+                }
+            }
+        }
+
+        let expected_sid = "S-1-15-2-1-2-3-4-5-6-7";
+        let wide: Vec<u16> = expected_sid
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut raw_sid: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated UTF-16; `raw_sid` is freed by `LocalSid`.
+        assert_ne!(unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut raw_sid) }, 0);
+        let _sid_guard = LocalSid(raw_sid);
+
+        // (a) Flag set + valid AppContainer SID -> extracted.
+        let pkg_hdr = FWPM_NET_EVENT_HEADER2 {
+            flags: v4_header.flags | FWPM_NET_EVENT_FLAG_PACKAGE_ID_SET,
+            packageSid: raw_sid.cast::<SID>(),
+            ..v4_header
+        };
+        let pkg_ev = parse_wfp_classify_drop_fields(
+            FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+            &pkg_hdr,
+            Some(&v4_drop),
+            &filter_index,
+        )
+        .expect("drop with packageSid must parse");
+        assert_eq!(pkg_ev.package_sid.as_deref(), Some(expected_sid));
+
+        // (b) Flag unset + non-null packageSid -> None.
+        let unflagged_hdr = FWPM_NET_EVENT_HEADER2 {
+            packageSid: raw_sid.cast::<SID>(),
+            ..v4_header
+        };
+        let unflagged_ev = parse_wfp_classify_drop_fields(
+            FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+            &unflagged_hdr,
+            Some(&v4_drop),
+            &filter_index,
+        )
+        .expect("drop without package flag must parse");
+        assert_eq!(unflagged_ev.package_sid, None);
+
+        // (c) Flag set + null packageSid -> None.
+        let null_sid_hdr = FWPM_NET_EVENT_HEADER2 {
+            flags: v4_header.flags | FWPM_NET_EVENT_FLAG_PACKAGE_ID_SET,
+            packageSid: std::ptr::null_mut(),
+            ..v4_header
+        };
+        let null_sid_ev = parse_wfp_classify_drop_fields(
+            FWPM_NET_EVENT_TYPE_CLASSIFY_DROP,
+            &null_sid_hdr,
+            Some(&v4_drop),
+            &filter_index,
+        )
+        .expect("drop with null packageSid must parse");
+        assert_eq!(null_sid_ev.package_sid, None);
+    }
 }
 
 #[test]

@@ -10,9 +10,10 @@ use ledr_proto::SensorEvent;
 use crate::dns_cache::DnsResolutionCache;
 use crate::path_norm::DosVolumeMap;
 
+use super::ProcessPackageInfo;
 use super::cmdline_correlator::ProcessCommandLineCorrelator;
 use super::file_canary::CanaryMatcher;
-use super::session::EventSinkFn;
+use super::session::PackageAwareEventSinkFn;
 
 const MAX_TRACKED_HONEYPOT_HANDLES: usize = 512;
 
@@ -70,7 +71,7 @@ impl HoneypotHandleTracker {
 }
 
 pub(super) struct EtwCallbackContext {
-    pub(super) sink: EventSinkFn,
+    pub(super) sink: PackageAwareEventSinkFn,
     pub(super) dns_cache: Mutex<DnsResolutionCache>,
     pub(super) volume_map: DosVolumeMap,
     pub(super) canary_matcher: Arc<RwLock<CanaryMatcher>>,
@@ -86,7 +87,7 @@ pub(super) struct EtwCallbackContext {
 /// Lightweight ETW callback context for the auxiliary `EVENT_TRACE_SYSTEM_LOGGER_MODE`
 /// (`EVENT_TRACE_FLAG_PROCESS`) session supplying kernel-captured `CommandLine` values.
 pub(super) struct AuxSystemProcessContext {
-    pub(super) sink: EventSinkFn,
+    pub(super) sink: PackageAwareEventSinkFn,
     pub(super) cmdline_correlator: Arc<Mutex<ProcessCommandLineCorrelator>>,
     pub(super) stop_requested: Arc<AtomicBool>,
     pub(super) aux_active: Arc<AtomicBool>,
@@ -100,11 +101,15 @@ impl AuxSystemProcessContext {
     /// downstream sink (in production, `TwoLaneSender::blocking_send` on the non-dropping
     /// `L-10` high-priority lane), and marks `stop_requested` / clears `aux_active` only
     /// when the downstream sink closes.
-    pub(super) fn dispatch_event(&self, event: SensorEvent) -> bool {
+    pub(super) fn dispatch_event_with_package(
+        &self,
+        event: SensorEvent,
+        package: ProcessPackageInfo,
+    ) -> bool {
         if self.stop_requested.load(Ordering::Acquire) {
             return false;
         }
-        if !(self.sink)(event) {
+        if !(self.sink)(event, package) {
             self.stop_requested.store(true, Ordering::Release);
             self.aux_active.store(false, Ordering::Release);
             return false;
@@ -124,10 +129,18 @@ impl EtwCallbackContext {
     /// Marks `stop_requested` only once the sink returns `false` (downstream receiver closed)
     /// or if cancellation was already requested.
     pub(super) fn dispatch_event(&self, event: SensorEvent) -> bool {
+        self.dispatch_event_with_package(event, ProcessPackageInfo::default())
+    }
+
+    pub(super) fn dispatch_event_with_package(
+        &self,
+        event: SensorEvent,
+        package: ProcessPackageInfo,
+    ) -> bool {
         if self.stop_requested.load(Ordering::Acquire) {
             return false;
         }
-        if !(self.sink)(event) {
+        if !(self.sink)(event, package) {
             self.stop_requested.store(true, Ordering::Release);
             return false;
         }

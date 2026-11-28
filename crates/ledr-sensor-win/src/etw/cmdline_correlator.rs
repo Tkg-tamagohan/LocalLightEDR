@@ -4,6 +4,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
+use super::ProcessPackageInfo;
+
 pub(super) const MAX_CACHED_SYSTEM_CMDLINES: usize = 2048;
 pub(super) const MAX_CACHED_SYSTEM_CMDLINE_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const MAX_PENDING_KERNEL_STARTS: usize = 1024;
@@ -29,6 +31,7 @@ pub(super) struct PendingKernelStart {
     pub parent_pid: u32,
     pub exe_path: String,
     pub user_sid: Option<String>,
+    pub package: ProcessPackageInfo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,6 +643,7 @@ mod tests {
             parent_pid: ppid,
             exe_path: exe.to_string(),
             user_sid: None,
+            package: ProcessPackageInfo::default(),
         }
     }
 

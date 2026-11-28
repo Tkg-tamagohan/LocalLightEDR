@@ -33,6 +33,7 @@ fn make_wfp_drop_event(exe: &str, last_octet: u8, timestamp_ms: i64) -> WfpDropE
         dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, last_octet)),
         dst_port: 443,
         timestamp_ms,
+        package_sid: None,
     }
 }
 
@@ -89,6 +90,7 @@ fn daemon_p3_44a_wfp_drop_overflow_queue_coalescing_and_fifo_eviction() {
         protocol: 6,
         timestamp_ms: 1_000,
         os_filter_id: 1,
+        package_sid: None,
     };
 
     let ip1 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
@@ -248,6 +250,7 @@ fn daemon_p3_44a_wfp_drop_overflow_queue_coalescing_and_fifo_eviction() {
             dst_ip: ip,
             dst_port: port,
             timestamp_ms: ts,
+            package_sid: None,
         };
         assert!(engine.ingest_wfp_drop_event(mk(ip1, 443))); // fills wfp_drop_tx
         assert_eq!(engine.wfp_drop_overflow_pushed(), 0);

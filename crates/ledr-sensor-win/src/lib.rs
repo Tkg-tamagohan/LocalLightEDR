@@ -15,6 +15,10 @@ pub use etw::file_canary::{
     CanaryMatcher, is_autorun_registry_key, is_autorun_registry_key_u16,
     prefilter_and_classify_canary, prefilter_and_classify_canary_u16,
 };
+pub use etw::{
+    CapturedProcessSnapshot, LiveProcessInfo, PackageAwareEventSinkFn, ProcessPackageInfo,
+    try_capture_running_processes_with_package,
+};
 pub use motw::{
     MAX_ZONE_IDENTIFIER_BYTES, MotwZoneInfo, ZONE_ID_INTERNET, parse_zone_identifier,
     read_zone_identifier, write_zone_identifier,

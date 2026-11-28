@@ -50,6 +50,7 @@ pub(super) struct QueuedWfpDrop {
     pub(super) protocol: u8,
     pub(super) timestamp_ms: i64,
     pub(super) os_filter_id: u64,
+    pub(super) package_sid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,8 @@ struct WfpCandidate {
     motw_referrer: Option<String>,
     motw_frame_url: Option<String>,
     motw_zone_id: Option<u32>,
+    package_family_name: Option<String>,
+    package_sid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,12 +277,25 @@ impl DaemonEngine {
             current_unix_ms()
         };
 
+        let package_sid = drop_ev
+            .package_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
         {
             let mut dedup = self
                 .wfp_drop_dedup
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if !dedup.should_emit(&exe_key, canon_ip, drop_ev.dst_port, effective_ts) {
+            if !dedup.should_emit(
+                &exe_key,
+                package_sid.as_deref(),
+                canon_ip,
+                drop_ev.dst_port,
+                effective_ts,
+            ) {
                 return false;
             }
         }
@@ -292,6 +308,7 @@ impl DaemonEngine {
             protocol: drop_ev.protocol,
             timestamp_ms: effective_ts,
             os_filter_id: drop_ev.os_filter_id,
+            package_sid,
         };
         match self.wfp_drop_tx.try_send(queued) {
             Ok(()) => true,
@@ -427,6 +444,8 @@ impl DaemonEngine {
                         motw_referrer: e.motw_referrer.clone(),
                         motw_frame_url: e.motw_frame_url.clone(),
                         motw_zone_id: e.motw_zone_id,
+                        package_family_name: e.package_family_name.clone(),
+                        package_sid: e.package_sid.clone(),
                     }
                 })
                 .collect();
@@ -462,6 +481,8 @@ impl DaemonEngine {
                 motw_referrer: None,
                 motw_frame_url: None,
                 motw_zone_id: None,
+                package_family_name: None,
+                package_sid: None,
             });
         }
         let mut ambiguous = candidates.len() > 1;
@@ -520,6 +541,8 @@ impl DaemonEngine {
                                     motw_referrer: None,
                                     motw_frame_url: None,
                                     motw_zone_id: None,
+                                    package_family_name: None,
+                                    package_sid: None,
                                 });
                             }
                         }
@@ -1054,6 +1077,11 @@ impl DaemonEngine {
             motw_referrer: cand.motw_referrer.clone(),
             motw_frame_url: cand.motw_frame_url.clone(),
             motw_zone_id: cand.motw_zone_id,
+            package_family_name: cand.package_family_name.clone(),
+            package_sid: item
+                .package_sid
+                .clone()
+                .or_else(|| cand.package_sid.clone()),
             proc_sha256: None,
             proc_created_at_ms: None,
         };
@@ -1409,6 +1437,8 @@ impl DaemonEngine {
         let candidate_pids: Vec<u32> = candidates.iter().map(|c| c.identity.pid).collect();
         let candidate_instance_ids: Vec<&str> =
             candidates.iter().map(|c| c.instance_id.as_str()).collect();
+        let (effective_package_family_name, effective_package_sid) =
+            resolve_ambiguous_package_context(item.package_sid.as_deref(), candidates);
         let context_json = serde_json::json!({
             "attribution": "app_level_ambiguous",
             "pid": serde_json::Value::Null,
@@ -1432,6 +1462,8 @@ impl DaemonEngine {
             "motw_referrer": motw_cand.and_then(|c| c.motw_referrer.as_deref()),
             "motw_frame_url": motw_cand.and_then(|c| c.motw_frame_url.as_deref()),
             "motw_zone_id": motw_cand.and_then(|c| c.motw_zone_id),
+            "package_family_name": effective_package_family_name,
+            "package_sid": effective_package_sid,
         })
         .to_string();
 
@@ -1488,12 +1520,67 @@ impl DaemonEngine {
     }
 }
 
+fn resolve_ambiguous_package_context(
+    event_package_sid: Option<&str>,
+    candidates: &[WfpCandidate],
+) -> (Option<String>, Option<String>) {
+    let effective_sid = event_package_sid
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            let first = candidates.first()?.package_sid.as_deref()?;
+            candidates
+                .iter()
+                .all(|c| {
+                    c.package_sid
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(first))
+                })
+                .then(|| first.to_owned())
+        });
+
+    let effective_pfn = if let Some(ref sid) = effective_sid {
+        let mut unique_pfns: HashSet<&str> = HashSet::new();
+        for c in candidates {
+            if c.package_sid
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(sid))
+            {
+                if let Some(pfn) = c
+                    .package_family_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    unique_pfns.insert(pfn);
+                }
+            }
+        }
+        (unique_pfns.len() == 1).then(|| (*unique_pfns.iter().next().unwrap()).to_owned())
+    } else {
+        candidates
+            .first()
+            .and_then(|c| c.package_family_name.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|first| {
+                candidates
+                    .iter()
+                    .all(|c| c.package_family_name.as_deref().map(str::trim) == Some(first))
+                    .then(|| first.to_owned())
+            })
+    };
+
+    (effective_pfn, effective_sid)
+}
+
 #[derive(Debug, Default)]
 pub(super) struct WfpDropDedupCache {
     capacity: usize,
     window_ms: i64,
-    last_seen: HashMap<(String, IpAddr, u16), i64>,
-    insertion_order: VecDeque<(String, IpAddr, u16)>,
+    last_seen: HashMap<(String, Option<String>, IpAddr, u16), i64>,
+    insertion_order: VecDeque<(String, Option<String>, IpAddr, u16)>,
 }
 
 impl WfpDropDedupCache {
@@ -1506,8 +1593,19 @@ impl WfpDropDedupCache {
         }
     }
 
-    fn should_emit(&mut self, exe_key: &str, ip: IpAddr, port: u16, ts_ms: i64) -> bool {
-        let key = (exe_key.to_string(), canonical_ip(ip), port);
+    fn should_emit(
+        &mut self,
+        exe_key: &str,
+        package_sid: Option<&str>,
+        ip: IpAddr,
+        port: u16,
+        ts_ms: i64,
+    ) -> bool {
+        let norm_sid = package_sid
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase);
+        let key = (exe_key.to_string(), norm_sid, canonical_ip(ip), port);
         if let Some(prev_ts) = self.last_seen.get_mut(&key) {
             if ts_ms >= *prev_ts && ts_ms.saturating_sub(*prev_ts) < self.window_ms {
                 return false;

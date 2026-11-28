@@ -115,10 +115,10 @@ fn sens_06_custom_sink_and_graceful_stop_drain() {
         command_line: "cmd.exe /c echo ok".to_string(),
         user_sid: None,
     };
-    assert!((legacy_sensor.sink)(sample_start.clone()));
+    assert!((legacy_sensor.sink)(sample_start.clone(), ProcessPackageInfo::default()));
     assert!(rx.try_recv().is_ok());
     drop(rx);
-    assert!(!(legacy_sensor.sink)(sample_start.clone()));
+    assert!(!(legacy_sensor.sink)(sample_start.clone(), ProcessPackageInfo::default()));
 
     let (tx2, _rx2) = mpsc::channel();
     let named_legacy = WindowsEtwSensor::with_session_name(tx2, "LocalEDR-Legacy-Named");
@@ -533,7 +533,7 @@ fn sens_p2_08_registry_missing_status_continues_processing() {
 
 #[test]
 fn sens_p3_08_etw_per_pid_dns_isolation_and_pid_reuse_eviction() {
-    let sink: EventSinkFn = Arc::new(|_| true);
+    let sink: PackageAwareEventSinkFn = Arc::new(|_, _| true);
     let ctx = EtwCallbackContext {
         sink,
         dns_cache: Mutex::new(DnsResolutionCache::default()),

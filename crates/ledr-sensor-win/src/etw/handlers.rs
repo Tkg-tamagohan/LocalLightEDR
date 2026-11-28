@@ -6,6 +6,7 @@ use ledr_proto::{CanaryCategory, ProcessIdentity, ScriptSource, SensorEvent};
 use windows::core::GUID;
 use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, EVENT_TRACE_LOGFILEW};
 
+use super::ProcessPackageInfo;
 use super::cmdline_correlator::{
     PendingKernelStart, SystemProcessCommandLine, TakeOrRegisterOutcome,
 };
@@ -13,7 +14,7 @@ use super::context::{AuxSystemProcessContext, EtwCallbackContext};
 use super::registry::handle_kernel_registry;
 use super::tdh::{
     ProcessInspectInfo, TdhEventInfo, filetime_100ns_to_unix_ms, inspect_process_by_pid,
-    parse_dns_query_results,
+    inspect_process_package_by_pid, parse_dns_query_results,
 };
 
 static KERNEL_PROCESS_RECEIVED: AtomicU64 = AtomicU64::new(0);
@@ -123,8 +124,8 @@ pub(super) unsafe extern "system" fn event_record_callback(event_record: *mut EV
             );
         }
         if event_id == 1 {
-            if let Some(event) = handle_process_start(record, ctx) {
-                dispatch_process_start_with_correlator(ctx, event);
+            if let Some((event, package)) = handle_process_start(record, ctx) {
+                dispatch_process_start_with_correlator_and_package(ctx, event, package);
             }
             return;
         }
@@ -185,15 +186,20 @@ impl ProcessStartPropertySource for TdhEventInfo<'_> {
     }
 }
 
-fn handle_process_start(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Option<SensorEvent> {
-    build_process_start_event(
+fn handle_process_start(
+    record: &EVENT_RECORD,
+    ctx: &EtwCallbackContext,
+) -> Option<(SensorEvent, ProcessPackageInfo)> {
+    build_process_start_event_with_package(
         record,
         ctx,
         TdhEventInfo::from_record_with_status(record),
         |pid| inspect_process_by_pid(pid, Some(&ctx.volume_map)),
+        inspect_process_package_by_pid,
     )
 }
 
+#[cfg(test)]
 fn build_process_start_event<S, F>(
     record: &EVENT_RECORD,
     ctx: &EtwCallbackContext,
@@ -203,6 +209,22 @@ fn build_process_start_event<S, F>(
 where
     S: ProcessStartPropertySource,
     F: FnOnce(u32) -> Option<ProcessInspectInfo>,
+{
+    build_process_start_event_with_package(record, ctx, tdh_result, inspect_fn, |_, _, _| None)
+        .map(|(ev, _)| ev)
+}
+
+fn build_process_start_event_with_package<S, F, P>(
+    record: &EVENT_RECORD,
+    ctx: &EtwCallbackContext,
+    tdh_result: Result<S, u32>,
+    inspect_fn: F,
+    inspect_package_fn: P,
+) -> Option<(SensorEvent, ProcessPackageInfo)>
+where
+    S: ProcessStartPropertySource,
+    F: FnOnce(u32) -> Option<ProcessInspectInfo>,
+    P: FnOnce(u32, u64, Option<u64>) -> Option<ProcessPackageInfo>,
 {
     let (pid, mut parent_pid, mut create_time_100ns, mut exe_path, mut command_line, user_sid) =
         match tdh_result {
@@ -284,6 +306,7 @@ where
         }
     }
 
+    let mut package = ProcessPackageInfo::default();
     let needs_inspect = parent_pid == 0
         || create_time_100ns == 0
         || exe_path.is_empty()
@@ -322,6 +345,17 @@ where
             if command_line.is_empty() {
                 command_line = inspected.command_line.unwrap_or_default();
             }
+            package = ProcessPackageInfo {
+                package_family_name: inspected.package_family_name,
+                package_sid: inspected.package_sid,
+            }
+            .normalized();
+        }
+    } else if !needs_inspect {
+        let max_event_ts = (record.EventHeader.TimeStamp > 0)
+            .then_some(record.EventHeader.TimeStamp as u64);
+        if let Some(pkg) = inspect_package_fn(pid, create_time_100ns, max_event_ts) {
+            package = pkg.normalized();
         }
     }
 
@@ -355,13 +389,16 @@ where
         );
     }
 
-    Some(SensorEvent::ProcessStart {
-        identity: ProcessIdentity::new(pid, create_time_100ns),
-        parent_pid,
-        exe_path,
-        command_line,
-        user_sid,
-    })
+    Some((
+        SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(pid, create_time_100ns),
+            parent_pid,
+            exe_path,
+            command_line,
+            user_sid,
+        },
+        package,
+    ))
 }
 
 fn handle_process_stop(record: &EVENT_RECORD, ctx: &EtwCallbackContext) -> Option<SensorEvent> {
@@ -618,7 +655,16 @@ fn handle_kernel_file(
     }
 }
 
+#[cfg(test)]
 fn dispatch_process_start_with_correlator(ctx: &EtwCallbackContext, event: SensorEvent) {
+    dispatch_process_start_with_correlator_and_package(ctx, event, ProcessPackageInfo::default());
+}
+
+fn dispatch_process_start_with_correlator_and_package(
+    ctx: &EtwCallbackContext,
+    event: SensorEvent,
+    package: ProcessPackageInfo,
+) {
     let pending = match &event {
         SensorEvent::ProcessStart {
             identity,
@@ -636,12 +682,13 @@ fn dispatch_process_start_with_correlator(ctx: &EtwCallbackContext, event: Senso
                 parent_pid: *parent_pid,
                 exe_path: exe_path.clone(),
                 user_sid: user_sid.clone(),
+                package: package.clone(),
             })
         }
         _ => None,
     };
 
-    if !ctx.dispatch_event(event) {
+    if !ctx.dispatch_event_with_package(event, package) {
         return;
     }
 
@@ -662,7 +709,7 @@ fn dispatch_process_start_with_correlator(ctx: &EtwCallbackContext, event: Senso
                 command_line: matched.command_line,
                 user_sid: pending.user_sid,
             };
-            let _ = ctx.dispatch_event(enriched);
+            let _ = ctx.dispatch_event_with_package(enriched, pending.package);
         }
     }
 }
@@ -731,10 +778,10 @@ pub(super) unsafe extern "system" fn aux_system_process_callback(event_record: *
         );
     }
 
-    if let Some(enriched) =
+    if let Some((enriched, package)) =
         handle_system_process_start(record, ctx, TdhEventInfo::from_record_with_status(record))
     {
-        let _ = ctx.dispatch_event(enriched);
+        let _ = ctx.dispatch_event_with_package(enriched, package);
     }
 }
 
@@ -742,7 +789,7 @@ fn handle_system_process_start<S>(
     record: &EVENT_RECORD,
     ctx: &AuxSystemProcessContext,
     tdh_result: Result<S, u32>,
-) -> Option<SensorEvent>
+) -> Option<(SensorEvent, ProcessPackageInfo)>
 where
     S: SystemProcessPropertySource,
 {
@@ -800,16 +847,19 @@ where
         resolved.pending.pid,
         resolved.delta_100ns,
     );
-    Some(SensorEvent::ProcessStart {
-        identity: ProcessIdentity::new(
-            resolved.pending.pid,
-            resolved.pending.create_time_100ns,
-        ),
-        parent_pid: resolved.pending.parent_pid,
-        exe_path: resolved.pending.exe_path,
-        command_line: resolved.command_line,
-        user_sid: resolved.pending.user_sid,
-    })
+    Some((
+        SensorEvent::ProcessStart {
+            identity: ProcessIdentity::new(
+                resolved.pending.pid,
+                resolved.pending.create_time_100ns,
+            ),
+            parent_pid: resolved.pending.parent_pid,
+            exe_path: resolved.pending.exe_path,
+            command_line: resolved.command_line,
+            user_sid: resolved.pending.user_sid,
+        },
+        resolved.pending.package,
+    ))
 }
 
 #[cfg(test)]
@@ -825,11 +875,11 @@ mod tests {
     use super::super::cmdline_correlator::ProcessCommandLineCorrelator;
     use super::super::context::HoneypotHandleTracker;
     use super::super::file_canary::CanaryMatcher;
-    use super::super::session::EventSinkFn;
+    use super::super::session::PackageAwareEventSinkFn;
     use super::super::snapshot::try_capture_running_processes;
 
     fn dummy_etw_ctx() -> EtwCallbackContext {
-        let sink: EventSinkFn = Arc::new(|_| true);
+        let sink: PackageAwareEventSinkFn = Arc::new(|_, _| true);
         EtwCallbackContext {
             sink,
             dns_cache: Mutex::new(DnsResolutionCache::default()),
@@ -898,7 +948,7 @@ mod tests {
         record.UserData = user_data.as_mut_ptr().cast();
         record.UserDataLength = user_data.len() as u16;
 
-        let event = handle_process_start(&record, &ctx)
+        let (event, _pkg) = handle_process_start(&record, &ctx)
             .expect("ProcessStart with valid UserData PID should emit event");
         match event {
             SensorEvent::ProcessStart {
@@ -968,7 +1018,7 @@ mod tests {
         record.UserData = user_data.as_mut_ptr().cast();
         record.UserDataLength = user_data.len() as u16;
 
-        let event = handle_process_start(&record, &ctx)
+        let (event, _pkg) = handle_process_start(&record, &ctx)
             .expect("handle_process_start must emit event for live self PID");
         match event {
             SensorEvent::ProcessStart {
@@ -1015,6 +1065,8 @@ mod tests {
                 create_time_100ns: 133_800_000_000_000_000,
                 exe_path: Some(r"C:\Tools\app.exe".to_string()),
                 command_line: Some("app.exe --run".to_string()),
+                package_family_name: None,
+                package_sid: None,
             })
         })
         .expect("event emitted on same incarnation");
@@ -1038,6 +1090,8 @@ mod tests {
                 create_time_100ns: 133_800_000_999_000_000,
                 exe_path: Some(r"C:\Tools\other.exe".to_string()),
                 command_line: Some("other.exe".to_string()),
+                package_family_name: None,
+                package_sid: None,
             })
         })
         .expect("event emitted when inspect sees reused PID");
@@ -1079,6 +1133,8 @@ mod tests {
                 create_time_100ns: earlier_create_100ns,
                 exe_path: Some(r"C:\Tools\legit.exe".to_string()),
                 command_line: Some("legit.exe --ok".to_string()),
+                package_family_name: None,
+                package_sid: None,
             })
         };
         let newer_inspect = || {
@@ -1087,6 +1143,8 @@ mod tests {
                 create_time_100ns: newer_reused_create_100ns,
                 exe_path: Some(r"C:\Tools\reused.exe".to_string()),
                 command_line: Some("reused.exe --after".to_string()),
+                package_family_name: None,
+                package_sid: None,
             })
         };
 
@@ -1213,7 +1271,7 @@ mod tests {
     ) {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_sink = Arc::clone(&captured);
-        let sink: EventSinkFn = Arc::new(move |ev| {
+        let sink: PackageAwareEventSinkFn = Arc::new(move |ev, _| {
             captured_sink
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1343,7 +1401,7 @@ mod tests {
         sys_record.EventHeader.TimeStamp = (create_ts + 40_000) as i64;
         sys_record.EventHeader.ProviderId = SYSTEM_PROCESS_MOF_GUID;
         sys_record.EventHeader.EventDescriptor.Opcode = 1;
-        let enriched = handle_system_process_start(
+        let (enriched, package) = handle_system_process_start(
             &sys_record,
             &aux_ctx,
             Ok(StubSysProcSource {
@@ -1354,7 +1412,7 @@ mod tests {
             }),
         )
         .expect("Path B produces enriched ProcessStart");
-        assert!(aux_ctx.dispatch_event(enriched));
+        assert!(aux_ctx.dispatch_event_with_package(enriched, package));
 
         let events = captured.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(events.len(), 2);
@@ -1452,7 +1510,7 @@ mod tests {
             let stop_requested = Arc::new(AtomicBool::new(false));
             let aux_active = Arc::new(AtomicBool::new(true));
 
-            let aux_sink: EventSinkFn = Arc::new(|_| true);
+            let aux_sink: PackageAwareEventSinkFn = Arc::new(|_, _| true);
             let aux_ctx = AuxSystemProcessContext {
                 sink: aux_sink,
                 cmdline_correlator: Arc::clone(&correlator),
@@ -1462,7 +1520,7 @@ mod tests {
             };
 
             let captured_sink = Arc::clone(&captured);
-            let main_sink: EventSinkFn = Arc::new(move |ev| {
+            let main_sink: PackageAwareEventSinkFn = Arc::new(move |ev, _| {
                 let is_first = captured_sink
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1571,5 +1629,127 @@ mod tests {
                 .pending_starts_len(),
             0
         );
+    }
+
+    #[test]
+    fn sens_fu_p4_03_process_start_collects_independent_package_attrs_across_paths() {
+        let ctx = dummy_etw_ctx();
+        let create_ts: u64 = 133_800_000_000_000_000;
+        let mut record = EVENT_RECORD::default();
+        record.EventHeader.TimeStamp = create_ts as i64;
+        record.EventHeader.EventDescriptor.Id = 1;
+
+        // 1. needs_inspect == true: both PFN and SID populated.
+        let (_, pkg_both) = build_process_start_event_with_package(
+            &record,
+            &ctx,
+            Ok(StubPropertySource {
+                pid: Some(8101),
+                parent_pid: Some(1200),
+                create_time_100ns: Some(create_ts),
+                image_name: Some(r"C:\Windows\System32\backgroundTaskHost.exe".to_string()),
+                command_line: None,
+            }),
+            |_| {
+                Some(ProcessInspectInfo {
+                    parent_pid: Some(1200),
+                    create_time_100ns: create_ts,
+                    exe_path: Some(r"C:\Windows\System32\backgroundTaskHost.exe".to_string()),
+                    command_line: Some("backgroundTaskHost.exe -ServerName:App".to_string()),
+                    package_family_name: Some("Contoso.App_12345".to_string()),
+                    package_sid: Some("S-1-15-2-11-22-33".to_string()),
+                })
+            },
+            |_, _, _| panic!("inspect_package_fn must not run when needs_inspect is true"),
+        )
+        .expect("ProcessStart emitted");
+        assert_eq!(
+            pkg_both,
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.App_12345".to_string()),
+                package_sid: Some("S-1-15-2-11-22-33".to_string()),
+            }
+        );
+
+        // 2. needs_inspect == true: PFN_ONLY_NON_APPCONTAINER stays package_sid == None (no derivation).
+        let (_, pkg_pfn_only) = build_process_start_event_with_package(
+            &record,
+            &ctx,
+            Ok(StubPropertySource {
+                pid: Some(8102),
+                parent_pid: Some(1200),
+                create_time_100ns: Some(create_ts),
+                image_name: Some(r"C:\Windows\System32\RuntimeBroker.exe".to_string()),
+                command_line: None,
+            }),
+            |_| {
+                Some(ProcessInspectInfo {
+                    parent_pid: Some(1200),
+                    create_time_100ns: create_ts,
+                    exe_path: Some(r"C:\Windows\System32\RuntimeBroker.exe".to_string()),
+                    command_line: Some("RuntimeBroker.exe".to_string()),
+                    package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+                    package_sid: None,
+                })
+            },
+            |_, _, _| None,
+        )
+        .expect("ProcessStart emitted");
+        assert_eq!(
+            pkg_pfn_only.package_family_name.as_deref(),
+            Some("Microsoft.Windows.Shell_cw5n1h2txyewy")
+        );
+        assert_eq!(pkg_pfn_only.package_sid, None);
+
+        // 3. needs_inspect == false: inspect_package_fn supplies TOKEN_SID_ONLY.
+        let (_, pkg_sid_only) = build_process_start_event_with_package(
+            &record,
+            &ctx,
+            Ok(StubPropertySource {
+                pid: Some(8103),
+                parent_pid: Some(1200),
+                create_time_100ns: Some(create_ts),
+                image_name: Some(r"C:\Windows\System32\fontdrvhost.exe".to_string()),
+                command_line: Some("fontdrvhost.exe".to_string()),
+            }),
+            |_| panic!("inspect_fn must not run when ETW supplies all 4 basic fields"),
+            |pid, ct, _| {
+                assert_eq!(pid, 8103);
+                assert_eq!(ct, create_ts);
+                Some(ProcessPackageInfo {
+                    package_family_name: None,
+                    package_sid: Some("S-1-15-2-99".to_string()),
+                })
+            },
+        )
+        .expect("ProcessStart emitted");
+        assert_eq!(pkg_sid_only.package_family_name, None);
+        assert_eq!(pkg_sid_only.package_sid.as_deref(), Some("S-1-15-2-99"));
+
+        // 4. Mismatched incarnation (PID reuse) must drop inspected package attributes too.
+        let (_, pkg_reused) = build_process_start_event_with_package(
+            &record,
+            &ctx,
+            Ok(StubPropertySource {
+                pid: Some(8104),
+                parent_pid: Some(1200),
+                create_time_100ns: Some(create_ts),
+                image_name: Some(r"C:\Tools\app.exe".to_string()),
+                command_line: None,
+            }),
+            |_| {
+                Some(ProcessInspectInfo {
+                    parent_pid: Some(1200),
+                    create_time_100ns: create_ts + 999_999,
+                    exe_path: Some(r"C:\Tools\other.exe".to_string()),
+                    command_line: Some("other.exe".to_string()),
+                    package_family_name: Some("Other.Pkg_1".to_string()),
+                    package_sid: Some("S-1-15-2-77".to_string()),
+                })
+            },
+            |_, _, _| None,
+        )
+        .expect("ProcessStart emitted");
+        assert_eq!(pkg_reused, ProcessPackageInfo::default());
     }
 }

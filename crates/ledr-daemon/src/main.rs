@@ -29,8 +29,8 @@ use ledr_sensor_win::defense::{
     WindowsDefenseController,
 };
 use ledr_sensor_win::etw::{
-    try_capture_running_processes, EventSinkFn, NoopSensorBackend, WindowsEtwSensor,
-    DEFAULT_ETW_SESSION_NAME,
+    try_capture_running_processes_with_package, NoopSensorBackend, PackageAwareEventSinkFn,
+    WindowsEtwSensor, DEFAULT_ETW_SESSION_NAME,
 };
 use ledr_sensor_win::privileges::enable_required_privileges;
 use ledr_store::{LedrStore, TrackedHoneypotRecord};
@@ -1347,8 +1347,9 @@ where
     // Start ETW capture directly into ClassifiedEventSender BEFORE Toolhelp32 snapshot capture so
     // processes spawned or exiting during snapshot enumeration are not missed (BUG_0001, BUG_0006, L-10).
     let bridge_sender = engine.classified_sender();
-    let etw_sink: EventSinkFn = Arc::new(move |ev| bridge_sender.blocking_send(ev).is_ok());
-    let mut etw_sensor = WindowsEtwSensor::with_sink(etw_sink, DEFAULT_ETW_SESSION_NAME);
+    let etw_sink: PackageAwareEventSinkFn =
+        Arc::new(move |ev, pkg| bridge_sender.blocking_send_with_package(ev, pkg).is_ok());
+    let mut etw_sensor = WindowsEtwSensor::with_package_aware_sink(etw_sink, DEFAULT_ETW_SESSION_NAME);
     etw_sensor.set_honeypot_paths(last_honeypot_paths.clone());
     let mut active_backend = match etw_sensor.start() {
         Ok(()) => {
@@ -1367,8 +1368,8 @@ where
         }
     };
 
-    let seeded_count = match try_capture_running_processes() {
-        Ok(initial_processes) => engine.seed_processes(initial_processes)?,
+    let seeded_count = match try_capture_running_processes_with_package() {
+        Ok(initial_processes) => engine.seed_processes_with_package(initial_processes)?,
         Err(err) => {
             tracing::warn!(
                 error = %err,

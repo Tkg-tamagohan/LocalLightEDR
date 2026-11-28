@@ -1058,3 +1058,306 @@ fn store_mem_01_reader_cache_size_and_idle_shrink() {
         .expect("in-memory pragma after shrink");
     assert_eq!(mem_cache_after, -2048);
 }
+
+#[test]
+fn store_fu_p4_03_idempotent_package_column_migration_and_non_clobbering_roundtrip() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("legacy_processes.db");
+
+    // 1. Seed a legacy SQLite DB lacking `package_family_name` / `package_sid` on `processes`.
+    {
+        let legacy = rusqlite::Connection::open(&db_path).expect("open legacy sqlite");
+        legacy
+            .execute_batch(
+                "CREATE TABLE processes (
+                    process_instance_id TEXT PRIMARY KEY,
+                    pid                 INTEGER NOT NULL,
+                    parent_instance_id  TEXT,
+                    ppid                INTEGER NOT NULL,
+                    exe_path            TEXT NOT NULL,
+                    command_line        TEXT,
+                    sha256              TEXT,
+                    signer_subject      TEXT,
+                    is_trusted_os       INTEGER NOT NULL DEFAULT 0,
+                    user_sid            TEXT,
+                    origin_url          TEXT,
+                    created_at_ms       INTEGER NOT NULL,
+                    exited_at_ms        INTEGER
+                ) WITHOUT ROWID;
+                INSERT INTO processes (
+                    process_instance_id, pid, ppid, exe_path, created_at_ms
+                ) VALUES ('100:1000', 100, 4, 'C:\\Legacy\\app.exe', 1700000000000);",
+            )
+            .expect("seed legacy schema");
+    }
+
+    // 2. First and second LedrStore::open calls must migrate idempotently without losing rows.
+    let store = LedrStore::open(&db_path).expect("migrate legacy db");
+    drop(store);
+    let store = LedrStore::open(&db_path).expect("reopen migrated db idempotently");
+
+    let legacy_snap = store
+        .query_flight_recorder(10, Some("100:1000"))
+        .expect("query migrated legacy process");
+    assert_eq!(legacy_snap.processes.len(), 1);
+    assert_eq!(legacy_snap.processes[0].exe_path, r"C:\Legacy\app.exe");
+    assert_eq!(
+        store
+            .get_process_package_info("100:1000")
+            .expect("query legacy package cols"),
+        Some(ProcessPackageRecord {
+            package_family_name: None,
+            package_sid: None,
+        })
+    );
+    assert_eq!(
+        store
+            .get_process_package_info("999:999")
+            .expect("missing process returns None"),
+        None
+    );
+
+    // 3. Persist all 4 independent combinations (PFN+SID, PFN-only, SID-only, None).
+    let cases = [
+        (
+            ProcessIdentity::new(201, 133_800_000_000_000_100),
+            r"C:\Windows\System32\backgroundTaskHost.exe",
+            Some("Contoso.App_12345"),
+            Some("S-1-15-2-10-20-30"),
+        ),
+        (
+            ProcessIdentity::new(202, 133_800_000_000_000_200),
+            r"C:\Windows\System32\RuntimeBroker.exe",
+            Some("Microsoft.Windows.Shell_cw5n1h2txyewy"),
+            None,
+        ),
+        (
+            ProcessIdentity::new(203, 133_800_000_000_000_300),
+            r"C:\Windows\System32\fontdrvhost.exe",
+            None,
+            Some("S-1-15-2-99-88-77"),
+        ),
+        (
+            ProcessIdentity::new(204, 133_800_000_000_000_400),
+            r"C:\Windows\System32\cmd.exe",
+            None,
+            None,
+        ),
+    ];
+
+    for (ident, exe, pfn, sid) in cases {
+        let ev = SensorEvent::ProcessStart {
+            identity: ident,
+            parent_pid: 4,
+            exe_path: exe.to_string(),
+            command_line: format!("{exe} --run"),
+            user_sid: None,
+        };
+        store
+            .ingest_event_with_extra_metadata(
+                &ev,
+                None,
+                None,
+                None,
+                ProcessExtraMetadata {
+                    origin_url: None,
+                    sha256: None,
+                    package_family_name: pfn,
+                    package_sid: sid,
+                },
+                false,
+                "OBSERVED",
+            )
+            .expect("ingest extra metadata");
+    }
+    store.flush_batch().expect("flush extra metadata");
+
+    for (ident, _, pfn, sid) in cases {
+        assert_eq!(
+            store
+                .get_process_package_info(&ident.instance_id())
+                .expect("read back package attrs"),
+            Some(ProcessPackageRecord {
+                package_family_name: pfn.map(str::to_string),
+                package_sid: sid.map(str::to_string),
+            })
+        );
+    }
+
+    // 4. Subsequent upsert_process_record and None ProcessStart must NOT clobber existing attrs.
+    let id_both = cases[0].0;
+    store
+        .upsert_process_record(&ProcessRecord {
+            process_instance_id: id_both.instance_id(),
+            pid: id_both.pid,
+            parent_instance_id: None,
+            ppid: 4,
+            exe_path: cases[0].1.to_string(),
+            command_line: Some("updated".to_string()),
+            sha256: Some("a".repeat(64)),
+            signer_subject: None,
+            is_trusted_os: true,
+            user_sid: None,
+            origin_url: None,
+            created_at_ms: 1_700_000_000_000,
+            exited_at_ms: None,
+        })
+        .expect("upsert_process_record preserves package cols");
+    let dup_none = SensorEvent::ProcessStart {
+        identity: id_both,
+        parent_pid: 4,
+        exe_path: cases[0].1.to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_extra_metadata(
+            &dup_none,
+            None,
+            None,
+            None,
+            ProcessExtraMetadata::default(),
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest duplicate none");
+    store.flush_batch().expect("flush duplicate none");
+    assert_eq!(
+        store
+            .get_process_package_info(&id_both.instance_id())
+            .expect("verify non-clobber"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Contoso.App_12345".to_string()),
+            package_sid: Some("S-1-15-2-10-20-30".to_string()),
+        })
+    );
+
+    // Conflicting non-NULL values in a subsequent upsert must preserve first-non-NULL values.
+    store
+        .ingest_event_with_extra_metadata(
+            &dup_none,
+            None,
+            None,
+            None,
+            ProcessExtraMetadata {
+                package_family_name: Some("Conflicting.App_99999"),
+                package_sid: Some("S-1-15-2-99-99-99"),
+                ..Default::default()
+            },
+            false,
+            "OBSERVED",
+        )
+        .expect("ingest conflicting metadata on id_both");
+    // Missing column (package_sid == None on id_pfn_only) still backfills while preserving existing PFN.
+    let id_pfn_only = cases[1].0;
+    let pfn_only_ev = SensorEvent::ProcessStart {
+        identity: id_pfn_only,
+        parent_pid: 4,
+        exe_path: cases[1].1.to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_extra_metadata(
+            &pfn_only_ev,
+            None,
+            None,
+            None,
+            ProcessExtraMetadata {
+                package_family_name: Some("ShouldNotReplace.Broker"),
+                package_sid: Some("S-1-15-2-filled-sid"),
+                ..Default::default()
+            },
+            false,
+            "OBSERVED",
+        )
+        .expect("backfill missing sid via ingest");
+    // Whitespace-only values normalize to None and update_process_package_metadata rejects empty updates.
+    assert!(
+        !store
+            .update_process_package_metadata(&id_pfn_only.instance_id(), Some("   "), Some("\t\n"))
+            .expect("whitespace-only metadata is a no-op")
+    );
+    store.flush_batch().expect("flush conflicting and backfill checks");
+    assert_eq!(
+        store
+            .get_process_package_info(&id_both.instance_id())
+            .expect("verify first-non-null preserved"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Contoso.App_12345".to_string()),
+            package_sid: Some("S-1-15-2-10-20-30".to_string()),
+        })
+    );
+    assert_eq!(
+        store
+            .get_process_package_info(&id_pfn_only.instance_id())
+            .expect("verify null-only backfill on ingest"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+            package_sid: Some("S-1-15-2-filled-sid".to_string()),
+        })
+    );
+
+    // 5. update_process_package_metadata updates both pending batch entries and committed rows via COALESCE.
+    let id_pending = ProcessIdentity::new(205, 133_800_000_000_000_500);
+    let ev_pending = SensorEvent::ProcessStart {
+        identity: id_pending,
+        parent_pid: 4,
+        exe_path: r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+        command_line: String::new(),
+        user_sid: None,
+    };
+    store
+        .ingest_event_with_extra_metadata(
+            &ev_pending,
+            None,
+            None,
+            None,
+            ProcessExtraMetadata {
+                package_family_name: Some("Initial.Pkg_1"),
+                ..Default::default()
+            },
+            false,
+            "OBSERVED",
+        )
+        .expect("buffer pending row");
+    assert!(
+        store
+            .update_process_package_metadata(
+                &id_pending.instance_id(),
+                Some("ShouldNotOverwrite.Pkg_1"),
+                Some("S-1-15-2-555"),
+            )
+            .expect("backfill pending batch entry")
+    );
+    store.flush_batch().expect("flush backfilled pending row");
+    assert_eq!(
+        store
+            .get_process_package_info(&id_pending.instance_id())
+            .expect("query flushed backfilled row"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Initial.Pkg_1".to_string()),
+            package_sid: Some("S-1-15-2-555".to_string()),
+        })
+    );
+
+    // Also verify committed row backfill on id_none (204).
+    assert!(
+        store
+            .update_process_package_metadata(
+                &cases[3].0.instance_id(),
+                Some("Committed.Pkg_2"),
+                None,
+            )
+            .expect("backfill committed row")
+    );
+    assert_eq!(
+        store
+            .get_process_package_info(&cases[3].0.instance_id())
+            .expect("query committed backfilled row"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Committed.Pkg_2".to_string()),
+            package_sid: None,
+        })
+    );
+}

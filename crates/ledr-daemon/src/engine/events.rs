@@ -11,7 +11,8 @@ use ledr_proto::{
 use ledr_rules::{
     classify_outbound_risk, is_allowed_by_rules, BinaryIdentity, EventContext, OutboundRiskClass,
 };
-use ledr_store::StoreError;
+use ledr_sensor_win::ProcessPackageInfo;
+use ledr_store::{ProcessExtraMetadata, StoreError};
 use uuid::Uuid;
 
 use crate::firewall::{WfpFilterOrigin, WfpRuleManager};
@@ -36,6 +37,8 @@ struct PreparedCanaryBackfill {
     existing_ppid: u32,
     exe_path: String,
     command_line: String,
+    package_family_name: Option<String>,
+    package_sid: Option<String>,
     res: ProcessStartResolution,
 }
 
@@ -166,10 +169,19 @@ impl DaemonEngine {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn process_seed_process_start(&self, event: &SensorEvent) -> SeedProcessStartOutcome {
+        self.process_seed_process_start_with_package(event, &ProcessPackageInfo::default())
+    }
+
+    pub(super) fn process_seed_process_start_with_package(
+        &self,
+        event: &SensorEvent,
+        package: &ProcessPackageInfo,
+    ) -> SeedProcessStartOutcome {
         let now_ms = current_unix_ms();
         let event_ts_ms = event_timestamp_ms(event, now_ms);
-        let proc_ctx = self.resolve_process_context(event, event_ts_ms);
+        let proc_ctx = self.resolve_process_context_with_package(event, event_ts_ms, package);
 
         let motw_candidate = if let SensorEvent::ProcessStart { identity, .. } = event {
             if proc_ctx.origin_url.is_none()
@@ -228,6 +240,20 @@ impl DaemonEngine {
         event: &SensorEvent,
         lane: EventLane,
     ) -> Option<DnsCorrelationUpdate> {
+        self.process_event_with_lane_and_package_async(
+            event,
+            lane,
+            &ProcessPackageInfo::default(),
+        )
+        .await
+    }
+
+    pub(super) async fn process_event_with_lane_and_package_async(
+        &self,
+        event: &SensorEvent,
+        lane: EventLane,
+        package: &ProcessPackageInfo,
+    ) -> Option<DnsCorrelationUpdate> {
         if let SensorEvent::CanaryFileAccess {
             category: CanaryCategory::Honeypot,
             is_write_or_delete: false,
@@ -242,7 +268,7 @@ impl DaemonEngine {
         let now_ms = current_unix_ms();
         let event_ts_ms = event_timestamp_ms(event, now_ms);
 
-        let mut proc_ctx = self.resolve_process_context(event, event_ts_ms);
+        let mut proc_ctx = self.resolve_process_context_with_package(event, event_ts_ms, package);
 
         if let SensorEvent::ProcessStart { identity, .. } = event {
             if proc_ctx.origin_url.is_none()
@@ -404,6 +430,8 @@ impl DaemonEngine {
                     "motw_referrer": proc_ctx.motw_referrer,
                     "motw_frame_url": proc_ctx.motw_frame_url,
                     "motw_zone_id": proc_ctx.motw_zone_id,
+                    "package_family_name": proc_ctx.package_family_name,
+                    "package_sid": proc_ctx.package_sid,
                 })
                 .to_string();
 
@@ -545,7 +573,7 @@ impl DaemonEngine {
 
         if !proc_ctx.skip_store_ingest {
             if let Some(res) = self.try_store_write(|s| {
-                s.ingest_event_with_process_metadata(
+                s.ingest_event_with_extra_metadata(
                     effective_event,
                     proc_ctx.store_hint.as_deref(),
                     proc_ctx.exited_at_ms,
@@ -553,8 +581,12 @@ impl DaemonEngine {
                         .superseded_exit
                         .as_ref()
                         .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
-                    proc_ctx.origin_url.as_deref(),
-                    proc_ctx.proc_sha256.as_deref(),
+                    ProcessExtraMetadata {
+                        origin_url: proc_ctx.origin_url.as_deref(),
+                        sha256: proc_ctx.proc_sha256.as_deref(),
+                        package_family_name: proc_ctx.package_family_name.as_deref(),
+                        package_sid: proc_ctx.package_sid.as_deref(),
+                    },
                     is_nrd,
                     action,
                 )
@@ -712,12 +744,30 @@ impl DaemonEngine {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
+        let live_pfn_opt = live
+            .package_family_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let live_sid_opt = live
+            .package_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
         let gained_create_time = proc_ctx
             .proc_identity
             .is_none_or(|id| id.create_time_100ns == 0);
         let gained_exe_path = existing_exe_opt.is_none() && live_exe_opt.is_some();
         let gained_command_line = existing_cmd_opt.is_none() && live_cmd_opt.is_some();
-        if !gained_create_time && !gained_exe_path && !gained_command_line {
+        let gained_pfn = proc_ctx.package_family_name.is_none() && live_pfn_opt.is_some();
+        let gained_sid = proc_ctx.package_sid.is_none() && live_sid_opt.is_some();
+        if !gained_create_time
+            && !gained_exe_path
+            && !gained_command_line
+            && !gained_pfn
+            && !gained_sid
+        {
             return None;
         }
 
@@ -729,6 +779,14 @@ impl DaemonEngine {
             .or(live_cmd_opt)
             .map(str::to_string)
             .unwrap_or_default();
+        let package_family_name = proc_ctx
+            .package_family_name
+            .clone()
+            .or_else(|| live_pfn_opt.map(str::to_string));
+        let package_sid = proc_ctx
+            .package_sid
+            .clone()
+            .or_else(|| live_sid_opt.map(str::to_string));
 
         // Record the live process's actual creation timestamp (`live_created_ms <= event_ts_ms`)
         // so `ActiveProcessTable::lookup_by_pid_at` matches events and child ProcessStarts
@@ -752,12 +810,14 @@ impl DaemonEngine {
                 })
                 .map(|entry| entry.ppid)
                 .unwrap_or(0);
-            let res = table.on_process_start(
+            let res = table.on_process_start_with_package(
                 ident,
                 existing_ppid,
                 exe_path.clone(),
                 command_line.clone(),
                 None,
+                package_family_name.clone(),
+                package_sid.clone(),
                 backfilled_created_ms,
             );
             (existing_ppid, res)
@@ -789,6 +849,8 @@ impl DaemonEngine {
                 existing_ppid,
                 exe_path,
                 command_line,
+                package_family_name,
+                package_sid,
                 res,
             },
         ))
@@ -849,8 +911,17 @@ impl DaemonEngine {
             existing_ppid,
             exe_path,
             command_line,
+            package_family_name,
+            package_sid,
             res,
         } = prepared;
+
+        if proc_ctx.package_family_name.is_none() {
+            proc_ctx.package_family_name = package_family_name;
+        }
+        if proc_ctx.package_sid.is_none() {
+            proc_ctx.package_sid = package_sid;
+        }
 
         if res.exited_at_ms.is_none() && !res.skip_launch_guards {
             self.apply_process_launch_guards(
@@ -869,15 +940,19 @@ impl DaemonEngine {
             user_sid: None,
         };
         if let Some(Err(err)) = self.try_store_write(|s| {
-            s.ingest_event_with_process_metadata(
+            s.ingest_event_with_extra_metadata(
                 &synthetic_start,
                 res.parent_instance_id.as_deref(),
                 res.exited_at_ms,
                 res.superseded_exit
                     .as_ref()
                     .map(|(id, exit_ms)| (id.as_str(), *exit_ms)),
-                proc_ctx.origin_url.as_deref(),
-                proc_ctx.proc_sha256.as_deref(),
+                ProcessExtraMetadata {
+                    origin_url: proc_ctx.origin_url.as_deref(),
+                    sha256: proc_ctx.proc_sha256.as_deref(),
+                    package_family_name: proc_ctx.package_family_name.as_deref(),
+                    package_sid: proc_ctx.package_sid.as_deref(),
+                },
                 false,
                 "OBSERVED",
             )
@@ -1115,6 +1190,8 @@ impl DaemonEngine {
             "motw_referrer": proc_ctx.motw_referrer,
             "motw_frame_url": proc_ctx.motw_frame_url,
             "motw_zone_id": proc_ctx.motw_zone_id,
+            "package_family_name": proc_ctx.package_family_name,
+            "package_sid": proc_ctx.package_sid,
         });
         if include_children && process_suspended {
             if let Some(map) = context_obj.as_object_mut() {
@@ -1312,10 +1389,20 @@ impl DaemonEngine {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn resolve_process_context(
         &self,
         event: &SensorEvent,
         event_ts_ms: i64,
+    ) -> ResolvedProcessContext {
+        self.resolve_process_context_with_package(event, event_ts_ms, &ProcessPackageInfo::default())
+    }
+
+    pub(super) fn resolve_process_context_with_package(
+        &self,
+        event: &SensorEvent,
+        event_ts_ms: i64,
+        package: &ProcessPackageInfo,
     ) -> ResolvedProcessContext {
         let mut evicted_instance_ids: Vec<String> = Vec::new();
         let mut superseded_exited_processes: Vec<(String, String)> = Vec::new();
@@ -1333,12 +1420,14 @@ impl DaemonEngine {
                     command_line,
                     user_sid,
                 } => {
-                    let res = table.on_process_start(
+                    let res = table.on_process_start_with_package(
                         *identity,
                         *parent_pid,
                         exe_path.clone(),
                         command_line.clone(),
                         user_sid.clone(),
+                        package.package_family_name.clone(),
+                        package.package_sid.clone(),
                         event_ts_ms,
                     );
                     evicted_instance_ids = res.evicted_instance_ids;
@@ -1352,6 +1441,8 @@ impl DaemonEngine {
                     motw_referrer,
                     motw_frame_url,
                     motw_zone_id,
+                    package_family_name,
+                    package_sid,
                     proc_created_at_ms,
                 ) = if let Some(entry) = table.get_by_instance_id(&res.instance_id) {
                     let differs = entry.identity != *identity
@@ -1375,9 +1466,12 @@ impl DaemonEngine {
                         entry.motw_referrer.clone(),
                         entry.motw_frame_url.clone(),
                         entry.motw_zone_id,
+                        entry.package_family_name.clone(),
+                        entry.package_sid.clone(),
                         Some(entry.created_at_ms),
                     )
                 } else {
+                    let norm_pkg = package.clone().normalized();
                     (
                         exe_path.clone(),
                         command_line.clone(),
@@ -1387,6 +1481,8 @@ impl DaemonEngine {
                         None,
                         None,
                         None,
+                        norm_pkg.package_family_name,
+                        norm_pkg.package_sid,
                         (res.resolved_identity.create_time_100ns != 0).then(|| {
                             super::filetime_100ns_to_unix_ms(
                                 res.resolved_identity.create_time_100ns,
@@ -1414,15 +1510,18 @@ impl DaemonEngine {
                     motw_referrer,
                     motw_frame_url,
                     motw_zone_id,
+                    package_family_name,
+                    package_sid,
                     proc_sha256: None,
                     proc_created_at_ms,
                 }
             }
             SensorEvent::ProcessStop { pid, .. } => {
-                let (id, exe_path) = match table.on_process_stop_with_exe(*pid, event_ts_ms) {
-                    Some((inst_id, exe)) => (Some(inst_id), Some(exe)),
-                    None => (None, None),
-                };
+                let (id, exe_path, pkg_pfn, pkg_sid) =
+                    match table.on_process_stop_with_package(*pid, event_ts_ms) {
+                        Some((inst_id, exe, pfn, sid)) => (Some(inst_id), Some(exe), pfn, sid),
+                        None => (None, None, None, None),
+                    };
                 ResolvedProcessContext {
                     proc_identity: None,
                     proc_instance_id: id.clone(),
@@ -1442,6 +1541,8 @@ impl DaemonEngine {
                     motw_referrer: None,
                     motw_frame_url: None,
                     motw_zone_id: None,
+                    package_family_name: pkg_pfn,
+                    package_sid: pkg_sid,
                     proc_sha256: None,
                     proc_created_at_ms: None,
                 }
@@ -1463,6 +1564,8 @@ impl DaemonEngine {
                     motw_referrer,
                     motw_frame_url,
                     motw_zone_id,
+                    package_family_name,
+                    package_sid,
                     created_at_ms,
                 )) = table.lookup_by_pid_at(*pid, event_ts_ms).map(|e| {
                     (
@@ -1476,6 +1579,8 @@ impl DaemonEngine {
                         e.motw_referrer.clone(),
                         e.motw_frame_url.clone(),
                         e.motw_zone_id,
+                        e.package_family_name.clone(),
+                        e.package_sid.clone(),
                         e.created_at_ms,
                     )
                 })
@@ -1508,6 +1613,8 @@ impl DaemonEngine {
                     motw_referrer,
                     motw_frame_url,
                     motw_zone_id,
+                    package_family_name,
+                    package_sid,
                     proc_sha256: None,
                     proc_created_at_ms: Some(created_at_ms),
                 }
@@ -1566,6 +1673,8 @@ pub(super) struct ResolvedProcessContext {
     pub(super) motw_referrer: Option<String>,
     pub(super) motw_frame_url: Option<String>,
     pub(super) motw_zone_id: Option<u32>,
+    pub(super) package_family_name: Option<String>,
+    pub(super) package_sid: Option<String>,
     pub(super) proc_sha256: Option<String>,
     pub(super) proc_created_at_ms: Option<i64>,
 }
@@ -1591,6 +1700,8 @@ impl Default for ResolvedProcessContext {
             motw_referrer: None,
             motw_frame_url: None,
             motw_zone_id: None,
+            package_family_name: None,
+            package_sid: None,
             proc_sha256: None,
             proc_created_at_ms: None,
         }

@@ -25,6 +25,7 @@ use crate::dns_cache::DnsResolutionCache;
 use crate::path_norm::DosVolumeMap;
 use crate::SensorError;
 
+use super::ProcessPackageInfo;
 use super::cmdline_correlator::ProcessCommandLineCorrelator;
 use super::context::{AuxSystemProcessContext, EtwCallbackContext, HoneypotHandleTracker};
 use super::file_canary::CanaryMatcher;
@@ -45,6 +46,11 @@ pub const DEFAULT_ETW_SESSION_NAME: &str = "LocalEDR-ETW-Session";
 /// telemetry ring) and ETW consumption should continue. Returning `false` indicates the
 /// downstream receiver has closed and the ETW consumer should terminate promptly.
 pub type EventSinkFn = Arc<dyn Fn(SensorEvent) -> bool + Send + Sync>;
+
+/// Package-aware callback sink receiving [`SensorEvent`] together with independently collected
+/// [`ProcessPackageInfo`] (`FU-P4-03`).
+pub type PackageAwareEventSinkFn =
+    Arc<dyn Fn(SensorEvent, ProcessPackageInfo) -> bool + Send + Sync>;
 const MAX_SESSION_NAME_CHARS: usize = 128;
 const MAX_LOGFILE_NAME_CHARS: usize = 128;
 const ERROR_WMI_INSTANCE_NOT_FOUND_CODE: u32 = 4201;
@@ -204,7 +210,7 @@ pub(super) struct ActiveEtwSession {
 /// Real-time Windows ETW sensor backend subscribing to Process, File, Registry, DNS, Network,
 /// AMSI, and PowerShell 4104 providers (`AUTO-03`, `AUTO-05`, `AUTO-06`, `AUTO-08`).
 pub struct WindowsEtwSensor {
-    pub(super) sink: EventSinkFn,
+    pub(super) sink: PackageAwareEventSinkFn,
     session_name: String,
     dev_roots: Vec<PathBuf>,
     honeypot_paths: Vec<PathBuf>,
@@ -236,6 +242,16 @@ impl WindowsEtwSensor {
 
     /// Creates a new [`WindowsEtwSensor`] delivering events directly to `sink` (`BUG_0001`).
     pub fn with_sink(sink: EventSinkFn, session_name: impl Into<String>) -> Self {
+        let wrapped: PackageAwareEventSinkFn = Arc::new(move |ev, _| sink(ev));
+        Self::with_package_aware_sink(wrapped, session_name)
+    }
+
+    /// Creates a new [`WindowsEtwSensor`] delivering events and [`ProcessPackageInfo`] directly
+    /// to `sink` (`FU-P4-03`).
+    pub fn with_package_aware_sink(
+        sink: PackageAwareEventSinkFn,
+        session_name: impl Into<String>,
+    ) -> Self {
         let user_profiles: Vec<PathBuf> = std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
             .into_iter()
@@ -739,7 +755,7 @@ fn start_or_restart_system_process_session(
 
 fn try_start_aux_system_process_session(
     main_session_name: &str,
-    sink: EventSinkFn,
+    sink: PackageAwareEventSinkFn,
     cmdline_correlator: Arc<Mutex<ProcessCommandLineCorrelator>>,
     stop_requested: Arc<AtomicBool>,
     shutdown_initiated: Arc<AtomicBool>,
@@ -758,7 +774,7 @@ fn try_start_aux_system_process_session(
 
 fn try_start_aux_system_process_session_with<F>(
     main_session_name: &str,
-    sink: EventSinkFn,
+    sink: PackageAwareEventSinkFn,
     cmdline_correlator: Arc<Mutex<ProcessCommandLineCorrelator>>,
     stop_requested: Arc<AtomicBool>,
     shutdown_initiated: Arc<AtomicBool>,
@@ -922,7 +938,7 @@ mod tests {
     /// cleanly to `None` with `aux_active = false` so the main ETW session continues with PEB.
     #[test]
     fn etw_p4_cmd_07_aux_session_startup_failure_and_name_limit_degrade_cleanly() {
-        let sink: EventSinkFn = Arc::new(|_| true);
+        let sink: PackageAwareEventSinkFn = Arc::new(|_, _| true);
         let correlator = Arc::new(Mutex::new(ProcessCommandLineCorrelator::new()));
         let stop_requested = Arc::new(AtomicBool::new(false));
         let shutdown_initiated = Arc::new(AtomicBool::new(false));

@@ -9,9 +9,18 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use crate::path_norm::DosVolumeMap;
 use crate::{OwnedHandle, SensorError};
 
+use super::ProcessPackageInfo;
 use super::tdh::{
     PidBasicInspect, filetime_100ns_to_unix_ms, inspect_process_basic_by_pid, inspect_process_by_pid,
 };
+
+/// Running-process snapshot entry paired with independently collected package/AppContainer
+/// attributes (`FU-P4-03`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedProcessSnapshot {
+    pub event: SensorEvent,
+    pub package: ProcessPackageInfo,
+}
 
 /// Result of querying live OS processes for another active instance of the same executable (`FU-E2E-05`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,17 +153,9 @@ pub fn find_other_live_processes_for_exe_key(
 }
 
 /// Captures a baseline snapshot of currently running processes using Toolhelp32 (`AUTO-03`,
-/// `BUG_0002`).
-///
-/// Queries each accessible process's `CreationTime` (`create_time_100ns`), full Win32 image path,
-/// and command line. Protected system processes that deny `PROCESS_QUERY_LIMITED_INFORMATION`
-/// in non-elevated sessions still emit an entry using the Toolhelp32 executable name fallback.
-///
-/// Returns `Err(SensorError::Snapshot)` if snapshot creation, initial enumeration, mid-stream
-/// iteration (any `Process32NextW` error other than `ERROR_NO_MORE_FILES`), or zero-process
-/// enumeration occurs so callers never mistake a truncated snapshot for all processes having
-/// exited.
-pub fn try_capture_running_processes() -> Result<Vec<SensorEvent>, SensorError> {
+/// `BUG_0002`), preserving each process's independently collected [`ProcessPackageInfo`].
+pub fn try_capture_running_processes_with_package()
+-> Result<Vec<CapturedProcessSnapshot>, SensorError> {
     // SAFETY: `TH32CS_SNAPPROCESS` with PID 0 snapshots all processes on the host.
     let raw_snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(|err| {
         SensorError::Snapshot(format!(
@@ -168,7 +169,7 @@ pub fn try_capture_running_processes() -> Result<Vec<SensorEvent>, SensorError> 
     })?;
 
     let volume_map = DosVolumeMap::from_system();
-    let mut events = Vec::new();
+    let mut snapshots = Vec::new();
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
@@ -187,21 +188,29 @@ pub fn try_capture_running_processes() -> Result<Vec<SensorEvent>, SensorError> 
         if pid != 0 {
             let fallback_name = utf16_z_to_string(&entry.szExeFile);
             let inspected = inspect_process_by_pid(pid, Some(&volume_map));
-            let (create_time_100ns, exe_path, command_line) = match inspected {
+            let (create_time_100ns, exe_path, command_line, package) = match inspected {
                 Some(info) => (
                     info.create_time_100ns,
                     info.exe_path.unwrap_or(fallback_name),
                     info.command_line.unwrap_or_default(),
+                    ProcessPackageInfo {
+                        package_family_name: info.package_family_name,
+                        package_sid: info.package_sid,
+                    }
+                    .normalized(),
                 ),
-                None => (0, fallback_name, String::new()),
+                None => (0, fallback_name, String::new(), ProcessPackageInfo::default()),
             };
 
-            events.push(SensorEvent::ProcessStart {
-                identity: ProcessIdentity::new(pid, create_time_100ns),
-                parent_pid: entry.th32ParentProcessID,
-                exe_path,
-                command_line,
-                user_sid: None,
+            snapshots.push(CapturedProcessSnapshot {
+                event: SensorEvent::ProcessStart {
+                    identity: ProcessIdentity::new(pid, create_time_100ns),
+                    parent_pid: entry.th32ParentProcessID,
+                    exe_path,
+                    command_line,
+                    user_sid: None,
+                },
+                package,
             });
         }
 
@@ -216,13 +225,31 @@ pub fn try_capture_running_processes() -> Result<Vec<SensorEvent>, SensorError> 
         }
     }
 
-    if events.is_empty() {
+    if snapshots.is_empty() {
         return Err(SensorError::Snapshot(
             "enumerated 0 running processes".to_string(),
         ));
     }
 
-    Ok(events)
+    Ok(snapshots)
+}
+
+/// Captures a baseline snapshot of currently running processes using Toolhelp32 (`AUTO-03`,
+/// `BUG_0002`).
+///
+/// Queries each accessible process's `CreationTime` (`create_time_100ns`), full Win32 image path,
+/// and command line. Protected system processes that deny `PROCESS_QUERY_LIMITED_INFORMATION`
+/// in non-elevated sessions still emit an entry using the Toolhelp32 executable name fallback.
+///
+/// Returns `Err(SensorError::Snapshot)` if snapshot creation, initial enumeration, mid-stream
+/// iteration (any `Process32NextW` error other than `ERROR_NO_MORE_FILES`), or zero-process
+/// enumeration occurs so callers never mistake a truncated snapshot for all processes having
+/// exited.
+pub fn try_capture_running_processes() -> Result<Vec<SensorEvent>, SensorError> {
+    Ok(try_capture_running_processes_with_package()?
+        .into_iter()
+        .map(|snap| snap.event)
+        .collect())
 }
 
 /// Captures a baseline snapshot of currently running processes using Toolhelp32 (`AUTO-03`).

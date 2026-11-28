@@ -31,11 +31,12 @@ use ledr_proto::{
     TELEMETRY_CHANNEL_CAPACITY,
 };
 use ledr_rules::{
-    compute_file_sha256_hex, BinaryIdentity, EarlyPruner, SigmaEngine,
+    compute_file_sha256_hex, BinaryIdentity, EarlyPruner, FieldCondition, MatchModifier,
+    SigmaEngine, SigmaField, SigmaRule,
 };
-use ledr_sensor_win::etw::LiveProcessInfo;
+use ledr_sensor_win::etw::{CapturedProcessSnapshot, LiveProcessInfo, ProcessPackageInfo};
 use ledr_sensor_win::{write_zone_identifier, MotwZoneInfo, WfpDropEvent};
-use ledr_store::LedrStore;
+use ledr_store::{LedrStore, ProcessPackageRecord};
 
 static PIPE_SEQ: AtomicU64 = AtomicU64::new(1);
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -2900,6 +2901,7 @@ async fn daemon_p4_19_late_motw_escalates_observed_process_to_enforced_containme
         dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77)),
         dst_port: 443,
         timestamp_ms: t0_ms + 500,
+        package_sid: None,
     }));
 
     let enforce_deadline = Instant::now() + Duration::from_secs(2);
@@ -2967,6 +2969,7 @@ async fn daemon_p4_19_late_motw_escalates_observed_process_to_enforced_containme
         dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 79)),
         dst_port: 8443,
         timestamp_ms: t0_ms + 1_500,
+        package_sid: None,
     }));
 
     // Shutdown drains every remaining queued WFP drop deterministically without cross-lane barriers.
@@ -5261,4 +5264,731 @@ async fn daemon_p4_25_expired_suspended_layer4_browser_alert_resolves_allow_once
 
     ipc_handle.shutdown().await;
     engine.shutdown_and_flush().await.expect("shutdown engine");
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_01_package_attrs_flow_to_store_and_sigma_canary_outbound_alerts() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let notifier = Arc::new(RecordingNotifier::default());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    let broker_exe = r"C:\Windows\System32\RuntimeBroker.exe";
+    let font_exe = r"C:\Windows\System32\fontdrvhost.exe";
+    for exe in [bth_exe, broker_exe, font_exe] {
+        inspector.insert(
+            exe,
+            BinaryIdentity {
+                exe_path: exe.to_string(),
+                sha256: Some("a".repeat(64)),
+                authenticode: None,
+            },
+        );
+    }
+
+    let sigma_rule = SigmaRule {
+        id: "TEST-FU-P4-03-SIGMA".to_string(),
+        title: "Suspicious BackgroundTaskHost ServerName".to_string(),
+        severity: AlertSeverity::Medium,
+        description: None,
+        conditions: vec![
+            FieldCondition {
+                field: SigmaField::Image,
+                modifier: MatchModifier::EndsWith,
+                values: vec![r"\backgroundTaskHost.exe".to_string()],
+            },
+            FieldCondition {
+                field: SigmaField::CommandLine,
+                modifier: MatchModifier::Contains,
+                values: vec!["-ServerName:Contoso.EvilTask".to_string()],
+            },
+        ],
+    };
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(vec![sigma_rule]).expect("compile sigma rule"),
+        EarlyPruner::from_json_str("{}").expect("empty pruner"),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Audit,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::clone(&notifier) as Arc<dyn NotificationDispatcher>,
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id_both = ProcessIdentity::new(41_001, unix_ms_to_filetime(now_ms - 5_000));
+    let id_pfn_only = ProcessIdentity::new(41_002, unix_ms_to_filetime(now_ms - 4_000));
+    let id_sid_only = ProcessIdentity::new(41_003, unix_ms_to_filetime(now_ms - 3_000));
+
+    // Seed PFN_ONLY_NON_APPCONTAINER and TOKEN_SID_ONLY via `seed_processes_with_package`.
+    let seeded = engine
+        .seed_processes_with_package(vec![
+            CapturedProcessSnapshot {
+                event: SensorEvent::ProcessStart {
+                    identity: id_pfn_only,
+                    parent_pid: 4,
+                    exe_path: broker_exe.to_string(),
+                    command_line: "RuntimeBroker.exe -Embedding".to_string(),
+                    user_sid: None,
+                },
+                package: ProcessPackageInfo {
+                    package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+                    package_sid: None,
+                },
+            },
+            CapturedProcessSnapshot {
+                event: SensorEvent::ProcessStart {
+                    identity: id_sid_only,
+                    parent_pid: 4,
+                    exe_path: font_exe.to_string(),
+                    command_line: "fontdrvhost.exe".to_string(),
+                    user_sid: None,
+                },
+                package: ProcessPackageInfo {
+                    package_family_name: None,
+                    package_sid: Some("S-1-15-2-99-88-77".to_string()),
+                },
+            },
+        ])
+        .expect("seed_processes_with_package");
+    assert_eq!(seeded, 2);
+
+    // Send PFN+SID ProcessStart through the TwoLaneSender package-aware path.
+    let sender = engine.sender();
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_both,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:Contoso.EvilTask".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.EvilTask_12345".to_string()),
+                package_sid: Some("S-1-15-2-10-20-30".to_string()),
+            },
+        )
+        .await
+        .expect("send_with_package ProcessStart");
+
+    // Emit Canary and NetworkConnect events for `id_both` (no `NEVER_SUSPEND` exemption on backgroundTaskHost.exe).
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: id_both.pid,
+            target_path: r"C:\Users\Alice\.env.prod".to_string(),
+            category: CanaryCategory::EnvFile,
+            access_mask: 0x2,
+            is_write_or_delete: true,
+            timestamp_ms: now_ms - 1_000,
+        })
+        .await
+        .expect("send CanaryFileAccess");
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_both.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            dst_port: 443,
+            domain_hint: Some("evil.example.invalid".to_string()),
+            timestamp_ms: now_ms - 500,
+        })
+        .await
+        .expect("send NetworkConnect");
+
+    wait_high_priority_processed(&engine, 3, "ProcessStart + Canary + NetworkConnect").await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    // 1. Verify SQLite auxiliary columns preserve all 3 independent combinations and frozen ProcessRecord works.
+    assert_eq!(
+        store
+            .get_process_package_info(&id_both.instance_id())
+            .expect("get package both"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Contoso.EvilTask_12345".to_string()),
+            package_sid: Some("S-1-15-2-10-20-30".to_string()),
+        })
+    );
+    assert_eq!(
+        store
+            .get_process_package_info(&id_pfn_only.instance_id())
+            .expect("get package pfn only"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+            package_sid: None,
+        })
+    );
+    assert_eq!(
+        store
+            .get_process_package_info(&id_sid_only.instance_id())
+            .expect("get package sid only"),
+        Some(ProcessPackageRecord {
+            package_family_name: None,
+            package_sid: Some("S-1-15-2-99-88-77".to_string()),
+        })
+    );
+    let snap = store
+        .query_flight_recorder(10, Some(&id_both.instance_id()))
+        .expect("query_flight_recorder intact");
+    assert_eq!(snap.processes.len(), 1);
+    assert_eq!(snap.processes[0].exe_path, bth_exe);
+
+    // 2. Verify all 3 alert layers (`LAYER_2_RULES`, `LAYER_1_CANARY`, `LAYER_3_NETWORK`) carry package attrs.
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    for layer in ["LAYER_2_RULES", "LAYER_1_CANARY", "LAYER_3_NETWORK"] {
+        let alert = alerts
+            .iter()
+            .find(|a| a.source_layer == layer)
+            .unwrap_or_else(|| panic!("expected alert from {layer}, got {alerts:?}"));
+        let ctx: serde_json::Value =
+            serde_json::from_str(&alert.context_json).expect("parse alert context_json");
+        assert_eq!(
+            ctx.get("package_family_name").and_then(|v| v.as_str()),
+            Some("Contoso.EvilTask_12345"),
+            "missing package_family_name in {layer}"
+        );
+        assert_eq!(
+            ctx.get("package_sid").and_then(|v| v.as_str()),
+            Some("S-1-15-2-10-20-30"),
+            "missing package_sid in {layer}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_falls_back_to_table() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let app_a = r"C:\Tools\pkg_drop_a.exe";
+    let app_b = r"C:\Tools\pkg_drop_b.exe";
+    let app_c = r"C:\Tools\pkg_drop_c.exe";
+    for exe in [app_a, app_b, app_c] {
+        inspector.insert(
+            exe,
+            BinaryIdentity {
+                exe_path: exe.to_string(),
+                sha256: Some("b".repeat(64)),
+                authenticode: None,
+            },
+        );
+    }
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Audit,
+            wfp_drop_dns_grace_ms: 0,
+            wfp_drop_attribution_grace_ms: 0,
+            wfp_drop_live_sibling_os_check: false,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id_a = ProcessIdentity::new(42_001, unix_ms_to_filetime(now_ms - 5_000));
+    let id_b = ProcessIdentity::new(42_002, unix_ms_to_filetime(now_ms - 5_000));
+    let id_c = ProcessIdentity::new(42_003, unix_ms_to_filetime(now_ms - 5_000));
+    let sender = engine.sender();
+
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_a,
+                parent_pid: 4,
+                exe_path: app_a.to_string(),
+                command_line: "pkg_drop_a.exe".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.DropA_1".to_string()),
+                package_sid: Some("S-1-15-2-table-a".to_string()),
+            },
+        )
+        .await
+        .expect("send start A");
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_b,
+                parent_pid: 4,
+                exe_path: app_b.to_string(),
+                command_line: "pkg_drop_b.exe".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.DropB_2".to_string()),
+                package_sid: Some("S-1-15-2-table-fallback-b".to_string()),
+            },
+        )
+        .await
+        .expect("send start B");
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_c,
+                parent_pid: 4,
+                exe_path: app_c.to_string(),
+                command_line: "pkg_drop_c.exe".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.DropC_3".to_string()),
+                package_sid: Some("S-1-15-2-match-c".to_string()),
+            },
+        )
+        .await
+        .expect("send start C");
+    wait_high_priority_processed(&engine, 3, "three ProcessStarts").await;
+
+    // A: Mismatched WFP drop event SID keeps event SID and clears candidate PFN to avoid mixing packages.
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 501,
+        rule_handle: 501,
+        exe_path: app_a.to_string(),
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)),
+        dst_port: 443,
+        timestamp_ms: now_ms,
+        package_sid: Some("S-1-15-2-wfp-override-a".to_string()),
+    }));
+
+    // B: WFP drop event has package_sid == None -> falls back to table TokenAppContainerSid and PFN.
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 502,
+        rule_handle: 502,
+        exe_path: app_b.to_string(),
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 12)),
+        dst_port: 443,
+        timestamp_ms: now_ms,
+        package_sid: None,
+    }));
+
+    // C: Case-insensitive matching SID preserves both candidate PFN and event SID.
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 503,
+        rule_handle: 503,
+        exe_path: app_c.to_string(),
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 13)),
+        dst_port: 443,
+        timestamp_ms: now_ms,
+        package_sid: Some("s-1-15-2-match-c".to_string()),
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while store.list_alerts(None, 10).expect("list").len() < 3 {
+        assert!(Instant::now() < deadline, "timed out waiting for three WFP drop alerts");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let alerts = store.list_alerts(None, 10).expect("list alerts");
+    let alert_a = alerts
+        .iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(id_a.instance_id().as_str()))
+        .expect("alert A");
+    let ctx_a: serde_json::Value = serde_json::from_str(&alert_a.context_json).expect("ctx A");
+    assert!(
+        ctx_a["package_family_name"].is_null(),
+        "mismatched WFP package_sid must clear candidate package_family_name, got {ctx_a}"
+    );
+    assert_eq!(ctx_a["package_sid"], "S-1-15-2-wfp-override-a");
+
+    let alert_b = alerts
+        .iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(id_b.instance_id().as_str()))
+        .expect("alert B");
+    let ctx_b: serde_json::Value = serde_json::from_str(&alert_b.context_json).expect("ctx B");
+    assert_eq!(ctx_b["package_family_name"], "Contoso.DropB_2");
+    assert_eq!(ctx_b["package_sid"], "S-1-15-2-table-fallback-b");
+
+    let alert_c = alerts
+        .iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(id_c.instance_id().as_str()))
+        .expect("alert C");
+    let ctx_c: serde_json::Value = serde_json::from_str(&alert_c.context_json).expect("ctx C");
+    assert_eq!(ctx_c["package_family_name"], "Contoso.DropC_3");
+    assert_eq!(ctx_c["package_sid"], "s-1-15-2-match-c");
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_03_ambiguous_wfp_drop_disambiguates_package_by_sid_without_guessing() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    inspector.insert(
+        bth_exe,
+        BinaryIdentity {
+            exe_path: bth_exe.to_string(),
+            sha256: Some("c".repeat(64)),
+            authenticode: None,
+        },
+    );
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Audit,
+            wfp_drop_dns_grace_ms: 0,
+            wfp_drop_attribution_grace_ms: 0,
+            wfp_drop_live_sibling_os_check: false,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id1 = ProcessIdentity::new(43_001, unix_ms_to_filetime(now_ms - 5_000));
+    let id2 = ProcessIdentity::new(43_002, unix_ms_to_filetime(now_ms - 4_500));
+    let sender = engine.sender();
+
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id1,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:PkgA".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("PkgA_111".to_string()),
+                package_sid: Some("S-1-15-2-111".to_string()),
+            },
+        )
+        .await
+        .expect("send id1");
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id2,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:PkgB".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("PkgB_222".to_string()),
+                package_sid: Some("S-1-15-2-222".to_string()),
+            },
+        )
+        .await
+        .expect("send id2");
+    wait_high_priority_processed(&engine, 2, "two backgroundTaskHost instances").await;
+
+    let shared_dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 44));
+    // 1. Ambiguous drop with `S-1-15-2-111` resolves `PkgA_111` in context_json.
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 601,
+        rule_handle: 601,
+        exe_path: bth_exe.to_string(),
+        protocol: 6,
+        dst_ip: shared_dst,
+        dst_port: 443,
+        timestamp_ms: now_ms,
+        package_sid: Some("S-1-15-2-111".to_string()),
+    }));
+
+    // 2. Simultaneous drop within 250ms to the SAME IP/port from `S-1-15-2-222` must NOT be
+    //    suppressed by `WfpDropDedupCache`.
+    assert!(
+        engine.ingest_wfp_drop_event(WfpDropEvent {
+            os_filter_id: 602,
+            rule_handle: 602,
+            exe_path: bth_exe.to_string(),
+            protocol: 6,
+            dst_ip: shared_dst,
+            dst_port: 443,
+            timestamp_ms: now_ms + 50,
+            package_sid: Some("S-1-15-2-222".to_string()),
+        }),
+        "distinct package_sid drops within 250ms must not suppress each other"
+    );
+
+    // 3. Ambiguous drop on a different IP with `package_sid == None` across two distinct packages
+    //    must keep both `package_family_name` and `package_sid` as `null` rather than guessing.
+    let no_sid_dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 45));
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 603,
+        rule_handle: 603,
+        exe_path: bth_exe.to_string(),
+        protocol: 6,
+        dst_ip: no_sid_dst,
+        dst_port: 443,
+        timestamp_ms: now_ms + 100,
+        package_sid: None,
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while store.list_alerts(None, 10).expect("list").len() < 3 {
+        assert!(Instant::now() < deadline, "timed out waiting for ambiguous drop alerts");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let alerts = store.list_alerts(None, 10).expect("list alerts");
+    let shared_alerts: Vec<serde_json::Value> = alerts
+        .iter()
+        .filter_map(|a| serde_json::from_str::<serde_json::Value>(&a.context_json).ok())
+        .filter(|ctx| ctx.get("dst_ip").and_then(|d| d.as_str()) == Some("198.51.100.44"))
+        .collect();
+    assert_eq!(
+        shared_alerts.len(),
+        2,
+        "distinct package_sid drops on shared IP must emit two alerts, got {shared_alerts:?}"
+    );
+    let alert_a = shared_alerts
+        .iter()
+        .find(|ctx| ctx.get("package_sid").and_then(|s| s.as_str()) == Some("S-1-15-2-111"))
+        .expect("alert for PkgA_111");
+    assert_eq!(alert_a["attribution"], "app_level_ambiguous");
+    assert_eq!(alert_a["package_family_name"], "PkgA_111");
+    assert_eq!(alert_a["package_sid"], "S-1-15-2-111");
+
+    let alert_b = shared_alerts
+        .iter()
+        .find(|ctx| ctx.get("package_sid").and_then(|s| s.as_str()) == Some("S-1-15-2-222"))
+        .expect("alert for PkgB_222");
+    assert_eq!(alert_b["attribution"], "app_level_ambiguous");
+    assert_eq!(alert_b["package_family_name"], "PkgB_222");
+    assert_eq!(alert_b["package_sid"], "S-1-15-2-222");
+
+    let unguessed_alert = alerts
+        .iter()
+        .find(|a| {
+            serde_json::from_str::<serde_json::Value>(&a.context_json)
+                .ok()
+                .and_then(|v| v.get("dst_ip").and_then(|d| d.as_str()).map(str::to_owned))
+                .as_deref()
+                == Some("198.51.100.45")
+        })
+        .expect("alert for no_sid_dst");
+    let unguessed_ctx: serde_json::Value =
+        serde_json::from_str(&unguessed_alert.context_json).expect("unguessed ctx");
+    assert_eq!(unguessed_ctx["attribution"], "app_level_ambiguous");
+    assert!(unguessed_ctx["package_family_name"].is_null());
+    assert!(unguessed_ctx["package_sid"].is_null());
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_04_canary_backfill_populates_package_attrs_in_store_and_alert() {
+    struct SingleLiveInspector {
+        pid: u32,
+        info: LiveProcessInfo,
+    }
+    impl LiveProcessInspector for SingleLiveInspector {
+        fn inspect_live_process(&self, pid: u32) -> Option<LiveProcessInfo> {
+            (pid == self.pid).then(|| self.info.clone())
+        }
+    }
+
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let created_100ns = unix_ms_to_filetime(now_ms - 5_000);
+    let pid = 44_004u32;
+    let exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    inspector.insert(
+        exe,
+        BinaryIdentity {
+            exe_path: exe.to_string(),
+            sha256: Some("d".repeat(64)),
+            authenticode: None,
+        },
+    );
+
+    let live_inspector = Arc::new(SingleLiveInspector {
+        pid,
+        info: LiveProcessInfo {
+            create_time_100ns: created_100ns,
+            exe_path: Some(exe.to_string()),
+            command_line: Some("backgroundTaskHost.exe -ServerName:CanaryApp".to_string()),
+            package_family_name: Some("Canary.App_abcde".to_string()),
+            package_sid: Some("S-1-15-2-44-55-66".to_string()),
+        },
+    });
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        live_inspector,
+    );
+
+    engine
+        .sender()
+        .send(SensorEvent::CanaryFileAccess {
+            pid,
+            target_path: r"C:\Users\Alice\.ssh\id_rsa".to_string(),
+            category: CanaryCategory::SshKey,
+            access_mask: 0x1,
+            is_write_or_delete: false,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send canary before ProcessStart");
+    wait_high_priority_processed(&engine, 1, "CanaryFileAccess backfill").await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let expected_inst_id = ProcessIdentity::new(pid, created_100ns).instance_id();
+    assert_eq!(
+        store
+            .get_process_package_info(&expected_inst_id)
+            .expect("get backfilled package attrs"),
+        Some(ProcessPackageRecord {
+            package_family_name: Some("Canary.App_abcde".to_string()),
+            package_sid: Some("S-1-15-2-44-55-66".to_string()),
+        })
+    );
+
+    let alerts = store.list_alerts(None, 10).expect("list alerts");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].source_layer, "LAYER_1_CANARY");
+    assert_eq!(
+        alerts[0].process_instance_id.as_deref(),
+        Some(expected_inst_id.as_str())
+    );
+    let ctx: serde_json::Value =
+        serde_json::from_str(&alerts[0].context_json).expect("parse canary context");
+    assert_eq!(ctx["package_family_name"], "Canary.App_abcde");
+    assert_eq!(ctx["package_sid"], "S-1-15-2-44-55-66");
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_05_process_stop_sigma_alert_preserves_package_attrs() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    inspector.insert(
+        bth_exe,
+        BinaryIdentity {
+            exe_path: bth_exe.to_string(),
+            sha256: Some("e".repeat(64)),
+            authenticode: None,
+        },
+    );
+
+    let sigma_rule = SigmaRule {
+        id: "TEST-FU-P4-03-STOP".to_string(),
+        title: "BackgroundTaskHost Image Exit Rule".to_string(),
+        severity: AlertSeverity::Medium,
+        description: None,
+        conditions: vec![FieldCondition {
+            field: SigmaField::Image,
+            modifier: MatchModifier::EndsWith,
+            values: vec![r"\backgroundTaskHost.exe".to_string()],
+        }],
+    };
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(vec![sigma_rule]).expect("compile sigma rule"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let pid = 45_005u32;
+    let id = ProcessIdentity::new(pid, unix_ms_to_filetime(now_ms - 2_000));
+    let sender = engine.sender();
+
+    // `EarlyPruner::default()` suppresses Sigma evaluation on `ProcessStart` for
+    // `backgroundTaskHost.exe`, leaving `ProcessStop` as the first rule match.
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:Contoso.StopHost".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.StopHost_1".to_string()),
+                package_sid: Some("S-1-15-2-stop-1".to_string()),
+            },
+        )
+        .await
+        .expect("send start");
+    wait_high_priority_processed(&engine, 1, "ProcessStart before stop").await;
+
+    sender
+        .send(SensorEvent::ProcessStop {
+            pid,
+            exit_code: 0,
+            exit_time_100ns: unix_ms_to_filetime(now_ms),
+        })
+        .await
+        .expect("send stop");
+    wait_high_priority_processed(&engine, 2, "ProcessStop").await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let alerts = store.list_alerts(None, 10).expect("list alerts");
+    assert_eq!(alerts.len(), 1, "ProcessStop should fire the Sigma Image rule once");
+    assert_eq!(alerts[0].source_layer, "LAYER_2_RULES");
+    assert_eq!(alerts[0].rule_id, "TEST-FU-P4-03-STOP");
+    assert_eq!(
+        alerts[0].process_instance_id.as_deref(),
+        Some(id.instance_id().as_str())
+    );
+    let ctx: serde_json::Value =
+        serde_json::from_str(&alerts[0].context_json).expect("parse stop alert context");
+    assert_eq!(ctx["package_family_name"], "Contoso.StopHost_1");
+    assert_eq!(ctx["package_sid"], "S-1-15-2-stop-1");
 }

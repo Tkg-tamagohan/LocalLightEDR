@@ -120,6 +120,8 @@ pub struct ActiveProcessEntry {
     pub exe_path: Arc<str>,
     pub command_line: String,
     pub user_sid: Option<String>,
+    pub package_family_name: Option<String>,
+    pub package_sid: Option<String>,
     pub created_at_ms: i64,
     pub exited_at_ms: Option<i64>,
     pub sigma_evaluated: bool,
@@ -218,6 +220,8 @@ struct EvictedLiveRecord {
     exe_path: Arc<str>,
     exe_key: Arc<str>,
     has_motw: bool,
+    package_family_name: Option<String>,
+    package_sid: Option<String>,
     generation: u64,
 }
 
@@ -355,6 +359,34 @@ impl ActiveProcessTable {
         user_sid: Option<String>,
         created_at_ms: i64,
     ) -> ProcessStartResolution {
+        self.on_process_start_with_package(
+            identity,
+            parent_pid,
+            exe_path,
+            command_line,
+            user_sid,
+            None,
+            None,
+            created_at_ms,
+        )
+    }
+
+    /// Variant of [`Self::on_process_start`] that also records independently gathered
+    /// `package_family_name` and `package_sid` without synthesizing one from the other (`FU-P4-03`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_process_start_with_package(
+        &mut self,
+        identity: ProcessIdentity,
+        parent_pid: u32,
+        exe_path: String,
+        command_line: String,
+        user_sid: Option<String>,
+        package_family_name: Option<String>,
+        package_sid: Option<String>,
+        created_at_ms: i64,
+    ) -> ProcessStartResolution {
+        let package_family_name = normalize_optional_pkg_attr(package_family_name);
+        let package_sid = normalize_optional_pkg_attr(package_sid);
         let instance_id = identity.instance_id();
 
         if identity.create_time_100ns == 0 {
@@ -436,6 +468,10 @@ impl ActiveProcessTable {
                     let upgraded_cmd =
                         prev_entry.command_line.is_empty() && !command_line.is_empty();
                     let upgraded_sid = prev_entry.user_sid.is_none() && user_sid.is_some();
+                    let upgraded_pkg_pfn =
+                        prev_entry.package_family_name.is_none() && package_family_name.is_some();
+                    let upgraded_pkg_sid =
+                        prev_entry.package_sid.is_none() && package_sid.is_some();
 
                     if upgraded_parent {
                         prev_entry.parent_instance_id = parent_instance_id.clone();
@@ -453,12 +489,20 @@ impl ActiveProcessTable {
                     if upgraded_sid {
                         prev_entry.user_sid = user_sid;
                     }
+                    if upgraded_pkg_pfn {
+                        prev_entry.package_family_name = package_family_name;
+                    }
+                    if upgraded_pkg_sid {
+                        prev_entry.package_sid = package_sid;
+                    }
 
                     let enriched = upgraded_parent
                         || upgraded_ppid
                         || upgraded_exe
                         || upgraded_cmd
-                        || upgraded_sid;
+                        || upgraded_sid
+                        || upgraded_pkg_pfn
+                        || upgraded_pkg_sid;
                     let should_evaluate_sigma =
                         !prev_entry.sigma_evaluated || upgraded_parent || upgraded_cmd || upgraded_exe;
                     prev_entry.sigma_evaluated = true;
@@ -556,6 +600,12 @@ impl ActiveProcessTable {
             }
             if existing.user_sid.is_none() {
                 existing.user_sid = user_sid;
+            }
+            if existing.package_family_name.is_none() {
+                existing.package_family_name = package_family_name;
+            }
+            if existing.package_sid.is_none() {
+                existing.package_sid = package_sid;
             }
             let is_active = existing.exited_at_ms.is_none();
             let existing_exited_at_ms = existing.exited_at_ms;
@@ -657,6 +707,8 @@ impl ActiveProcessTable {
                             exe_path: interned_exe,
                             command_line,
                             user_sid,
+                            package_family_name,
+                            package_sid,
                             created_at_ms,
                             exited_at_ms: Some(inferred_exit_ms),
                             sigma_evaluated: true,
@@ -716,6 +768,8 @@ impl ActiveProcessTable {
                     exe_path: interned_exe,
                     command_line,
                     user_sid,
+                    package_family_name,
+                    package_sid,
                     created_at_ms,
                     exited_at_ms: Some(inferred_exit_ms),
                     sigma_evaluated: true,
@@ -810,6 +864,8 @@ impl ActiveProcessTable {
                 exe_path: interned_exe,
                 command_line,
                 user_sid,
+                package_family_name,
+                package_sid,
                 created_at_ms,
                 exited_at_ms: None,
                 sigma_evaluated: true,
@@ -858,6 +914,17 @@ impl ActiveProcessTable {
         pid: u32,
         exited_at_ms: i64,
     ) -> Option<(String, String)> {
+        self.on_process_stop_with_package(pid, exited_at_ms)
+            .map(|(id, exe, _, _)| (id, exe))
+    }
+
+    /// Variant of [`Self::on_process_stop_with_exe`] that also returns collected
+    /// `(package_family_name, package_sid)` from either primary `entries` or `evicted_live`.
+    pub fn on_process_stop_with_package(
+        &mut self,
+        pid: u32,
+        exited_at_ms: i64,
+    ) -> Option<(String, String, Option<String>, Option<String>)> {
         let candidate_id = if let Some(ident) = self.pid_to_identity.get(&pid).copied() {
             let id = ident.instance_id();
             match self.entries.get(&id) {
@@ -888,7 +955,9 @@ impl ActiveProcessTable {
                 self.exited_fifo.push_back(target_id.clone());
             }
             let exe_path = entry.exe_path.to_string();
-            return Some((target_id, exe_path));
+            let pfn = entry.package_family_name.clone();
+            let sid = entry.package_sid.clone();
+            return Some((target_id, exe_path, pfn, sid));
         }
 
         if let Some(ev_id) = self.evicted_live_by_pid.get(&pid).and_then(|ids| {
@@ -899,7 +968,12 @@ impl ActiveProcessTable {
                 .map(|(id, _)| id.clone())
         }) {
             if let Some(ev) = self.remove_evicted_live_by_id(&ev_id) {
-                return Some((ev_id, ev.exe_path.to_string()));
+                return Some((
+                    ev_id,
+                    ev.exe_path.to_string(),
+                    ev.package_family_name,
+                    ev.package_sid,
+                ));
             }
         }
 
@@ -1584,7 +1658,15 @@ impl ActiveProcessTable {
                 }
             } else {
                 self.active_count = self.active_count.saturating_sub(1);
-                self.record_evicted_live(removed.instance_id, removed.identity, removed.created_at_ms, removed.exe_path, removed.origin_url.is_some());
+                self.record_evicted_live(
+                    removed.instance_id,
+                    removed.identity,
+                    removed.created_at_ms,
+                    removed.exe_path,
+                    removed.origin_url.is_some(),
+                    removed.package_family_name,
+                    removed.package_sid,
+                );
             }
             if self.pid_to_identity.get(&removed.pid) == Some(&removed.identity) {
                 self.pid_to_identity.remove(&removed.pid);
@@ -1592,6 +1674,7 @@ impl ActiveProcessTable {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_evicted_live(
         &mut self,
         instance_id: String,
@@ -1599,6 +1682,8 @@ impl ActiveProcessTable {
         created_at_ms: i64,
         exe_path: Arc<str>,
         has_motw: bool,
+        package_family_name: Option<String>,
+        package_sid: Option<String>,
     ) {
         let exe_key_str = normalize_exe_key(&exe_path);
         let exe_key = PathInterner::intern_shared(&self.path_interner, &exe_key_str);
@@ -1631,6 +1716,8 @@ impl ActiveProcessTable {
                 exe_path,
                 exe_key,
                 has_motw,
+                package_family_name,
+                package_sid,
                 generation,
             },
         );
@@ -1722,6 +1809,13 @@ impl ActiveProcessTable {
         }
         Some(removed)
     }
+}
+
+fn normalize_optional_pkg_attr(raw: Option<String>) -> Option<String> {
+    raw.and_then(|s| {
+        let trimmed = s.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
 }
 
 fn normalize_exe_key(raw_exe: &str) -> String {
@@ -3645,5 +3739,109 @@ mod tests {
         let removed = bounded.sweep_dead();
         assert_eq!(removed, PATH_INTERNER_MAX_ENTRIES);
         assert_eq!(bounded.len(), 0);
+    }
+
+    #[test]
+    fn proc_fu_p4_03_package_attributes_preserved_and_non_clobbering_across_upserts() {
+        let mut table = ActiveProcessTable::new(16);
+        let ident = ProcessIdentity::new(7100, 133_800_000_000_000_100);
+        let res = table.on_process_start_with_package(
+            ident,
+            4,
+            r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+            "backgroundTaskHost.exe -ServerName:App".to_string(),
+            None,
+            Some("  Contoso.App_12345  ".to_string()),
+            Some("".to_string()),
+            1_000,
+        );
+        assert!(!res.skip_store_ingest);
+        let entry = table
+            .get_by_instance_id(&res.instance_id)
+            .expect("entry present");
+        assert_eq!(entry.package_family_name.as_deref(), Some("Contoso.App_12345"));
+        assert_eq!(entry.package_sid, None);
+
+        // pid:0 absorption backfills missing package_sid without overwriting existing package_family_name.
+        let abs_res = table.on_process_start_with_package(
+            ProcessIdentity::new(7100, 0),
+            4,
+            r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+            String::new(),
+            None,
+            Some("Other.App_999".to_string()),
+            Some("S-1-15-2-1-2-3".to_string()),
+            1_010,
+        );
+        assert!(
+            !abs_res.skip_store_ingest,
+            "pid:0 backfill gaining package_sid must persist"
+        );
+        let entry = table
+            .get_by_instance_id(&res.instance_id)
+            .expect("entry still present");
+        assert_eq!(entry.package_family_name.as_deref(), Some("Contoso.App_12345"));
+        assert_eq!(entry.package_sid.as_deref(), Some("S-1-15-2-1-2-3"));
+
+        // Duplicate start with None must NOT clobber existing fields.
+        table.on_process_start_with_package(
+            ident,
+            4,
+            r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+            String::new(),
+            None,
+            None,
+            None,
+            1_020,
+        );
+        let entry = table
+            .get_by_instance_id(&res.instance_id)
+            .expect("entry keeps package attrs");
+        assert_eq!(entry.package_family_name.as_deref(), Some("Contoso.App_12345"));
+        assert_eq!(entry.package_sid.as_deref(), Some("S-1-15-2-1-2-3"));
+    }
+
+    #[test]
+    fn proc_fu_p4_03_evicted_live_process_stop_preserves_package_attrs() {
+        let mut table = ActiveProcessTable::new(1);
+        let evicted_id = ProcessIdentity::new(7201, 133_800_000_000_000_100);
+        let evicting_id = ProcessIdentity::new(7202, 133_800_000_000_000_200);
+        let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+
+        table.on_process_start_with_package(
+            evicted_id,
+            4,
+            bth_exe.to_string(),
+            "backgroundTaskHost.exe -ServerName:EvictedPkg".to_string(),
+            None,
+            Some("Contoso.Evicted_1".to_string()),
+            Some("S-1-15-2-7201".to_string()),
+            1_000,
+        );
+        table.on_process_start_with_package(
+            evicting_id,
+            4,
+            r"C:\Windows\System32\notepad.exe".to_string(),
+            "notepad.exe".to_string(),
+            None,
+            None,
+            None,
+            1_100,
+        );
+
+        assert!(
+            table.get_by_instance_id(&evicted_id.instance_id()).is_none(),
+            "first process should be displaced out of primary entries"
+        );
+        let stopped = table.on_process_stop_with_package(evicted_id.pid, 1_200);
+        assert_eq!(
+            stopped,
+            Some((
+                evicted_id.instance_id(),
+                bth_exe.to_string(),
+                Some("Contoso.Evicted_1".to_string()),
+                Some("S-1-15-2-7201".to_string()),
+            ))
+        );
     }
 }

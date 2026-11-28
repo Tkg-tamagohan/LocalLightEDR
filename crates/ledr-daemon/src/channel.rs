@@ -16,7 +16,14 @@ use ledr_proto::{
     TELEMETRY_CHANNEL_CAPACITY,
 };
 use ledr_rules::is_external_ip;
+use ledr_sensor_win::ProcessPackageInfo;
 use tokio::sync::{mpsc, watch, Notify};
+
+#[derive(Debug, Clone)]
+struct HighPriorityItem {
+    event: SensorEvent,
+    package: ProcessPackageInfo,
+}
 
 /// Error returned when a high-priority event cannot be sent immediately or the channel is closed.
 #[derive(Debug)]
@@ -197,7 +204,7 @@ impl Drop for InFlightHighGuard<'_> {
 /// Cloneable producer handle for [`TwoLaneChannel`].
 #[derive(Debug, Clone)]
 pub struct TwoLaneSender {
-    high_tx: mpsc::Sender<SensorEvent>,
+    high_tx: mpsc::Sender<HighPriorityItem>,
     telemetry: Arc<TelemetryRing>,
     stats: Arc<SharedStats>,
     close_tx: Arc<watch::Sender<bool>>,
@@ -207,12 +214,25 @@ impl TwoLaneSender {
     /// Routes `event` to its [`SensorEvent::default_lane`], awaiting space if the
     /// high-priority lane is temporarily full (never dropping high-priority events).
     pub async fn send(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
+        self.send_with_package(event, ProcessPackageInfo::default())
+            .await
+    }
+
+    /// Routes `event` paired with [`ProcessPackageInfo`] to its [`SensorEvent::default_lane`].
+    pub async fn send_with_package(
+        &self,
+        event: SensorEvent,
+        package: ProcessPackageInfo,
+    ) -> Result<(), ChannelClosedError> {
         match event.default_lane() {
-            EventLane::HighPriority => self.send_high_priority(event).await.map_err(|err| match err {
-                HighPrioritySendError::Full(ev) | HighPrioritySendError::Closed(ev) => {
-                    ChannelClosedError(ev)
-                }
-            }),
+            EventLane::HighPriority => self
+                .send_high_priority_with_package(event, package)
+                .await
+                .map_err(|err| match err {
+                    HighPrioritySendError::Full(ev) | HighPrioritySendError::Closed(ev) => {
+                        ChannelClosedError(ev)
+                    }
+                }),
             EventLane::Telemetry => self.send_telemetry(event),
         }
     }
@@ -229,14 +249,23 @@ impl TwoLaneSender {
 
     /// Sends a high-priority event, waiting for capacity instead of dropping (`L-10`).
     pub async fn send_high_priority(&self, event: SensorEvent) -> Result<(), HighPrioritySendError> {
+        self.send_high_priority_with_package(event, ProcessPackageInfo::default())
+            .await
+    }
+
+    async fn send_high_priority_with_package(
+        &self,
+        event: SensorEvent,
+        package: ProcessPackageInfo,
+    ) -> Result<(), HighPrioritySendError> {
         let _guard = InFlightHighGuard::enter(&self.stats);
         if self.stats.closed.load(Ordering::SeqCst) {
             return Err(HighPrioritySendError::Closed(event));
         }
         self.high_tx
-            .send(event)
+            .send(HighPriorityItem { event, package })
             .await
-            .map_err(|mpsc::error::SendError(ev)| HighPrioritySendError::Closed(ev))
+            .map_err(|mpsc::error::SendError(item)| HighPrioritySendError::Closed(item.event))
     }
 
     /// Attempts to enqueue a high-priority event without awaiting or dropping (`L-10`).
@@ -245,29 +274,53 @@ impl TwoLaneSender {
         if self.stats.closed.load(Ordering::SeqCst) {
             return Err(HighPrioritySendError::Closed(event));
         }
-        self.high_tx.try_send(event).map_err(|err| match err {
-            mpsc::error::TrySendError::Full(ev) => HighPrioritySendError::Full(ev),
-            mpsc::error::TrySendError::Closed(ev) => HighPrioritySendError::Closed(ev),
-        })
+        self.high_tx
+            .try_send(HighPriorityItem {
+                event,
+                package: ProcessPackageInfo::default(),
+            })
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(item) => HighPrioritySendError::Full(item.event),
+                mpsc::error::TrySendError::Closed(item) => {
+                    HighPrioritySendError::Closed(item.event)
+                }
+            })
     }
 
     /// Blocking send for synchronous producer threads (such as the ETW callback bridge).
     pub fn blocking_send(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
+        self.blocking_send_with_package(event, ProcessPackageInfo::default())
+    }
+
+    /// Blocking send paired with [`ProcessPackageInfo`] for synchronous producers (`FU-P4-03`).
+    pub fn blocking_send_with_package(
+        &self,
+        event: SensorEvent,
+        package: ProcessPackageInfo,
+    ) -> Result<(), ChannelClosedError> {
         match event.default_lane() {
-            EventLane::HighPriority => self.blocking_send_high_priority(event),
+            EventLane::HighPriority => self.blocking_send_high_priority_with_package(event, package),
             EventLane::Telemetry => self.send_telemetry(event),
         }
     }
 
     /// Blocking send directly into the non-dropping high-priority lane (`L-10`).
     pub fn blocking_send_high_priority(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
+        self.blocking_send_high_priority_with_package(event, ProcessPackageInfo::default())
+    }
+
+    fn blocking_send_high_priority_with_package(
+        &self,
+        event: SensorEvent,
+        package: ProcessPackageInfo,
+    ) -> Result<(), ChannelClosedError> {
         let _guard = InFlightHighGuard::enter(&self.stats);
         if self.stats.closed.load(Ordering::SeqCst) {
             return Err(ChannelClosedError(event));
         }
         self.high_tx
-            .blocking_send(event)
-            .map_err(|mpsc::error::SendError(ev)| ChannelClosedError(ev))
+            .blocking_send(HighPriorityItem { event, package })
+            .map_err(|mpsc::error::SendError(item)| ChannelClosedError(item.event))
     }
 
     /// Enqueues a telemetry event into the drop-oldest ring buffer (`L-10`).
@@ -339,7 +392,7 @@ impl TwoLaneSender {
 /// Consumer half of [`TwoLaneChannel`] draining high-priority events strictly before telemetry.
 #[derive(Debug)]
 pub struct TwoLaneReceiver {
-    high_rx: mpsc::Receiver<SensorEvent>,
+    high_rx: mpsc::Receiver<HighPriorityItem>,
     telemetry: Arc<TelemetryRing>,
     stats: Arc<SharedStats>,
     close_rx: watch::Receiver<bool>,
@@ -353,26 +406,34 @@ impl TwoLaneReceiver {
     }
 
     pub(crate) async fn recv_with_lane(&mut self) -> Option<(SensorEvent, EventLane)> {
+        self.recv_with_lane_and_package()
+            .await
+            .map(|(ev, lane, _)| (ev, lane))
+    }
+
+    pub(crate) async fn recv_with_lane_and_package(
+        &mut self,
+    ) -> Option<(SensorEvent, EventLane, ProcessPackageInfo)> {
         loop {
-            if let Ok(ev) = self.high_rx.try_recv() {
-                return Some((ev, EventLane::HighPriority));
+            if let Ok(item) = self.high_rx.try_recv() {
+                return Some((item.event, EventLane::HighPriority, item.package));
             }
 
             let notified = self.telemetry.notify.notified();
             tokio::pin!(notified);
 
             if let Some(ev) = self.telemetry.try_pop() {
-                return Some((ev, EventLane::Telemetry));
+                return Some((ev, EventLane::Telemetry, ProcessPackageInfo::default()));
             }
 
             if *self.close_rx.borrow() || self.telemetry.is_closed() {
                 if self.stats.in_flight_high.load(Ordering::SeqCst) == 0 {
                     self.high_rx.close();
-                    if let Some(ev) = self.high_rx.recv().await {
-                        return Some((ev, EventLane::HighPriority));
+                    if let Some(item) = self.high_rx.recv().await {
+                        return Some((item.event, EventLane::HighPriority, item.package));
                     }
                     if let Some(ev) = self.telemetry.try_pop() {
-                        return Some((ev, EventLane::Telemetry));
+                        return Some((ev, EventLane::Telemetry, ProcessPackageInfo::default()));
                     }
                     return None;
                 }
@@ -385,8 +446,8 @@ impl TwoLaneReceiver {
                 tokio::select! {
                     biased;
                     maybe_high = self.high_rx.recv() => {
-                        if let Some(ev) = maybe_high {
-                            return Some((ev, EventLane::HighPriority));
+                        if let Some(item) = maybe_high {
+                            return Some((item.event, EventLane::HighPriority, item.package));
                         }
                     }
                     _ = &mut in_flight_notified => {}
@@ -397,8 +458,8 @@ impl TwoLaneReceiver {
             tokio::select! {
                 biased;
                 maybe_high = self.high_rx.recv() => {
-                    if let Some(ev) = maybe_high {
-                        return Some((ev, EventLane::HighPriority));
+                    if let Some(item) = maybe_high {
+                        return Some((item.event, EventLane::HighPriority, item.package));
                     }
                     // High-priority senders dropped; drain any remaining telemetry and exit on next pass.
                     self.telemetry.close();
@@ -409,8 +470,13 @@ impl TwoLaneReceiver {
         }
     }
 
-    pub(crate) fn try_recv_high_priority(&mut self) -> Option<SensorEvent> {
-        self.high_rx.try_recv().ok()
+    pub(crate) fn try_recv_high_priority_with_package(
+        &mut self,
+    ) -> Option<(SensorEvent, ProcessPackageInfo)> {
+        self.high_rx
+            .try_recv()
+            .ok()
+            .map(|item| (item.event, item.package))
     }
 
     pub(crate) fn try_recv_telemetry(&mut self) -> Option<SensorEvent> {
@@ -426,17 +492,26 @@ impl TwoLaneReceiver {
     }
 
     pub(crate) fn drain_ready_with_lane(&mut self) -> Vec<(SensorEvent, EventLane)> {
+        self.drain_ready_with_lane_and_package()
+            .into_iter()
+            .map(|(ev, lane, _)| (ev, lane))
+            .collect()
+    }
+
+    pub(crate) fn drain_ready_with_lane_and_package(
+        &mut self,
+    ) -> Vec<(SensorEvent, EventLane, ProcessPackageInfo)> {
         if (*self.close_rx.borrow() || self.telemetry.is_closed())
             && self.stats.in_flight_high.load(Ordering::SeqCst) == 0
         {
             self.high_rx.close();
         }
         let mut out = Vec::new();
-        while let Ok(ev) = self.high_rx.try_recv() {
-            out.push((ev, EventLane::HighPriority));
+        while let Ok(item) = self.high_rx.try_recv() {
+            out.push((item.event, EventLane::HighPriority, item.package));
         }
         while let Some(ev) = self.telemetry.try_pop() {
-            out.push((ev, EventLane::Telemetry));
+            out.push((ev, EventLane::Telemetry, ProcessPackageInfo::default()));
         }
         out
     }
@@ -602,9 +677,19 @@ impl ClassifiedEventSender {
 
     /// Sends `event`, promoting unverified external `NetworkConnect` events to high-priority.
     pub async fn send(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
+        self.send_with_package(event, ProcessPackageInfo::default())
+            .await
+    }
+
+    /// Sends `event` paired with [`ProcessPackageInfo`], promoting qualifying events to high-priority.
+    pub async fn send_with_package(
+        &self,
+        event: SensorEvent,
+        package: ProcessPackageInfo,
+    ) -> Result<(), ChannelClosedError> {
         if self.should_promote(&event) {
             self.inner
-                .send_high_priority(event)
+                .send_high_priority_with_package(event, package)
                 .await
                 .map_err(|err| match err {
                     HighPrioritySendError::Full(ev) | HighPrioritySendError::Closed(ev) => {
@@ -612,7 +697,7 @@ impl ClassifiedEventSender {
                     }
                 })
         } else {
-            self.inner.send(event).await
+            self.inner.send_with_package(event, package).await
         }
     }
 
@@ -627,10 +712,20 @@ impl ClassifiedEventSender {
 
     /// Blocking send for synchronous producers (ETW callback bridge) with high-priority promotion.
     pub fn blocking_send(&self, event: SensorEvent) -> Result<(), ChannelClosedError> {
+        self.blocking_send_with_package(event, ProcessPackageInfo::default())
+    }
+
+    /// Blocking send paired with [`ProcessPackageInfo`] for synchronous ETW callback bridges.
+    pub fn blocking_send_with_package(
+        &self,
+        event: SensorEvent,
+        package: ProcessPackageInfo,
+    ) -> Result<(), ChannelClosedError> {
         if self.should_promote(&event) {
-            self.inner.blocking_send_high_priority(event)
+            self.inner
+                .blocking_send_high_priority_with_package(event, package)
         } else {
-            self.inner.blocking_send(event)
+            self.inner.blocking_send_with_package(event, package)
         }
     }
 

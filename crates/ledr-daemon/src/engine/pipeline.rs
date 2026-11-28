@@ -97,10 +97,14 @@ impl DaemonEngine {
             // are always up to date for attribution (`L-10`). Interleave one Tier 1b MOTW result
             // drain every `HIGH_PRIORITY_MOTW_INTERLEAVE_STREAK` (16) consecutive events so
             // sustained high-priority bursts cannot starve `motw_result_rx` or seed backlog progress.
-            if let Some(event) = receiver.try_recv_high_priority() {
+            if let Some((event, package)) = receiver.try_recv_high_priority_with_package() {
                 sync_telemetry_streak = 0;
                 let dns_update = self
-                    .process_event_with_lane_async(&event, EventLane::HighPriority)
+                    .process_event_with_lane_and_package_async(
+                        &event,
+                        EventLane::HighPriority,
+                        &package,
+                    )
                     .await;
                 self.maybe_wake_pending_wfp_drops(&event, dns_update, &mut pending_wfp_drops);
                 high_priority_streak += 1;
@@ -246,10 +250,12 @@ impl DaemonEngine {
 
             tokio::select! {
                 biased;
-                maybe_event = receiver.recv_with_lane() => {
+                maybe_event = receiver.recv_with_lane_and_package() => {
                     match maybe_event {
-                        Some((event, lane)) => {
-                            let dns_update = self.process_event_with_lane_async(&event, lane).await;
+                        Some((event, lane, package)) => {
+                            let dns_update = self
+                                .process_event_with_lane_and_package_async(&event, lane, &package)
+                                .await;
                             self.maybe_wake_pending_wfp_drops(&event, dns_update, &mut pending_wfp_drops);
                         }
                         None => break,
@@ -452,9 +458,9 @@ impl DaemonEngine {
             }
         }
 
-        let remaining_events = receiver.drain_ready_with_lane();
+        let remaining_events = receiver.drain_ready_with_lane_and_package();
         let total_remaining = remaining_events.len();
-        for (idx, (remaining, lane)) in remaining_events.into_iter().enumerate() {
+        for (idx, (remaining, lane, package)) in remaining_events.into_iter().enumerate() {
             if self.is_shutdown_drain_cutoff() {
                 tracing::warn!(
                     dropped_remaining = total_remaining.saturating_sub(idx),
@@ -462,7 +468,9 @@ impl DaemonEngine {
                 );
                 return Ok(WorkerExit::DrainTruncated);
             }
-            let _ = self.process_event_with_lane_async(&remaining, lane).await;
+            let _ = self
+                .process_event_with_lane_and_package_async(&remaining, lane, &package)
+                .await;
             tokio::task::yield_now().await;
         }
         while let Ok(late_motw) = motw_result_rx.try_recv() {

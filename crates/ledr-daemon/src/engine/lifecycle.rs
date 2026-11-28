@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use ledr_proto::{ActiveDefenseController, ProcessIdentity, SensorEvent};
 use ledr_rules::{EarlyPruner, NrdCache, NrdCancelToken, SigmaEngine, NRD_MAX_ENTRIES};
-use ledr_sensor_win::NoopDefenseController;
+use ledr_sensor_win::{CapturedProcessSnapshot, NoopDefenseController, ProcessPackageInfo};
 use ledr_store::{LedrStore, PurgeStats, StoreError};
 
 use crate::channel::{OutboundLaneClassifier, TwoLaneChannel};
@@ -332,14 +332,33 @@ impl DaemonEngine {
     /// Seeds the in-memory [`ActiveProcessTable`] and SQLite store with initial OS process snapshots
     /// (`AUTO-03`), flushes them immediately, and reconciles any stale running processes from prior
     /// daemon sessions (`BUG_0001`, `BUG_0002`).
+    /// Seeds initial processes captured at daemon startup into [`ActiveProcessTable`] and
+    /// SQLite without invoking `ActiveProcessTable::on_process_start` out of order.
     pub fn seed_processes(&self, snapshots: Vec<SensorEvent>) -> Result<usize, anyhow::Error> {
+        let wrapped = snapshots
+            .into_iter()
+            .map(|event| CapturedProcessSnapshot {
+                event,
+                package: ProcessPackageInfo::default(),
+            })
+            .collect();
+        self.seed_processes_with_package(wrapped)
+    }
+
+    /// Seeds initial processes paired with [`ProcessPackageInfo`] captured at daemon startup
+    /// into [`ActiveProcessTable`] and SQLite (`FU-P4-03`).
+    pub fn seed_processes_with_package(
+        &self,
+        snapshots: Vec<CapturedProcessSnapshot>,
+    ) -> Result<usize, anyhow::Error> {
         let mut count = 0usize;
         let mut active_id_set = HashSet::with_capacity(snapshots.len());
         let mut motw_group_indices: HashMap<String, usize> = HashMap::new();
         let mut motw_groups: Vec<SeedMotwGroup> = Vec::new();
-        for ev in snapshots {
+        for snap in snapshots {
+            let ev = snap.event;
             if matches!(&ev, SensorEvent::ProcessStart { .. }) {
-                let outcome = self.process_seed_process_start(&ev);
+                let outcome = self.process_seed_process_start_with_package(&ev, &snap.package);
                 if let Some(resolved_id) = outcome.resolved_active_id {
                     active_id_set.insert(resolved_id);
                 }

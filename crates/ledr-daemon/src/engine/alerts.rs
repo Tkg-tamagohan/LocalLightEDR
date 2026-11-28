@@ -904,10 +904,11 @@ impl DaemonEngine {
 
         if is_network_alert {
             if let (Some(ref exe), Some(dst_ip)) = (&exe_path, alert_dst_ip) {
+                let alert_pkg_sid = ctx_val.get("package_sid").and_then(|v| v.as_str());
                 self.app_wfp_alert_dedup
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .clear_key(&WfpRuleManager::exe_key(exe), dst_ip);
+                    .clear_key(&WfpRuleManager::exe_key(exe), alert_pkg_sid, dst_ip);
             }
             if self.config.outbound_firewall_enabled {
                 if let Some(ref exe) = exe_path {

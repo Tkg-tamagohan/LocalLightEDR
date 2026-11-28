@@ -1908,6 +1908,8 @@ async fn pr21_v2_ci_0001_canary_backfill_rejects_low_bit_pid_alias_and_missing_l
                 create_time_100ns: live_create_100ns,
                 exe_path: None,
                 command_line: None,
+                package_family_name: None,
+                package_sid: None,
             },
         ),
         (
@@ -1916,6 +1918,8 @@ async fn pr21_v2_ci_0001_canary_backfill_rejects_low_bit_pid_alias_and_missing_l
                 create_time_100ns: live_create_100ns,
                 exe_path: Some("   ".to_string()),
                 command_line: None,
+                package_family_name: None,
+                package_sid: None,
             },
         ),
     ]));
@@ -1975,6 +1979,8 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
                 create_time_100ns: created_100ns,
                 exe_path: Some(r"C:\Temp\unregistered_stealer.exe".to_string()),
                 command_line: Some("unregistered_stealer.exe --dump".to_string()),
+                package_family_name: None,
+                package_sid: None,
             },
         ),
         (
@@ -1983,6 +1989,8 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
                 create_time_100ns: created_100ns,
                 exe_path: Some(r"C:\Temp\zero_ts_upgraded.exe".to_string()),
                 command_line: None,
+                package_family_name: None,
+                package_sid: None,
             },
         ),
         (
@@ -1991,6 +1999,8 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
                 create_time_100ns: created_100ns,
                 exe_path: None,
                 command_line: None,
+                package_family_name: None,
+                package_sid: None,
             },
         ),
     ]));
@@ -2137,6 +2147,8 @@ async fn pr21_v2_ci_0002_canary_backfill_preserves_created_at_ppid_and_skips_noo
             create_time_100ns: created_100ns,
             exe_path: Some(r"C:\Temp\enriched_4408.exe".to_string()),
             command_line: None,
+            package_family_name: None,
+            package_sid: None,
         },
     );
     let canary_ts_4408_enriched = current_unix_ms().max(canary_ts_4408_noop + 1);
@@ -2243,6 +2255,8 @@ async fn pr23_bug_0001_superseded_zero_ts_placeholder_closed_in_sqlite_on_start_
             create_time_100ns: real_created_100ns,
             exe_path: Some(r"C:\Temp\backfill_4604.exe".to_string()),
             command_line: Some("backfill_4604.exe".to_string()),
+            package_family_name: None,
+            package_sid: None,
         },
     )]));
 
@@ -4612,6 +4626,8 @@ async fn daemon_p4_cmd_05_canary_backfill_before_process_start_applies_launch_gu
                 create_time_100ns: canary_proc_100ns,
                 exe_path: Some(canary_exe.to_string()),
                 command_line: Some("canary_first.exe --steal".to_string()),
+                package_family_name: None,
+                package_sid: None,
             },
         ),
         (
@@ -4620,6 +4636,8 @@ async fn daemon_p4_cmd_05_canary_backfill_before_process_start_applies_launch_gu
                 create_time_100ns: empty_exe_canary_100ns,
                 exe_path: None,
                 command_line: None,
+                package_family_name: None,
+                package_sid: None,
             },
         ),
     ]));
@@ -5174,6 +5192,8 @@ async fn daemon_p4_cmd_06_canary_first_delayed_motw_exceeding_budget_applies_wfp
             create_time_100ns: proc_100ns,
             exe_path: Some(normal_exe.to_string()),
             command_line: Some("moved_canary_app.exe --quiet".to_string()),
+            package_family_name: None,
+            package_sid: None,
         },
     )]));
 

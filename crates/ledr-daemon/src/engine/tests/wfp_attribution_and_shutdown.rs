@@ -166,6 +166,7 @@ async fn daemon_p3_51_bfe_race_os_live_sibling_and_lock_non_holding() {
             dst_ip: dst_v6,
             dst_port: 443,
             timestamp_ms: drop_ts,
+            package_sid: None,
         }));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -255,6 +256,7 @@ async fn daemon_p3_51_bfe_race_os_live_sibling_and_lock_non_holding() {
             dst_ip: dst_v6,
             dst_port: 443,
             timestamp_ms: base_ms,
+            package_sid: None,
         }));
 
         assert!(
@@ -327,6 +329,7 @@ async fn daemon_p3_51_bfe_race_os_live_sibling_and_lock_non_holding() {
             dst_ip: dst_v6,
             dst_port: 443,
             timestamp_ms: base_ms,
+            package_sid: None,
         }));
 
         assert!(
@@ -406,6 +409,7 @@ async fn daemon_p3_52_evicted_siblings_non_dos_negative_dns_and_decoy_rejection(
             protocol: 6,
             timestamp_ms: base_ms,
             os_filter_id: 9,
+            package_sid: None,
         });
         assert_eq!(defense.suspends(), 0);
         let alerts = store.list_alerts(Some(AlertStatus::Pending), 20).expect("alerts");
@@ -446,6 +450,7 @@ async fn daemon_p3_52_evicted_siblings_non_dos_negative_dns_and_decoy_rejection(
             protocol: 6,
             timestamp_ms: base_ms,
             os_filter_id: 19,
+            package_sid: None,
         });
         assert_eq!(defense.suspends(), 0);
         let alerts = store.list_alerts(Some(AlertStatus::Pending), 20).expect("alerts");
@@ -498,6 +503,7 @@ async fn daemon_p3_52_evicted_siblings_non_dos_negative_dns_and_decoy_rejection(
             protocol: 6,
             timestamp_ms: base_ms,
             os_filter_id: 10,
+            package_sid: None,
         });
         assert_eq!(
             defense.suspends(),
@@ -546,6 +552,7 @@ async fn daemon_p3_52_evicted_siblings_non_dos_negative_dns_and_decoy_rejection(
             protocol: 6,
             timestamp_ms: base_ms,
             os_filter_id: 11,
+            package_sid: None,
         });
         assert_eq!(
             defense.suspends(),
@@ -603,6 +610,7 @@ async fn daemon_p3_52_evicted_siblings_non_dos_negative_dns_and_decoy_rejection(
             dst_ip,
             dst_port: 443,
             timestamp_ms: drop_ts,
+            package_sid: None,
         }));
         tokio::time::sleep(Duration::from_millis(40)).await;
 
@@ -672,6 +680,7 @@ async fn daemon_p3_52_evicted_siblings_non_dos_negative_dns_and_decoy_rejection(
             dst_ip,
             dst_port: 443,
             timestamp_ms: drop_ts,
+            package_sid: None,
         }));
         tokio::time::sleep(Duration::from_millis(40)).await;
 
@@ -841,6 +850,7 @@ async fn daemon_p3_51b_single_pass_os_sibling_no_double_inspect_and_dns_and_attr
             dst_ip: dst_v4,
             dst_port: 443,
             timestamp_ms: base_ms,
+            package_sid: None,
         }));
         assert!(
             wait_until_unit(1_000, || {
@@ -890,6 +900,7 @@ async fn daemon_p3_51b_single_pass_os_sibling_no_double_inspect_and_dns_and_attr
             dst_ip: dst_v4,
             dst_port: 443,
             timestamp_ms: base_ms + 300,
+            package_sid: None,
         }));
         assert!(
             wait_until_unit(1_000, || {
@@ -986,6 +997,7 @@ async fn daemon_p3_51b_single_pass_os_sibling_no_double_inspect_and_dns_and_attr
             dst_ip: dst_v4,
             dst_port: 443,
             timestamp_ms: now_ms,
+            package_sid: None,
         }));
         tokio::time::sleep(Duration::from_millis(40)).await;
 

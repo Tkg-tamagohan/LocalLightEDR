@@ -934,6 +934,8 @@ impl DaemonEngine {
                     "motw_referrer": proc_ctx.motw_referrer,
                     "motw_frame_url": proc_ctx.motw_frame_url,
                     "motw_zone_id": proc_ctx.motw_zone_id,
+                    "package_family_name": proc_ctx.package_family_name,
+                    "package_sid": proc_ctx.package_sid,
                 })
                 .to_string();
                 let alert = AlertRecord {
@@ -1263,6 +1265,8 @@ impl DaemonEngine {
                     "motw_referrer": proc_ctx.motw_referrer,
                     "motw_frame_url": proc_ctx.motw_frame_url,
                     "motw_zone_id": proc_ctx.motw_zone_id,
+                    "package_family_name": proc_ctx.package_family_name,
+                    "package_sid": proc_ctx.package_sid,
                 })
                 .to_string();
 

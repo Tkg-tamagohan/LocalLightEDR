@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ledr_proto::{
     AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord, CanaryCategory, DnsQueryRecord,
     DownloadOriginRecord, FileCanaryEventRecord, NetworkEventRecord, ProcessRecord, RuleScope,
@@ -41,6 +43,8 @@ CREATE TABLE IF NOT EXISTS processes (
     is_trusted_os       INTEGER NOT NULL DEFAULT 0,
     user_sid            TEXT,
     origin_url          TEXT,
+    package_family_name TEXT,
+    package_sid         TEXT,
     created_at_ms       INTEGER NOT NULL,
     exited_at_ms        INTEGER
 ) WITHOUT ROWID;
@@ -142,6 +146,26 @@ CREATE TABLE IF NOT EXISTS honeypot_files (
     last_seen_at_ms INTEGER NOT NULL
 ) WITHOUT ROWID;
 ";
+
+pub(crate) fn ensure_process_package_columns(conn: &Connection) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(processes)")?;
+    let mut rows = stmt.query([])?;
+    let mut cols = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        cols.insert(name);
+    }
+    if cols.is_empty() {
+        return Ok(());
+    }
+    if !cols.contains("package_family_name") {
+        conn.execute_batch("ALTER TABLE processes ADD COLUMN package_family_name TEXT;")?;
+    }
+    if !cols.contains("package_sid") {
+        conn.execute_batch("ALTER TABLE processes ADD COLUMN package_sid TEXT;")?;
+    }
+    Ok(())
+}
 
 pub(crate) fn writer_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_WRITE

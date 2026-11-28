@@ -50,6 +50,7 @@ pub(super) struct QueuedWfpDrop {
     pub(super) protocol: u8,
     pub(super) timestamp_ms: i64,
     pub(super) os_filter_id: u64,
+    pub(super) package_sid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,7 @@ pub(super) struct WfpCandidateResolution {
     candidates: Vec<WfpCandidate>,
     ambiguous: bool,
     candidate_gone: bool,
+    candidates_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,8 @@ struct WfpCandidate {
     motw_referrer: Option<String>,
     motw_frame_url: Option<String>,
     motw_zone_id: Option<u32>,
+    package_family_name: Option<String>,
+    package_sid: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,16 +112,25 @@ pub(super) enum OverflowPushOutcome {
     CoalescedOverwritten,
 }
 
+fn normalize_package_sid_key(package_sid: Option<&str>) -> Option<String> {
+    package_sid
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
 /// Bounded overflow fallback queue for [`QueuedWfpDrop`] events when `wfp_drop_tx` is temporarily
 /// full inside a non-blocking BFE net-event callback (`L-10`, `BUG_0006` overflow guarantee).
-/// Deduplicates identical `(exe_key, dst_ip)` tuples and coalesces per `exe_key` if even the
-/// secondary queue reaches `capacity` so blocked apps still reach operator triage.
+/// Deduplicates identical `(exe_key, package_sid, dst_ip)` tuples and coalesces per
+/// `(exe_key, package_sid)` if even the secondary queue reaches `capacity` so blocked apps/packages
+/// still reach operator triage without cross-package suppression.
 #[derive(Debug, Default)]
 pub(super) struct WfpDropOverflowQueue {
     queue: VecDeque<QueuedWfpDrop>,
-    active_keys: HashSet<(String, IpAddr)>,
-    coalesced_by_exe: HashMap<String, QueuedWfpDrop>,
-    coalesced_order: VecDeque<String>,
+    active_keys: HashSet<(String, Option<String>, IpAddr)>,
+    coalesced_by_exe: HashMap<(String, Option<String>), QueuedWfpDrop>,
+    coalesced_order: VecDeque<(String, Option<String>)>,
+    coalesced_exe_counts: HashMap<String, usize>,
     last_coalesced: Option<(String, IpAddr)>,
     capacity: usize,
 }
@@ -129,18 +142,65 @@ impl WfpDropOverflowQueue {
             active_keys: HashSet::new(),
             coalesced_by_exe: HashMap::new(),
             coalesced_order: VecDeque::new(),
+            coalesced_exe_counts: HashMap::new(),
             last_coalesced: None,
             capacity: capacity.max(1),
         }
     }
 
+    fn remove_coalesced_entry(
+        &mut self,
+        key: &(String, Option<String>),
+    ) -> Option<QueuedWfpDrop> {
+        let removed = self.coalesced_by_exe.remove(key)?;
+        if let Some(count) = self.coalesced_exe_counts.get_mut(&key.0) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.coalesced_exe_counts.remove(&key.0);
+            }
+        }
+        Some(removed)
+    }
+
+    fn evict_coalesced_fair(&mut self, incoming_exe: &str) -> Option<(String, Option<String>)> {
+        // Tier 1: Reclaim an extra slot from any executable holding >1 package slot so shared
+        // host executables cannot starve unrelated single-slot executables.
+        // Tier 2: Reclaim the incoming executable's own existing slot if it already has >=1 slot.
+        // Tier 3: Fall back to oldest FIFO across single-slot executables.
+        let target_idx = self
+            .coalesced_order
+            .iter()
+            .position(|(exe, _)| self.coalesced_exe_counts.get(exe).copied().unwrap_or(0) > 1)
+            .or_else(|| {
+                (self
+                    .coalesced_exe_counts
+                    .get(incoming_exe)
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1)
+                    .then(|| {
+                        self.coalesced_order
+                            .iter()
+                            .position(|(exe, _)| exe == incoming_exe)
+                    })
+                    .flatten()
+            })
+            .or_else(|| (!self.coalesced_order.is_empty()).then_some(0));
+        let idx = target_idx?;
+        let key = self.coalesced_order.remove(idx)?;
+        self.remove_coalesced_entry(&key);
+        Some(key)
+    }
+
     pub(super) fn push(&mut self, item: QueuedWfpDrop) -> OverflowPushOutcome {
         let canon_dst = canonical_ip(item.dst_ip);
-        let dedup_key = (item.exe_key.clone(), canon_dst);
+        let sid_key = normalize_package_sid_key(item.package_sid.as_deref());
+        let dedup_key = (item.exe_key.clone(), sid_key.clone(), canon_dst);
         if self.active_keys.contains(&dedup_key) {
             return OverflowPushOutcome::Deduplicated;
         }
-        if let Some(existing) = self.coalesced_by_exe.get_mut(&item.exe_key) {
+        let coalesce_key = (item.exe_key.clone(), sid_key);
+        if let Some(existing) = self.coalesced_by_exe.get_mut(&coalesce_key) {
             if canonical_ip(existing.dst_ip) == canon_dst {
                 *existing = item;
                 return OverflowPushOutcome::Deduplicated;
@@ -151,24 +211,37 @@ impl WfpDropOverflowQueue {
             self.queue.push_back(item);
             return OverflowPushOutcome::Queued;
         }
-        let exe_k = item.exe_key.clone();
         if let std::collections::hash_map::Entry::Occupied(mut entry) =
-            self.coalesced_by_exe.entry(exe_k.clone())
+            self.coalesced_by_exe.entry(coalesce_key.clone())
         {
             self.last_coalesced = Some((item.exe_path.clone(), canon_dst));
             entry.insert(item);
             return OverflowPushOutcome::CoalescedOverwritten;
         }
+        let mut evicted_same_exe = false;
         while self.coalesced_by_exe.len() >= self.capacity {
-            let Some(evicted) = self.coalesced_order.pop_front() else {
+            let Some((ev_exe, _)) = self.evict_coalesced_fair(&coalesce_key.0) else {
                 self.coalesced_by_exe.clear();
+                self.coalesced_exe_counts.clear();
+                self.coalesced_order.clear();
                 break;
             };
-            self.coalesced_by_exe.remove(&evicted);
+            if ev_exe == coalesce_key.0 {
+                evicted_same_exe = true;
+                self.last_coalesced = Some((item.exe_path.clone(), canon_dst));
+            }
         }
-        self.coalesced_order.push_back(exe_k.clone());
-        self.coalesced_by_exe.insert(exe_k, item);
-        OverflowPushOutcome::CoalescedNewExe
+        self.coalesced_order.push_back(coalesce_key.clone());
+        *self
+            .coalesced_exe_counts
+            .entry(coalesce_key.0.clone())
+            .or_insert(0) += 1;
+        self.coalesced_by_exe.insert(coalesce_key, item);
+        if evicted_same_exe {
+            OverflowPushOutcome::CoalescedOverwritten
+        } else {
+            OverflowPushOutcome::CoalescedNewExe
+        }
     }
 
     pub(super) fn take_last_coalesced(&mut self) -> Option<(String, IpAddr)> {
@@ -177,12 +250,16 @@ impl WfpDropOverflowQueue {
 
     pub(super) fn pop(&mut self) -> Option<QueuedWfpDrop> {
         if let Some(item) = self.queue.pop_front() {
-            let dedup_key = (item.exe_key.clone(), canonical_ip(item.dst_ip));
+            let dedup_key = (
+                item.exe_key.clone(),
+                normalize_package_sid_key(item.package_sid.as_deref()),
+                canonical_ip(item.dst_ip),
+            );
             self.active_keys.remove(&dedup_key);
             return Some(item);
         }
-        while let Some(exe_k) = self.coalesced_order.pop_front() {
-            if let Some(item) = self.coalesced_by_exe.remove(&exe_k) {
+        while let Some(coalesce_key) = self.coalesced_order.pop_front() {
+            if let Some(item) = self.remove_coalesced_entry(&coalesce_key) {
                 return Some(item);
             }
         }
@@ -191,11 +268,11 @@ impl WfpDropOverflowQueue {
 }
 
 /// Bounded deduplication set for unresolved app-level ambiguous WFP drop alerts keyed by
-/// `(exe_key, canonical_dst_ip)` (`Thread 9`).
+/// `(exe_key, package_sid, canonical_dst_ip)` (`Thread 9`).
 #[derive(Debug, Default)]
 pub(super) struct AppWfpAlertDedup {
-    keys: HashSet<(String, IpAddr)>,
-    order: VecDeque<(String, IpAddr)>,
+    keys: HashSet<(String, Option<String>, IpAddr)>,
+    order: VecDeque<(String, Option<String>, IpAddr)>,
     capacity: usize,
 }
 
@@ -208,8 +285,12 @@ impl AppWfpAlertDedup {
         }
     }
 
-    fn mark_if_new(&mut self, exe_key: &str, dst_ip: IpAddr) -> bool {
-        let key = (exe_key.to_string(), canonical_ip(dst_ip));
+    fn mark_if_new(&mut self, exe_key: &str, package_sid: Option<&str>, dst_ip: IpAddr) -> bool {
+        let key = (
+            exe_key.to_string(),
+            normalize_package_sid_key(package_sid),
+            canonical_ip(dst_ip),
+        );
         if self.keys.contains(&key) {
             return false;
         }
@@ -226,8 +307,17 @@ impl AppWfpAlertDedup {
         true
     }
 
-    pub(super) fn clear_key(&mut self, exe_key: &str, dst_ip: IpAddr) {
-        let key = (exe_key.to_string(), canonical_ip(dst_ip));
+    pub(super) fn clear_key(
+        &mut self,
+        exe_key: &str,
+        package_sid: Option<&str>,
+        dst_ip: IpAddr,
+    ) {
+        let key = (
+            exe_key.to_string(),
+            normalize_package_sid_key(package_sid),
+            canonical_ip(dst_ip),
+        );
         self.keys.remove(&key);
     }
 }
@@ -274,12 +364,25 @@ impl DaemonEngine {
             current_unix_ms()
         };
 
+        let package_sid = drop_ev
+            .package_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
         {
             let mut dedup = self
                 .wfp_drop_dedup
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if !dedup.should_emit(&exe_key, canon_ip, drop_ev.dst_port, effective_ts) {
+            if !dedup.should_emit(
+                &exe_key,
+                package_sid.as_deref(),
+                canon_ip,
+                drop_ev.dst_port,
+                effective_ts,
+            ) {
                 return false;
             }
         }
@@ -292,6 +395,7 @@ impl DaemonEngine {
             protocol: drop_ev.protocol,
             timestamp_ms: effective_ts,
             os_filter_id: drop_ev.os_filter_id,
+            package_sid,
         };
         match self.wfp_drop_tx.try_send(queued) {
             Ok(()) => true,
@@ -427,6 +531,8 @@ impl DaemonEngine {
                         motw_referrer: e.motw_referrer.clone(),
                         motw_frame_url: e.motw_frame_url.clone(),
                         motw_zone_id: e.motw_zone_id,
+                        package_family_name: e.package_family_name.clone(),
+                        package_sid: e.package_sid.clone(),
                     }
                 })
                 .collect();
@@ -462,9 +568,12 @@ impl DaemonEngine {
                 motw_referrer: None,
                 motw_frame_url: None,
                 motw_zone_id: None,
+                package_family_name: None,
+                package_sid: None,
             });
         }
         let mut ambiguous = candidates.len() > 1;
+        let mut candidates_complete = !exe_overflowed;
 
         if candidates.len() == 1 && !ambiguous {
             let single_inst_id = candidates[0].instance_id.clone();
@@ -493,6 +602,7 @@ impl DaemonEngine {
             };
             if negative_dns_ambiguous {
                 ambiguous = true;
+                candidates_complete = false;
             }
 
             if !ambiguous && check_live_os_siblings && self.config.wfp_drop_live_sibling_os_check {
@@ -520,6 +630,8 @@ impl DaemonEngine {
                                     motw_referrer: None,
                                     motw_frame_url: None,
                                     motw_zone_id: None,
+                                    package_family_name: None,
+                                    package_sid: None,
                                 });
                             }
                         }
@@ -546,6 +658,7 @@ impl DaemonEngine {
             candidates,
             ambiguous,
             candidate_gone,
+            candidates_complete,
         }
     }
 
@@ -633,8 +746,10 @@ impl DaemonEngine {
                 ambiguous_freshness,
             ) {
                 let canon_dst = canonical_ip(item.dst_ip);
+                let item_sid_key = normalize_package_sid_key(item.package_sid.as_deref());
                 if pending.iter().any(|p| {
                     p.item.exe_key == item.exe_key
+                        && normalize_package_sid_key(p.item.package_sid.as_deref()) == item_sid_key
                         && canonical_ip(p.item.dst_ip) == canon_dst
                         && p.item.dst_port == item.dst_port
                 }) {
@@ -1009,6 +1124,7 @@ impl DaemonEngine {
             .unwrap_or_else(|| self.resolve_wfp_candidates(item, !force_ambiguous));
         if force_ambiguous {
             res.ambiguous = true;
+            res.candidates_complete = false;
         }
         if res.candidates.is_empty() {
             tracing::debug!(
@@ -1023,7 +1139,12 @@ impl DaemonEngine {
         if res.ambiguous || res.candidates.len() > 1 {
             // WfpDropEvent carries no PID or local socket tuple (`BUG_0004`); never guess an
             // individual instance across concurrent siblings — keep multi-candidate drops app-level.
-            self.handle_ambiguous_wfp_drop(item, &res.candidates, prefetched_identity);
+            self.handle_ambiguous_wfp_drop(
+                item,
+                &res.candidates,
+                res.candidates_complete && res.candidates.len() > 1,
+                prefetched_identity,
+            );
             return;
         }
         let cand = &res.candidates[0];
@@ -1035,6 +1156,20 @@ impl DaemonEngine {
                 .unwrap_or_else(|e| e.into_inner());
             history.lookup_domains_for_process(&cand.instance_id, item.dst_ip)
         };
+        let event_sid = item
+            .package_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let cand_sid = cand
+            .package_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let sid_mismatch = matches!(
+            (event_sid, cand_sid),
+            (Some(ev), Some(cd)) if !ev.eq_ignore_ascii_case(cd)
+        );
         let proc_ctx = ResolvedProcessContext {
             proc_identity: Some(cand.identity),
             proc_instance_id: Some(cand.instance_id.clone()),
@@ -1054,6 +1189,14 @@ impl DaemonEngine {
             motw_referrer: cand.motw_referrer.clone(),
             motw_frame_url: cand.motw_frame_url.clone(),
             motw_zone_id: cand.motw_zone_id,
+            package_family_name: if sid_mismatch {
+                None
+            } else {
+                cand.package_family_name.clone()
+            },
+            package_sid: event_sid
+                .map(str::to_owned)
+                .or_else(|| cand_sid.map(str::to_owned)),
             proc_sha256: None,
             proc_created_at_ms: None,
         };
@@ -1079,6 +1222,7 @@ impl DaemonEngine {
         &self,
         item: &QueuedWfpDrop,
         candidates: &[WfpCandidate],
+        candidates_complete: bool,
         prefetched_identity: Option<BinaryIdentity>,
     ) {
         if self.is_shutdown_drain_cutoff() {
@@ -1234,12 +1378,23 @@ impl DaemonEngine {
             OutboundDecision::BlockedByRule { .. } => {}
         }
 
+        let (effective_package_family_name, effective_package_sid) =
+            resolve_ambiguous_package_context(
+                item.package_sid.as_deref(),
+                candidates,
+                candidates_complete,
+            );
+
         {
             let mut dedup = self
                 .app_wfp_alert_dedup
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if !dedup.mark_if_new(&item.exe_key, item.dst_ip) {
+            if !dedup.mark_if_new(
+                &item.exe_key,
+                effective_package_sid.as_deref(),
+                item.dst_ip,
+            ) {
                 return;
             }
         }
@@ -1432,6 +1587,8 @@ impl DaemonEngine {
             "motw_referrer": motw_cand.and_then(|c| c.motw_referrer.as_deref()),
             "motw_frame_url": motw_cand.and_then(|c| c.motw_frame_url.as_deref()),
             "motw_zone_id": motw_cand.and_then(|c| c.motw_zone_id),
+            "package_family_name": effective_package_family_name,
+            "package_sid": effective_package_sid,
         })
         .to_string();
 
@@ -1470,7 +1627,7 @@ impl DaemonEngine {
             self.app_wfp_alert_dedup
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clear_key(&item.exe_key, item.dst_ip);
+                .clear_key(&item.exe_key, effective_package_sid.as_deref(), item.dst_ip);
             return;
         }
 
@@ -1488,12 +1645,85 @@ impl DaemonEngine {
     }
 }
 
+fn resolve_ambiguous_package_context(
+    event_package_sid: Option<&str>,
+    candidates: &[WfpCandidate],
+    candidates_complete: bool,
+) -> (Option<String>, Option<String>) {
+    let effective_sid = event_package_sid
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            if !candidates_complete || candidates.is_empty() {
+                return None;
+            }
+            let first = candidates
+                .first()?
+                .package_sid
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            candidates
+                .iter()
+                .all(|c| {
+                    c.package_sid
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|s| s.eq_ignore_ascii_case(first))
+                })
+                .then(|| first.to_owned())
+        });
+
+    let effective_pfn = if let Some(ref sid) = effective_sid {
+        let mut unique_pfns: HashMap<String, &str> = HashMap::new();
+        for c in candidates {
+            if c.package_sid
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| s.eq_ignore_ascii_case(sid))
+            {
+                if let Some(pfn) = c
+                    .package_family_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    unique_pfns.entry(pfn.to_ascii_lowercase()).or_insert(pfn);
+                }
+            }
+        }
+        (unique_pfns.len() == 1).then(|| (*unique_pfns.values().next().unwrap()).to_owned())
+    } else if !candidates_complete || candidates.is_empty() {
+        None
+    } else {
+        candidates
+            .first()
+            .and_then(|c| c.package_family_name.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|first| {
+                candidates
+                    .iter()
+                    .all(|c| {
+                        c.package_family_name
+                            .as_deref()
+                            .map(str::trim)
+                            .is_some_and(|p| p.eq_ignore_ascii_case(first))
+                    })
+                    .then(|| first.to_owned())
+            })
+    };
+
+    (effective_pfn, effective_sid)
+}
+
 #[derive(Debug, Default)]
 pub(super) struct WfpDropDedupCache {
     capacity: usize,
     window_ms: i64,
-    last_seen: HashMap<(String, IpAddr, u16), i64>,
-    insertion_order: VecDeque<(String, IpAddr, u16)>,
+    last_seen: HashMap<(String, Option<String>, IpAddr, u16), i64>,
+    insertion_order: VecDeque<(String, Option<String>, IpAddr, u16)>,
 }
 
 impl WfpDropDedupCache {
@@ -1506,8 +1736,16 @@ impl WfpDropDedupCache {
         }
     }
 
-    fn should_emit(&mut self, exe_key: &str, ip: IpAddr, port: u16, ts_ms: i64) -> bool {
-        let key = (exe_key.to_string(), canonical_ip(ip), port);
+    fn should_emit(
+        &mut self,
+        exe_key: &str,
+        package_sid: Option<&str>,
+        ip: IpAddr,
+        port: u16,
+        ts_ms: i64,
+    ) -> bool {
+        let norm_sid = normalize_package_sid_key(package_sid);
+        let key = (exe_key.to_string(), norm_sid, canonical_ip(ip), port);
         if let Some(prev_ts) = self.last_seen.get_mut(&key) {
             if ts_ms >= *prev_ts && ts_ms.saturating_sub(*prev_ts) < self.window_ms {
                 return false;
@@ -1524,5 +1762,232 @@ impl WfpDropDedupCache {
         self.insertion_order.push_back(key.clone());
         self.last_seen.insert(key, ts_ms);
         true
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn make_drop_item(exe: &str, package_sid: Option<&str>, dst_ip: IpAddr) -> QueuedWfpDrop {
+        QueuedWfpDrop {
+            os_filter_id: 1,
+            exe_key: exe.to_ascii_lowercase(),
+            exe_path: exe.to_string(),
+            protocol: 6,
+            dst_ip,
+            dst_port: 443,
+            timestamp_ms: 1_760_000_000_000,
+            package_sid: package_sid.map(str::to_string),
+        }
+    }
+
+    fn make_candidate(pid: u32, pfn: Option<&str>, sid: Option<&str>) -> WfpCandidate {
+        let identity = ProcessIdentity::new(pid, pid as u64);
+        WfpCandidate {
+            identity,
+            instance_id: identity.instance_id(),
+            exe_path: r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+            command_line: None,
+            parent_exe_path: None,
+            parent_command_line: None,
+            origin_url: None,
+            motw_source: None,
+            motw_referrer: None,
+            motw_frame_url: None,
+            motw_zone_id: None,
+            package_family_name: pfn.map(str::to_string),
+            package_sid: sid.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn overflow_queue_dedup_isolates_distinct_package_sids() {
+        let mut q = WfpDropOverflowQueue::new(4);
+        let exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+        let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 44));
+        let dst2 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 45));
+
+        assert_eq!(
+            q.push(make_drop_item(exe, Some("S-1-15-2-111"), dst)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q.push(make_drop_item(exe, Some(" S-1-15-2-111 "), dst)),
+            OverflowPushOutcome::Deduplicated
+        );
+        assert_eq!(
+            q.push(make_drop_item(exe, Some("S-1-15-2-222"), dst)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q.push(make_drop_item(exe, None, dst)),
+            OverflowPushOutcome::Queued
+        );
+
+        let first = q.pop().expect("first");
+        assert_eq!(first.package_sid.as_deref(), Some("S-1-15-2-111"));
+        assert_eq!(
+            q.pop().expect("second").package_sid.as_deref(),
+            Some("S-1-15-2-222")
+        );
+        assert_eq!(q.pop().expect("third").package_sid, None);
+        assert_eq!(
+            q.push(make_drop_item(exe, Some("S-1-15-2-111"), dst)),
+            OverflowPushOutcome::Queued
+        );
+
+        // Secondary coalescing map must also preserve distinct packages on the same exe/IP.
+        let mut q_sec = WfpDropOverflowQueue::new(2);
+        assert_eq!(
+            q_sec.push(make_drop_item("other_a.exe", None, dst)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q_sec.push(make_drop_item("other_b.exe", None, dst)),
+            OverflowPushOutcome::Queued
+        );
+        // Primary queue is full (2/2). Both packages on `backgroundTaskHost.exe` enter coalesced map.
+        assert_eq!(
+            q_sec.push(make_drop_item(exe, Some("S-1-15-2-111"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q_sec.push(make_drop_item(exe, Some(" s-1-15-2-111 "), dst)),
+            OverflowPushOutcome::Deduplicated
+        );
+        assert_eq!(
+            q_sec.push(make_drop_item(exe, Some("S-1-15-2-222"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        // Distinct destination for package 111 overwrites only package 111, leaving 222 intact.
+        assert_eq!(
+            q_sec.push(make_drop_item(exe, Some("S-1-15-2-111"), dst2)),
+            OverflowPushOutcome::CoalescedOverwritten
+        );
+        let _ = q_sec.pop().expect("primary 1");
+        let _ = q_sec.pop().expect("primary 2");
+        let sec1 = q_sec.pop().expect("secondary pkg 111");
+        let sec2 = q_sec.pop().expect("secondary pkg 222");
+        assert!(q_sec.pop().is_none());
+        assert_eq!(sec1.package_sid.as_deref(), Some("S-1-15-2-111"));
+        assert_eq!(sec1.dst_ip, dst2);
+        assert_eq!(sec2.package_sid.as_deref(), Some("S-1-15-2-222"));
+        assert_eq!(sec2.dst_ip, dst);
+    }
+
+    #[test]
+    fn overflow_queue_secondary_fair_eviction_protects_other_exe_sole_slot() {
+        let bth = r"C:\Windows\System32\backgroundTaskHost.exe";
+        let other = r"C:\Tools\other.exe";
+        let third = r"C:\Tools\third.exe";
+        let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 44));
+
+        // Case A: cap = 2, primary full; secondary receives other.exe, bth+PkgA, then bth+PkgB.
+        // bth+PkgB must reclaim bth+PkgA rather than evicting other.exe's sole slot.
+        let mut q2 = WfpDropOverflowQueue::new(2);
+        assert_eq!(
+            q2.push(make_drop_item("p1.exe", None, dst)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q2.push(make_drop_item("p2.exe", None, dst)),
+            OverflowPushOutcome::Queued
+        );
+        assert_eq!(
+            q2.push(make_drop_item(other, None, dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q2.push(make_drop_item(bth, Some("S-1-15-2-111"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q2.push(make_drop_item(bth, Some("S-1-15-2-222"), dst)),
+            OverflowPushOutcome::CoalescedOverwritten
+        );
+        let _ = q2.pop().expect("p1");
+        let _ = q2.pop().expect("p2");
+        let rem_a1 = q2.pop().expect("other survives");
+        let rem_a2 = q2.pop().expect("bth 222 survives");
+        assert!(q2.pop().is_none());
+        assert_eq!(rem_a1.exe_path, other);
+        assert_eq!(rem_a2.exe_path, bth);
+        assert_eq!(rem_a2.package_sid.as_deref(), Some("S-1-15-2-222"));
+
+        // Case B: cap = 3, primary full; secondary has [other, bth+111, bth+222].
+        // Pushing brand-new third.exe reclaims multi-slot bth+111 before other's sole slot.
+        let mut q3 = WfpDropOverflowQueue::new(3);
+        for name in ["p1.exe", "p2.exe", "p3.exe"] {
+            assert_eq!(
+                q3.push(make_drop_item(name, None, dst)),
+                OverflowPushOutcome::Queued
+            );
+        }
+        assert_eq!(
+            q3.push(make_drop_item(other, None, dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q3.push(make_drop_item(bth, Some("S-1-15-2-111"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q3.push(make_drop_item(bth, Some("S-1-15-2-222"), dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        assert_eq!(
+            q3.push(make_drop_item(third, None, dst)),
+            OverflowPushOutcome::CoalescedNewExe
+        );
+        for _ in 0..3 {
+            let _ = q3.pop().expect("primary item");
+        }
+        let sec: Vec<(String, Option<String>)> = std::iter::from_fn(|| q3.pop())
+            .map(|i| (i.exe_path, i.package_sid))
+            .collect();
+        assert_eq!(
+            sec,
+            vec![
+                (other.to_string(), None),
+                (bth.to_string(), Some("S-1-15-2-222".to_string())),
+                (third.to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn app_wfp_alert_dedup_isolates_and_clears_by_package_sid() {
+        let mut dedup = AppWfpAlertDedup::new(8);
+        let exe_key = r"c:\windows\system32\backgroundtaskhost.exe";
+        let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 44));
+
+        assert!(dedup.mark_if_new(exe_key, Some("S-1-15-2-111"), dst));
+        assert!(!dedup.mark_if_new(exe_key, Some("s-1-15-2-111 "), dst));
+        assert!(dedup.mark_if_new(exe_key, Some("S-1-15-2-222"), dst));
+        assert!(dedup.mark_if_new(exe_key, None, dst));
+
+        dedup.clear_key(exe_key, Some("S-1-15-2-111"), dst);
+        assert!(dedup.mark_if_new(exe_key, Some("S-1-15-2-111"), dst));
+        assert!(!dedup.mark_if_new(exe_key, Some("S-1-15-2-222"), dst));
+        assert!(!dedup.mark_if_new(exe_key, None, dst));
+    }
+
+    #[test]
+    fn incomplete_candidates_do_not_infer_unanimous_package_without_event_sid() {
+        let cand = make_candidate(1001, Some("PkgA_111"), Some("S-1-15-2-111"));
+
+        // Negative DNS / overflowed candidate set without event package_sid must return (None, None).
+        assert_eq!(
+            resolve_ambiguous_package_context(None, std::slice::from_ref(&cand), false),
+            (None, None)
+        );
+
+        // Even with incomplete candidates, an explicit kernel package_sid matches known PFN safely.
+        assert_eq!(
+            resolve_ambiguous_package_context(Some("s-1-15-2-111"), &[cand], false),
+            (Some("PkgA_111".to_string()), Some("s-1-15-2-111".to_string()))
+        );
     }
 }

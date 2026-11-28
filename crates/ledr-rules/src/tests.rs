@@ -2800,3 +2800,339 @@ fn rules_p4_01_local_cert_chain_flags_offline_and_verifies_cmd_exe() {
         "cmd.exe should match ALLOW-OS-WIN-SYS32 from default_allowlist.json"
     );
 }
+
+#[test]
+fn rules_fu_p4_03_track_b2_scoped_validation_cmd_wildcard_and_isolation() {
+    use ledr_proto::{AllowlistRuleRecord, ScopedPolicyRuleRecord};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let valid_root = "3B1EFD3A66EA28B16697394703A72CA340A05BD5";
+    let valid_sha = "a".repeat(64);
+    let pfn_a = "Microsoft.StartExperiencesApp_8wekyb3d8bbwe";
+    let sid_a = "S-1-15-2-100-200-300";
+    let pfn_b = "Contoso.StoreApp_8wekyb3d8bbwe";
+    let sid_b = "S-1-15-2-400-500-600";
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+
+    // 1. SID validation & command_line_pattern validation.
+    assert!(is_valid_app_container_sid(sid_a));
+    assert!(is_valid_app_container_sid("s-1-15-2-1"));
+    assert!(!is_valid_app_container_sid("S-1-5-18"));
+    assert!(!is_valid_app_container_sid("S-1-15-2-"));
+    assert!(!is_valid_app_container_sid("S-1-15-2-abc"));
+    assert!(!is_valid_app_container_sid(" S-1-15-2-1"));
+
+    assert!(validate_command_line_pattern("*-ServerName:Contoso*").is_ok());
+    assert!(validate_command_line_pattern("").is_err());
+    assert!(validate_command_line_pattern("   ").is_err());
+    assert!(validate_command_line_pattern(&"x".repeat(513)).is_err());
+    assert!(validate_command_line_pattern("bad\ncmd").is_err());
+
+    // command_line_pattern matching: case-insensitive, unescaped *, NO path normalization or ? wildcard.
+    assert!(matches_command_line_pattern(
+        r"C:\Windows\System32\backgroundTaskHost.exe -ServerName:Contoso.Task1",
+        "*-servername:contoso.*"
+    ));
+    // BUG_0004: pattern `*` must take precedence over literal `*` in command_line input.
+    assert!(matches_command_line_pattern(
+        "tool.exe *.log",
+        "tool.exe *log"
+    ));
+    assert!(matches_command_line_pattern(
+        "tool.exe --flag *.log --mode=prod",
+        "tool.exe * *.log *prod"
+    ));
+    assert!(!matches_command_line_pattern(
+        "foo /bar",
+        r"foo \bar"
+    ));
+    assert!(!matches_command_line_pattern("abc", "a?c"));
+
+    // 2. Scoped rule validation boundaries.
+    let base_allow = ScopedPolicyRuleRecord {
+        rule_id: "SC-ALLOW-A".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: None,
+        signer_subject: Some("CN=Microsoft Windows".to_string()),
+        root_thumbprint: Some(valid_root.to_string()),
+        allowed_target: Some("*.microsoft.com".to_string()),
+        package_family_name: Some(pfn_a.to_string()),
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_700_000_000_000,
+        created_by: "user_triage".to_string(),
+    };
+    assert!(validate_scoped_policy_rule(&base_allow).is_ok());
+
+    // Reject command_line_pattern on Layer 3 NetworkAllow / NetworkBlock.
+    let mut bad_cmd_allow = base_allow.clone();
+    bad_cmd_allow.command_line_pattern = Some("*-ServerName:*".to_string());
+    assert!(validate_scoped_policy_rule(&bad_cmd_allow).is_err());
+
+    // Reject SHA-256 only (missing Authenticode signer) on scoped NetworkAllow.
+    let mut bad_unsigned_allow = base_allow.clone();
+    bad_unsigned_allow.signer_subject = None;
+    bad_unsigned_allow.root_thumbprint = None;
+    bad_unsigned_allow.sha256 = Some(valid_sha.clone());
+    assert!(validate_scoped_policy_rule(&bad_unsigned_allow).is_err());
+
+    // Reject missing package_family_name or missing/invalid package_sid on scoped NetworkAllow.
+    let mut bad_no_pfn = base_allow.clone();
+    bad_no_pfn.package_family_name = None;
+    assert!(validate_scoped_policy_rule(&bad_no_pfn).is_err());
+
+    let mut bad_no_sid = base_allow.clone();
+    bad_no_sid.package_sid = None;
+    assert!(validate_scoped_policy_rule(&bad_no_sid).is_err());
+
+    let mut bad_sid_fmt = base_allow.clone();
+    bad_sid_fmt.package_sid = Some("S-1-5-18".to_string());
+    assert!(validate_scoped_policy_rule(&bad_sid_fmt).is_err());
+
+    // NetworkBlock requires package_sid, rejects command_line_pattern, and respects AUTO-02.
+    let valid_block = ScopedPolicyRuleRecord {
+        rule_id: "SC-BLOCK-B".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        package_family_name: None,
+        package_sid: Some(sid_b.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_700_000_000_010,
+        created_by: "user_quarantine".to_string(),
+    };
+    assert!(validate_scoped_policy_rule(&valid_block).is_ok());
+
+    let mut bad_block_no_sid = valid_block.clone();
+    bad_block_no_sid.package_sid = None;
+    assert!(validate_scoped_policy_rule(&bad_block_no_sid).is_err());
+
+    let mut bad_block_cmd = valid_block.clone();
+    bad_block_cmd.command_line_pattern = Some("*evil*".to_string());
+    assert!(validate_scoped_policy_rule(&bad_block_cmd).is_err());
+
+    let mut bad_block_protected = valid_block.clone();
+    bad_block_protected.exe_path_pattern = r"C:\Windows\System32\svchost.exe".to_string();
+    assert!(validate_scoped_policy_rule(&bad_block_protected).is_err());
+
+    // ProcessAllow / FileCanaryAllow allow command_line_pattern, require L-04 + >=1 scope axis.
+    let proc_allow = ScopedPolicyRuleRecord {
+        rule_id: "SC-PROC-1".to_string(),
+        scope: RuleScope::ProcessAllow,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: Some(valid_sha.clone()),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        package_family_name: None,
+        package_sid: None,
+        command_line_pattern: Some("*-ServerName:Contoso.Task*".to_string()),
+        created_at_ms: 1_700_000_000_020,
+        created_by: "user_triage".to_string(),
+    };
+    assert!(validate_scoped_policy_rule(&proc_allow).is_ok());
+
+    let mut bad_proc_no_scope = proc_allow.clone();
+    bad_proc_no_scope.command_line_pattern = None;
+    assert!(validate_scoped_policy_rule(&bad_proc_no_scope).is_err());
+
+    // ANALYSIS_0002: ProcessAllow rejects non-empty allowed_target; FileCanaryAllow accepts it.
+    let mut bad_proc_target = proc_allow.clone();
+    bad_proc_target.allowed_target = Some(r"C:\Users\*\Documents\*.txt".to_string());
+    assert!(validate_scoped_policy_rule(&bad_proc_target).is_err());
+
+    let mut canary_target_ok = proc_allow.clone();
+    canary_target_ok.scope = RuleScope::FileCanaryAllow;
+    canary_target_ok.allowed_target = Some(r"C:\Users\*\Documents\*.txt".to_string());
+    assert!(validate_scoped_policy_rule(&canary_target_ok).is_ok());
+
+    // 3. Layer 3 isolation & deny-overrides-allow across all 4 legacy/scoped combinations.
+    let identity = BinaryIdentity {
+        exe_path: bth_exe.to_string(),
+        sha256: Some(valid_sha.clone()),
+        authenticode: Some(ledr_proto::AuthenticodeInfo {
+            signer_subject: "CN=Microsoft Windows".to_string(),
+            root_thumbprint: valid_root.to_string(),
+        }),
+    };
+    let dst = IpAddr::V4(Ipv4Addr::new(20, 42, 65, 88));
+    let ctx_a = ProcessScopeContext {
+        package_family_name: Some(pfn_a),
+        package_sid: Some(sid_a),
+        command_line: None,
+    };
+    let ctx_b = ProcessScopeContext {
+        package_family_name: Some(pfn_b),
+        package_sid: Some(sid_b),
+        command_line: None,
+    };
+    let ctx_non_appcontainer = ProcessScopeContext {
+        package_family_name: Some(pfn_a),
+        package_sid: None,
+        command_line: None,
+    };
+
+    // Package A allowed; Package B and PFN-only non-AppContainer are NOT allowed.
+    assert_eq!(
+        evaluate_outbound_policy_with_scoped(
+            &identity,
+            &ctx_a,
+            dst,
+            Some("api.microsoft.com"),
+            &[],
+            std::slice::from_ref(&base_allow),
+        ),
+        OutboundDecision::AllowedByRule {
+            rule_id: "SC-ALLOW-A".to_string()
+        }
+    );
+    assert_eq!(
+        evaluate_outbound_policy_with_scoped(
+            &identity,
+            &ctx_b,
+            dst,
+            Some("api.microsoft.com"),
+            &[],
+            std::slice::from_ref(&base_allow),
+        ),
+        OutboundDecision::UnknownFirstConnect
+    );
+    assert_eq!(
+        evaluate_outbound_policy_with_scoped(
+            &identity,
+            &ctx_non_appcontainer,
+            dst,
+            Some("api.microsoft.com"),
+            &[],
+            std::slice::from_ref(&base_allow),
+        ),
+        OutboundDecision::UnknownFirstConnect
+    );
+
+    // Scoped block beats scoped allow on Package A; legacy allow also beaten by scoped block.
+    let block_a = ScopedPolicyRuleRecord {
+        rule_id: "SC-BLOCK-A".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        package_family_name: None,
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_700_000_000_030,
+        created_by: "user_quarantine".to_string(),
+    };
+    let legacy_allow = AllowlistRuleRecord {
+        rule_id: "LEG-ALLOW".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: None,
+        signer_subject: Some("CN=Microsoft Windows".to_string()),
+        root_thumbprint: Some(valid_root.to_string()),
+        allowed_target: None,
+        created_at_ms: 1_700_000_000_001,
+        created_by: "user".to_string(),
+    };
+    let legacy_block = AllowlistRuleRecord {
+        rule_id: "LEG-BLOCK".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        created_at_ms: 1_700_000_000_002,
+        created_by: "user".to_string(),
+    };
+
+    // Scoped Block overrides Scoped Allow & Legacy Allow.
+    assert_eq!(
+        evaluate_outbound_policy_with_scoped(
+            &identity,
+            &ctx_a,
+            dst,
+            Some("api.microsoft.com"),
+            std::slice::from_ref(&legacy_allow),
+            &[base_allow.clone(), block_a.clone()],
+        ),
+        OutboundDecision::BlockedByRule {
+            rule_id: "SC-BLOCK-A".to_string()
+        }
+    );
+    // Legacy Block overrides Scoped Allow.
+    assert_eq!(
+        evaluate_outbound_policy_with_scoped(
+            &identity,
+            &ctx_a,
+            dst,
+            Some("api.microsoft.com"),
+            &[legacy_block],
+            std::slice::from_ref(&base_allow),
+        ),
+        OutboundDecision::BlockedByRule {
+            rule_id: "LEG-BLOCK".to_string()
+        }
+    );
+    // Scoped Block on Package B does not block Package A.
+    assert_eq!(
+        evaluate_outbound_policy_with_scoped(
+            &identity,
+            &ctx_a,
+            dst,
+            Some("api.microsoft.com"),
+            &[],
+            &[base_allow, valid_block],
+        ),
+        OutboundDecision::AllowedByRule {
+            rule_id: "SC-ALLOW-A".to_string()
+        }
+    );
+
+    // 4. Layer 1/2 scoped matching (ProcessAllow & FileCanaryAllow).
+    let canary_allow = ScopedPolicyRuleRecord {
+        rule_id: "SC-CANARY-1".to_string(),
+        scope: RuleScope::FileCanaryAllow,
+        exe_path_pattern: r"C:\Windows\System32\RuntimeBroker.exe".to_string(),
+        sha256: Some(valid_sha),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some(r"C:\Users\*\Documents\*.txt".to_string()),
+        package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+        package_sid: None,
+        command_line_pattern: Some("*-Embedding".to_string()),
+        created_at_ms: 1_700_000_000_040,
+        created_by: "user_triage".to_string(),
+    };
+    let rb_identity = BinaryIdentity {
+        exe_path: r"C:\Windows\System32\RuntimeBroker.exe".to_string(),
+        ..identity
+    };
+    assert!(is_allowed_by_scoped_rules(
+        &rb_identity,
+        &ProcessScopeContext {
+            package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy"),
+            package_sid: None,
+            command_line: Some("RuntimeBroker.exe -Embedding"),
+        },
+        Some(r"C:\Users\Alice\Documents\notes.txt"),
+        RuleScope::FileCanaryAllow,
+        std::slice::from_ref(&canary_allow),
+    ));
+    assert!(!is_allowed_by_scoped_rules(
+        &rb_identity,
+        &ProcessScopeContext {
+            package_family_name: Some("Contoso.Other_8wekyb3d8bbwe"),
+            package_sid: None,
+            command_line: Some("RuntimeBroker.exe -Embedding"),
+        },
+        Some(r"C:\Users\Alice\Documents\notes.txt"),
+        RuleScope::FileCanaryAllow,
+        &[canary_allow],
+    ));
+}

@@ -8,11 +8,12 @@ use std::time::Duration;
 use ledr_proto::SensorEvent;
 use ledr_proto::{
     is_never_suspend_process, AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord,
-    ProcessIdentity,
+    ProcessIdentity, RuleScope, ScopedPolicyRuleRecord,
 };
 use ledr_rules::{
-    canonical_ip, classify_outbound_risk, evaluate_outbound_policy, is_external_ip,
+    canonical_ip, classify_outbound_risk, evaluate_outbound_policy_with_scoped, is_external_ip,
     matches_network_target, parse_cidr_target, BinaryIdentity, OutboundDecision, OutboundRiskClass,
+    ProcessScopeContext,
 };
 use ledr_sensor_win::etw::LiveSiblingCheck;
 #[cfg(doc)]
@@ -25,9 +26,9 @@ use crate::firewall::{parse_literal_target_ip, WfpRuleManager};
 use crate::process_table::ActiveProcessTable;
 
 use super::domain_policy::{
-    collect_domain_specific_blocked_hints, extend_authorizing_hints_from_existing_permit,
-    has_domain_allow_rule_for_exe, outbound_alert_title, partition_permit_hints,
-    select_outbound_decision_for_domains,
+    collect_domain_specific_blocked_hints, collect_scoped_domain_specific_blocked_hints,
+    extend_authorizing_hints_from_existing_permit, has_domain_allow_rule_for_exe_with_scoped,
+    outbound_alert_title, partition_permit_hints, select_outbound_decision_for_domains_with_scoped,
 };
 use super::events::ResolvedProcessContext;
 use super::{
@@ -680,8 +681,24 @@ impl DaemonEngine {
         }
 
         let rules = self.store.list_network_rules().unwrap_or_default();
-        let has_domain_allow = has_domain_allow_rule_for_exe(&item.exe_path, &rules);
+        let scoped_rules = self.store.list_scoped_network_rules().unwrap_or_default();
         let is_ambig = res.ambiguous || res.candidates.len() > 1;
+        if !is_ambig && res.candidates.len() == 1 && single_candidate_sid_mismatch(&item, &res.candidates[0]) {
+            self.handle_wfp_drop_event_with_context(&item, Some(res), false, None);
+            return;
+        }
+        let (effective_pfn, effective_sid) = resolve_wfp_drop_package_context(
+            &item,
+            &res.candidates,
+            !is_ambig && res.candidates.len() == 1,
+            res.candidates_complete && res.candidates.len() > 1,
+        );
+        let has_domain_allow = has_domain_allow_rule_for_exe_with_scoped(
+            &item.exe_path,
+            &rules,
+            &scoped_rules,
+            effective_sid.as_deref(),
+        );
         let domain_candidates: Vec<(String, i64)> = {
             let history = self
                 .process_dns_history
@@ -724,11 +741,18 @@ impl DaemonEngine {
         else {
             return;
         };
-        let (decision, _) = select_outbound_decision_for_domains(
+        let scope_ctx = ProcessScopeContext {
+            package_family_name: effective_pfn.as_deref(),
+            package_sid: effective_sid.as_deref(),
+            command_line: None,
+        };
+        let (decision, _) = select_outbound_decision_for_domains_with_scoped(
             &bin_identity,
+            &scope_ctx,
             item.dst_ip,
             &domain_candidates,
             &rules,
+            &scoped_rules,
         );
         let decision_restrict_or_unknown = matches!(
             decision,
@@ -737,12 +761,14 @@ impl DaemonEngine {
         if decision_restrict_or_unknown {
             let ambiguous_freshness =
                 is_ambig.then_some((item.timestamp_ms, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS));
-            if !self.has_valid_live_domain_policy_permit(
+            if !self.has_valid_live_domain_policy_permit_with_scoped(
                 &item.exe_path,
                 &bin_identity,
+                &scope_ctx,
                 item.dst_ip,
                 &domain_candidates,
                 &rules,
+                &scoped_rules,
                 ambiguous_freshness,
             ) {
                 let canon_dst = canonical_ip(item.dst_ip);
@@ -813,6 +839,7 @@ impl DaemonEngine {
         }
         let canon_accepted: Vec<IpAddr> = accepted_ips.iter().map(|ip| canonical_ip(*ip)).collect();
         let mut cached_rules: Option<Vec<AllowlistRuleRecord>> = None;
+        let mut cached_scoped_rules: Option<Vec<ScopedPolicyRuleRecord>> = None;
         let mut remaining = VecDeque::with_capacity(pending.len());
         let mut ready: Vec<(QueuedWfpDrop, bool)> = Vec::new();
         while let Some(mut entry) = pending.pop_front() {
@@ -824,6 +851,13 @@ impl DaemonEngine {
             let res = self.resolve_wfp_candidates(&entry.item, false);
             let is_ambig = entry.confirmed_ambiguous || res.ambiguous || res.candidates.len() > 1;
             let dns_matches_candidate = res.candidates.iter().any(|c| c.instance_id == dns_inst_id);
+            if !is_ambig
+                && res.candidates.len() == 1
+                && single_candidate_sid_mismatch(&entry.item, &res.candidates[0])
+            {
+                ready.push((entry.item, true));
+                continue;
+            }
 
             if entry.reason.includes_attribution_grace() {
                 if is_ambig {
@@ -861,16 +895,32 @@ impl DaemonEngine {
                     };
                     let rules = cached_rules
                         .get_or_insert_with(|| self.store.list_network_rules().unwrap_or_default());
+                    let scoped_rules = cached_scoped_rules.get_or_insert_with(|| {
+                        self.store.list_scoped_network_rules().unwrap_or_default()
+                    });
+                    let (eff_pfn, eff_sid) = resolve_wfp_drop_package_context(
+                        &entry.item,
+                        &res.candidates,
+                        res.candidates.len() == 1 && !is_ambig,
+                        res.candidates_complete && res.candidates.len() > 1,
+                    );
+                    let scope_ctx = ProcessScopeContext {
+                        package_family_name: eff_pfn.as_deref(),
+                        package_sid: eff_sid.as_deref(),
+                        command_line: None,
+                    };
                     let InspectOutcome::Completed(bin_identity) =
                         self.inspect_binary_for_pipeline(&entry.item.exe_path)
                     else {
                         return;
                     };
-                    let (decision, _) = select_outbound_decision_for_domains(
+                    let (decision, _) = select_outbound_decision_for_domains_with_scoped(
                         &bin_identity,
+                        &scope_ctx,
                         entry.item.dst_ip,
                         &domains,
                         rules,
+                        scoped_rules,
                     );
                     if matches!(
                         decision,
@@ -915,20 +965,41 @@ impl DaemonEngine {
                 }
                 let rules = cached_rules
                     .get_or_insert_with(|| self.store.list_network_rules().unwrap_or_default());
-                if !has_domain_allow_rule_for_exe(&entry.item.exe_path, rules) {
+                let scoped_rules = cached_scoped_rules.get_or_insert_with(|| {
+                    self.store.list_scoped_network_rules().unwrap_or_default()
+                });
+                let (eff_pfn, eff_sid) = resolve_wfp_drop_package_context(
+                    &entry.item,
+                    &res.candidates,
+                    true,
+                    false,
+                );
+                if !has_domain_allow_rule_for_exe_with_scoped(
+                    &entry.item.exe_path,
+                    rules,
+                    scoped_rules,
+                    eff_sid.as_deref(),
+                ) {
                     ready.push((entry.item, entry.confirmed_ambiguous));
                     continue;
                 }
+                let scope_ctx = ProcessScopeContext {
+                    package_family_name: eff_pfn.as_deref(),
+                    package_sid: eff_sid.as_deref(),
+                    command_line: None,
+                };
                 let InspectOutcome::Completed(bin_identity) =
                     self.inspect_binary_for_pipeline(&entry.item.exe_path)
                 else {
                     return;
                 };
-                let (decision, _) = select_outbound_decision_for_domains(
+                let (decision, _) = select_outbound_decision_for_domains_with_scoped(
                     &bin_identity,
+                    &scope_ctx,
                     entry.item.dst_ip,
                     &domains,
                     rules,
+                    scoped_rules,
                 );
                 if matches!(
                     decision,
@@ -981,20 +1052,41 @@ impl DaemonEngine {
                 }
                 let rules = cached_rules
                     .get_or_insert_with(|| self.store.list_network_rules().unwrap_or_default());
-                if !has_domain_allow_rule_for_exe(&entry.item.exe_path, rules) {
+                let scoped_rules = cached_scoped_rules.get_or_insert_with(|| {
+                    self.store.list_scoped_network_rules().unwrap_or_default()
+                });
+                let (eff_pfn, eff_sid) = resolve_wfp_drop_package_context(
+                    &entry.item,
+                    &res.candidates,
+                    false,
+                    res.candidates_complete && res.candidates.len() > 1,
+                );
+                if !has_domain_allow_rule_for_exe_with_scoped(
+                    &entry.item.exe_path,
+                    rules,
+                    scoped_rules,
+                    eff_sid.as_deref(),
+                ) {
                     ready.push((entry.item, entry.confirmed_ambiguous));
                     continue;
                 }
+                let scope_ctx = ProcessScopeContext {
+                    package_family_name: eff_pfn.as_deref(),
+                    package_sid: eff_sid.as_deref(),
+                    command_line: None,
+                };
                 let InspectOutcome::Completed(bin_identity) =
                     self.inspect_binary_for_pipeline(&entry.item.exe_path)
                 else {
                     return;
                 };
-                let (decision, _) = select_outbound_decision_for_domains(
+                let (decision, _) = select_outbound_decision_for_domains_with_scoped(
                     &bin_identity,
+                    &scope_ctx,
                     entry.item.dst_ip,
                     &all_fresh_domains,
                     rules,
+                    scoped_rules,
                 );
                 if matches!(
                     decision,
@@ -1170,6 +1262,18 @@ impl DaemonEngine {
             (event_sid, cand_sid),
             (Some(ev), Some(cd)) if !ev.eq_ignore_ascii_case(cd)
         );
+        if sid_mismatch {
+            tracing::warn!(
+                exe_path = %item.exe_path,
+                dst_ip = %item.dst_ip,
+                event_package_sid = ?event_sid,
+                candidate_pid = cand.identity.pid,
+                candidate_package_sid = ?cand_sid,
+                "single WFP drop candidate package_sid mismatches kernel event package_sid; refusing cross-package attribution (PRG-001)"
+            );
+            self.handle_ambiguous_wfp_drop(item, &[], false, prefetched_identity);
+            return;
+        }
         let proc_ctx = ResolvedProcessContext {
             proc_identity: Some(cand.identity),
             proc_instance_id: Some(cand.instance_id.clone()),
@@ -1189,11 +1293,7 @@ impl DaemonEngine {
             motw_referrer: cand.motw_referrer.clone(),
             motw_frame_url: cand.motw_frame_url.clone(),
             motw_zone_id: cand.motw_zone_id,
-            package_family_name: if sid_mismatch {
-                None
-            } else {
-                cand.package_family_name.clone()
-            },
+            package_family_name: cand.package_family_name.clone(),
             package_sid: event_sid
                 .map(str::to_owned)
                 .or_else(|| cand_sid.map(str::to_owned)),
@@ -1236,7 +1336,19 @@ impl DaemonEngine {
         if risk == OutboundRiskClass::ProtectedOs {
             return;
         }
+        let (effective_package_family_name, effective_package_sid) =
+            resolve_ambiguous_package_context(
+                item.package_sid.as_deref(),
+                candidates,
+                candidates_complete,
+            );
         let rules = self.store.list_network_rules().unwrap_or_default();
+        let scoped_rules = self.store.list_scoped_network_rules().unwrap_or_default();
+        let scope_ctx = ProcessScopeContext {
+            package_family_name: effective_package_family_name.as_deref(),
+            package_sid: effective_package_sid.as_deref(),
+            command_line: None,
+        };
         let bin_identity = match prefetched_identity {
             Some(id) => id,
             None => match self.inspect_binary_for_pipeline(canonical_exe) {
@@ -1261,12 +1373,21 @@ impl DaemonEngine {
             combined.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             combined
         };
-        let mut decision = evaluate_outbound_policy(&bin_identity, item.dst_ip, None, &rules);
-        let (cand_decision, cand_hint) = select_outbound_decision_for_domains(
+        let mut decision = evaluate_outbound_policy_with_scoped(
             &bin_identity,
+            &scope_ctx,
+            item.dst_ip,
+            None,
+            &rules,
+            &scoped_rules,
+        );
+        let (cand_decision, cand_hint) = select_outbound_decision_for_domains_with_scoped(
+            &bin_identity,
+            &scope_ctx,
             item.dst_ip,
             &cand_domains,
             &rules,
+            &scoped_rules,
         );
         let mut blocked_dom_from_cand: Option<String> = None;
         if matches!(decision, OutboundDecision::AllowedByRule { .. }) {
@@ -1284,65 +1405,109 @@ impl DaemonEngine {
         match &decision {
             OutboundDecision::ProtectedOs => return,
             OutboundDecision::AllowedByRule { rule_id } => {
-                // App-scoped IP/CIDR/wildcard allow: materialize a concrete IP WFP Permit even
-                // when PID is ambiguous, respecting existing IP blocks (`deny overrides allow`)
-                // and preserving all known candidate domain hints (`SEC_0001`, `#2`).
-                // Never swallow a BFE failure silently without alerting.
-                let matched_target = rules
+                if let Some(scoped_allow) = scoped_rules
                     .iter()
-                    .find(|r| &r.rule_id == rule_id)
-                    .and_then(|r| r.allowed_target.as_deref())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let cand_hint_strs: Vec<&str> = cand_domains
-                    .iter()
-                    .map(|(dom, _)| dom.as_str())
-                    .collect();
-                let (mut authorizing_hints, cohosted_hints) =
-                    partition_permit_hints(&bin_identity, item.dst_ip, &cand_hint_strs, &rules);
-                if authorizing_hints.is_empty() && cohosted_hints.is_empty() {
-                    let fallback_domain = matched_target.filter(|t| {
-                        parse_literal_target_ip(t).is_none()
-                            && parse_cidr_target(t).is_err()
-                            && !matches_network_target(t, item.dst_ip, None)
-                    });
-                    if let Some(dom) = fallback_domain {
-                        authorizing_hints.push(dom.to_string());
+                    .find(|r| r.rule_id == *rule_id && r.scope == RuleScope::NetworkAllow)
+                {
+                    let Some(pkg_sid) = effective_package_sid.as_deref() else {
+                        return;
+                    };
+                    let permit_res = {
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        if fw.active_app_block(canonical_exe).is_some()
+                            || fw.active_scoped_app_block(canonical_exe, pkg_sid).is_some()
+                        {
+                            let fallback_hint: Vec<String> = scoped_allow
+                                .allowed_target
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|t| {
+                                    !t.is_empty()
+                                        && parse_literal_target_ip(t).is_none()
+                                        && parse_cidr_target(t).is_err()
+                                })
+                                .map(|t| vec![t.to_string()])
+                                .unwrap_or_default();
+                            fw.ensure_scoped_ip_permit(
+                                canonical_exe,
+                                pkg_sid,
+                                effective_package_family_name.as_deref(),
+                                item.dst_ip,
+                                &fallback_hint,
+                                &[] as &[&str],
+                                &*self.defense,
+                            )
+                        } else {
+                            Ok(None)
+                        }
+                    };
+                    match permit_res {
+                        Ok(_) => return,
+                        Err(err) => {
+                            permit_failure = Some((rule_id.clone(), err));
+                        }
                     }
-                }
-                let permit_res = {
-                    let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                    if fw.active_app_block(canonical_exe).is_some() {
-                        extend_authorizing_hints_from_existing_permit(
-                            &fw,
-                            canonical_exe,
-                            item.dst_ip,
-                            &bin_identity,
-                            &rules,
-                            &mut authorizing_hints,
-                        );
-                        fw.ensure_ip_permit_for_domain_hints_prioritized(
-                            canonical_exe,
-                            item.dst_ip,
-                            &authorizing_hints,
-                            &cohosted_hints,
-                            &*self.defense,
-                        )
-                    } else {
-                        Ok(None)
+                } else {
+                    // App-scoped IP/CIDR/wildcard allow: materialize a concrete IP WFP Permit even
+                    // when PID is ambiguous, respecting existing IP blocks (`deny overrides allow`)
+                    // and preserving all known candidate domain hints (`SEC_0001`, `#2`).
+                    // Never swallow a BFE failure silently without alerting.
+                    let matched_target = rules
+                        .iter()
+                        .find(|r| &r.rule_id == rule_id)
+                        .and_then(|r| r.allowed_target.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let cand_hint_strs: Vec<&str> = cand_domains
+                        .iter()
+                        .map(|(dom, _)| dom.as_str())
+                        .collect();
+                    let (mut authorizing_hints, cohosted_hints) =
+                        partition_permit_hints(&bin_identity, item.dst_ip, &cand_hint_strs, &rules);
+                    if authorizing_hints.is_empty() && cohosted_hints.is_empty() {
+                        let fallback_domain = matched_target.filter(|t| {
+                            parse_literal_target_ip(t).is_none()
+                                && parse_cidr_target(t).is_err()
+                                && !matches_network_target(t, item.dst_ip, None)
+                        });
+                        if let Some(dom) = fallback_domain {
+                            authorizing_hints.push(dom.to_string());
+                        }
                     }
-                };
-                match permit_res {
-                    Ok(_) => return,
-                    Err(err) => {
-                        tracing::warn!(
-                            exe_path = %canonical_exe,
-                            dst_ip = %item.dst_ip,
-                            rule_id = %rule_id,
-                            error = %err,
-                            "failed installing IP-specific WFP permit for app-level allowed target"
-                        );
-                        permit_failure = Some((rule_id.clone(), err));
+                    let permit_res = {
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        if fw.active_app_block(canonical_exe).is_some() {
+                            extend_authorizing_hints_from_existing_permit(
+                                &fw,
+                                canonical_exe,
+                                item.dst_ip,
+                                &bin_identity,
+                                &rules,
+                                &mut authorizing_hints,
+                            );
+                            fw.ensure_ip_permit_for_domain_hints_prioritized(
+                                canonical_exe,
+                                item.dst_ip,
+                                &authorizing_hints,
+                                &cohosted_hints,
+                                &*self.defense,
+                            )
+                        } else {
+                            Ok(None)
+                        }
+                    };
+                    match permit_res {
+                        Ok(_) => return,
+                        Err(err) => {
+                            tracing::warn!(
+                                exe_path = %canonical_exe,
+                                dst_ip = %item.dst_ip,
+                                rule_id = %rule_id,
+                                error = %err,
+                                "failed installing IP-specific WFP permit for app-level allowed target"
+                            );
+                            permit_failure = Some((rule_id.clone(), err));
+                        }
                     }
                 }
             }
@@ -1355,20 +1520,31 @@ impl DaemonEngine {
                 if matches!(cand_decision, OutboundDecision::AllowedByRule { .. }) {
                     let has_live_ip_permit = {
                         let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                        fw.has_active_filter(canonical_exe, Some(item.dst_ip), true)
-                            && !fw.has_active_filter(canonical_exe, Some(item.dst_ip), false)
+                        (fw.has_active_filter(canonical_exe, Some(item.dst_ip), true)
+                            && !fw.has_active_filter(canonical_exe, Some(item.dst_ip), false))
+                            || effective_package_sid.as_deref().is_some_and(|sid| {
+                                fw.has_active_scoped_filter(canonical_exe, sid, Some(item.dst_ip), true)
+                                    && !fw.has_active_scoped_filter(
+                                        canonical_exe,
+                                        sid,
+                                        Some(item.dst_ip),
+                                        false,
+                                    )
+                            })
                     };
                     if has_live_ip_permit {
                         return;
                     }
                 }
                 if !matches!(cand_decision, OutboundDecision::BlockedByRule { .. })
-                    && self.has_valid_live_domain_policy_permit(
+                    && self.has_valid_live_domain_policy_permit_with_scoped(
                         canonical_exe,
                         &bin_identity,
+                        &scope_ctx,
                         item.dst_ip,
                         &cand_domains,
                         &rules,
+                        &scoped_rules,
                         Some((item.timestamp_ms, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS)),
                     )
                 {
@@ -1377,13 +1553,6 @@ impl DaemonEngine {
             }
             OutboundDecision::BlockedByRule { .. } => {}
         }
-
-        let (effective_package_family_name, effective_package_sid) =
-            resolve_ambiguous_package_context(
-                item.package_sid.as_deref(),
-                candidates,
-                candidates_complete,
-            );
 
         {
             let mut dedup = self
@@ -1422,7 +1591,108 @@ impl DaemonEngine {
             } else {
                 match decision {
                     OutboundDecision::BlockedByRule { rule_id } => {
-                        let matched_target = rules
+                        if let Some(scoped_block) = scoped_rules
+                            .iter()
+                            .find(|r| r.rule_id == rule_id && r.scope == RuleScope::NetworkBlock)
+                        {
+                            let matched_target = scoped_block
+                                .allowed_target
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            let scoped_blocked_hints = if matched_target
+                                .is_some_and(|target_pat| parse_literal_target_ip(target_pat).is_none())
+                            {
+                                collect_scoped_domain_specific_blocked_hints(
+                                    &bin_identity,
+                                    &scope_ctx,
+                                    item.dst_ip,
+                                    &cand_domains,
+                                    &scoped_rules,
+                                )
+                            } else {
+                                Vec::new()
+                            };
+                            let scoped_pfn = scoped_block
+                                .package_family_name
+                                .as_deref()
+                                .or(effective_package_family_name.as_deref());
+                            let wfp_handle = effective_package_sid
+                                .as_deref()
+                                .and_then(|pkg_sid| {
+                                    let mut fw =
+                                        self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                                    let res = match matched_target {
+                                        None => fw.ensure_scoped_policy_block(
+                                            canonical_exe,
+                                            pkg_sid,
+                                            None,
+                                            &*self.defense,
+                                        ),
+                                        Some(target_pat)
+                                            if parse_literal_target_ip(target_pat).is_some() =>
+                                        {
+                                            fw.ensure_scoped_policy_block(
+                                                canonical_exe,
+                                                pkg_sid,
+                                                Some(item.dst_ip),
+                                                &*self.defense,
+                                            )
+                                        }
+                                        Some(target_pat)
+                                            if parse_cidr_target(target_pat).is_ok()
+                                                || matches_network_target(
+                                                    target_pat,
+                                                    item.dst_ip,
+                                                    None,
+                                                ) =>
+                                        {
+                                            fw.ensure_scoped_domain_policy_block(
+                                                canonical_exe,
+                                                pkg_sid,
+                                                scoped_pfn,
+                                                item.dst_ip,
+                                                &scoped_blocked_hints,
+                                                &*self.defense,
+                                            )
+                                        }
+                                        Some(target_pat) => {
+                                            if !scoped_blocked_hints.is_empty() {
+                                                fw.ensure_scoped_domain_policy_block(
+                                                    canonical_exe,
+                                                    pkg_sid,
+                                                    scoped_pfn,
+                                                    item.dst_ip,
+                                                    &scoped_blocked_hints,
+                                                    &*self.defense,
+                                                )
+                                            } else {
+                                                let fallback_label = blocked_dom_from_cand
+                                                    .as_deref()
+                                                    .unwrap_or(target_pat);
+                                                fw.ensure_scoped_domain_policy_block(
+                                                    canonical_exe,
+                                                    pkg_sid,
+                                                    scoped_pfn,
+                                                    item.dst_ip,
+                                                    &[fallback_label],
+                                                    &*self.defense,
+                                                )
+                                            }
+                                        }
+                                    };
+                                    res.ok()
+                                })
+                                .or((item.os_filter_id != 0).then_some(item.os_filter_id));
+                            (
+                                "LEDR-NET-POLICY-BLOCK",
+                                AlertSeverity::High,
+                                "Blocked Outbound Policy Match (Package-Scoped)",
+                                Some(rule_id),
+                                wfp_handle,
+                            )
+                        } else {
+                            let matched_target = rules
                             .iter()
                             .find(|r| r.rule_id == rule_id)
                             .and_then(|r| r.allowed_target.as_deref())
@@ -1512,6 +1782,7 @@ impl DaemonEngine {
                             Some(rule_id),
                             wfp_handle,
                         )
+                        }
                     }
                     OutboundDecision::PreemptiveRestrict(_)
                     | OutboundDecision::UnknownFirstConnect => {
@@ -1643,6 +1914,55 @@ impl DaemonEngine {
             tracing::warn!(error = %err, "failed flushing store after app-level WFP drop alert");
         }
     }
+}
+
+fn single_candidate_sid_mismatch(item: &QueuedWfpDrop, cand: &WfpCandidate) -> bool {
+    let event_sid = item
+        .package_sid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let cand_sid = cand
+        .package_sid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    matches!((event_sid, cand_sid), (Some(ev), Some(cd)) if !ev.eq_ignore_ascii_case(cd))
+}
+
+fn resolve_wfp_drop_package_context(
+    item: &QueuedWfpDrop,
+    candidates: &[WfpCandidate],
+    single_non_ambig: bool,
+    candidates_complete: bool,
+) -> (Option<String>, Option<String>) {
+    if single_non_ambig && candidates.len() == 1 {
+        let cand = &candidates[0];
+        let event_sid = item
+            .package_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        if single_candidate_sid_mismatch(item, cand) {
+            return (None, event_sid);
+        }
+        let cand_sid = cand
+            .package_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        return (
+            cand.package_family_name.clone(),
+            event_sid.or(cand_sid),
+        );
+    }
+    resolve_ambiguous_package_context(
+        item.package_sid.as_deref(),
+        candidates,
+        candidates_complete,
+    )
 }
 
 fn resolve_ambiguous_package_context(

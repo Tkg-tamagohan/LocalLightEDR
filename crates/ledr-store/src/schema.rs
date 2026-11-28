@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use ledr_proto::{
     AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord, CanaryCategory, DnsQueryRecord,
     DownloadOriginRecord, FileCanaryEventRecord, NetworkEventRecord, ProcessRecord, RuleScope,
+    ScopedPolicyRuleRecord,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 
@@ -145,6 +146,22 @@ CREATE TABLE IF NOT EXISTS honeypot_files (
     created_at_ms   INTEGER NOT NULL,
     last_seen_at_ms INTEGER NOT NULL
 ) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS scoped_policy_rules (
+    rule_id              TEXT PRIMARY KEY,
+    scope                TEXT NOT NULL,
+    exe_path_pattern     TEXT NOT NULL,
+    sha256               TEXT,
+    signer_subject       TEXT,
+    root_thumbprint      TEXT,
+    allowed_target       TEXT,
+    package_family_name  TEXT,
+    package_sid          TEXT,
+    command_line_pattern TEXT,
+    created_at_ms        INTEGER NOT NULL,
+    created_by           TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_scoped_rules_scope_created ON scoped_policy_rules(scope, created_at_ms DESC, rule_id ASC);
 ";
 
 pub(crate) fn ensure_process_package_columns(conn: &Connection) -> Result<(), StoreError> {
@@ -212,6 +229,7 @@ pub(crate) const CANARY_COLS: &str =
     "id, timestamp_ms, process_instance_id, target_path, category, access_mask, action_taken";
 pub(crate) const ALERT_COLS: &str = "alert_id, timestamp_ms, severity, source_layer, rule_id, title, process_instance_id, process_suspended, status, context_json, resolved_at_ms";
 pub(crate) const RULE_COLS: &str = "rule_id, scope, exe_path_pattern, sha256, signer_subject, root_thumbprint, allowed_target, created_at_ms, created_by";
+pub(crate) const SCOPED_RULE_COLS: &str = "rule_id, scope, exe_path_pattern, sha256, signer_subject, root_thumbprint, allowed_target, package_family_name, package_sid, command_line_pattern, created_at_ms, created_by";
 pub(crate) const DOWNLOAD_COLS: &str =
     "id, file_path, sha256, tab_url, frame_url, referrer_url, downloaded_at_ms";
 
@@ -363,6 +381,28 @@ pub(crate) fn row_to_rule(row: &Row<'_>) -> Result<AllowlistRuleRecord, StoreErr
         allowed_target: row.get(6)?,
         created_at_ms: row.get(7)?,
         created_by: row.get(8)?,
+    })
+}
+
+pub(crate) fn row_to_scoped_rule(row: &Row<'_>) -> Result<ScopedPolicyRuleRecord, StoreError> {
+    let scope_str: String = row.get(1)?;
+    let scope = RuleScope::from_db_str(&scope_str).ok_or_else(|| StoreError::InvalidValue {
+        field: "scoped_policy_rules.scope",
+        value: scope_str,
+    })?;
+    Ok(ScopedPolicyRuleRecord {
+        rule_id: row.get(0)?,
+        scope,
+        exe_path_pattern: row.get(2)?,
+        sha256: row.get(3)?,
+        signer_subject: row.get(4)?,
+        root_thumbprint: row.get(5)?,
+        allowed_target: row.get(6)?,
+        package_family_name: row.get(7)?,
+        package_sid: row.get(8)?,
+        command_line_pattern: row.get(9)?,
+        created_at_ms: row.get(10)?,
+        created_by: row.get(11)?,
     })
 }
 

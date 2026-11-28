@@ -1,8 +1,11 @@
 use std::net::IpAddr;
 
-use ledr_proto::{is_never_suspend_process, AllowlistRuleRecord, RuleScope};
+use ledr_proto::{
+    is_never_suspend_process, AllowlistRuleRecord, RuleScope, ScopedPolicyRuleRecord,
+};
 use ledr_rules::{
-    classify_outbound_risk, matches_network_block_rule, validate_policy_rule, OutboundRiskClass,
+    classify_outbound_risk, matches_network_block_rule, validate_policy_rule,
+    validate_scoped_policy_rule, OutboundRiskClass,
 };
 use ledr_store::StoreError;
 
@@ -50,14 +53,38 @@ impl DaemonEngine {
         &self,
         prev_rules: Option<&[AllowlistRuleRecord]>,
     ) -> WfpReconcileReport {
+        self.deploy_persisted_network_rules_with_scoped_baseline(prev_rules, None)
+    }
+
+    pub(super) fn deploy_persisted_network_rules_with_scoped_baseline(
+        &self,
+        prev_rules: Option<&[AllowlistRuleRecord]>,
+        prev_scoped_rules: Option<&[ScopedPolicyRuleRecord]>,
+    ) -> WfpReconcileReport {
         if !self.config.outbound_firewall_enabled {
             self.outbound_classifier.set_has_domain_rules(false);
             return WfpReconcileReport::default();
         }
         if self.config.outbound_enforcement_mode == super::OutboundEnforcementMode::Audit {
-            match self.store.list_network_rules() {
-                Ok(rules) => {
-                    let has_domain_rules = rules.iter().any(|rule| {
+            match (
+                self.store.list_network_rules(),
+                self.store.list_scoped_network_rules(),
+            ) {
+                (Ok(rules), Ok(scoped_rules)) => {
+                    let has_domain_unscoped = rules.iter().any(|rule| {
+                        matches!(rule.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow)
+                            && !rule.exe_path_pattern.trim().is_empty()
+                            && rule
+                                .allowed_target
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .is_some_and(|target| {
+                                    crate::firewall::parse_literal_target_ip(target).is_none()
+                                        && ledr_rules::parse_cidr_target(target).is_err()
+                                })
+                    });
+                    let has_domain_scoped = scoped_rules.iter().any(|rule| {
                         matches!(rule.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow)
                             && !rule.exe_path_pattern.trim().is_empty()
                             && rule
@@ -71,9 +98,9 @@ impl DaemonEngine {
                                 })
                     });
                     self.outbound_classifier
-                        .set_has_domain_rules(has_domain_rules);
+                        .set_has_domain_rules(has_domain_unscoped || has_domain_scoped);
                 }
-                Err(err) => {
+                (Err(err), _) | (_, Err(err)) => {
                     tracing::warn!(
                         error = %err,
                         "failed to load persisted network rules in audit mode; preserving previous has_domain_rules state"
@@ -82,14 +109,18 @@ impl DaemonEngine {
             }
             return WfpReconcileReport::default();
         }
-        let rules = match self.store.list_network_rules() {
-            Ok(rules) => rules,
-            Err(err) => {
+        let (rules, scoped_rules) = match (
+            self.store.list_network_rules(),
+            self.store.list_scoped_network_rules(),
+        ) {
+            (Ok(rules), Ok(scoped)) => (rules, scoped),
+            (Err(err), _) | (_, Err(err)) => {
                 tracing::warn!(error = %err, "failed to load persisted network rules for WFP reconciliation");
                 return WfpReconcileReport {
                     failed: 1,
                     failed_ops: vec![WfpFailedOp {
                         exe_key: "<store>".to_string(),
+                        package_sid: None,
                         remote_ip: None,
                         is_remove: false,
                         is_startup_preemptive: false,
@@ -115,8 +146,9 @@ impl DaemonEngine {
                 .active_exe_liveness_snapshot();
             let mut dns_ctx = {
                 let blocks = fw.all_domain_policy_blocks();
+                let scoped_blocks = fw.all_scoped_domain_policy_blocks_with_hints();
                 let permits = fw.all_domain_policy_permits_with_hints();
-                if blocks.is_empty() && permits.is_empty() {
+                if blocks.is_empty() && scoped_blocks.is_empty() && permits.is_empty() {
                     WfpReconcileDnsContext::default()
                 } else {
                     let dns_hist = self
@@ -128,6 +160,29 @@ impl DaemonEngine {
                         let doms = dns_hist.domains_for_exe_ip(&exe_k, ip);
                         if !doms.is_empty() {
                             ctx.active_block_domains.insert((exe_k, ip), doms);
+                        }
+                    }
+                    for (exe_k, ip, hints) in scoped_blocks {
+                        let doms = dns_hist.domains_for_exe_ip(&exe_k, ip);
+                        if !doms.is_empty() {
+                            let entry = ctx
+                                .active_block_domains
+                                .entry((exe_k.clone(), ip))
+                                .or_default();
+                            for dom in doms {
+                                if !entry.contains(&dom) {
+                                    entry.push(dom);
+                                }
+                            }
+                        }
+                        for hint in hints {
+                            let norm = hint.trim().trim_end_matches('.').to_ascii_lowercase();
+                            if !norm.is_empty()
+                                && dns_hist.is_domain_ip_superseded(&exe_k, &norm, ip)
+                            {
+                                ctx.superseded_block_hints
+                                    .insert((exe_k.clone(), ip, norm));
+                            }
                         }
                     }
                     for (exe_k, ip, hints) in permits {
@@ -142,9 +197,11 @@ impl DaemonEngine {
             };
             dns_ctx.live_exe_overflow_any = live_exe_overflow_any;
             dns_ctx.overflow_live_exe_keys = overflow_live_exe_keys;
-            let mut rep = fw.reconcile_persisted_rules_with_dns_context(
+            let mut rep = fw.reconcile_persisted_rules_with_scoped(
                 &rules,
                 prev_rules,
+                &scoped_rules,
+                prev_scoped_rules,
                 &active_exes,
                 &dns_ctx,
                 &*self.inspector,
@@ -216,6 +273,7 @@ impl DaemonEngine {
                                 rep.failed += 1;
                                 rep.failed_ops.push(WfpFailedOp {
                                     exe_key: exe_k,
+                                    package_sid: None,
                                     remote_ip: Some(ip),
                                     is_remove: true,
                                     is_startup_preemptive: false,
@@ -237,9 +295,14 @@ impl DaemonEngine {
     }
 
     pub(super) fn compensate_failed_wfp_report(&self, report: &WfpReconcileReport) {
-        if !report.promoted_backups.is_empty() {
+        if !report.promoted_backups.is_empty() || !report.promoted_scoped_backups.is_empty() {
             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-            fw.restore_promoted_filter_states(&report.promoted_backups);
+            if !report.promoted_backups.is_empty() {
+                fw.restore_promoted_filter_states(&report.promoted_backups);
+            }
+            if !report.promoted_scoped_backups.is_empty() {
+                fw.restore_promoted_scoped_filter_states(&report.promoted_scoped_backups);
+            }
         }
         let _ = self.deploy_persisted_network_rules();
         if !report.removed_domain_filters.is_empty() || !report.removed_app_blocks.is_empty() {
@@ -425,5 +488,126 @@ impl DaemonEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .has_active_filter(exe_path, remote_ip, allow)
+    }
+
+    /// Returns `true` if the daemon currently tracks an active package-scoped WFP filter for
+    /// `(exe_path, package_sid, remote_ip, allow)`.
+    pub fn has_active_scoped_wfp_filter(
+        &self,
+        exe_path: &str,
+        package_sid: &str,
+        remote_ip: Option<IpAddr>,
+        allow: bool,
+    ) -> bool {
+        self.firewall
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_active_scoped_filter(exe_path, package_sid, remote_ip, allow)
+    }
+
+    /// Validates (`FU-P4-03`, `L-04`, `AUTO-02`) and persists a [`ScopedPolicyRuleRecord`] into
+    /// `scoped_policy_rules`, immediately reconciling package-scoped WFP filters when network-scoped,
+    /// with full SQLite + WFP compensation rollback on synchronization failure.
+    pub fn upsert_scoped_policy_rule(
+        &self,
+        rule: &ScopedPolicyRuleRecord,
+    ) -> Result<WfpReconcileReport, PolicyRuleError> {
+        validate_scoped_policy_rule(rule).map_err(PolicyRuleError::Invalid)?;
+        let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let write_guard = StoreWriteGate::enter_op(&self.store_write_gate)
+            .ok_or_else(Self::store_write_closed_err)?;
+        let previous = self.store.get_scoped_rule(&rule.rule_id)?;
+        let previous_was_network = previous
+            .as_ref()
+            .is_some_and(|r| matches!(r.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow));
+        let new_is_network = matches!(rule.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow);
+        let prev_scoped_rules =
+            (self.config.outbound_firewall_enabled && (previous_was_network || new_is_network))
+                .then(|| self.store.list_scoped_network_rules())
+                .transpose()?;
+
+        write_guard.write(&self.store, |s| s.upsert_scoped_rule(rule))?;
+        if let Some(ref prev_scoped) = prev_scoped_rules {
+            let report =
+                self.deploy_persisted_network_rules_with_scoped_baseline(None, Some(prev_scoped));
+            let mut affected: Vec<&ScopedPolicyRuleRecord> = Vec::with_capacity(2);
+            if new_is_network {
+                affected.push(rule);
+            }
+            if let Some(ref prev) = previous {
+                if previous_was_network {
+                    affected.push(prev);
+                }
+            }
+            if let Some(err_summary) = report.failure_summary_for_scoped_rules(&affected) {
+                let comp_res = write_guard.write(&self.store, |s| match previous {
+                    Some(ref prev) => s.upsert_scoped_rule(prev),
+                    None => s.delete_scoped_rule(&rule.rule_id).map(|_| ()),
+                });
+                if let Err(comp_err) = comp_res {
+                    tracing::warn!(
+                        rule_id = %rule.rule_id,
+                        error = %comp_err,
+                        "failed compensating SQLite after WFP sync failure in upsert_scoped_policy_rule"
+                    );
+                } else {
+                    self.compensate_failed_wfp_report(&report);
+                }
+                return Err(PolicyRuleError::FirewallSync(err_summary));
+            }
+            self.invalidate_non_protected_steady_pids();
+            Ok(report)
+        } else {
+            Ok(WfpReconcileReport::default())
+        }
+    }
+
+    /// Deletes a scoped policy rule from `scoped_policy_rules` and reconciles package-scoped WFP
+    /// filters, rolling back SQLite and WFP state on synchronization failure.
+    pub fn delete_scoped_policy_rule(
+        &self,
+        rule_id: &str,
+    ) -> Result<(bool, WfpReconcileReport), PolicyRuleError> {
+        let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let write_guard = StoreWriteGate::enter_op(&self.store_write_gate)
+            .ok_or_else(Self::store_write_closed_err)?;
+        let existing = self.store.get_scoped_rule(rule_id)?;
+        let existing_is_network = existing
+            .as_ref()
+            .is_some_and(|r| matches!(r.scope, RuleScope::NetworkBlock | RuleScope::NetworkAllow));
+        let prev_scoped_rules = (self.config.outbound_firewall_enabled && existing_is_network)
+            .then(|| self.store.list_scoped_network_rules())
+            .transpose()?;
+        let deleted = write_guard.write(&self.store, |s| s.delete_scoped_rule(rule_id))?;
+        if deleted {
+            if let Some(ref prev_scoped) = prev_scoped_rules {
+                let report = self.deploy_persisted_network_rules_with_scoped_baseline(
+                    None,
+                    Some(prev_scoped),
+                );
+                let err_summary = existing
+                    .as_ref()
+                    .and_then(|prev| report.failure_summary_for_scoped_rules(&[prev]));
+                if let Some(err_summary) = err_summary {
+                    if let Some(ref prev) = existing {
+                        if let Err(comp_err) =
+                            write_guard.write(&self.store, |s| s.upsert_scoped_rule(prev))
+                        {
+                            tracing::warn!(
+                                rule_id = %rule_id,
+                                error = %comp_err,
+                                "failed compensating SQLite after WFP sync failure in delete_scoped_policy_rule"
+                            );
+                        } else {
+                            self.compensate_failed_wfp_report(&report);
+                        }
+                    }
+                    return Err(PolicyRuleError::FirewallSync(err_summary));
+                }
+                self.invalidate_non_protected_steady_pids();
+                return Ok((true, report));
+            }
+        }
+        Ok((deleted, WfpReconcileReport::default()))
     }
 }

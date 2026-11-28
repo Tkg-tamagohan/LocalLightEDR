@@ -6,6 +6,7 @@ pub mod domain;
 pub mod nrd;
 pub mod outbound;
 pub mod pruner;
+pub mod scoped;
 pub mod sigma;
 
 use std::fs;
@@ -36,6 +37,13 @@ pub use outbound::{
     OutboundDecision, OutboundRiskClass,
 };
 pub use pruner::{AllowlistConfig, EarlyPruner, EarlyPrunerConfig};
+pub use scoped::{
+    evaluate_outbound_policy_with_scoped, is_allowed_by_scoped_rules, is_valid_app_container_sid,
+    matches_command_line_pattern, matches_package_wide_network_allow,
+    matches_package_wide_network_block, matches_scoped_network_allow_rule,
+    matches_scoped_network_block_rule, validate_command_line_pattern, validate_scoped_policy_rule,
+    ProcessScopeContext, MAX_COMMAND_LINE_PATTERN_CHARS,
+};
 pub use sigma::{
     EventContext, FieldCondition, MatchModifier, SigmaEngine, SigmaField, SigmaMatch, SigmaRule,
 };

@@ -12,7 +12,9 @@ use windows::Win32::System::Threading::{
     PROCESS_TERMINATE, TerminateProcess,
 };
 
-use crate::wfp::{WfpDropSinkFn, WfpDynamicEngine, validate_wfp_rule_request};
+use crate::wfp::{
+    WfpDropSinkFn, WfpDynamicEngine, validate_wfp_package_sid, validate_wfp_rule_request,
+};
 
 use super::guard::{
     TargetValidationError, ValidatedTarget, validate_and_inspect_target,
@@ -532,6 +534,26 @@ impl ActiveDefenseController for WindowsDefenseController {
             .unwrap_or_else(|e| e.into_inner());
         let engine = ensure_wfp_engine_locked(&mut slot, &self.wfp_drop_sink)?;
         engine.add_app_rule(exe_path, remote_ip, allow)
+    }
+
+    fn add_wfp_scoped_app_rule(
+        &self,
+        exe_path: &Path,
+        package_sid: Option<&str>,
+        remote_ip: Option<IpAddr>,
+        allow: bool,
+    ) -> Result<u64, String> {
+        let Some(sid) = package_sid else {
+            return self.add_wfp_app_rule(exe_path, remote_ip, allow);
+        };
+        validate_wfp_rule_request(exe_path, allow)?;
+        let validated_sid = validate_wfp_package_sid(sid)?;
+        let mut slot = self
+            .wfp_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let engine = ensure_wfp_engine_locked(&mut slot, &self.wfp_drop_sink)?;
+        engine.add_scoped_app_rule(exe_path, Some(&validated_sid), remote_ip, allow)
     }
 
     fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {

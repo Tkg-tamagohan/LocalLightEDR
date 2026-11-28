@@ -3,11 +3,11 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ledr_proto::{AllowlistRuleRecord, RuleScope};
+use ledr_proto::{AllowlistRuleRecord, RuleScope, ScopedPolicyRuleRecord};
 use rusqlite::params;
 
 use crate::queries::query_optional_row;
-use crate::schema::{row_to_rule, RULE_COLS};
+use crate::schema::{row_to_rule, row_to_scoped_rule, RULE_COLS, SCOPED_RULE_COLS};
 use crate::{LedrStore, StoreError};
 
 impl LedrStore {
@@ -184,5 +184,133 @@ impl LedrStore {
         }
         tx.commit()?;
         Ok(inserted)
+    }
+
+    /// Lists persisted scoped policy rules from `scoped_policy_rules`, optionally filtered by
+    /// [`RuleScope`] (`FU-P4-03`).
+    pub fn list_scoped_rules(
+        &self,
+        scope: Option<RuleScope>,
+    ) -> Result<Vec<ScopedPolicyRuleRecord>, StoreError> {
+        let reader = self.lock_reader()?;
+        let mut rules = Vec::new();
+
+        match scope {
+            Some(scope_filter) => {
+                let sql = format!(
+                    "SELECT {SCOPED_RULE_COLS} FROM scoped_policy_rules WHERE scope = ?1 ORDER BY created_at_ms DESC, rule_id ASC"
+                );
+                let mut stmt = reader.prepare(&sql)?;
+                let mut rows = stmt.query(params![scope_filter.as_db_str()])?;
+                while let Some(row) = rows.next()? {
+                    rules.push(row_to_scoped_rule(row)?);
+                }
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {SCOPED_RULE_COLS} FROM scoped_policy_rules ORDER BY created_at_ms DESC, rule_id ASC"
+                );
+                let mut stmt = reader.prepare(&sql)?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    rules.push(row_to_scoped_rule(row)?);
+                }
+            }
+        }
+
+        Ok(rules)
+    }
+
+    /// Lists persisted scoped firewall rules (`NetworkBlock` followed by `NetworkAllow`) from
+    /// `scoped_policy_rules` (`FU-P4-03`).
+    pub fn list_scoped_network_rules(&self) -> Result<Vec<ScopedPolicyRuleRecord>, StoreError> {
+        self.list_scoped_rules_by_scopes(&[RuleScope::NetworkBlock, RuleScope::NetworkAllow])
+    }
+
+    /// Lists persisted scoped rules matching any scope in `scopes`, preserving the caller's
+    /// scope priority order via `idx_scoped_rules_scope_created`.
+    pub fn list_scoped_rules_by_scopes(
+        &self,
+        scopes: &[RuleScope],
+    ) -> Result<Vec<ScopedPolicyRuleRecord>, StoreError> {
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reader = self.lock_reader()?;
+        let sql = format!(
+            "SELECT {SCOPED_RULE_COLS} FROM scoped_policy_rules WHERE scope = ?1 ORDER BY created_at_ms DESC, rule_id ASC"
+        );
+        let mut stmt = reader.prepare(&sql)?;
+        let mut seen = HashSet::with_capacity(scopes.len());
+        let mut rules = Vec::new();
+        for &scope in scopes {
+            if !seen.insert(scope) {
+                continue;
+            }
+            let mut rows = stmt.query(params![scope.as_db_str()])?;
+            while let Some(row) = rows.next()? {
+                rules.push(row_to_scoped_rule(row)?);
+            }
+        }
+        Ok(rules)
+    }
+
+    /// Fetches a single [`ScopedPolicyRuleRecord`] by `rule_id`.
+    pub fn get_scoped_rule(
+        &self,
+        rule_id: &str,
+    ) -> Result<Option<ScopedPolicyRuleRecord>, StoreError> {
+        let reader = self.lock_reader()?;
+        let sql = format!("SELECT {SCOPED_RULE_COLS} FROM scoped_policy_rules WHERE rule_id = ?1");
+        query_optional_row(&reader, &sql, params![rule_id], row_to_scoped_rule)
+    }
+
+    /// Inserts or updates a [`ScopedPolicyRuleRecord`] keyed by `rule_id`.
+    pub fn upsert_scoped_rule(&self, rule: &ScopedPolicyRuleRecord) -> Result<(), StoreError> {
+        let writer = self.lock_writer()?;
+        writer.execute(
+            "INSERT INTO scoped_policy_rules (
+                rule_id, scope, exe_path_pattern, sha256, signer_subject,
+                root_thumbprint, allowed_target, package_family_name, package_sid,
+                command_line_pattern, created_at_ms, created_by
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(rule_id) DO UPDATE SET
+                scope = excluded.scope,
+                exe_path_pattern = excluded.exe_path_pattern,
+                sha256 = excluded.sha256,
+                signer_subject = excluded.signer_subject,
+                root_thumbprint = excluded.root_thumbprint,
+                allowed_target = excluded.allowed_target,
+                package_family_name = excluded.package_family_name,
+                package_sid = excluded.package_sid,
+                command_line_pattern = excluded.command_line_pattern,
+                created_at_ms = excluded.created_at_ms,
+                created_by = excluded.created_by",
+            params![
+                rule.rule_id,
+                rule.scope.as_db_str(),
+                rule.exe_path_pattern,
+                rule.sha256,
+                rule.signer_subject,
+                rule.root_thumbprint,
+                rule.allowed_target,
+                rule.package_family_name,
+                rule.package_sid,
+                rule.command_line_pattern,
+                rule.created_at_ms,
+                rule.created_by,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a scoped policy rule by `rule_id`; returns `true` if a row was removed.
+    pub fn delete_scoped_rule(&self, rule_id: &str) -> Result<bool, StoreError> {
+        let writer = self.lock_writer()?;
+        let deleted = writer.execute(
+            "DELETE FROM scoped_policy_rules WHERE rule_id = ?1",
+            params![rule_id],
+        )?;
+        Ok(deleted > 0)
     }
 }

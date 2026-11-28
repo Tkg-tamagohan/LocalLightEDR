@@ -2,7 +2,7 @@ use super::*;
 use crate::batch::resolve_process_instance_id;
 use ledr_proto::{
     AlertRecord, AlertSeverity, AllowlistRuleRecord, ProcessIdentity, ProcessRecord, RuleScope,
-    ScriptSource,
+    ScopedPolicyRuleRecord, ScriptSource,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use tempfile::TempDir;
@@ -27,6 +27,7 @@ fn unit_schema_tables_indexes_and_all_seven_pragmas() {
         "honeypot_files",
         "network_events",
         "processes",
+        "scoped_policy_rules",
     ];
     let expected_indexes = [
         "idx_alerts_proc_status",
@@ -45,6 +46,7 @@ fn unit_schema_tables_indexes_and_all_seven_pragmas() {
         "idx_processes_pid_created",
         "idx_processes_sha256",
         "idx_rules_scope_created",
+        "idx_scoped_rules_scope_created",
     ];
 
     let writer = store.lock_writer().expect("lock writer");
@@ -1359,5 +1361,172 @@ fn store_fu_p4_03_idempotent_package_column_migration_and_non_clobbering_roundtr
             package_family_name: Some("Committed.Pkg_2".to_string()),
             package_sid: None,
         })
+    );
+}
+
+#[test]
+fn store_fu_p4_03_track_b2_scoped_policy_rules_crud_and_legacy_isolation() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("scoped_rules.db");
+
+    // 1. Verify idempotent table creation on a legacy DB lacking `scoped_policy_rules`.
+    {
+        let legacy = rusqlite::Connection::open(&db_path).expect("open legacy db");
+        legacy
+            .execute_batch(
+                "CREATE TABLE allowlist_rules (
+                    rule_id          TEXT PRIMARY KEY,
+                    scope            TEXT NOT NULL,
+                    exe_path_pattern TEXT NOT NULL,
+                    sha256           TEXT,
+                    signer_subject   TEXT,
+                    root_thumbprint  TEXT,
+                    allowed_target   TEXT,
+                    created_at_ms    INTEGER NOT NULL,
+                    created_by       TEXT NOT NULL
+                ) WITHOUT ROWID;",
+            )
+            .expect("create legacy allowlist_rules");
+    }
+
+    let store = LedrStore::open(&db_path).expect("open migrated db");
+    drop(store);
+    let store = LedrStore::open(&db_path).expect("reopen migrated db idempotently");
+
+    // Seed one legacy rule to confirm `allowlist_rules` stays untouched and isolated.
+    let legacy_rule = AllowlistRuleRecord {
+        rule_id: "LEGACY-1".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: r"C:\Apps\legacy.exe".to_string(),
+        sha256: Some("a".repeat(64)),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("1.1.1.1".to_string()),
+        created_at_ms: 1_700_000_000_001,
+        created_by: "user".to_string(),
+    };
+    store.upsert_rule(&legacy_rule).expect("upsert legacy rule");
+
+    // 2. Upsert all 4 scopes into `scoped_policy_rules` with mixed NULL / non-NULL columns.
+    let r_net_allow = ScopedPolicyRuleRecord {
+        rule_id: "SC-NET-ALLOW-1".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+        sha256: None,
+        signer_subject: Some("CN=Microsoft Windows".to_string()),
+        root_thumbprint: Some("0123456789ABCDEF0123456789ABCDEF01234567".to_string()),
+        allowed_target: Some("*.microsoft.com".to_string()),
+        package_family_name: Some("Microsoft.StartExperiencesApp_8wekyb3d8bbwe".to_string()),
+        package_sid: Some("S-1-15-2-100-200".to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_700_000_000_010,
+        created_by: "user_triage".to_string(),
+    };
+    let r_net_block = ScopedPolicyRuleRecord {
+        rule_id: "SC-NET-BLOCK-1".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        package_family_name: None,
+        package_sid: Some("S-1-15-2-300-400".to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_700_000_000_020,
+        created_by: "user_quarantine".to_string(),
+    };
+    let r_proc_allow = ScopedPolicyRuleRecord {
+        rule_id: "SC-PROC-ALLOW-1".to_string(),
+        scope: RuleScope::ProcessAllow,
+        exe_path_pattern: r"C:\Windows\System32\backgroundTaskHost.exe".to_string(),
+        sha256: Some("b".repeat(64)),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        package_family_name: Some("Contoso.Helper_8wekyb3d8bbwe".to_string()),
+        package_sid: None,
+        command_line_pattern: Some("*-ServerName:Contoso.Task*".to_string()),
+        created_at_ms: 1_700_000_000_030,
+        created_by: "user_triage".to_string(),
+    };
+    let r_canary_allow = ScopedPolicyRuleRecord {
+        rule_id: "SC-CANARY-ALLOW-1".to_string(),
+        scope: RuleScope::FileCanaryAllow,
+        exe_path_pattern: r"C:\Windows\System32\RuntimeBroker.exe".to_string(),
+        sha256: None,
+        signer_subject: Some("CN=Microsoft Windows".to_string()),
+        root_thumbprint: Some("0123456789ABCDEF0123456789ABCDEF01234567".to_string()),
+        allowed_target: Some(r"C:\Users\*\Documents\*.txt".to_string()),
+        package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+        package_sid: None,
+        command_line_pattern: Some("*-Embedding".to_string()),
+        created_at_ms: 1_700_000_000_040,
+        created_by: "user_triage".to_string(),
+    };
+
+    for r in [&r_net_allow, &r_net_block, &r_proc_allow, &r_canary_allow] {
+        store.upsert_scoped_rule(r).expect("upsert scoped rule");
+    }
+
+    assert_eq!(
+        store.get_scoped_rule("SC-NET-ALLOW-1").expect("get scoped"),
+        Some(r_net_allow.clone())
+    );
+    assert_eq!(
+        store.get_scoped_rule("MISSING").expect("get missing scoped"),
+        None
+    );
+    assert_eq!(
+        store.list_scoped_rules(None).expect("list all scoped").len(),
+        4
+    );
+    assert_eq!(
+        store
+            .list_scoped_rules(Some(RuleScope::ProcessAllow))
+            .expect("list ProcessAllow scoped"),
+        vec![r_proc_allow.clone()]
+    );
+
+    // `list_scoped_network_rules` returns NetworkBlock before NetworkAllow.
+    assert_eq!(
+        store
+            .list_scoped_network_rules()
+            .expect("list scoped network rules"),
+        vec![r_net_block.clone(), r_net_allow.clone()]
+    );
+
+    // Legacy `list_rules()` and `list_network_rules()` must remain completely unaffected.
+    assert_eq!(
+        store.list_rules(None).expect("legacy list_rules"),
+        vec![legacy_rule.clone()]
+    );
+    assert_eq!(
+        store.list_network_rules().expect("legacy list_network_rules"),
+        vec![legacy_rule]
+    );
+
+    // Upsert update + delete roundtrip.
+    let mut updated_allow = r_net_allow.clone();
+    updated_allow.allowed_target = Some("api.microsoft.com".to_string());
+    store
+        .upsert_scoped_rule(&updated_allow)
+        .expect("update scoped rule");
+    assert_eq!(
+        store
+            .get_scoped_rule("SC-NET-ALLOW-1")
+            .expect("get updated")
+            .and_then(|r| r.allowed_target),
+        Some("api.microsoft.com".to_string())
+    );
+    assert!(store.delete_scoped_rule("SC-NET-BLOCK-1").expect("delete scoped"));
+    assert!(!store
+        .delete_scoped_rule("SC-NET-BLOCK-1")
+        .expect("delete missing scoped"));
+    assert_eq!(
+        store
+            .list_scoped_network_rules()
+            .expect("list remaining scoped network"),
+        vec![updated_allow]
     );
 }

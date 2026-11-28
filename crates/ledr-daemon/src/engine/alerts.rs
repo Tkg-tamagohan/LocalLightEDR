@@ -4,10 +4,13 @@ use std::net::IpAddr;
 use ledr_proto::{
     build_windows_apps_version_wildcard_pattern, AlertDecision, AlertRecord, AlertStatus,
     AllowPermanentPathMode, AllowlistRuleRecord, ProcessIdentity, RuleScope,
+    ScopedPolicyRuleRecord,
 };
 use ledr_rules::{
-    matches_app_wide_network_block, matches_network_block_rule, matches_network_target,
-    matches_path_pattern, parse_cidr_target, BinaryIdentity, OutboundDecision,
+    is_valid_app_container_sid, matches_app_wide_network_block, matches_network_block_rule,
+    matches_network_target, matches_package_wide_network_block, matches_path_pattern,
+    matches_scoped_network_block_rule, parse_cidr_target, validate_scoped_policy_rule,
+    BinaryIdentity, OutboundDecision, ProcessScopeContext,
 };
 use uuid::Uuid;
 
@@ -15,7 +18,7 @@ use crate::firewall::{parse_literal_target_ip, WfpReconcileReport, WfpRuleManage
 
 use super::domain_policy::{
     extend_authorizing_hints_from_existing_permit, partition_permit_hints,
-    select_outbound_decision_for_domains,
+    select_outbound_decision_for_domains, select_outbound_decision_for_domains_with_scoped,
 };
 use super::{
     current_unix_ms, DaemonEngine, StoreWriteGate, WriteOpGuard, AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS,
@@ -729,64 +732,12 @@ impl DaemonEngine {
                 }
             }
             AlertDecision::TerminateAndBlock { add_block_rule } => {
-                if let Some(ident) = identity {
-                    if let Err(err) = self.defense.terminate_process(&ident, true) {
-                        if is_protected_process_refusal(&err) {
-                            return Err(err);
-                        }
-                        // A suspended alert tolerates the target already being gone: a
-                        // previous attempt may have terminated the process and then
-                        // failed the status update (rolling back the block rule), so a
-                        // retry must reach the rule save instead of erroring again.
-                        // A failure on a still-running process stays fatal.
-                        if alert.process_suspended && !is_process_gone_or_replaced(&err, ident.pid) {
-                            for child in &suspended_children {
-                                let _ = self.defense.terminate_process(child, true);
-                            }
-                            return Err(err);
-                        }
-                        tracing::warn!(
-                            alert_id = %alert_id,
-                            pid = ident.pid,
-                            error = %err,
-                            "terminate_process failed (target already terminated or PID reused); continuing block rule and alert resolution"
-                        );
-                    }
-                } else if alert.process_suspended {
-                    return Err(format!(
-                        "missing process identity to terminate suspended alert {alert_id}"
-                    ));
-                }
-
-                // Attempt every recorded child and defer the first real failure: a live
-                // or unverifiable child keeps the alert unresolved, but remaining
-                // descendants must still get their terminate attempt — once the parent
-                // is gone, a recorded identifier is the only way to reach them.
-                let mut child_terminate_err: Option<String> = None;
-                for child in &suspended_children {
-                    match self.defense.terminate_process(child, true) {
-                        Ok(()) => {}
-                        Err(err)
-                            if is_protected_process_refusal(&err)
-                                || !is_process_gone_or_replaced(&err, child.pid) =>
-                        {
-                            child_terminate_err.get_or_insert(err);
-                        }
-                        Err(err) => {
-                            // Only tolerate a child confirmed gone or PID-reused
-                            // (`BUG_0001`).
-                            tracing::warn!(
-                                alert_id = %alert_id,
-                                child_pid = child.pid,
-                                error = %err,
-                                "terminate_process failed for suspended child (already exited); continuing"
-                            );
-                        }
-                    }
-                }
-                if let Some(err) = child_terminate_err {
-                    return Err(err);
-                }
+                self.terminate_alert_targets_for_resolution(
+                    alert_id,
+                    &alert,
+                    identity,
+                    &suspended_children,
+                )?;
 
                 if add_block_rule {
                     if let Some(exe) = exe_path.clone() {
@@ -828,37 +779,10 @@ impl DaemonEngine {
                         }
                     }
                 } else if is_network_alert && self.config.outbound_firewall_enabled {
-                    let (release_res, bound_exe) = {
-                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                        let bound_exe = fw.bound_alert_exe_path(alert_id);
-                        let res = fw.release_transient_containment_for_alert(
-                            alert_id,
-                            exe_path.as_deref(),
-                            &*self.defense,
-                        );
-                        (res, bound_exe)
-                    };
-                    if let Err(err) = release_res {
-                        tracing::warn!(
-                            alert_id = %alert_id,
-                            error = %err,
-                            "best-effort transient WFP release after terminate without block failed"
-                        );
-                    }
-                    if let Some(exe) = exe_path.as_deref().or(bound_exe.as_deref()) {
-                        let target_key = WfpRuleManager::exe_key(exe);
-                        // Lock order: `firewall` -> `process_table` (unified with `wfp_premat.rs`
-                        // and `events.rs`).
-                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                        let still_active = self
-                            .process_table
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .has_active_exe_key(&target_key);
-                        if !still_active {
-                            fw.remove_preemptive_block_if_unused(exe, &*self.defense);
-                        }
-                    }
+                    self.release_transient_wfp_after_terminate_without_block(
+                        alert_id,
+                        exe_path.as_deref(),
+                    );
                 }
             }
         }
@@ -935,6 +859,963 @@ impl DaemonEngine {
             alert,
             saved_rule_id,
         })
+    }
+
+    /// Resolves `alert_id` with optional package-level scoping (`FU-P4-03` Track B-2).
+    ///
+    /// When `scope_to_package` is `false`, delegates directly to
+    /// [`Self::resolve_alert_with_options_and_outcome`] with [`AllowPermanentPathMode::Exact`].
+    /// When `scope_to_package` is `true`:
+    /// - `AllowPermanent` on Layer 3 requires `L-04` Authenticode signing, non-empty
+    ///   `package_family_name`, and valid AppContainer `package_sid`, storing a
+    ///   [`ScopedPolicyRuleRecord`] into `scoped_policy_rules` and synchronizing package-scoped WFP
+    ///   filters with full compensation rollback on failure.
+    /// - `TerminateAndBlock { add_block_rule: true }` stores a package-scoped `NetworkBlock` rule
+    ///   only when `package_sid` is present; for non-AppContainer processes (including
+    ///   `PFN_ONLY_NON_APPCONTAINER`), persistent block rule creation is skipped to prevent locking
+    ///   out the shared host executable across all packages.
+    pub fn resolve_alert_scoped_with_outcome(
+        &self,
+        alert_id: &str,
+        decision: AlertDecision,
+        scope_to_package: bool,
+    ) -> Result<ResolvedAlertOutcome, String> {
+        if !scope_to_package {
+            return self.resolve_alert_with_options_and_outcome(
+                alert_id,
+                decision,
+                AllowPermanentPathMode::Exact,
+            );
+        }
+
+        let _resolve_guard = self.resolve_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let write_guard = StoreWriteGate::enter_op(&self.store_write_gate)
+            .ok_or_else(|| "daemon store writes closed for shutdown".to_string())?;
+        let mut saved_rule_id: Option<String> = None;
+        let mut alert = self
+            .store
+            .get_alert(alert_id)
+            .map_err(|err| format!("failed to query alert {alert_id}: {err}"))?
+            .ok_or_else(|| format!("alert {alert_id} not found"))?;
+
+        if !alert.status.is_unresolved() {
+            return Err(format!(
+                "alert {alert_id} is already resolved ({})",
+                alert.status.as_db_str()
+            ));
+        }
+
+        if alert.source_layer == "LAYER_4_BROWSER" && alert.process_instance_id.is_none() {
+            let now_ms = current_unix_ms();
+            return match decision {
+                AlertDecision::AllowOnce
+                | AlertDecision::TerminateAndBlock {
+                    add_block_rule: false,
+                } => {
+                    let new_status = decision.resulting_status();
+                    let updated = write_guard
+                        .write(&self.store, |s| {
+                            s.update_alert_status(alert_id, new_status, Some(now_ms))
+                        })
+                        .map_err(|err| format!("failed to update alert status: {err}"))?;
+                    if !updated {
+                        return Err(format!("alert {alert_id} not found"));
+                    }
+                    alert.status = new_status;
+                    alert.resolved_at_ms = Some(now_ms);
+                    Ok(ResolvedAlertOutcome {
+                        alert,
+                        saved_rule_id: None,
+                    })
+                }
+                AlertDecision::AllowPermanent { .. } => Err(format!(
+                    "LAYER_4_BROWSER alert {alert_id} has no associated process and cannot create a permanent rule"
+                )),
+                AlertDecision::TerminateAndBlock {
+                    add_block_rule: true,
+                } => Err(format!(
+                    "LAYER_4_BROWSER alert {alert_id} has no associated process and cannot create a block rule"
+                )),
+            };
+        }
+
+        let ctx_val: serde_json::Value =
+            serde_json::from_str(&alert.context_json).unwrap_or(serde_json::Value::Null);
+
+        let identity = alert
+            .process_instance_id
+            .as_deref()
+            .and_then(ProcessIdentity::from_instance_id)
+            .filter(|id| id.create_time_100ns != 0);
+
+        let mut seen_own_children = HashSet::new();
+        let mut own_suspended_children = Vec::new();
+        collect_suspended_children_from_ctx(
+            &ctx_val,
+            if alert.process_suspended {
+                identity
+            } else {
+                None
+            },
+            &mut seen_own_children,
+            &mut own_suspended_children,
+        );
+
+        let mut seen_children = seen_own_children;
+        let mut suspended_children = own_suspended_children.clone();
+        if let Some(ref proc_inst_id) = alert.process_instance_id {
+            if let Ok(all_alerts) = self.store.list_alerts_for_process(proc_inst_id, false, 1000) {
+                for other in all_alerts {
+                    if other.alert_id != alert_id {
+                        if let Ok(other_ctx) =
+                            serde_json::from_str::<serde_json::Value>(&other.context_json)
+                        {
+                            collect_suspended_children_from_ctx(
+                                &other_ctx,
+                                identity,
+                                &mut seen_children,
+                                &mut suspended_children,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut exe_path = json_non_empty_str(&ctx_val, "/exe_path")
+            .or_else(|| json_non_empty_str(&ctx_val, "/event/ProcessStart/exe_path"))
+            .or_else(|| {
+                alert
+                    .process_instance_id
+                    .as_deref()
+                    .and_then(|inst_id| {
+                        self.process_table
+                            .lock()
+                            .ok()
+                            .and_then(|t| t.get_by_instance_id(inst_id).map(|e| e.exe_path.to_string()))
+                    })
+                    .filter(|s| !s.trim().is_empty())
+            });
+        if exe_path.is_none() {
+            if let Some(ref inst_id) = alert.process_instance_id {
+                if let Ok(snap) = self.store.query_flight_recorder(1, Some(inst_id)) {
+                    exe_path = snap
+                        .processes
+                        .into_iter()
+                        .next()
+                        .map(|p| p.exe_path)
+                        .filter(|s| !s.trim().is_empty());
+                }
+            }
+        }
+
+        let mut sha256 = json_non_empty_str(&ctx_val, "/sha256");
+        let mut signer_subject = json_non_empty_str(&ctx_val, "/signer_subject");
+        let mut root_thumbprint = json_non_empty_str(&ctx_val, "/root_thumbprint")
+            .filter(|tp| !tp.trim().is_empty() && !tp.trim().chars().all(|c| c == '0'));
+
+        if (sha256.is_none()
+            || signer_subject.is_none()
+            || root_thumbprint.is_none())
+            && exe_path.is_some()
+        {
+            if let Some(ref exe) = exe_path {
+                let inspected = self.inspector.inspect(exe);
+                if sha256.is_none() {
+                    sha256 = inspected.sha256;
+                }
+                if signer_subject.is_none() || root_thumbprint.is_none() {
+                    if let Some(auth) = inspected.authenticode {
+                        if signer_subject.is_none() {
+                            let subj = auth.signer_subject.trim();
+                            if !subj.is_empty() {
+                                signer_subject = Some(subj.to_string());
+                            }
+                        }
+                        if root_thumbprint.is_none() {
+                            let tp = auth.root_thumbprint.trim();
+                            if !tp.is_empty() && !tp.chars().all(|c| c == '0') {
+                                root_thumbprint = Some(tp.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let (pkg_pfn, pkg_sid) =
+            self.resolve_alert_package_attributes(&ctx_val, alert.process_instance_id.as_deref());
+        let valid_pkg_sid = pkg_sid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| is_valid_app_container_sid(s))
+            .map(str::to_string);
+
+        let now_ms = current_unix_ms();
+        let new_status = decision.resulting_status();
+        let is_terminate = matches!(decision, AlertDecision::TerminateAndBlock { .. });
+        let is_network_alert = alert.source_layer == "LAYER_3_NETWORK"
+            || ctx_val.pointer("/event/NetworkConnect").is_some();
+        let alert_dst_ip: Option<IpAddr> = json_non_empty_str(&ctx_val, "/dst_ip")
+            .or_else(|| json_non_empty_str(&ctx_val, "/event/NetworkConnect/dst_ip"))
+            .and_then(|s| s.parse::<IpAddr>().ok());
+        let alert_domain_hint = json_non_empty_str(&ctx_val, "/domain_hint")
+            .or_else(|| json_non_empty_str(&ctx_val, "/event/NetworkConnect/domain_hint"));
+
+        let mut lifted_wfp_block = None;
+        let mut rebind_alert_exe: Option<String> = None;
+        let mut displaced_bound_alerts: Vec<String> = Vec::new();
+        let mut marked_once_allowed_procs: Vec<String> = Vec::new();
+        let mut applied_wfp_report: Option<WfpReconcileReport> = None;
+
+        match decision {
+            AlertDecision::AllowOnce => {
+                if is_network_alert && self.config.outbound_firewall_enabled {
+                    if let Some(ref exe) = exe_path {
+                        let block_check_domains: Vec<String> = if let Some(dst_ip) = alert_dst_ip {
+                            let exe_k = WfpRuleManager::exe_key(exe);
+                            let mut doms: Vec<String> = Vec::new();
+                            if let Some(hint) = alert_domain_hint
+                                .as_deref()
+                                .map(str::trim)
+                                .map(|s| s.trim_end_matches('.'))
+                                .filter(|s| !s.is_empty())
+                            {
+                                doms.push(hint.to_ascii_lowercase());
+                            }
+                            let history = self
+                                .process_dns_history
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if let Some(inst_id) = alert.process_instance_id.as_deref() {
+                                for (dom, _) in history.lookup_domains_for_process(inst_id, dst_ip)
+                                {
+                                    if !doms.iter().any(|existing| existing == &dom) {
+                                        doms.push(dom);
+                                    }
+                                }
+                            } else if let Some(cand_ids) = ctx_val
+                                .pointer("/candidate_instance_ids")
+                                .and_then(|v| v.as_array())
+                            {
+                                for raw_id in cand_ids {
+                                    if let Some(inst_id) = raw_id.as_str() {
+                                        for (dom, _) in history.lookup_fresh_domains_for_process(
+                                            inst_id,
+                                            dst_ip,
+                                            alert.timestamp_ms,
+                                            AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS,
+                                        ) {
+                                            if !doms.iter().any(|existing| existing == &dom) {
+                                                doms.push(dom);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for dom in history.domains_for_exe_ip(&exe_k, dst_ip) {
+                                if !doms.iter().any(|existing| existing == &dom) {
+                                    doms.push(dom);
+                                }
+                            }
+                            doms
+                        } else {
+                            alert_domain_hint
+                                .as_deref()
+                                .map(str::trim)
+                                .map(|s| s.trim_end_matches('.'))
+                                .filter(|s| !s.is_empty())
+                                .map(|s| vec![s.to_ascii_lowercase()])
+                                .unwrap_or_default()
+                        };
+                        let scope_ctx = ProcessScopeContext {
+                            package_family_name: pkg_pfn.as_deref(),
+                            package_sid: valid_pkg_sid.as_deref(),
+                            command_line: None,
+                        };
+                        let has_persisted_block = self
+                            .has_matching_persisted_network_block_with_scoped(
+                                exe,
+                                &scope_ctx,
+                                alert_dst_ip,
+                                &block_check_domains,
+                            );
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        let (lifted, was_bound) = fw.lift_block_for_allow_once(
+                            alert_id,
+                            exe,
+                            has_persisted_block,
+                            &*self.defense,
+                        )?;
+                        lifted_wfp_block = lifted;
+                        if was_bound {
+                            rebind_alert_exe = Some(exe.clone());
+                        }
+                        if !has_persisted_block {
+                            if let Some(ref proc_inst_id) = alert.process_instance_id {
+                                fw.mark_once_allowed(proc_inst_id, exe);
+                                marked_once_allowed_procs.push(proc_inst_id.clone());
+                            } else if let Some(cand_ids) =
+                                ctx_val.pointer("/candidate_instance_ids").and_then(|v| v.as_array())
+                            {
+                                let table = self
+                                    .process_table
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                for raw_id in cand_ids {
+                                    if let Some(inst_id) = raw_id.as_str() {
+                                        if table
+                                            .get_by_instance_id(inst_id)
+                                            .is_some_and(|e| e.exited_at_ms.is_none())
+                                        {
+                                            fw.mark_once_allowed(inst_id, exe);
+                                            marked_once_allowed_procs.push(inst_id.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Err(err) = self.resume_alert_targets_if_unblocked(
+                    &write_guard,
+                    &alert,
+                    identity,
+                    &own_suspended_children,
+                    &suspended_children,
+                ) {
+                    self.rollback_allow_once_wfp(
+                        alert_id,
+                        lifted_wfp_block.take(),
+                        rebind_alert_exe.take(),
+                        Vec::new(),
+                        std::mem::take(&mut marked_once_allowed_procs),
+                    );
+                    return Err(err);
+                }
+            }
+            AlertDecision::AllowPermanent {
+                use_signer_if_available,
+                allow_dest,
+            } => {
+                let exe = exe_path.clone().ok_or_else(|| {
+                    format!("missing executable path to create scoped allowlist rule for alert {alert_id}")
+                })?;
+                let scope = if is_network_alert {
+                    RuleScope::NetworkAllow
+                } else if alert.source_layer == "LAYER_2_RULES" {
+                    RuleScope::ProcessAllow
+                } else {
+                    RuleScope::FileCanaryAllow
+                };
+
+                let valid_signer_subject = signer_subject
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let valid_root_thumbprint = root_thumbprint
+                    .map(|tp| tp.trim().to_string())
+                    .filter(|tp| !tp.is_empty() && !tp.chars().all(|c| c == '0'));
+
+                let (rule_sha256, rule_signer, rule_thumbprint, rule_pfn, rule_sid) =
+                    if scope == RuleScope::NetworkAllow {
+                        if !use_signer_if_available {
+                            return Err(format!(
+                                "package-scoped NetworkAllow for alert {alert_id} requires use_signer_if_available=true (FU-P4-03)"
+                            ));
+                        }
+                        let signer = valid_signer_subject.ok_or_else(|| {
+                            format!(
+                                "cannot create package-scoped NetworkAllow without verified Authenticode signer_subject for {exe} (L-04, FU-P4-03)"
+                            )
+                        })?;
+                        let thumbprint = valid_root_thumbprint.ok_or_else(|| {
+                            format!(
+                                "cannot create package-scoped NetworkAllow without non-zero root_thumbprint for {exe} (L-04, FU-P4-03)"
+                            )
+                        })?;
+                        let pfn = pkg_pfn.clone().ok_or_else(|| {
+                            format!(
+                                "cannot create package-scoped NetworkAllow without non-empty package_family_name for alert {alert_id} (FU-P4-03)"
+                            )
+                        })?;
+                        let sid = valid_pkg_sid.clone().ok_or_else(|| {
+                            format!(
+                                "cannot create package-scoped NetworkAllow without valid AppContainer package_sid for alert {alert_id} (FU-P4-03)"
+                            )
+                        })?;
+                        (None, Some(signer), Some(thumbprint), Some(pfn), Some(sid))
+                    } else {
+                        if pkg_pfn.is_none() && valid_pkg_sid.is_none() {
+                            return Err(format!(
+                                "cannot create package-scoped {:?} rule without package_family_name or package_sid for alert {alert_id}",
+                                scope
+                            ));
+                        }
+                        if use_signer_if_available
+                            && valid_signer_subject.is_some()
+                            && valid_root_thumbprint.is_some()
+                        {
+                            (
+                                None,
+                                valid_signer_subject,
+                                valid_root_thumbprint,
+                                pkg_pfn.clone(),
+                                valid_pkg_sid.clone(),
+                            )
+                        } else {
+                            let hash = sha256.ok_or_else(|| {
+                                format!(
+                                    "cannot create unsigned scoped allowlist rule without SHA-256 digest for {exe} (L-04)"
+                                )
+                            })?;
+                            (
+                                Some(hash),
+                                None,
+                                None,
+                                pkg_pfn.clone(),
+                                valid_pkg_sid.clone(),
+                            )
+                        }
+                    };
+
+                let rule = ScopedPolicyRuleRecord {
+                    rule_id: format!("RULE-SCOPED-ALLOW-{}", Uuid::new_v4()),
+                    scope,
+                    exe_path_pattern: exe.clone(),
+                    sha256: rule_sha256,
+                    signer_subject: rule_signer,
+                    root_thumbprint: rule_thumbprint,
+                    allowed_target: allow_dest
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                    package_family_name: rule_pfn,
+                    package_sid: rule_sid,
+                    command_line_pattern: None,
+                    created_at_ms: now_ms,
+                    created_by: "user_triage".to_string(),
+                };
+                validate_scoped_policy_rule(&rule)?;
+
+                let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+                let prev_scoped_rules = (scope == RuleScope::NetworkAllow
+                    && self.config.outbound_firewall_enabled)
+                    .then(|| self.store.list_scoped_network_rules().unwrap_or_default());
+                write_guard
+                    .write(&self.store, |s| s.upsert_scoped_rule(&rule))
+                    .map_err(|err| format!("failed to store scoped permanent allowlist rule: {err}"))?;
+                saved_rule_id = Some(rule.rule_id.clone());
+
+                if scope == RuleScope::NetworkAllow && self.config.outbound_firewall_enabled {
+                    let release_res = {
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        fw.release_transient_containment_for_alert(
+                            alert_id,
+                            Some(&exe),
+                            &*self.defense,
+                        )
+                    };
+                    match release_res {
+                        Ok((snap, was_bound)) => {
+                            lifted_wfp_block = snap;
+                            if was_bound {
+                                rebind_alert_exe = Some(exe.clone());
+                            }
+                        }
+                        Err(err) => {
+                            self.rollback_saved_scoped_rule(&write_guard, &rule.rule_id);
+                            return Err(err);
+                        }
+                    }
+
+                    {
+                        let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        let (snap, sibs) = fw.snapshot_app_block_and_bindings(&exe);
+                        if lifted_wfp_block.is_none() {
+                            lifted_wfp_block = snap;
+                        }
+                        displaced_bound_alerts = sibs;
+                    }
+
+                    let sync_res =
+                        (|| -> Result<WfpReconcileReport, Box<(String, WfpReconcileReport)>> {
+                            let report = self.deploy_persisted_network_rules_with_scoped_baseline(
+                                None,
+                                prev_scoped_rules.as_deref(),
+                            );
+                            if let Some(summary) =
+                                report.failure_summary_for_scoped_rules(&[&rule])
+                            {
+                                return Err(Box::new((
+                                    format!(
+                                        "failed synchronizing scoped WFP firewall rule for NetworkAllow {}: {}",
+                                        rule.rule_id, summary
+                                    ),
+                                    report,
+                                )));
+                            }
+                            if let (Some(target_pat), Some(dst_ip), Some(pkg_sid)) = (
+                                rule.allowed_target.as_deref(),
+                                alert_dst_ip,
+                                rule.package_sid.as_deref(),
+                            ) {
+                                if parse_literal_target_ip(target_pat).is_none() {
+                                    let needs_ip_permit = {
+                                        let fw =
+                                            self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                                        fw.active_app_block(&exe).is_some()
+                                            || fw.active_scoped_app_block(&exe, pkg_sid).is_some()
+                                    };
+                                    if needs_ip_permit {
+                                        let current_rules =
+                                            self.store.list_network_rules().unwrap_or_default();
+                                        let current_scoped = self
+                                            .store
+                                            .list_scoped_network_rules()
+                                            .unwrap_or_default();
+                                        let bin_identity = self.inspector.inspect(&exe);
+                                        let scope_ctx = ProcessScopeContext {
+                                            package_family_name: rule
+                                                .package_family_name
+                                                .as_deref(),
+                                            package_sid: Some(pkg_sid),
+                                            command_line: None,
+                                        };
+                                        let mut eval_cands: Vec<(String, i64)> = Vec::new();
+                                        if let Some(hint) = alert_domain_hint
+                                            .as_deref()
+                                            .map(str::trim)
+                                            .map(|s| s.trim_end_matches('.'))
+                                            .filter(|s| !s.is_empty())
+                                        {
+                                            eval_cands.push((hint.to_ascii_lowercase(), now_ms));
+                                        }
+                                        let (eff_dec, _) =
+                                            select_outbound_decision_for_domains_with_scoped(
+                                                &bin_identity,
+                                                &scope_ctx,
+                                                dst_ip,
+                                                &eval_cands,
+                                                &current_rules,
+                                                &current_scoped,
+                                            );
+                                        if matches!(eff_dec, OutboundDecision::AllowedByRule { .. })
+                                        {
+                                            let hints: Vec<String> = eval_cands
+                                                .into_iter()
+                                                .map(|(d, _)| d)
+                                                .collect();
+                                            let mut fw = self
+                                                .firewall
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            if let Err(err) = fw.ensure_scoped_ip_permit(
+                                                &exe,
+                                                pkg_sid,
+                                                rule.package_family_name.as_deref(),
+                                                dst_ip,
+                                                &hints,
+                                                &[] as &[&str],
+                                                &*self.defense,
+                                            ) {
+                                                return Err(Box::new((
+                                                    format!(
+                                                        "failed installing scoped IP permit for NetworkAllow {}: {err}",
+                                                        rule.rule_id
+                                                    ),
+                                                    report,
+                                                )));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(report)
+                        })();
+
+                    match sync_res {
+                        Ok(report) => applied_wfp_report = Some(report),
+                        Err(boxed) => {
+                            let (err, failed_report) = *boxed;
+                            self.rollback_saved_scoped_rule(&write_guard, &rule.rule_id);
+                            self.compensate_failed_wfp_report(&failed_report);
+                            self.maybe_apply_preemptive_wfp_block(&exe);
+                            self.rollback_allow_once_wfp(
+                                alert_id,
+                                lifted_wfp_block.take(),
+                                rebind_alert_exe.take(),
+                                std::mem::take(&mut displaced_bound_alerts),
+                                Vec::new(),
+                            );
+                            return Err(err);
+                        }
+                    }
+                    self.invalidate_non_protected_steady_pids();
+                }
+                drop(_policy_guard);
+
+                if let Err(err) = self.resume_alert_targets_if_unblocked(
+                    &write_guard,
+                    &alert,
+                    identity,
+                    &own_suspended_children,
+                    &suspended_children,
+                ) {
+                    {
+                        let _policy_guard =
+                            self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        self.rollback_saved_scoped_rule(&write_guard, &rule.rule_id);
+                        if scope == RuleScope::NetworkAllow && self.config.outbound_firewall_enabled
+                        {
+                            if let Some(rep) = applied_wfp_report.take() {
+                                self.compensate_failed_wfp_report(&rep);
+                            } else {
+                                let _ = self.deploy_persisted_network_rules();
+                            }
+                            self.maybe_apply_preemptive_wfp_block(&exe);
+                        }
+                    }
+                    self.rollback_allow_once_wfp(
+                        alert_id,
+                        lifted_wfp_block.take(),
+                        rebind_alert_exe.take(),
+                        std::mem::take(&mut displaced_bound_alerts),
+                        Vec::new(),
+                    );
+                    return Err(err);
+                }
+            }
+            AlertDecision::TerminateAndBlock { add_block_rule } => {
+                self.terminate_alert_targets_for_resolution(
+                    alert_id,
+                    &alert,
+                    identity,
+                    &suspended_children,
+                )?;
+
+                if add_block_rule {
+                    if let (Some(exe), Some(pkg_sid)) = (exe_path.clone(), valid_pkg_sid.clone()) {
+                        let block_rule = ScopedPolicyRuleRecord {
+                            rule_id: format!("RULE-SCOPED-BLOCK-{}", Uuid::new_v4()),
+                            scope: RuleScope::NetworkBlock,
+                            exe_path_pattern: exe,
+                            sha256: None,
+                            signer_subject: None,
+                            root_thumbprint: None,
+                            allowed_target: None,
+                            package_family_name: pkg_pfn.clone(),
+                            package_sid: Some(pkg_sid),
+                            command_line_pattern: None,
+                            created_at_ms: now_ms,
+                            created_by: "user_quarantine".to_string(),
+                        };
+                        validate_scoped_policy_rule(&block_rule)?;
+                        let _policy_guard =
+                            self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let prev_scoped_rules = self
+                            .config
+                            .outbound_firewall_enabled
+                            .then(|| self.store.list_scoped_network_rules().unwrap_or_default());
+                        write_guard
+                            .write(&self.store, |s| s.upsert_scoped_rule(&block_rule))
+                            .map_err(|err| format!("failed to store scoped block rule: {err}"))?;
+                        saved_rule_id = Some(block_rule.rule_id.clone());
+                        if self.config.outbound_firewall_enabled {
+                            let report = self.deploy_persisted_network_rules_with_scoped_baseline(
+                                None,
+                                prev_scoped_rules.as_deref(),
+                            );
+                            if let Some(summary) =
+                                report.failure_summary_for_scoped_rules(&[&block_rule])
+                            {
+                                self.rollback_saved_scoped_rule(&write_guard, &block_rule.rule_id);
+                                self.compensate_failed_wfp_report(&report);
+                                return Err(format!(
+                                    "failed synchronizing scoped WFP firewall rule for NetworkBlock {}: {summary}",
+                                    block_rule.rule_id
+                                ));
+                            }
+                            applied_wfp_report = Some(report);
+                            self.invalidate_non_protected_steady_pids();
+                            if is_network_alert {
+                                let release_res = {
+                                    let mut fw =
+                                        self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                                    fw.release_transient_containment_for_alert(
+                                        alert_id,
+                                        Some(&block_rule.exe_path_pattern),
+                                        &*self.defense,
+                                    )
+                                };
+                                match release_res {
+                                    Ok((snap, was_bound)) => {
+                                        lifted_wfp_block = snap;
+                                        if was_bound {
+                                            rebind_alert_exe =
+                                                Some(block_rule.exe_path_pattern.clone());
+                                        }
+                                    }
+                                    Err(err) => {
+                                        self.rollback_saved_scoped_rule(
+                                            &write_guard,
+                                            &block_rule.rule_id,
+                                        );
+                                        if let Some(rep) = applied_wfp_report.take() {
+                                            self.compensate_failed_wfp_report(&rep);
+                                        }
+                                        return Err(err);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::info!(
+                            alert_id = %alert_id,
+                            exe_path = ?exe_path,
+                            package_family_name = ?pkg_pfn,
+                            "skipping persistent scoped NetworkBlock for non-AppContainer or unresolved process (FU-P4-03)"
+                        );
+                        if is_network_alert && self.config.outbound_firewall_enabled {
+                            self.release_transient_wfp_after_terminate_without_block(
+                                alert_id,
+                                exe_path.as_deref(),
+                            );
+                        }
+                    }
+                } else if is_network_alert && self.config.outbound_firewall_enabled {
+                    self.release_transient_wfp_after_terminate_without_block(
+                        alert_id,
+                        exe_path.as_deref(),
+                    );
+                }
+            }
+        }
+
+        let status_result = write_guard
+            .write(&self.store, |s| {
+                s.update_alert_status(alert_id, new_status, Some(now_ms))
+            })
+            .map_err(|err| format!("failed to update alert status: {err}"))
+            .and_then(|updated| {
+                if updated {
+                    Ok(())
+                } else {
+                    Err(format!("alert {alert_id} not found"))
+                }
+            });
+        if let Err(err) = status_result {
+            if let Some(rule_id) = saved_rule_id.take() {
+                let _policy_guard = self.policy_lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.rollback_saved_scoped_rule(&write_guard, &rule_id);
+                if self.config.outbound_firewall_enabled {
+                    if let Some(rep) = applied_wfp_report.take() {
+                        self.compensate_failed_wfp_report(&rep);
+                    } else {
+                        let _ = self.deploy_persisted_network_rules();
+                    }
+                }
+            }
+            if is_network_alert && self.config.outbound_firewall_enabled {
+                if let Some(ref exe) = exe_path {
+                    self.maybe_apply_preemptive_wfp_block(exe);
+                }
+            }
+            self.rollback_allow_once_wfp(
+                alert_id,
+                lifted_wfp_block.take(),
+                rebind_alert_exe.take(),
+                std::mem::take(&mut displaced_bound_alerts),
+                std::mem::take(&mut marked_once_allowed_procs),
+            );
+            return Err(err);
+        }
+
+        if is_network_alert {
+            if let (Some(ref exe), Some(dst_ip)) = (&exe_path, alert_dst_ip) {
+                let alert_pkg_sid = valid_pkg_sid
+                    .as_deref()
+                    .or_else(|| ctx_val.get("package_sid").and_then(|v| v.as_str()));
+                self.app_wfp_alert_dedup
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear_key(&WfpRuleManager::exe_key(exe), alert_pkg_sid, dst_ip);
+            }
+            if self.config.outbound_firewall_enabled {
+                if let Some(ref exe) = exe_path {
+                    let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                    self.retry_deferred_preemptive_removal_locked(&mut fw, exe);
+                }
+            }
+        }
+        if let Some(ref proc_inst_id) = alert.process_instance_id {
+            self.clear_alert_dedup_from_context_val(proc_inst_id, &alert.source_layer, &ctx_val);
+            if is_terminate {
+                self.resolve_sibling_alerts_as_terminated(
+                    &write_guard,
+                    alert_id,
+                    proc_inst_id,
+                    now_ms,
+                );
+            }
+        }
+
+        alert.status = new_status;
+        alert.resolved_at_ms = Some(now_ms);
+        Ok(ResolvedAlertOutcome {
+            alert,
+            saved_rule_id,
+        })
+    }
+
+    fn terminate_alert_targets_for_resolution(
+        &self,
+        alert_id: &str,
+        alert: &AlertRecord,
+        identity: Option<ProcessIdentity>,
+        suspended_children: &[ProcessIdentity],
+    ) -> Result<(), String> {
+        if let Some(ident) = identity {
+            if let Err(err) = self.defense.terminate_process(&ident, true) {
+                if is_protected_process_refusal(&err) {
+                    return Err(err);
+                }
+                if alert.process_suspended && !is_process_gone_or_replaced(&err, ident.pid) {
+                    for child in suspended_children {
+                        let _ = self.defense.terminate_process(child, true);
+                    }
+                    return Err(err);
+                }
+                tracing::warn!(
+                    alert_id = %alert_id,
+                    pid = ident.pid,
+                    error = %err,
+                    "terminate_process failed (target already terminated or PID reused); continuing block rule and alert resolution"
+                );
+            }
+        } else if alert.process_suspended {
+            return Err(format!(
+                "missing process identity to terminate suspended alert {alert_id}"
+            ));
+        }
+
+        let mut child_terminate_err: Option<String> = None;
+        for child in suspended_children {
+            match self.defense.terminate_process(child, true) {
+                Ok(()) => {}
+                Err(err)
+                    if is_protected_process_refusal(&err)
+                        || !is_process_gone_or_replaced(&err, child.pid) =>
+                {
+                    child_terminate_err.get_or_insert(err);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        alert_id = %alert_id,
+                        child_pid = child.pid,
+                        error = %err,
+                        "terminate_process failed for suspended child (already exited); continuing"
+                    );
+                }
+            }
+        }
+        if let Some(err) = child_terminate_err {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn release_transient_wfp_after_terminate_without_block(
+        &self,
+        alert_id: &str,
+        exe_path: Option<&str>,
+    ) {
+        let (release_res, bound_exe) = {
+            let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+            let bound_exe = fw.bound_alert_exe_path(alert_id);
+            let res = fw.release_transient_containment_for_alert(
+                alert_id,
+                exe_path,
+                &*self.defense,
+            );
+            (res, bound_exe)
+        };
+        if let Err(err) = release_res {
+            tracing::warn!(
+                alert_id = %alert_id,
+                error = %err,
+                "best-effort transient WFP release after terminate without block failed"
+            );
+        }
+        if let Some(exe) = exe_path.or(bound_exe.as_deref()) {
+            let target_key = WfpRuleManager::exe_key(exe);
+            let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+            let still_active = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .has_active_exe_key(&target_key);
+            if !still_active {
+                fw.remove_preemptive_block_if_unused(exe, &*self.defense);
+            }
+        }
+    }
+
+    fn resolve_alert_package_attributes(
+        &self,
+        ctx_val: &serde_json::Value,
+        process_instance_id: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let ctx_pfn = json_non_empty_str(ctx_val, "/package_family_name");
+        let ctx_sid = json_non_empty_str(ctx_val, "/package_sid");
+        let mut pfn = ctx_pfn;
+        let mut sid = ctx_sid.clone();
+
+        if pfn.is_none() || sid.is_none() {
+            if let Some(inst_id) = process_instance_id {
+            let tbl_pkg = self
+                .process_table
+                .lock()
+                .ok()
+                .and_then(|t| {
+                    t.get_by_instance_id(inst_id)
+                        .map(|e| (e.package_family_name.clone(), e.package_sid.clone()))
+                });
+            if let Some((tbl_pfn, tbl_sid)) = tbl_pkg {
+                let sid_conflict = matches!(
+                    (ctx_sid.as_deref(), tbl_sid.as_deref()),
+                    (Some(a), Some(b)) if !a.trim().eq_ignore_ascii_case(b.trim())
+                );
+                if sid.is_none() {
+                    sid = tbl_sid.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                }
+                if pfn.is_none() && !sid_conflict {
+                    pfn = tbl_pfn.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                }
+            }
+            if pfn.is_none() || sid.is_none() {
+                if let Ok(Some(rec)) = self.store.get_process_package_info(inst_id) {
+                    let sid_conflict = matches!(
+                        (ctx_sid.as_deref(), rec.package_sid.as_deref()),
+                        (Some(a), Some(b)) if !a.trim().eq_ignore_ascii_case(b.trim())
+                    );
+                    if sid.is_none() {
+                        sid = rec
+                            .package_sid
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                    }
+                    if pfn.is_none() && !sid_conflict {
+                        pfn = rec
+                            .package_family_name
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                    }
+                }
+            }
+            }
+        }
+
+        (pfn, sid)
     }
 
     /// Inspects all other unresolved suspended alerts to collect unresolved sibling alerts still
@@ -1211,6 +2092,16 @@ impl DaemonEngine {
         }
     }
 
+    fn rollback_saved_scoped_rule(&self, write_guard: &WriteOpGuard, rule_id: &str) {
+        if let Err(err) = write_guard.write(&self.store, |s| s.delete_scoped_rule(rule_id)) {
+            tracing::warn!(
+                rule_id = %rule_id,
+                error = %err,
+                "failed to roll back scoped policy rule after resolve error"
+            );
+        }
+    }
+
     fn resume_single_process(
         &self,
         alert_id: &str,
@@ -1412,9 +2303,28 @@ impl DaemonEngine {
         dst_ip: Option<IpAddr>,
         domain_hints: &[String],
     ) -> bool {
+        self.has_matching_persisted_network_block_with_scoped(
+            exe_path,
+            &ProcessScopeContext::default(),
+            dst_ip,
+            domain_hints,
+        )
+    }
+
+    fn has_matching_persisted_network_block_with_scoped(
+        &self,
+        exe_path: &str,
+        scope_ctx: &ProcessScopeContext<'_>,
+        dst_ip: Option<IpAddr>,
+        domain_hints: &[String],
+    ) -> bool {
         let rules = self
             .store
             .list_rules(Some(RuleScope::NetworkBlock))
+            .unwrap_or_default();
+        let scoped_rules = self
+            .store
+            .list_scoped_rules(Some(RuleScope::NetworkBlock))
             .unwrap_or_default();
         let matching_path: Vec<&AllowlistRuleRecord> = rules
             .iter()
@@ -1423,10 +2333,26 @@ impl DaemonEngine {
                     && matches_path_pattern(exe_path, &r.exe_path_pattern)
             })
             .collect();
-        if matching_path.is_empty() {
+        let matching_scoped_path: Vec<&ScopedPolicyRuleRecord> = scoped_rules
+            .iter()
+            .filter(|r| {
+                !r.exe_path_pattern.trim().is_empty()
+                    && matches_path_pattern(exe_path, &r.exe_path_pattern)
+                    && r.package_sid
+                        .as_deref()
+                        .zip(scope_ctx.package_sid)
+                        .is_some_and(|(a, b)| a.trim().eq_ignore_ascii_case(b.trim()))
+            })
+            .collect();
+        if matching_path.is_empty() && matching_scoped_path.is_empty() {
             return false;
         }
         let needs_inspect = matching_path.iter().any(|r| {
+            r.sha256.as_deref().is_some_and(|s| !s.trim().is_empty())
+                || r.signer_subject
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+        }) || matching_scoped_path.iter().any(|r| {
             r.sha256.as_deref().is_some_and(|s| !s.trim().is_empty())
                 || r.signer_subject
                     .as_deref()
@@ -1451,6 +2377,22 @@ impl DaemonEngine {
                     })
             }
             None => matches_app_wide_network_block(rule, &identity),
+        }) || matching_scoped_path.into_iter().any(|rule| match dst_ip {
+            Some(ip) => {
+                matches_scoped_network_block_rule(rule, &identity, scope_ctx, ip, None)
+                    || domain_hints.iter().any(|hint| {
+                        let trimmed = hint.trim().trim_end_matches('.');
+                        !trimmed.is_empty()
+                            && matches_scoped_network_block_rule(
+                                rule,
+                                &identity,
+                                scope_ctx,
+                                ip,
+                                Some(trimmed),
+                            )
+                    })
+            }
+            None => matches_package_wide_network_block(rule, &identity),
         })
     }
 }

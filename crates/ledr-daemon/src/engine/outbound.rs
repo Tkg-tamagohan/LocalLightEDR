@@ -5,12 +5,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use ledr_proto::{
-    AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord, RuleScope, SensorEvent,
+    AlertRecord, AlertSeverity, AlertStatus, AllowlistRuleRecord, RuleScope,
+    ScopedPolicyRuleRecord, SensorEvent,
 };
 use ledr_rules::{
-    classify_outbound_risk, evaluate_outbound_policy, is_external_ip,
+    classify_outbound_risk, evaluate_outbound_policy_with_scoped, is_external_ip,
     matches_app_wide_network_allow, matches_network_target, matches_path_pattern,
-    parse_cidr_target, BinaryIdentity, OutboundDecision, OutboundRiskClass,
+    matches_scoped_network_allow_rule, parse_cidr_target, BinaryIdentity, OutboundDecision,
+    OutboundRiskClass, ProcessScopeContext,
 };
 use uuid::Uuid;
 
@@ -21,9 +23,10 @@ use crate::process_table::{PathInterner, PATH_INTERNER_MAX_ENTRIES};
 
 use super::config::OutboundEnforcementMode;
 use super::domain_policy::{
-    collect_domain_specific_blocked_hints, extend_authorizing_hints_from_existing_permit,
-    network_allow_rule_identity_matches, outbound_alert_title, partition_permit_hints,
-    select_outbound_decision_for_domains,
+    collect_domain_specific_blocked_hints, collect_scoped_domain_specific_blocked_hints,
+    extend_authorizing_hints_from_existing_permit, network_allow_rule_identity_matches,
+    outbound_alert_title, partition_permit_hints,
+    select_outbound_decision_for_domains_with_scoped,
 };
 use super::events::ResolvedProcessContext;
 use super::{DaemonEngine, InspectOutcome};
@@ -289,6 +292,7 @@ impl DaemonEngine {
     /// `on_wfp_drop_dequeued`, `flush_ready_pending_wfp_drops`, and `handle_ambiguous_wfp_drop`.
     ///
     /// Releases `self.firewall` before locking `self.process_dns_history` (no nested locks).
+    #[allow(dead_code)]
     pub(super) fn has_valid_live_domain_policy_permit(
         &self,
         exe_path: &str,
@@ -298,14 +302,49 @@ impl DaemonEngine {
         rules: &[AllowlistRuleRecord],
         ambiguous_freshness: Option<(i64, i64)>,
     ) -> bool {
+        self.has_valid_live_domain_policy_permit_with_scoped(
+            exe_path,
+            bin_identity,
+            &ProcessScopeContext::default(),
+            dst_ip,
+            domain_candidates,
+            rules,
+            &[],
+            ambiguous_freshness,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn has_valid_live_domain_policy_permit_with_scoped(
+        &self,
+        exe_path: &str,
+        bin_identity: &BinaryIdentity,
+        scope_ctx: &ProcessScopeContext<'_>,
+        dst_ip: IpAddr,
+        domain_candidates: &[(String, i64)],
+        rules: &[AllowlistRuleRecord],
+        scoped_rules: &[ScopedPolicyRuleRecord],
+        ambiguous_freshness: Option<(i64, i64)>,
+    ) -> bool {
         let Some(permit_hints) = ({
             let fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-            fw.domain_policy_permit_hints(exe_path, dst_ip)
+            fw.domain_policy_permit_hints(exe_path, dst_ip).or_else(|| {
+                scope_ctx
+                    .package_sid
+                    .and_then(|sid| fw.scoped_domain_policy_permit_hints(exe_path, sid, dst_ip))
+            })
         }) else {
             return false;
         };
 
-        let static_allowed = match evaluate_outbound_policy(bin_identity, dst_ip, None, rules) {
+        let static_allowed = match evaluate_outbound_policy_with_scoped(
+            bin_identity,
+            scope_ctx,
+            dst_ip,
+            None,
+            rules,
+            scoped_rules,
+        ) {
             OutboundDecision::BlockedByRule { .. } => return false,
             OutboundDecision::AllowedByRule { .. } => true,
             _ => false,
@@ -317,7 +356,14 @@ impl DaemonEngine {
             if norm.is_empty() {
                 continue;
             }
-            match evaluate_outbound_policy(bin_identity, dst_ip, Some(norm), rules) {
+            match evaluate_outbound_policy_with_scoped(
+                bin_identity,
+                scope_ctx,
+                dst_ip,
+                Some(norm),
+                rules,
+                scoped_rules,
+            ) {
                 OutboundDecision::BlockedByRule { .. } => return false,
                 OutboundDecision::AllowedByRule { .. } => allowed_hints.push(norm),
                 _ => {}
@@ -333,7 +379,14 @@ impl DaemonEngine {
                 continue;
             }
             if matches!(
-                evaluate_outbound_policy(bin_identity, dst_ip, Some(norm), rules),
+                evaluate_outbound_policy_with_scoped(
+                    bin_identity,
+                    scope_ctx,
+                    dst_ip,
+                    Some(norm),
+                    rules,
+                    scoped_rules,
+                ),
                 OutboundDecision::BlockedByRule { .. }
             ) {
                 return false;
@@ -360,11 +413,13 @@ impl DaemonEngine {
                                 max_age_ms,
                                 |k_dom| {
                                     matches!(
-                                        evaluate_outbound_policy(
+                                        evaluate_outbound_policy_with_scoped(
                                             bin_identity,
+                                            scope_ctx,
                                             dst_ip,
                                             Some(k_dom),
                                             rules,
+                                            scoped_rules,
                                         ),
                                         OutboundDecision::AllowedByRule { .. }
                                     )
@@ -384,7 +439,14 @@ impl DaemonEngine {
                 continue;
             }
             if matches!(
-                evaluate_outbound_policy(bin_identity, dst_ip, Some(norm), rules),
+                evaluate_outbound_policy_with_scoped(
+                    bin_identity,
+                    scope_ctx,
+                    dst_ip,
+                    Some(norm),
+                    rules,
+                    scoped_rules,
+                ),
                 OutboundDecision::BlockedByRule { .. }
             ) {
                 return false;
@@ -451,16 +513,31 @@ impl DaemonEngine {
                 (Vec::new(), false)
             }
         };
-        let has_potentially_matching_rule = rules.iter().any(|r| {
+        let (scoped_rules, scoped_rules_loaded) = match self.store.list_scoped_network_rules() {
+            Ok(rules) => (rules, true),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to load scoped network rules during outbound evaluation"
+                );
+                (Vec::new(), false)
+            }
+        };
+        let all_rules_loaded = rules_loaded && scoped_rules_loaded;
+        let has_potentially_matching_scoped_rule = scoped_rules.iter().any(|r| {
             let pat = r.exe_path_pattern.trim();
             pat.is_empty() || matches_path_pattern(exe_path, pat)
         });
+        let has_potentially_matching_rule = rules.iter().any(|r| {
+            let pat = r.exe_path_pattern.trim();
+            pat.is_empty() || matches_path_pattern(exe_path, pat)
+        }) || has_potentially_matching_scoped_rule;
         // Fast path (`ANALYSIS_0001`): when already alerted and no persisted network rule can
         // match this executable path, avoid re-running BinaryInspector (full SHA-256) on every
         // repeated connect in a burst. When any rule could match `exe_path` (or rule loading
         // failed), always evaluate policy first so explicit NetworkBlock / NetworkAllow rules are
         // never bypassed by NET_OUTBOUND alert deduplication.
-        if rules_loaded && !has_potentially_matching_rule {
+        if all_rules_loaded && !has_potentially_matching_rule {
             let once_allowed = proc_ctx.proc_instance_id.as_deref().is_some_and(|inst_id| {
                 self.firewall
                     .lock()
@@ -481,8 +558,19 @@ impl DaemonEngine {
             r.scope == RuleScope::NetworkBlock
                 && (r.exe_path_pattern.trim().is_empty()
                     || matches_path_pattern(exe_path, &r.exe_path_pattern))
+        }) || scoped_rules.iter().any(|r| {
+            r.scope == RuleScope::NetworkBlock
+                && (r.exe_path_pattern.trim().is_empty()
+                    || matches_path_pattern(exe_path, &r.exe_path_pattern))
         });
         let has_target_scoped_rule_for_exe = rules.iter().any(|r| {
+            matches!(r.scope, RuleScope::NetworkAllow | RuleScope::NetworkBlock)
+                && r.allowed_target
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                && (r.exe_path_pattern.trim().is_empty()
+                    || matches_path_pattern(exe_path, &r.exe_path_pattern))
+        }) || scoped_rules.iter().any(|r| {
             matches!(r.scope, RuleScope::NetworkAllow | RuleScope::NetworkBlock)
                 && r.allowed_target
                     .as_deref()
@@ -502,13 +590,9 @@ impl DaemonEngine {
         let is_audit_mode =
             self.config.outbound_enforcement_mode == OutboundEnforcementMode::Audit;
 
-        // Verified app-wide `NetworkAllow` fast path: for a concrete process instance
-        // (`create_time_100ns != 0`) already verified once against an unscoped app-wide allow
-        // rule, skip redundant `inspector.inspect` (disk SHA-256 + Authenticode) only when the
-        // live rules snapshot has no `NetworkBlock` or target-scoped rule for `exe_path`, the
-        // authorizing rule's ID and full content are unchanged, and (outside Audit mode) an
-        // app-wide WFP Permit filter is active with no app-wide block.
-        if rules_loaded {
+        // Verified app-wide `NetworkAllow` fast path: disabled whenever any scoped rule could
+        // match `exe_path` so distinct AppContainer packages sharing one binary never share cache.
+        if all_rules_loaded && !has_potentially_matching_scoped_rule {
             if let Some(inst_id) = verified_inst_id {
                 let exe_k = WfpRuleManager::exe_key(exe_path);
                 let cached_rule_valid = {
@@ -562,11 +646,18 @@ impl DaemonEngine {
         else {
             return ("OBSERVED", false);
         };
-        let (decision, effective_domain_hint) = select_outbound_decision_for_domains(
+        let scope_ctx = ProcessScopeContext {
+            package_family_name: proc_ctx.package_family_name.as_deref(),
+            package_sid: proc_ctx.package_sid.as_deref(),
+            command_line: None,
+        };
+        let (decision, effective_domain_hint) = select_outbound_decision_for_domains_with_scoped(
             &bin_identity,
+            &scope_ctx,
             dst_ip,
             domain_candidates,
             &rules,
+            &scoped_rules,
         );
         let synthetic_event;
         let alert_event: &SensorEvent = match event {
@@ -595,6 +686,18 @@ impl DaemonEngine {
                     })
                 && !r.exe_path_pattern.trim().is_empty()
                 && matches_path_pattern(exe_path, &r.exe_path_pattern)
+        }) || scoped_rules.iter().any(|r| {
+            matches!(r.scope, RuleScope::NetworkAllow | RuleScope::NetworkBlock)
+                && r.allowed_target
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| {
+                        !s.is_empty()
+                            && parse_literal_target_ip(s).is_none()
+                            && parse_cidr_target(s).is_err()
+                    })
+                && !r.exe_path_pattern.trim().is_empty()
+                && matches_path_pattern(exe_path, &r.exe_path_pattern)
         });
 
         match decision {
@@ -603,6 +706,101 @@ impl DaemonEngine {
                 ("OBSERVED", false)
             }
             OutboundDecision::AllowedByRule { rule_id } => {
+                if let Some(scoped_allow) = scoped_rules
+                    .iter()
+                    .find(|r| r.rule_id == rule_id && r.scope == RuleScope::NetworkAllow)
+                {
+                    if !is_audit_mode && self.config.outbound_firewall_enabled {
+                        if let Some(pkg_sid) = proc_ctx
+                            .package_sid
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                            let needs_ip_permit = fw.active_app_block(exe_path).is_some()
+                                || fw.active_scoped_app_block(exe_path, pkg_sid).is_some();
+                            if needs_ip_permit {
+                                let exe_k = WfpRuleManager::exe_key(exe_path);
+                                let shared_blocking_hint: Option<Option<String>> = {
+                                    let history = self
+                                        .process_dns_history
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    let mut shared_cands: Vec<(String, i64)> =
+                                        domain_candidates.to_vec();
+                                    for dom in history.domains_for_exe_ip(&exe_k, dst_ip) {
+                                        if !shared_cands
+                                            .iter()
+                                            .any(|(existing, _)| existing.eq_ignore_ascii_case(&dom))
+                                        {
+                                            shared_cands.push((dom, 0));
+                                        }
+                                    }
+                                    let (eff_decision, blocking_hint) =
+                                        select_outbound_decision_for_domains_with_scoped(
+                                            &bin_identity,
+                                            &scope_ctx,
+                                            dst_ip,
+                                            &shared_cands,
+                                            &rules,
+                                            &scoped_rules,
+                                        );
+                                    matches!(eff_decision, OutboundDecision::BlockedByRule { .. })
+                                        .then_some(blocking_hint)
+                                };
+                                if let Some(blocking_hint) = shared_blocking_hint {
+                                    tracing::warn!(
+                                        exe_path = %exe_path,
+                                        package_sid = %pkg_sid,
+                                        dst_ip = %dst_ip,
+                                        blocking_domain = ?blocking_hint,
+                                        "suppressing scoped DomainPolicy WFP Permit because another active domain on this IP is blocked"
+                                    );
+                                } else {
+                                    let hint_list: Vec<String> = effective_domain_hint
+                                        .iter()
+                                        .cloned()
+                                        .collect();
+                                    if let Err(err) = fw.ensure_scoped_ip_permit(
+                                        exe_path,
+                                        pkg_sid,
+                                        proc_ctx.package_family_name.as_deref(),
+                                        dst_ip,
+                                        &hint_list,
+                                        &[] as &[&str],
+                                        &*self.defense,
+                                    ) {
+                                        tracing::debug!(
+                                            exe_path = %exe_path,
+                                            package_sid = %pkg_sid,
+                                            dst_ip = %dst_ip,
+                                            error = %err,
+                                            "could not install scoped IP WFP permit"
+                                        );
+                                    }
+                                }
+                            } else if scoped_allow
+                                .allowed_target
+                                .as_deref()
+                                .is_none_or(|s| s.trim().is_empty())
+                                && !fw.has_active_scoped_filter(exe_path, pkg_sid, None, true)
+                            {
+                                if let Err(err) =
+                                    fw.ensure_scoped_policy_permit(exe_path, pkg_sid, &*self.defense)
+                                {
+                                    tracing::debug!(
+                                        exe_path = %exe_path,
+                                        package_sid = %pkg_sid,
+                                        error = %err,
+                                        "could not install package-scoped WFP permit"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return ("ALLOWED", false);
+                }
                 let authorizing_app_wide_rule = rules.iter().find(|r| {
                     r.rule_id == rule_id
                         && r.scope == RuleScope::NetworkAllow
@@ -615,34 +813,48 @@ impl DaemonEngine {
                 // (`policy_lock -> store/firewall -> verified_app_wide_allows`) and re-verify
                 // against the latest persisted rules so a rule deleted while `inspector.inspect`
                 // was running can never resurrect a stale WFP Permit (`SEC_0001`).
-                let app_wide_candidate = rules_loaded
+                let app_wide_candidate = all_rules_loaded
+                    && !has_potentially_matching_scoped_rule
                     && authorizing_app_wide_rule.is_some()
                     && !has_block_rule_for_exe
                     && !has_target_scoped_rule_for_exe;
                 let _policy_guard = app_wide_candidate
                     .then(|| self.policy_lock.lock().unwrap_or_else(|e| e.into_inner()));
                 let fresh_app_wide_rule: Option<AllowlistRuleRecord> = if app_wide_candidate {
-                    self.store.list_network_rules().ok().and_then(|fresh_rules| {
-                        let fresh_has_block = fresh_rules.iter().any(|r| {
-                            r.scope == RuleScope::NetworkBlock
-                                && (r.exe_path_pattern.trim().is_empty()
-                                    || matches_path_pattern(exe_path, &r.exe_path_pattern))
+                    let no_matching_scoped = self
+                        .store
+                        .list_scoped_network_rules()
+                        .is_ok_and(|fresh_scoped| {
+                            !fresh_scoped.iter().any(|r| {
+                                let pat = r.exe_path_pattern.trim();
+                                pat.is_empty() || matches_path_pattern(exe_path, pat)
+                            })
                         });
-                        let fresh_has_scoped = fresh_rules.iter().any(|r| {
-                            matches!(r.scope, RuleScope::NetworkAllow | RuleScope::NetworkBlock)
-                                && r.allowed_target
-                                    .as_deref()
-                                    .is_some_and(|s| !s.trim().is_empty())
-                                && (r.exe_path_pattern.trim().is_empty()
-                                    || matches_path_pattern(exe_path, &r.exe_path_pattern))
-                        });
-                        if fresh_has_block || fresh_has_scoped {
-                            return None;
-                        }
-                        fresh_rules
-                            .into_iter()
-                            .find(|r| matches_app_wide_network_allow(r, &bin_identity))
-                    })
+                    if no_matching_scoped {
+                        self.store.list_network_rules().ok().and_then(|fresh_rules| {
+                            let fresh_has_block = fresh_rules.iter().any(|r| {
+                                r.scope == RuleScope::NetworkBlock
+                                    && (r.exe_path_pattern.trim().is_empty()
+                                        || matches_path_pattern(exe_path, &r.exe_path_pattern))
+                            });
+                            let fresh_has_scoped = fresh_rules.iter().any(|r| {
+                                matches!(r.scope, RuleScope::NetworkAllow | RuleScope::NetworkBlock)
+                                    && r.allowed_target
+                                        .as_deref()
+                                        .is_some_and(|s| !s.trim().is_empty())
+                                    && (r.exe_path_pattern.trim().is_empty()
+                                        || matches_path_pattern(exe_path, &r.exe_path_pattern))
+                            });
+                            if fresh_has_block || fresh_has_scoped {
+                                return None;
+                            }
+                            fresh_rules
+                                .into_iter()
+                                .find(|r| matches_app_wide_network_allow(r, &bin_identity))
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -673,12 +885,15 @@ impl DaemonEngine {
                                 shared_cands.push((dom, 0));
                             }
                         }
-                        let (eff_decision, blocking_hint) = select_outbound_decision_for_domains(
-                            &bin_identity,
-                            dst_ip,
-                            &shared_cands,
-                            &rules,
-                        );
+                        let (eff_decision, blocking_hint) =
+                            select_outbound_decision_for_domains_with_scoped(
+                                &bin_identity,
+                                &scope_ctx,
+                                dst_ip,
+                                &shared_cands,
+                                &rules,
+                                &scoped_rules,
+                            );
                         let blocking = matches!(eff_decision, OutboundDecision::BlockedByRule { .. })
                             .then_some(blocking_hint);
                         (shared_cands, blocking)
@@ -799,6 +1014,203 @@ impl DaemonEngine {
                 ("ALLOWED", false)
             }
             OutboundDecision::BlockedByRule { rule_id } => {
+                if let Some(scoped_block) = scoped_rules
+                    .iter()
+                    .find(|r| r.rule_id == rule_id && r.scope == RuleScope::NetworkBlock)
+                {
+                    let matched_target = scoped_block
+                        .allowed_target
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let is_audit_mode =
+                        self.config.outbound_enforcement_mode == OutboundEnforcementMode::Audit;
+                    let needs_domain_block = matched_target
+                        .is_some_and(|target_pat| parse_literal_target_ip(target_pat).is_none());
+                    let scoped_blocked_hints = if needs_domain_block {
+                        let mut block_hint_candidates: Vec<(String, i64)> =
+                            domain_candidates.to_vec();
+                        let exe_k = WfpRuleManager::exe_key(exe_path);
+                        {
+                            let history = self
+                                .process_dns_history
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            for dom in history.domains_for_exe_ip(&exe_k, dst_ip) {
+                                if !block_hint_candidates
+                                    .iter()
+                                    .any(|(existing, _)| existing.eq_ignore_ascii_case(&dom))
+                                {
+                                    block_hint_candidates.push((dom, 0));
+                                }
+                            }
+                        }
+                        collect_scoped_domain_specific_blocked_hints(
+                            &bin_identity,
+                            &scope_ctx,
+                            dst_ip,
+                            &block_hint_candidates,
+                            &scoped_rules,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let scoped_pfn = scoped_block
+                        .package_family_name
+                        .as_deref()
+                        .or(proc_ctx.package_family_name.as_deref());
+                    let wfp_handle = if is_audit_mode {
+                        None
+                    } else if let Some(pkg_sid) = proc_ctx
+                        .package_sid
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+                        let res = match matched_target {
+                            None => {
+                                fw.ensure_scoped_policy_block(exe_path, pkg_sid, None, &*self.defense)
+                            }
+                            Some(target_pat) if parse_literal_target_ip(target_pat).is_some() => {
+                                fw.ensure_scoped_policy_block(
+                                    exe_path,
+                                    pkg_sid,
+                                    Some(dst_ip),
+                                    &*self.defense,
+                                )
+                            }
+                            Some(target_pat)
+                                if parse_cidr_target(target_pat).is_ok()
+                                    || matches_network_target(target_pat, dst_ip, None) =>
+                            {
+                                fw.ensure_scoped_domain_policy_block(
+                                    exe_path,
+                                    pkg_sid,
+                                    scoped_pfn,
+                                    dst_ip,
+                                    &scoped_blocked_hints,
+                                    &*self.defense,
+                                )
+                            }
+                            Some(target_pat) => {
+                                if !scoped_blocked_hints.is_empty() {
+                                    fw.ensure_scoped_domain_policy_block(
+                                        exe_path,
+                                        pkg_sid,
+                                        scoped_pfn,
+                                        dst_ip,
+                                        &scoped_blocked_hints,
+                                        &*self.defense,
+                                    )
+                                } else {
+                                    let label = effective_domain_hint
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or(target_pat);
+                                    fw.ensure_scoped_domain_policy_block(
+                                        exe_path,
+                                        pkg_sid,
+                                        scoped_pfn,
+                                        dst_ip,
+                                        &[label],
+                                        &*self.defense,
+                                    )
+                                }
+                            }
+                        };
+                        match res {
+                            Ok(h) => Some(h),
+                            Err(err) => {
+                                tracing::warn!(
+                                    exe_path = %exe_path,
+                                    package_sid = %pkg_sid,
+                                    rule_id = %rule_id,
+                                    error = %err,
+                                    "failed to ensure package-scoped WFP block filter"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let is_new_block_alert = proc_ctx
+                        .proc_instance_id
+                        .as_deref()
+                        .is_none_or(|inst_id| self.is_new_rule_alert(inst_id, "NET_POLICY_BLOCK"));
+                    if !is_new_block_alert {
+                        return (if is_audit_mode { "ALERTED" } else { "BLOCKED" }, false);
+                    }
+                    let domain_risk = effective_domain_hint
+                        .as_deref()
+                        .map(|d| self.assess_domain(d));
+                    let is_first_seen_domain = effective_domain_hint
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_some_and(|d| !self.store.has_seen_dns_domain(d).unwrap_or(false));
+                    let context_json = serde_json::json!({
+                        "event": alert_event,
+                        "dst_ip": dst_ip.to_string(),
+                        "dst_port": dst_port,
+                        "protocol": protocol,
+                        "domain_hint": effective_domain_hint,
+                        "matched_rule_id": rule_id,
+                        "risk_class": format!("{effective_risk:?}"),
+                        "wfp_blocked": wfp_handle.is_some(),
+                        "wfp_filter_id": wfp_handle,
+                        "pid": pid,
+                        "exe_path": exe_path,
+                        "command_line": proc_ctx.proc_command_line,
+                        "parent_exe_path": proc_ctx.parent_exe_path,
+                        "parent_command_line": proc_ctx.parent_command_line,
+                        "sha256": bin_identity.sha256,
+                        "signer_subject": bin_identity.authenticode.as_ref().map(|a| a.signer_subject.as_str()),
+                        "root_thumbprint": bin_identity.authenticode.as_ref().map(|a| a.root_thumbprint.as_str()),
+                        "is_nrd": domain_risk.as_ref().is_some_and(|r| r.is_nrd),
+                        "is_homograph": domain_risk.as_ref().is_some_and(|r| r.is_homograph),
+                        "matched_brand": domain_risk.and_then(|r| r.matched_brand),
+                        "is_first_seen_domain": is_first_seen_domain,
+                        "origin_url": proc_ctx.origin_url,
+                        "motw_source": proc_ctx.motw_source,
+                        "motw_referrer": proc_ctx.motw_referrer,
+                        "motw_frame_url": proc_ctx.motw_frame_url,
+                        "motw_zone_id": proc_ctx.motw_zone_id,
+                        "package_family_name": proc_ctx.package_family_name,
+                        "package_sid": proc_ctx.package_sid,
+                    })
+                    .to_string();
+                    let alert = AlertRecord {
+                        alert_id: Uuid::new_v4().to_string(),
+                        timestamp_ms: event_ts_ms,
+                        severity: AlertSeverity::High,
+                        source_layer: "LAYER_3_NETWORK".to_string(),
+                        rule_id: "LEDR-NET-POLICY-BLOCK".to_string(),
+                        title: outbound_alert_title(
+                            "Blocked Outbound Policy Match",
+                            exe_path,
+                            dst_ip,
+                            dst_port,
+                            effective_domain_hint.as_deref(),
+                        ),
+                        process_instance_id: proc_ctx.proc_instance_id.clone(),
+                        process_suspended: false,
+                        status: AlertStatus::Pending,
+                        context_json,
+                        resolved_at_ms: None,
+                    };
+                    if let Err(err) = self.record_alert_checked(&alert) {
+                        tracing::warn!(error = %err, "failed to record scoped network policy block alert");
+                        if let Some(ref inst_id) = proc_ctx.proc_instance_id {
+                            self.clear_rule_alert(inst_id, "NET_POLICY_BLOCK");
+                        }
+                        return (if is_audit_mode { "ALERTED" } else { "BLOCKED" }, false);
+                    }
+                    self.alerts_emitted.fetch_add(1, Ordering::Relaxed);
+                    return (if is_audit_mode { "ALERTED" } else { "BLOCKED" }, true);
+                }
                 let matched_target = rules
                     .iter()
                     .find(|r| r.rule_id == rule_id)
@@ -999,12 +1411,14 @@ impl DaemonEngine {
                 // migrated to a new IP while clients connect to its cached old IP) against the
                 // latest binary identity, current rules, and active exe-wide DNS history before
                 // falling through to Permit revocation and containment (`AUD-P3-01`).
-                if self.has_valid_live_domain_policy_permit(
+                if self.has_valid_live_domain_policy_permit_with_scoped(
                     exe_path,
                     &bin_identity,
+                    &scope_ctx,
                     dst_ip,
                     domain_candidates,
                     &rules,
+                    &scoped_rules,
                     None,
                 ) {
                     return ("ALLOWED", false);
@@ -1028,20 +1442,64 @@ impl DaemonEngine {
                     let any_allow_identity_valid = rules
                         .iter()
                         .any(|r| network_allow_rule_identity_matches(r, &bin_identity));
+                    let any_scoped_allow_identity_valid = scoped_rules.iter().any(|r| {
+                        r.scope == RuleScope::NetworkAllow
+                            && proc_ctx.package_sid.as_deref().is_some_and(|sid| {
+                                let mut probe = r.clone();
+                                probe.allowed_target = None;
+                                matches_scoped_network_allow_rule(
+                                    &probe,
+                                    &bin_identity,
+                                    &ProcessScopeContext {
+                                        package_family_name: proc_ctx.package_family_name.as_deref(),
+                                        package_sid: Some(sid),
+                                        command_line: None,
+                                    },
+                                    dst_ip,
+                                    None,
+                                )
+                            })
+                    });
                     let revoked_permits = {
                         let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
-                        if !any_allow_identity_valid {
+                        let mut count = if !any_allow_identity_valid {
                             fw.revoke_permits_for_exe(exe_path, &*self.defense)
                         } else {
-                            let mut count = 0usize;
+                            let mut c = 0usize;
                             if fw.revoke_permit_for_target(exe_path, None, &*self.defense) {
-                                count += 1;
+                                c += 1;
                             }
                             if fw.revoke_permit_for_target(exe_path, Some(dst_ip), &*self.defense) {
-                                count += 1;
+                                c += 1;
                             }
-                            count
+                            c
+                        };
+                        if !any_scoped_allow_identity_valid {
+                            if let Some(pkg_sid) = proc_ctx
+                                .package_sid
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                if fw.revoke_scoped_permit_for_target(
+                                    exe_path,
+                                    pkg_sid,
+                                    None,
+                                    &*self.defense,
+                                ) {
+                                    count += 1;
+                                }
+                                if fw.revoke_scoped_permit_for_target(
+                                    exe_path,
+                                    pkg_sid,
+                                    Some(dst_ip),
+                                    &*self.defense,
+                                ) {
+                                    count += 1;
+                                }
+                            }
                         }
+                        count
                     };
                     if revoked_permits > 0 {
                         tracing::warn!(

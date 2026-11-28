@@ -3,10 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use ledr_proto::{ActiveDefenseController, AllowlistRuleRecord, RuleScope};
+use ledr_proto::{
+    ActiveDefenseController, AllowlistRuleRecord, RuleScope, ScopedPolicyRuleRecord,
+};
 use ledr_rules::{
-    evaluate_outbound_policy, matches_app_wide_network_allow, matches_app_wide_network_block,
-    matches_network_block_rule, matches_path_pattern, BinaryIdentity, OutboundDecision,
+    evaluate_outbound_policy, evaluate_outbound_policy_with_scoped,
+    matches_app_wide_network_allow, matches_app_wide_network_block, matches_network_block_rule,
+    matches_path_pattern, matches_scoped_network_block_rule, BinaryIdentity, OutboundDecision,
+    ProcessScopeContext,
 };
 
 use crate::engine::BinaryInspector;
@@ -16,9 +20,10 @@ use super::hints::{
 };
 use super::manager::WfpRuleManager;
 use super::types::{
-    InstalledWfpFilter, PromotedFilterSnapshot, RemovedAppBlockSnapshot, RemovedBlockSnapshot,
-    RemovedDomainFilterSnapshot, WfpFailedOp, WfpFilterOrigin, WfpReconcileDnsContext,
-    WfpReconcileReport, WfpTargetKey,
+    InstalledScopedWfpFilter, InstalledWfpFilter, PromotedFilterSnapshot,
+    PromotedScopedFilterSnapshot, RemovedAppBlockSnapshot, RemovedBlockSnapshot,
+    RemovedDomainFilterSnapshot, ScopedWfpTargetKey, WfpFailedOp, WfpFilterOrigin,
+    WfpReconcileDnsContext, WfpReconcileReport, WfpTargetKey,
 };
 
 impl WfpRuleManager {
@@ -74,6 +79,32 @@ impl WfpRuleManager {
         inspector: &dyn BinaryInspector,
         defense: &dyn ActiveDefenseController,
     ) -> WfpReconcileReport {
+        self.reconcile_persisted_rules_with_scoped(
+            rules,
+            prev_rules,
+            &[],
+            None,
+            active_concrete_exes,
+            dns_ctx,
+            inspector,
+            defense,
+        )
+    }
+
+    /// Reconciles both unscoped `allowlist_rules` and package-scoped `scoped_policy_rules`
+    /// against live BFE filters (`FU-P4-03`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconcile_persisted_rules_with_scoped(
+        &mut self,
+        rules: &[AllowlistRuleRecord],
+        prev_rules: Option<&[AllowlistRuleRecord]>,
+        scoped_rules: &[ScopedPolicyRuleRecord],
+        prev_scoped_rules: Option<&[ScopedPolicyRuleRecord]>,
+        active_concrete_exes: &[String],
+        dns_ctx: &WfpReconcileDnsContext,
+        inspector: &dyn BinaryInspector,
+        defense: &dyn ActiveDefenseController,
+    ) -> WfpReconcileReport {
         let mut report = WfpReconcileReport::default();
         let mut identity_cache: HashMap<String, BinaryIdentity> = HashMap::new();
 
@@ -91,9 +122,28 @@ impl WfpRuleManager {
             inspector,
             &mut identity_cache,
         );
-        self.has_wildcard_network_rules = plan.has_wildcard_network_rules;
-        self.has_domain_network_rules = plan.has_domain_network_rules;
-        report.skipped_wildcard = plan.skipped_wildcard;
+        let prev_scoped_plan = prev_scoped_rules.map(|prev_scoped| {
+            let baseline_unscoped = prev_plan.as_ref().unwrap_or(&plan);
+            self.build_desired_scoped_persisted_plan(
+                prev_scoped,
+                baseline_unscoped,
+                active_concrete_exes,
+                inspector,
+                &mut identity_cache,
+            )
+        });
+        let mut scoped_plan = self.build_desired_scoped_persisted_plan(
+            scoped_rules,
+            &plan,
+            active_concrete_exes,
+            inspector,
+            &mut identity_cache,
+        );
+        self.has_wildcard_network_rules =
+            plan.has_wildcard_network_rules || scoped_plan.has_wildcard_network_rules;
+        self.has_domain_network_rules =
+            plan.has_domain_network_rules || scoped_plan.has_domain_network_rules;
+        report.skipped_wildcard = plan.skipped_wildcard + scoped_plan.skipped_wildcard;
 
         // 3. Remove obsolete PersistedPolicy / DomainPolicy filters and conflicting
         //    Preemptive/Transient filters; promote matching filters in place without a gap;
@@ -505,6 +555,7 @@ impl WfpRuleManager {
                             if let Some(remote_ip) = key.1 {
                                 report.removed_domain_filters.push(RemovedDomainFilterSnapshot {
                                     exe_path: entry.exe_path.clone(),
+                                    package_sid: None,
                                     remote_ip,
                                     allow: entry.allow,
                                     domain_hints: domain_hints.clone(),
@@ -557,6 +608,7 @@ impl WfpRuleManager {
                         report.failed += 1;
                         report.failed_ops.push(WfpFailedOp {
                             exe_key: key.0,
+                            package_sid: None,
                             remote_ip: key.1,
                             is_remove: true,
                             is_startup_preemptive: false,
@@ -569,6 +621,13 @@ impl WfpRuleManager {
                 }
             }
         }
+
+        let unscoped_app_blocked_exes: HashSet<String> = plan
+            .desired
+            .iter()
+            .filter(|(k, (_, allow))| k.1.is_none() && !*allow)
+            .map(|(k, _)| k.0.clone())
+            .collect();
 
         // 4. Add missing desired PersistedPolicy filters (Block before Permit for fail-closed order).
         let mut desired_sorted: Vec<(WfpTargetKey, String, bool)> = plan
@@ -618,6 +677,7 @@ impl WfpRuleManager {
                     report.failed += 1;
                     report.failed_ops.push(WfpFailedOp {
                         exe_key: key.0,
+                        package_sid: None,
                         remote_ip: key.1,
                         is_remove: false,
                         is_startup_preemptive: false,
@@ -733,6 +793,7 @@ impl WfpRuleManager {
                     report.failed += 1;
                     report.failed_ops.push(WfpFailedOp {
                         exe_key: exe_k,
+                        package_sid: None,
                         remote_ip: None,
                         is_remove: false,
                         is_startup_preemptive: true,
@@ -742,6 +803,450 @@ impl WfpRuleManager {
                         error: err,
                     });
                 }
+            }
+        }
+
+        // 6. Reconcile package-scoped WFP filters (`ALE_APP_ID` + `ALE_PACKAGE_ID`, `FU-P4-03`).
+        let mut scoped_keys_to_remove: Vec<ScopedWfpTargetKey> = Vec::new();
+        let mut scoped_removal_sources: HashMap<ScopedWfpTargetKey, Vec<String>> = HashMap::new();
+        let mut scoped_removal_hints: HashMap<ScopedWfpTargetKey, Vec<String>> = HashMap::new();
+        let mut scoped_keys_to_promote: Vec<ScopedWfpTargetKey> = Vec::new();
+        let mut scoped_domain_hint_updates: Vec<(ScopedWfpTargetKey, Vec<String>)> = Vec::new();
+        for (key, entry) in &self.scoped_installed {
+            match &entry.origin {
+                WfpFilterOrigin::PersistedPolicy => match scoped_plan.desired.get(key) {
+                    Some((_, _, desired_allow)) if *desired_allow == entry.allow => {}
+                    Some((_, _, _)) => {
+                        let mut combined_srcs = scoped_plan
+                            .desired_sources
+                            .get(key)
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Some(prev_scoped) = prev_scoped_rules {
+                            let identity = identity_cache
+                                .entry(key.0.clone())
+                                .or_insert_with(|| inspector.inspect(&entry.exe_path));
+                            Self::collect_removed_prev_scoped_sources(
+                                prev_scoped,
+                                scoped_rules,
+                                identity,
+                                &entry.package_sid,
+                                entry.package_family_name.as_deref(),
+                                key.2,
+                                &[],
+                                entry.allow,
+                                &mut combined_srcs,
+                            );
+                        }
+                        if !combined_srcs.is_empty() {
+                            scoped_removal_sources.insert(key.clone(), combined_srcs);
+                        }
+                        scoped_keys_to_remove.push(key.clone());
+                    }
+                    None => {
+                        if let Some(prev) = prev_scoped_plan.as_ref() {
+                            if let Some(srcs) = prev.desired_sources.get(key) {
+                                scoped_removal_sources.insert(key.clone(), srcs.clone());
+                            }
+                        }
+                        scoped_keys_to_remove.push(key.clone());
+                    }
+                },
+                WfpFilterOrigin::DomainPolicy { domain_hints } => {
+                    if let Some((_, _, desired_allow)) = scoped_plan.desired.get(key) {
+                        if *desired_allow == entry.allow {
+                            scoped_keys_to_promote.push(key.clone());
+                        } else {
+                            let mut combined_srcs = scoped_plan
+                                .desired_sources
+                                .get(key)
+                                .cloned()
+                                .unwrap_or_default();
+                            if let (Some(prev_scoped), Some(ip)) = (prev_scoped_rules, key.2) {
+                                let identity = identity_cache
+                                    .entry(key.0.clone())
+                                    .or_insert_with(|| inspector.inspect(&entry.exe_path));
+                                Self::collect_removed_prev_scoped_sources(
+                                    prev_scoped,
+                                    scoped_rules,
+                                    identity,
+                                    &entry.package_sid,
+                                    entry.package_family_name.as_deref(),
+                                    Some(ip),
+                                    domain_hints,
+                                    entry.allow,
+                                    &mut combined_srcs,
+                                );
+                            }
+                            if !combined_srcs.is_empty() {
+                                scoped_removal_sources.insert(key.clone(), combined_srcs);
+                            }
+                            if !domain_hints.is_empty() {
+                                scoped_removal_hints.insert(key.clone(), domain_hints.clone());
+                            }
+                            scoped_keys_to_remove.push(key.clone());
+                        }
+                        continue;
+                    }
+                    let app_wide_blocked = unscoped_app_blocked_exes.contains(&key.0)
+                        || scoped_plan
+                            .desired
+                            .get(&(key.0.clone(), key.1.clone(), None))
+                            .is_some_and(|(_, _, allow)| !*allow);
+                    if entry.allow && app_wide_blocked {
+                        if !domain_hints.is_empty() {
+                            scoped_removal_hints.insert(key.clone(), domain_hints.clone());
+                        }
+                        scoped_keys_to_remove.push(key.clone());
+                        continue;
+                    }
+                    let Some(ip) = key.2 else {
+                        scoped_keys_to_remove.push(key.clone());
+                        continue;
+                    };
+                    let identity = identity_cache
+                        .entry(key.0.clone())
+                        .or_insert_with(|| inspector.inspect(&entry.exe_path));
+                    let scope_ctx = ProcessScopeContext {
+                        package_family_name: entry.package_family_name.as_deref(),
+                        package_sid: Some(&entry.package_sid),
+                        command_line: None,
+                    };
+                    let still_valid = if !entry.allow {
+                        let static_blocked = matches!(
+                            evaluate_outbound_policy_with_scoped(
+                                identity,
+                                &scope_ctx,
+                                ip,
+                                None,
+                                rules,
+                                scoped_rules,
+                            ),
+                            OutboundDecision::BlockedByRule { .. }
+                        );
+                        let mut surviving_hints: Vec<String> = Vec::with_capacity(domain_hints.len());
+                        for hint in domain_hints {
+                            let Some(hint_norm) = normalize_domain_hint(hint) else {
+                                continue;
+                            };
+                            if dns_ctx
+                                .superseded_block_hints
+                                .contains(&(key.0.clone(), ip, hint_norm.clone()))
+                            {
+                                continue;
+                            }
+                            let h_opt = Some(hint_norm.as_str());
+                            let hint_still_blocked = if static_blocked {
+                                matches!(
+                                    evaluate_outbound_policy_with_scoped(
+                                        identity,
+                                        &scope_ctx,
+                                        ip,
+                                        h_opt,
+                                        rules,
+                                        scoped_rules,
+                                    ),
+                                    OutboundDecision::BlockedByRule { .. }
+                                ) && (scoped_rules.iter().any(|r| {
+                                    matches_scoped_network_block_rule(
+                                        r, identity, &scope_ctx, ip, h_opt,
+                                    ) && !matches_scoped_network_block_rule(
+                                        r, identity, &scope_ctx, ip, None,
+                                    )
+                                }) || rules.iter().any(|r| {
+                                    matches_network_block_rule(r, identity, ip, h_opt)
+                                        && !matches_network_block_rule(r, identity, ip, None)
+                                }))
+                            } else {
+                                matches!(
+                                    evaluate_outbound_policy_with_scoped(
+                                        identity,
+                                        &scope_ctx,
+                                        ip,
+                                        h_opt,
+                                        rules,
+                                        scoped_rules,
+                                    ),
+                                    OutboundDecision::BlockedByRule { .. }
+                                )
+                            };
+                            if hint_still_blocked {
+                                merge_domain_hint(&mut surviving_hints, &hint_norm);
+                            }
+                        }
+                        if let Some(live_doms) =
+                            dns_ctx.active_block_domains.get(&(key.0.clone(), ip))
+                        {
+                            for dom in live_doms {
+                                let Some(norm_dom) = normalize_domain_hint(dom) else {
+                                    continue;
+                                };
+                                let domain_specifically_blocked = matches!(
+                                    evaluate_outbound_policy_with_scoped(
+                                        identity,
+                                        &scope_ctx,
+                                        ip,
+                                        Some(norm_dom.as_str()),
+                                        rules,
+                                        scoped_rules,
+                                    ),
+                                    OutboundDecision::BlockedByRule { .. }
+                                ) && (scoped_rules.iter().any(|r| {
+                                    matches_scoped_network_block_rule(
+                                        r,
+                                        identity,
+                                        &scope_ctx,
+                                        ip,
+                                        Some(norm_dom.as_str()),
+                                    ) && !matches_scoped_network_block_rule(
+                                        r, identity, &scope_ctx, ip, None,
+                                    )
+                                }) || rules.iter().any(|r| {
+                                    matches_network_block_rule(
+                                        r,
+                                        identity,
+                                        ip,
+                                        Some(norm_dom.as_str()),
+                                    ) && !matches_network_block_rule(r, identity, ip, None)
+                                }));
+                                if domain_specifically_blocked {
+                                    merge_domain_hint(&mut surviving_hints, &norm_dom);
+                                }
+                            }
+                        }
+                        let keep = static_blocked || !surviving_hints.is_empty();
+                        if keep && &surviving_hints != domain_hints {
+                            scoped_domain_hint_updates.push((key.clone(), surviving_hints));
+                        }
+                        keep
+                    } else if domain_hints.is_empty() {
+                        matches!(
+                            evaluate_outbound_policy_with_scoped(
+                                identity,
+                                &scope_ctx,
+                                ip,
+                                None,
+                                rules,
+                                scoped_rules,
+                            ),
+                            OutboundDecision::AllowedByRule { .. }
+                        )
+                    } else {
+                        let mut any_blocked = false;
+                        let mut any_allowed = false;
+                        for hint in domain_hints {
+                            let h_opt = (!hint.is_empty()).then_some(hint.as_str());
+                            match evaluate_outbound_policy_with_scoped(
+                                identity,
+                                &scope_ctx,
+                                ip,
+                                h_opt,
+                                rules,
+                                scoped_rules,
+                            ) {
+                                OutboundDecision::BlockedByRule { .. } => {
+                                    any_blocked = true;
+                                    let mut srcs = Vec::new();
+                                    for r in scoped_rules {
+                                        if r.scope == RuleScope::NetworkBlock
+                                            && matches_scoped_network_block_rule(
+                                                r, identity, &scope_ctx, ip, h_opt,
+                                            )
+                                            && !srcs.contains(&r.rule_id)
+                                        {
+                                            srcs.push(r.rule_id.clone());
+                                        }
+                                    }
+                                    if !srcs.is_empty() {
+                                        scoped_removal_sources
+                                            .entry(key.clone())
+                                            .or_default()
+                                            .extend(srcs);
+                                    }
+                                }
+                                OutboundDecision::AllowedByRule { .. } => {
+                                    any_allowed = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        !any_blocked && any_allowed
+                    };
+                    if !still_valid {
+                        if let Some(prev_scoped) = prev_scoped_rules {
+                            let srcs = scoped_removal_sources.entry(key.clone()).or_default();
+                            Self::collect_removed_prev_scoped_sources(
+                                prev_scoped,
+                                scoped_rules,
+                                identity,
+                                &entry.package_sid,
+                                entry.package_family_name.as_deref(),
+                                Some(ip),
+                                domain_hints,
+                                entry.allow,
+                                srcs,
+                            );
+                        }
+                        if !domain_hints.is_empty() {
+                            scoped_removal_hints.insert(key.clone(), domain_hints.clone());
+                        }
+                        scoped_keys_to_remove.push(key.clone());
+                    }
+                }
+                WfpFilterOrigin::Preemptive | WfpFilterOrigin::TransientContainment => {
+                    scoped_keys_to_remove.push(key.clone());
+                }
+            }
+        }
+
+        let mut failed_scoped_keys: HashSet<(String, String)> = HashSet::new();
+        for key in scoped_keys_to_remove {
+            if let Some(entry) = self.scoped_installed.get(&key).cloned() {
+                match defense.remove_wfp_rule(entry.handle) {
+                    Ok(()) => {
+                        if let WfpFilterOrigin::DomainPolicy { domain_hints } = &entry.origin {
+                            if let Some(remote_ip) = key.2 {
+                                report.removed_domain_filters.push(RemovedDomainFilterSnapshot {
+                                    exe_path: entry.exe_path.clone(),
+                                    package_sid: Some(entry.package_sid.clone()),
+                                    remote_ip,
+                                    allow: entry.allow,
+                                    domain_hints: domain_hints.clone(),
+                                });
+                            }
+                        }
+                        self.scoped_installed.remove(&key);
+                        report.removed += 1;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            exe_path = %entry.exe_path,
+                            package_sid = %entry.package_sid,
+                            wfp_handle = entry.handle,
+                            error = %err,
+                            "failed to remove obsolete scoped WFP rule during reconciliation"
+                        );
+                        let source_rule_ids =
+                            scoped_removal_sources.remove(&key).unwrap_or_default();
+                        let domain_hints = scoped_removal_hints.remove(&key).unwrap_or_default();
+                        failed_scoped_keys.insert((key.0.clone(), key.1.clone()));
+                        report.failed += 1;
+                        report.failed_ops.push(WfpFailedOp {
+                            exe_key: key.0,
+                            package_sid: Some(entry.package_sid),
+                            remote_ip: key.2,
+                            is_remove: true,
+                            is_startup_preemptive: false,
+                            newly_required: false,
+                            source_rule_ids,
+                            domain_hints,
+                            error: err,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut desired_scoped_sorted: Vec<(ScopedWfpTargetKey, String, String, bool)> =
+            scoped_plan
+                .desired
+                .into_iter()
+                .map(|(k, (exe, sid, allow))| (k, exe, sid, allow))
+                .collect();
+        desired_scoped_sorted.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
+
+        for (key, exe_path, package_sid, allow) in desired_scoped_sorted {
+            if let Some(existing) = self.scoped_installed.get(&key) {
+                if existing.allow == allow {
+                    continue;
+                }
+                continue;
+            }
+            match defense.add_wfp_scoped_app_rule(
+                Path::new(&exe_path),
+                Some(&package_sid),
+                key.2,
+                allow,
+            ) {
+                Ok(handle) => {
+                    self.scoped_installed.insert(
+                        key,
+                        InstalledScopedWfpFilter {
+                            handle,
+                            exe_path,
+                            package_sid,
+                            package_family_name: None,
+                            allow,
+                            origin: WfpFilterOrigin::PersistedPolicy,
+                        },
+                    );
+                    report.applied += 1;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        exe_path = %exe_path,
+                        package_sid = %package_sid,
+                        remote_ip = ?key.2,
+                        allow,
+                        error = %err,
+                        "failed to apply persisted scoped WFP firewall rule"
+                    );
+                    let newly_required = prev_scoped_plan.as_ref().is_some_and(|prev| {
+                        prev.desired
+                            .get(&key)
+                            .is_none_or(|(_, _, prev_allow)| *prev_allow != allow)
+                    });
+                    let source_rule_ids = scoped_plan
+                        .desired_sources
+                        .remove(&key)
+                        .unwrap_or_default();
+                    failed_scoped_keys.insert((key.0.clone(), key.1.clone()));
+                    report.failed += 1;
+                    report.failed_ops.push(WfpFailedOp {
+                        exe_key: key.0,
+                        package_sid: Some(package_sid),
+                        remote_ip: key.2,
+                        is_remove: false,
+                        is_startup_preemptive: false,
+                        newly_required,
+                        source_rule_ids,
+                        domain_hints: Vec::new(),
+                        error: err,
+                    });
+                }
+            }
+        }
+
+        for key in scoped_keys_to_promote {
+            if failed_scoped_keys.contains(&(key.0.clone(), key.1.clone())) {
+                continue;
+            }
+            if let Some(entry) = self.scoped_installed.get_mut(&key) {
+                report
+                    .promoted_scoped_backups
+                    .push(PromotedScopedFilterSnapshot {
+                        key: key.clone(),
+                        prev_origin: entry.origin.clone(),
+                    });
+                entry.origin = WfpFilterOrigin::PersistedPolicy;
+                report.promoted += 1;
+            }
+        }
+
+        for (key, surviving_hints) in scoped_domain_hint_updates {
+            if failed_scoped_keys.contains(&(key.0.clone(), key.1.clone())) {
+                continue;
+            }
+            if let Some(entry) = self.scoped_installed.get_mut(&key) {
+                report
+                    .promoted_scoped_backups
+                    .push(PromotedScopedFilterSnapshot {
+                        key: key.clone(),
+                        prev_origin: entry.origin.clone(),
+                    });
+                entry.origin = WfpFilterOrigin::DomainPolicy {
+                    domain_hints: surviving_hints,
+                };
             }
         }
 
@@ -772,6 +1277,19 @@ impl WfpRuleManager {
         }
     }
 
+    /// Restores package-scoped filter origins overwritten during a failed reconciliation pass whose
+    /// SQLite mutation was rolled back (`BUG_0003`).
+    pub fn restore_promoted_scoped_filter_states(
+        &mut self,
+        backups: &[PromotedScopedFilterSnapshot],
+    ) {
+        for snap in backups {
+            if let Some(entry) = self.scoped_installed.get_mut(&snap.key) {
+                entry.origin = snap.prev_origin.clone();
+            }
+        }
+    }
+
     /// Best-effort restoration of [`WfpFilterOrigin::DomainPolicy`] IP filters removed before a
     /// subsequent WFP failure caused SQLite rollback.
     pub fn restore_removed_domain_filters(
@@ -780,6 +1298,45 @@ impl WfpRuleManager {
         defense: &dyn ActiveDefenseController,
     ) {
         for snap in removed {
+            if let Some(ref sid) = snap.package_sid {
+                let key = Self::scoped_target_key(&snap.exe_path, sid, Some(snap.remote_ip));
+                if self.scoped_installed.contains_key(&key) {
+                    continue;
+                }
+                match defense.add_wfp_scoped_app_rule(
+                    Path::new(&snap.exe_path),
+                    Some(sid),
+                    Some(snap.remote_ip),
+                    snap.allow,
+                ) {
+                    Ok(handle) => {
+                        self.scoped_installed.insert(
+                            key,
+                            InstalledScopedWfpFilter {
+                                handle,
+                                exe_path: snap.exe_path.clone(),
+                                package_sid: sid.clone(),
+                                package_family_name: None,
+                                allow: snap.allow,
+                                origin: WfpFilterOrigin::DomainPolicy {
+                                    domain_hints: snap.domain_hints.clone(),
+                                },
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            exe_path = %snap.exe_path,
+                            package_sid = %sid,
+                            remote_ip = %snap.remote_ip,
+                            allow = snap.allow,
+                            error = %err,
+                            "failed to restore removed scoped DomainPolicy WFP filter during rollback"
+                        );
+                    }
+                }
+                continue;
+            }
             let key = Self::target_key(&snap.exe_path, Some(snap.remote_ip));
             if self.installed.contains_key(&key) {
                 continue;

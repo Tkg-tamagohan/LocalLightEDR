@@ -9,20 +9,31 @@ use std::sync::{Arc, RwLock};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FWPM_ACTION0, FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0,
-    FWPM_ENGINE_COLLECT_NET_EVENTS, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_NONE,
-    FWPM_NET_EVENT_SUBSCRIPTION0, FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC,
-    FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE,
-    FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0,
-    FWP_MATCH_EQUAL, FWP_UINT32, FWP_UINT8, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
-    FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0, FwpmEngineClose0,
-    FwpmEngineGetOption0, FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0,
-    FwpmFilterDeleteById0, FwpmFreeMemory0, FwpmGetAppIdFromFileName0, FwpmNetEventSubscribe1,
-    FwpmNetEventUnsubscribe0, FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0,
-    FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
+    FWPM_ACTION0, FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_ALE_PACKAGE_ID,
+    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0, FWPM_ENGINE_COLLECT_NET_EVENTS,
+    FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_NONE, FWPM_NET_EVENT_SUBSCRIPTION0,
+    FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_BLOCK,
+    FWP_ACTION_PERMIT, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE,
+    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID, FWP_UINT32, FWP_UINT8,
+    FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0,
+    FWP_VALUE0_0, FwpmEngineClose0, FwpmEngineGetOption0, FwpmEngineOpen0, FwpmEngineSetOption0,
+    FwpmFilterAdd0, FwpmFilterDeleteById0, FwpmFreeMemory0, FwpmGetAppIdFromFileName0,
+    FwpmNetEventSubscribe1, FwpmNetEventUnsubscribe0, FwpmProviderAdd0, FwpmProviderDeleteByKey0,
+    FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
     FwpmTransactionCommit0,
 };
+use windows::Win32::Security::SID;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut *mut c_void) -> i32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+}
 
 use super::net_events::{
     NetEventCallbackContext, NetEventSubscription, NetEventSubscriptionState, WfpDropSinkFn,
@@ -84,6 +95,40 @@ impl Drop for OwnedFwpByteBlob {
             let mut raw = self.0.cast::<c_void>();
             // SAFETY: `self.0` was allocated by `FwpmGetAppIdFromFileName0` and is freed once.
             unsafe { FwpmFreeMemory0(&mut raw) };
+            self.0 = ptr::null_mut();
+        }
+    }
+}
+
+struct OwnedLocalSid(*mut c_void);
+
+impl OwnedLocalSid {
+    fn from_str(sid_str: &str) -> Result<Self, String> {
+        let wide = encode_wide_nul(sid_str);
+        let mut raw_sid: *mut c_void = ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated UTF-16; `raw_sid` is freed via `LocalFree` on `Drop`.
+        let ok = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut raw_sid) };
+        if ok == 0 || raw_sid.is_null() {
+            return Err(format!(
+                "ConvertStringSidToSidW(`{sid_str}`) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self(raw_sid))
+    }
+
+    fn as_sid_ptr(&self) -> *mut SID {
+        self.0.cast::<SID>()
+    }
+}
+
+impl Drop for OwnedLocalSid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` was allocated by `ConvertStringSidToSidW` and is freed once.
+            unsafe {
+                let _ = LocalFree(self.0);
+            }
             self.0 = ptr::null_mut();
         }
     }
@@ -439,6 +484,11 @@ impl WfpBackend for LiveWfpBackend {
 
     fn add_filter(&mut self, spec: &WfpFilterSpec) -> Result<u64, String> {
         let app_blob = OwnedFwpByteBlob::from_exe_path(&spec.exe_path)?;
+        let package_sid_guard = spec
+            .package_sid
+            .as_deref()
+            .map(OwnedLocalSid::from_str)
+            .transpose()?;
 
         let mut v6_addr_storage = match spec.remote_addr {
             Some(WfpRemoteAddress::V6NetworkOrder(bytes)) => {
@@ -447,7 +497,7 @@ impl WfpBackend for LiveWfpBackend {
             _ => None,
         };
 
-        let mut conditions = Vec::with_capacity(2);
+        let mut conditions = Vec::with_capacity(3);
         conditions.push(FWPM_FILTER_CONDITION0 {
             fieldKey: FWPM_CONDITION_ALE_APP_ID,
             matchType: FWP_MATCH_EQUAL,
@@ -458,6 +508,19 @@ impl WfpBackend for LiveWfpBackend {
                 },
             },
         });
+
+        if let Some(ref sid_guard) = package_sid_guard {
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_ALE_PACKAGE_ID,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_SID,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        sid: sid_guard.as_sid_ptr(),
+                    },
+                },
+            });
+        }
 
         if let Some(remote) = spec.remote_addr {
             let cond_val = match remote {
@@ -492,10 +555,16 @@ impl WfpBackend for LiveWfpBackend {
             WfpLayer::AleAuthConnectV4 => "v4",
             WfpLayer::AleAuthConnectV6 => "v6",
         };
-        let mut filter_name = encode_wide_nul(&format!(
-            "LocalEDR {action_label} ({layer_label}): {}",
-            spec.exe_path
-        ));
+        let mut filter_name = match spec.package_sid.as_deref() {
+            Some(sid) => encode_wide_nul(&format!(
+                "LocalEDR {action_label} ({layer_label}, pkg={sid}): {}",
+                spec.exe_path
+            )),
+            None => encode_wide_nul(&format!(
+                "LocalEDR {action_label} ({layer_label}): {}",
+                spec.exe_path
+            )),
+        };
         let mut filter_desc = encode_wide_nul("Dynamic outbound rule managed by LocalEDR");
         let mut provider_guid = spec.provider_guid;
 
@@ -525,13 +594,13 @@ impl WfpBackend for LiveWfpBackend {
         };
 
         let mut filter_id: u64 = 0;
-        // SAFETY: `filter`, `conditions`, `app_blob`, `v6_addr_storage`, `provider_guid`, and
-        // UTF-16 display strings remain valid for the entire `FwpmFilterAdd0` call.
+        // SAFETY: `filter`, `conditions`, `app_blob`, `package_sid_guard`, `v6_addr_storage`,
+        // `provider_guid`, and UTF-16 display strings remain valid for the entire `FwpmFilterAdd0` call.
         let status = unsafe { FwpmFilterAdd0(self.engine.raw(), &filter, None, Some(&mut filter_id)) };
         if status != ERROR_SUCCESS_U32 {
             return Err(format!(
-                "FwpmFilterAdd0({action_label}, {layer_label}, `{}`) failed: 0x{status:08X}",
-                spec.exe_path
+                "FwpmFilterAdd0({action_label}, {layer_label}, pkg={:?}, `{}`) failed: 0x{status:08X}",
+                spec.package_sid, spec.exe_path
             ));
         }
 

@@ -7,7 +7,9 @@ use ledr_proto::{is_never_suspend_process, ActiveDefenseController};
 use ledr_rules::canonical_ip;
 
 use super::manager::WfpRuleManager;
-use super::types::{InstalledWfpFilter, RemovedBlockSnapshot, WfpFilterOrigin};
+use super::types::{
+    InstalledScopedWfpFilter, InstalledWfpFilter, RemovedBlockSnapshot, WfpFilterOrigin,
+};
 
 impl WfpRuleManager {
     /// Records a newly installed pre-emptive app-wide WFP Block handle.
@@ -260,6 +262,34 @@ impl WfpRuleManager {
                 origin: WfpFilterOrigin::PersistedPolicy,
             },
         );
+        // When installing an explicit app-wide persisted NetworkBlock, revoke any conflicting
+        // package-scoped Permit filters for this executable (`deny-overrides-allow`, since
+        // `WFP_WEIGHT_PERMIT_PACKAGE` = 12 > `WFP_WEIGHT_BLOCK_APP` = 11).
+        if canon_ip.is_none() {
+            let exe_k = Self::exe_key(exe_path);
+            let conflicting_scoped: Vec<(super::types::ScopedWfpTargetKey, u64)> = self
+                .scoped_installed
+                .iter()
+                .filter(|(k, e)| k.0 == exe_k && e.allow)
+                .map(|(k, e)| (k.clone(), e.handle))
+                .collect();
+            for (skey, shandle) in conflicting_scoped {
+                match defense.remove_wfp_rule(shandle) {
+                    Ok(()) => {
+                        self.scoped_installed.remove(&skey);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            exe_path = %exe_path,
+                            package_sid = %skey.1,
+                            wfp_handle = shandle,
+                            error = %err,
+                            "failed removing conflicting scoped WFP Permit while enforcing app-wide NetworkBlock"
+                        );
+                    }
+                }
+            }
+        }
         Ok(handle)
     }
 
@@ -291,6 +321,103 @@ impl WfpRuleManager {
             InstalledWfpFilter {
                 handle,
                 exe_path: trimmed.to_string(),
+                allow: true,
+                origin: WfpFilterOrigin::PersistedPolicy,
+            },
+        );
+        Ok(handle)
+    }
+
+    /// Ensures a package-scoped (`ALE_APP_ID` + `ALE_PACKAGE_ID`) WFP Block filter is active.
+    pub fn ensure_scoped_policy_block(
+        &mut self,
+        exe_path: &str,
+        package_sid: &str,
+        remote_ip: Option<IpAddr>,
+        defense: &dyn ActiveDefenseController,
+    ) -> Result<u64, String> {
+        let clean = exe_path.trim().trim_end_matches(['.', ' ']);
+        if is_never_suspend_process(exe_path) || is_never_suspend_process(clean) {
+            return Err(format!(
+                "refusing scoped WFP block for protected process `{exe_path}`"
+            ));
+        }
+        let sid_trimmed = package_sid.trim();
+        if sid_trimmed.is_empty() {
+            return Err("refusing scoped WFP block with empty package_sid".to_string());
+        }
+        let canon_ip = remote_ip.map(canonical_ip);
+        let key = Self::scoped_target_key(exe_path, sid_trimmed, canon_ip);
+        if let Some(existing) = self.scoped_installed.get_mut(&key) {
+            if !existing.allow {
+                existing.origin = WfpFilterOrigin::PersistedPolicy;
+                return Ok(existing.handle);
+            }
+            let old_handle = existing.handle;
+            defense.remove_wfp_rule(old_handle)?;
+            self.scoped_installed.remove(&key);
+        }
+
+        let handle =
+            defense.add_wfp_scoped_app_rule(Path::new(exe_path), Some(sid_trimmed), canon_ip, false)?;
+        self.scoped_installed.insert(
+            key,
+            InstalledScopedWfpFilter {
+                handle,
+                exe_path: exe_path.to_string(),
+                package_sid: sid_trimmed.to_string(),
+                package_family_name: None,
+                allow: false,
+                origin: WfpFilterOrigin::PersistedPolicy,
+            },
+        );
+        Ok(handle)
+    }
+
+    /// Ensures a package-scoped (`ALE_APP_ID` + `ALE_PACKAGE_ID`) WFP Permit filter is active
+    /// without overriding any unscoped or package-scoped Block filter (`FU-P4-03`).
+    pub fn ensure_scoped_policy_permit(
+        &mut self,
+        exe_path: &str,
+        package_sid: &str,
+        defense: &dyn ActiveDefenseController,
+    ) -> Result<u64, String> {
+        let trimmed = exe_path.trim();
+        if trimmed.is_empty() || Self::is_wildcard_pattern(trimmed) {
+            return Err("refusing scoped WFP permit for empty or wildcard executable path".to_string());
+        }
+        let sid_trimmed = package_sid.trim();
+        if sid_trimmed.is_empty() {
+            return Err("refusing scoped WFP permit with empty package_sid".to_string());
+        }
+        if self
+            .active_app_block(trimmed)
+            .is_some_and(|(_, origin)| origin == WfpFilterOrigin::PersistedPolicy)
+            || self.active_scoped_app_block(trimmed, sid_trimmed).is_some()
+        {
+            return Err(format!(
+                "refusing scoped WFP permit for `{trimmed}` (pkg={sid_trimmed}) while block filter is active"
+            ));
+        }
+        let key = Self::scoped_target_key(trimmed, sid_trimmed, None);
+        if let Some(existing) = self.scoped_installed.get(&key) {
+            if existing.allow {
+                return Ok(existing.handle);
+            }
+            return Err(format!(
+                "refusing scoped WFP permit for `{trimmed}` (pkg={sid_trimmed}) while block filter is active"
+            ));
+        }
+
+        let handle =
+            defense.add_wfp_scoped_app_rule(Path::new(trimmed), Some(sid_trimmed), None, true)?;
+        self.scoped_installed.insert(
+            key,
+            InstalledScopedWfpFilter {
+                handle,
+                exe_path: trimmed.to_string(),
+                package_sid: sid_trimmed.to_string(),
+                package_family_name: None,
                 allow: true,
                 origin: WfpFilterOrigin::PersistedPolicy,
             },

@@ -36,11 +36,25 @@ pub enum WfpFilterOrigin {
 /// Composite key identifying a concrete WFP filter target managed by the daemon (canonical IP).
 pub type WfpTargetKey = (String, Option<IpAddr>);
 
+/// Composite key identifying a package-scoped WFP filter target (`(exe_key, package_sid_key, canonical_ip)`).
+pub type ScopedWfpTargetKey = (String, String, Option<IpAddr>);
+
 /// Metadata for a live WFP rule handle registered via [`ActiveDefenseController`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledWfpFilter {
     pub handle: u64,
     pub exe_path: String,
+    pub allow: bool,
+    pub origin: WfpFilterOrigin,
+}
+
+/// Metadata for a live package-scoped WFP rule handle (`ALE_APP_ID` + `ALE_PACKAGE_ID`, `FU-P4-03`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledScopedWfpFilter {
+    pub handle: u64,
+    pub exe_path: String,
+    pub package_sid: String,
+    pub package_family_name: Option<String>,
     pub allow: bool,
     pub origin: WfpFilterOrigin,
 }
@@ -70,6 +84,7 @@ pub struct RemovedAppBlockSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WfpFailedOp {
     pub exe_key: String,
+    pub package_sid: Option<String>,
     pub remote_ip: Option<IpAddr>,
     pub is_remove: bool,
     pub is_startup_preemptive: bool,
@@ -91,12 +106,21 @@ pub struct PromotedFilterSnapshot {
     pub prev_deferred_preemptive_removal: bool,
 }
 
+/// Snapshot of a package-scoped filter origin promoted or updated during reconciliation so SQLite
+/// rollback restores its pre-reconcile [`WfpFilterOrigin`] faithfully (`BUG_0003`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotedScopedFilterSnapshot {
+    pub key: ScopedWfpTargetKey,
+    pub prev_origin: WfpFilterOrigin,
+}
+
 /// Snapshot of a [`WfpFilterOrigin::DomainPolicy`] filter removed during reconciliation so
 /// SQLite rollback can re-install it in BFE (since `reconcile_persisted_rules` only rebuilds
 /// static [`WfpFilterOrigin::PersistedPolicy`] filters).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedDomainFilterSnapshot {
     pub exe_path: String,
+    pub package_sid: Option<String>,
     pub remote_ip: IpAddr,
     pub allow: bool,
     pub domain_hints: Vec<String>,
@@ -114,6 +138,9 @@ pub struct WfpReconcileDnsContext {
     /// Normalized `(exe_key, canonical_ip, domain_hint)` tuples known to be superseded in
     /// `ProcessDnsHistory` for currently installed `DomainPolicy` Permits.
     pub superseded_permit_hints: HashSet<(String, IpAddr, String)>,
+    /// Normalized `(exe_key, canonical_ip, domain_hint)` tuples known to be superseded in
+    /// `ProcessDnsHistory` for currently installed scoped `DomainPolicy` Blocks (`BUG_0001`).
+    pub superseded_block_hints: HashSet<(String, IpAddr, String)>,
     /// Fail-closed flag indicating `ActiveProcessTable::evicted_live_overflow_any` is active so
     /// deferred `Preemptive` block removals cannot fire while unenumerated live processes exist.
     pub live_exe_overflow_any: bool,
@@ -131,6 +158,7 @@ pub struct WfpReconcileReport {
     pub failed: usize,
     pub failed_ops: Vec<WfpFailedOp>,
     pub promoted_backups: Vec<PromotedFilterSnapshot>,
+    pub promoted_scoped_backups: Vec<PromotedScopedFilterSnapshot>,
     pub removed_domain_filters: Vec<RemovedDomainFilterSnapshot>,
     pub removed_app_blocks: Vec<RemovedAppBlockSnapshot>,
 }

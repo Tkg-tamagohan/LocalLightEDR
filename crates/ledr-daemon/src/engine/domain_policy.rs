@@ -1,10 +1,11 @@
 use std::net::IpAddr;
 
-use ledr_proto::{AllowlistRuleRecord, RuleScope};
+use ledr_proto::{AllowlistRuleRecord, RuleScope, ScopedPolicyRuleRecord};
 use ledr_rules::{
-    evaluate_outbound_policy, matches_app_wide_network_allow, matches_network_allow_rule,
-    matches_network_block_rule, matches_path_pattern, parse_cidr_target, BinaryIdentity,
-    OutboundDecision,
+    evaluate_outbound_policy, evaluate_outbound_policy_with_scoped,
+    matches_app_wide_network_allow, matches_network_allow_rule, matches_network_block_rule,
+    matches_path_pattern, matches_scoped_network_block_rule, parse_cidr_target, BinaryIdentity,
+    OutboundDecision, ProcessScopeContext,
 };
 
 use crate::firewall::{parse_literal_target_ip, WfpRuleManager};
@@ -42,6 +43,35 @@ pub(super) fn has_domain_allow_rule_for_exe(exe_path: &str, rules: &[AllowlistRu
     })
 }
 
+pub(super) fn has_domain_allow_rule_for_exe_with_scoped(
+    exe_path: &str,
+    rules: &[AllowlistRuleRecord],
+    scoped_rules: &[ScopedPolicyRuleRecord],
+    package_sid: Option<&str>,
+) -> bool {
+    if has_domain_allow_rule_for_exe(exe_path, rules) {
+        return true;
+    }
+    let norm_sid = package_sid.map(str::trim).filter(|s| !s.is_empty());
+    scoped_rules.iter().any(|r| {
+        r.scope == RuleScope::NetworkAllow
+            && !r.exe_path_pattern.trim().is_empty()
+            && matches_path_pattern(exe_path, &r.exe_path_pattern)
+            && norm_sid.is_none_or(|sid| {
+                r.package_sid
+                    .as_deref()
+                    .is_some_and(|rule_sid| rule_sid.trim().eq_ignore_ascii_case(sid))
+            })
+            && r.allowed_target
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .is_some_and(|t| {
+                    parse_literal_target_ip(t).is_none() && parse_cidr_target(t).is_err()
+                })
+    })
+}
+
 /// Evaluates outbound policy across all non-superseded domain candidates sharing `dst_ip` with a
 /// single consistent precedence used by WFP pre-materialization, WFP drop triage, `NetworkConnect`,
 /// and `AllowPermanent` (`#2`):
@@ -56,7 +86,32 @@ pub(super) fn select_outbound_decision_for_domains(
     candidates: &[(String, i64)],
     rules: &[AllowlistRuleRecord],
 ) -> (OutboundDecision, Option<String>) {
-    let base_decision = evaluate_outbound_policy(bin_identity, dst_ip, None, rules);
+    select_outbound_decision_for_domains_with_scoped(
+        bin_identity,
+        &ProcessScopeContext::default(),
+        dst_ip,
+        candidates,
+        rules,
+        &[],
+    )
+}
+
+pub(super) fn select_outbound_decision_for_domains_with_scoped(
+    bin_identity: &BinaryIdentity,
+    scope_ctx: &ProcessScopeContext<'_>,
+    dst_ip: IpAddr,
+    candidates: &[(String, i64)],
+    rules: &[AllowlistRuleRecord],
+    scoped_rules: &[ScopedPolicyRuleRecord],
+) -> (OutboundDecision, Option<String>) {
+    let base_decision = evaluate_outbound_policy_with_scoped(
+        bin_identity,
+        scope_ctx,
+        dst_ip,
+        None,
+        rules,
+        scoped_rules,
+    );
     if matches!(base_decision, OutboundDecision::ProtectedOs) {
         return (OutboundDecision::ProtectedOs, None);
     }
@@ -82,7 +137,14 @@ pub(super) fn select_outbound_decision_for_domains(
     let mut first_decision: Option<OutboundDecision> = None;
 
     for (dom, _) in &ordered {
-        let decision = evaluate_outbound_policy(bin_identity, dst_ip, Some(dom.as_str()), rules);
+        let decision = evaluate_outbound_policy_with_scoped(
+            bin_identity,
+            scope_ctx,
+            dst_ip,
+            Some(dom.as_str()),
+            rules,
+            scoped_rules,
+        );
         match decision {
             OutboundDecision::ProtectedOs => return (OutboundDecision::ProtectedOs, None),
             OutboundDecision::BlockedByRule { .. } => {
@@ -143,6 +205,47 @@ pub(super) fn collect_domain_specific_blocked_hints(
             r.scope == RuleScope::NetworkBlock
                 && matches_network_block_rule(r, bin_identity, dst_ip, Some(norm.as_str()))
                 && !matches_network_block_rule(r, bin_identity, dst_ip, None)
+        });
+        if matches_domain_block && !hints.iter().any(|existing| existing == &norm) {
+            hints.push(norm);
+        }
+    }
+    hints
+}
+
+pub(super) fn collect_scoped_domain_specific_blocked_hints(
+    bin_identity: &BinaryIdentity,
+    scope_ctx: &ProcessScopeContext<'_>,
+    dst_ip: IpAddr,
+    candidates: &[(String, i64)],
+    scoped_rules: &[ScopedPolicyRuleRecord],
+) -> Vec<String> {
+    let mut ordered: Vec<(String, i64)> = Vec::with_capacity(candidates.len());
+    for (dom, ts) in candidates {
+        let norm = dom.trim().trim_end_matches('.').to_ascii_lowercase();
+        if norm.is_empty() {
+            continue;
+        }
+        if let Some(existing) = ordered.iter_mut().find(|(d, _)| d == &norm) {
+            existing.1 = existing.1.max(*ts);
+        } else {
+            ordered.push((norm, *ts));
+        }
+    }
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut hints = Vec::new();
+    for (norm, _) in ordered {
+        let matches_domain_block = scoped_rules.iter().any(|r| {
+            r.scope == RuleScope::NetworkBlock
+                && matches_scoped_network_block_rule(
+                    r,
+                    bin_identity,
+                    scope_ctx,
+                    dst_ip,
+                    Some(norm.as_str()),
+                )
+                && !matches_scoped_network_block_rule(r, bin_identity, scope_ctx, dst_ip, None)
         });
         if matches_domain_block && !hints.iter().any(|existing| existing == &norm) {
             hints.push(norm);

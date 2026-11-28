@@ -25,11 +25,12 @@ pub use motw::{
 };
 pub use wfp::{
     LEDR_WFP_PROVIDER_GUID, LEDR_WFP_SUBLAYER_GUID, WFP_WEIGHT_BLOCK_APP,
-    WFP_WEIGHT_BLOCK_SPECIFIC, WFP_WEIGHT_LOOPBACK_PERMIT, WFP_WEIGHT_PERMIT_APP,
-    WFP_WEIGHT_PERMIT_SPECIFIC, WfpBackend, WfpDropEvent, WfpDropSinkFn, WfpDynamicEngine,
-    WfpFilterAction, WfpFilterMeta, WfpFilterSpec, WfpLayer, WfpLoopbackCondition,
-    WfpLoopbackFilterSpec, WfpRemoteAddress, build_loopback_permit_filter_specs,
-    build_wfp_filter_specs, parse_wfp_classify_drop_fields, validate_wfp_rule_request,
+    WFP_WEIGHT_BLOCK_PACKAGE, WFP_WEIGHT_BLOCK_SPECIFIC, WFP_WEIGHT_LOOPBACK_PERMIT,
+    WFP_WEIGHT_PERMIT_APP, WFP_WEIGHT_PERMIT_PACKAGE, WFP_WEIGHT_PERMIT_SPECIFIC, WfpBackend, WfpDropEvent, WfpDropSinkFn,
+    WfpDynamicEngine, WfpFilterAction, WfpFilterMeta, WfpFilterSpec, WfpLayer,
+    WfpLoopbackCondition, WfpLoopbackFilterSpec, WfpRemoteAddress,
+    build_loopback_permit_filter_specs, build_wfp_filter_specs, build_wfp_scoped_filter_specs,
+    parse_wfp_classify_drop_fields, validate_wfp_package_sid, validate_wfp_rule_request,
 };
 
 use std::net::IpAddr;
@@ -124,6 +125,16 @@ impl ActiveDefenseController for NoopDefenseController {
     fn add_wfp_app_rule(
         &self,
         _exe_path: &Path,
+        _remote_ip: Option<IpAddr>,
+        _allow: bool,
+    ) -> Result<u64, String> {
+        Ok(0)
+    }
+
+    fn add_wfp_scoped_app_rule(
+        &self,
+        _exe_path: &Path,
+        _package_sid: Option<&str>,
         _remote_ip: Option<IpAddr>,
         _allow: bool,
     ) -> Result<u64, String> {

@@ -26,9 +26,9 @@ use ledr_daemon::{
 use ledr_proto::{
     read_ipc_frame, write_ipc_frame, ActiveDefenseController, AlertDecision, AlertRecord,
     AlertSeverity, AlertStatus, AllowlistRuleRecord, AuthenticodeInfo, BrowserSecurityEventType,
-    CanaryCategory, FrameError, IpcRequest, IpcResponse, ProcessIdentity, RuleScope, SensorEvent,
-    ACTIVE_PROCESS_TABLE_CAPACITY, AUTHORIZED_BRIDGE_EXE_PATH, HIGH_PRIORITY_CHANNEL_CAPACITY,
-    TELEMETRY_CHANNEL_CAPACITY,
+    CanaryCategory, FrameError, IpcRequest, IpcResponse, ProcessIdentity, RuleScope,
+    ScopedPolicyRuleRecord, SensorEvent, ACTIVE_PROCESS_TABLE_CAPACITY, AUTHORIZED_BRIDGE_EXE_PATH,
+    HIGH_PRIORITY_CHANNEL_CAPACITY, TELEMETRY_CHANNEL_CAPACITY,
 };
 use ledr_rules::{
     compute_file_sha256_hex, BinaryIdentity, EarlyPruner, FieldCondition, MatchModifier,
@@ -110,6 +110,15 @@ struct WfpCall {
     allow: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopedWfpCall {
+    handle: u64,
+    exe_path: String,
+    package_sid: Option<String>,
+    remote_ip: Option<IpAddr>,
+    allow: bool,
+}
+
 #[derive(Default)]
 struct MockDefense {
     next_handle: AtomicU64,
@@ -117,7 +126,10 @@ struct MockDefense {
     resumes: Mutex<Vec<ProcessIdentity>>,
     terminates: Mutex<Vec<ProcessIdentity>>,
     added_wfp: Mutex<Vec<WfpCall>>,
+    added_scoped_wfp: Mutex<Vec<ScopedWfpCall>>,
     removed_wfp: Mutex<Vec<u64>>,
+    fail_next_scoped_add: AtomicBool,
+    fail_next_remove: AtomicBool,
 }
 
 impl MockDefense {
@@ -132,12 +144,31 @@ impl MockDefense {
         self.suspends.lock().expect("lock suspends").clone()
     }
 
+    fn terminates(&self) -> Vec<ProcessIdentity> {
+        self.terminates.lock().expect("lock terminates").clone()
+    }
+
     fn added_wfp(&self) -> Vec<WfpCall> {
         self.added_wfp.lock().expect("lock added_wfp").clone()
     }
 
+    fn added_scoped_wfp(&self) -> Vec<ScopedWfpCall> {
+        self.added_scoped_wfp
+            .lock()
+            .expect("lock added_scoped_wfp")
+            .clone()
+    }
+
     fn removed_wfp(&self) -> Vec<u64> {
         self.removed_wfp.lock().expect("lock removed_wfp").clone()
+    }
+
+    fn set_fail_next_scoped_add(&self, fail: bool) {
+        self.fail_next_scoped_add.store(fail, Ordering::Release);
+    }
+
+    fn set_fail_next_remove(&self, fail: bool) {
+        self.fail_next_remove.store(fail, Ordering::Release);
     }
 }
 
@@ -177,7 +208,40 @@ impl ActiveDefenseController for MockDefense {
         Ok(handle)
     }
 
+    fn add_wfp_scoped_app_rule(
+        &self,
+        exe_path: &Path,
+        package_sid: Option<&str>,
+        remote_ip: Option<IpAddr>,
+        allow: bool,
+    ) -> Result<u64, String> {
+        let Some(pkg_sid) = package_sid.map(str::trim).filter(|s| !s.is_empty()) else {
+            return self.add_wfp_app_rule(exe_path, remote_ip, allow);
+        };
+        if self.fail_next_scoped_add.swap(false, Ordering::AcqRel) {
+            return Err(format!(
+                "injected scoped WFP add failure for {} ({pkg_sid})",
+                exe_path.display()
+            ));
+        }
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.added_scoped_wfp
+            .lock()
+            .expect("lock added_scoped_wfp")
+            .push(ScopedWfpCall {
+                handle,
+                exe_path: exe_path.display().to_string(),
+                package_sid: Some(pkg_sid.to_string()),
+                remote_ip,
+                allow,
+            });
+        Ok(handle)
+    }
+
     fn remove_wfp_rule(&self, filter_id: u64) -> Result<(), String> {
+        if self.fail_next_remove.swap(false, Ordering::AcqRel) {
+            return Err(format!("injected WFP remove failure for {filter_id}"));
+        }
         self.removed_wfp.lock().expect("lock removed_wfp").push(filter_id);
         Ok(())
     }
@@ -5561,7 +5625,8 @@ async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_fall
         .expect("send start C");
     wait_high_priority_processed(&engine, 3, "three ProcessStarts").await;
 
-    // A: Mismatched WFP drop event SID keeps event SID and clears candidate PFN to avoid mixing packages.
+    // A: Mismatched WFP drop event SID refuses cross-package attribution (PRG-001): routes to
+    //    ambiguous app-level handling without adopting candidate PFN or suspending `id_a`.
     assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
         os_filter_id: 501,
         rule_handle: 501,
@@ -5607,9 +5672,24 @@ async fn daemon_fu_p4_03_02_single_candidate_wfp_drop_prefers_event_sid_and_fall
     let alerts = store.list_alerts(None, 10).expect("list alerts");
     let alert_a = alerts
         .iter()
-        .find(|a| a.process_instance_id.as_deref() == Some(id_a.instance_id().as_str()))
+        .find(|a| {
+            serde_json::from_str::<serde_json::Value>(&a.context_json)
+                .ok()
+                .and_then(|v| v.get("dst_ip").and_then(|d| d.as_str()).map(str::to_owned))
+                .as_deref()
+                == Some("198.51.100.11")
+        })
         .expect("alert A");
+    assert_eq!(
+        alert_a.process_instance_id, None,
+        "PRG-001: SID-mismatched drop must not attribute to candidate process"
+    );
+    assert!(
+        !defense.suspends().contains(&id_a),
+        "PRG-001: SID-mismatched drop must not suspend mismatched candidate"
+    );
     let ctx_a: serde_json::Value = serde_json::from_str(&alert_a.context_json).expect("ctx A");
+    assert_eq!(ctx_a["attribution"], "app_level_ambiguous");
     assert!(
         ctx_a["package_family_name"].is_null(),
         "mismatched WFP package_sid must clear candidate package_family_name, got {ctx_a}"
@@ -5991,4 +6071,1207 @@ async fn daemon_fu_p4_03_05_process_stop_sigma_alert_preserves_package_attrs() {
         serde_json::from_str(&alerts[0].context_json).expect("parse stop alert context");
     assert_eq!(ctx["package_family_name"], "Contoso.StopHost_1");
     assert_eq!(ctx["package_sid"], "S-1-15-2-stop-1");
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_b2_cross_package_isolation_and_legacy_list_isolation() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    let signer = "CN=Microsoft Windows";
+    let root_tp = "ab".repeat(20);
+    inspector.insert(
+        bth_exe,
+        BinaryIdentity {
+            exe_path: bth_exe.to_string(),
+            sha256: Some("f".repeat(64)),
+            authenticode: Some(AuthenticodeInfo {
+                signer_subject: signer.to_string(),
+                root_thumbprint: root_tp.clone(),
+            }),
+        },
+    );
+
+    let pipe_name = unique_test_pipe_name();
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            dev_mode_bypass_ui_auth: true,
+            pipe_name: pipe_name.clone(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+    let ipc_handle = start_ipc_server(Arc::clone(&engine)).expect("start ipc");
+
+    let sid_a = "S-1-15-2-1001-1";
+    let pfn_a = "Contoso.PkgA_8wekyb3d8bbwe";
+    let sid_b = "S-1-15-2-2002-1";
+    let pfn_b = "Contoso.PkgB_8wekyb3d8bbwe";
+
+    let scoped_allow_a = ScopedPolicyRuleRecord {
+        rule_id: "SC-ALLOW-BTH-A".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: None,
+        signer_subject: Some(signer.to_string()),
+        root_thumbprint: Some(root_tp),
+        allowed_target: None,
+        package_family_name: Some(pfn_a.to_string()),
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_000,
+        created_by: "test_b2".to_string(),
+    };
+    let pipe = pipe_name.clone();
+    let rule_clone = scoped_allow_a.clone();
+    let upsert_resp = tokio::task::spawn_blocking(move || {
+        send_pipe_request(&pipe, &IpcRequest::UpsertScopedRule { rule: rule_clone })
+    })
+    .await
+    .expect("join upsert");
+    assert!(matches!(upsert_resp, IpcResponse::Ack { .. }), "got {upsert_resp:?}");
+
+    // Legacy ListRules must remain completely isolated from scoped_policy_rules.
+    let pipe = pipe_name.clone();
+    let legacy_resp = tokio::task::spawn_blocking(move || {
+        send_pipe_request(&pipe, &IpcRequest::ListRules { scope: None })
+    })
+    .await
+    .expect("join ListRules");
+    match legacy_resp {
+        IpcResponse::Rules(rules) => assert!(rules.is_empty(), "legacy ListRules leaked scoped rules"),
+        other => panic!("unexpected ListRules response: {other:?}"),
+    }
+    assert!(store.list_rules(None).expect("store list_rules").is_empty());
+
+    let pipe = pipe_name.clone();
+    let scoped_resp = tokio::task::spawn_blocking(move || {
+        send_pipe_request(&pipe, &IpcRequest::ListScopedRules { scope: None })
+    })
+    .await
+    .expect("join ListScopedRules");
+    match scoped_resp {
+        IpcResponse::ScopedRules(rules) => {
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].rule_id, "SC-ALLOW-BTH-A");
+        }
+        other => panic!("unexpected ListScopedRules response: {other:?}"),
+    }
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id_a = ProcessIdentity::new(47_101, unix_ms_to_filetime(now_ms - 1_000));
+    let id_b = ProcessIdentity::new(47_102, unix_ms_to_filetime(now_ms - 900));
+    let sender = engine.sender();
+
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_a,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:PkgA".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some(pfn_a.to_string()),
+                package_sid: Some(sid_a.to_string()),
+            },
+        )
+        .await
+        .expect("send start A");
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_b,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:PkgB".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some(pfn_b.to_string()),
+                package_sid: Some(sid_b.to_string()),
+            },
+        )
+        .await
+        .expect("send start B");
+    wait_high_priority_processed(&engine, 2, "two backgroundTaskHost starts").await;
+
+    let scoped_wfp = defense.added_scoped_wfp();
+    assert!(
+        scoped_wfp.iter().any(|c| {
+            c.package_sid.as_deref() == Some(sid_a) && c.remote_ip.is_none() && c.allow
+        }),
+        "expected package-scoped WFP Permit for Package A, got {scoped_wfp:?}"
+    );
+    assert!(
+        !scoped_wfp.iter().any(|c| c.package_sid.as_deref() == Some(sid_b)),
+        "Package B must NOT receive a scoped WFP Permit, got {scoped_wfp:?}"
+    );
+    assert!(
+        !defense.added_wfp().iter().any(|c| {
+            c.allow && c.exe_path.eq_ignore_ascii_case(bth_exe)
+        }),
+        "scoped NetworkAllow must NEVER install an unscoped host-wide Permit"
+    );
+
+    // Outbound connect from Package A is allowed silently; Package B triggers an alert (no cache leak).
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_a.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send net A");
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_b.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 78)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send net B");
+    wait_high_priority_processed(&engine, 4, "two NetworkConnect events").await;
+
+    // ANALYSIS_0001: With Package B transiently contained (`TransientContainment` app block active on
+    // shared backgroundTaskHost.exe, alert still Pending), Package A must STILL connect to a brand-new
+    // IP cleanly (`WFP_WEIGHT_PERMIT_PACKAGE = 12 > WFP_WEIGHT_BLOCK_APP = 11`).
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_a.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 79)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send net A2 while B contained");
+    wait_high_priority_processed(&engine, 5, "Package A connect while B contained").await;
+
+    ipc_handle.shutdown().await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    assert_eq!(alerts.len(), 1, "expected only Package B outbound alert, got {alerts:?}");
+    assert_eq!(
+        alerts[0].process_instance_id.as_deref(),
+        Some(id_b.instance_id().as_str())
+    );
+    assert!(!defense.suspends().contains(&id_a));
+    let ctx_b: serde_json::Value = serde_json::from_str(&alerts[0].context_json).expect("ctx B");
+    assert_eq!(ctx_b["package_sid"], sid_b);
+    assert_eq!(ctx_b["package_family_name"], pfn_b);
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_b2_compensatory_rollback_on_wfp_sync_failure() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    let signer = "CN=Microsoft Windows";
+    let root_tp = "cd".repeat(20);
+    inspector.insert(
+        bth_exe,
+        BinaryIdentity {
+            exe_path: bth_exe.to_string(),
+            sha256: Some("e".repeat(64)),
+            authenticode: Some(AuthenticodeInfo {
+                signer_subject: signer.to_string(),
+                root_thumbprint: root_tp.clone(),
+            }),
+        },
+    );
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let sid_a = "S-1-15-2-2001-1";
+    let pfn_a = "Contoso.RollbackA_8wekyb3d8bbwe";
+    let sid_b = "S-1-15-2-2002-1";
+    let pfn_b = "Contoso.RollbackB_8wekyb3d8bbwe";
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id_b = ProcessIdentity::new(47_201, unix_ms_to_filetime(now_ms - 1_000));
+    engine
+        .sender()
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_b,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:RollbackB".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some(pfn_b.to_string()),
+                package_sid: Some(sid_b.to_string()),
+            },
+        )
+        .await
+        .expect("send start B");
+    wait_high_priority_processed(&engine, 1, "start before rollback tests").await;
+
+    let allow_a = ScopedPolicyRuleRecord {
+        rule_id: "SC-RB-ALLOW-A".to_string(),
+        scope: RuleScope::NetworkAllow,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: None,
+        signer_subject: Some(signer.to_string()),
+        root_thumbprint: Some(root_tp.clone()),
+        allowed_target: None,
+        package_family_name: Some(pfn_a.to_string()),
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_000,
+        created_by: "test_b2".to_string(),
+    };
+    let mut allow_b = allow_a.clone();
+    allow_b.rule_id = "SC-RB-ALLOW-B".to_string();
+    allow_b.package_family_name = Some(pfn_b.to_string());
+    allow_b.package_sid = Some(sid_b.to_string());
+
+    // 1. UpsertScopedRule failure rolls back SQLite and leaves zero orphaned WFP filters.
+    defense.set_fail_next_scoped_add(true);
+    let up_err = engine.upsert_scoped_policy_rule(&allow_b);
+    assert!(up_err.is_err(), "expected upsert_scoped_policy_rule failure");
+    assert!(
+        store.list_scoped_rules(None).expect("list scoped").is_empty(),
+        "failed upsert_scoped_policy_rule must roll back SQLite"
+    );
+
+    // 2. DeleteScopedRule remove failure restores the deleted scoped rule into SQLite.
+    engine
+        .upsert_scoped_policy_rule(&allow_b)
+        .expect("upsert allow_b cleanly");
+    assert_eq!(store.list_scoped_rules(None).expect("list").len(), 1);
+    defense.set_fail_next_remove(true);
+    let del_err = engine.delete_scoped_policy_rule(&allow_b.rule_id);
+    assert!(del_err.is_err(), "expected delete_scoped_policy_rule failure");
+    assert!(
+        store
+            .get_scoped_rule(&allow_b.rule_id)
+            .expect("query restored")
+            .is_some(),
+        "failed delete_scoped_policy_rule must restore SQLite rule"
+    );
+    assert!(
+        engine
+            .delete_scoped_policy_rule(&allow_b.rule_id)
+            .expect("clean delete allow_b")
+            .0
+    );
+
+    // 3. ResolveAlertScoped (AllowPermanent & TerminateAndBlock) rollback on WFP add failure.
+    let alert_id = "ALERT-SC-RB-01";
+    let alert = AlertRecord {
+        alert_id: alert_id.to_string(),
+        timestamp_ms: now_ms,
+        severity: AlertSeverity::Medium,
+        source_layer: "LAYER_3_NETWORK".to_string(),
+        rule_id: "NET_OUTBOUND_ENFORCE".to_string(),
+        title: "Outbound".to_string(),
+        process_instance_id: Some(id_b.instance_id()),
+        process_suspended: false,
+        status: AlertStatus::Pending,
+        context_json: serde_json::json!({
+            "exe_path": bth_exe,
+            "signer_subject": signer,
+            "root_thumbprint": root_tp,
+            "package_family_name": pfn_b,
+            "package_sid": sid_b,
+            "dst_ip": "198.51.100.88",
+            "dst_port": 443
+        })
+        .to_string(),
+        resolved_at_ms: None,
+    };
+    store.record_alert(&alert).expect("record alert");
+
+    defense.set_fail_next_scoped_add(true);
+    let allow_err = engine.resolve_alert_scoped_with_outcome(
+        alert_id,
+        AlertDecision::AllowPermanent {
+            use_signer_if_available: true,
+            allow_dest: None,
+        },
+        true,
+    );
+    assert!(allow_err.is_err(), "expected ResolveAlertScoped AllowPermanent WFP failure");
+    assert_eq!(
+        store.get_alert(alert_id).expect("get").expect("exists").status,
+        AlertStatus::Pending
+    );
+    assert!(store.list_scoped_rules(None).expect("list").is_empty());
+
+    defense.set_fail_next_scoped_add(true);
+    let blk_err = engine.resolve_alert_scoped_with_outcome(
+        alert_id,
+        AlertDecision::TerminateAndBlock {
+            add_block_rule: true,
+        },
+        true,
+    );
+    assert!(blk_err.is_err(), "expected ResolveAlertScoped TerminateAndBlock WFP failure");
+    assert_eq!(
+        store.get_alert(alert_id).expect("get").expect("exists").status,
+        AlertStatus::Pending
+    );
+    assert!(store.list_scoped_rules(None).expect("list").is_empty());
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_b2_resolve_alert_scoped_terminate_and_allow_boundaries() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    let pfn_only_exe = r"C:\Tools\pfn_only_host.exe";
+    let unsigned_exe = r"C:\Tools\unsigned_b2.exe";
+    let signer = "CN=Microsoft Windows";
+    let root_tp = "ef".repeat(20);
+    for signed in [bth_exe, pfn_only_exe] {
+        inspector.insert(
+            signed,
+            BinaryIdentity {
+                exe_path: signed.to_string(),
+                sha256: Some("a".repeat(64)),
+                authenticode: Some(AuthenticodeInfo {
+                    signer_subject: signer.to_string(),
+                    root_thumbprint: root_tp.clone(),
+                }),
+            },
+        );
+    }
+    inspector.insert(
+        unsigned_exe,
+        BinaryIdentity {
+            exe_path: unsigned_exe.to_string(),
+            sha256: Some("b".repeat(64)),
+            authenticode: None,
+        },
+    );
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id_ac = ProcessIdentity::new(47_301, unix_ms_to_filetime(now_ms - 3_000));
+    let id_rb = ProcessIdentity::new(47_302, unix_ms_to_filetime(now_ms - 2_000));
+    let id_nonpkg = ProcessIdentity::new(47_303, unix_ms_to_filetime(now_ms - 1_000));
+    let sid_ac = "S-1-15-2-3001-1";
+    let pfn_ac = "Contoso.AcPkg_8wekyb3d8bbwe";
+    let sender = engine.sender();
+
+    // Case A: AppContainer process emits NetworkConnect -> transient host block installed ->
+    // TerminateAndBlock(scope_to_package=true) saves scoped block, adds scoped WFP block,
+    // AND releases the host-wide TransientContainment block on backgroundTaskHost.exe.
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_ac,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:AcPkg".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some(pfn_ac.to_string()),
+                package_sid: Some(sid_ac.to_string()),
+            },
+        )
+        .await
+        .expect("send start AC");
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_ac.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 91)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send net AC");
+    wait_high_priority_processed(&engine, 2, "AC outbound alert").await;
+
+    let transient_bth_handle = defense
+        .added_wfp()
+        .iter()
+        .find(|c| c.exe_path.eq_ignore_ascii_case(bth_exe) && !c.allow && c.remote_ip.is_none())
+        .expect("transient host-wide containment handle on backgroundTaskHost.exe")
+        .handle;
+    let alert_ac = store
+        .list_alerts(Some(AlertStatus::Pending), 10)
+        .expect("list alerts")
+        .into_iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(id_ac.instance_id().as_str()))
+        .expect("alert_ac");
+
+    let out_ac = engine
+        .resolve_alert_scoped_with_outcome(
+            &alert_ac.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+            true,
+        )
+        .expect("resolve alert_ac");
+    assert!(out_ac.saved_rule_id.is_some());
+    assert!(defense.terminates().contains(&id_ac));
+    assert!(
+        defense.added_scoped_wfp().iter().any(|c| {
+            c.package_sid.as_deref() == Some(sid_ac) && !c.allow && c.remote_ip.is_none()
+        }),
+        "expected package-scoped WFP block for {sid_ac}"
+    );
+    assert!(
+        defense.removed_wfp().contains(&transient_bth_handle),
+        "host-wide TransientContainment on backgroundTaskHost.exe must be released after installing package-scoped block"
+    );
+    assert!(store.list_rules(None).expect("legacy rules").is_empty());
+
+    // Case B: PFN_ONLY_NON_APPCONTAINER (pfn_only_host) & NON_PACKAGED (unsigned_b2)
+    // TerminateAndBlock(scope_to_package=true) skips persistent block save and releases transient containment.
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_rb,
+                parent_pid: 4,
+                exe_path: pfn_only_exe.to_string(),
+                command_line: "pfn_only_host.exe -Embedding".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+                package_sid: None,
+            },
+        )
+        .await
+        .expect("send start PFN-only");
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_rb.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 92)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send net PFN-only");
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_nonpkg,
+                parent_pid: 4,
+                exe_path: unsigned_exe.to_string(),
+                command_line: "unsigned_b2.exe".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: None,
+                package_sid: None,
+            },
+        )
+        .await
+        .expect("send start nonpkg");
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_nonpkg.pid,
+            protocol: 6,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 93)),
+            dst_port: 443,
+            domain_hint: None,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send net nonpkg");
+    wait_high_priority_processed(&engine, 6, "PFN-only and non-pkg outbound alerts").await;
+
+    let transient_rb_handle = defense
+        .added_wfp()
+        .iter()
+        .find(|c| c.exe_path.eq_ignore_ascii_case(pfn_only_exe) && !c.allow && c.remote_ip.is_none())
+        .expect("transient PFN-only handle")
+        .handle;
+    let alert_rb = store
+        .list_alerts(Some(AlertStatus::Pending), 10)
+        .expect("list")
+        .into_iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(id_rb.instance_id().as_str()))
+        .expect("alert_rb");
+    let alert_nonpkg = store
+        .list_alerts(Some(AlertStatus::Pending), 10)
+        .expect("list")
+        .into_iter()
+        .find(|a| a.process_instance_id.as_deref() == Some(id_nonpkg.instance_id().as_str()))
+        .expect("alert_nonpkg");
+
+    // Case C: AllowPermanent(scope_to_package=true) fail-closed checks on Layer 3:
+    // - PFN_ONLY_NON_APPCONTAINER (missing package_sid) -> Err
+    assert!(engine
+        .resolve_alert_scoped_with_outcome(
+            &alert_rb.alert_id,
+            AlertDecision::AllowPermanent {
+                use_signer_if_available: true,
+                allow_dest: None,
+            },
+            true,
+        )
+        .is_err());
+    // - Missing use_signer_if_available -> Err
+    let alert_no_pfn_id = "ALERT-SC-NO-PFN";
+    store
+        .record_alert(&AlertRecord {
+            alert_id: alert_no_pfn_id.to_string(),
+            timestamp_ms: now_ms,
+            severity: AlertSeverity::Medium,
+            source_layer: "LAYER_3_NETWORK".to_string(),
+            rule_id: "NET_OUTBOUND_ENFORCE".to_string(),
+            title: "Outbound".to_string(),
+            process_instance_id: None,
+            process_suspended: false,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": bth_exe,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "package_sid": "S-1-15-2-9999-1",
+                "dst_ip": "198.51.100.94",
+                "dst_port": 443
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("record alert_no_pfn");
+    // Missing package_family_name -> Err
+    assert!(engine
+        .resolve_alert_scoped_with_outcome(
+            alert_no_pfn_id,
+            AlertDecision::AllowPermanent {
+                use_signer_if_available: true,
+                allow_dest: None,
+            },
+            true,
+        )
+        .is_err());
+    // Unsigned binary even with PFN+SID -> Err (L-04)
+    let alert_unsigned_scoped_id = "ALERT-SC-UNSIGNED";
+    store
+        .record_alert(&AlertRecord {
+            alert_id: alert_unsigned_scoped_id.to_string(),
+            timestamp_ms: now_ms,
+            severity: AlertSeverity::Medium,
+            source_layer: "LAYER_3_NETWORK".to_string(),
+            rule_id: "NET_OUTBOUND_ENFORCE".to_string(),
+            title: "Outbound".to_string(),
+            process_instance_id: None,
+            process_suspended: false,
+            status: AlertStatus::Pending,
+            context_json: serde_json::json!({
+                "exe_path": unsigned_exe,
+                "package_family_name": "Contoso.Unsigned_1",
+                "package_sid": "S-1-15-2-9999-2",
+                "dst_ip": "198.51.100.95",
+                "dst_port": 443
+            })
+            .to_string(),
+            resolved_at_ms: None,
+        })
+        .expect("record alert_unsigned_scoped");
+    assert!(engine
+        .resolve_alert_scoped_with_outcome(
+            alert_unsigned_scoped_id,
+            AlertDecision::AllowPermanent {
+                use_signer_if_available: false,
+                allow_dest: None,
+            },
+            true,
+        )
+        .is_err());
+    assert!(engine
+        .resolve_alert_scoped_with_outcome(
+            alert_unsigned_scoped_id,
+            AlertDecision::AllowPermanent {
+                use_signer_if_available: true,
+                allow_dest: None,
+            },
+            true,
+        )
+        .is_err());
+
+    // Now resolve alert_rb & alert_nonpkg via TerminateAndBlock(scope_to_package=true):
+    // both succeed with saved_rule_id == None and release transient containment.
+    let scoped_before = store.list_scoped_rules(None).expect("list").len();
+    let out_rb = engine
+        .resolve_alert_scoped_with_outcome(
+            &alert_rb.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+            true,
+        )
+        .expect("resolve PFN-only terminate");
+    assert_eq!(out_rb.saved_rule_id, None);
+    assert!(defense.removed_wfp().contains(&transient_rb_handle));
+
+    let out_nonpkg = engine
+        .resolve_alert_scoped_with_outcome(
+            &alert_nonpkg.alert_id,
+            AlertDecision::TerminateAndBlock {
+                add_block_rule: true,
+            },
+            true,
+        )
+        .expect("resolve non-packaged terminate");
+    assert_eq!(out_nonpkg.saved_rule_id, None);
+    assert_eq!(store.list_scoped_rules(None).expect("list").len(), scoped_before);
+
+    engine.shutdown_and_flush().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_b2_prg_001_single_candidate_sid_mismatch_refuses_attribution() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    inspector.insert(
+        bth_exe,
+        BinaryIdentity {
+            exe_path: bth_exe.to_string(),
+            sha256: Some("c".repeat(64)),
+            authenticode: None,
+        },
+    );
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            wfp_drop_dns_grace_ms: 0,
+            wfp_drop_attribution_grace_ms: 0,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id_b = ProcessIdentity::new(47_401, unix_ms_to_filetime(now_ms - 1_000));
+    let sid_b = "S-1-15-2-4444-2";
+    let pfn_b = "Contoso.CandB_8wekyb3d8bbwe";
+    let sid_a = "S-1-15-2-3333-1";
+
+    engine
+        .sender()
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_b,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:CandB".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some(pfn_b.to_string()),
+                package_sid: Some(sid_b.to_string()),
+            },
+        )
+        .await
+        .expect("send start CandB");
+    wait_high_priority_processed(&engine, 1, "start CandB").await;
+
+    assert!(engine.ingest_wfp_drop_event(WfpDropEvent {
+        os_filter_id: 701,
+        rule_handle: 701,
+        exe_path: bth_exe.to_string(),
+        protocol: 6,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 120)),
+        dst_port: 443,
+        timestamp_ms: now_ms,
+        package_sid: Some(sid_a.to_string()),
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while store.list_alerts(None, 10).expect("list").is_empty() {
+        assert!(Instant::now() < deadline, "timed out waiting for PRG-001 drop alert");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let alerts = store.list_alerts(None, 10).expect("list alerts");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].process_instance_id, None);
+    assert!(
+        !defense.suspends().contains(&id_b),
+        "PRG-001: Candidate B must NOT be suspended when WFP event carries SID A"
+    );
+    let ctx: serde_json::Value = serde_json::from_str(&alerts[0].context_json).expect("parse ctx");
+    assert_eq!(ctx["attribution"], "app_level_ambiguous");
+    assert_eq!(ctx["package_sid"], sid_a);
+    assert!(ctx["package_family_name"].is_null());
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_b2_layer1_process_allow_and_layer2_canary_scoped_eval() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let rb_exe = r"C:\Windows\System32\RuntimeBroker.exe";
+    let rb_sha = "1".repeat(64);
+    inspector.insert(
+        rb_exe,
+        BinaryIdentity {
+            exe_path: rb_exe.to_string(),
+            sha256: Some(rb_sha.clone()),
+            authenticode: None,
+        },
+    );
+
+    let sigma_rule = SigmaRule {
+        id: "TEST-B2-RB-PROC".to_string(),
+        title: "RuntimeBroker Exec Rule".to_string(),
+        severity: AlertSeverity::Medium,
+        description: None,
+        conditions: vec![FieldCondition {
+            field: SigmaField::Image,
+            modifier: MatchModifier::EndsWith,
+            values: vec![r"\RuntimeBroker.exe".to_string()],
+        }],
+    };
+    let pruner = EarlyPruner::default();
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(vec![sigma_rule]).expect("compile sigma"),
+        pruner,
+        DaemonConfig {
+            outbound_firewall_enabled: false,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let process_allow = ScopedPolicyRuleRecord {
+        rule_id: "SC-PROC-RB-1".to_string(),
+        scope: RuleScope::ProcessAllow,
+        exe_path_pattern: rb_exe.to_string(),
+        sha256: Some(rb_sha.clone()),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+        package_sid: None,
+        command_line_pattern: Some("*-Embedding".to_string()),
+        created_at_ms: 1_750_000_000_000,
+        created_by: "test_b2".to_string(),
+    };
+    let canary_allow = ScopedPolicyRuleRecord {
+        rule_id: "SC-CANARY-RB-1".to_string(),
+        scope: RuleScope::FileCanaryAllow,
+        exe_path_pattern: rb_exe.to_string(),
+        sha256: Some(rb_sha),
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some(r"C:\Users\*\Documents\*.txt".to_string()),
+        package_family_name: Some("Contoso.Reader_111".to_string()),
+        package_sid: None,
+        command_line_pattern: Some("*-reader*".to_string()),
+        created_at_ms: 1_750_000_000_001,
+        created_by: "test_b2".to_string(),
+    };
+    engine
+        .upsert_scoped_policy_rule(&process_allow)
+        .expect("upsert ProcessAllow");
+    engine
+        .upsert_scoped_policy_rule(&canary_allow)
+        .expect("upsert FileCanaryAllow");
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id_proc_ok = ProcessIdentity::new(47_501, unix_ms_to_filetime(now_ms - 4_000));
+    let id_proc_bad = ProcessIdentity::new(47_502, unix_ms_to_filetime(now_ms - 3_000));
+    let id_canary_ok = ProcessIdentity::new(47_503, unix_ms_to_filetime(now_ms - 2_000));
+    let id_canary_bad = ProcessIdentity::new(47_504, unix_ms_to_filetime(now_ms - 1_000));
+    let sender = engine.sender();
+
+    // 1. Layer 1 ProcessAllow: matching PFN+cmdline suppresses Sigma; non-matching cmdline alerts.
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_proc_ok,
+                parent_pid: 4,
+                exe_path: rb_exe.to_string(),
+                command_line: "RuntimeBroker.exe -Embedding".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+                package_sid: None,
+            },
+        )
+        .await
+        .expect("send id_proc_ok");
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_proc_bad,
+                parent_pid: 4,
+                exe_path: rb_exe.to_string(),
+                command_line: "RuntimeBroker.exe -UnexpectedArg".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Microsoft.Windows.Shell_cw5n1h2txyewy".to_string()),
+                package_sid: None,
+            },
+        )
+        .await
+        .expect("send id_proc_bad");
+
+    // 2. Layer 2 FileCanaryAllow: matching PFN+cmdline+target allowed; sibling PFN alerts.
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_canary_ok,
+                parent_pid: 4,
+                exe_path: rb_exe.to_string(),
+                command_line: "RuntimeBroker.exe -reader-mode".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.Reader_111".to_string()),
+                package_sid: None,
+            },
+        )
+        .await
+        .expect("send id_canary_ok");
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_canary_bad,
+                parent_pid: 4,
+                exe_path: rb_exe.to_string(),
+                command_line: "RuntimeBroker.exe -reader-mode".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.Evil_222".to_string()),
+                package_sid: None,
+            },
+        )
+        .await
+        .expect("send id_canary_bad");
+    wait_high_priority_processed(&engine, 4, "four RuntimeBroker starts").await;
+
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: id_canary_ok.pid,
+            target_path: r"C:\Users\Alice\Documents\notes.txt".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x2,
+            is_write_or_delete: true,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send canary ok");
+    sender
+        .send(SensorEvent::CanaryFileAccess {
+            pid: id_canary_bad.pid,
+            target_path: r"C:\Users\Alice\Documents\notes.txt".to_string(),
+            category: CanaryCategory::Honeypot,
+            access_mask: 0x2,
+            is_write_or_delete: true,
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send canary bad");
+    wait_high_priority_processed(&engine, 6, "two CanaryFileAccess events").await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let alerts = store.list_alerts(None, 20).expect("list alerts");
+    let proc_alerts: Vec<&AlertRecord> = alerts
+        .iter()
+        .filter(|a| a.source_layer == "LAYER_2_RULES")
+        .collect();
+    // Sigma rule matches all 4 ProcessStarts except id_proc_ok (which matches ProcessAllow);
+    // verify id_proc_ok has 0 LAYER_2_RULES alerts while id_proc_bad has 1.
+    assert!(
+        !proc_alerts
+            .iter()
+            .any(|a| a.process_instance_id.as_deref() == Some(id_proc_ok.instance_id().as_str())),
+        "matching ProcessAllow command line must suppress LAYER_2_RULES alert"
+    );
+    assert!(
+        proc_alerts
+            .iter()
+            .any(|a| a.process_instance_id.as_deref() == Some(id_proc_bad.instance_id().as_str())),
+        "non-matching command line must still trigger LAYER_2_RULES alert"
+    );
+
+    let canary_alerts: Vec<&AlertRecord> = alerts
+        .iter()
+        .filter(|a| a.source_layer == "LAYER_1_CANARY")
+        .collect();
+    assert_eq!(canary_alerts.len(), 1, "expected 1 canary alert, got {canary_alerts:?}");
+    assert_eq!(
+        canary_alerts[0].process_instance_id.as_deref(),
+        Some(id_canary_bad.instance_id().as_str())
+    );
+}
+
+#[tokio::test]
+async fn daemon_fu_p4_03_b2_r1_domain_block_delete_failure_rollback_and_wildcard_late_start_sec_0002() {
+    let store = LedrStore::open_in_memory().expect("open store");
+    let defense = Arc::new(MockDefense::new());
+    let inspector = Arc::new(MapBinaryInspector::default());
+
+    let bth_exe = r"C:\Windows\System32\backgroundTaskHost.exe";
+    let late_exe = r"C:\Tools\LatePkg_1\worker.exe";
+    let signer = "CN=Microsoft Windows";
+    let root_tp = "ab".repeat(20);
+    for exe in [bth_exe, late_exe] {
+        inspector.insert(
+            exe,
+            BinaryIdentity {
+                exe_path: exe.to_string(),
+                sha256: Some("e".repeat(64)),
+                authenticode: Some(AuthenticodeInfo {
+                    signer_subject: signer.to_string(),
+                    root_thumbprint: root_tp.clone(),
+                }),
+            },
+        );
+    }
+
+    let engine = DaemonEngine::start_with_all_dependencies(
+        store.clone(),
+        SigmaEngine::from_rules(Vec::new()).expect("empty sigma"),
+        EarlyPruner::default(),
+        DaemonConfig {
+            outbound_firewall_enabled: true,
+            outbound_enforcement_mode: OutboundEnforcementMode::Enforce,
+            pipe_name: unique_test_pipe_name(),
+            ..DaemonConfig::default()
+        },
+        Arc::clone(&defense) as Arc<dyn ActiveDefenseController>,
+        Arc::new(RecordingNotifier::default()),
+        Arc::clone(&inspector) as Arc<dyn BinaryInspector>,
+        Arc::new(NullLiveProcessInspector),
+    );
+
+    let sid_a = "S-1-15-2-7100-1";
+    let pfn_a = "Contoso.DomainBlk_8wekyb3d8bbwe";
+    let dom_block_rule = ScopedPolicyRuleRecord {
+        rule_id: "SC-DOM-BLK-R1".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: bth_exe.to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: Some("blocked.example".to_string()),
+        package_family_name: Some(pfn_a.to_string()),
+        package_sid: Some(sid_a.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_000,
+        created_by: "test_r1".to_string(),
+    };
+    engine
+        .upsert_scoped_policy_rule(&dom_block_rule)
+        .expect("upsert pure domain scoped NetworkBlock");
+
+    let sid_late = "S-1-15-2-7200-2";
+    let wildcard_block_rule = ScopedPolicyRuleRecord {
+        rule_id: "SC-WILD-LATE-R1".to_string(),
+        scope: RuleScope::NetworkBlock,
+        exe_path_pattern: r"C:\Tools\LatePkg_*\worker.exe".to_string(),
+        sha256: None,
+        signer_subject: None,
+        root_thumbprint: None,
+        allowed_target: None,
+        package_family_name: Some("Contoso.LatePkg_8wekyb3d8bbwe".to_string()),
+        package_sid: Some(sid_late.to_string()),
+        command_line_pattern: None,
+        created_at_ms: 1_750_000_000_001,
+        created_by: "test_r1".to_string(),
+    };
+    engine
+        .upsert_scoped_policy_rule(&wildcard_block_rule)
+        .expect("upsert wildcard scoped NetworkBlock before launch");
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let id_a = ProcessIdentity::new(47_601, unix_ms_to_filetime(now_ms - 1_000));
+    let id_late = ProcessIdentity::new(47_602, unix_ms_to_filetime(now_ms - 500));
+    let sender = engine.sender();
+
+    // 1. Materialize pure domain scoped NetworkBlock on IP 198.51.100.210, then fail delete -> rollback!
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_a,
+                parent_pid: 4,
+                exe_path: bth_exe.to_string(),
+                command_line: "backgroundTaskHost.exe -ServerName:DomBlk".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some(pfn_a.to_string()),
+                package_sid: Some(sid_a.to_string()),
+            },
+        )
+        .await
+        .expect("send start bth");
+    let blocked_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 210));
+    sender
+        .send_high_priority(SensorEvent::DnsQuery {
+            pid: id_a.pid,
+            query_name: "blocked.example".to_string(),
+            query_type: 1,
+            resolved_ips: vec![blocked_ip],
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send dns");
+    sender
+        .send_high_priority(SensorEvent::NetworkConnect {
+            pid: id_a.pid,
+            protocol: 6,
+            dst_ip: blocked_ip,
+            dst_port: 443,
+            domain_hint: Some("blocked.example".to_string()),
+            timestamp_ms: now_ms,
+        })
+        .await
+        .expect("send net to materialize domain block");
+    wait_high_priority_processed(&engine, 3, "domain block materialization").await;
+
+    assert!(
+        defense.added_scoped_wfp().iter().any(|c| {
+            c.exe_path.eq_ignore_ascii_case(bth_exe)
+                && c.package_sid.as_deref() == Some(sid_a)
+                && c.remote_ip == Some(blocked_ip)
+                && !c.allow
+        }),
+        "expected materialized scoped IP block for blocked.example"
+    );
+
+    defense.set_fail_next_remove(true);
+    let del_err = engine.delete_scoped_policy_rule(&dom_block_rule.rule_id);
+    assert!(
+        matches!(del_err, Err(ledr_daemon::PolicyRuleError::FirewallSync(_))),
+        "BUG_0002: failed BFE removal of domain block must return FirewallSync error, got {del_err:?}"
+    );
+    assert!(
+        store
+            .get_scoped_rule(&dom_block_rule.rule_id)
+            .expect("query")
+            .is_some(),
+        "BUG_0002: SQLite domain block rule must be restored on BFE removal failure"
+    );
+
+    // 2. SEC_0002: Late ProcessStart matching wildcard scoped NetworkBlock must immediately
+    // materialize a package-scoped WFP Block before any NetworkConnect event.
+    let scoped_before = defense.added_scoped_wfp().len();
+    sender
+        .send_with_package(
+            SensorEvent::ProcessStart {
+                identity: id_late,
+                parent_pid: 4,
+                exe_path: late_exe.to_string(),
+                command_line: "worker.exe".to_string(),
+                user_sid: None,
+            },
+            ProcessPackageInfo {
+                package_family_name: Some("Contoso.LatePkg_8wekyb3d8bbwe".to_string()),
+                package_sid: Some(sid_late.to_string()),
+            },
+        )
+        .await
+        .expect("send late ProcessStart");
+    wait_high_priority_processed(&engine, 4, "late ProcessStart wildcard materialization").await;
+    engine.shutdown_and_flush().await.expect("shutdown");
+
+    let new_scoped = &defense.added_scoped_wfp()[scoped_before..];
+    assert!(
+        new_scoped.iter().any(|c| {
+            c.exe_path.eq_ignore_ascii_case(late_exe)
+                && c.package_sid.as_deref() == Some(sid_late)
+                && c.remote_ip.is_none()
+                && !c.allow
+        }),
+        "SEC_0002: expected wildcard scoped NetworkBlock materialized immediately on late ProcessStart, got {new_scoped:?}"
+    );
 }

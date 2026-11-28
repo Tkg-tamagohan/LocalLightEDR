@@ -58,3 +58,22 @@
   バージョン同期対象は `3 ファイル`（`Cargo.toml`、`apps/ledr-ui/tauri.conf.json`、`extensions/ledr-chrome-mv3/manifest.json`）、固定 Chrome 拡張 ID 長は `32 文字`（`ecelachfiiiiiibpjeomfncgpegbpanh`、`L-20`）とします。
 - **CI と自動検証基準**：`cargo clippy --workspace --all-targets --locked -- -D warnings` は警告 `0 件`、`cargo test --workspace --locked`、UI モック DOM テスト（`phase4_ui.test.mjs` および `updater_ui.test.mjs`）、Chrome 拡張テスト、`test_release_scripts.py`、および `test_check_invariants.py` は全件合格とします。
   変更文書に対する `slop_lint.py --strict` の警告とエラーは `0 件`、全テキスト検査の `U+FFFD` と競合マーカーは `0 件` とします。
+
+## 今後の仕様決定記録（L-30 以降の追記専用 ADR）
+
+既存の `L-01`〜`L-29` 一覧表は他文書からの ID 参照互換性を保つため書き換えず、`L-30` 以降の新規決定と既存決定の改定は本節末尾へ追記専用で記録します。
+既存の決定を改定するときは元エントリを上書きせず、`Supersedes` に置き換え元 ID（`L-XX` または `ADR-L-XX`）を明記した新しいエントリを末尾へ追記します。
+
+```markdown
+## ADR-L-<NN>: <決定タイトル>
+
+- **Status**：Accepted
+- **Supersedes**：なし（既存決定を置き換える場合は `L-XX` または `ADR-L-XX` を記載）
+- **Date**：YYYY-MM-DD
+- **Scope**：<対象領域、クレート、層>
+- **Decision**：<確定した決定内容>
+- **Rejected Alternatives & Reason**：<却下した代替案とその理由>
+- **Verbatim Raw Evidence**：<決定根拠となった未加工の計測値、ログ、仕様引用>
+- **Revert Condition**：<この決定を再検討または撤回する具体条件>
+- **Source Conversation**：`conversation://<id>`
+```

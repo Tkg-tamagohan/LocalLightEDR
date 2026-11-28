@@ -18,7 +18,7 @@
     "two_lane_no_unbounded_channel": {
       "heading": "Phase 1 Two-Lane Bounded Channel Boundary",
       "description": "センサーから DaemonEngine への供給は TwoLaneSender（HIGH_PRIORITY_CHANNEL_CAPACITY = 1024 / TELEMETRY_CHANNEL_CAPACITY = 8192）直結とし、前段へ無制限チャネルを挟まない。",
-      "source_file": "AGENTS.md",
+      "source_file": ".agents/rules/daemon-wfp-process-invariants.md",
       "path_globs": [
         "crates/ledr-proto/src/lib.rs",
         "crates/ledr-daemon/src/**",
@@ -123,7 +123,7 @@
     "nrd_shutdown_nonblocking_and_checkpoint": {
       "heading": "Phase 3 Non-Blocking NRD Shutdown, Checkpoint Priority, and Chunked Cancel",
       "description": "NRD 更新スレッド停止は spawn_blocking を使わず NrdThreadHandle（oneshot と InFlightGuard::drop）で非ブロッキング待機し、checkpoint_truncate 優先と 64 KiB チャンク単位キャンセルを維持する。",
-      "source_file": "AGENTS.md",
+      "source_file": ".agents/rules/daemon-wfp-process-invariants.md",
       "path_globs": [
         "crates/ledr-daemon/src/engine/lifecycle.rs",
         "crates/ledr-daemon/src/engine/nrd.rs",
@@ -140,7 +140,7 @@
     "phase4_nrd_local_only_and_motw": {
       "heading": "Phase 4 Local-Only NRD Evaluation and 3-Stage MOTW Lineage",
       "description": "Phase 4 の NRD 判定は閲覧ドメインを外部送信せずローカル完結に保ち、ダウンロード起源はパス・SHA-256・:Zone.Identifier の 3 段階で紐付ける。",
-      "source_file": ".agents/rules/active-defense-guards.md",
+      "source_file": ".agents/rules/browser-ui-invariants.md",
       "path_globs": [
         "extensions/ledr-chrome-mv3/**",
         "crates/ledr-bridge-nm/**",
@@ -173,7 +173,7 @@
     "phase4_ui_manifest_allowlist_and_wow64": {
       "heading": "Phase 4 View 3 Manifest Allowlist, WOW64 Lookup, and Detail Row Guard",
       "description": "View 3 マニフェスト検証の既定 2 ディレクトリホワイトリスト（カスタム配置のファイル I/O ゼロと unverified 区別、リパースポイント拒否、FILE_FLAG_OPEN_REPARSE_POINT と FILE_READ_ATTRIBUTES 先行検査、nNumberOfLinks == 1、GetFinalPathNameByHandleW 閉じ込め、ReOpenFile 昇格、description 必須）、View 3 診断の WOW64 参照順（KEY_WOW64_32KEY -> KEY_WOW64_64KEY）と EmptyString 32 ビット打切り、および .browser-detail-row の manifest_path と診断表示併記と UI-P4-08 等のブラウザ単位抽出および他ブラウザ情報非混入検証を維持する。",
-      "source_file": "AGENTS.md",
+      "source_file": ".agents/rules/browser-ui-invariants.md",
       "path_globs": [
         "apps/ledr-ui/src/defense_status.rs",
         "apps/ledr-ui/src/uri_reg.rs",
@@ -206,7 +206,7 @@
     "bridge_nm_wow64_probe_and_status": {
       "heading": "CLI Native Messaging Chromium-Compatible Probe and HKLM WOW64 Short-Circuit",
       "description": "crates/ledr-bridge-nm/src/setup.rs のレジストリ文字列プローブ（REG_SZ / REG_EXPAND_SZ 対応、トリム前生値と 2,048 バイト時末尾 NUL 必須およびトリム前展開結果に対する 1,024 UTF-16 単位上限 CHROMIUM_READ_VALUE_MAX_UTF16_UNITS、UnresolvableExpandSz の 32 ビット打ち切り、ChromiumReadFallback の HKLM 診断 64 ビットフォールバック）と、HKLM 診断での stops_wow64_fallback() 成立時の 64 ビット非参照短絡終了（HKCU 等は既定ビューのみ）を維持する。",
-      "source_file": ".agents/rules/active-defense-guards.md",
+      "source_file": ".agents/rules/browser-ui-invariants.md",
       "path_globs": [
         "crates/ledr-bridge-nm/src/setup.rs"
       ],
@@ -221,7 +221,7 @@
     "bridge_nm_unregister_manifest_protection": {
       "heading": "CLI Native Messaging Fail-Closed Manifest Protection and Multi-View manifest_removed",
       "description": "crates/ledr-bridge-nm/src/setup.rs の unregister において、HKLM 両ビューのレジストリキー冪等削除後の共有マニフェスト削除前参照検査（any_browser_references_manifest_with）で、一致時および UnresolvableExpandSz・ChromiumReadFallback { resolved_path: None } 検出時の削除抑止早期リターン（Ok(true)）を維持しつつ、stops_wow64_fallback()（EmptyString や非一致 Present 等）で 64 ビットビューをスキップせず全ブラウザの 32 ビット・64 ビット両ビューをすべて検査してから削除許可（Ok(false)）を判定し、最大 32,768 UTF-16 単位展開の ChromiumReadFallback { resolved_path: Some(..) } を保護対象に含め、ブラウザ別 manifest_removed を両ビュー全登録パスの正規化比較で判定する。",
-      "source_file": ".agents/rules/active-defense-guards.md",
+      "source_file": ".agents/rules/browser-ui-invariants.md",
       "path_globs": [
         "crates/ledr-bridge-nm/src/setup.rs"
       ],

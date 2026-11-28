@@ -1,6 +1,6 @@
 ---
 trigger: model_decision
-description: LocalEDR の防御アクチュエータ（サスペンド、終了）、おとりファイル（サービス配置と L-06 自動削除）、Session 0 通知、IPC 認可と Authenticode 署名検証キャッシュ、WFP 動的フィルタ、ブラウザ拡張と MOTW 連携、View 3 マニフェスト検証、ledr-bridge-nm の Native Messaging レジストリプローブとマニフェスト削除保護、アンインストール前検査、インストーラ ACL 保護、アップデータ署名状態検証、および Win32 HRESULT エラー変換を実装またはレビューするとき
+description: LocalEDR の防御アクチュエータ（サスペンド、TerminateAndBlock、ProcessLiveness、rollback_saved_rule）、おとりファイル（L-06 自動削除）、ETW レジストリ CloseKey 監視、Session 0 通知、IPC 認可と dev_bypass_auth、--prepare-dir、WFP 動的フィルタとドメイン由来フィルタ、デュアルスタック DNS 履歴、BFE ドロップ有界キュー、アンインストール前検査、インストーラ ACL 保護、アップデータ署名状態検証、および Win32 HRESULT エラー変換を実装またはレビューするとき
 ---
 
 # 能動防御と特権境界の安全制約を遵守する
@@ -23,17 +23,30 @@ LocalEDR の Layer 1 から Layer 4 にわたる能動防御処理と特権境�
    これらの IPC 呼び出し元検証（開発バイパス無効かつ SHA-256 ピン単独で完結しない Authenticode 検証経路）ではキャッシュを迂回する `inspect_uncached` を使い、アプリ内のキャッシュ済み判定を再利用せず毎回検証する（`ledr-auth-helper` は `WTD_REVOCATION_CHECK_NONE` を用いるためオンライン CRL/OCSP の失効確認は行わない）。
 5. WFP 動的フィルタ：Phase 3 の WFP エンジンは `FWPM_SESSION_FLAG_DYNAMIC` と独自 SubLayer を必ず使い、異常終了時に恒久ブロックを残さない。
    サスペンドとフィルタ追加の片系失敗時は孤立状態を残さず復元する。
-6. Chrome と MOTW：Phase 4 の NRD 判定は外部へ閲覧ドメインを送信せずローカル完結に保ち、ダウンロード起源はパス、SHA-256、`:Zone.Identifier` の 3 段階で紐付ける。
-7. View 3 マニフェスト検証：Native Messaging マニフェストの読み取りは既定 2 ディレクトリのホワイトリスト配下だけに限定し、カスタム配置パスに対してはファイル I/O を行わない。
-   ホワイトリスト配下でもリパースポイントを拒否し、`FILE_FLAG_OPEN_REPARSE_POINT` と `FILE_READ_ATTRIBUTES` で先行検査して `nNumberOfLinks == 1` および `GetFinalPathNameByHandleW` によるディレクトリ閉じ込めを確認してから、`ReOpenFile` で読み取りハンドルへ昇格して読み取る。
-8. CLI Native Messaging レジストリプローブとマニフェスト削除保護：`crates/ledr-bridge-nm/src/setup.rs` の `HKLM` Native Messaging 操作は `setup --scope machine` で 32 ビットおよび 64 ビット両ビューへ冪等に登録し、レジストリ文字列プローブは Chromium 互換で `REG_SZ` と `REG_EXPAND_SZ` の双方を扱い、空白トリム前の生値（2,048 バイト時の末尾 UTF-16 NUL 終端必須を含む `exceeds_chromium_raw_limit`）および空白トリム前の展開結果に対して 1,024 UTF-16 コード単位上限（`CHROMIUM_READ_VALUE_MAX_UTF16_UNITS`）を判定する。
-   上限内かつ未解決の環境変数（展開後も `%TOKEN%` が残存する `has_unresolved_env_token` 検出）を含む `REG_EXPAND_SZ` は `UnresolvableExpandSz` として 32 ビット優先打ち切りとし、上限超過または `ExpandEnvironmentStringsW` 失敗は `ChromiumReadFallback` として `HKLM` 診断のみ 64 ビットビューへフォールバックする。
-   `HKLM` の WOW64 診断（`run_status_with_ops`）は 32 ビットビューで `stops_wow64_fallback()`（`Present`、`EmptyString`、`UnresolvableExpandSz`）が成立した時点で 64 ビットビューを読まずに短絡終了する（`HKCU`、URI スキーム、AUMID、グループポリシーはフラグなしの既定ビューのみを維持する）。
-   `unregister` では両ビューのレジストリキーを冪等に削除したうえで、共有マニフェストファイル削除前の参照検査（`any_browser_references_manifest_with`）では、マニフェスト一致またはフェイルクローズ対象（`UnresolvableExpandSz` と `ChromiumReadFallback { resolved_path: None }`）検出時の削除抑止の早期リターン（`Ok(true)`）を維持しつつ、`stops_wow64_fallback()`（`EmptyString` や非一致の `Present` 等）で 64 ビットビューをスキップせず全ブラウザの 32 ビットおよび 64 ビット両ビューをすべて検査してから削除許可（`Ok(false)`）を判定し、最大 32,768 UTF-16 コード単位まで保守的に展開した `ChromiumReadFallback { resolved_path: Some(..) }` を保護対象に含め、ブラウザ別 `manifest_removed` は 32 ビットおよび 64 ビット両ビューの全登録パスを `normalize_display_path` と大文字小文字無視の正規化比較で照合する。
-9. アンインストール・インストーラ・アップデータ特権境界：アンインストール前段は読み取り専用（`--check-unresolved-suspended`）で未解決凍結アラートを検査し、`ProcessLiveness` と `CreationTime` 照合に加えハンドル上で `PROCESS_SYNCHRONIZE` 取得時は `WaitForSingleObject(0) == WAIT_OBJECT_0`、権限拒否時の `PROCESS_QUERY_LIMITED_INFORMATION` フォールバックでは `GetExitCodeProcess != STILL_ACTIVE` により終了済みゾンビハンドルを `Gone`（続行可）として区別し、PID 不明・生存残存・`Unknown`・作成時刻欠損かつ消失未確認（PID 再利用を排除不能）・検査失敗時はフェイルクローズで中断する。
-   再インストール時の ACL 保護は明示 ACE を削除したうえで、対象ツリー内のリパースポイント不在を事前検証（`Assert-NoReparsePointsInTree`）してから `icacls /reset /T` を適用し、復元失敗時は管理者専用バックアップを保全する。
-   `update-state.json` へ更新マニフェストをキャッシュ永続化するときは署名付きマニフェストと署名エンベロープを併記し（最新版確認のみの保存では確認時刻とバージョンのみ保持）、起動時にキャッシュが存在する場合はサイズ上限・Ed25519 署名・SemVer・ファイル名を再検証して不正時は `Idle` へフェイルクローズする。
-10. Win32 `HRESULT` エラー種別変換：`windows::core::Error` の `HRESULT_FROM_WIN32`（`0x8007xxxx`）を `std::io::Error::from` へ直接渡すと `ErrorKind::Uncategorized` になるため、エラー種別を判定する経路では `(hresult & 0xFFFF_0000) == 0x8007_0000` を満たす場合のみ下位 16 ビットを `std::io::Error::from_raw_os_error` へ変換し、それ以外の `HRESULT` は元の `std::io::Error::from` として扱う。
+6. 防御アクチュエータ記録、ロールバック、および `ProcessLiveness` / `TerminateAndBlock`：状態記録は防御アクチュエータで確認できた分だけを記録し、`suspended_children` には凍結確認済みの子のみを含める。
+   ルール保存（永続許可や遮断ルール）のあとに再開や状態更新が失敗したときは、保存済みルールに対して `rollback_saved_rule` による補償削除をベストエフォートで試み、削除にも失敗した場合は警告ログを記録して元のエラーを返す（取り消しの成功までは保証しない）。
+   凍結済み対象（`process_suspended` が真の親プロセスおよび記録済み `suspended_children`）の再開や終了の失敗における存否判定は `ProcessLiveness`（`Running`、`Gone`、`Unknown`）の三値で扱い、スナップショット列挙の失敗（`Unknown`）を消失とみなさず、消失の許容は `CreationTime mismatch` または `Gone` の確認に限る。
+   一方、凍結記録のない親プロセスの終了失敗は、保護対象の拒否を除き存否確認を行わず警告ログを出して続行する。
+   `TerminateAndBlock` では、親プロセスの保護対象拒否と凍結済み親の識別子欠落は、記録済みの子を試行せず即時にエラーを返して打ち切る。
+   保護対象拒否以外の理由で凍結済み親の終了に失敗し、消失や PID 再利用を確認できない場合は、記録済みの子を全員終了試行したうえで子の成否にかかわらず親の終了エラーを返す。
+   それ以外の経路（親の終了成功、失敗許容、または非凍結親の識別子欠落）で記録済み子プロセスの終了ループへ進んだ場合に限り、保護対象拒否または消失や PID 再利用を確認できない実エラーが起きても途中で打ち切らず残りの子も全員試行し、最初の実エラーを保持してループ後に返す。
+7. ETW レジストリ監視、`--prepare-dir`、および `dev_bypass_auth`：ETW レジストリ監視は `CloseKey`（キーワード `0x0001`）を購読し、NTSTATUS 系 `Status` に非ゼロ値が明示された失敗イベントだけを除外し、`Status` が `0` または欠落している場合は処理を継続して `KeyObject` キャッシュの更新や無効化およびアラート発行を判定する。
+   監視外と判明した `KeyObject` はキャッシュから除去し、`DeleteKey` と `CloseKey` で無効化する。
+   `--prepare-dir` は `create_new(true)` でファイルを排他作成し、失敗時は今回作成分のファイルだけを削除対象にしてベストエフォートで削除を試みる（既存ファイルは削除せず、削除エラーは無視して準備エラーを返す）。
+   `dev_bypass_auth` は実行時呼び出し元認証の迂回であり、使用しない署名設定の要求をスキップする。
+8. デュアルスタック DNS 履歴と共有 IP 遮断優先：デュアルスタック DNS 履歴（`ProcessDnsHistory`）は `LatestDomainIps` で IPv4 と IPv6 の最新 IP 集合と時刻を独立管理し、`canonical_ip` により IPv4 射影 IPv6 を参照時に正規化し、遅延応答で既存エントリのより新しい時刻を後退させない。
+   各 `(process_instance_id, IpAddr)` エントリは複数ドメイン候補（上限 `MAX_DOMAINS_PER_PROCESS_IP = 16`）を保持し、複数候補の評価は `select_outbound_decision_for_domains` の優先順位（`ProtectedOs`、`BlockedByRule`、`AllowedByRule`、最新候補の順）へ統一する。
+   プロセス終了後や容量退避後でも `domains_for_exe_ip` と `current_domains_by_ip_for_exe` で全ドメイン横断の最新履歴を照合し、共有 IP の遮断優先（deny-overrides-allow）を維持する。
+9. WFP ドメイン由来フィルタと BFE ドロップ有界キュー：WFP のドメイン由来フィルタ（`WfpFilterOrigin::DomainPolicy { domain_hints }`）は複数ドメイン集合（上限 `MAX_DOMAIN_HINTS_PER_FILTER = 32`）を保持し、アプリ全体、リテラル IP、CIDR、ワイルドカード IP のように `domain_hint` なしで静的に一致するルールではヒントを空のまま保ち、ドメイン固有ルールのみ `collect_domain_specific_blocked_hints` と `ensure_domain_policy_block_hints` で付与する。
+   ポリシー変更時の `reconcile_persisted_rules_with_baseline` は、変更前後比較で新規に必要となったフィルタ追加失敗へ `newly_required = true` を付与し、削除、縮小、上書きされたドメインルールの失敗も `removal_sources` で元ルール ID へ帰属させて補償ロールバックを漏らさない。
+   BFE コールバック経路の `ingest_wfp_drop_event` は非ブロッキングかつ同期 `tracing` 出力を持たず、チャネル満杯時は一次 FIFO と満杯時 `coalesced_by_exe` の二段有界キュー `WfpDropOverflowQueue`（一次キュー部分ドレイン時も両層横断で重複判定）へ退避する。
+   同一実行ファイルの別宛先上書き回数は `wfp_drop_overflow_coalesced` で計測し、非同期ワーカー側の `maybe_log_wfp_drop_overflow_coalesced` からべき乗間引きで警告ログを出す。
+   `on_wfp_drop_dequeued`、`flush_ready_pending_wfp_drops`、`handle_ambiguous_wfp_drop` では、単一候補時は `lookup_domains_for_process`、複数候補時は 60 秒鮮度窓付きの `lookup_fresh_domains_for_process`（`AMBIGUOUS_DNS_HISTORY_MAX_AGE_MS = 60_000`）を用い、猶予保留、早期解除、最終評価の鮮度条件を対称に保つ。
+10. アンインストール、インストーラ、アップデータ特権境界：アンインストール前段は読み取り専用（`--check-unresolved-suspended`）で未解決凍結アラートを検査し、`ProcessLiveness` と `CreationTime` 照合に加えハンドル上で `PROCESS_SYNCHRONIZE` 取得時は `WaitForSingleObject(0) == WAIT_OBJECT_0`、権限拒否時の `PROCESS_QUERY_LIMITED_INFORMATION` フォールバックでは `GetExitCodeProcess != STILL_ACTIVE` により終了済みゾンビハンドルを `Gone`（続行可）として区別し、PID 不明・生存残存・`Unknown`・作成時刻欠損かつ消失未確認（PID 再利用を排除不能）・検査失敗時はフェイルクローズで中断する。
+    再インストール時の ACL 保護は明示 ACE を削除したうえで、対象ツリー内のリパースポイント不在を事前検証（`Assert-NoReparsePointsInTree`）してから `icacls /reset /T` を適用し、復元失敗時は管理者専用バックアップを保全する。
+    `update-state.json` へ更新マニフェストをキャッシュ永続化するときは署名付きマニフェストと署名エンベロープを併記し（最新版確認のみの保存では確認時刻とバージョンのみ保持）、起動時にキャッシュが存在する場合はサイズ上限・Ed25519 署名・SemVer・ファイル名を再検証して不正時は `Idle` へフェイルクローズする。
+11. Win32 `HRESULT` エラー種別変換：`windows::core::Error` の `HRESULT_FROM_WIN32`（`0x8007xxxx`）を `std::io::Error::from` へ直接渡すと `ErrorKind::Uncategorized` になるため、エラー種別を判定する経路では `(hresult & 0xFFFF_0000) == 0x8007_0000` を満たす場合のみ下位 16 ビットを `std::io::Error::from_raw_os_error` へ変換し、それ以外の `HRESULT` は元の `std::io::Error::from` として扱う。
+12. 実機 E2E 検証境界：実機依存の挙動（ツリー終了の非同期性、実 BFE カーネル WFP フィルタ登録、`FwpmNetEventSubscribe1` 実イベント捕捉、および実 ETW `DNS-Client`）は合成ユニットテストでは検証済みと扱わず、Windows 10/11 クライアント SKU の実機 E2E 対象として残す。
 
 ## 対象外
 

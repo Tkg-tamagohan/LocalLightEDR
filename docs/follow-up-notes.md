@@ -91,7 +91,7 @@ Review #40 の主訴だった「満杯 32 件の Permit フィルタを更新す
 ### 背景と出典
 
 Phase 2 は PR #3（ブランチ `phase-2-canary-suspend`、マージコミット `a68bce5` / `a68bce5eb73922a0ebcfb6c052a430c620050958`）で、Phase 3 は PR #5（ブランチ `phase-3-wfp-firewall`、マージコミット `3fe1031` / `3fe1031fc3692beab77e0eeb531f27e6e56c888e`）で `main` へマージした。
-[AGENTS.md](../AGENTS.md) の Phase 2 不変条件、Phase 3 不変条件、および標準検証コマンドの定めにより、OS カーネルや実サービス環境に依存する挙動は合成テストだけでは検証済みとみなさない。
+[AGENTS.md](../AGENTS.md) の標準検証コマンド、および [.agents/rules/active-defense-guards.md](../.agents/rules/active-defense-guards.md) と [.agents/rules/daemon-wfp-process-invariants.md](../.agents/rules/daemon-wfp-process-invariants.md) の不変条件の定めにより、OS カーネルや実サービス環境に依存する挙動は合成テストだけでは検証済みとみなさない。
 
 ### 現行の保証範囲
 

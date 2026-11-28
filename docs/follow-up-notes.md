@@ -670,7 +670,7 @@ Run `#45753387980` の `release-dist` 6 点は `LocalEDR-Setup-v0.1.0-win-x64.ex
   1. `FwpmNetEventSubscribe1`（`FWPM_NET_EVENT_HEADER2.packageSid`）のみで `packageSid` を取得できるため、`FwpmNetEventSubscribe2` への移行は不要とする。
   2. `RuntimeBroker.exe`、`MicrosoftStartFeedProvider.exe`、`StartMenuExperienceHost.exe`、`SnippingTool.exe`、`gamingservices.exe` 等は `GetPackageFamilyName` が非空でも `TokenAppContainerSid` が `None`（`PFN_ONLY_NON_APPCONTAINER`）であり、逆に `fontdrvhost.exe` や `DefenderAiPlatformHost.exe` は `TokenAppContainerSid` のみを持つ（`TOKEN_SID_ONLY`）。
      そのため Track B-1 と Track B-2 では `package_family_name` と `package_sid` をそれぞれ独立した `Option<String>` として取得し、`PFN_ONLY_NON_APPCONTAINER` に対して `DeriveAppContainerSidFromAppContainerName` で架空の `package_sid` を補完しない。
-- **判定**：BFE の `backgroundTaskHost.exe` 用フィルタ受理、代替バイナリ `curl.exe` による異 SID 通信分離および `FWPM_NET_EVENT_HEADER2.packageSid` 捕捉、ならびに全 AppContainer プロセスの SID 導出一致を確認したため、合格基準 1 と 2 を代替検証範囲を含め合格と判定し、フォールバック設計へ縮退せず Track B-1 の実装へ進む。
+- **判定**：BFE の `backgroundTaskHost.exe` 用フィルタ受理、代替バイナリ `curl.exe` による異 SID 通信分離および `FWPM_NET_EVENT_HEADER2.packageSid` 捕捉、ならびに `GetPackageFamilyName` と `TokenAppContainerSid` の双方を取得できたパッケージ付き AppContainer プロセス 12 件の SID 導出一致を確認したため、合格基準 1 と 2 を代替検証範囲を含め合格と判定し、フォールバック設計へ縮退せず Track B-1 の実装へ進む。
 
 ### 段階的な実装計画（計約 4.5〜5 日）と各 PR の受け入れ基準
 

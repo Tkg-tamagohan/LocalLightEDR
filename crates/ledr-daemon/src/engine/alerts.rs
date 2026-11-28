@@ -2680,4 +2680,106 @@ mod tests {
 
         engine.shutdown_and_flush().await.expect("shutdown");
     }
+
+    #[tokio::test]
+    async fn unrelated_policy_upsert_preserves_deferred_preemptive_removal_and_dest_allow_cleans_stopped_app() {
+        let defense = Arc::new(MockDefense::new());
+        let inspector = Arc::new(MapInspector::new());
+        let engine = build_engine(Arc::clone(&defense), Arc::clone(&inspector), true).await;
+
+        let exe_a = r"C:\Users\Alice\Downloads\ContosoAppA.exe";
+        let exe_b = r"C:\Users\Alice\Downloads\ContosoAppB.exe";
+        let signer = "CN=Contoso Tools";
+        let root_tp = "0123456789ABCDEF0123456789ABCDEF01234567";
+        inspector.insert(BinaryIdentity {
+            exe_path: exe_a.to_string(),
+            sha256: Some("a".repeat(64)),
+            authenticode: Some(auth_info(signer, root_tp)),
+        });
+        inspector.insert(BinaryIdentity {
+            exe_path: exe_b.to_string(),
+            sha256: Some("b".repeat(64)),
+            authenticode: Some(auth_info(signer, root_tp)),
+        });
+
+        let p_a = ProcessIdentity::new(4201, 133_000_000_000_000_301);
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStart {
+                identity: p_a,
+                parent_pid: 4,
+                exe_path: exe_a.to_string(),
+                command_line: exe_a.to_string(),
+                user_sid: None,
+            },
+            EventLane::HighPriority,
+        );
+        let alert_a = make_alert(
+            "ALT-DEFERRED-A",
+            "LAYER_3_NETWORK",
+            Some(&p_a.instance_id()),
+            serde_json::json!({
+                "exe_path": exe_a,
+                "signer_subject": signer,
+                "root_thumbprint": root_tp,
+                "dst_ip": "198.51.100.10"
+            }),
+        );
+        engine.store().record_alert(&alert_a).expect("record alert");
+        {
+            let mut fw = engine.firewall.lock().unwrap();
+            assert!(fw.bind_alert_to_app_block("ALT-DEFERRED-A", exe_a));
+        }
+        let _ = engine.process_event_with_lane(
+            &SensorEvent::ProcessStop {
+                pid: p_a.pid,
+                exit_time_100ns: p_a.create_time_100ns + 10_000,
+                exit_code: 0,
+            },
+            EventLane::HighPriority,
+        );
+
+        // Unrelated View 3 policy rule save for App B while App A is stopped with a bound alert.
+        engine
+            .upsert_policy_rule(&ledr_proto::AllowlistRuleRecord {
+                rule_id: "RULE-UNRELATED-B".to_string(),
+                scope: RuleScope::NetworkAllow,
+                exe_path_pattern: exe_b.to_string(),
+                sha256: Some("b".repeat(64)),
+                signer_subject: Some(signer.to_string()),
+                root_thumbprint: Some(root_tp.to_string()),
+                allowed_target: Some("198.51.100.20".to_string()),
+                created_at_ms: 1_750_000_000_000,
+                created_by: "user_manual".to_string(),
+            })
+            .expect("unrelated upsert succeeds");
+        {
+            let fw = engine.firewall.lock().unwrap();
+            assert!(
+                fw.has_deferred_preemptive_removal(exe_a),
+                "unrelated policy sync must preserve deferred_preemptive_removals for stopped App A"
+            );
+        }
+
+        // Resolving App A's final alert with dest-scoped AllowPermanent removes App A's Preemptive block.
+        engine
+            .resolve_alert_with_options_and_outcome(
+                "ALT-DEFERRED-A",
+                AlertDecision::AllowPermanent {
+                    use_signer_if_available: true,
+                    allow_dest: Some("198.51.100.10".to_string()),
+                },
+                AllowPermanentPathMode::Exact,
+            )
+            .expect("dest-scoped approval succeeds");
+        {
+            let fw = engine.firewall.lock().unwrap();
+            assert!(
+                fw.active_app_block(exe_a).is_none(),
+                "stopped App A must release its Preemptive block after final alert resolves"
+            );
+            assert!(!fw.has_deferred_preemptive_removal(exe_a));
+        }
+
+        engine.shutdown_and_flush().await.expect("shutdown");
+    }
 }

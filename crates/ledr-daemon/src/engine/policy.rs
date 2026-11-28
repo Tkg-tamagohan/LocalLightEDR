@@ -102,13 +102,17 @@ impl DaemonEngine {
                 };
             }
         };
-        let (active_exes, live_exe_overflow_any, overflow_live_exe_keys) = self
-            .process_table
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .active_exe_liveness_snapshot();
         let (report, has_domain_rules) = {
             let mut fw = self.firewall.lock().unwrap_or_else(|e| e.into_inner());
+            // Lock order: `firewall` -> `process_table`; release `process_table` immediately
+            // before BFE calls so a concurrent `ProcessStop` (`cleanup_firewall_for_stopped_instance`)
+            // cannot mark `deferred_preemptive_removals` between snapshot capture and `firewall`
+            // acquisition (`PRRT_kwDOVyjVyM68_Pnt`).
+            let (active_exes, live_exe_overflow_any, overflow_live_exe_keys) = self
+                .process_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_exe_liveness_snapshot();
             let mut dns_ctx = {
                 let blocks = fw.all_domain_policy_blocks();
                 let permits = fw.all_domain_policy_permits_with_hints();

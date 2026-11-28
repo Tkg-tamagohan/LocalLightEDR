@@ -496,6 +496,7 @@ fn run_probe_processes(cfg: &SpikeConfig) -> Result<(), String> {
     let mut appcontainer_count = 0usize;
     let mut both_matched = 0usize;
     let mut mismatched = 0usize;
+    let mut query_errors = 0usize;
     let mut bth_seen = 0usize;
 
     loop {
@@ -512,20 +513,61 @@ fn run_probe_processes(cfg: &SpikeConfig) -> Result<(), String> {
             match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
                 Ok(proc_h) => {
                     let _proc_guard = OwnedHandle(proc_h);
-                    let pfn = query_process_package_family_name(proc_h).unwrap_or(None);
-                    let token_sid = query_token_app_container_sid(proc_h).unwrap_or(None);
-                    let derived_sid = pfn
-                        .as_deref()
-                        .and_then(|name| derive_sid_for_pfn(name).ok().map(|(_, s)| s));
+                    let pfn_res = query_process_package_family_name(proc_h);
+                    let token_res = query_token_app_container_sid(proc_h);
+                    let derived_res = match &pfn_res {
+                        Ok(Some(name)) => Some(derive_sid_for_pfn(name).map(|(_, s)| s)),
+                        _ => None,
+                    };
 
-                    if pfn.is_some() {
+                    if let Ok(Some(_)) = &pfn_res {
                         packaged_count += 1;
                     }
-                    if token_sid.is_some() {
+                    if let Ok(Some(_)) = &token_res {
                         appcontainer_count += 1;
                     }
 
-                    if pfn.is_some() || token_sid.is_some() || is_bth {
+                    let has_error = pfn_res.is_err()
+                        || token_res.is_err()
+                        || matches!(derived_res, Some(Err(_)));
+                    let has_data = matches!(pfn_res, Ok(Some(_)))
+                        || matches!(token_res, Ok(Some(_)));
+
+                    if has_error {
+                        query_errors += 1;
+                        let pfn_disp = match &pfn_res {
+                            Ok(Some(v)) => v.as_str(),
+                            Ok(None) => "-",
+                            Err(_) => "<ERR>",
+                        };
+                        let derived_disp = match &derived_res {
+                            Some(Ok(v)) => v.as_str(),
+                            Some(Err(_)) => "<ERR>",
+                            None => "-",
+                        };
+                        let token_disp = match &token_res {
+                            Ok(Some(v)) => v.as_str(),
+                            Ok(None) => "-",
+                            Err(_) => "<ERR>",
+                        };
+                        let mut err_parts = Vec::new();
+                        if let Err(e) = &pfn_res {
+                            err_parts.push(format!("pfn:{e}"));
+                        }
+                        if let Err(e) = &token_res {
+                            err_parts.push(format!("token:{e}"));
+                        }
+                        if let Some(Err(e)) = &derived_res {
+                            err_parts.push(format!("derive:{e}"));
+                        }
+                        println!(
+                            "  pid={pid:<6} exe={exe_name:<28} status=QUERY_ERROR              pfn={pfn_disp} derived={derived_disp} token={token_disp} errors=[{}]",
+                            err_parts.join("; ")
+                        );
+                    } else if has_data || is_bth {
+                        let pfn = pfn_res.ok().flatten();
+                        let token_sid = token_res.ok().flatten();
+                        let derived_sid = derived_res.and_then(Result::ok);
                         let status_tag = match (&derived_sid, &token_sid) {
                             (Some(d), Some(t)) if d == t => {
                                 both_matched += 1;
@@ -560,7 +602,7 @@ fn run_probe_processes(cfg: &SpikeConfig) -> Result<(), String> {
     }
 
     println!(
-        "\nSummary: total={total_procs}, open_denied={open_denied}, backgroundTaskHost_seen={bth_seen}, packaged={packaged_count}, appcontainer={appcontainer_count}, sid_match={both_matched}, sid_mismatch={mismatched}"
+        "\nSummary: total={total_procs}, open_denied={open_denied}, query_errors={query_errors}, backgroundTaskHost_seen={bth_seen}, packaged={packaged_count}, appcontainer={appcontainer_count}, sid_match={both_matched}, sid_mismatch={mismatched}"
     );
     if mismatched > 0 {
         return Err(format!("detected {mismatched} SID mismatch(es)"));
@@ -1113,6 +1155,9 @@ fn run_probe_wfp(cfg: &SpikeConfig) -> Result<(), String> {
     }
 
     session.subscribe_net_events()?;
+    if session.sub1.is_none() && session.sub2.is_none() {
+        return Err("both FwpmNetEventSubscribe1 and FwpmNetEventSubscribe2 failed".to_string());
+    }
     println!(
         "  Observing BFE net-events for {}s (trigger target Store/backgroundTaskHost traffic now)...",
         cfg.wait_secs
@@ -1268,6 +1313,12 @@ fn run_self_test_wfp(cfg: &SpikeConfig) -> Result<(), String> {
         block_profile.sid.0,
     )?;
     session.subscribe_net_events()?;
+    if session.sub1.is_none() {
+        return Err(
+            "FwpmNetEventSubscribe1 failed; cannot verify v1/HEADER2 drop event and packageSid"
+                .to_string(),
+        );
+    }
 
     let (permit_code, permit_elapsed) = run_curl_in_app_container(
         CURL_EXE,
@@ -1302,6 +1353,7 @@ fn run_self_test_wfp(cfg: &SpikeConfig) -> Result<(), String> {
     let mut v1_block_drops = 0usize;
     let mut v1_pkg_flag = 0usize;
     let mut v1_sid_match = 0usize;
+    let mut v1_verified_events = 0usize;
     let mut v2_block_drops = 0usize;
     let mut v2_pkg_flag = 0usize;
     let mut v2_sid_match = 0usize;
@@ -1335,6 +1387,9 @@ fn run_self_test_wfp(cfg: &SpikeConfig) -> Result<(), String> {
                 if sid_matches {
                     v1_sid_match += 1;
                 }
+                if ev.flag_package_id_set && sid_matches {
+                    v1_verified_events += 1;
+                }
             } else if ev.api_version == "v2/HEADER3" {
                 v2_block_drops += 1;
                 if ev.flag_package_id_set {
@@ -1352,7 +1407,7 @@ fn run_self_test_wfp(cfg: &SpikeConfig) -> Result<(), String> {
         "  Isolation: permit_exit_code={permit_code} (expect 0), block_exit_code={block_code} (expect != 0)"
     );
     println!(
-        "  NetEvents v1/HEADER2: block_drops={v1_block_drops}, flag_pkg={v1_pkg_flag}, sid_match={v1_sid_match}"
+        "  NetEvents v1/HEADER2: block_drops={v1_block_drops}, flag_pkg={v1_pkg_flag}, sid_match={v1_sid_match}, fully_verified={v1_verified_events}"
     );
     println!(
         "  NetEvents v2/HEADER3: block_drops={v2_block_drops}, flag_pkg={v2_pkg_flag}, sid_match={v2_sid_match}"
@@ -1361,6 +1416,12 @@ fn run_self_test_wfp(cfg: &SpikeConfig) -> Result<(), String> {
     if permit_code != 0 || block_code == 0 {
         return Err(format!(
             "WFP package isolation assertion failed (permit_code={permit_code}, block_code={block_code})"
+        ));
+    }
+    if v1_verified_events == 0 {
+        return Err(format!(
+            "missing verified v1/HEADER2 drop event matching block filter ID, FWPM_NET_EVENT_FLAG_PACKAGE_ID_SET, and block packageSid `{}`",
+            block_profile.sid_str
         ));
     }
     Ok(())
